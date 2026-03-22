@@ -83,8 +83,10 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
 
         // ── Timer interrupt (IRQ0, vector 32) ───────────────────────────
         32 => {
-            crate::sched::timer_tick();
-            // Send EOI to PIC
+            // Increment the global tick counter
+            crate::arch::x86_64::timer::tick();
+            // Send EOI to PIC (must be sent before scheduling, since
+            // schedule() may context-switch and never return here)
             unsafe {
                 core::arch::asm!(
                     "mov al, 0x20",
@@ -92,6 +94,8 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                     options(nomem, nostack)
                 );
             }
+            // Energy accounting + preemptive reschedule
+            crate::sched::timer_tick();
         }
 
         // ── Keyboard interrupt (IRQ1, vector 33) ────────────────────────

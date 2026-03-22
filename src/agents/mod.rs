@@ -8,3 +8,4 @@ pub mod root;
 pub mod ping;
 pub mod pong;
 pub mod idle;
+pub mod bad;

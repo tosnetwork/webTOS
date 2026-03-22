@@ -121,6 +121,26 @@ pub fn init() {
     serial_println!("[INIT] Pong agent created: id={}", pong_id);
     event::agent_created(pong_id, root_id);
 
+    // ── Bad agent (agent 4) ── Demo 2: capability denial ────────────────
+    let bad_id = create_agent(
+        Some(root_id),
+        agents::bad::bad_entry as *const () as u64,
+        stack_top(4),
+        10_000,
+        64,
+    ).expect("Failed to create bad agent");
+
+    // Deliberately grant NO send capabilities — only EventEmit
+    {
+        let agent = get_agent_mut(bad_id).expect("Bad agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 1;
+    }
+    mailbox::create_mailbox(bad_id as MailboxId, bad_id).ok();
+    state::create_keyspace(bad_id as u16).ok();
+    serial_println!("[INIT] Bad agent created: id={} (no send caps)", bad_id);
+    event::agent_created(bad_id, root_id);
+
     // ── Set cr3 for all agents ──────────────────────────────────────────
     // In Stage-1 all agents share the kernel page table. Read the current
     // CR3 (set up by arch::init) and store it in each agent's context so
@@ -130,7 +150,7 @@ pub fn init() {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
 
-    for &id in &[idle_id, root_id, ping_id, pong_id] {
+    for &id in &[idle_id, root_id, ping_id, pong_id, bad_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -142,6 +162,7 @@ pub fn init() {
     sched::add_to_run_queue(root_id);
     sched::add_to_run_queue(ping_id);
     sched::add_to_run_queue(pong_id);
+    sched::add_to_run_queue(bad_id);
 
     serial_println!("[INIT] All agents created and queued");
 }

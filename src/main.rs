@@ -39,7 +39,8 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     arch::x86_64::init();
     serial_println!("[OK] Architecture initialized");
 
-    // 4. Initialize memory (frame allocator deferred to later stage)
+    // 4. Initialize memory (frame allocator)
+    arch::x86_64::paging::init();
     serial_println!("[OK] Memory initialized");
 
     // 5. Initialize kernel subsystems

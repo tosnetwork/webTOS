@@ -276,8 +276,9 @@ pub fn start() {
 
 /// Called from the timer interrupt handler to perform preemptive scheduling.
 ///
-/// Decrements the current agent's energy budget and may preempt it.
-/// Also decrements energy for all blocked agents.
+/// 1. Decrements the current agent's energy budget; suspends if exhausted.
+/// 2. Decrements energy for all blocked agents; suspends if exhausted.
+/// 3. Triggers a preemptive context switch (round-robin time slice).
 pub fn timer_tick() {
     unsafe {
         let id = CURRENT_AGENT_ID;
@@ -297,7 +298,6 @@ pub fn timer_tick() {
         }
 
         // Charge energy for blocked agents
-        // Collect IDs first to avoid borrow conflicts
         let mut blocked: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
         let mut count = 0;
 
@@ -322,5 +322,8 @@ pub fn timer_tick() {
                 }
             }
         }
+
+        // Preemptive reschedule: switch to the next ready agent
+        schedule();
     }
 }
