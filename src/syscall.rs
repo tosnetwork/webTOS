@@ -485,6 +485,14 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
     }
 }
 
+/// Entry point called from syscall_entry.asm when a ring 3 agent executes
+/// the SYSCALL instruction. This is just a thin wrapper around the existing
+/// syscall dispatcher.
+#[no_mangle]
+pub extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    syscall(num, a1, a2, a3, a4, a5)
+}
+
 /// Read CR3 safely. Returns 0 if inline assembly is not available.
 /// In Stage-1 all agents share the kernel page table.
 fn read_cr3_safe() -> u64 {

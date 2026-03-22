@@ -9,6 +9,7 @@ pub mod serial;
 pub mod paging;
 pub mod timer;
 pub mod context;
+pub mod syscall_msr;
 pub mod ata;
 
 pub use serial::{serial_print, serial_println};
@@ -18,6 +19,7 @@ pub use serial::{serial_print, serial_println};
 /// Must be called early in kernel boot, after basic stack and BSS are set up.
 pub fn init() {
     gdt::init();
+    syscall_msr::init();
     idt::init();
     // Paging: identity mapping is set up by boot.asm.
     // The frame allocator is initialized separately via paging::init()

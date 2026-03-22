@@ -19,34 +19,44 @@ const MAX_FRAMES: usize = MAX_MEMORY / PAGE_SIZE;
 /// Number of u64 bitmap entries needed (each covers 64 frames).
 const BITMAP_SIZE: usize = (MAX_FRAMES + 63) / 64;
 
-/// Start of allocatable physical memory (skip first 2 MB for kernel/boot).
-const ALLOC_START: usize = 2 * 1024 * 1024;
-
-/// Start frame index (first allocatable frame).
-const START_FRAME: usize = ALLOC_START / PAGE_SIZE;
-
 // Bitmap: bit set = frame is allocated, bit clear = frame is free.
 // Safety: single-core access in Stage-1.
 static mut BITMAP: [u64; BITMAP_SIZE] = [0u64; BITMAP_SIZE];
 
 // Next frame index to check (simple bump hint for fast allocation).
-static NEXT_FREE: AtomicU64 = AtomicU64::new(START_FRAME as u64);
+// Initialized to 0; set properly in init().
+static NEXT_FREE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    static __kernel_end: u8;
+}
 
 /// Initialize the frame allocator.
 ///
-/// In Stage-1 this just marks the first 2MB as reserved (used by kernel/boot).
+/// Reserves all frames from 0 up to __kernel_end (kernel code, BSS,
+/// page tables, and stack). This prevents the allocator from handing
+/// out frames that overlap with the running kernel.
 pub fn init() {
+    // Calculate the first safe frame: round __kernel_end up to the next page
+    let kernel_end = unsafe { &__kernel_end as *const u8 as usize };
+    let reserved_frames = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
+
     unsafe {
-        // Mark all frames below ALLOC_START as used
-        for i in 0..START_FRAME {
+        for i in 0..reserved_frames {
             let word = i / 64;
             let bit = i % 64;
             BITMAP[word] |= 1u64 << bit;
         }
     }
-    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB)",
-        MAX_FRAMES - START_FRAME,
-        (MAX_FRAMES - START_FRAME) * PAGE_SIZE / (1024 * 1024));
+
+    NEXT_FREE.store(reserved_frames as u64, Ordering::Relaxed);
+
+    let available = MAX_FRAMES - reserved_frames;
+    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB), kernel reserved {} frames ({} KB)",
+        available,
+        available * PAGE_SIZE / (1024 * 1024),
+        reserved_frames,
+        reserved_frames * PAGE_SIZE / 1024);
 }
 
 /// Allocate a single 4KB physical frame.
@@ -68,8 +78,8 @@ pub fn alloc_frame() -> Option<u64> {
             }
         }
 
-        // Wrap around and search from START_FRAME to start
-        for i in START_FRAME..start {
+        // Wrap around and search from frame 1 to start
+        for i in 1..start {
             let word = i / 64;
             let bit = i % 64;
             if BITMAP[word] & (1u64 << bit) == 0 {
@@ -131,35 +141,50 @@ pub const PTE_NO_EXECUTE: u64 = 1 << 63;
 /// Page table levels
 const PT_LEVELS: usize = 4; // PML4 -> PDPT -> PD -> PT
 
-/// Create a new empty page table hierarchy for an agent.
-/// Allocates a PML4 frame and maps the kernel (identity-mapped) in all entries.
-/// Returns the physical address of the PML4 (to be stored in cr3).
+/// Create a new independent page table hierarchy for an agent.
+///
+/// Allocates fresh PML4, PDPT, and PD frames. The kernel's identity-mapped
+/// 2MB huge pages are copied into the new PD as supervisor-only entries.
+/// This ensures that map_page() on the new address space does NOT modify
+/// the boot page tables (which are shared by the kernel).
 pub fn create_address_space() -> Option<u64> {
-    // 1. Allocate a frame for PML4
+    // 1. Allocate fresh frames for PML4, PDPT, and PD
     let pml4_phys = alloc_frame()?;
+    let pdpt_phys = alloc_frame()?;
+    let pd_phys = alloc_frame()?;
 
-    // 2. Zero the PML4
     let pml4 = pml4_phys as *mut u64;
-    unsafe {
-        core::ptr::write_bytes(pml4, 0, PAGE_SIZE / 8);
-    }
+    let pdpt = pdpt_phys as *mut u64;
+    let pd = pd_phys as *mut u64;
 
-    // 3. Copy kernel mappings from the current PML4
-    //    The kernel uses identity mapping in the lower entries.
-    //    Copy all entries from the current page table to preserve kernel access.
-    let current_cr3 = read_cr3();
-    let current_pml4 = current_cr3 as *const u64;
     unsafe {
-        // Copy the first 4 entries (covers 0-512GB, more than enough for kernel)
-        for i in 0..4 {
-            let entry = core::ptr::read_volatile(current_pml4.add(i));
-            core::ptr::write_volatile(pml4.add(i), entry);
+        // 2. Zero all three tables
+        core::ptr::write_bytes(pml4, 0, PAGE_SIZE / 8);
+        core::ptr::write_bytes(pdpt, 0, PAGE_SIZE / 8);
+        core::ptr::write_bytes(pd, 0, PAGE_SIZE / 8);
+
+        // 3. Copy PD entries (2MB huge pages) from the boot page tables.
+        //    This gives the new address space the same kernel identity mapping
+        //    but in an INDEPENDENT PD that can be modified without affecting boot.
+        let current_cr3 = read_cr3();
+        let boot_pml4 = current_cr3 as *const u64;
+        let boot_pml4_0 = core::ptr::read_volatile(boot_pml4);
+        if boot_pml4_0 & PTE_PRESENT != 0 {
+            let boot_pdpt = (boot_pml4_0 & 0x000F_FFFF_FFFF_F000) as *const u64;
+            let boot_pdpt_0 = core::ptr::read_volatile(boot_pdpt);
+            if boot_pdpt_0 & PTE_PRESENT != 0 {
+                let boot_pd = (boot_pdpt_0 & 0x000F_FFFF_FFFF_F000) as *const u64;
+                // Copy all 512 PD entries (2MB huge pages for kernel identity mapping)
+                for i in 0..512 {
+                    let entry = core::ptr::read_volatile(boot_pd.add(i));
+                    core::ptr::write_volatile(pd.add(i), entry);
+                }
+            }
         }
-        // Also copy the upper half entries (256..512) for future higher-half kernel
-        for i in 256..512 {
-            let entry = core::ptr::read_volatile(current_pml4.add(i));
-            core::ptr::write_volatile(pml4.add(i), entry);
-        }
+
+        // 4. Wire up: PML4[0] → new PDPT, PDPT[0] → new PD
+        core::ptr::write_volatile(pml4, pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        core::ptr::write_volatile(pdpt, pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
     }
 
     Some(pml4_phys)

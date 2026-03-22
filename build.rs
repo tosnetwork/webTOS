@@ -14,6 +14,7 @@ fn main() {
         "syscall_entry.asm",
         "trap_entry.asm",
         "switch.asm",
+        "user_agents.asm",
     ];
 
     for asm_file in &asm_files {

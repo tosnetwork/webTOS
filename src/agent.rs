@@ -57,6 +57,17 @@ pub const E_QUOTA_EXCEEDED: i64 = -6;
 pub const E_PAYLOAD_TOO_LARGE: i64 = -7;
 pub const E_CHECKPOINT_NOT_ROOT: i64 = -9;
 
+// ─── Agent mode ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgentMode {
+    Kernel = 0,
+    User = 1,
+}
+
+pub const KERNEL_STACK_SIZE: usize = 8192;
+
 // ─── Agent status ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +167,8 @@ pub struct Agent {
     pub energy_budget: EnergyUnit,
     pub memory_quota: u32,  // in pages
     pub memory_used: u32,
+    pub mode: AgentMode,
+    pub kernel_stack_top: u64,
     pub active: bool,       // whether this slot is in use
 }
 
@@ -183,6 +196,8 @@ impl Agent {
             energy_budget: energy,
             memory_quota: mem_quota,
             memory_used: 0,
+            mode: AgentMode::Kernel,
+            kernel_stack_top: 0,
             active: true,
         }
     }

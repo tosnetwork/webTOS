@@ -132,3 +132,31 @@ context_switch:
     ; We arrive here when another agent switches back to us.
     ; The original call to context_switch appears to return normally.
     ret
+
+; ─── Ring 3 entry trampoline ────────────────────────────────────────────────
+;
+; Used for the FIRST context switch to a ring 3 agent. The agent's context
+; has these callee-saved registers pre-loaded:
+;   r12 = user entry point (RIP)
+;   r13 = user stack top (RSP)
+;   r14 = user code segment (USER_CS = 0x23)
+;   r15 = user data segment (USER_DS = 0x1B)
+;
+; context_switch restores these registers and jumps here (rip = enter_user_mode).
+; We build an iretq frame on the kernel stack and iretq to ring 3.
+
+global enter_user_mode
+
+enter_user_mode:
+    ; Build iretq frame:
+    ;   [rsp+32] SS    = USER_DS
+    ;   [rsp+24] RSP   = user stack
+    ;   [rsp+16] RFLAGS = 0x202 (IF=1, reserved bit 1 always set)
+    ;   [rsp+8]  CS    = USER_CS
+    ;   [rsp+0]  RIP   = user entry point
+    push r15            ; SS (USER_DS = 0x1B)
+    push r13            ; RSP (user stack top)
+    push qword 0x202    ; RFLAGS (IF=1)
+    push r14            ; CS (USER_CS = 0x23)
+    push r12            ; RIP (user entry point)
+    iretq

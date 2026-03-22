@@ -222,3 +222,13 @@ pub fn init() {
     serial_println!("[gdt] GDT loaded: kernel CS=0x{:02x} DS=0x{:02x}, TSS at 0x{:02x}",
         KERNEL_CS, KERNEL_DS, TSS_SELECTOR);
 }
+
+/// Update TSS.rsp0 to the given stack top address.
+/// Called on context switch to a ring 3 agent so the CPU knows
+/// where to switch on interrupt/exception from user mode.
+pub fn set_tss_rsp0(stack_top: u64) {
+    // Safety: single-core, called during context switch with interrupts disabled.
+    unsafe {
+        TSS.rsp0 = stack_top;
+    }
+}

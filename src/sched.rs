@@ -10,6 +10,12 @@
 use crate::serial_println;
 use crate::agent::*;
 use crate::arch::x86_64::context::context_switch;
+use crate::agent::AgentMode;
+use crate::arch::x86_64::gdt;
+
+extern "C" {
+    static mut CURRENT_KERNEL_RSP: u64;
+}
 
 /// Maximum run queue size (same as MAX_AGENTS).
 const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
@@ -167,7 +173,13 @@ pub fn unblock(id: AgentId) {
 ///
 /// Round-robin selection among Ready agents. If no agents are Ready,
 /// falls back to the idle agent.
+///
+/// Interrupts are disabled during the scheduling decision and context
+/// switch to prevent re-entrant schedule() calls from timer_tick().
 pub fn schedule() {
+    // Disable interrupts to prevent re-entrant schedule() from timer_tick()
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
     unsafe {
         let old_id = CURRENT_AGENT_ID;
 
@@ -195,6 +207,7 @@ pub fn schedule() {
             if let Some(agent) = get_agent_mut(old_id) {
                 agent.status = AgentStatus::Running;
             }
+            core::arch::asm!("sti", options(nomem, nostack));
             return;
         }
 
@@ -205,11 +218,23 @@ pub fn schedule() {
 
         CURRENT_AGENT_ID = next_id;
 
+        // For ring 3 agents: update TSS.rsp0 and CURRENT_KERNEL_RSP
+        // so the CPU knows which kernel stack to use on interrupt/syscall
+        if let Some(agent) = get_agent(next_id) {
+            if agent.mode == AgentMode::User {
+                gdt::set_tss_rsp0(agent.kernel_stack_top);
+                unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+            }
+        }
+
         // Get context pointers for old and new agents
         let old_ctx = get_old_context_ptr(old_id);
         let new_ctx = &get_agent(next_id).unwrap().context as *const AgentContext;
 
         context_switch(old_ctx, new_ctx);
+        // We reach here when this agent is resumed by another context_switch.
+        // Re-enable interrupts.
+        core::arch::asm!("sti", options(nomem, nostack));
     }
 }
 
@@ -268,6 +293,15 @@ pub fn start() {
         }
 
         serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
+
+        // For ring 3 agents: update TSS.rsp0 and CURRENT_KERNEL_RSP
+        // so the CPU knows which kernel stack to use on interrupt/syscall
+        if let Some(agent) = get_agent(first_id) {
+            if agent.mode == AgentMode::User {
+                gdt::set_tss_rsp0(agent.kernel_stack_top);
+                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+            }
+        }
 
         let new_ctx = &get_agent(first_id).unwrap().context as *const AgentContext;
         context_switch(&mut BOOT_CONTEXT as *mut AgentContext, new_ctx);
