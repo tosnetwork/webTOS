@@ -141,6 +141,48 @@ pub fn init() {
     serial_println!("[INIT] Bad agent created: id={} (no send caps)", bad_id);
     event::agent_created(bad_id, root_id);
 
+    // ── Stated agent (agent 5) ── state persistence manager ──────────
+    let stated_id = create_agent(
+        Some(root_id),
+        agents::stated::stated_entry as *const () as u64,
+        stack_top(5),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create stated agent");
+    {
+        let agent = get_agent_mut(stated_id).expect("Stated agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::StateRead, CAP_TARGET_WILDCARD));
+        agent.capabilities[4] = Some(Capability::new(CapType::StateWrite, CAP_TARGET_WILDCARD));
+        agent.cap_count = 5;
+    }
+    mailbox::create_mailbox(stated_id as MailboxId, stated_id).ok();
+    state::create_keyspace(stated_id as u16).ok();
+    serial_println!("[INIT] Stated agent created: id={}", stated_id);
+    event::agent_created(stated_id, root_id);
+
+    // ── Policyd agent (agent 6) ── policy engine ─────────────────────
+    let policyd_id = create_agent(
+        Some(root_id),
+        agents::policyd::policyd_entry as *const () as u64,
+        stack_top(6),
+        100_000,
+        256,
+    ).expect("Failed to create policyd agent");
+    {
+        let agent = get_agent_mut(policyd_id).expect("Policyd agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(policyd_id as MailboxId, policyd_id).ok();
+    state::create_keyspace(policyd_id as u16).ok();
+    serial_println!("[INIT] Policyd agent created: id={}", policyd_id);
+    event::agent_created(policyd_id, root_id);
+
     // ── Set cr3 for all agents ──────────────────────────────────────────
     // In Stage-1 all agents share the kernel page table. Read the current
     // CR3 (set up by arch::init) and store it in each agent's context so
@@ -150,7 +192,7 @@ pub fn init() {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
 
-    for &id in &[idle_id, root_id, ping_id, pong_id, bad_id] {
+    for &id in &[idle_id, root_id, ping_id, pong_id, bad_id, stated_id, policyd_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -163,6 +205,8 @@ pub fn init() {
     sched::add_to_run_queue(ping_id);
     sched::add_to_run_queue(pong_id);
     sched::add_to_run_queue(bad_id);
+    sched::add_to_run_queue(stated_id);
+    sched::add_to_run_queue(policyd_id);
 
     serial_println!("[INIT] All agents created and queued");
 }

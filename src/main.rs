@@ -26,6 +26,7 @@ mod init;
 mod agents;
 mod ebpf;
 mod wasm;
+mod loader;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

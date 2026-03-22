@@ -113,3 +113,189 @@ pub fn read_cr3() -> u64 {
     }
     cr3
 }
+
+// ─── Per-agent page table management ─────────────────────────────────────
+
+/// Page table entry flags
+pub const PTE_PRESENT: u64 = 1 << 0;
+pub const PTE_WRITABLE: u64 = 1 << 1;
+pub const PTE_USER: u64 = 1 << 2;
+pub const PTE_WRITE_THROUGH: u64 = 1 << 3;
+pub const PTE_NO_CACHE: u64 = 1 << 4;
+pub const PTE_ACCESSED: u64 = 1 << 5;
+pub const PTE_DIRTY: u64 = 1 << 6;
+pub const PTE_HUGE: u64 = 1 << 7;
+pub const PTE_GLOBAL: u64 = 1 << 8;
+pub const PTE_NO_EXECUTE: u64 = 1 << 63;
+
+/// Page table levels
+const PT_LEVELS: usize = 4; // PML4 -> PDPT -> PD -> PT
+
+/// Create a new empty page table hierarchy for an agent.
+/// Allocates a PML4 frame and maps the kernel (identity-mapped) in all entries.
+/// Returns the physical address of the PML4 (to be stored in cr3).
+pub fn create_address_space() -> Option<u64> {
+    // 1. Allocate a frame for PML4
+    let pml4_phys = alloc_frame()?;
+
+    // 2. Zero the PML4
+    let pml4 = pml4_phys as *mut u64;
+    unsafe {
+        core::ptr::write_bytes(pml4, 0, PAGE_SIZE / 8);
+    }
+
+    // 3. Copy kernel mappings from the current PML4
+    //    The kernel uses identity mapping in the lower entries.
+    //    Copy all entries from the current page table to preserve kernel access.
+    let current_cr3 = read_cr3();
+    let current_pml4 = current_cr3 as *const u64;
+    unsafe {
+        // Copy the first 4 entries (covers 0-512GB, more than enough for kernel)
+        for i in 0..4 {
+            let entry = core::ptr::read_volatile(current_pml4.add(i));
+            core::ptr::write_volatile(pml4.add(i), entry);
+        }
+        // Also copy the upper half entries (256..512) for future higher-half kernel
+        for i in 256..512 {
+            let entry = core::ptr::read_volatile(current_pml4.add(i));
+            core::ptr::write_volatile(pml4.add(i), entry);
+        }
+    }
+
+    Some(pml4_phys)
+}
+
+/// Destroy an agent's address space.
+/// Frees the PML4 and all page table frames allocated for user-space mappings.
+/// Does NOT free the kernel mappings (those are shared).
+pub fn destroy_address_space(pml4_phys: u64) {
+    // 1. Walk the PML4 entries that belong to user space (entries 4..256)
+    // 2. For each present entry, walk down and free all page table frames
+    // 3. Free the PML4 frame itself
+
+    let pml4 = pml4_phys as *const u64;
+    unsafe {
+        // Only free user-space entries (4..256, skipping kernel entries 0..4 and 256..512)
+        for i in 4..256 {
+            let pml4e = core::ptr::read_volatile(pml4.add(i));
+            if pml4e & PTE_PRESENT != 0 {
+                let pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+                free_page_table_level(pdpt_phys, 3);
+            }
+        }
+    }
+
+    dealloc_frame(pml4_phys);
+}
+
+/// Recursively free page table frames at a given level.
+/// level 3 = PDPT, 2 = PD, 1 = PT
+unsafe fn free_page_table_level(table_phys: u64, level: usize) {
+    let table = table_phys as *const u64;
+
+    if level > 1 {
+        for i in 0..512 {
+            let entry = core::ptr::read_volatile(table.add(i));
+            if entry & PTE_PRESENT != 0 && entry & PTE_HUGE == 0 {
+                let next_phys = entry & 0x000F_FFFF_FFFF_F000;
+                free_page_table_level(next_phys, level - 1);
+            }
+        }
+    }
+
+    dealloc_frame(table_phys);
+}
+
+/// Map a single 4KB page in an agent's address space.
+/// Creates intermediate page table levels as needed.
+pub fn map_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        // Walk PML4 -> PDPT
+        let pml4 = pml4_phys as *mut u64;
+        let pdpt_phys = ensure_table_entry(pml4, pml4_idx, flags)?;
+
+        // Walk PDPT -> PD
+        let pdpt = pdpt_phys as *mut u64;
+        let pd_phys = ensure_table_entry(pdpt, pdpt_idx, flags)?;
+
+        // Walk PD -> PT
+        let pd = pd_phys as *mut u64;
+        let pt_phys = ensure_table_entry(pd, pd_idx, flags)?;
+
+        // Set PT entry
+        let pt = pt_phys as *mut u64;
+        core::ptr::write_volatile(
+            pt.add(pt_idx),
+            (phys_addr & 0x000F_FFFF_FFFF_F000) | flags | PTE_PRESENT,
+        );
+    }
+
+    Ok(())
+}
+
+/// Ensure a page table entry exists at the given index.
+/// If not present, allocate a new frame for the next-level table.
+/// Returns the physical address of the next-level table.
+unsafe fn ensure_table_entry(table: *mut u64, index: usize, flags: u64) -> Result<u64, ()> {
+    let entry = core::ptr::read_volatile(table.add(index));
+    if entry & PTE_PRESENT != 0 {
+        // Entry exists, return the physical address of the next table
+        // Update flags (e.g., add USER bit if needed)
+        let phys = entry & 0x000F_FFFF_FFFF_F000;
+        let new_entry = phys | (entry & 0xFFF) | (flags & (PTE_USER | PTE_WRITABLE));
+        core::ptr::write_volatile(table.add(index), new_entry);
+        Ok(phys)
+    } else {
+        // Allocate a new frame for the next-level table
+        let new_frame = alloc_frame().ok_or(())?;
+        // Zero the new frame
+        core::ptr::write_bytes(new_frame as *mut u8, 0, PAGE_SIZE);
+        // Set the entry
+        core::ptr::write_volatile(
+            table.add(index),
+            new_frame | PTE_PRESENT | PTE_WRITABLE | (flags & PTE_USER),
+        );
+        Ok(new_frame)
+    }
+}
+
+/// Unmap a single 4KB page from an agent's address space.
+/// Does NOT free intermediate page table frames (those are cleaned up by destroy_address_space).
+pub fn unmap_page(pml4_phys: u64, virt_addr: u64) {
+    let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4 = pml4_phys as *const u64;
+        let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+        if pml4e & PTE_PRESENT == 0 { return; }
+
+        let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+        if pdpte & PTE_PRESENT == 0 { return; }
+
+        let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pde = core::ptr::read_volatile(pd.add(pd_idx));
+        if pde & PTE_PRESENT == 0 { return; }
+
+        let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        core::ptr::write_volatile(pt.add(pt_idx), 0);
+
+        // Invalidate TLB for this address
+        invlpg(virt_addr);
+    }
+}
+
+/// Invalidate a single TLB entry
+pub fn invlpg(addr: u64) {
+    unsafe {
+        core::arch::asm!("invlpg [{}]", in(reg) addr, options(nostack, preserves_flags));
+    }
+}
