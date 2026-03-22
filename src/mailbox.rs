@@ -10,14 +10,17 @@ use crate::agent::{
 };
 use crate::capability::{agent_try_cap, agent_has_cap, CapType};
 
+/// Maximum number of mailboxes (supports multi-mailbox: more than one per agent).
+pub const MAX_MAILBOXES: usize = 32;
+
 /// Maximum number of agents that can be blocked waiting to send on a single mailbox.
 const MAX_BLOCKED_SENDERS: usize = MAX_AGENTS;
 
 /// Tracks agents blocked waiting to send on each mailbox.
 ///
 /// Safety: single-core, no preemption during access in Stage-1.
-static mut BLOCKED_SENDERS: [[Option<AgentId>; MAX_BLOCKED_SENDERS]; MAX_AGENTS] =
-    [[None; MAX_BLOCKED_SENDERS]; MAX_AGENTS];
+static mut BLOCKED_SENDERS: [[Option<AgentId>; MAX_BLOCKED_SENDERS]; MAX_MAILBOXES] =
+    [[None; MAX_BLOCKED_SENDERS]; MAX_MAILBOXES];
 
 // ─── Message ────────────────────────────────────────────────────────────────
 
@@ -111,7 +114,7 @@ impl Mailbox {
 // ─── Global mailbox table ───────────────────────────────────────────────────
 
 // Safety: single-core, no preemption during mailbox access in Stage-1.
-static mut MAILBOXES: [Option<Mailbox>; MAX_AGENTS] = [const { None }; MAX_AGENTS];
+static mut MAILBOXES: [Option<Mailbox>; MAX_MAILBOXES] = [const { None }; MAX_MAILBOXES];
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -122,7 +125,7 @@ pub fn create_mailbox(id: MailboxId, owner: AgentId) -> Result<(), i64> {
     // Safety: single-core, no preemption during mailbox access
     unsafe {
         let idx = id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return Err(E_INVALID_ARG);
         }
         if MAILBOXES[idx].is_some() {
@@ -155,7 +158,7 @@ pub fn send_message(sender_id: AgentId, target_mailbox: MailboxId, payload: &[u8
     // Safety: single-core, no preemption during mailbox access
     unsafe {
         let idx = target_mailbox as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return Err(E_INVALID_ARG);
         }
         let mailbox = match MAILBOXES[idx].as_mut() {
@@ -195,7 +198,7 @@ pub fn recv_message(agent_id: AgentId, mailbox_id: MailboxId) -> Result<Message,
     // Safety: single-core, no preemption during mailbox access
     unsafe {
         let idx = mailbox_id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return Err(E_INVALID_ARG);
         }
         let mailbox = match MAILBOXES[idx].as_mut() {
@@ -224,7 +227,7 @@ pub fn destroy_mailbox(id: MailboxId) {
     // Safety: single-core, no preemption during mailbox access
     unsafe {
         let idx = id as usize;
-        if idx < MAX_AGENTS {
+        if idx < MAX_MAILBOXES {
             MAILBOXES[idx] = None;
         }
     }
@@ -235,7 +238,7 @@ pub fn get_mailbox(id: MailboxId) -> Option<&'static Mailbox> {
     // Safety: single-core, no preemption during mailbox access
     unsafe {
         let idx = id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return None;
         }
         MAILBOXES[idx].as_ref()
@@ -255,7 +258,7 @@ pub fn get_mailbox_owner(id: MailboxId) -> Option<AgentId> {
 pub fn add_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
     unsafe {
         let idx = mailbox_id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return;
         }
         for slot in BLOCKED_SENDERS[idx].iter_mut() {
@@ -271,7 +274,7 @@ pub fn add_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
 fn remove_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
     unsafe {
         let idx = mailbox_id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return;
         }
         for slot in BLOCKED_SENDERS[idx].iter_mut() {
@@ -290,7 +293,7 @@ fn remove_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
 pub fn try_unblock_sender(mailbox_id: MailboxId) -> Option<AgentId> {
     unsafe {
         let idx = mailbox_id as usize;
-        if idx >= MAX_AGENTS {
+        if idx >= MAX_MAILBOXES {
             return None;
         }
         for slot in BLOCKED_SENDERS[idx].iter_mut() {
@@ -318,4 +321,20 @@ pub fn try_unblock_sender(mailbox_id: MailboxId) -> Option<AgentId> {
 /// Falls back to 0 if the timer is not yet initialized.
 fn get_current_tick() -> Tick {
     crate::arch::x86_64::timer::get_ticks()
+}
+
+// ─── Multi-mailbox support ──────────────────────────────────────────────
+
+/// Find the next available mailbox ID (for multi-mailbox support).
+///
+/// Searches through the mailbox table for an unused slot.
+pub fn find_free_mailbox_id() -> Option<MailboxId> {
+    unsafe {
+        for i in 0..MAX_MAILBOXES {
+            if MAILBOXES[i].is_none() {
+                return Some(i as MailboxId);
+            }
+        }
+        None
+    }
 }

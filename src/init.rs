@@ -295,6 +295,47 @@ pub fn init() {
     serial_println!("[INIT] WASM agent created: id={}", wasm_id);
     event::agent_created(wasm_id, root_id);
 
+    // ── Accountd agent (agent 8) ── energy accounting reporter ────────
+    let accountd_id = create_agent(
+        Some(root_id),
+        agents::accountd::accountd_entry as *const () as u64,
+        stack_top(8),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create accountd agent");
+    {
+        let agent = get_agent_mut(accountd_id).expect("Accountd agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(accountd_id as MailboxId, accountd_id).ok();
+    state::create_keyspace(accountd_id as u16).ok();
+    serial_println!("[INIT] Accountd agent created: id={}", accountd_id);
+    event::agent_created(accountd_id, root_id);
+
+    // ── Netd agent (agent 9) ── network broker (stub) ────────────────
+    let netd_id = create_agent(
+        Some(root_id),
+        agents::netd::netd_entry as *const () as u64,
+        stack_top(9),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create netd agent");
+    {
+        let agent = get_agent_mut(netd_id).expect("Netd agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::Network, CAP_TARGET_WILDCARD));
+        agent.cap_count = 4;
+    }
+    mailbox::create_mailbox(netd_id as MailboxId, netd_id).ok();
+    state::create_keyspace(netd_id as u16).ok();
+    serial_println!("[INIT] Netd agent created: id={}", netd_id);
+    event::agent_created(netd_id, root_id);
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
@@ -302,7 +343,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -318,6 +359,8 @@ pub fn init() {
     sched::add_to_run_queue(stated_id);
     sched::add_to_run_queue(policyd_id);
     sched::add_to_run_queue(wasm_id);
+    sched::add_to_run_queue(accountd_id);
+    sched::add_to_run_queue(netd_id);
 
     // ── eBPF policy test: attach a program that allows all sends ──────
     // This proves the eBPF infrastructure runs end-to-end.

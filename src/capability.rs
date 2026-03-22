@@ -20,6 +20,7 @@ pub enum CapType {
     AgentSpawn = 3,
     StateRead = 4,
     StateWrite = 5,
+    Network = 6,
 }
 
 // ─── Capability struct ──────────────────────────────────────────────────────
@@ -229,9 +230,10 @@ pub fn create_root_capabilities() -> [Option<Capability>; MAX_CAPABILITIES_PER_A
     caps[3] = Some(Capability::new(CapType::AgentSpawn, CAP_TARGET_WILDCARD));
     caps[4] = Some(Capability::new(CapType::StateRead, CAP_TARGET_WILDCARD));
     caps[5] = Some(Capability::new(CapType::StateWrite, CAP_TARGET_WILDCARD));
+    caps[6] = Some(Capability::new(CapType::Network, CAP_TARGET_WILDCARD));
 
     caps
 }
 
 /// Return the number of root capabilities (for setting cap_count).
-pub const ROOT_CAP_COUNT: usize = 6;
+pub const ROOT_CAP_COUNT: usize = 7;

@@ -44,6 +44,8 @@ pub const SYS_ENERGY_GRANT: u64 = 14;
 pub const SYS_CHECKPOINT: u64 = 15;
 pub const SYS_MMAP: u64 = 16;
 pub const SYS_MUNMAP: u64 = 17;
+pub const SYS_MAILBOX_CREATE: u64 = 18;
+pub const SYS_MAILBOX_DESTROY: u64 = 19;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 

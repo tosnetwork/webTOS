@@ -8,7 +8,7 @@ use crate::serial_println;
 use crate::agent::*;
 use crate::syscall;
 use crate::wasm;
-// WasmInstance is now small enough for stack allocation (reduced sizes in Stage-2)
+// WasmInstance uses heap-allocated Vec for memory/code — struct itself is small on stack
 
 /// Hand-crafted WASM binary.
 ///

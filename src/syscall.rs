@@ -173,6 +173,7 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 3 => CapType::AgentSpawn,
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
+                6 => CapType::Network,
                 _ => return E_INVALID_ARG,
             };
 
@@ -197,6 +198,7 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 3 => CapType::AgentSpawn,
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
+                6 => CapType::Network,
                 _ => return E_INVALID_ARG,
             };
 
@@ -292,6 +294,7 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 3 => CapType::AgentSpawn,
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
+                6 => CapType::Network,
                 _ => return E_INVALID_ARG,
             };
 
@@ -489,6 +492,38 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
             );
 
             E_OK
+        }
+
+        // ── 18: sys_mailbox_create ──────────────────────────────────────
+        SYS_MAILBOX_CREATE => {
+            // Create an additional mailbox for the calling agent
+            let new_id = crate::mailbox::find_free_mailbox_id();
+            match new_id {
+                Some(id) => {
+                    crate::mailbox::create_mailbox(id, caller_id).ok();
+                    serial_println!("[SYSCALL] Agent {} created mailbox {}", caller_id, id);
+                    id as i64
+                }
+                None => E_QUOTA_EXCEEDED,
+            }
+        }
+
+        // ── 19: sys_mailbox_destroy ─────────────────────────────────────
+        SYS_MAILBOX_DESTROY => {
+            let mailbox_id = a1 as MailboxId;
+            // Cannot destroy primary mailbox (== agent_id)
+            if mailbox_id == caller_id {
+                return E_INVALID_ARG;
+            }
+            // Check ownership
+            match crate::mailbox::get_mailbox_owner(mailbox_id) {
+                Some(owner) if owner == caller_id => {
+                    crate::mailbox::destroy_mailbox(mailbox_id);
+                    serial_println!("[SYSCALL] Agent {} destroyed mailbox {}", caller_id, mailbox_id);
+                    E_OK
+                }
+                _ => E_INVALID_ARG,
+            }
         }
 
         _ => {

@@ -27,6 +27,12 @@ mod agents;
 mod ebpf;
 mod wasm;
 mod loader;
+mod sync;
+mod deterministic;
+mod cost;
+mod merkle;
+mod checkpoint;
+mod large_msg;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

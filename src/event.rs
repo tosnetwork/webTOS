@@ -87,6 +87,12 @@ pub struct Event {
 // Safety: single-core, no preemption during event emission in Stage-1.
 static mut EVENT_SEQUENCE: u64 = 0;
 
+/// Get the current event sequence number.
+pub fn get_sequence() -> u64 {
+    // Safety: single-core, no preemption during event access
+    unsafe { EVENT_SEQUENCE }
+}
+
 // ─── Core emit function ─────────────────────────────────────────────────────
 
 /// Emit a structured audit event.

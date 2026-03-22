@@ -12,3 +12,5 @@ pub mod bad;
 pub mod stated;
 pub mod policyd;
 pub mod wasm_agent;
+pub mod accountd;
+pub mod netd;

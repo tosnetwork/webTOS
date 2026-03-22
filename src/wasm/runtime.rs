@@ -4,6 +4,8 @@
 //! at a time, consuming fuel. When fuel runs out or a host call is needed,
 //! execution pauses and the caller can resume.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use crate::wasm::decoder::{WasmModule, ImportKind};
 use crate::wasm::types::*;
 
@@ -86,7 +88,7 @@ pub enum ExecResult {
 // ─── Locals storage ─────────────────────────────────────────────────────────
 
 /// Maximum total locals across all active call frames.
-const MAX_TOTAL_LOCALS: usize = 64;
+const MAX_TOTAL_LOCALS: usize = 256;
 
 // ─── WASM instance ─────────────────────────────────────────────────────────
 
@@ -96,7 +98,7 @@ pub struct WasmInstance {
     pub stack: [Value; MAX_STACK],
     pub stack_ptr: usize,
     pub locals: [Value; MAX_TOTAL_LOCALS],
-    pub memory: [u8; MAX_MEMORY_PAGES * WASM_PAGE_SIZE],
+    pub memory: Vec<u8>,
     pub memory_size: usize,
     /// Program counter — byte offset within `module.code`.
     pub pc: usize,
@@ -113,13 +115,14 @@ pub struct WasmInstance {
 impl WasmInstance {
     /// Create a new instance from a decoded module with the given fuel budget.
     pub fn new(module: WasmModule, fuel: u64) -> Self {
-        let mem_size = (module.memory_min_pages as usize) * WASM_PAGE_SIZE;
+        let mem_pages = module.memory_min_pages as usize;
+        let mem_size = mem_pages * WASM_PAGE_SIZE;
         WasmInstance {
             module,
             stack: [Value::I32(0); MAX_STACK],
             stack_ptr: 0,
             locals: [Value::I32(0); MAX_TOTAL_LOCALS],
-            memory: [0u8; MAX_MEMORY_PAGES * WASM_PAGE_SIZE],
+            memory: vec![0u8; mem_size],
             memory_size: mem_size,
             pc: 0,
             fuel,
@@ -161,7 +164,7 @@ impl WasmInstance {
     // ─── Code reading ───────────────────────────────────────────────────
 
     fn read_byte(&mut self) -> Result<u8, WasmError> {
-        if self.pc >= self.module.code_len {
+        if self.pc >= self.module.code.len() {
             return Err(WasmError::UnexpectedEnd);
         }
         let b = self.module.code[self.pc];

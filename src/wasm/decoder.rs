@@ -1,9 +1,11 @@
 //! WASM binary module decoder.
 //!
-//! Parses a WASM binary into a `WasmModule` using only fixed-size arrays.
+//! Parses a WASM binary into a `WasmModule`. Large buffers (code, names)
+//! are heap-allocated via `Vec`; small tables use fixed-size arrays.
 //! Supports sections: Type (1), Import (2), Function (3), Memory (5),
 //! Export (7), Code (10).
 
+use alloc::vec::Vec;
 use crate::wasm::types::*;
 
 // ─── Module structures ──────────────────────────────────────────────────────
@@ -103,7 +105,10 @@ pub enum ExportKind {
     // Table, Memory, Global not yet needed
 }
 
-/// A fully decoded WASM module (no heap allocation).
+/// A fully decoded WASM module.
+///
+/// Large buffers (`code`, `names`) are heap-allocated via `Vec`.
+/// Small fixed-capacity tables use stack arrays.
 pub struct WasmModule {
     pub func_types: [Option<FuncTypeDef>; MAX_FUNCTIONS],
     pub func_type_count: usize,
@@ -121,18 +126,14 @@ pub struct WasmModule {
     pub memory_max_pages: u32,
 
     /// Raw bytecode storage — function bodies are copied here during decoding.
-    pub code: [u8; MAX_CODE_SIZE],
-    pub code_len: usize,
+    pub code: Vec<u8>,
 
     /// Name bytes — import/export names are copied here.
-    pub names: [u8; MAX_NAME_BYTES],
-    pub names_len: usize,
-
-    // The original WASM bytes reference is not stored; everything is copied.
+    pub names: Vec<u8>,
 }
 
 impl WasmModule {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         WasmModule {
             func_types: [const { None }; MAX_FUNCTIONS],
             func_type_count: 0,
@@ -144,10 +145,8 @@ impl WasmModule {
             export_count: 0,
             memory_min_pages: 0,
             memory_max_pages: 0,
-            code: [0u8; MAX_CODE_SIZE],
-            code_len: 0,
-            names: [0u8; MAX_NAME_BYTES],
-            names_len: 0,
+            code: Vec::new(),
+            names: Vec::new(),
         }
     }
 
@@ -383,26 +382,16 @@ fn decode_import_section(
 
         // Module name
         let mod_name_len = decode_leb128_u32(bytes, pos)? as usize;
-        if module.names_len + mod_name_len > MAX_NAME_BYTES {
-            return Err(WasmError::CodeTooLarge);
-        }
-        imp.module_name_offset = module.names_len;
+        imp.module_name_offset = module.names.len();
         imp.module_name_len = mod_name_len;
-        module.names[module.names_len..module.names_len + mod_name_len]
-            .copy_from_slice(&bytes[*pos..*pos + mod_name_len]);
-        module.names_len += mod_name_len;
+        module.names.extend_from_slice(&bytes[*pos..*pos + mod_name_len]);
         *pos += mod_name_len;
 
         // Field name
         let field_name_len = decode_leb128_u32(bytes, pos)? as usize;
-        if module.names_len + field_name_len > MAX_NAME_BYTES {
-            return Err(WasmError::CodeTooLarge);
-        }
-        imp.field_name_offset = module.names_len;
+        imp.field_name_offset = module.names.len();
         imp.field_name_len = field_name_len;
-        module.names[module.names_len..module.names_len + field_name_len]
-            .copy_from_slice(&bytes[*pos..*pos + field_name_len]);
-        module.names_len += field_name_len;
+        module.names.extend_from_slice(&bytes[*pos..*pos + field_name_len]);
         *pos += field_name_len;
 
         // Import kind
@@ -498,14 +487,9 @@ fn decode_export_section(
 
         // Name
         let name_len = decode_leb128_u32(bytes, pos)? as usize;
-        if module.names_len + name_len > MAX_NAME_BYTES {
-            return Err(WasmError::CodeTooLarge);
-        }
-        exp.name_offset = module.names_len;
+        exp.name_offset = module.names.len();
         exp.name_len = name_len;
-        module.names[module.names_len..module.names_len + name_len]
-            .copy_from_slice(&bytes[*pos..*pos + name_len]);
-        module.names_len += name_len;
+        module.names.extend_from_slice(&bytes[*pos..*pos + name_len]);
         *pos += name_len;
 
         // Kind
@@ -566,14 +550,12 @@ fn decode_code_section(
 
         // Copy the remaining bytecode (instructions) into module.code
         let code_bytes = body_end - *pos;
-        if module.code_len + code_bytes > MAX_CODE_SIZE {
+        if module.code.len() + code_bytes > MAX_CODE_SIZE {
             return Err(WasmError::CodeTooLarge);
         }
-        func.code_offset = module.code_len;
+        func.code_offset = module.code.len();
         func.code_len = code_bytes;
-        module.code[module.code_len..module.code_len + code_bytes]
-            .copy_from_slice(&bytes[*pos..*pos + code_bytes]);
-        module.code_len += code_bytes;
+        module.code.extend_from_slice(&bytes[*pos..*pos + code_bytes]);
 
         *pos = body_end;
     }
