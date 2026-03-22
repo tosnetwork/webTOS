@@ -1324,13 +1324,13 @@ Extend AOS to run on multiple CPU cores:
 * APIC timer per core (replaces PIT for per-core tick accounting)
 * Inter-Processor Interrupts (IPI) for cross-core scheduling events
 
-SMP is required before production deployment. Single-core is a Stage-1/2 simplification. Introducing SMP requires a pervasive retrofit of all kernel data structures: the agent table, mailbox queues, capability sets, run queues, frame allocator, and event log must all be protected by spinlocks or lock-free structures. All `static mut` patterns from Stage-1 must be replaced with synchronized access.
+SMP is required before production deployment. Single-core is a Stage-1/2 simplification. Introducing SMP requires a pervasive retrofit of all kernel data structures: the agent table, mailbox queues, capability sets, run queues, frame allocator, kernel heap allocator, event log, and eBPF program/map tables must all be protected by spinlocks or lock-free structures. All `static mut` patterns and cli/sti critical sections from Stage-1/2 must be replaced with proper spinlock-based synchronization.
 
 #### 25.2.3 Network as Brokered Capability
 
 Agents do not access the network directly. Instead, they send requests to the **netd** system agent via mailbox.
 
-Stage-1's 256-byte mailbox payload limit (§11.3) is insufficient for HTTP requests and responses. Stage-3 extends the mailbox system with **large message support**: messages may reference a shared immutable memory region (allocated from the sender's quota, readable by the receiver via capability). The mailbox payload carries a region descriptor; the actual data lives in shared pages.
+Stage-1's 256-byte mailbox payload limit (§11.3) is insufficient for HTTP requests and responses. Stage-3 extends the mailbox system with **large message support**: messages may reference a shared immutable memory region allocated via `sys_mmap` (§24.7) from the sender's quota. The sender maps the region, writes data, then sends a mailbox message containing the region descriptor (physical address + length). The receiver maps the same physical frames into its own address space (read-only) via a new `sys_mmap_shared` syscall.
 
 ```text
 Agent → sys_send(netd_mailbox, {type: "http", method: "GET", url_region: <region_id>})
@@ -1353,9 +1353,9 @@ This brokered model ensures:
 
 #### 25.2.4 Advanced State Model
 
-Extend the persistent state store with verifiability:
+Extend the Stage-2 persistent state store (ATA PIO + CRC32 append-only log) with verifiability. The append-only log format is retained for write-ahead durability; the Merkle tree is an in-memory index structure built on top of it.
 
-* **Merkle tree**: each keyspace maintains a Merkle root over its key-value entries. State transitions produce a new root hash.
+* **Merkle tree**: each keyspace maintains a Merkle root over its key-value entries. State transitions produce a new root hash. The Merkle tree is rebuilt from the append-only log on boot (same as the Stage-2 in-memory index, but with hash verification).
 * **State proofs**: given a key, produce a Merkle proof that the value is (or is not) in the state tree. This enables external verification without full state access.
 * **Snapshot diffing**: compare two checkpoints by comparing Merkle roots. Only changed subtrees need to be transferred or stored.
 * **Rollback**: restore state to a previous Merkle root by replaying the log backwards.
@@ -1383,10 +1383,10 @@ Extend per-agent energy budgets into a unified economic model:
 Extend the Stage-2 eBPF-lite runtime:
 
 * **New attachment points**: network send/recv (at netd), state read/write, checkpoint trigger
-* **Program chaining**: multiple eBPF programs on the same attachment point, executed in priority order
-* **Persistent maps**: eBPF maps backed by persistent state (survives reboot)
+* **Program chaining with priority**: Stage-2's `run_at()` already iterates all programs at a point and returns the most restrictive action. Stage-3 adds explicit priority ordering (lower number = higher priority) and short-circuit on Deny.
+* **Persistent maps**: eBPF maps backed by persistent state via stated (survives reboot)
 * **Metrics helpers**: `increment_counter()`, `read_gauge()` for observability
-* **Hot-reload**: replace an attached eBPF program without restarting the system
+* **Hot-reload**: Stage-2 already supports `detach(index)` + `attach()`. Stage-3 adds an atomic `replace(index, new_program)` that swaps without a gap.
 
 ### 25.3 Multi-Mailbox Support
 
@@ -1394,23 +1394,34 @@ Stage-1 binds each agent to exactly one mailbox (§5.2). Stage-3 lifts this rest
 
 * An agent may own multiple mailboxes (e.g., separate control and data channels)
 * The primary mailbox (created at spawn time) retains its ID equal to the agent ID, preserving backwards compatibility with Stage-1/2 agents
-* Additional mailboxes are created via a new `sys_mailbox_create() -> mailbox_id` syscall. The `sys_spawn` signature is unchanged.
+* Additional mailboxes are created via `sys_mailbox_create() -> mailbox_id` (syscall 18). The `sys_spawn` signature is unchanged.
 * Mailbox IDs are globally unique, allocated from a kernel-managed pool
-* An agent may destroy its own non-primary mailboxes via `sys_mailbox_destroy(mailbox_id)`
+* An agent may destroy its own non-primary mailboxes via `sys_mailbox_destroy(mailbox_id)` (syscall 19)
 
 ### 25.4 Suggested Development Order (Stage-3)
+
+#### Phase 12b: WASM runtime upgrade to full spec sizes
+
+Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY_PAGES=1, WASM_PAGE_SIZE=4096). Stage-3 restores full WASM spec sizes by heap-allocating the large arrays (code buffer, linear memory) via the kernel heap allocator:
+
+* `WasmModule.code`: heap-allocated, up to 64 KB
+* `WasmInstance.memory`: heap-allocated, up to 16 × 64 KB = 1 MB
+* Verify: a WASM module with 64 KB linear memory runs correctly
 
 #### Phase 13: deterministic scheduler + SMP foundation
 
 * Implement fixed-tick-quota scheduling
 * Add spinlock primitives for shared kernel structures
-* APIC timer per core, IPI for cross-core events
+* Parse ACPI tables (RSDP → MADT) to discover LAPIC base address and CPU cores
+* Initialize LAPIC, calibrate APIC timer per core (replaces PIT for per-core tick accounting)
+* IPI for cross-core scheduling events
 * Verify: two agents on two cores exchange messages correctly
 
-#### Phase 14: virtio-net + netd
+#### Phase 14: network driver + netd
 
-* virtio-net driver (send/receive packets)
+* Network driver: virtio-net for QEMU (PCI-based virtqueue I/O). Unlike storage (where Stage-2 used simple ATA PIO), networking requires DMA-capable I/O for acceptable throughput, making virtio the right choice for QEMU.
 * netd system agent with mailbox-based request/response protocol
+* Large message support via shared memory regions (built on `sys_mmap`) for payloads exceeding 256 bytes
 * eBPF-lite filters at netd attachment points
 * Verify: an agent sends an HTTP GET through netd and receives a response
 
@@ -1457,7 +1468,7 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 #### 26.2.1 Hardware Support
 
 * **PCI bus enumeration**: discover and initialize devices on a real PCI bus
-* **NVMe storage driver**: replace virtio-blk with NVMe for real hardware deployment
+* **NVMe storage driver**: replace ATA PIO (Stage-2) with NVMe for real hardware deployment
 * **Real NIC driver**: e1000 or virtio-net on real hardware
 * **UEFI boot**: replace Multiboot v1 with UEFI boot path for modern hardware
 * **GPU/NPU access**: brokered through a system agent (gpud), not directly accessible to agents. The broker model from netd applies here.
@@ -1472,7 +1483,7 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 #### 26.2.3 Developer SDK
 
 * **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries
-* **Agent SDK (WASM)**: AssemblyScript or Rust-to-WASM toolchain for writing WASM agents with AOS syscall bindings
+* **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with AOS syscall bindings via imported host functions
 * **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier
 * **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs)
 
@@ -1484,22 +1495,24 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 ### 26.3 Suggested Development Order (Stage-4)
 
-#### Phase 17: UEFI boot + PCI enumeration
+#### Phase 17: higher-half kernel + UEFI boot + PCI enumeration
 
-* UEFI boot path (replaces Multiboot v1)
-* PCI bus discovery and device initialization
+* Higher-half kernel: relink kernel at `0xFFFFFFFF80000000`, update boot page tables and linker script. This is a prerequisite for UEFI boot (UEFI firmware uses low memory) and was deferred from Stage-2 §24.2.1.
+* UEFI boot path (replaces Multiboot v1): parse UEFI memory map, set up page tables, call kernel entry
+* PCI bus enumeration: discover and initialize devices on a real PCI bus
 * Verify: AOS boots via UEFI on real x86_64 hardware
 
 #### Phase 18: NVMe + real NIC
 
-* NVMe storage driver (replaces virtio-blk)
-* Real NIC driver (e1000 or similar)
+* NVMe storage driver (replaces ATA PIO from Stage-2)
+* Real NIC driver (e1000 or similar, replaces virtio-net from Stage-3)
 * Verify: persistent state and networking work on real hardware
 
 #### Phase 19: distributed execution
 
-* Remote mailbox routing over TCP/UDP
-* Node discovery protocol
+* Minimal kernel-internal UDP stack for inter-node mailbox routing (separate from user-facing netd). This is a simple send/recv UDP implementation, not a full TCP/IP stack.
+* routerd system agent: serializes cross-node mailbox messages and dispatches via the kernel UDP transport
+* Node discovery protocol (UDP multicast or seed node list)
 * Cross-node capability verification with signed capabilities
 * Verify: agent on node A sends message to agent on node B
 
@@ -1508,8 +1521,10 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 * Agent SDK crates (Rust native + WASM)
 * eBPF-lite SDK with compiler and verifier
 * CLI tools (aos-build, aos-deploy, aos-replay, aos-inspect)
-* Execution proofs and remote attestation
-* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK
+* Execution proof generator: given a checkpoint + replay trace, produce a hash-chain proof of the event log
+* Execution proof verifier: standalone tool that verifies a proof without running AOS (enables third-party verification)
+* Remote attestation via QEMU swtpm (for testing) or hardware TPM
+* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK; execution proof verified independently
 
 ### 26.4 Stage-4 Success Criteria
 
