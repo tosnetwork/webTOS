@@ -1146,7 +1146,7 @@ Design constraints:
 
 * **No JIT in Stage-2**: use an interpreter (e.g., a minimal stack-based WASM interpreter written in Rust). JIT compilation may be explored in Stage-3.
 * **Fuel-based metering**: WASM execution is bounded by a fuel counter that maps to the agent's energy budget. Each WASM instruction consumes fuel.
-* **Syscall bridging**: WASM agents invoke AOS syscalls via `call_indirect` to imported host functions. The runtime translates these to kernel syscalls.
+* **Syscall bridging**: WASM agents invoke AOS syscalls by calling imported host functions (WASM `call` to host-provided imports). The runtime translates these calls into kernel syscalls.
 * **Memory model**: WASM linear memory is backed by agent-allocated frames. The `memory.grow` instruction is gated by `memory_quota`.
 * **Determinism**: WASM is inherently deterministic (no threads, no system clock access). This makes it ideal for checkpoint/replay.
 
@@ -1177,7 +1177,10 @@ Design constraints:
 * **Instruction set**: a subset of Linux eBPF — 64-bit registers (r0-r10), ALU ops, conditional jumps, memory load/store, map lookups, helper calls. No direct kernel memory access.
 * **Maps**: shared key-value data structures (hash map, array map) for communication between eBPF programs and the kernel or agents.
 * **Helper functions**: a fixed set of kernel-provided helpers (e.g., `get_agent_id()`, `get_energy_remaining()`, `emit_event()`, `drop_message()`).
-* **Return value**: programs return an action code (ALLOW, DENY, LOG, MODIFY) that the kernel enforces at the attachment point.
+* **Return value**: programs return an action code that the kernel enforces at the attachment point:
+  * `ALLOW` — permit the operation to proceed
+  * `DENY` — reject the operation and return `E_NO_CAP` to the caller
+  * `LOG` — permit the operation but emit an additional audit event
 * **Energy cost**: eBPF-lite execution is charged against the system energy pool, not individual agents, since it runs as kernel policy.
 
 Use cases:
@@ -1192,9 +1195,10 @@ Use cases:
 Move higher-level services out of the kernel into privileged user-mode agents. Mailbox IPC and capability enforcement remain in-kernel — only management and policy logic migrates.
 
 * **stated** — state persistence manager: handles durable key-value writes to virtio-blk for **shared keyspaces** only. Each agent's private keyspace (§17.1) continues to be handled directly by the kernel for performance. Shared keyspaces are accessed by agents via mailbox messages to stated, not via direct syscalls.
-* **policyd** — policy engine: loads and manages eBPF-lite programs, handles dynamic policy updates via `sys_cap_grant`-style delegation
-* **accountd** — energy accounting reporter: exposes per-agent cumulative energy consumption for external billing queries
-* **netd** — network broker (Stage-2 preparation, functional in Stage-3): accepts outbound network requests from agents via mailbox, performs requests on their behalf, returns responses
+* **policyd** — policy engine: loads and manages eBPF-lite programs. Agents submit eBPF-lite bytecode to policyd via mailbox; policyd verifies and attaches the program on their behalf (requires `CAP_POLICY_LOAD` capability).
+* **netd** — network broker (Stage-2 stub, functional in Stage-3): accepts outbound network requests from agents via mailbox, performs requests on their behalf, returns responses.
+
+Additional system agents introduced in Stage-3: **accountd** (energy accounting, §25.2.6).
 
 System agents run in ring 3 but with elevated capabilities (granted by the root agent at boot). They communicate with the kernel and other agents exclusively through mailboxes and syscalls.
 
@@ -1318,15 +1322,17 @@ Extend AOS to run on multiple CPU cores:
 * APIC timer per core (replaces PIT for per-core tick accounting)
 * Inter-Processor Interrupts (IPI) for cross-core scheduling events
 
-SMP is required before production deployment. Single-core is a Stage-1/2 simplification.
+SMP is required before production deployment. Single-core is a Stage-1/2 simplification. Introducing SMP requires a pervasive retrofit of all kernel data structures: the agent table, mailbox queues, capability sets, run queues, frame allocator, and event log must all be protected by spinlocks or lock-free structures. All `static mut` patterns from Stage-1 must be replaced with synchronized access.
 
 #### 25.2.3 Network as Brokered Capability
 
-Agents do not access the network directly. Instead, they send requests to the **netd** system agent via mailbox:
+Agents do not access the network directly. Instead, they send requests to the **netd** system agent via mailbox.
+
+Stage-1's 256-byte mailbox payload limit (§11.3) is insufficient for HTTP requests and responses. Stage-3 extends the mailbox system with **large message support**: messages may reference a shared immutable memory region (allocated from the sender's quota, readable by the receiver via capability). The mailbox payload carries a region descriptor; the actual data lives in shared pages.
 
 ```text
-Agent → sys_send(netd_mailbox, {method: "GET", url: "...", headers: ...})
-       ← sys_recv(own_mailbox, {status: 200, body: ...})
+Agent → sys_send(netd_mailbox, {type: "http", method: "GET", url_region: <region_id>})
+       ← sys_recv(own_mailbox, {type: "http_response", status: 200, body_region: <region_id>})
 ```
 
 The netd system agent:
@@ -1368,7 +1374,7 @@ Extend per-agent energy budgets into a unified economic model:
 * **Cost table**: define energy cost per operation type: syscall (1), timer tick (1), frame allocation (10), virtio-blk read (100), virtio-blk write (200), network request (500). Costs are configurable at compile time.
 * **Energy transfer**: `sys_energy_grant` allows a parent to transfer energy to a child. Energy is conserved — the parent's budget decreases by the granted amount.
 * **Energy accounting across runtimes**: WASM fuel consumption is mapped to AOS energy units. The default mapping is 1 WASM fuel unit = 1 AOS energy unit (a simple approximation; instruction-class-weighted mapping may be introduced later if metering precision is needed).
-* **External billing interface**: the accountd system agent (introduced in Stage-2 §24.4) exposes per-agent cumulative energy consumption. External systems can query accountd via mailbox for billing or token integration.
+* **External billing interface**: a new **accountd** system agent exposes per-agent cumulative energy consumption. External systems can query accountd via mailbox for billing or token integration. accountd is introduced in Stage-3 alongside the cost table.
 
 #### 25.2.7 eBPF-lite Enhancements
 
@@ -1385,9 +1391,10 @@ Extend the Stage-2 eBPF-lite runtime:
 Stage-1 binds each agent to exactly one mailbox (§5.2). Stage-3 lifts this restriction:
 
 * An agent may own multiple mailboxes (e.g., separate control and data channels)
-* `sys_spawn` accepts an optional `mailbox_count` parameter (default 1)
-* Mailbox IDs are globally unique; an agent's primary mailbox ID still equals its agent ID for backwards compatibility
-* Additional mailboxes are allocated with sequential IDs from a global pool
+* The primary mailbox (created at spawn time) retains its ID equal to the agent ID, preserving backwards compatibility with Stage-1/2 agents
+* Additional mailboxes are created via a new `sys_mailbox_create() -> mailbox_id` syscall. The `sys_spawn` signature is unchanged.
+* Mailbox IDs are globally unique, allocated from a kernel-managed pool
+* An agent may destroy its own non-primary mailboxes via `sys_mailbox_destroy(mailbox_id)`
 
 ### 25.4 Suggested Development Order (Stage-3)
 
@@ -1455,7 +1462,7 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 #### 26.2.2 Distributed Execution
 
-* **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes messages to a network transport layer.
+* **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes cross-node messages to a **routerd** system agent, which serializes them and sends them over the network via the kernel's minimal UDP transport (a kernel-internal network stack separate from the user-facing netd broker). This separation ensures that inter-kernel routing does not depend on user-mode system agents for liveness.
 * **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list)
 * **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message.
 * **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible AOS kernels (same syscall ABI version and checkpoint format).
