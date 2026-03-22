@@ -277,6 +277,24 @@ pub fn init() {
     serial_println!("[INIT] Policyd agent created: id={}", policyd_id);
     event::agent_created(policyd_id, root_id);
 
+    // ── WASM agent (agent 7) ── WASM runtime test ────────────────────
+    let wasm_id = create_agent(
+        Some(root_id),
+        agents::wasm_agent::wasm_agent_entry as *const () as u64,
+        stack_top(7),
+        100_000,    // generous energy for WASM execution
+        256,
+    ).expect("Failed to create WASM agent");
+    {
+        let agent = get_agent_mut(wasm_id).expect("WASM agent not found");
+        agent.capabilities[0] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 1;
+    }
+    mailbox::create_mailbox(wasm_id as MailboxId, wasm_id).ok();
+    state::create_keyspace(wasm_id as u16).ok();
+    serial_println!("[INIT] WASM agent created: id={}", wasm_id);
+    event::agent_created(wasm_id, root_id);
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
@@ -284,7 +302,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -299,6 +317,73 @@ pub fn init() {
     sched::add_to_run_queue(bad_id);
     sched::add_to_run_queue(stated_id);
     sched::add_to_run_queue(policyd_id);
+    sched::add_to_run_queue(wasm_id);
+
+    // ── eBPF policy test: attach a program that allows all sends ──────
+    // This proves the eBPF infrastructure runs end-to-end.
+    // Program: r0 = 0 (Action::Allow); exit
+    {
+        use crate::ebpf::types::*;
+        use crate::ebpf::attach;
+
+        let program = [
+            // r0 = 0 (Action::Allow)
+            Insn {
+                opcode: BPF_ALU64 | BPF_MOV | BPF_K,
+                regs: 0x00,  // dst=r0, src=r0
+                off: 0,
+                imm: 0,      // immediate value = 0 (Allow)
+            },
+            // exit (return r0)
+            Insn {
+                opcode: BPF_JMP | BPF_EXIT,
+                regs: 0x00,
+                off: 0,
+                imm: 0,
+            },
+        ];
+
+        match attach::attach(&program, attach::AttachPoint::MailboxSend(3)) {
+            Ok(idx) => {
+                serial_println!("[INIT] eBPF program attached at MailboxSend(3), index={}", idx);
+            }
+            Err(e) => {
+                serial_println!("[INIT] eBPF attach failed: {:?}", e);
+            }
+        }
+    }
+
+    // ── eBPF policy: deny sends to mailbox 1 (root) ──────────────────
+    {
+        use crate::ebpf::types::*;
+        use crate::ebpf::attach;
+
+        let deny_program = [
+            // r0 = 1 (Action::Deny)
+            Insn {
+                opcode: BPF_ALU64 | BPF_MOV | BPF_K,
+                regs: 0x00,
+                off: 0,
+                imm: 1,  // Deny
+            },
+            // exit
+            Insn {
+                opcode: BPF_JMP | BPF_EXIT,
+                regs: 0x00,
+                off: 0,
+                imm: 0,
+            },
+        ];
+
+        match attach::attach(&deny_program, attach::AttachPoint::MailboxSend(1)) {
+            Ok(idx) => {
+                serial_println!("[INIT] eBPF DENY program attached at MailboxSend(1), index={}", idx);
+            }
+            Err(e) => {
+                serial_println!("[INIT] eBPF deny attach failed: {:?}", e);
+            }
+        }
+    }
 
     serial_println!("[INIT] All agents created and queued");
 }

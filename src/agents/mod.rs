@@ -11,3 +11,4 @@ pub mod idle;
 pub mod bad;
 pub mod stated;
 pub mod policyd;
+pub mod wasm_agent;

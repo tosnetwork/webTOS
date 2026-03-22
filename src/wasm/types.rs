@@ -158,13 +158,13 @@ impl Opcode {
 
 pub const MAX_FUNCTIONS: usize = 64;
 pub const MAX_LOCALS: usize = 32;
-pub const MAX_STACK: usize = 256;
-pub const MAX_MEMORY_PAGES: usize = 16; // 16 * 64 KiB = 1 MiB max
-pub const WASM_PAGE_SIZE: usize = 65536;
+pub const MAX_STACK: usize = 64;
+pub const MAX_MEMORY_PAGES: usize = 1;
+pub const WASM_PAGE_SIZE: usize = 4096; // Stage-2: reduced for stack safety; upgrade to 65536 with heap in Stage-3
 pub const MAX_IMPORTS: usize = 16;
 pub const MAX_EXPORTS: usize = 16;
-pub const MAX_CODE_SIZE: usize = 65536;
-pub const MAX_CALL_DEPTH: usize = 64;
+pub const MAX_CODE_SIZE: usize = 4096; // Stage-2: reduced for stack safety
+pub const MAX_CALL_DEPTH: usize = 16;
 pub const MAX_PARAMS: usize = 8;
 pub const MAX_RESULTS: usize = 4;
 pub const MAX_NAME_BYTES: usize = 256;

@@ -104,6 +104,22 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 return E_PAYLOAD_TOO_LARGE;
             }
 
+            // ── eBPF policy check ──
+            // Run any eBPF programs attached at MailboxSend for this target
+            let ebpf_ctx = crate::ebpf::attach::MailboxContext {
+                sender_id: caller_id,
+                target_mailbox,
+                payload_len: payload_len as u16,
+            };
+            let ebpf_action = crate::ebpf::attach::run_at(
+                crate::ebpf::attach::AttachPoint::MailboxSend(target_mailbox),
+                &ebpf_ctx as *const crate::ebpf::attach::MailboxContext as u64,
+            );
+            if ebpf_action == crate::ebpf::types::Action::Deny {
+                crate::event::cap_denied(caller_id, 0xFF, target_mailbox as u64); // 0xFF = eBPF policy denial
+                return E_NO_CAP;
+            }
+
             // Safety: the payload pointer comes from the calling agent's stack,
             // which is valid memory in Stage-1 (all agents share the kernel address space).
             let payload = unsafe {
