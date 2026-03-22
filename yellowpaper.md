@@ -1076,29 +1076,271 @@ To preserve implementation focus, the following are explicitly out of scope for 
 
 ---
 
-## 24. Long-Term Direction
+## 24. Stage-2 Roadmap (Post-Prototype Evolution)
 
-After Stage-1, the architecture may evolve toward:
+After Stage-1 establishes a working minimal kernel, Stage-2 focuses on transforming AOS from a prototype into a structured execution platform.
 
-* deterministic scheduling mode
-* capability-carrying messages
-* durable state store
-* checkpoint / replay implementation
-* brokered network endpoints
-* brokered compute endpoints
-* more advanced runtime types (WASM, JVM-lite, custom VM)
-* microkernel-style system agents
-* attestation and execution proof mechanisms
+### 24.1 Objectives
 
-The long-term vision is not a Unix clone. The long-term vision is an **AI-native operating substrate**.
+* Move from static demo agents to dynamic runtime execution
+* Introduce structured state persistence
+* Begin supporting multiple runtime types (WASM / JVM-lite / TOS VM)
+* Establish system agents (user-space-like services)
+* Introduce deterministic execution mode (partial)
+
+### 24.2 Core Additions
+
+#### 24.2.1 Runtime Host Layer
+
+Introduce a unified runtime interface:
+
+```text
+Runtime {
+  init()
+  execute_slice()
+  handle_syscall()
+  checkpoint()
+}
+```
+
+Initial supported runtimes:
+
+* minimal WASM runtime
+* TOS VM (custom bytecode)
+* JVM-lite (restricted Java execution)
+
+#### 24.2.2 System Agents
+
+Move non-core responsibilities out of kernel:
+
+* mailbox manager (mailboxd)
+* state manager (stated)
+* tool broker (toold)
+* policy engine (policyd)
+
+This begins the transition toward a microkernel-style architecture.
+
+#### 24.2.3 Persistent State Store
+
+Replace in-memory state with structured storage:
+
+* key-value store
+* append-only log
+* snapshot capability
+
+Future-ready for Merkle or verifiable state.
+
+#### 24.2.4 Basic Checkpointing
+
+Introduce execution snapshots:
+
+* capture agent state
+* restore execution
+* enable debugging and replay
+
+#### 24.2.5 Deterministic Mode (Partial)
+
+Add optional deterministic execution constraints:
+
+* fixed scheduling order
+* controlled timer
+* restricted randomness
+
+#### 24.2.6 Capability Expansion
+
+Extend capability system to:
+
+* tool access
+* state namespaces
+* runtime-specific permissions
+
+### 24.3 Stage-2 Success Criteria
+
+Stage-2 is successful when:
+
+* multiple runtimes can execute agents
+* system agents manage state and tools
+* checkpointing works for simple workloads
+* basic deterministic execution is possible
 
 ---
 
-## 25. Engineering Guidance for Implementation
+## 25. Stage-3 Roadmap (Production-Ready Execution Layer)
+
+Stage-3 transforms AOS into a full execution substrate for real-world deployment.
+
+### 25.1 Objectives
+
+* achieve deterministic, replayable execution
+* support distributed / networked agents
+* integrate economic model (energy / token)
+* enable real deployment scenarios
+
+### 25.2 Core Additions
+
+#### 25.2.1 Deterministic Scheduler (Full)
+
+* reproducible execution order
+* fixed instruction quotas
+* replay-compatible scheduling
+
+#### 25.2.2 Network as Brokered Capability
+
+Replace raw networking with controlled access:
+
+```text
+agent → tool_call(network_endpoint)
+```
+
+Includes:
+
+* request filtering
+* rate limiting
+* audit logging
+
+#### 25.2.3 Advanced State Model
+
+* Merkle-based state
+* verifiable state transitions
+* snapshot diffing
+* rollback support
+
+#### 25.2.4 Full Checkpoint & Replay
+
+* deterministic replay
+* execution tracing
+* audit verification
+
+#### 25.2.5 Multi-Agent Coordination
+
+* structured messaging protocols
+* mailbox routing
+* agent orchestration
+
+#### 25.2.6 Energy / Economic Model Integration
+
+* unified energy accounting across runtimes
+* cost model for CPU / memory / IO / tool calls
+* integration with external token systems (e.g., TOS)
+
+#### 25.2.7 eBPF-lite Policy Engine
+
+Introduce lightweight verified execution for:
+
+* policy enforcement
+* filtering
+* validation rules
+
+### 25.3 Stage-3 Success Criteria
+
+Stage-3 is successful when:
+
+* execution is replayable and auditable
+* agents interact across nodes or environments
+* energy accounting is consistent and enforced
+* system supports real workloads
+
+---
+
+## 26. Stage-4 Roadmap (Ecosystem and Hardware Integration)
+
+Stage-4 expands AOS beyond VM environments into full ecosystem infrastructure.
+
+### 26.1 Objectives
+
+* support hardware deployment
+* enable AI-native device environments
+* establish full agent economy stack
+
+### 26.2 Core Additions
+
+#### 26.2.1 Hardware Support Expansion
+
+* virtio → real hardware drivers
+* storage devices
+* networking devices
+* optional GPU/NPU integration via broker model
+
+#### 26.2.2 Distributed Execution Layer
+
+* multi-node agent execution
+* remote mailbox routing
+* cross-node capability verification
+
+#### 26.2.3 Tool Ecosystem
+
+* standardized tool endpoints
+* external service integration
+* AI model inference endpoints
+
+#### 26.2.4 Developer SDK
+
+* agent SDK
+* runtime SDK
+* deployment tooling
+* debugging and replay tools
+
+#### 26.2.5 Security & Attestation
+
+* execution proofs
+* remote attestation
+* trusted execution integration (optional)
+
+### 26.3 Stage-4 Success Criteria
+
+Stage-4 is successful when:
+
+* AOS runs on real hardware
+* agents operate across distributed environments
+* external developers can build and deploy agents
+* system supports production-level workloads
+
+---
+
+## 27. Long-Term Vision
+
+AOS evolves from a minimal kernel into a foundational execution layer for the agent economy.
+
+Final architecture direction:
+
+```text
+Human
+  ↓
+Agent Layer
+  ↓
+AOS Runtime Layer
+  ↓
+AOS Kernel (Layer 0)
+  ↓
+Hardware / Network
+```
+
+### 27.1 Final Role of AOS
+
+AOS is not:
+
+* a desktop OS
+* a Linux replacement
+* a general-purpose consumer system
+
+AOS is:
+
+* an execution substrate for agents
+* a deterministic computation layer
+* a capability-secured runtime environment
+* a bridge between AI systems and economic systems
+
+### 27.2 Final Statement
+
+> AOS begins as a minimal kernel, but evolves into the execution layer where autonomous systems operate, interact, and transact.
+
+---
+
+## 28. Engineering Guidance for Implementation
 
 This yellow paper is intended as a practical guide for implementation work.
 
-### 25.1 Preferred implementation style
+### 28.1 Preferred implementation style
 
 * keep subsystems small and explicit
 * prefer compile-time simplicity over generic abstraction too early
@@ -1107,7 +1349,7 @@ This yellow paper is intended as a practical guide for implementation work.
 * keep early data structures fixed-size where possible
 * avoid introducing general compatibility layers prematurely
 
-### 25.2 Suggested first success metric `[IMPL: ✅ ALL MET]`
+### 28.2 Suggested first success metric `[IMPL: ✅ ALL MET]`
 
 AOS should be considered meaningfully alive when all of the following are true:
 
@@ -1123,7 +1365,7 @@ When these conditions are met, AOS is no longer a toy boot project. It becomes a
 
 ---
 
-## 26. Conclusion
+## 29. Conclusion
 
 AOS proposes a different starting point for operating system design in the AI era.
 
@@ -1148,6 +1390,6 @@ This is the correct path for building a minimal AI-native OS foundation without 
 
 ---
 
-## 27. One-Sentence Definition
+## 30. One-Sentence Definition
 
 **AOS is a from-scratch, VM-first, AI-native minimal operating system built around agents, mailboxes, capabilities, structured state, execution budgets, and auditable kernel behavior.**
