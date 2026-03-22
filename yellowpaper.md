@@ -1,6 +1,6 @@
 # AOS Yellow Paper
 
-**Version:** Draft v0.1
+**Version:** Draft v0.6
 **Status:** Engineering Yellow Paper
 **Language:** English
 **Purpose:** Implementation reference for building AOS from scratch, initially targeting virtual machines and QEMU.
@@ -9,7 +9,7 @@
 
 ## Abstract
 
-AOS is an AI-native minimal operating system designed from first principles for agent execution, deterministic task handling, capability-based isolation, audited state transitions, and constrained tool access. It is **not** intended to be a desktop operating system or a general POSIX-compatible environment. Its primary role is to serve as a minimal execution substrate for AI agents, verifiable runtimes, blockchain-adjacent execution environments, and secure automated systems.
+AOS is an AI-native minimal operating system designed from first principles for agent execution, deterministic task handling, capability-based isolation, audited state transitions, and capability-scoped resource access. It is **not** intended to be a desktop operating system or a general POSIX-compatible environment. Its primary role is to serve as a minimal execution substrate for AI agents, verifiable runtimes, blockchain-adjacent execution environments, and secure automated systems.
 
 AOS is designed under two strict principles:
 
@@ -37,7 +37,7 @@ AI-native systems need a different execution substrate. They require:
 
 * deterministic or near-deterministic execution
 * capability-scoped resource access
-* explicit tool invocation controls
+* explicit, auditable action controls
 * mailbox-oriented message passing
 * structured state rather than file-first semantics
 * auditable execution events
@@ -56,7 +56,6 @@ AOS is not designed to replace Linux, Windows, or macOS for general human use. I
 
 * AI agents
 * constrained runtimes
-* tool brokers
 * blockchain-adjacent execution
 * verifiable automation
 * edge AI appliances
@@ -91,7 +90,6 @@ The primary concepts of AOS are:
 * mailbox
 * capability
 * state object
-* tool endpoint
 * energy budget
 * checkpoint
 * event log
@@ -113,7 +111,7 @@ The first implementation target of AOS is intentionally narrow.
 
 * **Architecture:** x86_64
 * **Execution environment:** QEMU first
-* **Boot environment:** UEFI or Multiboot-compatible boot path
+* **Boot environment:** Multiboot (v1) header, loaded directly by QEMU's `-kernel` flag. This avoids the need for GRUB or ISO image creation in Stage-1. Multiboot2 or UEFI boot may be explored in later stages.
 * **CPU mode:** 64-bit long mode
 * **Core assumption:** single-core initially
 
@@ -151,23 +149,24 @@ This is a deliberate engineering constraint. The goal is to validate the AI-nati
 The conceptual stack of AOS is as follows:
 
 ```text
-+----------------------------------------------+
-|               Test Agents / Runtimes         |
-|  ping agent | pong agent | idle agent        |
-+----------------------------------------------+
-|            AI-native Syscall ABI             |
-| spawn | send | recv | state | cap | energy   |
-+----------------------------------------------+
-|               Kernel Core                    |
-| sched | mm | trap | syscall | ipc | audit    |
-+----------------------------------------------+
-|              x86_64 Arch Layer               |
-| gdt | idt | paging | timer | irq | context   |
-+----------------------------------------------+
-|             Boot / Loader Layer              |
-+----------------------------------------------+
-|                  QEMU VM                     |
-+----------------------------------------------+
++---------------------------------------------------+
+|                Test Agents / Runtimes              |
+|   ping agent | pong agent | idle agent             |
++---------------------------------------------------+
+|              AI-native Syscall ABI                 |
+| yield | spawn | exit | send | recv | cap | energy  |
++---------------------------------------------------+
+|                 Kernel Core                        |
+| sched | mm | trap | syscall | ipc | cap | audit    |
++---------------------------------------------------+
+|                x86_64 Arch Layer                   |
+| gdt | idt | paging | timer | irq | context         |
++---------------------------------------------------+
+|               Boot / Loader Layer                  |
+|                  (Multiboot v1)                    |
++---------------------------------------------------+
+|                    QEMU VM                         |
++---------------------------------------------------+
 ```
 
 AOS should be understood not as a file-centric Unix derivative, but as an **agent execution substrate**.
@@ -185,8 +184,8 @@ A minimal Stage-1 agent structure may be defined conceptually as:
 ```text
 Agent {
     id,
+    parent_id,
     status,
-    runtime_kind,
     execution_context,
     mailbox_id,
     capability_set,
@@ -194,6 +193,9 @@ Agent {
     memory_quota,
 }
 ```
+
+* `parent_id` tracks which agent spawned this agent. This enables capability delegation chains, cascading termination, and supervisor patterns. The root system agent has `parent_id = NONE`.
+* Stage-1 supports only one execution type: native x86_64 code compiled into the kernel image. A `runtime_kind` field (for WASM, custom VM, etc.) may be added in later stages when multiple runtime backends are supported.
 
 #### Required properties
 
@@ -206,7 +208,7 @@ Agent {
 
 ### 5.2 Mailbox
 
-A **mailbox** is the primary IPC primitive. Each agent owns or is associated with one mailbox.
+A **mailbox** is the primary IPC primitive. In Stage-1, each agent owns exactly one mailbox (1:1 binding). This is a deliberate simplification. Later stages may allow agents to own multiple mailboxes for separate control and data channels.
 
 A mailbox is modeled as a bounded message queue, likely implemented as a ring buffer in Stage-1.
 
@@ -221,6 +223,8 @@ Mailbox {
     capacity,
 }
 ```
+
+The recommended default capacity for Stage-1 is **16 messages** per mailbox. Combined with the 256-byte payload limit (§11.3), each mailbox occupies approximately 4–5 KB of kernel memory.
 
 ### 5.3 Capability
 
@@ -240,16 +244,16 @@ Capability {
     type,
     target,
     flags,
-    quota,
+    use_limit,
     expiry,
 }
 ```
 
+`use_limit` bounds how many times this specific capability can be exercised (e.g., an agent may send at most N messages to a given mailbox). This is distinct from the agent's `energy_budget`, which bounds total execution cost. A capability with `use_limit = 0` means unlimited use (subject to energy budget). `expiry` may be tick-based or omitted in Stage-1.
+
 ### 5.4 State object
 
-A **state object** replaces file-first semantics for internal structured execution state.
-
-Stage-1 may implement this as a simple in-memory key-value map. Persistent storage can be introduced later.
+A **state object** replaces file-first semantics for internal structured execution state. State is organized into capability-scoped **keyspaces** (see §17 for details).
 
 ### 5.5 Energy budget
 
@@ -382,7 +386,7 @@ Responsibilities:
 * transition from firmware/bootloader into kernel entry
 * establish initial page tables as needed
 * hand off memory information
-* establish clean control flow into Rust/C kernel logic
+* establish clean control flow into Rust kernel logic
 
 ### 8.2 x86_64 architecture layer
 
@@ -391,9 +395,10 @@ Responsibilities:
 * GDT setup
 * IDT setup
 * interrupt/trap stubs
-* context switching
-* timer setup
-* low-level register and port handling
+* context switching (register save/restore, cr3 switch)
+* timer setup (PIT or APIC timer)
+* MSR configuration (STAR, LSTAR, SFMASK for `syscall`/`sysret` support)
+* low-level register, port, and serial I/O handling
 
 ### 8.3 Kernel core layer
 
@@ -456,37 +461,70 @@ AOS is agent-centric.
 
 ### 10.1 Agent states
 
-A minimal set of states may include:
+A minimal set of states:
 
-* Created
-* Ready
-* Running
-* BlockedRecv
-* BlockedSend
-* Suspended
-* Killed
-* Faulted
+* **Created** — agent struct allocated, not yet schedulable
+* **Ready** — in the run queue, waiting for CPU time
+* **Running** — currently executing on the CPU
+* **BlockedRecv** — waiting for a message to arrive in a mailbox
+* **BlockedSend** — waiting for space in a full mailbox (reserved for future use; Stage-1 `sys_send` is non-blocking)
+* **Suspended** — paused due to budget exhaustion (may be resumed if budget is replenished)
+* **Exited** — terminated normally via `sys_exit`
+* **Faulted** — terminated due to an unrecoverable fault (invalid instruction, protection violation, etc.)
+
+State transitions:
+
+```text
+Created -> Ready           (kernel finishes initialization, places in run queue)
+Ready -> Running           (scheduler selects this agent)
+Running -> Ready           (yield, timer preemption)
+Running -> BlockedRecv     (sys_recv on empty mailbox)
+Running -> BlockedSend     (reserved for future blocking send; Stage-1 sys_send returns error instead)
+Running -> Suspended       (energy budget exhausted)
+Running -> Exited          (sys_exit called)
+Running -> Faulted         (hardware fault or protection violation)
+BlockedRecv -> Ready       (message arrives in target mailbox)
+BlockedSend -> Ready       (space becomes available in target mailbox)
+Suspended -> Ready         (budget replenished by parent or system)
+```
+
+`Exited` and `Faulted` are terminal states. The kernel reclaims all resources upon entering either.
 
 ### 10.2 Agent execution context
 
-Each agent requires:
+The execution context is the CPU state saved and restored on context switch. It contains only hardware register state:
 
-* stack pointer
-* instruction pointer / entry point
-* saved registers
-* execution budget metadata
-* mailbox binding
-* capability set reference
+* `rsp` — stack pointer
+* `rip` — instruction pointer / entry point
+* general-purpose registers (`rax`, `rbx`, `rcx`, `rdx`, `rsi`, `rdi`, `rbp`, `r8`–`r15`)
+* `rflags`
+* `cr3` — page table root (for memory isolation)
 
-### 10.3 Agent lifecycle
+All other agent metadata (`energy_budget`, `mailbox_id`, `capability_set`, `memory_quota`) is stored in the Agent struct (§5.1), not in the execution context. The scheduler accesses agent metadata via the agent table, not via the saved context.
 
-1. Create agent.
-2. Assign mailbox.
-3. Assign capabilities.
-4. Assign initial budget.
-5. Place in run queue.
-6. Execute until yield, block, budget exhaustion, or fault.
-7. Emit audit events throughout lifecycle.
+### 10.3 Root agent bootstrap
+
+The very first agent (agent 0, the "root agent") is created by the kernel during boot, not via `sys_spawn`. The kernel grants the root agent **wildcard capabilities**: `CAP_SEND_MAILBOX:*`, `CAP_RECV_MAILBOX:*`, `CAP_AGENT_SPAWN`, `CAP_EVENT_EMIT`, `CAP_STATE_READ:*`, `CAP_STATE_WRITE:*`. Wildcard capabilities match any target id. When the root agent spawns a child and grants it `CAP_SEND_MAILBOX:3`, this is a narrowing of the root's wildcard — the child can only send to mailbox 3, not to all mailboxes.
+
+All other agents are descendants of the root agent and can only hold capabilities that trace back to this initial grant (no-escalation principle, §12.3).
+
+The root agent's initial energy budget and memory quota are set to the system's total available resources. As it spawns children, these resources are subdivided via the delegation rules in §12.2.
+
+The root agent's entry point is a compiled-in initialization function that spawns the system's test agents in Stage-1.
+
+### 10.4 Agent lifecycle
+
+1. Parent agent calls `sys_spawn` with entry point, budget, and initial capability set.
+2. Kernel creates agent, assigns unique id, records parent_id.
+3. Kernel creates and binds mailbox.
+4. Kernel grants initial capabilities (validated as subset of parent's capabilities).
+5. Kernel assigns initial energy budget and memory quota.
+6. Place in run queue.
+7. Execute until yield, block, exit, budget exhaustion, or fault.
+8. On budget exhaustion, the agent is suspended (see §13.3). It may be resumed if budget is replenished.
+9. On termination (`sys_exit` or fault), the kernel reclaims all resources (mailbox, memory, capabilities) and moves the agent to a terminal state.
+10. When a parent agent terminates, all its direct children are **cascading-terminated** (moved to `Faulted` with a "parent exited" reason). This cascades recursively to all descendants. Stage-1 implements immediate cascading termination; later stages may support reparenting to the root agent as an alternative policy.
+11. Emit audit events throughout lifecycle.
 
 ---
 
@@ -502,11 +540,28 @@ Mailbox IPC is one of the core defining traits of AOS.
 * recv behavior should be deterministic in simple cases
 * direct arbitrary shared memory should not be the default IPC model
 
-### 11.2 Stage-1 implementation suggestion
+### 11.2 Message structure
 
-Use a ring-buffer mailbox with fixed-size or small bounded messages.
+Each message in a mailbox must carry metadata for audit and replay:
 
-### 11.3 Future direction
+```text
+Message {
+    sender_id,
+    payload,
+    len,
+    tick,
+}
+```
+
+`sender_id` and `tick` are set by the **kernel**, not by the caller. The `sys_send` syscall accepts only the raw payload from the caller; the kernel populates `sender_id` from the calling agent's id and `tick` from the current kernel tick counter. This prevents agents from spoofing their identity.
+
+`sender_id` is required so the receiver can identify the origin of a message and so that audit logs can reconstruct full communication graphs. `tick` records the logical timestamp at send time for replay ordering.
+
+### 11.3 Stage-1 implementation suggestion
+
+Use a ring-buffer mailbox with fixed-size messages. The recommended maximum payload size for Stage-1 is **256 bytes**. This keeps the ring buffer implementation simple with fixed-slot allocation. Messages exceeding this limit must be rejected with an explicit error.
+
+### 11.4 Future direction
 
 In later stages, mailboxes may support:
 
@@ -527,18 +582,44 @@ No meaningful action should succeed unless the caller holds an appropriate capab
 
 ### 12.2 Example capability types
 
-* `CAP_SEND_MAILBOX:<id>`
-* `CAP_RECV_MAILBOX:<id>`
-* `CAP_EVENT_EMIT`
-* `CAP_AGENT_SPAWN`
-* `CAP_STATE_READ:<keyspace>`
-* `CAP_STATE_WRITE:<keyspace>`
+* `CAP_SEND_MAILBOX:<id>` — permission to send to a specific mailbox
+* `CAP_RECV_MAILBOX:<id>` — permission to receive from a specific mailbox
+* `CAP_EVENT_EMIT` — permission to emit audit events
+* `CAP_AGENT_SPAWN` — permission to spawn child agents
+* `CAP_STATE_READ:<keyspace>` — permission to read from a state keyspace
+* `CAP_STATE_WRITE:<keyspace>` — permission to write to a state keyspace
 
-### 12.3 Enforcement
+Resource delegation rules for `sys_spawn`:
+
+* **Energy**: the child's `energy_quota` is **deducted from the parent's remaining budget**. An agent cannot spawn a child with a larger energy budget than it currently holds. This prevents unbounded energy creation.
+* **Memory**: the child's `mem_quota` is **deducted from the parent's remaining memory quota**. An agent cannot allocate more memory to children than its own quota allows.
+
+Both deductions are automatic and enforced by the kernel. No separate capabilities are required for resource delegation — the spawn syscall handles it atomically.
+
+### 12.3 Capability lifecycle
+
+Capabilities must support:
+
+* **Grant**: a parent agent may grant a subset of its own capabilities to a child at spawn time or via `sys_cap_grant`.
+* **Revocation**: a parent agent may revoke capabilities it previously granted to a child. Revocation is immediate and does not require the child's cooperation.
+* **No escalation**: an agent cannot grant capabilities it does not itself hold. This is enforced by the kernel at grant time.
+
+Stage-1 may implement grant-at-spawn only, deferring dynamic grant and revocation to a later stage. But the data structures must anticipate the full lifecycle.
+
+### 12.4 Implicit capabilities
+
+To avoid circular dependencies during agent bootstrap, the following capabilities are implicitly granted by the kernel and do not need to be explicitly held:
+
+* An agent always has `CAP_RECV_MAILBOX` for its own mailbox.
+* An agent always has `CAP_STATE_READ` and `CAP_STATE_WRITE` for its own private keyspace.
+
+These implicit capabilities cannot be revoked.
+
+### 12.5 Enforcement
 
 Syscalls must validate capability requirements before execution.
 
-### 12.4 Denial behavior
+### 12.6 Denial behavior
 
 On failure:
 
@@ -565,21 +646,22 @@ Energy budgeting exists to support:
 
 ### 13.2 Stage-1 strategy
 
-Stage-1 may implement a simple per-agent decrementing budget based on:
+Stage-1 should implement a simple per-agent decrementing budget based on:
 
-* timer ticks
-* scheduler slices
-* explicit instruction window approximations
+* **timer ticks**: on each timer interrupt, the kernel decrements budget for the currently `Running` agent AND all agents in `BlockedRecv` state. Blocked agents must consume budget; otherwise an agent could block on an empty mailbox indefinitely at zero cost. In Stage-1 with a small number of agents (typically 3–5), iterating all agents per tick is trivially cheap. A blocked agent whose budget reaches zero is moved from `BlockedRecv` to `Suspended`, and `sys_recv` returns an error code when/if the agent is later resumed.
+* **syscall cost**: decrement a fixed cost per syscall invocation, so that agents cannot avoid budget consumption by performing many cheap syscalls between timer ticks.
+
+Note: precise per-instruction counting is not feasible on x86_64 without hardware performance counters and is inherently non-deterministic due to out-of-order execution. Tick-based accounting is the correct Stage-1 approach.
 
 ### 13.3 Exhaustion policy
 
-When the budget reaches zero, the kernel may:
+When the budget reaches zero, the kernel must:
 
-* suspend the agent
-* kill the agent
-* emit an event and reschedule others
+1. Emit a `BUDGET_EXHAUSTED` audit event.
+2. Move the agent to `Suspended` state (default) or `Faulted` state (configurable at compile time).
+3. Reschedule immediately.
 
-The behavior should be explicit and configurable at compile time in early versions.
+The default policy is **suspend**, not kill. A suspended agent may be resumed if a parent agent or the system replenishes its budget. This allows for recharge patterns without losing agent state. The compile-time option to kill on exhaustion exists for environments that require hard termination (e.g., untrusted agent execution).
 
 ---
 
@@ -587,47 +669,62 @@ The behavior should be explicit and configurable at compile time in early versio
 
 The Stage-1 syscall surface should be intentionally small.
 
-### 14.1 Initial syscall set
+### 14.1 Register convention
 
-#### `sys_yield()`
+On x86_64, AOS uses the `syscall` instruction with the following convention:
 
-Yield execution voluntarily.
+```text
+rax = syscall number
+rdi = arg0
+rsi = arg1
+rdx = arg2
+r10 = arg3
+r8  = arg4
 
-#### `sys_spawn(entry, quota) -> agent_id`
+Return:
+rax = result or error code (0 = success, negative = error)
+rdx = secondary return value (where applicable)
 
-Create a new agent with a specified entry point and initial budget.
+Clobbered by hardware:
+rcx = destroyed (hardware saves rip here)
+r11 = destroyed (hardware saves rflags here)
+```
 
-#### `sys_send(mailbox_id, ptr, len)`
+The `syscall` instruction unconditionally overwrites `rcx` and `r11`. Callers must not rely on these registers being preserved across a syscall. This convention is similar to the Linux x86_64 syscall ABI for familiarity, but the syscall numbers and semantics are entirely AOS-specific.
 
-Send a message to a mailbox.
+### 14.2 Initial syscall set
 
-#### `sys_recv(mailbox_id, out_ptr) -> len`
+| # | Name | Signature | Description |
+|---|------|-----------|-------------|
+| 0 | `sys_yield` | `() -> 0` | Yield execution voluntarily. The agent is moved to Ready and the scheduler runs. Always returns 0 when the agent resumes |
+| 1 | `sys_spawn` | `(entry, energy_quota, mem_quota, cap_set_ptr, cap_count) -> agent_id` | Create a new agent. `energy_quota` is deducted from caller's remaining budget. `mem_quota` sets the child's page frame limit. Capabilities must be a subset of caller's set |
+| 2 | `sys_exit` | `(status_code)` | Terminate the calling agent. Does not return |
+| 3 | `sys_send` | `(mailbox_id, ptr, len) -> error_code` | Send a message (non-blocking). Returns 0 on success, negative on failure (mailbox full, no capability, payload exceeds 256 bytes, etc.). Caller may yield and retry on mailbox-full |
+| 4 | `sys_recv` | `(mailbox_id, out_ptr, out_capacity) -> len` | Receive a message (blocking). Returns message length, or negative on error. Blocks if mailbox is empty (agent moves to BlockedRecv). Budget continues to decrement while blocked; budget exhaustion breaks the block. An agent always has implicit permission to receive from its own mailbox; receiving from another agent's mailbox requires `CAP_RECV_MAILBOX:<id>` |
+| 5 | `sys_cap_query` | `(out_ptr, out_capacity) -> count` | Return the caller's capability set |
+| 6 | `sys_cap_grant` | `(target_agent_id, cap_ptr) -> error_code` | Grant a capability to a direct child agent. Fails if caller does not hold the capability or target is not a direct child of the caller |
+| 7 | `sys_event_emit` | `(code, arg) -> error_code` | Emit an audit event |
 
-Receive a message from the caller's mailbox or a specified mailbox if permitted.
+### 14.3 Optional early syscalls
 
-#### `sys_cap_query(out_ptr)`
+| # | Name | Signature | Description |
+|---|------|-----------|-------------|
+| 8 | `sys_energy_get` | `() -> remaining` | Return current remaining budget |
+| 9 | `sys_state_get` | `(key_u64, out_ptr, out_capacity) -> len` | Read a value by key from the caller's keyspace. Key is a u64 identifier |
+| 10 | `sys_state_put` | `(key_u64, value_ptr, len) -> error_code` | Write a value by key to the caller's keyspace. Key is a u64 identifier |
 
-Return information about the current capability set.
+### 14.4 Reserved future syscalls
 
-#### `sys_event_emit(code, arg)`
+The following syscalls are anticipated but not included in Stage-1:
 
-Emit an audit event.
+* `sys_cap_revoke(target_agent_id, cap_ptr)` — revoke a previously granted capability from a child
+* `sys_recv_nonblocking(mailbox_id, out_ptr, out_capacity)` — non-blocking receive (returns immediately if empty)
+* `sys_send_blocking(mailbox_id, ptr, len)` — blocking send (waits for space)
+* `sys_energy_grant(target_agent_id, amount)` — replenish a suspended child's budget
 
-### 14.2 Optional early syscalls
+Syscall numbers 11–15 are reserved for these.
 
-#### `sys_energy_get()`
-
-Return current remaining budget.
-
-#### `sys_state_get(key, out_ptr)`
-
-Read a key from an in-memory state map.
-
-#### `sys_state_put(key, value_ptr, len)`
-
-Write to an in-memory state map.
-
-### 14.3 ABI philosophy
+### 14.5 ABI philosophy
 
 The syscall ABI should model the future shape of the system, even if the first implementation is minimal.
 
@@ -648,10 +745,12 @@ A fixed-order or round-robin scheduler is acceptable for Stage-1.
 Context switching may occur on:
 
 * explicit yield
-* blocking recv
+* blocking recv (mailbox empty)
+* blocking send (reserved for future; Stage-1 send is non-blocking)
+* agent exit or termination
 * budget exhaustion
 * timer interrupt
-* fault or kill event
+* fault event
 
 ### 15.4 Future direction
 
@@ -672,11 +771,22 @@ The kernel must initialize from boot-provided memory data and establish a stable
 * provide a kernel allocator
 * provide per-agent stack allocation
 
-### 16.3 Shared memory policy
+### 16.3 Agent memory isolation
+
+Each agent must execute in an isolated memory space. Without memory isolation, the capability model is meaningless — any agent could read or corrupt another agent's data by direct memory access, bypassing all capability checks.
+
+Stage-1 implementation options:
+
+* **Per-agent page tables**: each agent has its own page table hierarchy. The kernel switches page tables on context switch. This is the recommended approach as it provides hardware-enforced isolation.
+* **Kernel-only agents**: if Stage-1 agents run in kernel mode for simplicity, isolation may be enforced by convention initially, with page-table isolation introduced when user-mode agents are added.
+
+Memory quota enforcement: each agent's `memory_quota` limits the number of physical frames it may be allocated. Allocation requests beyond quota must fail with an explicit error.
+
+### 16.4 Shared memory policy
 
 Shared memory should not be the default agent communication mechanism. Mailbox delivery should remain primary.
 
-### 16.4 Future direction
+### 16.5 Future direction
 
 Future versions may add explicit immutable shared regions or capability-scoped shared pages.
 
@@ -686,7 +796,11 @@ Future versions may add explicit immutable shared regions or capability-scoped s
 
 ### 17.1 Stage-1 state
 
-Stage-1 may use an in-memory key-value subsystem for testing.
+Stage-1 uses an in-memory key-value subsystem. State is organized into **keyspaces**. Each keyspace is an isolated namespace of key-value pairs.
+
+* Each agent is automatically assigned a private keyspace (identified by agent id) at creation.
+* Additional shared keyspaces may be created by the root agent.
+* Access to any keyspace requires the corresponding `CAP_STATE_READ:<keyspace>` or `CAP_STATE_WRITE:<keyspace>` capability. An agent always holds capabilities for its own private keyspace.
 
 ### 17.2 Why state objects instead of files
 
@@ -711,11 +825,13 @@ Auditability must exist from the beginning.
 
 * system boot
 * agent creation
-* agent termination
+* agent termination (with exit status or fault reason)
 * mailbox send
 * mailbox receive
+* capability grant
 * capability denial
 * budget exhaustion
+* budget replenishment
 * fault/exception
 * syscall entry failure
 
@@ -725,8 +841,8 @@ Conceptually:
 
 ```text
 Event {
-    id,
-    timestamp_or_tick,
+    sequence,
+    tick,
     agent_id,
     event_type,
     arg0,
@@ -734,6 +850,11 @@ Event {
     status,
 }
 ```
+
+* `sequence` is a monotonically increasing counter, distinct from `tick`. It provides a total ordering of events for replay, even when multiple events share the same tick.
+* `agent_id` is the agent that caused the event.
+* For IPC events: `arg0` = target mailbox id, `arg1` = message length. The counterpart agent can be derived from the mailbox owner.
+* For capability denial events: `arg0` = denied capability type, `arg1` = target resource id.
 
 ### 18.3 Output path
 
@@ -747,12 +868,12 @@ Checkpointing may not be fully implemented in Stage-1, but the architecture shou
 
 Long-term checkpoint contents may include:
 
-* execution context
-* mailbox cursor state
-* PRNG state
-* energy counters
-* state object references
-* scheduler order state
+* execution context (all saved registers, including cr3)
+* mailbox cursor state (read/write positions in ring buffers)
+* energy counters (remaining budget per agent)
+* state object snapshots (key-value data per keyspace)
+* scheduler order state (run queue ordering, tick counter)
+* event sequence counter
 
 Replay is essential for:
 
@@ -767,22 +888,24 @@ Replay is essential for:
 
 The first successful version of AOS should not be judged by whether it runs a shell. It should be judged by whether the new OS model is alive.
 
-### 20.1 Demo 1: message exchange
+### 20.1 Demo 1: message exchange (achievable after Phase 5)
 
 * boot system
-* create agent_0 and agent_1
-* agent_0 sends a message to agent_1
-* agent_1 replies
-* serial output confirms mailbox flow
+* create agent_0 with `CAP_SEND_MAILBOX:1` and `CAP_RECV_MAILBOX:0`
+* create agent_1 with `CAP_SEND_MAILBOX:0` and `CAP_RECV_MAILBOX:1`
+* agent_0 sends a message to agent_1's mailbox
+* agent_1 receives and replies to agent_0's mailbox
+* serial output confirms mailbox flow with sender_id in each message
 
 This validates:
 
-* scheduling
+* scheduling and context switching
 * syscall path
-* mailbox delivery
+* mailbox delivery with message metadata
+* capability grant in the happy path
 * agent identity model
 
-### 20.2 Demo 2: capability denial
+### 20.2 Demo 2: capability denial (achievable after Phase 5)
 
 * agent_0 has mailbox-send capability
 * agent_1 lacks it
@@ -795,18 +918,21 @@ This validates:
 * syscall gating
 * audit logging
 
-### 20.3 Demo 3: budget exhaustion
+### 20.3 Demo 3: budget exhaustion (achievable after Phase 6)
 
 * assign limited execution budget to an agent
-* allow it to consume quota
-* kernel suspends or kills it on exhaustion
-* emit structured event
+* agent runs a busy loop consuming its budget
+* kernel detects budget reaches zero
+* kernel emits `BUDGET_EXHAUSTED` event and moves agent to `Suspended` state
+* scheduler switches to idle agent or next ready agent
+* serial output confirms the agent is no longer running
 
 This validates:
 
-* energy accounting
-* bounded execution
-* scheduler enforcement
+* energy accounting and tick-based decrement
+* budget boundary enforcement
+* suspend behavior and scheduler reaction
+* audit event emission
 
 ---
 
@@ -814,9 +940,15 @@ This validates:
 
 ```text
 aos0/
+  Cargo.toml
+  Makefile
+  rust-toolchain.toml
+  .cargo/
+    config.toml            # target triple, linker flags, runner = qemu
   boot/
     x86_64/
       boot.asm
+      multiboot_header.asm
       linker.ld
   kernel/
     src/
@@ -832,18 +964,22 @@ aos0/
       capability.rs
       energy.rs
       state.rs
+      event.rs
     arch/
       x86_64/
+        mod.rs
         gdt.rs
         idt.rs
         paging.rs
         timer.rs
         context.rs
+        serial.rs
         syscall_entry.asm
         trap_entry.asm
         switch.asm
   user/
     agents/
+      root_agent.rs
       ping_agent.rs
       pong_agent.rs
       idle_agent.rs
@@ -889,9 +1025,11 @@ Goal:
 
 Goal:
 
-* create idle agent
-* create one test agent
-* support context switching
+* create the idle agent — a special kernel-internal agent that runs when no other agent is Ready. It executes `hlt` in a loop and is exempt from energy budgeting. The scheduler must never remove the idle agent from the system.
+* create one test agent (kernel-mode, compiled into the image)
+* support context switching between agents
+
+Note: Phase 3 agents run in kernel mode (ring 0) for simplicity. User-mode (ring 3) isolation with per-agent page tables is a Phase 3b or later concern. The architectural boundary exists in the design, but the first working context switch does not require a privilege transition.
 
 ### Phase 4: mailbox IPC
 
@@ -914,8 +1052,8 @@ Goal:
 Goal:
 
 * assign budget per agent
-* decrement on scheduling slices or timer ticks
-* enforce zero-budget behavior
+* decrement via timer ticks (for running and blocked agents) and syscall cost
+* enforce zero-budget behavior: suspend agent, emit audit event, reschedule
 
 At the end of Phase 6, AOS Stage-1 becomes a valid AI-native minimal kernel prototype.
 
