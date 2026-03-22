@@ -15,8 +15,10 @@ use crate::agents;
 use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
 
-/// Stack size for each agent (4 KiB for Stage-1).
-const AGENT_STACK_SIZE: usize = 4096;
+/// Stack size for each agent.
+/// 16 KiB is needed for agents with large local variables (e.g., policyd
+/// allocates a 2 KB eBPF instruction array on the stack).
+const AGENT_STACK_SIZE: usize = 16384;
 
 /// Static stacks for agents.
 ///
