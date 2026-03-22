@@ -1076,224 +1076,370 @@ To preserve implementation focus, the following are explicitly out of scope for 
 
 ---
 
-## 24. Stage-2 Roadmap (Post-Prototype Evolution)
+## 24. Stage-2 Roadmap (Kernel Hardening + Runtime Foundation)
 
-After Stage-1 establishes a working minimal kernel, Stage-2 focuses on transforming AOS from a prototype into a structured execution platform.
+Stage-2 transforms AOS from a kernel-mode prototype into a hardened execution platform with memory isolation, sandboxed runtimes, and persistent state.
 
 ### 24.1 Objectives
 
-* Move from static demo agents to dynamic runtime execution
-* Introduce structured state persistence
-* Begin supporting multiple runtime types (WASM / JVM-lite / TOS VM)
-* Establish system agents (user-space-like services)
-* Introduce deterministic execution mode (partial)
+* Introduce user-mode agent isolation (ring 3 + per-agent page tables)
+* Add a kernel heap allocator for dynamic data structures
+* Support loading agent binaries (ELF loader for native, WASM loader for sandboxed)
+* Introduce WASM as the first sandboxed runtime backend
+* Introduce eBPF-lite as the policy and filtering runtime
+* Replace in-memory state with persistent storage via virtio-blk
+* Implement basic checkpoint and replay
+* Begin transition toward system agents (microkernel direction)
 
-### 24.2 Core Additions
+### 24.2 Prerequisite: Kernel Infrastructure
 
-#### 24.2.1 Runtime Host Layer
+These must be completed before runtime or system agent work can begin.
 
-Introduce a unified runtime interface:
+#### 24.2.1 User-Mode Agent Isolation
+
+Stage-1 agents run in ring 0 (kernel mode). Stage-2 must introduce hardware-enforced isolation:
+
+* Per-agent page tables: each agent gets its own page table hierarchy. The kernel switches `cr3` on context switch. This is already anticipated by the `cr3` field in `AgentContext`.
+* Ring 3 execution: agent code runs in user mode. Syscalls transition to ring 0 via the `syscall` instruction (MSR setup for STAR/LSTAR/SFMASK, already prepared in `syscall_entry.asm`).
+* Kernel/user memory split: the kernel is mapped in the upper half of every agent's address space (higher-half kernel) but marked supervisor-only.
+* Memory quota enforcement: `alloc_frame()` is gated by each agent's `memory_quota`. Exceeding quota returns an error.
+
+Without memory isolation, the capability model is bypassable — any agent could read/write another agent's data via direct memory access.
+
+#### 24.2.2 Kernel Heap Allocator
+
+Stage-1 has only a frame allocator (4KB pages). Stage-2 requires a heap for dynamic kernel data structures (runtime metadata, variable-length messages, etc.):
+
+* Implement a slab or bump allocator on top of the frame allocator
+* Integrate with Rust's `#[global_allocator]` to enable `alloc` crate (`Vec`, `Box`, `String`)
+* Heap is kernel-only; agents allocate via `memory_quota`-bounded frame allocation
+
+#### 24.2.3 Agent Binary Loader
+
+Stage-1 agents are compiled into the kernel image. Stage-2 must support loading agent code from external sources:
+
+* **Native agents**: minimal ELF64 loader that maps `.text`, `.data`, `.bss` into the agent's address space and sets the entry point
+* **WASM agents**: WASM binary is loaded into kernel memory and executed by the WASM runtime (§24.3.1)
+* **eBPF-lite programs**: bytecode is loaded and verified before attachment (§24.3.2)
+* Agent binaries may be embedded in the kernel image initially (initramfs-style), with virtio-blk loading added when persistent storage is available
+
+### 24.3 Runtime Layer
+
+#### 24.3.1 WASM Runtime
+
+WASM is the primary sandboxed runtime for AOS agents. It provides portable, deterministic execution with fine-grained memory safety.
+
+Runtime host interface:
 
 ```text
-Runtime {
-  init()
-  execute_slice()
-  handle_syscall()
-  checkpoint()
+WasmRuntime {
+    load(wasm_bytes) -> module_id       // parse and validate WASM module
+    instantiate(module_id) -> instance  // create execution instance
+    execute_slice(instance, fuel) -> result  // run with bounded fuel
+    handle_syscall(instance, num, args) -> result  // bridge WASM → AOS syscalls
+    snapshot(instance) -> checkpoint    // capture execution state
+    restore(checkpoint) -> instance     // resume from checkpoint
 }
 ```
 
-Initial supported runtimes:
+Design constraints:
 
-* minimal WASM runtime
-* TOS VM (custom bytecode)
-* JVM-lite (restricted Java execution)
+* **No JIT in Stage-2**: use an interpreter (e.g., a minimal stack-based WASM interpreter written in Rust). JIT compilation may be explored in Stage-3.
+* **Fuel-based metering**: WASM execution is bounded by a fuel counter that maps to the agent's energy budget. Each WASM instruction consumes fuel.
+* **Syscall bridging**: WASM agents invoke AOS syscalls via `call_indirect` to imported host functions. The runtime translates these to kernel syscalls.
+* **Memory model**: WASM linear memory is backed by agent-allocated frames. The `memory.grow` instruction is gated by `memory_quota`.
+* **Determinism**: WASM is inherently deterministic (no threads, no system clock access). This makes it ideal for checkpoint/replay.
 
-#### 24.2.2 System Agents
+#### 24.3.2 eBPF-lite Policy Runtime
 
-Move non-core responsibilities out of kernel:
+eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode.
 
-* mailbox manager (mailboxd)
-* state manager (stated)
-* tool broker (toold)
-* policy engine (policyd)
+```text
+EbpfProgram {
+    bytecode: [u8],         // verified eBPF-lite instructions
+    attachment: AttachPoint, // where this program runs
+    maps: [EbpfMap],        // shared data structures
+}
 
-This begins the transition toward a microkernel-style architecture.
+AttachPoint {
+    SyscallEntry(syscall_num),  // filter before syscall execution
+    SyscallExit(syscall_num),   // inspect after syscall execution
+    MailboxSend(mailbox_id),    // filter outgoing messages
+    MailboxRecv(mailbox_id),    // filter incoming messages
+    AgentSpawn,                 // validate spawn parameters
+    TimerTick,                  // periodic policy checks
+}
+```
 
-#### 24.2.3 Persistent State Store
+Design constraints:
 
-Replace in-memory state with structured storage:
+* **Verified execution**: all eBPF-lite programs must pass a static verifier before loading. The verifier ensures: no unbounded loops, no out-of-bounds memory access, termination within bounded instructions.
+* **Instruction set**: a subset of Linux eBPF — 64-bit registers (r0-r10), ALU ops, conditional jumps, memory load/store, map lookups, helper calls. No direct kernel memory access.
+* **Maps**: shared key-value data structures (hash map, array map) for communication between eBPF programs and the kernel or agents.
+* **Helper functions**: a fixed set of kernel-provided helpers (e.g., `get_agent_id()`, `get_energy_remaining()`, `emit_event()`, `drop_message()`).
+* **Return value**: programs return an action code (ALLOW, DENY, LOG, MODIFY) that the kernel enforces at the attachment point.
+* **Energy cost**: eBPF-lite execution is charged against the system energy pool, not individual agents, since it runs as kernel policy.
 
-* key-value store
-* append-only log
-* snapshot capability
+Use cases:
 
-Future-ready for Merkle or verifiable state.
+* Rate-limit an agent's syscall frequency
+* Block messages matching a payload pattern
+* Enforce spawn policies (max children, minimum budget)
+* Custom audit filtering (emit events only for specific conditions)
 
-#### 24.2.4 Basic Checkpointing
+### 24.4 System Agents
 
-Introduce execution snapshots:
+Move higher-level services out of the kernel into privileged user-mode agents. Mailbox IPC and capability enforcement remain in-kernel — only management and policy logic migrates.
 
-* capture agent state
-* restore execution
-* enable debugging and replay
+* **stated** — state persistence manager: handles durable key-value writes to virtio-blk, serves `sys_state_get`/`sys_state_put` for shared keyspaces
+* **policyd** — policy engine: loads and manages eBPF-lite programs, handles dynamic policy updates
+* **netd** — network broker (Stage-2 preparation, functional in Stage-3): accepts outbound network requests from agents via mailbox, performs requests on their behalf, returns responses
 
-#### 24.2.5 Deterministic Mode (Partial)
+System agents run in ring 3 but with elevated capabilities (granted by the root agent at boot). They communicate with the kernel and other agents exclusively through mailboxes and syscalls.
 
-Add optional deterministic execution constraints:
+### 24.5 Persistent State Store
 
-* fixed scheduling order
-* controlled timer
-* restricted randomness
+Replace in-memory state with durable storage via virtio-blk:
 
-#### 24.2.6 Capability Expansion
+* **Storage backend**: virtio-blk device driver (QEMU `-drive` flag). Simple block I/O: read/write 512-byte sectors.
+* **On-disk format**: append-only log of key-value mutations. Each entry: `[sequence, keyspace_id, key_u64, len, value_bytes, checksum]`.
+* **In-memory index**: the kernel maintains an in-memory hash map of current key-value pairs, rebuilt from the log on boot.
+* **Snapshot**: flush the current state to a contiguous region on disk. This is the checkpoint-compatible state format.
+* **Consistency**: writes are logged before acknowledgment (write-ahead). On crash recovery, replay the log to rebuild state.
 
-Extend capability system to:
+### 24.6 Basic Checkpointing
 
-* tool access
-* state namespaces
-* runtime-specific permissions
+Introduce execution snapshots for debugging and replay:
 
-### 24.3 Stage-2 Success Criteria
+* **Checkpoint contents**: all agent contexts (registers, page tables), mailbox queues (read/write positions, pending messages), energy counters, state object snapshots, scheduler state (run queue, tick counter), event sequence counter.
+* **Trigger**: manual (via a `sys_checkpoint` syscall from root agent) or periodic (every N ticks, configurable).
+* **Storage**: serialized to virtio-blk as a single contiguous image.
+* **Restore**: on boot, if a checkpoint is present, the kernel can restore all agents to the checkpointed state instead of running init.
+* **Limitation**: Stage-2 checkpointing is not yet deterministic. Timer interrupt timing and I/O ordering may differ across replays. Full deterministic replay requires Stage-3.
+
+### 24.7 Additional Syscalls (Stage-2)
+
+| # | Name | Description |
+|---|------|-------------|
+| 11 | `sys_cap_revoke` | Revoke a capability from a direct child agent |
+| 12 | `sys_recv_nonblocking` | Non-blocking receive (returns immediately if empty) |
+| 13 | `sys_send_blocking` | Blocking send (waits for space in target mailbox) |
+| 14 | `sys_energy_grant` | Replenish a suspended child's energy budget |
+| 15 | `sys_checkpoint` | Trigger a checkpoint (root agent only) |
+| 16 | `sys_mmap` | Map physical frames into agent's address space |
+| 17 | `sys_munmap` | Unmap frames from agent's address space |
+
+### 24.8 Suggested Development Order (Stage-2)
+
+#### Phase 7: kernel heap + user-mode isolation
+
+* Implement slab allocator, enable `alloc` crate
+* Per-agent page tables, ring 3 execution, `syscall`/`sysret` path
+* Verify: existing ping/pong demo works in ring 3
+
+#### Phase 8: agent binary loader
+
+* Minimal ELF64 loader for native agents
+* Load agent from embedded initramfs image
+* Verify: load and run a separately compiled agent binary
+
+#### Phase 9: WASM runtime
+
+* WASM interpreter (stack-based, no JIT)
+* Fuel-based metering mapped to energy budget
+* Syscall bridging (WASM host imports → AOS syscalls)
+* Verify: ping/pong demo rewritten in WASM runs correctly
+
+#### Phase 10: eBPF-lite runtime
+
+* Bytecode format, static verifier, interpreter
+* Attachment points for syscall entry and mailbox send
+* Map data structures (hash map, array map)
+* Verify: eBPF program blocks unauthorized sends (replaces bad_agent demo)
+
+#### Phase 11: persistent state + checkpointing
+
+* virtio-blk driver (read/write sectors)
+* Append-only state log, in-memory index
+* Checkpoint serialization and restore
+* Verify: agent writes state, kernel reboots, state is preserved
+
+#### Phase 12: system agents
+
+* stated and policyd as ring-3 agents
+* Root agent spawns system agents during init
+* Verify: state operations routed through stated agent via mailbox
+
+### 24.9 Stage-2 Success Criteria
 
 Stage-2 is successful when:
 
-* multiple runtimes can execute agents
-* system agents manage state and tools
-* checkpointing works for simple workloads
-* basic deterministic execution is possible
+* agents run in ring 3 with per-agent page tables
+* a WASM agent and a native agent coexist and exchange messages
+* an eBPF-lite program enforces a policy at a syscall attachment point
+* state persists across kernel reboots via virtio-blk
+* a checkpoint can be taken and restored
+* at least one system agent (stated) runs as a user-mode service
 
 ---
 
 ## 25. Stage-3 Roadmap (Production-Ready Execution Layer)
 
-Stage-3 transforms AOS into a full execution substrate for real-world deployment.
+Stage-3 transforms AOS into a production-capable execution substrate with deterministic replay, networking, multi-core support, and an economic model.
 
 ### 25.1 Objectives
 
-* achieve deterministic, replayable execution
-* support distributed / networked agents
-* integrate economic model (energy / token)
-* enable real deployment scenarios
+* Achieve deterministic, replayable execution
+* Support distributed and networked agents
+* Introduce multi-core (SMP) scheduling
+* Integrate an economic model for energy accounting
+* Harden eBPF-lite into a full policy framework
 
 ### 25.2 Core Additions
 
-#### 25.2.1 Deterministic Scheduler (Full)
+#### 25.2.1 Deterministic Scheduler
 
-* reproducible execution order
-* fixed instruction quotas
-* replay-compatible scheduling
+Replace the round-robin scheduler with a deterministic, replay-compatible scheduler:
 
-#### 25.2.2 Network as Brokered Capability
+* **Fixed tick quotas**: each agent receives a fixed number of ticks per scheduling round. The order is deterministic given the same initial state.
+* **No instruction counting**: x86_64 does not support precise per-instruction counting due to out-of-order execution and variable instruction latency. Determinism is achieved at the tick granularity, not instruction granularity.
+* **I/O determinism**: external I/O (virtio-blk, network) is logged and replayed from a trace file during replay mode. The scheduler pauses agents waiting for I/O until the traced response is injected.
+* **WASM advantage**: WASM agents are inherently deterministic (fuel-counted). The deterministic scheduler combined with WASM provides full replay fidelity.
 
-Replace raw networking with controlled access:
+#### 25.2.2 SMP / Multi-Core Support
+
+Extend AOS to run on multiple CPU cores:
+
+* Per-core run queues with work-stealing
+* Spinlock-based synchronization for shared kernel data structures (agent table, mailbox queues, capability sets)
+* Core-pinning option for deterministic execution (pin agent to core for replay)
+* APIC timer per core (replaces PIT for per-core tick accounting)
+* Inter-Processor Interrupts (IPI) for cross-core scheduling events
+
+SMP is required before production deployment. Single-core is a Stage-1/2 simplification.
+
+#### 25.2.3 Network as Brokered Capability
+
+Agents do not access the network directly. Instead, they send requests to the **netd** system agent via mailbox:
 
 ```text
-agent → tool_call(network_endpoint)
+Agent → sys_send(netd_mailbox, {method: "GET", url: "...", headers: ...})
+       ← sys_recv(own_mailbox, {status: 200, body: ...})
 ```
 
-Includes:
+The netd system agent:
 
-* request filtering
-* rate limiting
-* audit logging
+* Holds `CAP_NETWORK` (a new capability type, not granted to regular agents)
+* Validates requests against policy (eBPF-lite filters or static rules)
+* Performs the actual network I/O via a virtio-net driver
+* Returns responses to the requesting agent's mailbox
+* Logs all network activity as audit events
 
-#### 25.2.3 Advanced State Model
+This brokered model ensures:
 
-* Merkle-based state
-* verifiable state transitions
-* snapshot diffing
-* rollback support
+* No agent can perform arbitrary network access
+* All network activity is auditable
+* Rate limiting and filtering are enforced at the broker level
 
-#### 25.2.4 Full Checkpoint & Replay
+#### 25.2.4 Advanced State Model
 
-* deterministic replay
-* execution tracing
-* audit verification
+Extend the persistent state store with verifiability:
 
-#### 25.2.5 Multi-Agent Coordination
+* **Merkle tree**: each keyspace maintains a Merkle root over its key-value entries. State transitions produce a new root hash.
+* **State proofs**: given a key, produce a Merkle proof that the value is (or is not) in the state tree. This enables external verification without full state access.
+* **Snapshot diffing**: compare two checkpoints by comparing Merkle roots. Only changed subtrees need to be transferred or stored.
+* **Rollback**: restore state to a previous Merkle root by replaying the log backwards.
 
-* structured messaging protocols
-* mailbox routing
-* agent orchestration
+#### 25.2.5 Full Checkpoint & Replay
 
-#### 25.2.6 Energy / Economic Model Integration
+Build on Stage-2 basic checkpointing to achieve deterministic replay:
 
-* unified energy accounting across runtimes
-* cost model for CPU / memory / IO / tool calls
-* integration with external token systems (e.g., TOS)
+* **Deterministic replay**: given a checkpoint and an I/O trace, reproduce the exact same sequence of events, agent states, and messages.
+* **I/O trace recording**: during live execution, log all non-deterministic inputs (timer interrupt timing, virtio responses, network responses) to a trace file.
+* **Replay mode**: boot from checkpoint, feed traced inputs, verify that the event log matches the original execution.
+* **Execution diffing**: compare two replay runs and report divergence points.
 
-#### 25.2.7 eBPF-lite Policy Engine
+#### 25.2.6 Energy / Economic Model
 
-Introduce lightweight verified execution for:
+Extend per-agent energy budgets into a unified economic model:
 
-* policy enforcement
-* filtering
-* validation rules
+* **Cost table**: define energy cost per operation type: syscall (1), timer tick (1), frame allocation (10), virtio-blk read (100), virtio-blk write (200), network request (500). Costs are configurable at compile time.
+* **Energy transfer**: `sys_energy_grant` allows a parent to transfer energy to a child. Energy is conserved — the parent's budget decreases by the granted amount.
+* **Energy accounting across runtimes**: WASM fuel consumption is mapped to AOS energy units. One WASM fuel unit = one AOS energy unit.
+* **External billing interface**: the kernel exposes per-agent cumulative energy consumption via a system agent (accountd). External systems can query this for billing or token integration.
+
+#### 25.2.7 eBPF-lite Enhancements
+
+Extend the Stage-2 eBPF-lite runtime:
+
+* **New attachment points**: network send/recv (at netd), state read/write, checkpoint trigger
+* **Program chaining**: multiple eBPF programs on the same attachment point, executed in priority order
+* **Persistent maps**: eBPF maps backed by persistent state (survives reboot)
+* **Metrics helpers**: `increment_counter()`, `read_gauge()` for observability
+* **Hot-reload**: replace an attached eBPF program without restarting the system
 
 ### 25.3 Stage-3 Success Criteria
 
 Stage-3 is successful when:
 
-* execution is replayable and auditable
-* agents interact across nodes or environments
-* energy accounting is consistent and enforced
-* system supports real workloads
+* A checkpoint can be replayed deterministically with identical event output
+* Agents on different cores exchange messages via mailbox
+* An agent sends an HTTP request through netd and receives a response
+* State transitions produce verifiable Merkle proofs
+* Energy accounting is consistent across native, WASM, and eBPF-lite execution
+* eBPF-lite programs enforce network-level policy at the netd broker
 
 ---
 
-## 26. Stage-4 Roadmap (Ecosystem and Hardware Integration)
+## 26. Stage-4 Roadmap (Ecosystem and Hardware)
 
-Stage-4 expands AOS beyond VM environments into full ecosystem infrastructure.
+Stage-4 expands AOS from a QEMU-only platform into a deployable system with real hardware support, distributed execution, and developer tooling.
 
 ### 26.1 Objectives
 
-* support hardware deployment
-* enable AI-native device environments
-* establish full agent economy stack
+* Run on real hardware (not just QEMU)
+* Support distributed agent execution across multiple nodes
+* Provide developer SDK and tooling for building and deploying agents
+* Establish security attestation for verifiable execution
 
 ### 26.2 Core Additions
 
-#### 26.2.1 Hardware Support Expansion
+#### 26.2.1 Hardware Support
 
-* virtio → real hardware drivers
-* storage devices
-* networking devices
-* optional GPU/NPU integration via broker model
+* **PCI bus enumeration**: discover and initialize devices on a real PCI bus
+* **NVMe storage driver**: replace virtio-blk with NVMe for real hardware deployment
+* **Real NIC driver**: e1000 or virtio-net on real hardware
+* **UEFI boot**: replace Multiboot v1 with UEFI boot path for modern hardware
+* **GPU/NPU access**: brokered through a system agent (gpud), not directly accessible to agents. The broker model from netd applies here.
 
-#### 26.2.2 Distributed Execution Layer
+#### 26.2.2 Distributed Execution
 
-* multi-node agent execution
-* remote mailbox routing
-* cross-node capability verification
+* **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes messages to a network transport layer.
+* **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list)
+* **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message.
+* **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state.
 
-#### 26.2.3 Tool Ecosystem
+#### 26.2.3 Developer SDK
 
-* standardized tool endpoints
-* external service integration
-* AI model inference endpoints
+* **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries
+* **Agent SDK (WASM)**: AssemblyScript or Rust-to-WASM toolchain for writing WASM agents with AOS syscall bindings
+* **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier
+* **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs)
 
-#### 26.2.4 Developer SDK
+#### 26.2.4 Security & Attestation
 
-* agent SDK
-* runtime SDK
-* deployment tooling
-* debugging and replay tools
-
-#### 26.2.5 Security & Attestation
-
-* execution proofs
-* remote attestation
-* trusted execution integration (optional)
+* **Execution proofs**: produce a cryptographic proof that a specific event log was generated by a specific checkpoint under deterministic replay
+* **Remote attestation**: a node can prove to a verifier that it is running unmodified AOS kernel code (via TPM or secure boot chain)
+* **Capability signing**: capabilities include an ed25519 signature from the granting agent, enabling offline verification of authority chains
 
 ### 26.3 Stage-4 Success Criteria
 
 Stage-4 is successful when:
 
-* AOS runs on real hardware
-* agents operate across distributed environments
-* external developers can build and deploy agents
-* system supports production-level workloads
+* AOS boots on real x86_64 hardware (not just QEMU)
+* An agent on node A sends a message to an agent on node B via remote mailbox
+* A developer writes, compiles, and deploys a WASM agent using the SDK
+* An execution proof can be independently verified by a third party
 
 ---
 
@@ -1301,38 +1447,36 @@ Stage-4 is successful when:
 
 AOS evolves from a minimal kernel into a foundational execution layer for the agent economy.
 
-Final architecture direction:
-
 ```text
-Human
-  ↓
-Agent Layer
-  ↓
-AOS Runtime Layer
-  ↓
-AOS Kernel (Layer 0)
-  ↓
-Hardware / Network
++-----------------------------------------+
+|         Applications / Users            |
++-----------------------------------------+
+|          Agent Layer (WASM/Native)       |
++-----------------------------------------+
+|    AOS Runtime (scheduler, IPC, caps)   |
++-----------------------------------------+
+|    AOS Kernel (mm, trap, syscall)       |
++-----------------------------------------+
+|    Hardware / Distributed Network       |
++-----------------------------------------+
 ```
 
-### 27.1 Final Role of AOS
+### 27.1 What AOS Is
 
-AOS is not:
+* An execution substrate for autonomous agents
+* A deterministic, replayable computation layer
+* A capability-secured runtime where every action is explicitly authorized
+* A bridge between AI systems, economic systems, and verifiable computation
 
-* a desktop OS
-* a Linux replacement
-* a general-purpose consumer system
+### 27.2 What AOS Is Not
 
-AOS is:
+* A desktop operating system
+* A Linux replacement for server administration
+* A general-purpose consumer platform
 
-* an execution substrate for agents
-* a deterministic computation layer
-* a capability-secured runtime environment
-* a bridge between AI systems and economic systems
+### 27.3 Closing Statement
 
-### 27.2 Final Statement
-
-> AOS begins as a minimal kernel, but evolves into the execution layer where autonomous systems operate, interact, and transact.
+> AOS begins as a minimal kernel. It evolves into the execution layer where autonomous systems operate, interact, and transact — with every action auditable, every resource budgeted, and every authority explicit.
 
 ---
 
