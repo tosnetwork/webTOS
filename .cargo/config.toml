@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+runner = "qemu-system-x86_64 -serial stdio -display none -no-reboot -no-shutdown -kernel"
+rustflags = ["-C", "code-model=kernel", "-C", "no-redzone=yes", "-C", "relocation-model=static"]

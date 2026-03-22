@@ -1,0 +1,15 @@
+[package]
+name = "aos"
+version = "0.1.0"
+edition = "2021"
+authors = ["AOS Project"]
+description = "AOS Stage-1: AI-native minimal operating system kernel"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+debug-assertions = false  # Avoid UB checks that panic on bare metal (e.g. ptr alignment)
+
+[profile.release]
+panic = "abort"
