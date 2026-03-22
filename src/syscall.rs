@@ -16,6 +16,7 @@ use crate::energy;
 use crate::sched;
 use crate::mailbox;
 use crate::state;
+use crate::arch::x86_64::paging;
 
 /// Dispatch a syscall from the current agent.
 ///
@@ -259,6 +260,219 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 Ok(()) => E_OK,
                 Err(e) => e,
             }
+        }
+
+        // ── 11: sys_cap_revoke ──────────────────────────────────────────
+        // a1 = target agent id, a2 = cap_type, a3 = cap_target
+        SYS_CAP_REVOKE => {
+            let target_agent = a1 as AgentId;
+            let cap_type_raw = a2 as u8;
+            let cap_target = a3 as u16;
+
+            let cap_type = match cap_type_raw {
+                0 => CapType::SendMailbox,
+                1 => CapType::RecvMailbox,
+                2 => CapType::EventEmit,
+                3 => CapType::AgentSpawn,
+                4 => CapType::StateRead,
+                5 => CapType::StateWrite,
+                _ => return E_INVALID_ARG,
+            };
+
+            match capability::revoke_cap(caller_id, target_agent, cap_type, cap_target) {
+                Ok(()) => {
+                    crate::event::cap_revoked(caller_id, target_agent as u64, cap_type as u64);
+                    E_OK
+                }
+                Err(e) => e,
+            }
+        }
+
+        // ── 12: sys_recv_nonblocking ─────────────────────────────────────
+        // a1 = mailbox id, a2 = buffer ptr, a3 = buffer capacity
+        SYS_RECV_NONBLOCKING => {
+            let mailbox_id = a1 as MailboxId;
+            let buf_len = a3 as usize;
+
+            match mailbox::recv_message(caller_id, mailbox_id) {
+                Ok(msg) => {
+                    let copy_len = (msg.len as usize).min(buf_len);
+                    if copy_len > 0 {
+                        unsafe {
+                            core::ptr::copy(
+                                msg.payload.as_ptr(),
+                                a2 as *mut u8,
+                                copy_len,
+                            );
+                        }
+                    }
+                    copy_len as i64
+                }
+                Err(_) => 0, // empty or error: return 0 immediately, no blocking
+            }
+        }
+
+        // ── 13: sys_send_blocking ────────────────────────────────────────
+        // a1 = target mailbox, a2 = payload ptr, a3 = payload len
+        SYS_SEND_BLOCKING => {
+            let target_mailbox = a1 as MailboxId;
+            let payload_len = a3 as usize;
+
+            if payload_len > MAX_MESSAGE_PAYLOAD {
+                return E_PAYLOAD_TOO_LARGE;
+            }
+
+            let payload = unsafe {
+                core::slice::from_raw_parts(a2 as *const u8, payload_len)
+            };
+
+            match mailbox::send_message(caller_id, target_mailbox, payload) {
+                Ok(()) => E_OK,
+                Err(E_MAILBOX_FULL) => {
+                    // Mailbox is full: block the sender
+                    serial_println!(
+                        "[SYSCALL] Agent {} blocking on full mailbox {}",
+                        caller_id, target_mailbox
+                    );
+                    mailbox::add_blocked_sender(target_mailbox, caller_id);
+                    sched::block_current(AgentStatus::BlockedSend);
+                    // When we resume, the mailbox may have space. Try sending again.
+                    // Re-read payload since we're resuming after context switch.
+                    let payload_retry = unsafe {
+                        core::slice::from_raw_parts(a2 as *const u8, payload_len)
+                    };
+                    match mailbox::send_message(caller_id, target_mailbox, payload_retry) {
+                        Ok(()) => E_OK,
+                        Err(e) => e,
+                    }
+                }
+                Err(e) => e,
+            }
+        }
+
+        // ── 14: sys_energy_grant ─────────────────────────────────────────
+        // a1 = target agent id, a2 = amount
+        SYS_ENERGY_GRANT => {
+            let target_agent = a1 as AgentId;
+            let amount = a2;
+
+            // Verify target is a direct child
+            if !crate::agent::is_child_of(target_agent, caller_id) {
+                return E_INVALID_ARG;
+            }
+
+            match energy::grant(caller_id, target_agent, amount) {
+                Ok(()) => {
+                    crate::event::energy_granted(caller_id, target_agent, amount);
+
+                    // If the child was Suspended and now has energy, move to Ready
+                    if let Some(agent) = get_agent_mut(target_agent) {
+                        if agent.status == AgentStatus::Suspended && agent.energy_budget > 0 {
+                            serial_println!(
+                                "[SYSCALL] Resuming suspended agent {} with {} energy",
+                                target_agent, agent.energy_budget
+                            );
+                            sched::enqueue(target_agent);
+                        }
+                    }
+
+                    E_OK
+                }
+                Err(e) => e,
+            }
+        }
+
+        // ── 15: sys_checkpoint ───────────────────────────────────────────
+        SYS_CHECKPOINT => {
+            if caller_id != ROOT_AGENT_ID {
+                return E_NO_CAP;
+            }
+
+            serial_println!("[SYSCALL] Checkpoint triggered by root agent");
+            crate::event::checkpoint_triggered(caller_id);
+            E_OK
+        }
+
+        // ── 16: sys_mmap ─────────────────────────────────────────────────
+        // a1 = num_pages
+        SYS_MMAP => {
+            let num_pages = a1 as u32;
+
+            if num_pages == 0 {
+                return E_INVALID_ARG;
+            }
+
+            // Check memory quota
+            let (memory_used, memory_quota) = match get_agent(caller_id) {
+                Some(agent) => (agent.memory_used, agent.memory_quota),
+                None => return E_INVALID_ARG,
+            };
+
+            if memory_used + num_pages > memory_quota {
+                return E_QUOTA_EXCEEDED;
+            }
+
+            // Allocate frames
+            let mut first_addr: u64 = 0;
+            let mut allocated: u32 = 0;
+
+            for i in 0..num_pages {
+                match paging::alloc_frame() {
+                    Some(addr) => {
+                        if i == 0 {
+                            first_addr = addr;
+                        }
+                        allocated += 1;
+                    }
+                    None => {
+                        // Roll back any frames we already allocated
+                        for j in 0..allocated {
+                            paging::dealloc_frame(first_addr + (j as u64) * 4096);
+                        }
+                        return E_QUOTA_EXCEEDED;
+                    }
+                }
+            }
+
+            // Update agent's memory usage
+            if let Some(agent) = get_agent_mut(caller_id) {
+                agent.memory_used += num_pages;
+            }
+
+            serial_println!(
+                "[SYSCALL] Agent {} mmap {} pages at {:#x}",
+                caller_id, num_pages, first_addr
+            );
+
+            first_addr as i64
+        }
+
+        // ── 17: sys_munmap ───────────────────────────────────────────────
+        // a1 = virtual_address, a2 = num_pages
+        SYS_MUNMAP => {
+            let vaddr = a1;
+            let num_pages = a2 as u32;
+
+            if num_pages == 0 {
+                return E_INVALID_ARG;
+            }
+
+            // Deallocate frames
+            for i in 0..num_pages {
+                paging::dealloc_frame(vaddr + (i as u64) * 4096);
+            }
+
+            // Decrement agent's memory usage
+            if let Some(agent) = get_agent_mut(caller_id) {
+                agent.memory_used = agent.memory_used.saturating_sub(num_pages);
+            }
+
+            serial_println!(
+                "[SYSCALL] Agent {} munmap {} pages at {:#x}",
+                caller_id, num_pages, vaddr
+            );
+
+            E_OK
         }
 
         _ => {

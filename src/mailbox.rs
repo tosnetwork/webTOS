@@ -5,10 +5,19 @@
 //! Messages carry kernel-stamped sender_id and tick for auditability.
 
 use crate::agent::{
-    AgentId, MailboxId, Tick, MAX_AGENTS, MAX_MAILBOX_CAPACITY, MAX_MESSAGE_PAYLOAD,
+    AgentId, AgentStatus, MailboxId, Tick, MAX_AGENTS, MAX_MAILBOX_CAPACITY, MAX_MESSAGE_PAYLOAD,
     E_MAILBOX_FULL, E_INVALID_ARG, E_NO_CAP, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE,
 };
 use crate::capability::{agent_try_cap, agent_has_cap, CapType};
+
+/// Maximum number of agents that can be blocked waiting to send on a single mailbox.
+const MAX_BLOCKED_SENDERS: usize = MAX_AGENTS;
+
+/// Tracks agents blocked waiting to send on each mailbox.
+///
+/// Safety: single-core, no preemption during access in Stage-1.
+static mut BLOCKED_SENDERS: [[Option<AgentId>; MAX_BLOCKED_SENDERS]; MAX_AGENTS] =
+    [[None; MAX_BLOCKED_SENDERS]; MAX_AGENTS];
 
 // ─── Message ────────────────────────────────────────────────────────────────
 
@@ -197,6 +206,12 @@ pub fn recv_message(agent_id: AgentId, mailbox_id: MailboxId) -> Result<Message,
         match mailbox.dequeue() {
             Some(msg) => {
                 crate::event::mailbox_recv(agent_id, mailbox_id, msg.len as u64);
+
+                // Check if any agent is BlockedSend on this mailbox and unblock them
+                if let Some(blocked_id) = try_unblock_sender(mailbox_id) {
+                    crate::sched::unblock(blocked_id);
+                }
+
                 Ok(msg)
             }
             None => Err(E_NOT_FOUND),
@@ -232,6 +247,67 @@ pub fn get_mailbox(id: MailboxId) -> Option<&'static Mailbox> {
 /// Used by syscall.rs to unblock a receiver when a message is sent.
 pub fn get_mailbox_owner(id: MailboxId) -> Option<AgentId> {
     get_mailbox(id).map(|m| m.owner)
+}
+
+/// Register an agent as blocked waiting to send on a mailbox.
+///
+/// Called when sys_send_blocking encounters a full mailbox.
+pub fn add_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_AGENTS {
+            return;
+        }
+        for slot in BLOCKED_SENDERS[idx].iter_mut() {
+            if slot.is_none() {
+                *slot = Some(agent_id);
+                return;
+            }
+        }
+    }
+}
+
+/// Remove a blocked sender from the waiting list for a mailbox.
+fn remove_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_AGENTS {
+            return;
+        }
+        for slot in BLOCKED_SENDERS[idx].iter_mut() {
+            if *slot == Some(agent_id) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+}
+
+/// Try to unblock one sender that is waiting on a given mailbox.
+///
+/// Called after a successful dequeue to wake up a blocked sender.
+/// Returns the unblocked agent ID if any.
+pub fn try_unblock_sender(mailbox_id: MailboxId) -> Option<AgentId> {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_AGENTS {
+            return None;
+        }
+        for slot in BLOCKED_SENDERS[idx].iter_mut() {
+            if let Some(agent_id) = *slot {
+                // Check that the agent is actually still BlockedSend
+                if let Some(agent) = crate::agent::get_agent(agent_id) {
+                    if agent.status == AgentStatus::BlockedSend {
+                        *slot = None;
+                        return Some(agent_id);
+                    }
+                }
+                // Agent no longer blocked, clean up stale entry
+                *slot = None;
+            }
+        }
+        None
+    }
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────────────

@@ -86,3 +86,31 @@ pub fn replenish(agent_id: AgentId, amount: EnergyUnit) {
         agent.energy_budget = agent.energy_budget.saturating_add(amount);
     }
 }
+
+/// Transfer energy from one agent (parent) to another (child).
+///
+/// Decreases the caller's budget by `amount` and increases the target's budget.
+/// Returns an error if the caller lacks sufficient energy.
+pub fn grant(from_id: AgentId, to_id: AgentId, amount: EnergyUnit) -> Result<(), i64> {
+    // Check caller has enough energy
+    let from_agent = match crate::agent::get_agent_mut(from_id) {
+        Some(a) => a,
+        None => return Err(crate::agent::E_INVALID_ARG),
+    };
+
+    if from_agent.energy_budget < amount {
+        return Err(crate::agent::E_NO_BUDGET);
+    }
+
+    from_agent.energy_budget -= amount;
+
+    // Add to the target agent
+    let to_agent = match crate::agent::get_agent_mut(to_id) {
+        Some(a) => a,
+        None => return Err(crate::agent::E_INVALID_ARG),
+    };
+
+    to_agent.energy_budget = to_agent.energy_budget.saturating_add(amount);
+
+    Ok(())
+}

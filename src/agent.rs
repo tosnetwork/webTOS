@@ -37,6 +37,13 @@ pub const SYS_EVENT_EMIT: u64 = 7;
 pub const SYS_ENERGY_GET: u64 = 8;
 pub const SYS_STATE_GET: u64 = 9;
 pub const SYS_STATE_PUT: u64 = 10;
+pub const SYS_CAP_REVOKE: u64 = 11;
+pub const SYS_RECV_NONBLOCKING: u64 = 12;
+pub const SYS_SEND_BLOCKING: u64 = 13;
+pub const SYS_ENERGY_GRANT: u64 = 14;
+pub const SYS_CHECKPOINT: u64 = 15;
+pub const SYS_MMAP: u64 = 16;
+pub const SYS_MUNMAP: u64 = 17;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -48,6 +55,7 @@ pub const E_NO_BUDGET: i64 = -4;
 pub const E_NOT_FOUND: i64 = -5;
 pub const E_QUOTA_EXCEEDED: i64 = -6;
 pub const E_PAYLOAD_TOO_LARGE: i64 = -7;
+pub const E_CHECKPOINT_NOT_ROOT: i64 = -9;
 
 // ─── Agent status ───────────────────────────────────────────────────────────
 

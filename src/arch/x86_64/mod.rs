@@ -9,6 +9,7 @@ pub mod serial;
 pub mod paging;
 pub mod timer;
 pub mod context;
+pub mod ata;
 
 pub use serial::{serial_print, serial_println};
 

@@ -34,6 +34,9 @@ pub enum EventType {
     CapabilityDenied = 14,
     CapabilityGranted = 15,
     Custom = 16,
+    CheckpointTriggered = 17,
+    CapRevoked = 18,
+    EnergyGranted = 19,
 }
 
 impl EventType {
@@ -57,6 +60,9 @@ impl EventType {
             EventType::CapabilityDenied => "CAPABILITY_DENIED",
             EventType::CapabilityGranted => "CAPABILITY_GRANTED",
             EventType::Custom => "CUSTOM",
+            EventType::CheckpointTriggered => "CHECKPOINT_TRIGGERED",
+            EventType::CapRevoked => "CAP_REVOKED",
+            EventType::EnergyGranted => "ENERGY_GRANTED",
         }
     }
 }
@@ -181,4 +187,19 @@ pub fn syscall_failed(agent_id: AgentId, syscall_nr: u64, error: i64) {
 /// Emit an agent suspended event.
 pub fn agent_suspended(agent_id: AgentId, reason: u64) {
     emit(agent_id, EventType::AgentSuspended, reason, 0, 0);
+}
+
+/// Emit a checkpoint triggered event.
+pub fn checkpoint_triggered(agent_id: AgentId) {
+    emit(agent_id, EventType::CheckpointTriggered, 0, 0, 0);
+}
+
+/// Emit a capability revoked event.
+pub fn cap_revoked(agent_id: AgentId, target_agent: u64, cap_type: u64) {
+    emit(agent_id, EventType::CapRevoked, target_agent, cap_type, 0);
+}
+
+/// Emit an energy granted event.
+pub fn energy_granted(from_id: AgentId, to_id: AgentId, amount: u64) {
+    emit(from_id, EventType::EnergyGranted, to_id as u64, amount, 0);
 }

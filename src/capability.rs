@@ -6,7 +6,7 @@
 
 use crate::agent::{
     AgentId, CAP_TARGET_WILDCARD,
-    MAX_CAPABILITIES_PER_AGENT, E_NO_CAP, E_QUOTA_EXCEEDED, E_INVALID_ARG,
+    MAX_CAPABILITIES_PER_AGENT, E_NO_CAP, E_QUOTA_EXCEEDED, E_INVALID_ARG, E_NOT_FOUND,
 };
 
 // ─── Capability types ───────────────────────────────────────────────────────
@@ -177,6 +177,42 @@ pub fn grant_cap(from_id: AgentId, to_id: AgentId, cap: Capability) -> Result<()
     to_agent.cap_count += 1;
 
     Ok(())
+}
+
+/// Revoke a capability from a direct child agent.
+///
+/// The revoking agent must be the parent of the target agent.
+/// Finds and removes the first matching capability from the child's array.
+pub fn revoke_cap(from_id: AgentId, to_id: AgentId, cap_type: CapType, cap_target: u16) -> Result<(), i64> {
+    // Verify target is a direct child of the revoking agent
+    if !crate::agent::is_child_of(to_id, from_id) {
+        return Err(E_INVALID_ARG);
+    }
+
+    // Find and remove the matching capability from the child
+    let to_agent = match crate::agent::get_agent_mut(to_id) {
+        Some(a) => a,
+        None => return Err(E_INVALID_ARG),
+    };
+
+    for i in 0..to_agent.cap_count {
+        if let Some(ref cap) = to_agent.capabilities[i] {
+            if cap.cap_type == cap_type && cap.target == cap_target {
+                // Remove by shifting remaining capabilities down
+                let mut j = i;
+                while j + 1 < to_agent.cap_count {
+                    to_agent.capabilities[j] = to_agent.capabilities[j + 1];
+                    j += 1;
+                }
+                to_agent.capabilities[to_agent.cap_count - 1] = None;
+                to_agent.cap_count -= 1;
+                return Ok(());
+            }
+        }
+    }
+
+    // No matching capability found
+    Err(E_NOT_FOUND)
 }
 
 /// Create the full set of wildcard capabilities for the root agent.

@@ -4,8 +4,12 @@
 
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
 
 pub mod arch;
+mod heap;
 mod panic;
 mod logger;
 mod agent;
@@ -14,11 +18,14 @@ mod capability;
 mod energy;
 mod event;
 mod state;
+mod persist;
 mod sched;
 mod syscall;
 mod trap;
 mod init;
 mod agents;
+mod ebpf;
+mod wasm;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
