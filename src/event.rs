@@ -37,6 +37,8 @@ pub enum EventType {
     CheckpointTriggered = 17,
     CapRevoked = 18,
     EnergyGranted = 19,
+    MailboxPressure = 20,
+    ChildAdopted = 21,
 }
 
 impl EventType {
@@ -63,6 +65,8 @@ impl EventType {
             EventType::CheckpointTriggered => "CHECKPOINT_TRIGGERED",
             EventType::CapRevoked => "CAP_REVOKED",
             EventType::EnergyGranted => "ENERGY_GRANTED",
+            EventType::MailboxPressure => "MAILBOX_PRESSURE",
+            EventType::ChildAdopted => "CHILD_ADOPTED",
         }
     }
 }
@@ -111,6 +115,18 @@ pub fn emit(agent_id: AgentId, event_type: EventType, arg0: u64, arg1: u64, stat
             "[EVENT seq={} tick={} agent={} type={} arg0={} arg1={} status={}]",
             seq, t, agent_id, event_type.as_str(), arg0, arg1, status
         );
+
+        // Also push to in-kernel ring buffer for high-throughput consumption
+        let event = Event {
+            sequence: seq,
+            tick: t,
+            agent_id,
+            event_type,
+            arg0,
+            arg1,
+            status,
+        };
+        crate::ringbuf::ring_push(event);
     }
 }
 
@@ -208,4 +224,15 @@ pub fn cap_revoked(agent_id: AgentId, target_agent: u64, cap_type: u64) {
 /// Emit an energy granted event.
 pub fn energy_granted(from_id: AgentId, to_id: AgentId, amount: u64) {
     emit(from_id, EventType::EnergyGranted, to_id as u64, amount, 0);
+}
+
+/// Emit a mailbox pressure event when a mailbox exceeds 75% capacity.
+pub fn mailbox_pressure(mailbox_id: u16, current_count: u64, capacity: u64) {
+    emit(mailbox_id as crate::agent::AgentId, EventType::MailboxPressure,
+        current_count, capacity, 0);
+}
+
+/// Emit a child-adopted event when an orphan is reparented to a new parent.
+pub fn child_adopted(child_id: AgentId, new_parent: AgentId, old_parent: AgentId) {
+    emit(child_id, EventType::ChildAdopted, new_parent as u64, old_parent as u64, 0);
 }

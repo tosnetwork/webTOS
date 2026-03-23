@@ -21,6 +21,15 @@ fn panic(info: &PanicInfo) -> ! {
     // persist module may not be in a consistent state, but try anyway
     // (the CRC32 on each entry will catch corruption on next boot)
 
+    // Best-effort: try to write any pending state to disk
+    // The CRC32 on each entry will catch corruption on next boot
+    if crate::arch::x86_64::ata::init() {
+        crate::serial_println!("[PANIC] ATA disk found, flushing...");
+        // Trigger a checkpoint save (may partially fail, that's OK)
+        let _ = crate::checkpoint::save_to_disk();
+        crate::serial_println!("[PANIC] Emergency checkpoint attempted");
+    }
+
     // Emit a final audit event
     crate::serial_println!("[EVENT seq=PANIC tick={} agent=KERNEL type=KERNEL_PANIC]",
         crate::arch::x86_64::timer::get_ticks());

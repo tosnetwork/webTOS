@@ -175,6 +175,14 @@ pub fn send_message(sender_id: AgentId, target_mailbox: MailboxId, payload: &[u8
         let msg = Message::new(sender_id, tick, payload);
         mailbox.enqueue(msg)?;
 
+        // Check for backpressure: emit MAILBOX_PRESSURE if > 75% full
+        let count = mailbox.count;
+        let capacity = MAX_MAILBOX_CAPACITY;
+        if count * 4 > capacity * 3 {
+            // Over 75% — emit pressure event
+            crate::event::mailbox_pressure(target_mailbox, count as u64, capacity as u64);
+        }
+
         crate::event::mailbox_send(sender_id, target_mailbox, payload.len() as u64);
         Ok(())
     }

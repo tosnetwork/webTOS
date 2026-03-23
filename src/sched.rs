@@ -6,6 +6,7 @@
 
 use crate::serial_println;
 use crate::agent::*;
+use crate::agent::AgentPriority;
 use crate::arch::x86_64::context::context_switch;
 use crate::agent::AgentMode;
 use crate::arch::x86_64::gdt;
@@ -205,6 +206,14 @@ pub fn schedule() {
         let mut found = IDLE_AGENT_ID;
         if rq.len > 0 {
             let start = rq.current_index % rq.len.max(1);
+
+            // Find highest-priority Ready agent (lowest AgentPriority value).
+            // Among agents with equal priority, round-robin by picking the
+            // first one encountered from the current index.
+            let mut best_id = IDLE_AGENT_ID;
+            let mut best_priority = AgentPriority::Background as u8 + 1; // worse than worst
+            let mut best_idx = 0;
+
             for offset in 0..rq.len {
                 let idx = (start + offset) % rq.len;
                 if let Some(agent_id) = rq.queue[idx] {
@@ -219,15 +228,26 @@ pub fn schedule() {
                             if on_ap && agent.mode == AgentMode::User {
                                 continue;
                             }
-                            // Claim this agent under the lock
-                            agent.status = AgentStatus::Running;
-                            rq.current_index = (idx + 1) % rq.len.max(1);
-                            found = agent_id;
-                            break;
+
+                            let p = agent.priority as u8;
+                            if p < best_priority {
+                                best_priority = p;
+                                best_id = agent_id;
+                                best_idx = idx;
+                            }
                         }
                     }
                 }
             }
+
+            // Mark the best agent as Running
+            if best_id != IDLE_AGENT_ID {
+                if let Some(agent) = get_agent_mut(best_id) {
+                    agent.status = AgentStatus::Running;
+                }
+                rq.current_index = (best_idx + 1) % rq.len.max(1);
+            }
+            found = best_id;
         }
         found
     };

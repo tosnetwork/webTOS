@@ -62,6 +62,19 @@ pub const E_PAYLOAD_TOO_LARGE: i64 = -7;
 pub const E_CHECKPOINT_NOT_ROOT: i64 = -9;
 pub const E_TIMEOUT: i64 = -10;
 
+// ─── Agent priority ─────────────────────────────────────────────────────────
+
+/// Agent scheduling priority (lower number = higher priority).
+/// This is a scheduling hint, not a security feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum AgentPriority {
+    SystemCritical = 0,  // idle, root
+    SystemService = 1,   // stated, policyd, accountd, netd
+    Normal = 2,          // user agents (default)
+    Background = 3,      // batch/idle workloads
+}
+
 // ─── Agent mode ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +189,7 @@ pub struct Agent {
     pub kernel_stack_top: u64,
     pub stack_bottom: u64,   // address of stack guard canary (lowest stack address)
     pub active: bool,       // whether this slot is in use
+    pub priority: AgentPriority,
 }
 
 impl Agent {
@@ -206,6 +220,7 @@ impl Agent {
             kernel_stack_top: 0,
             stack_bottom: 0,
             active: true,
+            priority: AgentPriority::Normal,
         }
     }
 }
@@ -306,10 +321,19 @@ pub fn terminate_agent(id: AgentId, status: AgentStatus) {
             }
         }
 
-        // Recursively terminate children first
+        // Reparent children to root agent (instead of cascade termination)
         for i in 0..child_count {
             if let Some(child_id) = children[i] {
-                terminate_agent(child_id, AgentStatus::Faulted);
+                for slot in AGENT_TABLE.iter_mut() {
+                    if let Some(agent) = slot {
+                        if agent.id == child_id && agent.active {
+                            agent.parent_id = Some(ROOT_AGENT_ID);
+                            break;
+                        }
+                    }
+                }
+                // Emit audit event for reparenting
+                crate::event::child_adopted(child_id, ROOT_AGENT_ID, id);
             }
         }
 

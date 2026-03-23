@@ -274,6 +274,25 @@ pub fn init() {
             .try_into()
             .unwrap_or_else(|_| unreachable!());
 
+        // Check for empty sector (all-zero sequence means end of log)
+        let sequence = get_u64(buf, 0);
+        if sequence == 0 {
+            unsafe { NEXT_SECTOR = sector; }
+            break;
+        }
+
+        // Verify CRC32 of the entry before replaying
+        let stored_crc = get_u32(buf, CRC_OFFSET);
+        let computed_crc = crc32(&buf[..CRC_OFFSET]);
+        if stored_crc != computed_crc {
+            crate::serial_println!(
+                "[persist] CRC mismatch at sector {} (stored={:#010x}, computed={:#010x}), truncating log",
+                sector, stored_crc, computed_crc
+            );
+            unsafe { NEXT_SECTOR = sector; }
+            break; // Stop replay — this entry was partially written during a crash
+        }
+
         match deserialize_entry(buf) {
             Some((sequence, keyspace_id, key, len)) => {
                 let value = &sector_buf[VALUE_OFFSET..VALUE_OFFSET + len];
@@ -288,7 +307,8 @@ pub fn init() {
                 replayed += 1;
             }
             None => {
-                // End of log (empty sector or CRC error)
+                // Entry was invalid (e.g., len > MAX_VALUE_SIZE)
+                crate::serial_println!("[persist] invalid entry at sector {}, stopping replay", sector);
                 unsafe { NEXT_SECTOR = sector; }
                 break;
             }

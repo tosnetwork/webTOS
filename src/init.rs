@@ -6,6 +6,7 @@
 
 use crate::serial_println;
 use crate::agent::*;
+use crate::agent::AgentPriority;
 use crate::capability::*;
 use crate::sched;
 use crate::mailbox;
@@ -212,6 +213,7 @@ pub fn init() {
     ).expect("Failed to create idle agent");
     if let Some(agent) = get_agent_mut(idle_id) {
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[0].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemCritical;
     }
     serial_println!("[INIT] Idle agent created: id={}", idle_id);
 
@@ -231,6 +233,7 @@ pub fn init() {
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[1].as_ptr() as u64 };
         agent.capabilities = root_caps;
         agent.cap_count = ROOT_CAP_COUNT;
+        agent.priority = AgentPriority::SystemCritical;
     }
 
     // Create mailbox and keyspace for root
@@ -287,6 +290,7 @@ pub fn init() {
     {
         let agent = get_agent_mut(stated_id).expect("Stated agent not found");
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[5].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -310,6 +314,7 @@ pub fn init() {
     {
         let agent = get_agent_mut(policyd_id).expect("Policyd agent not found");
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[6].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -350,6 +355,7 @@ pub fn init() {
     {
         let agent = get_agent_mut(accountd_id).expect("Accountd agent not found");
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[8].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -371,6 +377,7 @@ pub fn init() {
     {
         let agent = get_agent_mut(netd_id).expect("Netd agent not found");
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[9].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
