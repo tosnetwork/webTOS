@@ -1957,14 +1957,14 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 ### 26.1 Objectives
 
-* Run on real hardware (not just QEMU) `[IMPL: ⚠️ UEFI boot works on QEMU+OVMF; real hardware untested]`
+* Run on real hardware (not just QEMU) `[IMPL: ⚠️ UEFI+GOP+framebuffer console ready; QEMU+OVMF verified; awaiting physical machine test]`
 * Support distributed agent execution across multiple nodes `[IMPL: ✅ routerd + UDP + capability signing + cross-node test passing]`
 * Provide developer SDK and tooling for building and deploying agents `[IMPL: ✅ sdk/aos-sdk + sdk/aos-wasm-sdk + sdk/aos-cli]`
 * Establish security attestation for verifiable execution `[IMPL: ✅ attestation.rs + capability signing + proof verifier implemented]`
 
 ### 26.2 Core Additions
 
-#### 26.2.1 UEFI Boot `[IMPL: ❌ not yet implemented]`
+#### 26.2.1 UEFI Boot `[IMPL: ✅ uefi/ crate — PE/COFF app, GOP framebuffer, memory map parsing]`
 
 Replace Multiboot v1 with UEFI boot for modern hardware. UEFI provides a standardized firmware interface, memory map, and GOP framebuffer.
 
@@ -1989,9 +1989,9 @@ UEFI firmware
 
 **Implementation:**
 
-* `asm/uefi_entry.asm` or Rust-based UEFI application using `uefi-rs` patterns (no external crate — implement minimal EFI protocol handling from scratch)
-* Parse UEFI memory map to initialize frame allocator (replaces Multiboot memory info)
-* GOP framebuffer discovery (optional, serial remains primary output)
+* `asm/uefi_entry.asm` or Rust-based UEFI application using `uefi-rs` patterns (no external crate — implement minimal EFI protocol handling from scratch) `[IMPL: ✅ uefi/ Rust crate, x86_64-unknown-uefi target, hand-crafted UEFI FFI]`
+* Parse UEFI memory map to initialize frame allocator (replaces Multiboot memory info) `[IMPL: ✅ init_from_uefi_mmap() in paging.rs; BootInfo at 0x7000]`
+* GOP framebuffer discovery (optional, serial remains primary output) `[IMPL: ✅ LocateProtocol(GOP), framebuffer.rs 8x16 VGA font, serial mirrored to screen]`
 
 #### 26.2.2 PCI Bus Enumeration `[IMPL: ✅ src/arch/x86_64/pci.rs — enumeration + BAR decoding]`
 
@@ -2305,7 +2305,7 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 
 Stage-4 is successful when:
 
-* AOS boots on real x86_64 hardware (not just QEMU) `[IMPL: ⚠️ UEFI boot works on QEMU+OVMF; real hardware untested]`
+* AOS boots on real x86_64 hardware (not just QEMU) `[IMPL: ⚠️ UEFI+GOP framebuffer ready; QEMU+OVMF verified; REAL_HARDWARE_TEST.md written; awaiting physical machine]`
 * An agent on node A sends a message to an agent on node B via remote mailbox `[IMPL: ✅ routerd + UDP routing; cross-node test (2 QEMU nodes) passing]`
 * A developer writes, compiles, and deploys a WASM agent using the SDK `[IMPL: ✅ sdk/aos-sdk + sdk/aos-wasm-sdk + sdk/aos-cli all implemented]`
 * An execution proof can be independently verified by a third party `[IMPL: ✅ sdk/aos-cli verify + proof.rs verify_proof_standalone]`
