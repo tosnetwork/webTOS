@@ -210,6 +210,15 @@ pub fn schedule() {
                 if let Some(agent_id) = rq.queue[idx] {
                     if let Some(agent) = get_agent_mut(agent_id) {
                         if agent.status == AgentStatus::Ready {
+                            // On AP cores, skip ring-3 agents: they need
+                            // CURRENT_KERNEL_RSP which is a BSP-only global.
+                            // Kernel-mode agents use direct Rust calls, not
+                            // the SYSCALL instruction, so they are safe on APs.
+                            let on_ap = crate::arch::x86_64::lapic::is_active()
+                                && crate::arch::x86_64::lapic::id() != 0;
+                            if on_ap && agent.mode == AgentMode::User {
+                                continue;
+                            }
                             // Claim this agent under the lock
                             agent.status = AgentStatus::Running;
                             rq.current_index = (idx + 1) % rq.len.max(1);
