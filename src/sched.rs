@@ -244,6 +244,20 @@ pub fn schedule() {
         let new_ctx = &new_agent.context as *const AgentContext;
 
         context_switch(old_ctx, new_ctx);
+
+        // Debug: after resuming, check if agent 6's stack was corrupted
+        // by inspecting the canary value we placed at the stack top area
+        if CURRENT_AGENT_ID == 6 {
+            // We just resumed as agent 6. Check the return address
+            // that `ret` will pop. If it's 0x0202020202020202, log WHO corrupted it.
+            let rsp: u64;
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
+            let top_of_stack = core::ptr::read_volatile(rsp as *const u64);
+            if top_of_stack == 0x0202020202020202 {
+                serial_println!("[SCHED-CORRUPT] Agent 6 stack corrupted! rsp={:#x} value={:#x} old_id={} next_id={}",
+                    rsp, top_of_stack, old_id, next_id);
+            }
+        }
         // We reach here when this agent is resumed by another context_switch.
         // Re-enable interrupts.
         core::arch::asm!("sti", options(nomem, nostack));

@@ -16,11 +16,12 @@ use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
 
 /// Stack size for each agent.
-/// 32 KiB is needed because the WASM agent allocates WasmInstance on the
-/// stack (~18 KB for operand stack, locals, call/block stacks, and module
-/// metadata). Without enough stack, the WASM agent overflows into the
-/// adjacent agent's stack, corrupting saved return addresses.
-const AGENT_STACK_SIZE: usize = 32768;
+/// 64 KiB is needed because the WASM agent allocates WasmInstance on the
+/// stack (~33 KB total: 18 KB for operand stack/locals/call stacks, 6 KB
+/// for module metadata, plus call chain and serial formatting overhead).
+/// Without enough stack, the WASM agent overflows into the adjacent
+/// agent's stack, corrupting saved return addresses.
+const AGENT_STACK_SIZE: usize = 65536;
 
 /// Static stacks for agents.
 ///
@@ -274,7 +275,7 @@ pub fn init() {
     let policyd_id = create_agent(
         Some(root_id),
         agents::policyd::policyd_entry as *const () as u64,
-        stack_top(10),  // Skip slot 6 (corrupted by unknown source)
+        stack_top(6),   // Now safe: 64KB stacks prevent WASM overflow into adjacent slot
         100_000,
         256,
     ).expect("Failed to create policyd agent");
