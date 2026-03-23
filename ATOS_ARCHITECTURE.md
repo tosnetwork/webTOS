@@ -294,6 +294,120 @@ Manages energy credit deposits and consumption settlement. External payers depos
 
 ---
 
+## From VM to RM: ATOS as a Hardware-Native Ethereum
+
+### The Core Insight
+
+Ethereum's EVM is a **Virtual Machine** — it executes deterministic, metered, capability-scoped computation, but it is trapped inside a host OS process. It cannot drive hardware, cannot schedule autonomously, and cannot execute unless triggered by an external transaction.
+
+ATOS takes the same computational model and turns it into a **Real Machine** — an operating system that runs directly on x86_64 hardware, drives its own devices, and executes agents on its own schedule.
+
+```
+EVM: Smart contract bytecode → runs inside geth → runs inside Linux → runs on hardware
+ATOS: Agent code (WASM/native) → runs on ATOS kernel → runs on hardware (direct)
+```
+
+### Structural Isomorphism
+
+The conceptual mapping between EVM and ATOS is nearly 1:1:
+
+| EVM (Virtual Machine) | ATOS (Real Machine) | Why It Matters |
+|---|---|---|
+| Smart Contract | Agent | Both are isolated execution units with explicit identity |
+| Gas | Energy Budget | Both meter execution cost and prevent infinite loops |
+| msg.sender + require() | Capability token | Both enforce explicit authorization on every action |
+| Storage (slot-based) | State Object (keyspace) | Both provide structured, Merkle-backed persistent state |
+| Transaction | Mailbox Message | Both are the unit of inter-entity communication |
+| Transaction Receipt | ExecutionReceipt (Stage-9) | Both prove what happened during execution |
+| Merkle Patricia Trie | Merkle State Tree | Both enable external state verification without full replay |
+| EVM bytecode | WASM bytecode | Both are deterministic, fuel-metered instruction sets |
+| Genesis Block | ATOS Genesis (§4.5) | Both bootstrap the initial authority, state, and budget |
+| Contract deployment | Agent spawn (sys_spawn) | Both create new execution units with delegated resources |
+| SELFDESTRUCT | sys_exit | Both terminate an execution unit and reclaim resources |
+| DELEGATECALL | Capability delegation | Both allow controlled authority transfer |
+| Block number | Kernel tick counter | Both provide a logical clock for ordering |
+| Event logs (LOG0-LOG4) | Audit event log | Both emit structured, indexable execution evidence |
+
+### What ATOS Adds Beyond EVM
+
+The EVM model has fundamental limitations that ATOS overcomes by being a real operating system:
+
+#### 1. Hardware Control
+
+EVM has zero hardware access — it runs inside a process on a host OS. ATOS drives hardware directly:
+
+- **NVMe/ATA storage**: persistent state without relying on a host filesystem
+- **NIC (e1000/virtio-net)**: network access brokered through the netd system agent
+- **LAPIC timer**: preemptive scheduling at 100 Hz, no external trigger needed
+- **PCI bus**: device discovery and initialization at boot
+
+#### 2. Autonomous Execution
+
+EVM contracts are **passive** — they execute only when an external transaction arrives. Between transactions, they are inert.
+
+ATOS agents are **active** — the kernel's timer interrupt drives preemptive scheduling. Agents can:
+
+- Run continuously without external triggers
+- Wake on timer ticks (periodic tasks, heartbeats, monitoring)
+- Block on mailbox receive and resume when a message arrives
+- Execute background computation across scheduling quanta
+
+This is the difference between a **stored procedure** (EVM) and a **running process** (ATOS).
+
+#### 3. Multiple Runtime Backends
+
+EVM supports exactly one bytecode format (EVM opcodes). ATOS supports three:
+
+| Runtime | Use Case | Determinism |
+|---------|----------|-------------|
+| **Native x86_64** | High-performance agents, system services | Partial (scheduling-level) |
+| **WASM** | Portable, deterministic, proof-grade agents | Full (fuel-counted) |
+| **eBPF-lite** | Kernel-resident policy enforcement | Full (verified, bounded) |
+
+An agent platform can mix runtimes: system agents (stated, policyd, netd) run native for performance, while user agents run in WASM for deterministic replay and proof.
+
+#### 4. Asynchronous IPC
+
+EVM's CALL opcode is **synchronous and nested** — contract A calls contract B, which calls contract C, all within a single transaction's call stack. This creates reentrancy vulnerabilities and deep stack coupling.
+
+ATOS uses **asynchronous mailbox messaging** — agent A sends a message to agent B's mailbox and continues (or blocks waiting for a reply). There is no shared call stack. This eliminates reentrancy by design and enables natural concurrency patterns.
+
+#### 5. Multi-Core Parallelism
+
+EVM is **strictly single-threaded** — one transaction executes at a time, globally ordered. This is a fundamental throughput bottleneck.
+
+ATOS supports **SMP multi-core** scheduling — multiple agents execute in parallel on different CPU cores, with spinlock-protected shared kernel structures. Cross-core communication uses the same mailbox IPC.
+
+#### 6. Brokered Resource Access
+
+EVM has no concept of external resource access from within the VM. Oracles are external hacks bolted on through transactions.
+
+ATOS has **system agents as resource brokers**:
+
+- **netd**: network access (HTTP, UDP) gated by CAP_NETWORK capability
+- **stated**: persistent state management for shared keyspaces
+- **policyd**: eBPF-lite policy loading and management
+- **accountd**: energy accounting queries
+
+Every resource access is capability-checked, metered, and audit-logged — the same trust model as the core execution, extended to I/O.
+
+### Why This Matters
+
+The EVM proved that **metered, capability-scoped, deterministic execution with Merkle-backed state** is a powerful model for trustless computation. But it was designed as a component embedded inside a blockchain node, not as a standalone system.
+
+ATOS takes that proven model and asks: what if the execution engine **was** the operating system? What if it could drive its own hardware, schedule its own agents, manage its own storage, and produce its own verifiable receipts — without depending on a host OS or requiring global consensus for every computation?
+
+The result is an execution substrate that inherits the trust properties of a smart contract platform while operating at bare-metal speed with full hardware sovereignty.
+
+```
+Ethereum's path:    Hardware → Linux → geth → EVM → Smart Contract
+ATOS's path:        Hardware → ATOS kernel → Agent (direct)
+```
+
+One is a VM living inside software layers. The other is the machine itself.
+
+---
+
 ## Summary
 
 | Question | Answer |
