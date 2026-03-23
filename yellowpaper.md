@@ -345,8 +345,21 @@ The kernel must handle:
 * faults `[IMPL: ✅ vectors 0-19, agent faulted + reschedule]`
 * invalid instructions `[IMPL: ✅ vector 6]`
 * protection violations `[IMPL: ✅ vectors 13, 14]`
-* timer interrupts `[IMPL: ✅ PIT IRQ0 → vector 32, 100 Hz]`
+* double faults (vector 8): handled via IST1 separate stack `[IMPL: ✅ GDT TSS IST1]`
+* timer interrupts `[IMPL: ✅ PIT IRQ0 → vector 32, 100 Hz; LAPIC timer in Stage-3]`
 * software interrupts or syscall entry `[IMPL: ✅ direct call in Stage-1, syscall_entry.asm ready for ring-3]`
+* NMI (vector 2): non-maskable interrupts from hardware errors `[IMPL: ⏳ deferred to Stage-4]`
+
+#### 7.1.3.1 Kernel Panic Policy
+
+When the kernel encounters an unrecoverable error, the panic handler must:
+
+1. Disable interrupts to prevent further state changes
+2. Print the panic location and message to serial (best-effort)
+3. If a disk is available: attempt to flush the state log and write an emergency checkpoint (best-effort, non-atomic)
+4. Halt all CPU cores (send NMI IPI to APs in SMP mode)
+
+Stage-4 adds: automatic reboot via ACPI reset register after a configurable timeout, and kdump-equivalent core dump to disk for post-mortem analysis.
 
 #### 7.1.4 Scheduling
 
@@ -525,8 +538,17 @@ The root agent's entry point is a compiled-in initialization function that spawn
 7. Execute until yield, block, exit, budget exhaustion, or fault.
 8. On budget exhaustion, the agent is suspended (see §13.3). It may be resumed if budget is replenished.
 9. On termination (`sys_exit` or fault), the kernel reclaims all resources (mailbox, memory, capabilities) and moves the agent to a terminal state.
-10. When a parent agent terminates, all its direct children are **cascading-terminated** (moved to `Faulted` with a "parent exited" reason). This cascades recursively to all descendants. Stage-1 implements immediate cascading termination; later stages may support reparenting to the root agent as an alternative policy.
+10. When a parent agent terminates, orphan handling policy applies (see §10.5).
 11. Emit audit events throughout lifecycle.
+
+### 10.5 Orphan Handling
+
+When a parent agent terminates, its children become orphans. AOS supports two policies, selectable at compile time:
+
+* **Cascade termination** (Stage-1 default): all direct children are immediately moved to `Faulted` with reason "parent exited". This cascades recursively to all descendants. Simple but harsh — no grace period.
+* **Reparenting to root** (Stage-3+): orphaned children are adopted by the root agent. Their `parent_id` is updated to `ROOT_AGENT_ID`. The root agent receives a `CHILD_ADOPTED` audit event for each reparented child. Children continue running with their existing capabilities and energy budget. This is analogous to Linux's `init` process (PID 1) adopting orphans.
+
+The reparenting policy is preferred for production deployments because it allows children to complete in-flight work. System agents (stated, policyd, netd) should always use reparenting to prevent service disruption when the root agent is restarted.
 
 ---
 
@@ -563,14 +585,23 @@ Message {
 
 Use a ring-buffer mailbox with fixed-size messages. The recommended maximum payload size for Stage-1 is **256 bytes**. This keeps the ring buffer implementation simple with fixed-slot allocation. Messages exceeding this limit must be rejected with an explicit error.
 
-### 11.4 Future direction
+### 11.4 Backpressure and Flow Control (Planned for Stage-3)
+
+The Stage-1 mailbox is a fixed 16-slot ring buffer with no flow control. Production systems require:
+
+* **Configurable capacity**: mailbox capacity set at creation time via `sys_mailbox_create(capacity)`. Default 16, maximum 4096 messages.
+* **Blocking send**: `sys_send_blocking` (Stage-2, syscall 13) blocks the sender when the mailbox is full, waking when space is available. Prevents busy-wait polling.
+* **Backpressure signaling**: when a mailbox exceeds 75% capacity, the kernel emits a `MAILBOX_PRESSURE` audit event. System agents (stated, netd) can react by throttling upstream producers.
+* **Overflow policy**: configurable per-mailbox: `REJECT` (default, returns `E_MAILBOX_FULL`) or `DROP_OLDEST` (discard the oldest message to make room for the new one). Set via a future `sys_mailbox_configure` syscall.
+
+### 11.5 Future direction
 
 In later stages, mailboxes may support:
 
-* larger payload references
-* shared immutable object references
+* larger payload references via shared memory regions (Stage-3 §25.2.3)
 * capability-carrying messages
 * replay-friendly message logs
+* zero-copy message passing for same-core agents
 
 ---
 
@@ -621,7 +652,18 @@ These implicit capabilities cannot be revoked.
 
 Syscalls must validate capability requirements before execution.
 
-### 12.6 Denial behavior
+### 12.6 Capability Audit Trail
+
+Every capability operation must produce an audit event containing the full context:
+
+* **Grant**: `[CAP_GRANT granter=A target=B cap_type=T cap_target=X]`
+* **Revoke**: `[CAP_REVOKE revoker=A target=B cap_type=T cap_target=X]`
+* **Deny**: `[CAP_DENIED agent=A cap_type=T cap_target=X syscall=N]`
+* **Use**: for high-security deployments, an optional `CAP_USED` event: `[CAP_USED agent=A cap_type=T cap_target=X]` (disabled by default due to high event volume)
+
+This enables full reconstruction of the authority chain: given any agent, the audit log can trace back every capability it holds to the original grant from the root agent.
+
+### 12.7 Denial behavior
 
 On failure:
 
@@ -754,7 +796,29 @@ Context switching may occur on:
 * timer interrupt
 * fault event
 
-### 15.4 Future direction
+### 15.4 Priority Levels (Planned for Stage-3)
+
+Stage-1/2 use equal-priority round-robin. Production systems require priority differentiation:
+
+| Priority | Level | Agents | Preemption |
+|----------|-------|--------|------------|
+| 0 (highest) | System-critical | idle, root | Cannot be preempted by lower |
+| 1 | System-service | stated, policyd, accountd, netd | Preempts level 2+ |
+| 2 | Normal | User agents (native, WASM) | Default level |
+| 3 (lowest) | Background | Batch/idle workloads | Runs only when no higher-priority agent is Ready |
+
+The scheduler selects the highest-priority Ready agent. Within the same priority level, round-robin (or deterministic fixed-quota) ordering applies. Energy budgets are consumed regardless of priority.
+
+### 15.5 Syscall Timeouts (Planned for Stage-3)
+
+Blocking syscalls (`sys_recv`, `sys_send_blocking`) must accept an optional timeout parameter to prevent indefinite blocking and deadlock:
+
+* `sys_recv` with timeout: if no message arrives within N ticks, return `E_TIMEOUT`
+* `sys_send_blocking` with timeout: if mailbox remains full within N ticks, return `E_TIMEOUT`
+* Timeout is specified in the `r10` register (arg3), with 0 meaning infinite (current behavior)
+* The kernel tracks the deadline tick and unblocks the agent with an error when exceeded
+
+### 15.6 Future direction
 
 The long-term direction is a deterministic quota-based scheduler suitable for replay and auditable execution.
 
@@ -839,9 +903,31 @@ All stacks are 4096-byte aligned (`#[repr(align(4096))]`) with 16-byte RSP align
 
 Shared memory should not be the default agent communication mechanism. Mailbox delivery should remain primary.
 
-### 16.6 Future direction
+### 16.6 Guard Pages (Planned)
+
+Stack guard canaries detect overflow after the fact. Guard pages prevent overflow from propagating at all. Each agent stack should be bounded by an unmapped page:
+
+```text
+[Agent N stack]  64 KB usable
+[Guard page]     4 KB unmapped — triggers page fault on overflow
+[Agent N+1 stack] 64 KB usable
+```
+
+When an agent's stack grows into the guard page, the CPU triggers a page fault before any adjacent memory is touched. The trap handler detects the fault is in a guard region and terminates the agent with `[STACK OVERFLOW]`. This requires splitting the 2 MB huge pages into 4 KB pages in the stack region, which is deferred until the higher-half kernel migration (Stage-4 §26.2.1).
+
+### 16.7 Future direction
 
 Future versions may add explicit immutable shared regions or capability-scoped shared pages.
+
+### 16.8 CPU Security Features (Planned for Stage-4)
+
+Production deployment requires enabling hardware security features:
+
+* **SMEP** (Supervisor Mode Execution Prevention): set CR4.SMEP to prevent kernel from executing user-mode code. Mitigates ret2user attacks.
+* **SMAP** (Supervisor Mode Access Prevention): set CR4.SMAP to prevent kernel from reading/writing user-mode pages except in explicit `stac`/`clac` windows. Mitigates data leaks.
+* **NX enforcement**: all stack pages and data pages must have the NX (No-Execute) bit set. Only `.text` sections should be executable.
+* **KASLR** (Kernel Address Space Layout Randomization): randomize the kernel's virtual base address at boot (requires higher-half kernel). Mitigates ROP/JOP attacks.
+* **Spectre mitigations**: enable IBRS/STIBP on context switch between agents with different trust levels (kernel ↔ ring 3).
 
 ---
 
@@ -912,6 +998,17 @@ Event {
 ### 18.3 Output path
 
 Stage-1 should emit events over serial output in a structured and parseable format.
+
+### 18.4 Event Ring Buffer (Planned for Stage-3)
+
+Serial output is slow (~115200 baud = ~11 KB/s) and blocking. Production systems need an in-kernel ring buffer:
+
+* **Kernel ring buffer**: a fixed-size circular buffer (e.g., 64 KB) of `Event` structs in kernel memory. `emit()` writes to the ring buffer (non-blocking, O(1)). If the buffer is full, the oldest event is overwritten (drop-oldest policy).
+* **Consumer agent**: a system agent (`auditd`) reads events from the ring buffer via a new `sys_event_read` syscall. `auditd` can write events to disk, forward over network, or apply filtering.
+* **Serial fallback**: during early boot (before `auditd` starts), events are still printed to serial. Once `auditd` is running, serial output becomes optional (configurable).
+* **Overflow counter**: the ring buffer tracks how many events were dropped due to overflow. This count is exposed via `sys_event_stats` and included in the next event emitted after a drop.
+
+This decouples event emission (kernel, fast) from event consumption (system agent, can be slow), preventing audit logging from blocking kernel operations.
 
 ---
 
@@ -1269,9 +1366,31 @@ Introduce execution snapshots for debugging and replay:
 
 * **Checkpoint contents**: all agent contexts (registers, page tables), WASM interpreter state (stack, locals, program counter — via `WasmRuntime::snapshot()`), mailbox queues (read/write positions, pending messages), energy counters, state object snapshots, scheduler state (run queue, tick counter), event sequence counter.
 * **Trigger**: manual (via a `sys_checkpoint` syscall from root agent) or periodic (every N ticks, configurable).
-* **Storage**: serialized to virtio-blk as a single contiguous image.
-* **Restore**: on boot, if a checkpoint is present, the kernel can restore all agents to the checkpointed state instead of running init.
+* **Storage**: serialized to disk as a contiguous image in the Checkpoint Region (§24.6.1).
+* **Restore**: on boot, if a valid checkpoint is present, the kernel can restore all agents to the checkpointed state instead of running init.
 * **Limitation**: Stage-2 checkpointing is not yet deterministic. Timer interrupt timing and I/O ordering may differ across replays. Full deterministic replay requires Stage-3.
+
+#### Atomic Checkpoint Protocol
+
+Checkpoints must be atomic: either fully written or not at all. A power failure mid-write must not leave a corrupt checkpoint that prevents boot.
+
+1. **Write new checkpoint to a staging area** (Checkpoint Region B — the second half of the checkpoint region)
+2. **Validate**: re-read and verify CRC32 of the staged checkpoint
+3. **Commit**: atomically update the superblock's `checkpoint_tick` and `checkpoint_region_active` fields (a single 512-byte sector write). The superblock points to Region A or B.
+4. **On boot**: read superblock, load the checkpoint from whichever region the superblock points to. If the active region fails validation, fall back to the other region (or cold boot).
+
+This double-buffering scheme ensures that a crash during step 1 or 2 leaves the previous valid checkpoint untouched. Only step 3 (a single sector write) is the commit point. Sector writes are atomic on modern hardware (512-byte writes are not split by power loss).
+
+#### Crash Recovery for State Log
+
+The state log (§24.5) uses append-only writes with per-entry CRC32. On crash recovery:
+
+1. Replay the log from the beginning
+2. For each entry: validate CRC32. If invalid, stop replay at that point (the entry was partially written during a crash).
+3. Truncate the log at the last valid entry
+4. Resume normal operation
+
+This provides **redo-only recovery** — all committed state mutations are replayed, and partially written mutations are discarded.
 
 ### 24.6.1 Disk Layout Specification
 
