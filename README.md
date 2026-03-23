@@ -2,10 +2,8 @@
   <img src="ATOS.png?v=2" alt="ATOS Logo" width="200">
 </p>
 
-<h1 align="center">ATOS</h1>
-
 <p align="center">
-  <strong>An AI-native operating system built from scratch.</strong><br>
+  <strong>An agent-native operating system built from scratch.</strong><br>
   Agents. Mailboxes. Capabilities. No legacy.
 </p>
 
