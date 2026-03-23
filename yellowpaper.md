@@ -2281,7 +2281,7 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 * Set up RX/TX descriptor rings with DMA buffers `[IMPL: ✅ e1000.rs RX/TX descriptor rings]`
 * Implement send_packet/recv_packet `[IMPL: ✅ e1000.rs send_packet/recv_packet]`
 * Wire into netd system agent (replace stub mode) `[IMPL: ✅ netd.rs auto-detects NIC; dispatches to e1000 or virtio-net]`
-* Verify: agent sends HTTP request through netd on real NIC, receives response `[IMPL: ❌]`
+* Verify: agent sends HTTP request through netd on real NIC, receives response `[IMPL: ⚠️ NIC init + UDP send verified (tools/test_network_e2e.sh); HTTP requires TCP stack — current layer: Ethernet+IPv4+UDP only]`
 
 #### Phase 19: distributed execution `[IMPL: ✅ kernel UDP + routerd + node discovery + capability signing all implemented]`
 
