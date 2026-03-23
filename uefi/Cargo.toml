@@ -1,0 +1,12 @@
+[package]
+name = "aos-uefi"
+version = "0.1.0"
+edition = "2021"
+description = "AOS UEFI boot loader — loads kernel via UEFI firmware"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"

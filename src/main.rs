@@ -48,14 +48,22 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     // 1. Initialize serial output first
     arch::x86_64::serial::init();
 
-    serial_println!("AOS boot ok");
-    serial_println!("AOS v0.1 - AI-native Operating System");
-    serial_println!("multiboot magic: 0x{:x}, info: 0x{:x}", multiboot_magic, multiboot_info);
+    // 2. Detect boot method
+    const MULTIBOOT_MAGIC: u32 = 0x2BADB002;
+    const UEFI_MAGIC: u32 = 0xAE51_0EF1;
 
-    // 2. Validate multiboot magic
-    if multiboot_magic != 0x2BADB002 {
-        serial_println!("[WARN] Invalid multiboot magic, continuing anyway");
+    match multiboot_magic {
+        MULTIBOOT_MAGIC => {
+            serial_println!("AOS boot ok (Multiboot)");
+        }
+        UEFI_MAGIC => {
+            serial_println!("AOS boot ok (UEFI)");
+        }
+        _ => {
+            serial_println!("[WARN] Unknown boot magic: 0x{:x}, continuing", multiboot_magic);
+        }
     }
+    serial_println!("AOS v0.1 - AI-native Operating System");
 
     // 3. Initialize architecture (GDT, IDT, timer)
     arch::x86_64::init();
