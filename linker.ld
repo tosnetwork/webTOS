@@ -46,9 +46,14 @@ SECTIONS
     __boot_end = .;
 
     /* ── Phase 2: Kernel proper at VIRTUAL address ──────────────────
-     * VMA = KERNEL_VMA + physical offset.
-     * AT() directive sets LMA = VMA - KERNEL_VMA so Multiboot loads
-     * the data contiguously after the boot sections.
+     * The linker position is advanced by KERNEL_VMA so all subsequent
+     * section symbols resolve to higher-half virtual addresses
+     * (0xFFFFFFFF80xxxxxx). Each section uses AT(ADDR - KERNEL_VMA)
+     * to set its LMA (load memory address) back to the corresponding
+     * physical address, so the Multiboot loader places the data
+     * contiguously after the boot sections in physical memory.
+     *
+     * Result: code runs at high VMA, but is loaded at low LMA.
      */
     . += KERNEL_VMA;
 
