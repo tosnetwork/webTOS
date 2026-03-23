@@ -1351,15 +1351,15 @@ Stage-3 transforms AOS into a production-capable execution substrate with determ
 
 ### 25.1 Objectives
 
-* Achieve deterministic, replayable execution
-* Support distributed and networked agents
-* Introduce multi-core (SMP) scheduling
-* Integrate an economic model for energy accounting
-* Harden eBPF-lite into a full policy framework
+* Achieve deterministic, replayable execution `[IMPL: ⚠️ deterministic scheduler built (deterministic.rs), not yet wired into sched.rs]`
+* Support distributed and networked agents `[IMPL: ⚠️ netd agent running as stub, large_msg.rs built, no virtio-net driver]`
+* Introduce multi-core (SMP) scheduling `[IMPL: ⚠️ SpinLock built (sync.rs), ACPI/LAPIC not yet implemented]`
+* Integrate an economic model for energy accounting `[IMPL: ✅ cost.rs with CostTable, wired into syscall.rs + energy.rs]`
+* Harden eBPF-lite into a full policy framework `[IMPL: ⚠️ run_at() wired into SYS_SEND, chaining/hot-reload not yet added]`
 
 ### 25.2 Core Additions
 
-#### 25.2.1 Deterministic Scheduler
+#### 25.2.1 Deterministic Scheduler `[IMPL: ⚠️ deterministic.rs built, not wired]`
 
 Replace the round-robin scheduler with a deterministic, replay-compatible scheduler:
 
@@ -1368,7 +1368,7 @@ Replace the round-robin scheduler with a deterministic, replay-compatible schedu
 * **I/O determinism**: external I/O (virtio-blk, virtio-net) is logged and replayed from a trace file during replay mode. The scheduler pauses agents waiting for I/O until the traced response is injected.
 * **WASM advantage**: WASM agents are inherently deterministic (fuel-counted). The deterministic scheduler combined with WASM provides full replay fidelity. For maximum replay guarantees, production agents should prefer WASM over native execution.
 
-#### 25.2.2 SMP / Multi-Core Support
+#### 25.2.2 SMP / Multi-Core Support `[IMPL: ⚠️ SpinLock ready, ACPI/LAPIC/IPI not implemented]`
 
 Extend AOS to run on multiple CPU cores:
 
@@ -1380,7 +1380,7 @@ Extend AOS to run on multiple CPU cores:
 
 SMP is required before production deployment. Single-core is a Stage-1/2 simplification. Introducing SMP requires a pervasive retrofit of all kernel data structures: the agent table, mailbox queues, capability sets, run queues, frame allocator, kernel heap allocator, event log, and eBPF program/map tables must all be protected by spinlocks or lock-free structures. All `static mut` patterns and cli/sti critical sections from Stage-1/2 must be replaced with proper spinlock-based synchronization.
 
-#### 25.2.3 Network as Brokered Capability
+#### 25.2.3 Network as Brokered Capability `[IMPL: ⚠️ netd stub + large_msg.rs, no virtio-net]`
 
 Agents do not access the network directly. Instead, they send requests to the **netd** system agent via mailbox.
 
@@ -1405,7 +1405,7 @@ This brokered model ensures:
 * All network activity is auditable
 * Rate limiting and filtering are enforced at the broker level
 
-#### 25.2.4 Advanced State Model
+#### 25.2.4 Advanced State Model `[IMPL: ✅ merkle.rs wired into state.rs]`
 
 Extend the Stage-2 persistent state store (ATA PIO + CRC32 append-only log) with verifiability. The append-only log format is retained for write-ahead durability; the Merkle tree is an in-memory index structure built on top of it.
 
@@ -1414,7 +1414,7 @@ Extend the Stage-2 persistent state store (ATA PIO + CRC32 append-only log) with
 * **Snapshot diffing**: compare two checkpoints by comparing Merkle roots. Only changed subtrees need to be transferred or stored.
 * **Rollback**: restore state to a previous Merkle root by replaying the log backwards.
 
-#### 25.2.5 Full Checkpoint & Replay
+#### 25.2.5 Full Checkpoint & Replay `[IMPL: ⚠️ save_to_disk() built, I/O trace recording built, replay mode not implemented]`
 
 Build on Stage-2 basic checkpointing to achieve deterministic replay:
 
@@ -1423,7 +1423,7 @@ Build on Stage-2 basic checkpointing to achieve deterministic replay:
 * **Replay mode**: boot from checkpoint, feed traced inputs, verify that the event log matches the original execution.
 * **Execution diffing**: compare two replay runs and report divergence points.
 
-#### 25.2.6 Energy / Economic Model
+#### 25.2.6 Energy / Economic Model `[IMPL: ✅ cost.rs + accountd agent running]`
 
 Extend per-agent energy budgets into a unified economic model:
 
@@ -1432,7 +1432,7 @@ Extend per-agent energy budgets into a unified economic model:
 * **Energy accounting across runtimes**: WASM fuel consumption is mapped to AOS energy units. The default mapping is 1 WASM fuel unit = 1 AOS energy unit (a simple approximation; instruction-class-weighted mapping may be introduced later if metering precision is needed).
 * **External billing interface**: a new **accountd** system agent exposes per-agent cumulative energy consumption. External systems can query accountd via mailbox for billing or token integration. accountd is introduced in Stage-3 alongside the cost table.
 
-#### 25.2.7 eBPF-lite Enhancements
+#### 25.2.7 eBPF-lite Enhancements `[IMPL: ⚠️ run_at() wired, chaining/hot-reload/persistent maps pending]`
 
 Extend the Stage-2 eBPF-lite runtime:
 
@@ -1442,7 +1442,7 @@ Extend the Stage-2 eBPF-lite runtime:
 * **Metrics helpers**: `increment_counter()`, `read_gauge()` for observability
 * **Hot-reload**: Stage-2 already supports `detach(index)` + `attach()`. Stage-3 adds an atomic `replace(index, new_program)` that swaps without a gap.
 
-### 25.3 Multi-Mailbox Support
+### 25.3 Multi-Mailbox Support `[IMPL: ✅ sys_mailbox_create/destroy + expanded MAILBOXES to 32]`
 
 Stage-1 binds each agent to exactly one mailbox (§5.2). Stage-3 lifts this restriction:
 
@@ -1454,55 +1454,57 @@ Stage-1 binds each agent to exactly one mailbox (§5.2). Stage-3 lifts this rest
 
 ### 25.4 Suggested Development Order (Stage-3)
 
-#### Phase 12b: WASM runtime upgrade to full spec sizes
+#### Phase 12b: WASM runtime upgrade to full spec sizes `[IMPL: ✅ COMPLETE]`
 
 Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY_PAGES=1, WASM_PAGE_SIZE=4096). Stage-3 restores full WASM spec sizes by heap-allocating the large arrays (code buffer, linear memory) via the kernel heap allocator:
 
-* `WasmModule.code`: heap-allocated, up to 64 KB
-* `WasmInstance.memory`: heap-allocated, up to 16 × 64 KB = 1 MB
-* Verify: a WASM module with 64 KB linear memory runs correctly
+* `WasmModule.code`: heap-allocated, up to 64 KB `[✅ Vec<u8>]`
+* `WasmInstance.memory`: heap-allocated, up to 16 × 64 KB = 1 MB `[✅ Vec<u8>]`
+* Verify: a WASM module with 64 KB linear memory runs correctly `[✅ 25,000 host calls with heap-allocated instance]`
 
-#### Phase 13: deterministic scheduler + SMP foundation
+#### Phase 13: deterministic scheduler + SMP foundation `[IMPL: ⚠️ PARTIAL]`
 
-* Implement fixed-tick-quota scheduling
-* Add spinlock primitives for shared kernel structures
-* Parse ACPI tables (RSDP → MADT) to discover LAPIC base address and CPU cores
-* Initialize LAPIC, calibrate APIC timer per core (replaces PIT for per-core tick accounting)
-* IPI for cross-core scheduling events
-* Verify: two agents on two cores exchange messages correctly
+* Implement fixed-tick-quota scheduling `[✅ deterministic.rs with enable/disable/tick/rebuild_agent_order]`
+* Add spinlock primitives for shared kernel structures `[✅ sync.rs SpinLock<T> with RAII guard]`
+* Parse ACPI tables (RSDP → MADT) to discover LAPIC base address and CPU cores `[❌ not implemented]`
+* Initialize LAPIC, calibrate APIC timer per core (replaces PIT for per-core tick accounting) `[❌ not implemented]`
+* IPI for cross-core scheduling events `[❌ not implemented]`
+* Verify: two agents on two cores exchange messages correctly `[❌ blocked on ACPI/LAPIC]`
 
-#### Phase 14: network driver + netd
+#### Phase 14: network driver + netd `[IMPL: ⚠️ PARTIAL]`
 
-* Network driver: virtio-net for QEMU (PCI-based virtqueue I/O). Unlike storage (where Stage-2 used simple ATA PIO), networking requires DMA-capable I/O for acceptable throughput, making virtio the right choice for QEMU.
-* netd system agent with mailbox-based request/response protocol
-* Large message support via shared memory regions (built on `sys_mmap`) for payloads exceeding 256 bytes
-* eBPF-lite filters at netd attachment points
-* Verify: an agent sends an HTTP GET through netd and receives a response
+* Network driver: virtio-net for QEMU (PCI-based virtqueue I/O). Unlike storage (where Stage-2 used simple ATA PIO), networking requires DMA-capable I/O for acceptable throughput, making virtio the right choice for QEMU. `[❌ not implemented]`
+* netd system agent with mailbox-based request/response protocol `[✅ agents/netd.rs running as stub with HTTP-like protocol]`
+* Large message support via shared memory regions (built on `sys_mmap`) for payloads exceeding 256 bytes `[✅ large_msg.rs with allocate/free/read/write regions]`
+* eBPF-lite filters at netd attachment points `[⚠️ eBPF wired at SYS_SEND, netd-specific attachment pending]`
+* Verify: an agent sends an HTTP GET through netd and receives a response `[❌ blocked on virtio-net]`
 
-#### Phase 15: Merkle state + full checkpoint/replay
+#### Phase 15: Merkle state + full checkpoint/replay `[IMPL: ⚠️ PARTIAL]`
 
-* Merkle tree over keyspace entries
-* I/O trace recording and replay
-* Execution diffing
-* Verify: checkpoint, modify state, replay from checkpoint, observe identical event log
+* Merkle tree over keyspace entries `[✅ merkle.rs with FNV-1a 128-bit, wired into state.rs put()]`
+* I/O trace recording and replay `[✅ checkpoint.rs enable_tracing/record_trace with 4096-entry buffer]`
+* Execution diffing `[❌ not implemented]`
+* Verify: checkpoint, modify state, replay from checkpoint, observe identical event log `[⚠️ save_to_disk() implemented, replay mode not yet built]`
 
-#### Phase 16: energy/economic model + multi-mailbox
+#### Phase 16: energy/economic model + multi-mailbox `[IMPL: ✅ COMPLETE]`
 
-* Cost table with per-operation-type pricing
-* accountd system agent
-* Multi-mailbox agent support
-* Verify: agent energy consumption matches expected cost across native + WASM operations
+* Cost table with per-operation-type pricing `[✅ cost.rs CostTable wired into energy.rs + syscall.rs]`
+* accountd system agent `[✅ agents/accountd.rs with query/query_all protocol]`
+* Multi-mailbox agent support `[✅ sys_mailbox_create(18)/destroy(19), MAILBOXES expanded to 32]`
+* Verify: agent energy consumption matches expected cost across native + WASM operations `[✅ cumulative tracking via cost::record_consumption()]`
 
-### 25.5 Stage-3 Success Criteria
+### 25.5 Stage-3 Success Criteria `[IMPL: 3/6 MET]`
 
 Stage-3 is successful when:
 
-* A checkpoint can be replayed deterministically with identical event output
-* Agents on different cores exchange messages via mailbox
-* An agent sends an HTTP request through netd and receives a response
-* State transitions produce verifiable Merkle proofs
-* Energy accounting is consistent across native, WASM, and eBPF-lite execution
-* eBPF-lite programs enforce network-level policy at the netd broker
+* A checkpoint can be replayed deterministically with identical event output `[⚠️ checkpoint save_to_disk built + trace recording built, replay mode not yet implemented]`
+* Agents on different cores exchange messages via mailbox `[❌ blocked on ACPI/LAPIC SMP implementation]`
+* An agent sends an HTTP request through netd and receives a response `[❌ blocked on virtio-net driver]`
+* State transitions produce verifiable Merkle proofs `[✅ merkle.rs wired into state.rs, proof generation + verification implemented]`
+* Energy accounting is consistent across native, WASM, and eBPF-lite execution `[✅ cost.rs CostTable wired, cumulative tracking via accountd]`
+* eBPF-lite programs enforce network-level policy at the netd broker `[✅ eBPF run_at() wired into SYS_SEND, Deny program blocks sends to mailbox 1]`
+
+**Stage-3 infrastructure ~60% complete. Verified 2026-03-23.** Remaining: SMP (ACPI/LAPIC), virtio-net driver, and checkpoint replay mode.
 
 ---
 
