@@ -11,7 +11,9 @@
 ; [0x8FF0] = CR3 value (PML4 physical address)
 ; [0x8FF8] = AP stack top (unique per AP)
 
-extern ap_entry
+; ap_entry is called via indirect call from address stored at [0x8FE8]
+; (written by BSP). No `extern ap_entry` needed since we don't reference
+; the symbol directly in assembly.
 
 ; --- 16-bit Real Mode Entry ---
 section .rodata
@@ -22,6 +24,7 @@ ap_trampoline_start:
     cli
     xor ax, ax
     mov ds, ax
+
 
     ; Load 32-bit GDT
     lgdt [0x8000 + (ap_gdt32_ptr - ap_trampoline_start)]
@@ -41,6 +44,7 @@ ap_pm32:
     mov ds, ax
     mov es, ax
     mov ss, ax
+
 
     ; Enable PAE (CR4 bit 5)
     mov eax, cr4
@@ -78,11 +82,17 @@ ap_long_mode:
     mov gs, ax
     mov ss, ax
 
+
     ; Load per-AP stack from data area
     mov rsp, [0x8FF8]    ; Stack top written by BSP
 
-    ; Call Rust AP entry function
-    call ap_entry
+    ; Call Rust AP entry function via INDIRECT call.
+    ; We cannot use `call ap_entry` because that generates a RIP-relative
+    ; offset computed from the original .rodata position, not from 0x8000
+    ; where this code actually runs. The BSP writes the absolute address
+    ; of ap_entry to [0x8FE8] before sending SIPI.
+    mov rax, [0x8FE8]   ; ap_entry absolute address (written by BSP)
+    call rax
 
     ; Should not return
 .halt:

@@ -13,6 +13,7 @@ pub static AP_STARTED: AtomicU8 = AtomicU8::new(0);
 /// Trampoline code location in physical memory
 const AP_TRAMPOLINE_ADDR: u64 = 0x8000;
 /// Data area within the trampoline page
+const AP_DATA_AP_ENTRY: u64 = 0x8FE8; // absolute address of ap_entry function
 const AP_DATA_CR3: u64 = 0x8FF0;
 const AP_DATA_STACK: u64 = 0x8FF8;
 
@@ -58,9 +59,13 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
         trampoline_size
     );
 
-    // Write shared CR3 to trampoline data area
+    // Write shared data to trampoline data area
     unsafe {
         core::ptr::write_volatile(AP_DATA_CR3 as *mut u64, cr3);
+        // Write absolute address of ap_entry for indirect call (trampoline
+        // can't use RIP-relative call because it runs at 0x8000, not its
+        // compiled address)
+        core::ptr::write_volatile(AP_DATA_AP_ENTRY as *mut u64, ap_entry as *const () as u64);
     }
 
     // Boot each AP
@@ -93,10 +98,15 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
             apic_id
         );
 
+        // Disable interrupts during INIT/SIPI sequence to prevent
+        // the LAPIC timer from preempting the BSP (which would context-switch
+        // away from boot_aps and never return here).
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
         // Send INIT IPI
         lapic::send_init_ipi(apic_id);
 
-        // Wait ~10ms (busy loop, approximately 10M iterations on QEMU)
+        // Wait ~10ms (busy loop)
         for _ in 0..10_000_000u64 {
             core::hint::spin_loop();
         }
@@ -109,7 +119,9 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
         );
         lapic::send_sipi(apic_id, 0x08);
 
-        // Wait for AP to signal ready (up to ~100ms)
+        // Keep interrupts disabled while waiting for AP to signal ready.
+        // AP increments AP_STARTED atomically — BSP polls it.
+        // Interrupts will be re-enabled after boot_aps() returns.
         let expected = AP_STARTED.load(Ordering::Relaxed) + 1;
         let mut waited = 0u64;
         while AP_STARTED.load(Ordering::Acquire) < expected {
@@ -132,6 +144,11 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
 
     let total = AP_STARTED.load(Ordering::Relaxed);
     serial_println!("[SMP] {} AP(s) booted, total {} cores active", total, total + 1);
+
+    // Do NOT re-enable interrupts here. The BSP must return to kernel_main
+    // to call sched::start(), which properly sets up the boot context before
+    // the first context switch. Interrupts will be re-enabled when the first
+    // agent runs (via rflags restore or schedule's sti).
 }
 
 /// Entry point for Application Processors (called from trampoline).
@@ -140,8 +157,10 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
 /// It initializes per-core hardware state and enters the scheduler loop.
 #[no_mangle]
 pub extern "C" fn ap_entry() -> ! {
-    // 1. Load the shared IDT on this core (IDT is in memory, each core must execute lidt)
+
+    // 1. Load the shared IDT on this core
     crate::arch::x86_64::idt::reload();
+
 
     // 2. Init LAPIC (per-core timer)
     lapic::init_ap();
