@@ -15,6 +15,10 @@ use crate::agents;
 use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
 
+/// Stack guard magic value (same concept as Linux's STACK_END_MAGIC).
+/// Written at the bottom of every agent stack and checked on each context switch.
+pub const STACK_GUARD_MAGIC: u64 = 0x57AC6E9D_DEAD_BEEF;
+
 /// Stack size for each agent.
 /// 64 KiB is needed because the WASM agent allocates WasmInstance on the
 /// stack (~33 KB total: 18 KB for operand stack/locals/call stacks, 6 KB
@@ -62,6 +66,24 @@ fn stack_top(agent_index: usize) -> u64 {
     unsafe {
         let ptr = AGENT_STACKS.stacks[agent_index].as_ptr();
         ((ptr as u64) + AGENT_STACK_SIZE as u64) & !0xF
+    }
+}
+
+/// Write stack guard canary at the bottom of each agent's stack.
+/// Called once during init, after all stacks are allocated.
+fn write_stack_guards() {
+    unsafe {
+        for i in 0..MAX_AGENTS {
+            // Guard for agent stacks (used by kernel-mode agents)
+            let bottom = AGENT_STACKS.stacks[i].as_mut_ptr() as *mut u64;
+            core::ptr::write_volatile(bottom, STACK_GUARD_MAGIC);
+            core::ptr::write_volatile(bottom.add(1), STACK_GUARD_MAGIC);
+
+            // Guard for kernel stacks (used by ring-3 agents during syscall/interrupt)
+            let kbottom = KERNEL_STACKS.stacks[i].as_mut_ptr() as *mut u64;
+            core::ptr::write_volatile(kbottom, STACK_GUARD_MAGIC);
+            core::ptr::write_volatile(kbottom.add(1), STACK_GUARD_MAGIC);
+        }
     }
 }
 
@@ -149,6 +171,7 @@ fn create_user_agent(
         let agent = get_agent_mut(agent_id).expect("Agent not found");
         agent.mode = AgentMode::User;
         agent.kernel_stack_top = k_stack_top;
+        agent.stack_bottom = unsafe { KERNEL_STACKS.stacks[agent_slot].as_ptr() as u64 };
         agent.context = new_user_context(USER_CODE_VADDR, user_stack_top, k_stack_top);
         agent.context.cr3 = agent_cr3;
 
@@ -187,6 +210,9 @@ pub fn init() {
         u64::MAX,                            // unlimited energy
         16,                                  // minimal memory quota (pages)
     ).expect("Failed to create idle agent");
+    if let Some(agent) = get_agent_mut(idle_id) {
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[0].as_ptr() as u64 };
+    }
     serial_println!("[INIT] Idle agent created: id={}", idle_id);
 
     // ── Root agent (agent 1) ────────────────────────────────────────────
@@ -199,9 +225,10 @@ pub fn init() {
         1024,                                  // memory quota (pages)
     ).expect("Failed to create root agent");
 
-    // Grant root capabilities
+    // Set stack guard address and grant root capabilities
     {
         let agent = get_agent_mut(root_id).expect("Root agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[1].as_ptr() as u64 };
         agent.capabilities = root_caps;
         agent.cap_count = ROOT_CAP_COUNT;
     }
@@ -259,6 +286,7 @@ pub fn init() {
     ).expect("Failed to create stated agent");
     {
         let agent = get_agent_mut(stated_id).expect("Stated agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[5].as_ptr() as u64 };
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -281,6 +309,7 @@ pub fn init() {
     ).expect("Failed to create policyd agent");
     {
         let agent = get_agent_mut(policyd_id).expect("Policyd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[6].as_ptr() as u64 };
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -301,6 +330,7 @@ pub fn init() {
     ).expect("Failed to create WASM agent");
     {
         let agent = get_agent_mut(wasm_id).expect("WASM agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[7].as_ptr() as u64 };
         agent.capabilities[0] = Some(Capability::new(CapType::EventEmit, 0));
         agent.cap_count = 1;
     }
@@ -319,6 +349,7 @@ pub fn init() {
     ).expect("Failed to create accountd agent");
     {
         let agent = get_agent_mut(accountd_id).expect("Accountd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[8].as_ptr() as u64 };
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -339,6 +370,7 @@ pub fn init() {
     ).expect("Failed to create netd agent");
     {
         let agent = get_agent_mut(netd_id).expect("Netd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[9].as_ptr() as u64 };
         agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
         agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
@@ -375,6 +407,10 @@ pub fn init() {
     sched::add_to_run_queue(wasm_id);
     sched::add_to_run_queue(accountd_id);
     sched::add_to_run_queue(netd_id);
+
+    // ── Write stack guard canaries at the bottom of every agent stack ──
+    write_stack_guards();
+    serial_println!("[INIT] Stack guard canaries written ({:#x})", STACK_GUARD_MAGIC);
 
     // ── eBPF policy test: attach a program that allows all sends ──────
     // This proves the eBPF infrastructure runs end-to-end.

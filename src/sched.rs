@@ -12,6 +12,7 @@ use crate::agent::*;
 use crate::arch::x86_64::context::context_switch;
 use crate::agent::AgentMode;
 use crate::arch::x86_64::gdt;
+use crate::init::STACK_GUARD_MAGIC;
 
 extern "C" {
     static mut CURRENT_KERNEL_RSP: u64;
@@ -245,20 +246,28 @@ pub fn schedule() {
 
         context_switch(old_ctx, new_ctx);
 
-        // Debug: after resuming, check if agent 6's stack was corrupted
-        // by inspecting the canary value we placed at the stack top area
-        if CURRENT_AGENT_ID == 6 {
-            // We just resumed as agent 6. Check the return address
-            // that `ret` will pop. If it's 0x0202020202020202, log WHO corrupted it.
-            let rsp: u64;
-            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack));
-            let top_of_stack = core::ptr::read_volatile(rsp as *const u64);
-            if top_of_stack == 0x0202020202020202 {
-                serial_println!("[SCHED-CORRUPT] Agent 6 stack corrupted! rsp={:#x} value={:#x} old_id={} next_id={}",
-                    rsp, top_of_stack, old_id, next_id);
+        // We reach here when this agent is resumed by another context_switch.
+        // Check stack guard canary for the agent we just switched FROM.
+        if old_id != IDLE_AGENT_ID {
+            if let Some(old_agent) = get_agent(old_id) {
+                if old_agent.stack_bottom != 0 {
+                    let guard = core::ptr::read_volatile(old_agent.stack_bottom as *const u64);
+                    if guard != STACK_GUARD_MAGIC {
+                        serial_println!(
+                            "[STACK OVERFLOW] Agent {} stack corrupted! guard={:#x} expected={:#x}",
+                            old_id, guard, STACK_GUARD_MAGIC
+                        );
+                        // Terminate the agent to prevent further damage
+                        if let Some(agent) = get_agent_mut(old_id) {
+                            agent.status = AgentStatus::Faulted;
+                        }
+                        crate::event::agent_faulted(old_id, 0xFF);
+                        remove_from_run_queue(old_id);
+                    }
+                }
             }
         }
-        // We reach here when this agent is resumed by another context_switch.
+
         // Re-enable interrupts.
         core::arch::asm!("sti", options(nomem, nostack));
     }

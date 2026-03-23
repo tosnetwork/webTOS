@@ -172,6 +172,7 @@ pub struct Agent {
     pub memory_used: u32,
     pub mode: AgentMode,
     pub kernel_stack_top: u64,
+    pub stack_bottom: u64,   // address of stack guard canary (lowest stack address)
     pub active: bool,       // whether this slot is in use
 }
 
@@ -201,6 +202,7 @@ impl Agent {
             memory_used: 0,
             mode: AgentMode::Kernel,
             kernel_stack_top: 0,
+            stack_bottom: 0,
             active: true,
         }
     }

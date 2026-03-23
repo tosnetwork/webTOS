@@ -95,18 +95,18 @@ const MAX_TOTAL_LOCALS: usize = 256;
 /// A running WASM instance.
 pub struct WasmInstance {
     pub module: WasmModule,
-    pub stack: [Value; MAX_STACK],
+    pub stack: Vec<Value>,
     pub stack_ptr: usize,
-    pub locals: [Value; MAX_TOTAL_LOCALS],
+    pub locals: Vec<Value>,
     pub memory: Vec<u8>,
     pub memory_size: usize,
     /// Program counter — byte offset within `module.code`.
     pub pc: usize,
     pub fuel: u64,
-    pub call_stack: [CallFrame; MAX_CALL_DEPTH],
+    pub call_stack: Vec<CallFrame>,
     pub call_depth: usize,
     /// Block stack for control flow within the current function.
-    block_stack: [BlockFrame; MAX_BLOCK_DEPTH],
+    block_stack: Vec<BlockFrame>,
     block_depth: usize,
     /// Set when execution is finished.
     pub finished: bool,
@@ -119,16 +119,16 @@ impl WasmInstance {
         let mem_size = mem_pages * WASM_PAGE_SIZE;
         WasmInstance {
             module,
-            stack: [Value::I32(0); MAX_STACK],
+            stack: vec![Value::I32(0); MAX_STACK],
             stack_ptr: 0,
-            locals: [Value::I32(0); MAX_TOTAL_LOCALS],
+            locals: vec![Value::I32(0); MAX_TOTAL_LOCALS],
             memory: vec![0u8; mem_size],
             memory_size: mem_size,
             pc: 0,
             fuel,
-            call_stack: [CallFrame::zero(); MAX_CALL_DEPTH],
+            call_stack: vec![CallFrame::zero(); MAX_CALL_DEPTH],
             call_depth: 0,
-            block_stack: [BlockFrame::zero(); MAX_BLOCK_DEPTH],
+            block_stack: vec![BlockFrame::zero(); MAX_BLOCK_DEPTH],
             block_depth: 0,
             finished: false,
         }
@@ -355,18 +355,20 @@ impl WasmInstance {
 
     /// Enter a WASM-defined function (not an import).
     fn enter_function(&mut self, func_idx: u32, keep_args_on_stack: bool) -> Result<(), WasmError> {
-        let local_func_idx = func_idx as usize - self.module.import_count;
+        let local_func_idx = func_idx as usize - self.module.imports.len();
 
         // Extract everything we need from the module into local variables
         // so we don't hold any borrows of self.module during mutation.
         let (param_count, result_count, declared_local_count, func_code_offset, func_code_len, local_types) = {
-            let func = self.module.functions[local_func_idx]
-                .as_ref()
-                .ok_or(WasmError::FunctionNotFound(func_idx))?;
+            if local_func_idx >= self.module.functions.len() {
+                return Err(WasmError::FunctionNotFound(func_idx));
+            }
+            let func = &self.module.functions[local_func_idx];
             let type_idx = func.type_idx as usize;
-            let ft = self.module.func_types[type_idx]
-                .as_ref()
-                .ok_or(WasmError::FunctionNotFound(func_idx))?;
+            if type_idx >= self.module.func_types.len() {
+                return Err(WasmError::FunctionNotFound(func_idx));
+            }
+            let ft = &self.module.func_types[type_idx];
             let mut lt = [ValType::I32; MAX_LOCALS];
             let dlc = func.local_count as usize;
             for i in 0..dlc.min(MAX_LOCALS) {
@@ -432,17 +434,20 @@ impl WasmInstance {
 
     /// Prepare a host call (import invocation).
     fn handle_import_call(&mut self, import_idx: u32) -> Result<ExecResult, WasmError> {
-        let imp = self.module.imports[import_idx as usize]
-            .as_ref()
-            .ok_or(WasmError::ImportNotFound(import_idx))?;
+        let idx = import_idx as usize;
+        if idx >= self.module.imports.len() {
+            return Err(WasmError::ImportNotFound(import_idx));
+        }
+        let imp = &self.module.imports[idx];
 
         let type_idx = match imp.kind {
             ImportKind::Func(ti) => ti as usize,
         };
 
-        let ft = self.module.func_types[type_idx]
-            .as_ref()
-            .ok_or(WasmError::FunctionNotFound(import_idx))?;
+        if type_idx >= self.module.func_types.len() {
+            return Err(WasmError::FunctionNotFound(import_idx));
+        }
+        let ft = &self.module.func_types[type_idx];
 
         let param_count = ft.param_count;
         let mut args = [Value::I32(0); MAX_PARAMS];
@@ -466,7 +471,7 @@ impl WasmInstance {
         }
 
         // Check if it's an import
-        if (func_idx as usize) < self.module.import_count {
+        if (func_idx as usize) < self.module.imports.len() {
             return match self.handle_import_call(func_idx) {
                 Ok(result) => result,
                 Err(e) => ExecResult::Trap(e),
@@ -672,7 +677,7 @@ impl WasmInstance {
             0x10 => {
                 // call
                 let func_idx = try_exec!(self.read_leb128_u32());
-                if (func_idx as usize) < self.module.import_count {
+                if (func_idx as usize) < self.module.imports.len() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
                         Err(e) => ExecResult::Trap(e),

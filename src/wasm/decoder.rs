@@ -107,20 +107,12 @@ pub enum ExportKind {
 
 /// A fully decoded WASM module.
 ///
-/// Large buffers (`code`, `names`) are heap-allocated via `Vec`.
-/// Small fixed-capacity tables use stack arrays.
+/// All buffers are heap-allocated via `Vec` to avoid large stack frames.
 pub struct WasmModule {
-    pub func_types: [Option<FuncTypeDef>; MAX_FUNCTIONS],
-    pub func_type_count: usize,
-
-    pub functions: [Option<FuncDef>; MAX_FUNCTIONS],
-    pub func_count: usize,
-
-    pub imports: [Option<ImportDef>; MAX_IMPORTS],
-    pub import_count: usize,
-
-    pub exports: [Option<ExportDef>; MAX_EXPORTS],
-    pub export_count: usize,
+    pub func_types: Vec<FuncTypeDef>,
+    pub functions: Vec<FuncDef>,
+    pub imports: Vec<ImportDef>,
+    pub exports: Vec<ExportDef>,
 
     pub memory_min_pages: u32,
     pub memory_max_pages: u32,
@@ -135,14 +127,10 @@ pub struct WasmModule {
 impl WasmModule {
     pub fn new() -> Self {
         WasmModule {
-            func_types: [const { None }; MAX_FUNCTIONS],
-            func_type_count: 0,
-            functions: [const { None }; MAX_FUNCTIONS],
-            func_count: 0,
-            imports: [const { None }; MAX_IMPORTS],
-            import_count: 0,
-            exports: [const { None }; MAX_EXPORTS],
-            export_count: 0,
+            func_types: Vec::new(),
+            functions: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
             memory_min_pages: 0,
             memory_max_pages: 0,
             code: Vec::new(),
@@ -157,14 +145,11 @@ impl WasmModule {
 
     /// Find an exported function index by name.
     pub fn find_export_func(&self, name: &[u8]) -> Option<u32> {
-        for i in 0..self.export_count {
-            if let Some(ref exp) = self.exports[i] {
-                if let ExportKind::Func(idx) = exp.kind {
-                    let exp_name = self.get_name(exp.name_offset, exp.name_len);
-                    if exp_name == name {
-                        return Some(idx);
-                    }
-                }
+        for exp in &self.exports {
+            let ExportKind::Func(idx) = exp.kind;
+            let exp_name = self.get_name(exp.name_offset, exp.name_len);
+            if exp_name == name {
+                return Some(idx);
             }
         }
         None
@@ -328,7 +313,7 @@ fn decode_type_section(
         return Err(WasmError::TooManyFunctions);
     }
 
-    for i in 0..count {
+    for _i in 0..count {
         // Each entry starts with 0x60 (func type marker)
         if *pos >= bytes.len() || bytes[*pos] != 0x60 {
             return Err(WasmError::InvalidSection);
@@ -359,8 +344,7 @@ fn decode_type_section(
             *pos += 1;
         }
 
-        module.func_types[i] = Some(ft);
-        module.func_type_count += 1;
+        module.func_types.push(ft);
     }
 
     Ok(())
@@ -377,7 +361,7 @@ fn decode_import_section(
         return Err(WasmError::TooManyImports);
     }
 
-    for i in 0..count {
+    for _i in 0..count {
         let mut imp = ImportDef::empty();
 
         // Module name
@@ -410,8 +394,7 @@ fn decode_import_section(
             }
         }
 
-        module.imports[i] = Some(imp);
-        module.import_count += 1;
+        module.imports.push(imp);
     }
 
     Ok(())
@@ -424,17 +407,16 @@ fn decode_function_section(
     module: &mut WasmModule,
 ) -> Result<(), WasmError> {
     let count = decode_leb128_u32(bytes, pos)? as usize;
-    if count + module.import_count > MAX_FUNCTIONS {
+    if count + module.imports.len() > MAX_FUNCTIONS {
         return Err(WasmError::TooManyFunctions);
     }
 
-    for i in 0..count {
+    for _i in 0..count {
         let type_idx = decode_leb128_u32(bytes, pos)?;
         let mut fd = FuncDef::empty();
         fd.type_idx = type_idx;
         // code_offset and locals will be filled in by the Code section
-        module.functions[i] = Some(fd);
-        module.func_count += 1;
+        module.functions.push(fd);
     }
 
     Ok(())
@@ -482,7 +464,7 @@ fn decode_export_section(
         return Err(WasmError::TooManyFunctions);
     }
 
-    for i in 0..count {
+    for _i in 0..count {
         let mut exp = ExportDef::empty();
 
         // Name
@@ -504,8 +486,7 @@ fn decode_export_section(
             }
         }
 
-        module.exports[i] = Some(exp);
-        module.export_count += 1;
+        module.exports.push(exp);
     }
 
     Ok(())
@@ -531,9 +512,10 @@ fn decode_code_section(
         let local_decl_count = decode_leb128_u32(bytes, pos)? as usize;
         let mut total_locals: u16 = 0;
 
-        let func = module.functions[i]
-            .as_mut()
-            .ok_or(WasmError::FunctionNotFound(i as u32))?;
+        if i >= module.functions.len() {
+            return Err(WasmError::FunctionNotFound(i as u32));
+        }
+        let func = &mut module.functions[i];
 
         for _ in 0..local_decl_count {
             let n = decode_leb128_u32(bytes, pos)? as u16;

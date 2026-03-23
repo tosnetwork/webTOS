@@ -16,36 +16,30 @@ use crate::wasm::types::WasmError;
 /// - Memory pages are within limits
 pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     // Validate function type indices
-    for i in 0..module.func_count {
-        if let Some(ref func) = module.functions[i] {
-            if func.type_idx as usize >= module.func_type_count {
-                return Err(WasmError::FunctionNotFound(func.type_idx));
-            }
+    for func in &module.functions {
+        if func.type_idx as usize >= module.func_types.len() {
+            return Err(WasmError::FunctionNotFound(func.type_idx));
         }
     }
 
     // Validate import type indices
-    for i in 0..module.import_count {
-        if let Some(ref imp) = module.imports[i] {
-            match imp.kind {
-                crate::wasm::decoder::ImportKind::Func(type_idx) => {
-                    if type_idx as usize >= module.func_type_count {
-                        return Err(WasmError::FunctionNotFound(type_idx));
-                    }
+    for imp in &module.imports {
+        match imp.kind {
+            crate::wasm::decoder::ImportKind::Func(type_idx) => {
+                if type_idx as usize >= module.func_types.len() {
+                    return Err(WasmError::FunctionNotFound(type_idx));
                 }
             }
         }
     }
 
     // Validate export function indices
-    let total_functions = module.import_count + module.func_count;
-    for i in 0..module.export_count {
-        if let Some(ref exp) = module.exports[i] {
-            match exp.kind {
-                crate::wasm::decoder::ExportKind::Func(idx) => {
-                    if idx as usize >= total_functions {
-                        return Err(WasmError::FunctionNotFound(idx));
-                    }
+    let total_functions = module.imports.len() + module.functions.len();
+    for exp in &module.exports {
+        match exp.kind {
+            crate::wasm::decoder::ExportKind::Func(idx) => {
+                if idx as usize >= total_functions {
+                    return Err(WasmError::FunctionNotFound(idx));
                 }
             }
         }

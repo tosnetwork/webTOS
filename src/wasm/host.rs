@@ -36,14 +36,11 @@ pub enum HostFunc {
 /// Resolve an import index to a `HostFunc` by examining the import names.
 pub fn resolve_import(module: &WasmModule, import_idx: u32) -> HostFunc {
     let idx = import_idx as usize;
-    if idx >= module.import_count {
+    if idx >= module.imports.len() {
         return HostFunc::Unknown;
     }
 
-    let imp = match &module.imports[idx] {
-        Some(imp) => imp,
-        None => return HostFunc::Unknown,
-    };
+    let imp = &module.imports[idx];
 
     let mod_name = module.get_name(imp.module_name_offset, imp.module_name_len);
     let field_name = module.get_name(imp.field_name_offset, imp.field_name_len);
