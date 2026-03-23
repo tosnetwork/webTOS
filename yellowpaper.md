@@ -20,6 +20,16 @@ AOS is designed under two strict principles:
 
 The first execution target is a **virtual machine environment**, especially **QEMU on x86_64**, so that architecture purity is preserved while hardware complexity is minimized.
 
+Terminology clarification:
+
+* **AOS** refers to the full system architecture.
+* **AOS-0** refers to the privileged kernel substrate: boot, architecture support, memory management, trap handling, syscall entry, scheduling, mailbox IPC, capability enforcement, accounting, and audit.
+* **AOS-1** refers to the runtime host layer for agent execution backends such as native execution, WASM, and future managed runtimes.
+* **AOS-2** refers to the agent and system-service layer: root, stated, policyd, netd, accountd, and user agents.
+* **AOS-NET** refers to the brokered and distributed execution layer that extends AOS beyond a single local kernel instance.
+
+This yellow paper covers the whole AOS stack, but Stage-1 is primarily an **AOS-0** milestone. Later stages progressively realize AOS-1, AOS-2, and AOS-NET.
+
 ---
 
 ## 1. Motivation
@@ -148,30 +158,111 @@ This is a deliberate engineering constraint. The goal is to validate the AI-nati
 
 ## 4. System Overview
 
-The conceptual stack of AOS is as follows:
+AOS is the umbrella system. The early kernel is not the whole of AOS; it is the privileged foundation on which later runtime, service, and network layers are built.
+
+### 4.1 Layer naming
+
+* **AOS-0** — privileged kernel substrate
+* **AOS-1** — runtime host layer
+* **AOS-2** — agent and system-service layer
+* **AOS-NET** — brokered and distributed execution layer
+
+### 4.2 Logical architecture
+
+The conceptual stack of the full AOS system is as follows:
 
 ```text
 +---------------------------------------------------+
-|                Test Agents / Runtimes              |
-|   ping agent | pong agent | idle agent             |
+|           Applications / External Systems         |
 +---------------------------------------------------+
-|              AI-native Syscall ABI                 |
-| yield | spawn | exit | send | recv | cap | energy  |
+| AOS-NET                                           |
+| brokered network | distributed execution | replay |
 +---------------------------------------------------+
-|                 Kernel Core                        |
-| sched | mm | trap | syscall | ipc | cap | audit    |
+| AOS-2 Agent / Service Layer                       |
+| root | stated | policyd | netd | accountd | user  |
 +---------------------------------------------------+
-|                x86_64 Arch Layer                   |
-| gdt | idt | paging | timer | irq | context         |
+| AOS-1 Runtime Host                                |
+| native | WASM | future managed runtimes           |
 +---------------------------------------------------+
-|               Boot / Loader Layer                  |
-|                  (Multiboot v1)                    |
+| AOS-0 Kernel                                      |
+| sched | mailbox | capability | state | audit      |
+| energy | syscall | checkpoint                     |
 +---------------------------------------------------+
-|                    QEMU VM                         |
+| x86_64 Architecture + Boot                        |
+| gdt | idt | paging | timer | trap | multiboot     |
++---------------------------------------------------+
+|                    QEMU / Hardware                |
 +---------------------------------------------------+
 ```
 
-AOS should be understood not as a file-centric Unix derivative, but as an **agent execution substrate**.
+`AOS-NET` is a logical system layer, not a separate CPU privilege ring. It spans brokered network access, replay/export, and future inter-node coordination.
+
+### 4.3 External-facing architecture diagram
+
+The following figure is the recommended public-facing architecture view for overview pages, presentations, and design reviews. It is intentionally more narrative than the strictly layered diagram above: it shows not only where each subsystem sits, but how execution, authority, energy, networking, and verification move through the system.
+
+```text
+                         PUBLIC-FACING AOS ARCHITECTURE
+
++-------------------------------------------------------------------------+
+|                 Applications / External Systems                         |
+| AI platforms | verifiers | billing systems | operators | automation     |
++-----------------------------------+-------------------------------------+
+                                    |
+                                    v
++-------------------------------------------------------------------------+
+| AOS-2 Agent / Service Layer                                              |
+| user agents | root | stated | policyd | netd | accountd                 |
+| message plane: mailbox protocols, service APIs, delegated authority      |
++-------------------------+--------------------------+---------------------+
+                          |                          |
+                          | agent execution          | service / broker path
+                          v                          v
++-------------------------------------------------------------------------+
+| AOS-1 Runtime Host                                                       |
+| native runtime | WASM runtime | future managed runtimes                 |
+| load -> instantiate -> execute_slice -> syscall_bridge -> snapshot      |
++-------------------------+--------------------------+---------------------+
+                          |
+                          | syscall / trap / yield / block / exit
+                          v
++-------------------------------------------------------------------------+
+| AOS-0 Kernel                                                             |
+| scheduler | mailbox IPC | capability checks | eBPF-lite attach points   |
+| energy meter / cost table | state / Merkle / checkpoint | audit / trace |
++-------------+------------------------+------------------------+----------+
+              |                        |                        |
+              | storage / replay       | brokered network       | proofs / logs
+              v                        v                        v
+        state log / checkpoints   netd -> virtio-net     audit log / replay
+              \___________________________|___________________________/
+                                          v
++-------------------------------------------------------------------------+
+| x86_64 + Boot + Devices                                                  |
+| paging | traps | timer | syscall entry | virtio-blk | virtio-net | QEMU |
++-------------------------------------------------------------------------+
+```
+
+How to read this diagram:
+
+* **Execution path**: agents live in AOS-2, execute through an AOS-1 runtime backend, and enter AOS-0 through syscalls, traps, yields, blocks, and exits.
+* **Authority path**: capabilities originate from the root authority chain, are delegated across agents and services, and are finally enforced only in AOS-0. eBPF-lite policy extends this enforcement path; it does not replace it.
+* **Energy path**: runtime fuel, syscall cost, timer cost, storage cost, and network cost are all collapsed into one conserved AOS energy model. This is why `accountd` belongs in AOS-2 but depends on AOS-0 metering.
+* **Network path**: user agents do not touch NICs directly. They talk to `netd`, and `netd` brokers access through the kernel and the underlying device layer.
+* **Verification path**: audit events, replay traces, checkpoints, and Merkle-backed state all originate in or pass through AOS-0, then become exportable artifacts for external replay, proof, billing, and analysis systems.
+
+This diagram should be read as the **target system shape**, not as a claim that every box already exists in Stage-1. Stage-1 validates the kernel substrate; later stages progressively populate the rest of the figure.
+
+### 4.4 Stage-1 implementation snapshot
+
+Stage-1 intentionally realizes only a thin slice of the full stack:
+
+* AOS-0 is the primary focus
+* AOS-1 collapses to built-in native execution
+* AOS-2 contains only minimal bootstrap and test agents
+* AOS-NET is deferred
+
+AOS should therefore be understood not as a file-centric Unix derivative, but as an **agent execution substrate** that expands upward from AOS-0.
 
 ---
 
@@ -188,7 +279,9 @@ Agent {
     id,
     parent_id,
     status,
+    runtime_kind,
     execution_context,
+    runtime_state,
     mailbox_id,
     capability_set,
     energy_budget,
@@ -197,7 +290,8 @@ Agent {
 ```
 
 * `parent_id` tracks which agent spawned this agent. This enables capability delegation chains, cascading termination, and supervisor patterns. The root system agent has `parent_id = NONE`.
-* Stage-1 supports only one execution type: native x86_64 code compiled into the kernel image. A `runtime_kind` field (for WASM, custom VM, etc.) may be added in later stages when multiple runtime backends are supported.
+* `runtime_kind` identifies which execution backend advances the agent: native x86_64, WASM, or a future managed runtime.
+* `runtime_state` holds backend-specific execution data. In Stage-1 this is trivial because every agent is native x86_64 code compiled into the kernel image; in Stage-2+ it may hold a `WasmInstance` or another VM-specific state object.
 
 #### Required properties
 
@@ -227,6 +321,8 @@ Mailbox {
 ```
 
 The recommended default capacity for Stage-1 is **16 messages** per mailbox. Combined with the 256-byte payload limit (§11.3), each mailbox occupies approximately 4–5 KB of kernel memory.
+
+Stage-3 extends this model with large-message references via shared memory regions. The Stage-1 fixed payload limit is an implementation simplification, not a permanent architectural ceiling.
 
 ### 5.3 Capability
 
@@ -394,7 +490,9 @@ The kernel must provide serial output and structured event emission. `[IMPL: ✅
 
 ## 8. Architecture Layers
 
-### 8.1 Boot layer `[IMPL: ✅]`
+The layer naming from §4 is normative: boot, architecture, and kernel core together form **AOS-0**; the runtime host is **AOS-1**; agents and system services are **AOS-2**. `AOS-NET` is described later in the networking and distributed execution roadmap.
+
+### 8.1 AOS-0 Boot layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -403,7 +501,7 @@ Responsibilities:
 * hand off memory information `[IMPL: ✅ multiboot magic + info passed to kernel_main]`
 * establish clean control flow into Rust kernel logic `[IMPL: ✅ BSS zeroed, stack set, call kernel_main]`
 
-### 8.2 x86_64 architecture layer `[IMPL: ✅]`
+### 8.2 AOS-0 x86_64 architecture layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -415,7 +513,7 @@ Responsibilities:
 * MSR configuration (STAR, LSTAR, SFMASK for `syscall`/`sysret` support) `[IMPL: ⏳ syscall_entry.asm ready, MSR init deferred to ring-3 stage]`
 * low-level register, port, and serial I/O handling `[IMPL: ✅ serial.rs — COM1 0x3F8, outb/inb helpers]`
 
-### 8.3 Kernel core layer `[IMPL: ✅]`
+### 8.3 AOS-0 Kernel core layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -427,11 +525,22 @@ Responsibilities:
 * energy accounting `[IMPL: ✅ energy.rs]`
 * syscall dispatcher `[IMPL: ✅ syscall.rs]`
 
-### 8.4 Test agent layer `[IMPL: ✅]`
+### 8.4 AOS-1 Runtime host layer `[IMPL: ⚠️ Stage-1 native only]`
+
+Responsibilities:
+
+* load and instantiate agent runtimes `[IMPL: ⚠️ Stage-1 compiled-in native agents only]`
+* bridge runtime-specific host calls into the AOS syscall ABI `[IMPL: ⚠️ direct native entry only in Stage-1; generalized in Stage-2]`
+* expose runtime checkpoint / restore hooks `[IMPL: ⏳ placeholder in Stage-1, implemented progressively in Stage-2/3]`
+* translate runtime-specific execution into scheduler-visible slices `[IMPL: ⚠️ native CPU context only in Stage-1]`
+
+### 8.5 AOS-2 Agent / service layer `[IMPL: ✅ Stage-1 test agents, Stage-2+ system agents]`
 
 Stage-1 should compile in a minimal set of test agents directly into the kernel image or a fixed internal image format. `[IMPL: ✅ 5 agents compiled in: idle, root, ping, pong, bad]`
 
 This avoids early distraction from general executable loaders.
+
+In later stages this layer expands to include system services such as stated, policyd, netd, accountd, and user-supplied agents running on top of the AOS-1 runtime host.
 
 ---
 
@@ -507,7 +616,7 @@ Suspended -> Ready         (budget replenished by parent or system)
 
 ### 10.2 Agent execution context
 
-The execution context is the CPU state saved and restored on context switch. It contains only hardware register state:
+For native agents, the execution context is the CPU state saved and restored on context switch. It contains only hardware register state:
 
 * `rsp` — stack pointer
 * `rip` — instruction pointer / entry point
@@ -516,6 +625,16 @@ The execution context is the CPU state saved and restored on context switch. It 
 * `cr3` — page table root (for memory isolation)
 
 All other agent metadata (`energy_budget`, `mailbox_id`, `capability_set`, `memory_quota`) is stored in the Agent struct (§5.1), not in the execution context. The scheduler accesses agent metadata via the agent table, not via the saved context.
+
+For managed runtimes, the agent still has a minimal kernel scheduling context, but most VM-specific execution state lives in `runtime_state` and is advanced through the AOS-1 runtime host rather than directly by resuming native CPU registers.
+
+Conceptually:
+
+```text
+Agent = identity + authority + quotas + mailbox + runtime-backed execution state
+```
+
+The agent is therefore the unit of scheduling, messaging, capability enforcement, and accounting, while the runtime backend determines how its compute state is represented and advanced.
 
 ### 10.3 Root agent bootstrap
 
@@ -1273,6 +1392,32 @@ Stage-1 agents are compiled into the kernel image. Stage-2 must support loading 
 
 ### 24.3 Runtime Layer
 
+Stage-2 turns AOS-1 into a real subsystem rather than a thin Stage-1 placeholder.
+
+#### 24.3.0 Runtime Abstraction Layer `[IMPL: ⚠️ conceptual contract; native + WASM pieces implemented progressively]`
+
+AOS must not let each runtime grow as an unrelated special case. All agent runtimes must conform to a common conceptual lifecycle so that scheduling, accounting, syscall bridging, checkpointing, and replay remain runtime-neutral.
+
+```text
+AgentRuntime {
+    kind() -> RuntimeKind
+    load(image_bytes) -> module_id
+    instantiate(module_id, agent_id, quotas) -> runtime_instance
+    execute_slice(runtime_instance, budget) -> RuntimeResult
+    syscall_bridge(runtime_instance, num, args) -> result
+    snapshot(runtime_instance) -> RuntimeCheckpoint
+    restore(RuntimeCheckpoint) -> runtime_instance
+    destroy(runtime_instance)
+}
+```
+
+Runtime notes:
+
+* **Native runtime**: `load` parses an ELF or built-in image; `execute_slice` resumes user-mode or native execution until trap, yield, block, or exit.
+* **WASM runtime**: `load` parses and validates a WASM module; `execute_slice` consumes fuel and advances the interpreter.
+* **Future managed runtimes**: any future VM (custom VM, JVM-lite, TOS-specific VM, etc.) must fit this contract rather than introducing a separate kernel control path.
+* **eBPF-lite** is not an `AgentRuntime`; it is the policy execution layer of AOS. It follows similar bounded-lifecycle principles, but it is kernel-resident and attachment-driven rather than agent-scheduled.
+
 #### 24.3.1 WASM Runtime `[IMPL: ✅ 1,981 lines]`
 
 WASM is the primary sandboxed runtime for AOS agents. It provides portable, deterministic execution with fine-grained memory safety.
@@ -1300,7 +1445,7 @@ Design constraints:
 
 #### 24.3.2 eBPF-lite Policy Runtime `[IMPL: ✅ 1,010 lines]`
 
-eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode.
+eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode. It serves as the policy execution layer of AOS, providing verifiable, bounded, low-cost rule enforcement at kernel-defined attachment points.
 
 ```text
 EbpfProgram {
@@ -1538,6 +1683,14 @@ Replace the round-robin scheduler with a deterministic, replay-compatible schedu
 * **I/O determinism**: external I/O (virtio-blk, virtio-net) is logged and replayed from a trace file during replay mode. The scheduler pauses agents waiting for I/O until the traced response is injected.
 * **WASM advantage**: WASM agents are inherently deterministic (fuel-counted). The deterministic scheduler combined with WASM provides full replay fidelity. For maximum replay guarantees, production agents should prefer WASM over native execution.
 
+Determinism guarantees:
+
+* **Full determinism**: WASM agents, when executed with fixed fuel accounting, deterministic host behavior, and traced external inputs
+* **Partial determinism**: native agents, where scheduling order and external input replay are deterministic but instruction-level behavior may still vary by CPU microarchitecture
+* **Policy determinism**: eBPF-lite programs, which are deterministic for a given verified bytecode image, input context, and helper results, but remain subordinate to the determinism class of the kernel and triggering event
+
+Claims about replay, proof, or blockchain-style execution guarantees must therefore name the runtime class, not treat "AOS determinism" as uniform across all agents.
+
 #### 25.2.2 SMP / Multi-Core Support `[IMPL: ✅ ACPI+LAPIC+AP boot, SpinLock run queue, per-core contexts]`
 
 Extend AOS to run on multiple CPU cores:
@@ -1597,6 +1750,8 @@ Build on Stage-2 basic checkpointing to achieve deterministic replay:
 
 Extend per-agent energy budgets into a unified economic model:
 
+Energy in AOS is conceptually equivalent to gas in blockchain systems, but generalized to the entire operating system. It meters native agents, WASM agents, brokered I/O, and kernel-side policy execution under one conserved accounting model instead of restricting gas to a single smart-contract VM.
+
 * **Cost table**: define energy cost per operation type: syscall (1), timer tick (1), frame allocation (10), virtio-blk read (100), virtio-blk write (200), network request (500). Costs are configurable at compile time.
 * **Energy transfer**: `sys_energy_grant` allows a parent to transfer energy to a child. Energy is conserved — the parent's budget decreases by the granted amount.
 * **Energy accounting across runtimes**: WASM fuel consumption is mapped to AOS energy units. The default mapping is 1 WASM fuel unit = 1 AOS energy unit (a simple approximation; instruction-class-weighted mapping may be introduced later if metering precision is needed).
@@ -1622,7 +1777,125 @@ Stage-1 binds each agent to exactly one mailbox (§5.2). Stage-3 lifts this rest
 * Mailbox IDs are globally unique, allocated from a kernel-managed pool
 * An agent may destroy its own non-primary mailboxes via `sys_mailbox_destroy(mailbox_id)` (syscall 19)
 
-### 25.4 Suggested Development Order (Stage-3)
+### 25.4 Agent Skill System
+
+Agents can dynamically install **skill modules** — WASM programs that extend an agent's capabilities at runtime, analogous to plugins or MCP tool servers. A skill is a child agent spawned by the requesting agent, communicating via mailbox RPC.
+
+#### 25.4.1 Skill Definition
+
+A skill is a WASM module paired with a manifest:
+
+```text
+Skill {
+    name: "web-search",
+    version: "0.1.0",
+    runtime: "wasm",
+    capabilities_required: [CAP_NETWORK, CAP_STATE_WRITE],
+
+    exports: [
+        { name: "search", params: ["query: string"], returns: "json" },
+        { name: "fetch",  params: ["url: string"],   returns: "bytes" },
+    ],
+}
+```
+
+The manifest declares which capabilities the skill needs and which functions it exports. The kernel enforces that the skill cannot request capabilities that the installing agent does not hold (no-escalation principle, §12.3).
+
+#### 25.4.2 Installation Protocol
+
+An agent installs a skill by sending a request to the **skilld** system agent:
+
+```text
+1. Agent → sys_send(skilld_mailbox, {
+       op: "install",
+       name: "web-search",
+       wasm_bytes: [...],          // WASM module binary
+       caps_requested: [CAP_NETWORK, CAP_STATE_WRITE],
+   })
+
+2. skilld validates:
+   a. WASM module passes decoder + validator checks
+   b. Requested capabilities are a SUBSET of the installing agent's capabilities
+   c. eBPF policy at AttachPoint::AgentSpawn allows the installation
+   d. Installing agent has sufficient energy budget for the skill's spawn cost
+
+3. skilld calls sys_spawn to create the skill as a CHILD of the requesting agent:
+   - runtime: WASM interpreter
+   - capabilities: the requested subset
+   - energy: deducted from the installing agent's budget
+   - parent_id: the installing agent (not skilld)
+
+4. skilld returns the skill agent's mailbox ID to the installing agent:
+   Agent ← sys_recv(own_mailbox, { status: "ok", skill_mailbox: 42 })
+```
+
+Since the skill is a child of the installing agent, it is subject to all standard agent lifecycle rules: cascading termination if the parent dies (§10.5), capability revocation by the parent, energy budget limits.
+
+#### 25.4.3 Skill Invocation (Mailbox RPC)
+
+The installing agent calls skill functions via mailbox messages:
+
+```text
+Agent → sys_send(skill_mailbox, {
+    method: "search",
+    args: { query: "AOS kernel" },
+    reply_to: agent_mailbox,
+})
+
+Skill executes: calls host functions (sys_send to netd for network access),
+                processes results, sends reply.
+
+Agent ← sys_recv(agent_mailbox, {
+    method: "search",
+    result: { items: [...] },
+})
+```
+
+Each skill invocation is:
+* **Audited**: the kernel emits `MAILBOX_SEND`/`MAILBOX_RECV` events for every message
+* **Metered**: the skill's execution consumes energy from its own budget (deducted from the parent at install time)
+* **Isolated**: the skill runs in its own address space with its own page tables; it cannot access the parent's memory directly
+* **Capability-scoped**: the skill can only use the capabilities it was granted at installation
+
+#### 25.4.4 Skill Lifecycle
+
+| Operation | How |
+|-----------|-----|
+| **Install** | Agent sends WASM bytes to skilld → new child agent spawned |
+| **Invoke** | Agent sends RPC message to skill's mailbox → skill replies |
+| **Update** | Agent sends new WASM bytes to skilld → old skill terminated, new one spawned (same mailbox ID if possible) |
+| **Uninstall** | Agent calls `sys_exit` on the skill's behalf (parent can terminate children) or the skill's energy runs out |
+| **Auto-cleanup** | If the parent agent dies, the skill is cascade-terminated (§10.5) |
+
+#### 25.4.5 Comparison with External Plugin Systems
+
+| Aspect | Traditional Plugins | AOS Skills |
+|--------|-------------------|------------|
+| Isolation | Same process (shared memory) | Separate agent (separate page tables) |
+| Permissions | Full process authority | Capability subset of parent |
+| Lifecycle | Manual load/unload | Kernel-managed agent lifecycle |
+| Metering | None | Energy budget per invocation |
+| Audit | Application-level logging | Kernel-level event log |
+| Hot-update | Requires restart | Spawn new, terminate old |
+| Crash impact | Crashes host | Skill faults, parent unaffected |
+
+#### 25.4.6 Implementation Requirements
+
+All building blocks exist in Stage-2/3:
+
+| Component | Used For | Status |
+|-----------|----------|--------|
+| WASM interpreter | Execute skill code | ✅ Stage-2 |
+| `sys_spawn` | Create skill as child agent | ✅ Stage-1 |
+| Capability subset validation | Enforce no-escalation | ✅ Stage-1 |
+| Mailbox RPC | Agent ↔ skill communication | ✅ Stage-1 |
+| eBPF policy | Gate installations at AgentSpawn | ✅ Stage-2 |
+| Energy budget | Meter skill execution | ✅ Stage-1 |
+| Per-agent page tables | Memory isolation | ✅ Stage-2 |
+
+What remains: a **skilld** system agent (~200 lines) that implements the installation protocol and a skill manifest format. This is a Stage-4 deliverable alongside the Developer SDK (§26.2.7).
+
+### 25.5 Suggested Development Order (Stage-3)
 
 #### Phase 12b: WASM runtime upgrade to full spec sizes `[IMPL: ✅ COMPLETE]`
 
@@ -1663,7 +1936,7 @@ Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY
 * Multi-mailbox agent support `[✅ sys_mailbox_create(18)/destroy(19), MAILBOXES expanded to 32]`
 * Verify: agent energy consumption matches expected cost across native + WASM operations `[✅ cumulative tracking via cost::record_consumption()]`
 
-### 25.5 Stage-3 Success Criteria `[IMPL: ✅ ALL 6/6 MET]`
+### 25.6 Stage-3 Success Criteria `[IMPL: ✅ ALL 6/6 MET]`
 
 Stage-3 is successful when:
 
