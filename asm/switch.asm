@@ -111,8 +111,13 @@ context_switch:
     mov cr3, rax
 .skip_cr3:
 
-    ; Restore rflags
+    ; Restore rflags with IF (interrupt flag) CLEARED.
+    ; Interrupts must stay disabled during the switch because RSP and RIP
+    ; have not been restored yet. An interrupt here would use the wrong
+    ; stack and corrupt state. The caller (schedule()) re-enables interrupts
+    ; with STI after context_switch returns.
     mov rax, [rsi + CTX_RFLAGS]
+    and rax, ~(1 << 9)       ; Clear IF bit (bit 9)
     push rax
     popfq
 

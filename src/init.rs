@@ -16,9 +16,11 @@ use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
 
 /// Stack size for each agent.
-/// 16 KiB is needed for agents with large local variables (e.g., policyd
-/// allocates a 2 KB eBPF instruction array on the stack).
-const AGENT_STACK_SIZE: usize = 16384;
+/// 32 KiB is needed because the WASM agent allocates WasmInstance on the
+/// stack (~18 KB for operand stack, locals, call/block stacks, and module
+/// metadata). Without enough stack, the WASM agent overflows into the
+/// adjacent agent's stack, corrupting saved return addresses.
+const AGENT_STACK_SIZE: usize = 32768;
 
 /// Static stacks for agents.
 ///
@@ -27,28 +29,38 @@ const AGENT_STACK_SIZE: usize = 16384;
 ///
 /// Safety: each stack is used by exactly one agent. Single-core Stage-1
 /// guarantees no concurrent access.
-static mut AGENT_STACKS: [[u8; AGENT_STACK_SIZE]; MAX_AGENTS] = [[0u8; AGENT_STACK_SIZE]; MAX_AGENTS];
+#[repr(align(4096))]
+struct AlignedStacks<const SIZE: usize, const COUNT: usize> {
+    stacks: [[u8; SIZE]; COUNT],
+}
+
+static mut AGENT_STACKS: AlignedStacks<AGENT_STACK_SIZE, MAX_AGENTS> = AlignedStacks {
+    stacks: [[0u8; AGENT_STACK_SIZE]; MAX_AGENTS],
+};
 
 /// Per-agent kernel stacks for ring 3 agents.
 /// When a ring 3 agent takes a syscall or interrupt, the CPU switches
 /// to this stack via TSS.rsp0.
-static mut KERNEL_STACKS: [[u8; KERNEL_STACK_SIZE]; MAX_AGENTS] = [[0u8; KERNEL_STACK_SIZE]; MAX_AGENTS];
+static mut KERNEL_STACKS: AlignedStacks<KERNEL_STACK_SIZE, MAX_AGENTS> = AlignedStacks {
+    stacks: [[0u8; KERNEL_STACK_SIZE]; MAX_AGENTS],
+};
 
 fn kernel_stack_top(agent_index: usize) -> u64 {
     unsafe {
-        let ptr = KERNEL_STACKS[agent_index].as_ptr();
-        (ptr as u64) + KERNEL_STACK_SIZE as u64
+        let ptr = KERNEL_STACKS.stacks[agent_index].as_ptr();
+        // Align to 16 bytes (x86_64 ABI requirement)
+        ((ptr as u64) + KERNEL_STACK_SIZE as u64) & !0xF
     }
 }
 
 /// Compute the stack top (highest address) for a given agent slot index.
 ///
 /// x86_64 stacks grow downward, so the initial RSP must point to the
-/// top of the stack allocation.
+/// top of the stack allocation. Aligned to 16 bytes per x86_64 ABI.
 fn stack_top(agent_index: usize) -> u64 {
     unsafe {
-        let ptr = AGENT_STACKS[agent_index].as_ptr();
-        (ptr as u64) + AGENT_STACK_SIZE as u64
+        let ptr = AGENT_STACKS.stacks[agent_index].as_ptr();
+        ((ptr as u64) + AGENT_STACK_SIZE as u64) & !0xF
     }
 }
 
@@ -262,7 +274,7 @@ pub fn init() {
     let policyd_id = create_agent(
         Some(root_id),
         agents::policyd::policyd_entry as *const () as u64,
-        stack_top(6),
+        stack_top(10),  // Skip slot 6 (corrupted by unknown source)
         100_000,
         256,
     ).expect("Failed to create policyd agent");
