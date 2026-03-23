@@ -137,6 +137,9 @@ pub const PTE_DIRTY: u64 = 1 << 6;
 pub const PTE_HUGE: u64 = 1 << 7;
 pub const PTE_GLOBAL: u64 = 1 << 8;
 pub const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// Alias: NX (No-Execute) bit — same as PTE_NO_EXECUTE, prefer this name
+/// when explicitly enforcing the NX policy on stack/data pages.
+pub const PTE_NX: u64 = 1 << 63;
 
 /// Page table levels
 const PT_LEVELS: usize = 4; // PML4 -> PDPT -> PD -> PT
@@ -231,8 +234,33 @@ unsafe fn free_page_table_level(table_phys: u64, level: usize) {
     dealloc_frame(table_phys);
 }
 
+/// Map a stack or data page — always sets PTE_NX (No-Execute).
+///
+/// Use this for any page that should hold data but not be executable
+/// (stacks, heap, BSS, message buffers, …).  The NX bit is forced on
+/// regardless of what is passed in `flags`, so callers cannot accidentally
+/// create a writable-and-executable data page.
+pub fn map_data_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
+    map_page(pml4_phys, virt_addr, phys_addr, flags | PTE_NX)
+}
+
+/// Map a code page — explicitly clears PTE_NX so the page is executable.
+///
+/// Use this only for read-only text segments.  Writable+executable pages
+/// are refused: if `flags` contains `PTE_WRITABLE` the call returns `Err(())`.
+pub fn map_code_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
+    if flags & PTE_WRITABLE != 0 {
+        // W^X: refuse to create a writable executable page
+        return Err(());
+    }
+    map_page(pml4_phys, virt_addr, phys_addr, flags & !PTE_NX)
+}
+
 /// Map a single 4KB page in an agent's address space.
 /// Creates intermediate page table levels as needed.
+///
+/// Prefer `map_data_page` / `map_code_page` over this function to ensure
+/// the correct NX policy is applied automatically.
 pub fn map_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;

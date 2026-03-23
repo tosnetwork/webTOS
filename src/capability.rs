@@ -29,10 +29,15 @@ pub enum CapType {
 #[repr(C)]
 pub struct Capability {
     pub cap_type: CapType,
-    pub target: u16,    // target resource id, or CAP_TARGET_WILDCARD
+    pub target: u16,        // target resource id, or CAP_TARGET_WILDCARD
     pub flags: u16,
-    pub use_limit: u32, // 0 = unlimited
+    pub use_limit: u32,     // 0 = unlimited
     pub use_count: u32,
+    /// Node that issued this capability (0 = local / unset).
+    pub node_id: u32,
+    /// Placeholder signature — FNV-1a hash of cap fields concatenated with the
+    /// shared secret. A real implementation would use ed25519 here.
+    pub signature: [u8; 32],
 }
 
 impl Capability {
@@ -44,6 +49,8 @@ impl Capability {
             flags: 0,
             use_limit: 0,
             use_count: 0,
+            node_id: 0,
+            signature: [0u8; 32],
         }
     }
 
@@ -55,6 +62,8 @@ impl Capability {
             flags: 0,
             use_limit: limit,
             use_count: 0,
+            node_id: 0,
+            signature: [0u8; 32],
         }
     }
 
@@ -237,3 +246,102 @@ pub fn create_root_capabilities() -> [Option<Capability>; MAX_CAPABILITIES_PER_A
 
 /// Return the number of root capabilities (for setting cap_count).
 pub const ROOT_CAP_COUNT: usize = 7;
+
+// ─── Cross-node capability signing ──────────────────────────────────────────
+
+/// Compute a 32-byte signature over a capability and a 32-byte shared secret.
+///
+/// Algorithm: FNV-1a (64-bit) iterated over the serialised capability fields
+/// concatenated with the secret, then expanded to 32 bytes by running four
+/// independent FNV-1a streams with different seeds.
+///
+/// This is **not** cryptographically secure — it is a placeholder until a
+/// proper ed25519 implementation is available for the `no_std` kernel.
+pub fn sign_capability(cap: &Capability, secret: &[u8; 32]) -> [u8; 32] {
+    // Build a flat byte representation of the fields that must be signed.
+    // We deliberately exclude `use_count` and `signature` so that exercising
+    // a capability does not invalidate its signature, and to avoid circularity.
+    let mut buf = [0u8; 4 + 2 + 2 + 4 + 4]; // cap_type(1)+pad(3) + target(2) + flags(2) + use_limit(4) + node_id(4)
+    buf[0] = cap.cap_type as u8;
+    buf[1..3].copy_from_slice(&cap.target.to_le_bytes());
+    buf[3..5].copy_from_slice(&cap.flags.to_le_bytes());
+    buf[5..9].copy_from_slice(&cap.use_limit.to_le_bytes());
+    buf[9..13].copy_from_slice(&cap.node_id.to_le_bytes());
+
+    let mut sig = [0u8; 32];
+    // Four 8-byte lanes, each starting from a different FNV offset basis.
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+    const SEEDS: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325, // standard FNV-1a offset basis
+        0x0000_dead_beef_0001,
+        0x0000_cafe_babe_0002,
+        0xffff_0000_1234_5678,
+    ];
+
+    for (lane, &seed) in SEEDS.iter().enumerate() {
+        let mut h: u64 = seed;
+        for &b in buf.iter().chain(secret.iter()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        let bytes = h.to_le_bytes();
+        sig[lane * 8..(lane + 1) * 8].copy_from_slice(&bytes);
+    }
+
+    sig
+}
+
+/// Verify a capability signature produced by `sign_capability`.
+///
+/// Returns `true` if the computed signature matches `sig`.
+pub fn verify_capability(cap: &Capability, sig: &[u8; 32], secret: &[u8; 32]) -> bool {
+    let expected = sign_capability(cap, secret);
+    // Constant-time comparison (avoids timing oracle; good enough for a
+    // placeholder — a real implementation would use a proper CT library).
+    let mut diff: u8 = 0;
+    for (a, b) in expected.iter().zip(sig.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Alias for `sign_capability` — SDK-facing name.
+///
+/// Create a 32-byte signature over the capability fields using a keyed
+/// FNV-1a hash: hash(secret || cap_type || target || node_id).
+#[inline]
+pub fn cap_sign(cap: &Capability, secret: &[u8; 32]) -> [u8; 32] {
+    sign_capability(cap, secret)
+}
+
+/// Alias for `verify_capability` — SDK-facing name.
+///
+/// Returns `true` if recomputing the signature from `cap` and `secret`
+/// matches the provided `sig`.
+#[inline]
+pub fn cap_verify(cap: &Capability, sig: &[u8; 32], secret: &[u8; 32]) -> bool {
+    verify_capability(cap, sig, secret)
+}
+
+/// A capability bundled with its cryptographic signature.
+///
+/// Wraps a `Capability` together with the pre-computed signature so that
+/// it can be passed across trust boundaries and re-verified on arrival.
+#[derive(Debug, Clone, Copy)]
+pub struct SignedCapability {
+    pub cap: Capability,
+    pub signature: [u8; 32],
+}
+
+impl SignedCapability {
+    /// Sign a capability with `secret` and bundle the result.
+    pub fn new(cap: Capability, secret: &[u8; 32]) -> Self {
+        let signature = cap_sign(&cap, secret);
+        SignedCapability { cap, signature }
+    }
+
+    /// Verify the bundled signature against `secret`.
+    pub fn verify(&self, secret: &[u8; 32]) -> bool {
+        cap_verify(&self.cap, &self.signature, secret)
+    }
+}

@@ -7,6 +7,7 @@
 
 use crate::serial_println;
 use crate::arch::x86_64::paging;
+use crate::arch::x86_64::pci;
 
 // e1000 register offsets (MMIO from BAR0)
 const REG_CTRL: u32 = 0x0000;    // Device Control
@@ -111,8 +112,105 @@ unsafe fn write_reg(offset: u32, val: u32) {
     core::ptr::write_volatile((E1000_DEV.bar0 + offset as u64) as *mut u32, val);
 }
 
+/// Find the e1000 device on the PCI bus and return its MMIO BAR0 address.
+///
+/// The e1000 can appear under several device IDs:
+///   8086:100E — e1000 (QEMU default)
+///   8086:100F — e1000 (82545EM)
+///   8086:10D3 — e1000e
+fn find_e1000_bar0() -> Option<u64> {
+    // Known Intel e1000 / e1000e device IDs
+    const E1000_IDS: &[(u16, u16)] = &[
+        (0x8086, 0x100E), // 82540EM (QEMU default e1000)
+        (0x8086, 0x100F), // 82545EM Gigabit
+        (0x8086, 0x10D3), // 82574L (e1000e)
+        (0x8086, 0x1533), // I210
+        (0x8086, 0x1521), // I350
+        (0x8086, 0x107C), // 82541PI
+        (0x8086, 0x1076), // 82541GI
+    ];
+
+    for &(vendor, device) in E1000_IDS {
+        if let Some(dev) = pci::find_device(vendor, device) {
+            serial_println!("[e1000] Found device {:04x}:{:04x} at PCI {}:{}.{}",
+                vendor, device, dev.bus, dev.device, dev.function);
+
+            // BAR0 should be a 32-bit or 64-bit MMIO BAR for e1000
+            let bar0_addr = match dev.bars[0] {
+                pci::BarType::Mmio32(addr) => addr as u64,
+                pci::BarType::Mmio64(addr) => addr,
+                pci::BarType::IoPort(_) => {
+                    // e1000 sometimes also exposes an I/O BAR at BAR2; try BAR1 MMIO
+                    match dev.bars[1] {
+                        pci::BarType::Mmio32(addr) => addr as u64,
+                        pci::BarType::Mmio64(addr) => addr,
+                        _ => {
+                            serial_println!("[e1000] No MMIO BAR found, skipping");
+                            continue;
+                        }
+                    }
+                }
+                pci::BarType::None => {
+                    serial_println!("[e1000] BAR0 is None, skipping");
+                    continue;
+                }
+            };
+
+            if bar0_addr == 0 {
+                serial_println!("[e1000] BAR0 address is 0, skipping");
+                continue;
+            }
+
+            // Enable bus mastering in PCI command register so DMA works
+            let cmd = pci::read_config(dev.bus, dev.device, dev.function, 0x04);
+            pci::write_config(dev.bus, dev.device, dev.function, 0x04,
+                cmd | 0x04 /* Bus Master */ | 0x02 /* Memory Space Enable */);
+
+            serial_println!("[e1000] BAR0 MMIO base: {:#x}", bar0_addr);
+            return Some(bar0_addr);
+        }
+    }
+
+    // Fallback: scan by class code 0x02 (Network), subclass 0x00 (Ethernet)
+    // and check vendor == Intel
+    if let Some(dev) = pci::find_by_class(0x02, 0x00) {
+        if dev.vendor_id == 0x8086 {
+            serial_println!("[e1000] Found Intel Ethernet via class scan: device={:#x} at PCI {}:{}.{}",
+                dev.device_id, dev.bus, dev.device, dev.function);
+
+            let bar0_addr = match dev.bars[0] {
+                pci::BarType::Mmio32(addr) => addr as u64,
+                pci::BarType::Mmio64(addr) => addr,
+                _ => return None,
+            };
+
+            if bar0_addr != 0 {
+                let cmd = pci::read_config(dev.bus, dev.device, dev.function, 0x04);
+                pci::write_config(dev.bus, dev.device, dev.function, 0x04, cmd | 0x06);
+                serial_println!("[e1000] BAR0 MMIO base: {:#x}", bar0_addr);
+                return Some(bar0_addr);
+            }
+        }
+    }
+
+    None
+}
+
+/// Initialize the e1000 device — discovers PCI device automatically.
+/// Returns true if a device was found and initialized.
+pub fn init() -> bool {
+    let bar0 = match find_e1000_bar0() {
+        Some(addr) => addr,
+        None => {
+            serial_println!("[e1000] No device found on PCI bus");
+            return false;
+        }
+    };
+    init_with_bar0(bar0)
+}
+
 /// Initialize the e1000 device from PCI BAR0 MMIO address
-pub fn init(bar0: u64) -> bool {
+pub fn init_with_bar0(bar0: u64) -> bool {
     if bar0 == 0 { return false; }
 
     unsafe {
@@ -199,56 +297,101 @@ pub fn is_initialized() -> bool {
     unsafe { E1000_DEV.initialized }
 }
 
-/// Send a raw Ethernet frame
+/// Send a raw Ethernet frame.
+///
+/// Uses the legacy TX descriptor format. The cmd byte 0x0F sets:
+///   bit 0 (EOP)  — End Of Packet
+///   bit 1 (IFCS) — Insert FCS/CRC
+///   bit 2 (IC)   — Insert Checksum (unused here)
+///   bit 3 (RS)   — Report Status (set DD bit when done)
 pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
     if !is_initialized() { return Err("not initialized"); }
     if data.len() > 4096 { return Err("packet too large"); }
+    if data.len() == 0 { return Err("empty packet"); }
 
     unsafe {
-        let idx = E1000_DEV.tx_tail as usize % QUEUE_SIZE;
-        let buf = E1000_DEV.tx_buffers[idx];
+        let idx = E1000_DEV.tx_tail as usize;
+        let tx_ring = E1000_DEV.tx_descs as *mut TxDesc;
 
+        // Wait for the descriptor to be done if RS was set previously.
+        // Spin for at most ~10k iterations to avoid deadlock on a bare-metal stall.
+        let mut spins = 0usize;
+        while (*tx_ring.add(idx)).status & 0x01 == 0
+            && (*tx_ring.add(idx)).length != 0  // descriptor was used before
+        {
+            core::hint::spin_loop();
+            spins += 1;
+            if spins > 100_000 { return Err("TX timeout"); }
+        }
+
+        let buf = E1000_DEV.tx_buffers[idx];
         core::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, data.len());
 
-        let tx_ring = E1000_DEV.tx_descs as *mut TxDesc;
         (*tx_ring.add(idx)).addr = buf;
         (*tx_ring.add(idx)).length = data.len() as u16;
+        (*tx_ring.add(idx)).cso = 0;
         (*tx_ring.add(idx)).cmd = 0x0B; // EOP | IFCS | RS
-        (*tx_ring.add(idx)).status = 0;
+        (*tx_ring.add(idx)).status = 0; // clear DD; hardware will set it when done
+        (*tx_ring.add(idx)).css = 0;
+        (*tx_ring.add(idx)).special = 0;
 
-        E1000_DEV.tx_tail = ((E1000_DEV.tx_tail as usize + 1) % QUEUE_SIZE) as u16;
-        write_reg(REG_TDT, E1000_DEV.tx_tail as u32);
+        // Advance tail to signal packet to NIC
+        let next_tail = (idx + 1) % QUEUE_SIZE;
+        E1000_DEV.tx_tail = next_tail as u16;
+
+        // Memory barrier before notifying device
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        write_reg(REG_TDT, next_tail as u32);
     }
 
     Ok(())
 }
 
-/// Receive a packet (non-blocking)
+/// Receive a packet (non-blocking).
+///
+/// The e1000 RX ring works as follows:
+///   - RDH (head): NIC advances this pointer after writing a packet.
+///   - RDT (tail): driver advances this to give descriptors back to NIC.
+///   - rx_tail tracks the slot the driver will check next (one past the
+///     last descriptor given to hardware). A descriptor is ready when its
+///     DD (Descriptor Done) bit is set.
 pub fn recv_packet(buf: &mut [u8]) -> usize {
     if !is_initialized() { return 0; }
 
     unsafe {
-        let idx = E1000_DEV.rx_tail as usize % QUEUE_SIZE;
-        let rx_ring = E1000_DEV.rx_descs as *const RxDesc;
-        let desc = &*rx_ring.add(idx);
+        // The next slot to check is rx_tail (pointing to last slot we gave the NIC + 1).
+        // We track the consumer index separately via rx_tail used as "next to read".
+        // On init we set RDT = QUEUE_SIZE-1, meaning all descriptors 0..QUEUE_SIZE-1
+        // are owned by hardware. When DD is set on a descriptor, we own it.
+        // We scan from the next expected slot.
+        let next = (E1000_DEV.rx_tail as usize + 1) % QUEUE_SIZE;
+        let rx_ring = E1000_DEV.rx_descs as *mut RxDesc;
+        let desc = &*rx_ring.add(next);
 
-        if desc.status & 1 == 0 { return 0; } // DD bit not set
+        if desc.status & 0x01 == 0 { return 0; } // DD bit not set — no packet ready
 
         let len = desc.length as usize;
+        if len == 0 {
+            // Empty descriptor — clear and recycle
+            (*rx_ring.add(next)).status = 0;
+            E1000_DEV.rx_tail = next as u16;
+            write_reg(REG_RDT, next as u32);
+            return 0;
+        }
+
         let copy_len = len.min(buf.len());
 
         core::ptr::copy_nonoverlapping(
-            E1000_DEV.rx_buffers[idx] as *const u8,
+            E1000_DEV.rx_buffers[next] as *const u8,
             buf.as_mut_ptr(),
             copy_len,
         );
 
-        // Reset descriptor and advance tail
-        let rx_ring_mut = E1000_DEV.rx_descs as *mut RxDesc;
-        (*rx_ring_mut.add(idx)).status = 0;
-
-        E1000_DEV.rx_tail = ((E1000_DEV.rx_tail as usize + 1) % QUEUE_SIZE) as u16;
-        write_reg(REG_RDT, E1000_DEV.rx_tail as u32);
+        // Clear status and give descriptor back to hardware by advancing RDT
+        (*rx_ring.add(next)).status = 0;
+        E1000_DEV.rx_tail = next as u16;
+        write_reg(REG_RDT, next as u32);
 
         copy_len
     }

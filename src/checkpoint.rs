@@ -13,6 +13,9 @@ use crate::serial_println;
 use crate::agent::*;
 use crate::arch::x86_64::ata;
 use crate::merkle;
+use crate::capability::Capability;
+extern crate alloc;
+use alloc::vec::Vec;
 
 /// Disk sector where checkpoints are stored (after the state log area)
 const CHECKPOINT_START_SECTOR: u32 = 2048;
@@ -301,6 +304,197 @@ pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAge
     }
 
     agents
+}
+
+// ─── Agent migration serialization ────────────────────────────────────────
+//
+// Wire format for a single migrated agent (little-endian throughout):
+//
+//   [magic: 4B = 0x414F_5341 ("AOSA")]
+//   [id: 2B]
+//   [status: 1B]
+//   [mode: 1B]
+//   [energy_budget: 8B]
+//   [context: sizeof(AgentContext) bytes]
+//   [cap_count: 2B]
+//   [capabilities: cap_count × sizeof(Capability) bytes]
+//   [state_entry_count: 2B]
+//   [state_entries: state_entry_count × (key:8B + len:2B + value:256B)]
+
+const AGENT_MAGIC: u32 = 0x414F_5341; // "AOSA"
+const MAX_VALUE_SIZE: usize = 256; // mirrors state.rs
+
+/// Serialize a single agent's live state into a byte buffer suitable for
+/// transmission to a remote node (agent migration).
+///
+/// Captures: CPU context, capabilities, energy budget, and the agent's private
+/// state keyspace. Returns `None` if the agent does not exist.
+pub fn serialize_agent(agent_id: AgentId) -> Option<Vec<u8>> {
+    let agent = crate::agent::get_agent(agent_id)?;
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Magic
+    buf.extend_from_slice(&AGENT_MAGIC.to_le_bytes());
+
+    // Agent header
+    buf.extend_from_slice(&agent.id.to_le_bytes());
+    buf.push(agent.status as u8);
+    buf.push(agent.mode as u8);
+    buf.extend_from_slice(&agent.energy_budget.to_le_bytes());
+
+    // CPU context (raw bytes)
+    let ctx_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &agent.context as *const AgentContext as *const u8,
+            core::mem::size_of::<AgentContext>(),
+        )
+    };
+    buf.extend_from_slice(ctx_bytes);
+
+    // Capabilities
+    let cap_count = agent.cap_count as u16;
+    buf.extend_from_slice(&cap_count.to_le_bytes());
+    for i in 0..agent.cap_count {
+        if let Some(ref cap) = agent.capabilities[i] {
+            let cap_bytes = unsafe {
+                core::slice::from_raw_parts(
+                    cap as *const Capability as *const u8,
+                    core::mem::size_of::<Capability>(),
+                )
+            };
+            buf.extend_from_slice(cap_bytes);
+        }
+    }
+
+    // State keyspace entries: iterate keys 0..MAX_ENTRIES (brute-force scan
+    // through well-known key range — a real implementation would expose an
+    // iterator from state.rs).
+    let mut state_entries: Vec<(u64, [u8; MAX_VALUE_SIZE], usize)> = Vec::new();
+    for key in 0u64..64 {
+        if let Some((val, len)) = crate::state::state_get(agent_id, key) {
+            state_entries.push((key, val, len));
+        }
+    }
+
+    let entry_count = state_entries.len() as u16;
+    buf.extend_from_slice(&entry_count.to_le_bytes());
+    for (key, val, len) in &state_entries {
+        buf.extend_from_slice(&key.to_le_bytes());
+        buf.extend_from_slice(&(*len as u16).to_le_bytes());
+        buf.extend_from_slice(&val[..*len]);
+    }
+
+    serial_println!(
+        "[CHECKPOINT] serialize_agent: id={} caps={} state_entries={} total_bytes={}",
+        agent_id, cap_count, entry_count, buf.len()
+    );
+
+    Some(buf)
+}
+
+/// Deserialize an agent from a migration buffer produced by `serialize_agent`
+/// and register it in the local agent table.
+///
+/// The new agent inherits the serialized CPU context, capabilities, energy, and
+/// state keyspace. Its parent is set to `ROOT_AGENT_ID`. Returns the new
+/// `AgentId` on success, or `None` on malformed data.
+pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
+    if data.len() < 4 { return None; }
+
+    // Check magic
+    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != AGENT_MAGIC { return None; }
+
+    let mut pos = 4usize;
+
+    macro_rules! need {
+        ($n:expr) => {{
+            if pos + $n > data.len() { return None; }
+            let s = &data[pos..pos + $n];
+            pos += $n;
+            s
+        }};
+    }
+
+    // Agent header
+    let id_bytes = need!(2);
+    let _orig_id = u16::from_le_bytes([id_bytes[0], id_bytes[1]]);
+    let status_byte = need!(1)[0];
+    let _mode_byte = need!(1)[0];
+    let energy_bytes = need!(8);
+    let energy = u64::from_le_bytes(energy_bytes.try_into().ok()?);
+
+    // CPU context
+    let ctx_size = core::mem::size_of::<AgentContext>();
+    let ctx_bytes = need!(ctx_size);
+    let context: AgentContext = unsafe {
+        core::ptr::read(ctx_bytes.as_ptr() as *const AgentContext)
+    };
+
+    // Capabilities
+    let cap_count_bytes = need!(2);
+    let cap_count = u16::from_le_bytes([cap_count_bytes[0], cap_count_bytes[1]]) as usize;
+    let cap_size = core::mem::size_of::<Capability>();
+
+    let mut caps: [Option<Capability>; MAX_CAPABILITIES_PER_AGENT] =
+        [const { None }; MAX_CAPABILITIES_PER_AGENT];
+    let actual_caps = cap_count.min(MAX_CAPABILITIES_PER_AGENT);
+    for i in 0..actual_caps {
+        let cap_bytes = need!(cap_size);
+        let cap: Capability = unsafe {
+            core::ptr::read(cap_bytes.as_ptr() as *const Capability)
+        };
+        caps[i] = Some(cap);
+    }
+
+    // We need a stack — reuse the entry point from context.rip.
+    // Allocate a fresh kernel stack via create_agent, then patch in the
+    // serialized context. We pass entry=context.rip, stack=context.rsp.
+    let new_id = crate::agent::create_agent(
+        Some(ROOT_AGENT_ID),
+        context.rip,
+        context.rsp,
+        energy,
+        256, // default memory quota (pages)
+    ).ok()?;
+
+    // Patch in the full context and capabilities.
+    if let Some(agent) = crate::agent::get_agent_mut(new_id) {
+        agent.context = context;
+        agent.capabilities = caps;
+        agent.cap_count = actual_caps;
+        // Restore status from serialized value (keep as Ready if was Running).
+        agent.status = match status_byte {
+            1 => crate::agent::AgentStatus::Ready,
+            5 => crate::agent::AgentStatus::Suspended,
+            _ => crate::agent::AgentStatus::Ready,
+        };
+    }
+
+    // State keyspace entries
+    let ec_bytes = need!(2);
+    let entry_count = u16::from_le_bytes([ec_bytes[0], ec_bytes[1]]) as usize;
+
+    // Ensure keyspace exists
+    let _ = crate::state::create_keyspace(new_id);
+
+    for _ in 0..entry_count {
+        let key_bytes = need!(8);
+        let key = u64::from_le_bytes(key_bytes.try_into().ok()?);
+        let len_bytes = need!(2);
+        let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        if len > MAX_VALUE_SIZE { return None; }
+        let val_bytes = need!(len);
+        let _ = crate::state::state_put(new_id, key, val_bytes);
+    }
+
+    serial_println!(
+        "[CHECKPOINT] deserialize_agent: new_id={} caps={} state_entries={}",
+        new_id, actual_caps, entry_count
+    );
+
+    Some(new_id)
 }
 
 /// Load Merkle roots from a checkpoint on disk.

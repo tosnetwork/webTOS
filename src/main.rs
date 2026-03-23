@@ -36,9 +36,11 @@ mod replay;
 mod large_msg;
 mod smp;
 mod net;
+mod node;
 mod ringbuf;
 mod block;
 mod proof;
+mod attestation;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -87,7 +89,16 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     serial_println!("[OK] System initialization complete");
 
     // 8. Initialize virtio-net (if present)
-    arch::x86_64::virtio_net::init();
+    let virtio_ok = arch::x86_64::virtio_net::init();
+
+    // 8a. If virtio-net is not available, try the e1000 NIC
+    if !virtio_ok {
+        if arch::x86_64::e1000::init() {
+            serial_println!("[OK] e1000 NIC initialized");
+        } else {
+            serial_println!("[WARN] No network device found (neither virtio-net nor e1000)");
+        }
+    }
 
     // 8b. Detect and initialize NVMe storage (if present)
     arch::x86_64::nvme::init();

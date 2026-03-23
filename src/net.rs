@@ -48,6 +48,8 @@ pub fn send_udp(src: &UdpEndpoint, dst: &UdpEndpoint, payload: &[u8]) -> Result<
     // Send via whichever network driver is available
     if crate::arch::x86_64::virtio_net::is_initialized() {
         crate::arch::x86_64::virtio_net::send_packet(&packet[..total_len])
+    } else if crate::arch::x86_64::e1000::is_initialized() {
+        crate::arch::x86_64::e1000::send_packet(&packet[..total_len])
     } else {
         Err("no network device available")
     }
@@ -58,6 +60,8 @@ pub fn recv_udp(buf: &mut [u8]) -> Option<(UdpEndpoint, usize)> {
     let mut frame = [0u8; 1514];
     let frame_len = if crate::arch::x86_64::virtio_net::is_initialized() {
         crate::arch::x86_64::virtio_net::recv_packet(&mut frame)
+    } else if crate::arch::x86_64::e1000::is_initialized() {
+        crate::arch::x86_64::e1000::recv_packet(&mut frame)
     } else {
         0
     };
@@ -87,7 +91,15 @@ pub fn recv_udp(buf: &mut [u8]) -> Option<(UdpEndpoint, usize)> {
 pub fn get_mac() -> [u8; 6] {
     if crate::arch::x86_64::virtio_net::is_initialized() {
         crate::arch::x86_64::virtio_net::mac_address()
+    } else if crate::arch::x86_64::e1000::is_initialized() {
+        crate::arch::x86_64::e1000::mac_address()
     } else {
         [0x02, 0x00, 0x00, 0x00, 0x00, 0x01] // default
     }
+}
+
+/// Returns true if any network device is available.
+pub fn nic_available() -> bool {
+    crate::arch::x86_64::virtio_net::is_initialized()
+        || crate::arch::x86_64::e1000::is_initialized()
 }

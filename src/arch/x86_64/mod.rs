@@ -17,6 +17,7 @@ pub mod pci;
 pub mod virtio_net;
 pub mod e1000;
 pub mod nvme;
+pub mod security;
 
 pub use serial::{serial_print, serial_println};
 
@@ -31,4 +32,5 @@ pub fn init() {
     // The frame allocator is initialized separately via paging::init()
     // once the multiboot memory map is available.
     timer::init();
+    security::init();
 }

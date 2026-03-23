@@ -17,6 +17,7 @@ use crate::sched;
 use crate::mailbox;
 use crate::state;
 use crate::arch::x86_64::paging;
+use crate::arch::x86_64::security;
 
 /// Dispatch a syscall from the current agent.
 ///
@@ -123,8 +124,12 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
 
             // Safety: the payload pointer comes from the calling agent's stack,
             // which is valid memory in Stage-1 (all agents share the kernel address space).
+            // stac/clac bracket the user-memory read to satisfy SMAP when enabled.
             let payload = unsafe {
-                core::slice::from_raw_parts(a2 as *const u8, payload_len)
+                security::stac();
+                let s = core::slice::from_raw_parts(a2 as *const u8, payload_len);
+                security::clac();
+                s
             };
 
             match mailbox::send_message(caller_id, target_mailbox, payload) {
@@ -144,13 +149,15 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         // Safety: the buffer pointer comes from the calling agent's stack.
-                        // Use ptr::copy instead of copy_from_slice to avoid alignment requirements.
+                        // stac/clac bracket the write to satisfy SMAP when enabled.
                         unsafe {
+                            security::stac();
                             core::ptr::copy(
                                 msg.payload.as_ptr(),
                                 a2 as *mut u8,
                                 copy_len,
                             );
+                            security::clac();
                         }
                     }
                     copy_len as i64
@@ -250,9 +257,12 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 Some((data, len)) => {
                     let copy_len = len.min(a3 as usize);
                     if copy_len > 0 {
+                        // stac/clac bracket the write to user buffer to satisfy SMAP.
                         unsafe {
+                            security::stac();
                             let buf = core::slice::from_raw_parts_mut(a2 as *mut u8, copy_len);
                             buf.copy_from_slice(&data[..copy_len]);
+                            security::clac();
                         }
                     }
                     copy_len as i64
@@ -271,8 +281,12 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                 return E_NO_CAP;
             }
 
+            // stac/clac bracket the read from user buffer to satisfy SMAP.
             let value = unsafe {
-                core::slice::from_raw_parts(a2 as *const u8, a3 as usize)
+                security::stac();
+                let s = core::slice::from_raw_parts(a2 as *const u8, a3 as usize);
+                security::clac();
+                s
             };
 
             match state::state_put(keyspace, a1, value) {
@@ -319,11 +333,13 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         unsafe {
+                            security::stac();
                             core::ptr::copy(
                                 msg.payload.as_ptr(),
                                 a2 as *mut u8,
                                 copy_len,
                             );
+                            security::clac();
                         }
                     }
                     copy_len as i64
@@ -343,7 +359,10 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
             }
 
             let payload = unsafe {
-                core::slice::from_raw_parts(a2 as *const u8, payload_len)
+                security::stac();
+                let s = core::slice::from_raw_parts(a2 as *const u8, payload_len);
+                security::clac();
+                s
             };
 
             match mailbox::send_message(caller_id, target_mailbox, payload) {
@@ -359,7 +378,10 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                     // When we resume, the mailbox may have space. Try sending again.
                     // Re-read payload since we're resuming after context switch.
                     let payload_retry = unsafe {
-                        core::slice::from_raw_parts(a2 as *const u8, payload_len)
+                        security::stac();
+                        let s = core::slice::from_raw_parts(a2 as *const u8, payload_len);
+                        security::clac();
+                        s
                     };
                     match mailbox::send_message(caller_id, target_mailbox, payload_retry) {
                         Ok(()) => E_OK,
@@ -541,11 +563,13 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         unsafe {
+                            security::stac();
                             core::ptr::copy(
                                 msg.payload.as_ptr(),
                                 a2 as *mut u8,
                                 copy_len,
                             );
+                            security::clac();
                         }
                     }
                     copy_len as i64

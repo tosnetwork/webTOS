@@ -85,6 +85,22 @@ pub extern "C" fn root_entry() -> ! {
             crate::proof::print_proof(&proof);
         }
 
+        // Generate attestation report at tick 800
+        if count == 800 {
+            serial_println!("[ROOT] Generating attestation report...");
+            // Use a well-known test secret (all 0xAB bytes).
+            // A real deployment would derive this from a TPM-sealed key.
+            let secret = [0xABu8; 32];
+            let report = crate::attestation::generate_report(&secret);
+            crate::attestation::print_report(&report);
+            let valid = crate::attestation::verify_report(&report, &secret);
+            if valid {
+                serial_println!("[ROOT] \u{2713} Attestation report verified OK");
+            } else {
+                serial_println!("[ROOT] \u{2717} Attestation report verification FAILED");
+            }
+        }
+
         // Yield to let other agents run
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     }
