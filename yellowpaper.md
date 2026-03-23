@@ -784,11 +784,62 @@ Stage-1 implementation options:
 
 Memory quota enforcement: each agent's `memory_quota` limits the number of physical frames it may be allocated. Allocation requests beyond quota must fail with an explicit error.
 
-### 16.4 Shared memory policy
+### 16.4 Agent Stack Safety `[IMPL: ✅]`
+
+Each agent runs on its own fixed-size kernel stack. Stack overflow must never silently corrupt adjacent agents' memory. AOS employs two defenses:
+
+#### 16.4.1 Stack Guard Canaries
+
+Inspired by Linux's `STACK_END_MAGIC`, every agent stack has a canary value (`0x57AC6E9D_DEADBEEF`) written at its lowest address (stack bottom) during initialization. The scheduler checks this canary on every context switch via `read_volatile`. If the canary is corrupted:
+
+1. The scheduler logs `[STACK OVERFLOW] Agent N stack corrupted`
+2. The agent is moved to `Faulted` state
+3. An audit event is emitted (`agent_faulted` with code `0xFF`)
+4. The agent is removed from the run queue
+
+This ensures stack overflow is **detected and isolated** before it can corrupt other agents.
+
+```text
+Stack layout (growing downward):
+
+    stack_top (initial RSP)
+    ↓
+    [function frames, local variables]
+    ↓
+    [... stack grows down ...]
+    ↓
+    guard canary: 0x57AC6E9D_DEADBEEF   ← checked on every context switch
+    stack_bottom
+```
+
+The canary is written to both `AGENT_STACKS` (kernel-mode agent stacks) and `KERNEL_STACKS` (ring 3 agent interrupt/syscall stacks).
+
+#### 16.4.2 Heap Allocation for Large Runtime Structures
+
+Kernel subsystems that require large data structures (>1 KB) must heap-allocate them via the kernel allocator (`Vec`, `Box`) rather than placing them on the agent stack. This is enforced by design for:
+
+* **WASM runtime**: `WasmInstance` fields (`stack`, `locals`, `call_stack`, `block_stack`, `memory`, `code`) are all `Vec<T>` (heap-allocated). The `WasmInstance` struct itself is ~168 bytes on the stack; all data lives on the heap.
+* **eBPF runtime**: `EbpfVm` uses a fixed 512-byte stack (acceptable). Large `AttachedProgram` arrays are in static storage, not on agent stacks.
+
+**Rationale**: Agent stacks are 64 KB. Without heap allocation, a single `WasmInstance` consumed ~33 KB of stack, overflowing into the adjacent agent's stack. The `0x02` bytes from the WASM Import Section ID overwrote saved return addresses, causing a GPF with `rip=0x0202020202020202`. Moving large arrays to `Vec` reduces stack usage to <200 bytes, providing a >60 KB safety margin.
+
+#### 16.4.3 Stack Sizing
+
+| Stack Type | Size | Purpose |
+|-----------|------|---------|
+| `AGENT_STACKS` | 64 KB per agent | Kernel-mode agent execution |
+| `KERNEL_STACKS` | 8 KB per agent | Ring 3 agent syscall/interrupt handling |
+| Kernel boot stack | 64 KB | Boot thread (linker script `__stack_top`) |
+| IST1 stack | 4 KB | Double fault handler (GDT TSS) |
+| RSP0 stack | 8 KB | Ring transition default (GDT TSS) |
+
+All stacks are 4096-byte aligned (`#[repr(align(4096))]`) with 16-byte RSP alignment per x86_64 ABI.
+
+### 16.5 Shared memory policy
 
 Shared memory should not be the default agent communication mechanism. Mailbox delivery should remain primary.
 
-### 16.5 Future direction
+### 16.6 Future direction
 
 Future versions may add explicit immutable shared regions or capability-scoped shared pages.
 
