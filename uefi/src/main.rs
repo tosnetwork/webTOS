@@ -23,6 +23,31 @@ static KERNEL_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-none/rele
 /// Magic number passed to kernel_main to indicate UEFI boot.
 const UEFI_MAGIC: u32 = 0xAE51_0EF1;
 
+/// Physical address where the BootInfo header is placed before jumping
+/// to the kernel. Must be below the kernel load address and identity-mapped.
+const BOOT_INFO_PHYS: u64 = 0x7000;
+
+/// Byte offset within the 0x7000 page where the raw memory map is copied.
+/// Provides 32 bytes for the BootInfo header (padded to 32 for alignment).
+const MMAP_DATA_OFFSET: u64 = 32;
+
+/// Hand-off structure written at BOOT_INFO_PHYS before jumping to kernel_main.
+///
+/// Mirrors `paging::BootInfo` in the kernel — both must be kept in sync.
+#[repr(C)]
+struct BootInfo {
+    /// Must equal UEFI_MAGIC so the kernel can validate the struct.
+    magic: u32,
+    /// Physical address of the raw EFI_MEMORY_DESCRIPTOR array.
+    mmap_addr: u64,
+    /// Total byte size of the memory map array.
+    mmap_size: u32,
+    /// Stride (in bytes) between consecutive descriptors.
+    desc_size: u32,
+    /// Number of descriptors in the map.
+    desc_count: u32,
+}
+
 /// Kernel higher-half virtual address offset.
 const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 
@@ -113,9 +138,46 @@ pub extern "efiapi" fn efi_main(
 
     // ═══ POST EXIT BOOT SERVICES — firmware is gone ═══
 
-    serial::println("[UEFI] Boot services exited. Loading CR3...");
+    serial::println("[UEFI] Boot services exited. Saving memory map...");
 
-    // 7. Load our page tables (replaces UEFI firmware's mapping)
+    // 7. Copy the UEFI memory map to a known physical address (0x7000 + 32)
+    //    and write a BootInfo header at 0x7000 so the kernel can find it.
+    //
+    //    Layout at 0x7000:
+    //      [0x7000 ..  0x7020)  BootInfo header (32 bytes, padded)
+    //      [0x7020 .. 0x7020+map_size)  raw EFI_MEMORY_DESCRIPTOR array
+    //
+    //    The identity mapping covers the first 512 MB, so 0x7000 is always
+    //    accessible at this point (it is well below any loaded firmware).
+    let mmap_dest = (BOOT_INFO_PHYS + MMAP_DATA_OFFSET) as *mut u8;
+    // Clamp map_size to what fits in the rest of the 4 KB page (0x7020..0x8000 = ~4064 bytes).
+    // A typical UEFI map is well under 4 KB.
+    let max_mmap_bytes: usize = 0x1000 - MMAP_DATA_OFFSET as usize; // 4064 bytes
+    let copy_size = if map_size <= max_mmap_bytes { map_size } else { max_mmap_bytes };
+    let desc_count = copy_size / desc_size;
+
+    unsafe {
+        // Copy raw map bytes
+        core::ptr::copy_nonoverlapping(map_buf.as_ptr(), mmap_dest, copy_size);
+
+        // Write BootInfo header at 0x7000
+        let boot_info_ptr = BOOT_INFO_PHYS as *mut BootInfo;
+        core::ptr::write_volatile(boot_info_ptr, BootInfo {
+            magic:      UEFI_MAGIC,
+            mmap_addr:  BOOT_INFO_PHYS + MMAP_DATA_OFFSET,
+            mmap_size:  copy_size as u32,
+            desc_size:  desc_size as u32,
+            desc_count: desc_count as u32,
+        });
+    }
+
+    serial::print("[UEFI] BootInfo written at 0x7000, mmap_size=");
+    serial::print_hex(copy_size as u64);
+    serial::print(", desc_count=");
+    serial::print_hex(desc_count as u64);
+    serial::println("");
+
+    // 8. Load our page tables (replaces UEFI firmware's mapping)
     unsafe {
         core::arch::asm!(
             "mov cr3, {}",
@@ -126,18 +188,20 @@ pub extern "efiapi" fn efi_main(
 
     serial::println("[UEFI] CR3 loaded. Jumping to kernel...");
 
-    // 8. Jump to kernel_main at its higher-half virtual address
-    //    Set RSP to kernel stack (higher-half VMA)
-    //    Pass UEFI_MAGIC in RDI (first arg) and 0 in RSI (second arg)
+    // 9. Jump to kernel_main at its higher-half virtual address.
+    //    Calling convention (System V AMD64):
+    //      RDI = first arg  = boot_magic  (UEFI_MAGIC, u32 in EDI)
+    //      RSI = second arg = boot_info   (physical address of BootInfo = 0x7000)
     unsafe {
         core::arch::asm!(
             "mov rsp, {stack}",
-            "xor rsi, rsi",          // boot_info = 0 (no memory map passed yet)
+            "mov rsi, {boot_info}",  // boot_info = physical address of BootInfo
             "mov edi, {magic:e}",    // boot_magic = UEFI_MAGIC (32-bit in EDI)
             "jmp {entry}",
-            stack = in(reg) kernel_info.stack_top,
-            magic = in(reg) UEFI_MAGIC as u64,
-            entry = in(reg) kernel_info.entry_point,
+            stack     = in(reg) kernel_info.stack_top,
+            boot_info = in(reg) BOOT_INFO_PHYS,
+            magic     = in(reg) UEFI_MAGIC as u64,
+            entry     = in(reg) kernel_info.entry_point,
             options(noreturn),
         );
     }

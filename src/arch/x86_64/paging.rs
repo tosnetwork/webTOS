@@ -37,6 +37,142 @@ extern "C" {
 /// Physical memory remains accessible via the identity mapping (PML4[0]).
 pub const KERNEL_VMA_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
 
+/// UEFI boot-info header placed at physical 0x7000 by the UEFI stub.
+///
+/// The stub writes this struct at 0x7000, then copies the raw UEFI memory
+/// map directly after it (at 0x7000 + 32). `mmap_addr` points to that copy.
+#[repr(C)]
+pub struct BootInfo {
+    /// Magic value — must equal 0xAE510EF1 to confirm UEFI boot.
+    pub magic: u32,
+    /// Physical address of the UEFI memory descriptor array.
+    pub mmap_addr: u64,
+    /// Total size of the memory map in bytes.
+    pub mmap_size: u32,
+    /// Size of a single EFI_MEMORY_DESCRIPTOR (may be > 40 bytes).
+    pub desc_size: u32,
+    /// Number of descriptors in the map.
+    pub desc_count: u32,
+}
+
+/// EFI memory descriptor as defined by the UEFI specification.
+///
+/// The descriptor stride on the wire (`desc_size`) may be larger than
+/// `core::mem::size_of::<EfiMemoryDescriptor>()` (40 bytes) due to
+/// firmware-specific extensions; always walk by `desc_size`.
+#[repr(C)]
+struct EfiMemoryDescriptor {
+    type_: u32,
+    _pad: u32,
+    physical_start: u64,
+    virtual_start: u64,
+    number_of_pages: u64,
+    attribute: u64,
+}
+
+/// EFI memory type for usable RAM (EfiConventionalMemory).
+const EFI_CONVENTIONAL_MEMORY: u32 = 7;
+
+/// Initialize the frame allocator from a UEFI memory map.
+///
+/// Called on the UEFI boot path. Parses the descriptor array that the UEFI
+/// stub copied to physical memory and marks only `EfiConventionalMemory`
+/// (type 7) regions as available. All other regions remain reserved (bitmap
+/// bit clear → allocated/reserved in the current scheme, which uses
+/// bit-set = allocated).
+///
+/// Frames below `__kernel_end` are always reserved regardless of what the
+/// firmware reported. The managed window is capped at `MAX_MEMORY` (128 MB).
+///
+/// # Arguments
+/// * `mmap_ptr`  – physical address of the first EFI_MEMORY_DESCRIPTOR
+/// * `mmap_size` – total byte length of the descriptor array
+/// * `desc_size` – stride between consecutive descriptors (≥ 40 bytes)
+pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
+    // Resolve __kernel_end physical address
+    let kernel_end_virt = unsafe { &__kernel_end as *const u8 as usize };
+    let kernel_end_phys = if kernel_end_virt >= KERNEL_VMA_OFFSET {
+        kernel_end_virt - KERNEL_VMA_OFFSET
+    } else {
+        kernel_end_virt
+    };
+    let kernel_reserved_frames = (kernel_end_phys + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    // Sanity-check desc_size: it must be at least the size of our struct.
+    let min_desc = core::mem::size_of::<EfiMemoryDescriptor>(); // 40
+    if desc_size < min_desc || desc_size > 4096 {
+        serial_println!("[paging] UEFI mmap: invalid desc_size {}, falling back to init()", desc_size);
+        init();
+        return;
+    }
+
+    // Sanity-check pointer
+    if mmap_ptr == 0 || mmap_size == 0 {
+        serial_println!("[paging] UEFI mmap: null/empty map, falling back to init()");
+        init();
+        return;
+    }
+
+    // Start with the bitmap fully set (all frames allocated/reserved).
+    // We will clear bits only for frames that are EfiConventionalMemory.
+    unsafe {
+        for word in BITMAP.iter_mut() {
+            *word = !0u64; // all bits set = all frames reserved
+        }
+    }
+
+    let desc_count = mmap_size / desc_size;
+    let mut available_frames: usize = 0;
+
+    for i in 0..desc_count {
+        let desc_ptr = (mmap_ptr as usize + i * desc_size) as *const EfiMemoryDescriptor;
+        let desc = unsafe { &*desc_ptr };
+
+        if desc.type_ != EFI_CONVENTIONAL_MEMORY {
+            // Not usable RAM — leave as reserved (bit already set)
+            continue;
+        }
+
+        // Mark conventional memory frames as free (clear the bits)
+        let region_start = desc.physical_start as usize;
+        let region_pages = desc.number_of_pages as usize;
+
+        for p in 0..region_pages {
+            let frame = region_start / PAGE_SIZE + p;
+
+            // Skip frames below kernel end
+            if frame < kernel_reserved_frames {
+                continue;
+            }
+
+            // Cap at MAX_MEMORY
+            if frame >= MAX_FRAMES {
+                break;
+            }
+
+            // Clear bit → frame is free
+            let word = frame / 64;
+            let bit = frame % 64;
+            unsafe {
+                BITMAP[word] &= !(1u64 << bit);
+            }
+            available_frames += 1;
+        }
+    }
+
+    // Set NEXT_FREE to first frame after kernel
+    NEXT_FREE.store(kernel_reserved_frames as u64, Ordering::Relaxed);
+
+    serial_println!(
+        "[paging] UEFI mmap: {} descriptors parsed, {} frames available ({} MB), kernel reserved {} frames ({} KB)",
+        desc_count,
+        available_frames,
+        available_frames * PAGE_SIZE / (1024 * 1024),
+        kernel_reserved_frames,
+        kernel_reserved_frames * PAGE_SIZE / 1024,
+    );
+}
+
 /// Initialize the frame allocator.
 ///
 /// Reserves all frames from 0 up to __kernel_end (kernel code, BSS,

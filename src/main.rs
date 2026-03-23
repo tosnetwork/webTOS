@@ -70,7 +70,31 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     serial_println!("[OK] Architecture initialized");
 
     // 4. Initialize memory (frame allocator)
-    arch::x86_64::paging::init();
+    //    UEFI boot: parse the firmware memory map passed by the UEFI stub.
+    //    Multiboot / unknown: use the conservative init() that reserves
+    //    everything below __kernel_end and treats the rest as available.
+    if multiboot_magic == UEFI_MAGIC && multiboot_info != 0 {
+        // The UEFI stub placed a BootInfo struct at the physical address
+        // stored in multiboot_info (typically 0x7000).
+        let boot_info_ptr = multiboot_info as *const arch::x86_64::paging::BootInfo;
+        let boot_info = unsafe { &*boot_info_ptr };
+        if boot_info.magic == UEFI_MAGIC
+            && boot_info.mmap_addr != 0
+            && boot_info.mmap_size != 0
+            && boot_info.desc_size != 0
+        {
+            arch::x86_64::paging::init_from_uefi_mmap(
+                boot_info.mmap_addr,
+                boot_info.mmap_size as usize,
+                boot_info.desc_size as usize,
+            );
+        } else {
+            serial_println!("[WARN] UEFI BootInfo magic/fields invalid, using default init()");
+            arch::x86_64::paging::init();
+        }
+    } else {
+        arch::x86_64::paging::init();
+    }
     serial_println!("[OK] Memory initialized");
 
     // 4b. Enumerate PCI devices
