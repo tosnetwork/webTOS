@@ -1022,7 +1022,7 @@ All stacks are 4096-byte aligned (`#[repr(align(4096))]`) with 16-byte RSP align
 
 Shared memory should not be the default agent communication mechanism. Mailbox delivery should remain primary.
 
-### 16.6 Guard Pages (Planned)
+### 16.6 Guard Pages `[IMPL: ✅ detection in page fault handler; full huge-page split deferred until higher-half kernel]`
 
 Stack guard canaries detect overflow after the fact. Guard pages prevent overflow from propagating at all. Each agent stack should be bounded by an unmapped page:
 
@@ -1038,15 +1038,15 @@ When an agent's stack grows into the guard page, the CPU triggers a page fault b
 
 Future versions may add explicit immutable shared regions or capability-scoped shared pages.
 
-### 16.8 CPU Security Features (Planned for Stage-4)
+### 16.8 CPU Security Features (Planned for Stage-4) `[IMPL: ❌ all deferred]`
 
 Production deployment requires enabling hardware security features:
 
-* **SMEP** (Supervisor Mode Execution Prevention): set CR4.SMEP to prevent kernel from executing user-mode code. Mitigates ret2user attacks.
-* **SMAP** (Supervisor Mode Access Prevention): set CR4.SMAP to prevent kernel from reading/writing user-mode pages except in explicit `stac`/`clac` windows. Mitigates data leaks.
-* **NX enforcement**: all stack pages and data pages must have the NX (No-Execute) bit set. Only `.text` sections should be executable.
-* **KASLR** (Kernel Address Space Layout Randomization): randomize the kernel's virtual base address at boot (requires higher-half kernel). Mitigates ROP/JOP attacks.
-* **Spectre mitigations**: enable IBRS/STIBP on context switch between agents with different trust levels (kernel ↔ ring 3).
+* **SMEP** (Supervisor Mode Execution Prevention): set CR4.SMEP to prevent kernel from executing user-mode code. Mitigates ret2user attacks. `[IMPL: ❌]`
+* **SMAP** (Supervisor Mode Access Prevention): set CR4.SMAP to prevent kernel from reading/writing user-mode pages except in explicit `stac`/`clac` windows. Mitigates data leaks. `[IMPL: ❌]`
+* **NX enforcement**: all stack pages and data pages must have the NX (No-Execute) bit set. Only `.text` sections should be executable. `[IMPL: ❌]`
+* **KASLR** (Kernel Address Space Layout Randomization): randomize the kernel's virtual base address at boot (requires higher-half kernel). Mitigates ROP/JOP attacks. `[IMPL: ❌ requires higher-half kernel first]`
+* **Spectre mitigations**: enable IBRS/STIBP on context switch between agents with different trust levels (kernel ↔ ring 3). `[IMPL: ❌]`
 
 ---
 
@@ -1957,21 +1957,21 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 ### 26.1 Objectives
 
-* Run on real hardware (not just QEMU)
-* Support distributed agent execution across multiple nodes
-* Provide developer SDK and tooling for building and deploying agents
-* Establish security attestation for verifiable execution
+* Run on real hardware (not just QEMU) `[IMPL: ❌]`
+* Support distributed agent execution across multiple nodes `[IMPL: ❌]`
+* Provide developer SDK and tooling for building and deploying agents `[IMPL: ❌]`
+* Establish security attestation for verifiable execution `[IMPL: ⚠️ proof.rs done; remote attestation not yet]`
 
 ### 26.2 Core Additions
 
-#### 26.2.1 UEFI Boot
+#### 26.2.1 UEFI Boot `[IMPL: ❌ not yet implemented]`
 
 Replace Multiboot v1 with UEFI boot for modern hardware. UEFI provides a standardized firmware interface, memory map, and GOP framebuffer.
 
 **Prerequisites:**
 
-* Higher-half kernel: relink kernel at `0xFFFFFFFF80000000`. UEFI firmware uses low memory (0-2MB+) for its own data structures, so the kernel cannot remain identity-mapped at 1MB. This was deferred from Stage-2 §24.2.1.
-* Updated boot page tables: map kernel in upper half, UEFI runtime services in a reserved region.
+* Higher-half kernel: relink kernel at `0xFFFFFFFF80000000`. UEFI firmware uses low memory (0-2MB+) for its own data structures, so the kernel cannot remain identity-mapped at 1MB. This was deferred from Stage-2 §24.2.1. `[IMPL: ❌ kernel still identity-mapped at 0x100000]`
+* Updated boot page tables: map kernel in upper half, UEFI runtime services in a reserved region. `[IMPL: ❌]`
 
 **Boot sequence:**
 
@@ -1993,7 +1993,7 @@ UEFI firmware
 * Parse UEFI memory map to initialize frame allocator (replaces Multiboot memory info)
 * GOP framebuffer discovery (optional, serial remains primary output)
 
-#### 26.2.2 PCI Bus Enumeration
+#### 26.2.2 PCI Bus Enumeration `[IMPL: ✅ src/arch/x86_64/pci.rs — enumeration + BAR decoding]`
 
 Discover and initialize PCI devices. Required for NVMe and real NIC drivers.
 
@@ -2040,7 +2040,7 @@ for bus in 0..256:
 * Allocate MSI-X table entries and map them
 * Configure interrupt vectors for NVMe completion and NIC receive
 
-**Implementation: `src/arch/x86_64/pci.rs`**
+**Implementation: `src/arch/x86_64/pci.rs`** `[IMPL: ✅]`
 
 ```text
 PciDevice {
@@ -2066,7 +2066,7 @@ pub fn write_config(bus: u8, dev: u8, func: u8, offset: u8, val: u32)
 pub fn map_bar(device: &PciDevice, bar_index: usize) -> Option<u64>  // returns kernel virtual addr
 ```
 
-#### 26.2.3 NVMe Storage Driver
+#### 26.2.3 NVMe Storage Driver `[IMPL: ✅ src/arch/x86_64/nvme.rs — admin queue + IO queue + read/write sectors]`
 
 Replace ATA PIO with NVMe for high-performance block I/O. NVMe uses memory-mapped command queues and DMA — no CPU-driven byte-by-byte transfer.
 
@@ -2149,7 +2149,7 @@ NvmeCompletion {
 * After writing a command to the SQ tail: write the new tail index to the SQ Tail Doorbell register at BAR0 + 0x1000 + (2 × queue_id × doorbell_stride)
 * After processing a completion from the CQ: write the new head index to the CQ Head Doorbell register at BAR0 + 0x1000 + ((2 × queue_id + 1) × doorbell_stride)
 
-**Implementation: `src/arch/x86_64/nvme.rs`**
+**Implementation: `src/arch/x86_64/nvme.rs`** `[IMPL: ✅]`
 
 ```text
 NvmeController {
@@ -2173,9 +2173,9 @@ pub fn identify(ctrl: &mut NvmeController) -> NvmeIdentifyData
 
 **Integration with existing storage layer:**
 
-* `persist.rs` and `checkpoint.rs` call `read_sectors`/`write_sectors` via a trait or function pointer
-* Stage-4 introduces a `BlockDevice` trait: `{ fn read(&mut self, lba: u64, buf: &mut [u8]); fn write(&mut self, lba: u64, buf: &[u8]); }`
-* ATA PIO and NVMe both implement `BlockDevice`; the kernel selects the driver based on PCI enumeration at boot
+* `persist.rs` and `checkpoint.rs` call `read_sectors`/`write_sectors` via a trait or function pointer `[IMPL: ✅]`
+* Stage-4 introduces a `BlockDevice` trait: `{ fn read(&mut self, lba: u64, buf: &mut [u8]); fn write(&mut self, lba: u64, buf: &[u8]); }` `[IMPL: ❌ trait dispatch not yet wired; direct function calls used]`
+* ATA PIO and NVMe both implement `BlockDevice`; the kernel selects the driver based on PCI enumeration at boot `[IMPL: ❌ NVMe and ATA exist but BlockDevice trait not unified]`
 
 **NVMe capacity:**
 
@@ -2183,7 +2183,7 @@ pub fn identify(ctrl: &mut NvmeController) -> NvmeIdentifyData
 * With 512-byte sectors: theoretical maximum = 8 ZB (zettabytes)
 * Practical limit: determined by the physical SSD/device capacity
 
-#### 26.2.4 Real NIC Driver
+#### 26.2.4 Real NIC Driver `[IMPL: ✅ src/arch/x86_64/e1000.rs — skeleton with init/send/recv]`
 
 Replace virtio-net (Stage-3) with a real Ethernet controller driver for hardware deployment. The initial target is Intel e1000/e1000e, the most widely supported NIC in both QEMU and real hardware.
 
@@ -2194,7 +2194,7 @@ Replace virtio-net (Stage-3) with a real Ethernet controller driver for hardware
 * DMA: the NIC reads TX descriptors and writes RX descriptors directly to host memory
 * Interrupt on packet receive (or polling mode for high throughput)
 
-**Implementation: `src/arch/x86_64/e1000.rs`**
+**Implementation: `src/arch/x86_64/e1000.rs`** `[IMPL: ✅ skeleton]`
 
 ```text
 E1000 {
@@ -2213,7 +2213,7 @@ pub fn recv_packet(nic: &mut E1000, buf: &mut [u8]) -> Result<usize, E1000Error>
 pub fn mac_address(nic: &E1000) -> [u8; 6]
 ```
 
-**Integration:** The netd system agent (Stage-3 stub) is updated to call `e1000::send_packet`/`recv_packet` instead of logging stubs. The IP/UDP/TCP protocol handling is done by netd in user mode, not in the kernel driver.
+**Integration:** The netd system agent (Stage-3 stub) is updated to call `e1000::send_packet`/`recv_packet` instead of logging stubs. The IP/UDP/TCP protocol handling is done by netd in user mode, not in the kernel driver. `[IMPL: ❌ netd not yet wired to e1000]`
 
 #### 26.2.5 GPU/NPU Access
 
@@ -2221,94 +2221,94 @@ Brokered through a **gpud** system agent, not directly accessible to agents. The
 
 This is deferred to post-Stage-4 (no engineering specification yet). The interface will follow the same pattern as netd: mailbox protocol, capability-gated, audit-logged.
 
-#### 26.2.6 Distributed Execution
+#### 26.2.6 Distributed Execution `[IMPL: ❌ not yet implemented]`
 
-* **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes cross-node messages to a **routerd** system agent, which serializes them and sends them over the network via the kernel's minimal UDP transport (a kernel-internal network stack separate from the user-facing netd broker). This separation ensures that inter-kernel routing does not depend on user-mode system agents for liveness.
-* **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list)
-* **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message.
-* **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible AOS kernels (same syscall ABI version and checkpoint format).
+* **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes cross-node messages to a **routerd** system agent, which serializes them and sends them over the network via the kernel's minimal UDP transport (a kernel-internal network stack separate from the user-facing netd broker). This separation ensures that inter-kernel routing does not depend on user-mode system agents for liveness. `[IMPL: ❌]`
+* **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list) `[IMPL: ❌]`
+* **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message. `[IMPL: ❌]`
+* **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible AOS kernels (same syscall ABI version and checkpoint format). `[IMPL: ❌]`
 
-#### 26.2.7 Developer SDK
+#### 26.2.7 Developer SDK `[IMPL: ❌ not yet implemented]`
 
-* **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries
-* **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with AOS syscall bindings via imported host functions
-* **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier
-* **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs)
+* **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries `[IMPL: ❌]`
+* **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with AOS syscall bindings via imported host functions `[IMPL: ❌]`
+* **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier `[IMPL: ❌]`
+* **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs) `[IMPL: ❌]`
 
-#### 26.2.8 Security & Attestation
+#### 26.2.8 Security & Attestation `[IMPL: ⚠️ execution proofs implemented; remote attestation + capability signing not yet]`
 
-* **Execution proofs**: produce a cryptographic proof that a specific event log was generated by a specific checkpoint under deterministic replay
-* **Remote attestation**: a node can prove to a verifier that it is running unmodified AOS kernel code (via TPM or secure boot chain)
-* **Capability signing**: capabilities include a digital signature (e.g., ed25519) from the granting agent, enabling offline verification of authority chains
+* **Execution proofs**: produce a cryptographic proof that a specific event log was generated by a specific checkpoint under deterministic replay `[IMPL: ✅ src/proof.rs — hash-chain over checkpoint + events]`
+* **Remote attestation**: a node can prove to a verifier that it is running unmodified AOS kernel code (via TPM or secure boot chain) `[IMPL: ❌]`
+* **Capability signing**: capabilities include a digital signature (e.g., ed25519) from the granting agent, enabling offline verification of authority chains `[IMPL: ❌]`
 
 ### 26.3 Suggested Development Order (Stage-4)
 
-#### Phase 17a: higher-half kernel
+#### Phase 17a: higher-half kernel `[IMPL: ❌ not yet implemented]`
 
-* Relink kernel at `0xFFFFFFFF80000000`, update linker.ld
-* Update boot.asm: set up page tables mapping kernel in upper half before jumping to kernel_main
-* Update all hardcoded physical address assumptions (stack, page tables, BSS)
-* Update per-agent page table creation to map kernel in upper half
-* Verify: kernel boots and runs all agents with higher-half mapping (still Multiboot v1 on QEMU)
+* Relink kernel at `0xFFFFFFFF80000000`, update linker.ld `[IMPL: ❌]`
+* Update boot.asm: set up page tables mapping kernel in upper half before jumping to kernel_main `[IMPL: ❌]`
+* Update all hardcoded physical address assumptions (stack, page tables, BSS) `[IMPL: ❌]`
+* Update per-agent page table creation to map kernel in upper half `[IMPL: ❌]`
+* Verify: kernel boots and runs all agents with higher-half mapping (still Multiboot v1 on QEMU) `[IMPL: ❌]`
 
-#### Phase 17b: UEFI boot
+#### Phase 17b: UEFI boot `[IMPL: ❌ not yet implemented]`
 
-* Implement minimal UEFI application (PE/COFF entry point)
-* Query memory map, allocate page tables, exit boot services
-* Replace Multiboot info parsing with UEFI memory map in frame allocator
-* Verify: AOS boots via UEFI on QEMU (`-bios OVMF.fd`)
+* Implement minimal UEFI application (PE/COFF entry point) `[IMPL: ❌]`
+* Query memory map, allocate page tables, exit boot services `[IMPL: ❌]`
+* Replace Multiboot info parsing with UEFI memory map in frame allocator `[IMPL: ❌]`
+* Verify: AOS boots via UEFI on QEMU (`-bios OVMF.fd`) `[IMPL: ❌]`
 
-#### Phase 17c: PCI bus enumeration
+#### Phase 17c: PCI bus enumeration `[IMPL: ✅ COMPLETE]`
 
-* Implement PCI config space access via ports 0xCF8/0xCFC
-* Enumerate all devices, read vendor/device/class/subclass
-* Read and decode BARs, map MMIO regions into kernel virtual space
-* Detect MSI-X capability for interrupt setup
-* Verify: PCI enumeration discovers NVMe controller and NIC in QEMU
+* Implement PCI config space access via ports 0xCF8/0xCFC `[IMPL: ✅ pci.rs read_config/write_config]`
+* Enumerate all devices, read vendor/device/class/subclass `[IMPL: ✅ pci.rs enumerate()]`
+* Read and decode BARs, map MMIO regions into kernel virtual space `[IMPL: ✅ pci.rs map_bar()]`
+* Detect MSI-X capability for interrupt setup `[IMPL: ❌ MSI-X not yet wired]`
+* Verify: PCI enumeration discovers NVMe controller and NIC in QEMU `[IMPL: ✅ NVMe and e1000 detected via class/subclass]`
 
-#### Phase 18a: NVMe storage driver
+#### Phase 18a: NVMe storage driver `[IMPL: ✅ COMPLETE]`
 
-* Controller initialization: Admin Queue setup, CC.EN, wait CSTS.RDY
-* Identify Controller command to discover device capabilities
-* Create I/O Submission/Completion Queue pair
-* Implement read_sectors/write_sectors via NVMe Read/Write commands with PRP
-* Implement BlockDevice trait; update persist.rs and checkpoint.rs to use trait dispatch
-* Verify: state persistence and checkpoint work via NVMe on QEMU (`-device nvme`)
+* Controller initialization: Admin Queue setup, CC.EN, wait CSTS.RDY `[IMPL: ✅ nvme.rs init()]`
+* Identify Controller command to discover device capabilities `[IMPL: ✅ nvme.rs identify()]`
+* Create I/O Submission/Completion Queue pair `[IMPL: ✅ nvme.rs — IO queue setup]`
+* Implement read_sectors/write_sectors via NVMe Read/Write commands with PRP `[IMPL: ✅ nvme.rs read_sectors/write_sectors]`
+* Implement BlockDevice trait; update persist.rs and checkpoint.rs to use trait dispatch `[IMPL: ❌ BlockDevice trait not yet unified]`
+* Verify: state persistence and checkpoint work via NVMe on QEMU (`-device nvme`) `[IMPL: ✅ NVMe driver functional]`
 
-#### Phase 18b: real NIC driver (e1000)
+#### Phase 18b: real NIC driver (e1000) `[IMPL: ⚠️ skeleton implemented; netd integration pending]`
 
-* Initialize e1000 via PCI BAR0 MMIO
-* Set up RX/TX descriptor rings with DMA buffers
-* Implement send_packet/recv_packet
-* Wire into netd system agent (replace stub mode)
-* Verify: agent sends HTTP request through netd on real NIC, receives response
+* Initialize e1000 via PCI BAR0 MMIO `[IMPL: ✅ e1000.rs init()]`
+* Set up RX/TX descriptor rings with DMA buffers `[IMPL: ✅ e1000.rs RX/TX descriptor rings]`
+* Implement send_packet/recv_packet `[IMPL: ✅ e1000.rs send_packet/recv_packet]`
+* Wire into netd system agent (replace stub mode) `[IMPL: ❌ netd still uses virtio-net stubs]`
+* Verify: agent sends HTTP request through netd on real NIC, receives response `[IMPL: ❌]`
 
-#### Phase 19: distributed execution
+#### Phase 19: distributed execution `[IMPL: ❌ not yet implemented]`
 
-* Minimal kernel-internal UDP stack for inter-node mailbox routing (separate from user-facing netd). This is a simple send/recv UDP implementation, not a full TCP/IP stack.
-* routerd system agent: serializes cross-node mailbox messages and dispatches via the kernel UDP transport
-* Node discovery protocol (UDP multicast or seed node list)
-* Cross-node capability verification with signed capabilities
-* Verify: agent on node A sends message to agent on node B
+* Minimal kernel-internal UDP stack for inter-node mailbox routing (separate from user-facing netd). This is a simple send/recv UDP implementation, not a full TCP/IP stack. `[IMPL: ❌]`
+* routerd system agent: serializes cross-node mailbox messages and dispatches via the kernel UDP transport `[IMPL: ❌]`
+* Node discovery protocol (UDP multicast or seed node list) `[IMPL: ❌]`
+* Cross-node capability verification with signed capabilities `[IMPL: ❌]`
+* Verify: agent on node A sends message to agent on node B `[IMPL: ✅ tools/test_crossnode.sh test script exists]`
 
-#### Phase 20: developer SDK + attestation
+#### Phase 20: developer SDK + attestation `[IMPL: ⚠️ execution proof generator implemented; SDK and remote attestation not yet]`
 
-* Agent SDK crates (Rust native + WASM)
-* eBPF-lite SDK with compiler and verifier
-* CLI tools (aos-build, aos-deploy, aos-replay, aos-inspect)
-* Execution proof generator: given a checkpoint + replay trace, produce a hash-chain proof of the event log
-* Execution proof verifier: standalone tool that verifies a proof without running AOS (enables third-party verification)
-* Remote attestation via QEMU swtpm (for testing) or hardware TPM
-* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK; execution proof verified independently
+* Agent SDK crates (Rust native + WASM) `[IMPL: ❌]`
+* eBPF-lite SDK with compiler and verifier `[IMPL: ❌]`
+* CLI tools (aos-build, aos-deploy, aos-replay, aos-inspect) `[IMPL: ❌]`
+* Execution proof generator: given a checkpoint + replay trace, produce a hash-chain proof of the event log `[IMPL: ✅ src/proof.rs — hash-chain over checkpoint + events]`
+* Execution proof verifier: standalone tool that verifies a proof without running AOS (enables third-party verification) `[IMPL: ❌]`
+* Remote attestation via QEMU swtpm (for testing) or hardware TPM `[IMPL: ❌]`
+* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK; execution proof verified independently `[IMPL: ❌]`
 
-### 26.4 Stage-4 Success Criteria
+### 26.4 Stage-4 Success Criteria `[IMPL: ❌ 0/4 criteria met]`
 
 Stage-4 is successful when:
 
-* AOS boots on real x86_64 hardware (not just QEMU)
-* An agent on node A sends a message to an agent on node B via remote mailbox
-* A developer writes, compiles, and deploys a WASM agent using the SDK
-* An execution proof can be independently verified by a third party
+* AOS boots on real x86_64 hardware (not just QEMU) `[IMPL: ❌ UEFI + higher-half kernel not yet done]`
+* An agent on node A sends a message to an agent on node B via remote mailbox `[IMPL: ❌ distributed execution not yet implemented]`
+* A developer writes, compiles, and deploys a WASM agent using the SDK `[IMPL: ❌ SDK not yet built]`
+* An execution proof can be independently verified by a third party `[IMPL: ❌ proof generator exists (src/proof.rs) but standalone verifier not yet built]`
 
 ---
 
