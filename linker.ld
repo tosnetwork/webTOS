@@ -1,18 +1,29 @@
 /*
- * AOS Stage-1 Linker Script
+ * AOS Linker Script — Higher-Half Kernel
  *
  * Multiboot v1 compatible layout for QEMU -kernel loading.
- * Kernel loaded at physical address 0x100000 (1 MB).
- * Identity-mapped in Stage-1 (no higher-half offset).
+ * Kernel loaded at physical address 0x100000 (1 MB) by Multiboot.
+ * Kernel linked at virtual address 0xFFFFFFFF80000000+ (higher half).
+ *
+ * Boot code (.boot section) stays at the physical address so it can
+ * run before paging sets up the higher-half mapping. All other kernel
+ * sections (.text, .rodata, .data, .bss) have VMA in the higher half
+ * but LMA at the corresponding physical address (contiguous after boot).
  */
 
 ENTRY(_start)
 
+KERNEL_VMA = 0xFFFFFFFF80000000;
+
 SECTIONS
 {
+    /* ── Phase 1: Boot code at PHYSICAL address ─────────────────────
+     * These sections are linked at low addresses so 32-bit boot code
+     * can reference labels before paging enables the higher-half mapping.
+     */
     . = 0x100000;
 
-    __kernel_start = .;
+    __kernel_phys_start = .;
 
     /* Multiboot header must appear within the first 8KB of the binary */
     .multiboot ALIGN(4) :
@@ -20,22 +31,48 @@ SECTIONS
         KEEP(*(.multiboot))
     }
 
-    .text ALIGN(4096) :
+    /* Boot code: 32-bit entry + 64-bit trampoline, at physical address */
+    .boot ALIGN(4096) :
+    {
+        *(.boot)
+    }
+
+    /* Page tables: at physical address (used before paging is enabled) */
+    .page_tables ALIGN(4096) :
+    {
+        *(.page_tables)
+    }
+
+    __boot_end = .;
+
+    /* ── Phase 2: Kernel proper at VIRTUAL address ──────────────────
+     * VMA = KERNEL_VMA + physical offset.
+     * AT() directive sets LMA = VMA - KERNEL_VMA so Multiboot loads
+     * the data contiguously after the boot sections.
+     */
+    . += KERNEL_VMA;
+
+    .text ALIGN(4096) : AT(ADDR(.text) - KERNEL_VMA)
     {
         *(.text .text.*)
     }
 
-    .rodata ALIGN(4096) :
+    .got ALIGN(8) : AT(ADDR(.got) - KERNEL_VMA)
+    {
+        *(.got .got.*)
+    }
+
+    .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_VMA)
     {
         *(.rodata .rodata.*)
     }
 
-    .data ALIGN(4096) :
+    .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_VMA)
     {
         *(.data .data.*)
     }
 
-    .bss ALIGN(4096) :
+    .bss ALIGN(4096) : AT(ADDR(.bss) - KERNEL_VMA)
     {
         __bss_start = .;
         *(.bss .bss.*)
@@ -43,16 +80,9 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* Page tables: placed before the stack so stack overflow
-       can't corrupt them. */
-    .page_tables ALIGN(4096) :
-    {
-        *(.page_tables)
-    }
-
     . = ALIGN(4096);
 
-    /* Guard page (unmapped gap) between page tables and stack */
+    /* Guard page (unmapped gap) between BSS and stack */
     . += 4096;
 
     /* Kernel stack: 64 KB, grows downward */
@@ -61,6 +91,15 @@ SECTIONS
     __stack_top = .;
 
     __kernel_end = .;
+
+    /* ── Physical equivalents for 32-bit boot code ──────────────────
+     * 32-bit code cannot use 64-bit addresses. These symbols provide
+     * the physical addresses of high-VMA sections.
+     */
+    __bss_phys_start  = __bss_start - KERNEL_VMA;
+    __bss_phys_end    = __bss_end   - KERNEL_VMA;
+    __stack_phys_top  = __stack_top - KERNEL_VMA;
+    __kernel_phys_end = __kernel_end - KERNEL_VMA;
 
     /DISCARD/ :
     {

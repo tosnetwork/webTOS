@@ -1,8 +1,9 @@
 //! AOS x86_64 Paging - Simple Frame Allocator
 //!
 //! Provides a basic bitmap frame allocator for physical 4KB pages.
-//! Identity mapping is set up by boot.asm; this module manages frame
-//! allocation for future use (agent address spaces, stacks, etc.).
+//! Boot.asm sets up dual mapping: identity (PML4[0]) + higher-half
+//! (PML4[511]). Kernel code runs at KERNEL_VMA (0xFFFFFFFF80000000+)
+//! but physical memory remains accessible via the identity mapping.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::serial_println;
@@ -31,14 +32,24 @@ extern "C" {
     static __kernel_end: u8;
 }
 
+/// Higher-half kernel virtual base address.
+/// Kernel code/data/BSS is linked at KERNEL_VMA + physical offset.
+/// Physical memory remains accessible via the identity mapping (PML4[0]).
+pub const KERNEL_VMA_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
+
 /// Initialize the frame allocator.
 ///
 /// Reserves all frames from 0 up to __kernel_end (kernel code, BSS,
 /// page tables, and stack). This prevents the allocator from handing
 /// out frames that overlap with the running kernel.
 pub fn init() {
-    // Calculate the first safe frame: round __kernel_end up to the next page
-    let kernel_end = unsafe { &__kernel_end as *const u8 as usize };
+    // __kernel_end is linked at the higher-half VMA — convert to physical
+    let kernel_end_virt = unsafe { &__kernel_end as *const u8 as usize };
+    let kernel_end = if kernel_end_virt >= KERNEL_VMA_OFFSET {
+        kernel_end_virt - KERNEL_VMA_OFFSET
+    } else {
+        kernel_end_virt
+    };
     let reserved_frames = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
 
     unsafe {
@@ -188,6 +199,13 @@ pub fn create_address_space() -> Option<u64> {
         // 4. Wire up: PML4[0] → new PDPT, PDPT[0] → new PD
         core::ptr::write_volatile(pml4, pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
         core::ptr::write_volatile(pdpt, pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+
+        // 5. Copy PML4[511] — higher-half kernel mapping (supervisor-only, shared)
+        // This ensures the kernel remains accessible in the agent's address space.
+        let boot_pml4_511 = core::ptr::read_volatile(boot_pml4.add(511));
+        if boot_pml4_511 & PTE_PRESENT != 0 {
+            core::ptr::write_volatile(pml4.add(511), boot_pml4_511);
+        }
     }
 
     Some(pml4_phys)

@@ -13,17 +13,15 @@ extern _start
 extern __kernel_end
 
 MULTIBOOT_MAGIC     equ 0x1BADB002
-; Flags: ALIGN(0) | MEMINFO(1) | AOUT_KLUDGE(16)
-MULTIBOOT_FLAGS     equ (1 << 0) | (1 << 1) | (1 << 16)
+; Flags: ALIGN(0) | MEMINFO(1)
+; NOTE: AOUT_KLUDGE (bit 16) is NOT set. We rely on ELF program headers
+; for loading. The ELF32 headers have correct PhysAddr (LMA) values
+; set via AT() directives in the linker script, so the Multiboot loader
+; places each segment at the right physical address.
+MULTIBOOT_FLAGS     equ (1 << 0) | (1 << 1)
 MULTIBOOT_CHECKSUM  equ -(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS)
 
 multiboot_header:
     dd MULTIBOOT_MAGIC
     dd MULTIBOOT_FLAGS
     dd MULTIBOOT_CHECKSUM
-    ; AOUT_KLUDGE fields (required when bit 16 set):
-    dd multiboot_header    ; header_addr: where this header is in memory
-    dd 0x100000            ; load_addr: start loading here
-    dd 0                   ; load_end_addr: 0 = load entire file
-    dd 0                   ; bss_end_addr: 0 = skip BSS zeroing (we do it in boot.asm)
-    dd _start              ; entry_addr: jump here after loading
