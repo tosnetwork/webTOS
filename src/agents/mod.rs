@@ -14,3 +14,5 @@ pub mod policyd;
 pub mod wasm_agent;
 pub mod accountd;
 pub mod netd;
+pub mod routerd;
+pub mod skilld;

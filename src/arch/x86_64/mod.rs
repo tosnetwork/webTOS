@@ -13,7 +13,10 @@ pub mod syscall_msr;
 pub mod ata;
 pub mod acpi;
 pub mod lapic;
+pub mod pci;
 pub mod virtio_net;
+pub mod e1000;
+pub mod nvme;
 
 pub use serial::{serial_print, serial_println};
 

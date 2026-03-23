@@ -389,6 +389,52 @@ pub fn init() {
     serial_println!("[INIT] Netd agent created: id={}", netd_id);
     event::agent_created(netd_id, root_id);
 
+    // ── Routerd agent (agent 10) ── remote mailbox routing ─────────────
+    let routerd_id = create_agent(
+        Some(root_id),
+        agents::routerd::routerd_entry as *const () as u64,
+        stack_top(10),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create routerd agent");
+    {
+        let agent = get_agent_mut(routerd_id).expect("Routerd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[10].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::Network, CAP_TARGET_WILDCARD));
+        agent.cap_count = 4;
+    }
+    mailbox::create_mailbox(routerd_id as MailboxId, routerd_id).ok();
+    state::create_keyspace(routerd_id as u16).ok();
+    serial_println!("[INIT] Routerd agent created: id={}", routerd_id);
+    event::agent_created(routerd_id, root_id);
+
+    // ── Skilld agent (agent 11) ── skill module manager ────────────────
+    let skilld_id = create_agent(
+        Some(root_id),
+        agents::skilld::skilld_entry as *const () as u64,
+        stack_top(11),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create skilld agent");
+    {
+        let agent = get_agent_mut(skilld_id).expect("Skilld agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[11].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::AgentSpawn, CAP_TARGET_WILDCARD));
+        agent.cap_count = 4;
+    }
+    mailbox::create_mailbox(skilld_id as MailboxId, skilld_id).ok();
+    state::create_keyspace(skilld_id as u16).ok();
+    serial_println!("[INIT] Skilld agent created: id={}", skilld_id);
+    event::agent_created(skilld_id, root_id);
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
@@ -396,7 +442,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -414,6 +460,8 @@ pub fn init() {
     sched::add_to_run_queue(wasm_id);
     sched::add_to_run_queue(accountd_id);
     sched::add_to_run_queue(netd_id);
+    sched::add_to_run_queue(routerd_id);
+    sched::add_to_run_queue(skilld_id);
 
     // ── Write stack guard canaries at the bottom of every agent stack ──
     write_stack_guards();

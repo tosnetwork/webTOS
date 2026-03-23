@@ -35,7 +35,9 @@ mod checkpoint;
 mod replay;
 mod large_msg;
 mod smp;
+mod net;
 mod ringbuf;
+mod block;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -60,6 +62,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     arch::x86_64::paging::init();
     serial_println!("[OK] Memory initialized");
 
+    // 4b. Enumerate PCI devices
+    arch::x86_64::pci::init();
+    serial_println!("[OK] PCI bus enumerated");
+
     // 5. Initialize kernel subsystems
     sched::init();
     serial_println!("[OK] Scheduler initialized");
@@ -77,6 +83,9 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
 
     // 8. Initialize virtio-net (if present)
     arch::x86_64::virtio_net::init();
+
+    // 8b. Detect and initialize NVMe storage (if present)
+    arch::x86_64::nvme::init();
 
     // 9. Discover CPUs and boot APs (if multi-core)
     if let Some(acpi_info) = arch::x86_64::acpi::init() {
