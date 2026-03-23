@@ -1,6 +1,6 @@
-//! AOS Node Identity
+//! ATOS Node Identity
 //!
-//! Each AOS node has a 32-bit node ID used to uniquely identify it in a
+//! Each ATOS node has a 32-bit node ID used to uniquely identify it in a
 //! distributed cluster. The default is derived from the low 4 bytes of the
 //! NIC MAC address (same heuristic the old routerd used), but it can be
 //! overridden at runtime via `set_node_id`.

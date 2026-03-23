@@ -1,10 +1,10 @@
-//! AOS ATA PIO Block Device Driver
+//! ATOS ATA PIO Block Device Driver
 //!
 //! Minimal driver for the primary ATA channel in PIO mode.
 //! Supports 28-bit LBA addressing, 512-byte sectors.
 //! Used with QEMU: `-hda state.img`
 //!
-//! Reference: AOS Yellow Paper §24.5 (persistent state storage backend).
+//! Reference: ATOS Yellow Paper §24.5 (persistent state storage backend).
 
 use super::serial::{inb, outb};
 

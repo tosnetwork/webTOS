@@ -1,4 +1,4 @@
-//! AOS Kernel Event Ring Buffer
+//! ATOS Kernel Event Ring Buffer
 //!
 //! Non-blocking circular buffer for audit events. Decouples fast event
 //! emission (kernel) from slow consumption (serial output or auditd agent).

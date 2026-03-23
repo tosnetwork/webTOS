@@ -1,11 +1,11 @@
-//! AOS routerd — Remote Mailbox Routing Agent  (Phase 19: Distributed Execution)
+//! ATOS routerd — Remote Mailbox Routing Agent  (Phase 19: Distributed Execution)
 //!
 //! Responsibilities
 //! ────────────────
 //! 1. Cross-node mailbox routing
 //!    • Agents send a "remote forward" message to routerd's mailbox (mailbox 10)
 //!      using the MSG_MAILBOX_FORWARD type.
-//!    • routerd wraps the payload in the AOS distributed packet format and sends
+//!    • routerd wraps the payload in the ATOS distributed packet format and sends
 //!      it via kernel UDP (src/net.rs).
 //!    • Incoming UDP packets are demultiplexed and delivered to the local mailbox
 //!      of the target agent.
@@ -16,7 +16,7 @@
 //!
 //! Packet wire format (all fields little-endian)
 //! ──────────────────────────────────────────────
-//!   [magic:       4B  = 0x414F_5344 "AOSD"]
+//!   [magic:       4B  = 0x4154_5344 "ATSD"]
 //!   [msg_type:    1B]
 //!   [src_node:    4B]
 //!   [dst_node:    4B]
@@ -31,10 +31,10 @@ use crate::serial_println;
 use crate::agent::*;
 use crate::syscall;
 
-// ─── AOS Distributed packet constants ───────────────────────────────────────
+// ─── ATOS Distributed packet constants ───────────────────────────────────────
 
-/// Wire magic for AOS distributed packets.
-const AOS_DIST_MAGIC: u32 = 0x414F_5344; // "AOSD"
+/// Wire magic for ATOS distributed packets.
+const ATOS_DIST_MAGIC: u32 = 0x4154_5344; // "ATSD"
 
 /// Minimum packet size (header without payload).
 const PKT_HEADER_LEN: usize = 19;
@@ -58,8 +58,8 @@ const MSG_AGENT_MIGRATE: u8 = 0x04;
 
 // ─── UDP port assignments ────────────────────────────────────────────────────
 
-/// Port used for all inter-node AOS traffic (data + HELLO).
-const AOS_PORT: u16 = 4001;
+/// Port used for all inter-node ATOS traffic (data + HELLO).
+const ATOS_PORT: u16 = 4001;
 
 /// Our own IP address (QEMU default guest).  In a real deployment this would
 /// come from DHCP or a config file.
@@ -127,7 +127,7 @@ fn peer_ip(node_id: u32) -> Option<[u8; 4]> {
 
 // ─── Packet helpers ──────────────────────────────────────────────────────────
 
-/// Build an AOS distributed packet into `out` and return its total byte length.
+/// Build an ATOS distributed packet into `out` and return its total byte length.
 ///
 /// `out` must be at least PKT_HEADER_LEN + payload.len() bytes.
 fn build_packet(
@@ -143,7 +143,7 @@ fn build_packet(
     let total = PKT_HEADER_LEN + plen;
     if out.len() < total { return 0; }
 
-    out[0..4].copy_from_slice(&AOS_DIST_MAGIC.to_le_bytes());
+    out[0..4].copy_from_slice(&ATOS_DIST_MAGIC.to_le_bytes());
     out[4]   = msg_type;
     out[5..9].copy_from_slice(&src_node.to_le_bytes());
     out[9..13].copy_from_slice(&dst_node.to_le_bytes());
@@ -155,13 +155,13 @@ fn build_packet(
     total
 }
 
-/// Parse the header fields from a raw AOS distributed packet.
+/// Parse the header fields from a raw ATOS distributed packet.
 ///
 /// Returns `None` if the magic is wrong or the buffer is too short.
 fn parse_packet(buf: &[u8]) -> Option<(u8, u32, u32, u16, u16, &[u8])> {
     if buf.len() < PKT_HEADER_LEN { return None; }
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != AOS_DIST_MAGIC { return None; }
+    if magic != ATOS_DIST_MAGIC { return None; }
 
     let msg_type  = buf[4];
     let src_node  = u32::from_le_bytes([buf[5],  buf[6],  buf[7],  buf[8]]);
@@ -233,8 +233,8 @@ fn handle_inbound(
 
 /// Send a HELLO broadcast so that peers can discover us.
 fn send_hello(my_node_id: u32) {
-    let src = crate::net::UdpEndpoint { ip: LOCAL_IP, port: AOS_PORT };
-    let dst = crate::net::UdpEndpoint { ip: BCAST_IP, port: AOS_PORT };
+    let src = crate::net::UdpEndpoint { ip: LOCAL_IP, port: ATOS_PORT };
+    let dst = crate::net::UdpEndpoint { ip: BCAST_IP, port: ATOS_PORT };
 
     let mut pkt = [0u8; PKT_HEADER_LEN + 4];
     let plen = build_packet(
@@ -278,8 +278,8 @@ fn handle_forward_request(my_node_id: u32, msg: &[u8]) {
         }
     };
 
-    let src = crate::net::UdpEndpoint { ip: LOCAL_IP, port: AOS_PORT };
-    let dst = crate::net::UdpEndpoint { ip: dst_ip, port: AOS_PORT };
+    let src = crate::net::UdpEndpoint { ip: LOCAL_IP, port: ATOS_PORT };
+    let dst = crate::net::UdpEndpoint { ip: dst_ip, port: ATOS_PORT };
 
     let mut pkt = [0u8; PKT_HEADER_LEN + MAX_REMOTE_PAYLOAD];
     let plen = build_packet(

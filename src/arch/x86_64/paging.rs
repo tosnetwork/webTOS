@@ -1,4 +1,4 @@
-//! AOS x86_64 Paging - Simple Frame Allocator
+//! ATOS x86_64 Paging - Simple Frame Allocator
 //!
 //! Provides a basic bitmap frame allocator for physical 4KB pages.
 //! Boot.asm sets up dual mapping: identity (PML4[0]) + higher-half

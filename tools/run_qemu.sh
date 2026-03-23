@@ -1,8 +1,8 @@
 #!/bin/bash
-# Run AOS kernel in QEMU with serial output to stdio
+# Run ATOS kernel in QEMU with serial output to stdio
 set -e
 
-KERNEL="${1:-target/x86_64-unknown-none/debug/aos0}"
+KERNEL="${1:-target/x86_64-unknown-none/debug/atos0}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "Kernel binary not found: $KERNEL"

@@ -1,4 +1,4 @@
-//! AOS State Object Subsystem
+//! ATOS State Object Subsystem
 //!
 //! Implements an in-memory key-value subsystem organized into keyspaces.
 //! Each agent is automatically assigned a private keyspace at creation.

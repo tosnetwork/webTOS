@@ -1,4 +1,4 @@
-//! AOS Kernel Heap Allocator
+//! ATOS Kernel Heap Allocator
 //!
 //! A simple linked-list free-list allocator that obtains 4KB pages from the
 //! frame allocator and manages sub-page allocations for kernel data structures.

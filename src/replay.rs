@@ -1,4 +1,4 @@
-//! AOS Checkpoint Replay & Execution Diffing
+//! ATOS Checkpoint Replay & Execution Diffing
 //!
 //! Loads a checkpoint from disk, enables deterministic scheduling,
 //! and compares Merkle state roots after execution to detect divergence.

@@ -1,9 +1,9 @@
-# AOS Yellow Paper
+# ATOS Yellow Paper
 
 **Version:** Draft v0.6
 **Status:** Engineering Yellow Paper
 **Language:** English
-**Purpose:** Implementation reference for building AOS from scratch, initially targeting virtual machines and QEMU.
+**Purpose:** Implementation reference for building ATOS from scratch, initially targeting virtual machines and QEMU.
 
 > **Implementation Status (Stage-1):** All Phase 0–6 objectives are complete. See `[IMPL]` markers throughout this document for per-item status. Last verified: 2026-03-22.
 
@@ -11,9 +11,9 @@
 
 ## Abstract
 
-AOS is an AI-native minimal operating system designed from first principles for agent execution, deterministic task handling, capability-based isolation, audited state transitions, and capability-scoped resource access. It is **not** intended to be a desktop operating system or a general POSIX-compatible environment. Its primary role is to serve as a minimal execution substrate for AI agents, verifiable runtimes, blockchain-adjacent execution environments, and secure automated systems.
+ATOS is an AI-native minimal operating system designed from first principles for agent execution, deterministic task handling, capability-based isolation, audited state transitions, and capability-scoped resource access. It is **not** intended to be a desktop operating system or a general POSIX-compatible environment. Its primary role is to serve as a minimal execution substrate for AI agents, verifiable runtimes, blockchain-adjacent execution environments, and secure automated systems.
 
-AOS is designed under two strict principles:
+ATOS is designed under two strict principles:
 
 1. **The architecture must be designed from zero**, rather than inherited from legacy human-centric operating systems.
 2. **The code must be written from zero**, rather than modifying Linux or embedding itself inside an existing kernel.
@@ -22,13 +22,13 @@ The first execution target is a **virtual machine environment**, especially **QE
 
 Terminology clarification:
 
-* **AOS** refers to the full system architecture.
-* **AOS-0** refers to the privileged kernel substrate: boot, architecture support, memory management, trap handling, syscall entry, scheduling, mailbox IPC, capability enforcement, accounting, and audit.
-* **AOS-1** refers to the runtime host layer for agent execution backends such as native execution, WASM, and future managed runtimes.
-* **AOS-2** refers to the agent and system-service layer: root, stated, policyd, netd, accountd, and user agents.
-* **AOS-NET** refers to the brokered and distributed execution layer that extends AOS beyond a single local kernel instance.
+* **ATOS** refers to the full system architecture.
+* **ATOS-0** refers to the privileged kernel substrate: boot, architecture support, memory management, trap handling, syscall entry, scheduling, mailbox IPC, capability enforcement, accounting, and audit.
+* **ATOS-1** refers to the runtime host layer for agent execution backends such as native execution, WASM, and future managed runtimes.
+* **ATOS-2** refers to the agent and system-service layer: root, stated, policyd, netd, accountd, and user agents.
+* **ATOS-NET** refers to the brokered and distributed execution layer that extends ATOS beyond a single local kernel instance.
 
-This yellow paper covers the whole AOS stack, but Stage-1 is primarily an **AOS-0** milestone. Later stages progressively realize AOS-1, AOS-2, and AOS-NET.
+This yellow paper covers the whole ATOS stack, but Stage-1 is primarily an **ATOS-0** milestone. Later stages progressively realize ATOS-1, ATOS-2, and ATOS-NET.
 
 ---
 
@@ -47,13 +47,13 @@ Section `§0` is intentional: it serves as a preface for first principles and or
 
 ## Executive Roadmap
 
-This section consolidates the former `Roadmap.md` into the opening of the yellow paper. It provides the strategic end-to-end roadmap for AOS. The later detailed Stage-5 to Stage-10 engineering elaboration in §27 expands the same roadmap at a more technical level.
+This section consolidates the former `Roadmap.md` into the opening of the yellow paper. It provides the strategic end-to-end roadmap for ATOS. The later detailed Stage-5 to Stage-10 engineering elaboration in §27 expands the same roadmap at a more technical level.
 
 ### Core Principle
 
-AOS is **not** a desktop operating system, not a POSIX clone, and not a Linux replacement.
+ATOS is **not** a desktop operating system, not a POSIX clone, and not a Linux replacement.
 
-AOS is a **trusted execution substrate for autonomous agents**.
+ATOS is a **trusted execution substrate for autonomous agents**.
 
 Its first-class concepts are:
 
@@ -79,40 +79,40 @@ Instead, it should deepen the system along four consistent axes:
 
 #### Stage-1 to Stage-4
 
-These stages prove that **AOS can run**.
+These stages prove that **ATOS can run**.
 
 #### Stage-5 to Stage-9
 
-These stages prove that **AOS fulfills its original mission**.
+These stages prove that **ATOS fulfills its original mission**.
 
 #### Stage-10
 
-This stage proves that **AOS can be depended on as a product-grade system**.
+This stage proves that **ATOS can be depended on as a product-grade system**.
 
 ### The 10 Stages at a Glance
 
 | Stage | Title | Main Outcome |
 |---|---|---|
-| 1 | Minimal Kernel Prototype | AOS boots and runs core agent primitives |
-| 2 | Isolation + Runtime Foundation | AOS gains ring-3 isolation, WASM, eBPF-lite, persistent state |
-| 3 | Production-Ready Execution Layer | AOS gains deterministic scheduling, replay, networked execution foundations |
-| 4 | Hardware + Ecosystem Expansion | AOS reaches real hardware, SDKs, attestation, distributed direction |
+| 1 | Minimal Kernel Prototype | ATOS boots and runs core agent primitives |
+| 2 | Isolation + Runtime Foundation | ATOS gains ring-3 isolation, WASM, eBPF-lite, persistent state |
+| 3 | Production-Ready Execution Layer | ATOS gains deterministic scheduling, replay, networked execution foundations |
+| 4 | Hardware + Ecosystem Expansion | ATOS reaches real hardware, SDKs, attestation, distributed direction |
 | 5 | Trusted Authority Plane | Capability becomes a full authority system |
 | 6 | Durable State Plane | State becomes a first-class durable, replayable, provable substrate |
 | 7 | Agent Package & Skill Ecosystem | Agents and skills become deployable, signed, governable artifacts |
 | 8 | Distributed Execution Fabric | Execution can move across trusted nodes |
 | 9 | Verifiable Execution Economy | Execution becomes provable, billable, and settleable |
-| 10 | Appliance-Grade AOS | AOS becomes product-grade, operable, deployable, and dependable |
+| 10 | Appliance-Grade ATOS | ATOS becomes product-grade, operable, deployable, and dependable |
 
 ### Stage-by-Stage Roadmap
 
 #### Stage-1 — Minimal Kernel Prototype
 
 **Purpose**
-Prove that the minimal AOS model is alive.
+Prove that the minimal ATOS model is alive.
 
 **Goal**
-Build the smallest working AOS kernel with agent-oriented primitives.
+Build the smallest working ATOS kernel with agent-oriented primitives.
 
 **Core Capabilities**
 - boot in QEMU
@@ -128,7 +128,7 @@ Build the smallest working AOS kernel with agent-oriented primitives.
 - serial audit logs
 
 **Success Condition**
-AOS boots, creates multiple agents, supports mailbox communication, enforces capabilities, and logs events.
+ATOS boots, creates multiple agents, supports mailbox communication, enforces capabilities, and logs events.
 
 #### Stage-2 — Isolation + Runtime Foundation
 
@@ -150,7 +150,7 @@ Introduce memory isolation, user-mode execution, and first runtimes.
 - first system agents
 
 **Success Condition**
-AOS can run isolated agents, execute WASM workloads, persist state, and restore from checkpoints.
+ATOS can run isolated agents, execute WASM workloads, persist state, and restore from checkpoints.
 
 #### Stage-3 — Production-Ready Execution Layer
 
@@ -170,7 +170,7 @@ Strengthen scheduling, storage, replay, and runtime reliability.
 - richer eBPF-lite enforcement
 
 **Success Condition**
-AOS can run workloads with deterministic scheduling classes, durable state, replay-compatible execution, and production-grade accounting hooks.
+ATOS can run workloads with deterministic scheduling classes, durable state, replay-compatible execution, and production-grade accounting hooks.
 
 #### Stage-4 — Hardware + Ecosystem Expansion
 
@@ -190,7 +190,7 @@ Expand toward real hardware, distributed execution, attestation, and developer t
 - distributed execution groundwork
 
 **Success Condition**
-AOS can run beyond pure VM-only development and exposes enough tooling for external developers and trusted deployment.
+ATOS can run beyond pure VM-only development and exposes enough tooling for external developers and trusted deployment.
 
 #### Stage-5 — Trusted Authority Plane
 
@@ -211,10 +211,10 @@ Evolve capability checks into a full authority plane.
 - authority lineage inspection
 
 **Why It Matters**
-This is where AOS stops being "just a kernel with access checks" and becomes a system with explicit, inspectable authority.
+This is where ATOS stops being "just a kernel with access checks" and becomes a system with explicit, inspectable authority.
 
 **Success Condition**
-For any action in AOS, the system can answer:
+For any action in ATOS, the system can answer:
 - who authorized it
 - through what delegation chain
 - under what lease / expiry
@@ -241,7 +241,7 @@ Build a persistent state model optimized for replay, proof, migration, and polic
 - migration-friendly state packaging
 
 **Why It Matters**
-AOS is state-object-first, not file-first.
+ATOS is state-object-first, not file-first.
 This stage ensures that state is aligned with:
 - checkpointing
 - replay
@@ -255,7 +255,7 @@ Agent state can be versioned, snapshotted, compacted, replicated, proved, migrat
 #### Stage-7 — Agent Package & Skill Ecosystem
 
 **Purpose**
-Make AOS a true agent platform.
+Make ATOS a true agent platform.
 
 **Goal**
 Turn agents and skills into signed, deployable, governable artifacts.
@@ -273,7 +273,7 @@ Turn agents and skills into signed, deployable, governable artifacts.
 - governance hooks
 
 **Why It Matters**
-Without this stage, AOS remains an execution system.
+Without this stage, ATOS remains an execution system.
 With this stage, it becomes a platform.
 
 **Success Condition**
@@ -293,7 +293,7 @@ Agents and skills can be:
 Allow execution to move across trusted nodes.
 
 **Goal**
-Turn AOS into a distributed execution network.
+Turn ATOS into a distributed execution network.
 
 **Core Capabilities**
 - cross-node mailboxes
@@ -315,7 +315,7 @@ It means:
 - trusted execution can continue beyond one machine
 
 **Success Condition**
-AOS nodes can cooperatively host, move, and continue agent execution while preserving authority, state, and auditability.
+ATOS nodes can cooperatively host, move, and continue agent execution while preserving authority, state, and auditability.
 
 #### Stage-9 — Verifiable Execution Economy
 
@@ -361,13 +361,13 @@ A completed workload should produce an **execution receipt** answering:
 **Success Condition**
 External parties can verify, bill, and settle execution without trusting the operator blindly.
 
-#### Stage-10 — Appliance-Grade AOS
+#### Stage-10 — Appliance-Grade ATOS
 
 **Purpose**
-Turn AOS into a product-grade trusted system.
+Turn ATOS into a product-grade trusted system.
 
 **Goal**
-Deliver AOS as a deployable, operable, maintainable, dependable appliance profile.
+Deliver ATOS as a deployable, operable, maintainable, dependable appliance profile.
 
 **Core Capabilities**
 - secure boot
@@ -382,23 +382,23 @@ Deliver AOS as a deployable, operable, maintainable, dependable appliance profil
 - supportable reference deployment profiles
 
 **Important Clarification**
-This stage does **not** redefine AOS as a desktop or general-purpose OS.
+This stage does **not** redefine ATOS as a desktop or general-purpose OS.
 
-It defines AOS as:
+It defines ATOS as:
 - a trusted agent appliance
 - a trusted execution node OS
 - a product-grade autonomous systems substrate
 
 **Success Condition**
-Organizations can deploy AOS as an operational system they trust for long-running agent workloads, verifiable execution services, and managed node deployments.
+Organizations can deploy ATOS as an operational system they trust for long-running agent workloads, verifiable execution services, and managed node deployments.
 
-### The Three Eras of AOS
+### The Three Eras of ATOS
 
 #### Era I — System Formation
 
 **Stage-1 to Stage-4**
 
-AOS proves that it can run.
+ATOS proves that it can run.
 
 Focus:
 - kernel
@@ -412,7 +412,7 @@ Focus:
 
 **Stage-5 to Stage-9**
 
-AOS fulfills its original mission.
+ATOS fulfills its original mission.
 
 Focus:
 - trusted authority
@@ -425,7 +425,7 @@ Focus:
 
 **Stage-10**
 
-AOS becomes something the outside world can depend on.
+ATOS becomes something the outside world can depend on.
 
 Focus:
 - deployability
@@ -440,24 +440,24 @@ Focus:
 
 At **Stage-9**.
 
-By then, AOS has achieved:
+By then, ATOS has achieved:
 - trusted authority
 - state-first execution
 - agent platform semantics
 - distributed execution
 - verifiable and billable computation
 
-That is the full realization of the original AOS mission.
+That is the full realization of the original ATOS mission.
 
 #### Product-Complete
 
 At **Stage-10**.
 
-By then, AOS is not only architecturally complete, but also operationally dependable.
+By then, ATOS is not only architecturally complete, but also operationally dependable.
 
 ### Roadmap Summary
 
-AOS is not trying to become a general-purpose operating system.
+ATOS is not trying to become a general-purpose operating system.
 
 It is building toward a different destination:
 
@@ -466,23 +466,23 @@ It is building toward a different destination:
 The 10 stages are therefore not arbitrary.
 They form a coherent progression:
 
-- **Stage-1 to Stage-4:** prove AOS can run
-- **Stage-5 to Stage-9:** prove AOS fulfills its mission
-- **Stage-10:** prove AOS can be depended on in the real world
+- **Stage-1 to Stage-4:** prove ATOS can run
+- **Stage-5 to Stage-9:** prove ATOS fulfills its mission
+- **Stage-10:** prove ATOS can be depended on in the real world
 
 ### One-Sentence Roadmap Definition
 
-**AOS evolves in 10 stages: from a minimal kernel prototype, to a trusted agent execution substrate, to a distributed, verifiable execution economy, and finally to an appliance-grade system that organizations can safely deploy and depend on.**
+**ATOS evolves in 10 stages: from a minimal kernel prototype, to a trusted agent execution substrate, to a distributed, verifiable execution economy, and finally to an appliance-grade system that organizations can safely deploy and depend on.**
 
 ---
 
 ## Part I — Foundations and Stage-1 Scope
 
-## 0. Preface: AOS First Principles / Original Intent
+## 0. Preface: ATOS First Principles / Original Intent
 
-AOS began from a simple premise: autonomous software agents should not be treated as an afterthought running on top of abstractions designed for human users. The system is therefore intentionally built around the needs of agent execution, not around the needs of desktop sessions, shell users, or POSIX-era application compatibility.
+ATOS began from a simple premise: autonomous software agents should not be treated as an afterthought running on top of abstractions designed for human users. The system is therefore intentionally built around the needs of agent execution, not around the needs of desktop sessions, shell users, or POSIX-era application compatibility.
 
-The original intent of AOS is:
+The original intent of ATOS is:
 
 * to provide an **agent-native execution substrate**, not a general-purpose consumer operating system
 * to make **authority explicit** through capabilities and policy, rather than ambient privilege
@@ -491,7 +491,7 @@ The original intent of AOS is:
 * to keep the privileged kernel narrow, while allowing richer runtime, service, and distributed layers to grow above it
 * to validate this model first in **virtual machines and controlled environments**, before expanding toward broader hardware support
 
-In practical terms, AOS is centered on:
+In practical terms, ATOS is centered on:
 
 * agents
 * mailboxes
@@ -509,7 +509,7 @@ It is intentionally not centered on:
 * shell sessions as the primary operator interface
 * unrestricted global authority
 
-This distinction matters. If AOS drifts into becoming "Linux with agent tooling," it loses the architectural reason for existing. The project only remains true to its original intent if agent execution, bounded authority, auditability, replay, and brokered resource access remain the primary design constraints from kernel to runtime to network layer.
+This distinction matters. If ATOS drifts into becoming "Linux with agent tooling," it loses the architectural reason for existing. The project only remains true to its original intent if agent execution, bounded authority, auditability, replay, and brokered resource access remain the primary design constraints from kernel to runtime to network layer.
 
 Stage-1 should therefore be read as proof of the substrate, not as the final product shape. The purpose of the early kernel is to validate the first principles above so that later layers can grow on top of a coherent base rather than on inherited legacy assumptions.
 
@@ -539,7 +539,7 @@ AI-native systems need a different execution substrate. They require:
 * execution budgeting and energy accounting
 * checkpointing and replay
 
-AOS exists to provide these properties as primary system concepts instead of middleware layered on top of a legacy OS.
+ATOS exists to provide these properties as primary system concepts instead of middleware layered on top of a legacy OS.
 
 ---
 
@@ -547,7 +547,7 @@ AOS exists to provide these properties as primary system concepts instead of mid
 
 ### 2.1 AI-native, not human-desktop-native
 
-AOS is not designed to replace Linux, Windows, or macOS for general human use. It is designed as a substrate for:
+ATOS is not designed to replace Linux, Windows, or macOS for general human use. It is designed as a substrate for:
 
 * AI agents
 * constrained runtimes
@@ -571,7 +571,7 @@ Higher-level services should be built as structured kernel subsystems first, and
 
 ### 2.3 Determinism over convenience
 
-AOS must prefer predictable, replayable behavior over convenience APIs inherited from legacy systems.
+ATOS must prefer predictable, replayable behavior over convenience APIs inherited from legacy systems.
 
 ### 2.4 Explicit authority
 
@@ -579,7 +579,7 @@ Nothing should be accessible by default. Every meaningful action must be backed 
 
 ### 2.5 Message and state before file and socket
 
-The primary concepts of AOS are:
+The primary concepts of ATOS are:
 
 * agent
 * mailbox
@@ -600,7 +600,7 @@ Not:
 
 ## 3. Scope of Stage-1
 
-The first implementation target of AOS is intentionally narrow.
+The first implementation target of ATOS is intentionally narrow.
 
 ### 3.1 Target platform
 
@@ -641,33 +641,33 @@ This is a deliberate engineering constraint. The goal is to validate the AI-nati
 
 ## 4. System Overview
 
-AOS is the umbrella system. The early kernel is not the whole of AOS; it is the privileged foundation on which later runtime, service, and network layers are built.
+ATOS is the umbrella system. The early kernel is not the whole of ATOS; it is the privileged foundation on which later runtime, service, and network layers are built.
 
 ### 4.1 Layer naming
 
-* **AOS-0** — privileged kernel substrate
-* **AOS-1** — runtime host layer
-* **AOS-2** — agent and system-service layer
-* **AOS-NET** — brokered and distributed execution layer
+* **ATOS-0** — privileged kernel substrate
+* **ATOS-1** — runtime host layer
+* **ATOS-2** — agent and system-service layer
+* **ATOS-NET** — brokered and distributed execution layer
 
 ### 4.2 Logical architecture
 
-The conceptual stack of the full AOS system is as follows:
+The conceptual stack of the full ATOS system is as follows:
 
 ```text
 +---------------------------------------------------+
 |           Applications / External Systems         |
 +---------------------------------------------------+
-| AOS-NET                                           |
+| ATOS-NET                                           |
 | brokered network | distributed execution | replay |
 +---------------------------------------------------+
-| AOS-2 Agent / Service Layer                       |
+| ATOS-2 Agent / Service Layer                       |
 | root | stated | policyd | netd | accountd | user  |
 +---------------------------------------------------+
-| AOS-1 Runtime Host                                |
+| ATOS-1 Runtime Host                                |
 | native | WASM | future managed runtimes           |
 +---------------------------------------------------+
-| AOS-0 Kernel                                      |
+| ATOS-0 Kernel                                      |
 | sched | mailbox | capability | state | audit      |
 | energy | syscall | checkpoint                     |
 +---------------------------------------------------+
@@ -678,14 +678,14 @@ The conceptual stack of the full AOS system is as follows:
 +---------------------------------------------------+
 ```
 
-`AOS-NET` is a logical system layer, not a separate CPU privilege ring. It spans brokered network access, replay/export, and future inter-node coordination.
+`ATOS-NET` is a logical system layer, not a separate CPU privilege ring. It spans brokered network access, replay/export, and future inter-node coordination.
 
 ### 4.3 External-facing architecture diagram
 
 The following figure is the recommended public-facing architecture view for overview pages, presentations, and design reviews. It is intentionally more narrative than the strictly layered diagram above: it shows not only where each subsystem sits, but how execution, authority, energy, networking, and verification move through the system.
 
 ```text
-                         PUBLIC-FACING AOS ARCHITECTURE
+                         PUBLIC-FACING ATOS ARCHITECTURE
 
 +-------------------------------------------------------------------------+
 |                 Applications / External Systems                         |
@@ -694,7 +694,7 @@ The following figure is the recommended public-facing architecture view for over
                                     |
                                     v
 +-------------------------------------------------------------------------+
-| AOS-2 Agent / Service Layer                                              |
+| ATOS-2 Agent / Service Layer                                              |
 | user agents | root | stated | policyd | netd | accountd                 |
 | message plane: mailbox protocols, service APIs, delegated authority      |
 +-------------------------+--------------------------+---------------------+
@@ -702,7 +702,7 @@ The following figure is the recommended public-facing architecture view for over
                           | agent execution          | service / broker path
                           v                          v
 +-------------------------------------------------------------------------+
-| AOS-1 Runtime Host                                                       |
+| ATOS-1 Runtime Host                                                       |
 | native runtime | WASM runtime | future managed runtimes                 |
 | load -> instantiate -> execute_slice -> syscall_bridge -> snapshot      |
 +-------------------------+--------------------------+---------------------+
@@ -710,7 +710,7 @@ The following figure is the recommended public-facing architecture view for over
                           | syscall / trap / yield / block / exit
                           v
 +-------------------------------------------------------------------------+
-| AOS-0 Kernel                                                             |
+| ATOS-0 Kernel                                                             |
 | scheduler | mailbox IPC | capability checks | eBPF-lite attach points   |
 | energy meter / cost table | state / Merkle / checkpoint | audit / trace |
 +-------------+------------------------+------------------------+----------+
@@ -728,11 +728,11 @@ The following figure is the recommended public-facing architecture view for over
 
 How to read this diagram:
 
-* **Execution path**: agents live in AOS-2, execute through an AOS-1 runtime backend, and enter AOS-0 through syscalls, traps, yields, blocks, and exits.
-* **Authority path**: capabilities originate from the root authority chain, are delegated across agents and services, and are finally enforced only in AOS-0. eBPF-lite policy extends this enforcement path; it does not replace it.
-* **Energy path**: runtime fuel, syscall cost, timer cost, storage cost, and network cost are all collapsed into one conserved AOS energy model. This is why `accountd` belongs in AOS-2 but depends on AOS-0 metering.
+* **Execution path**: agents live in ATOS-2, execute through an ATOS-1 runtime backend, and enter ATOS-0 through syscalls, traps, yields, blocks, and exits.
+* **Authority path**: capabilities originate from the root authority chain, are delegated across agents and services, and are finally enforced only in ATOS-0. eBPF-lite policy extends this enforcement path; it does not replace it.
+* **Energy path**: runtime fuel, syscall cost, timer cost, storage cost, and network cost are all collapsed into one conserved ATOS energy model. This is why `accountd` belongs in ATOS-2 but depends on ATOS-0 metering.
 * **Network path**: user agents do not touch NICs directly. They talk to `netd`, and `netd` brokers access through the kernel and the underlying device layer.
-* **Verification path**: audit events, replay traces, checkpoints, and Merkle-backed state all originate in or pass through AOS-0, then become exportable artifacts for external replay, proof, billing, and analysis systems.
+* **Verification path**: audit events, replay traces, checkpoints, and Merkle-backed state all originate in or pass through ATOS-0, then become exportable artifacts for external replay, proof, billing, and analysis systems.
 
 This diagram should be read as the **target system shape**, not as a claim that every box already exists in Stage-1. Stage-1 validates the kernel substrate; later stages progressively populate the rest of the figure.
 
@@ -740,20 +740,20 @@ This diagram should be read as the **target system shape**, not as a claim that 
 
 Stage-1 intentionally realizes only a thin slice of the full stack:
 
-* AOS-0 is the primary focus
-* AOS-1 collapses to built-in native execution
-* AOS-2 contains only minimal bootstrap and test agents
-* AOS-NET is deferred
+* ATOS-0 is the primary focus
+* ATOS-1 collapses to built-in native execution
+* ATOS-2 contains only minimal bootstrap and test agents
+* ATOS-NET is deferred
 
-AOS should therefore be understood not as a file-centric Unix derivative, but as an **agent execution substrate** that expands upward from AOS-0.
+ATOS should therefore be understood not as a file-centric Unix derivative, but as an **agent execution substrate** that expands upward from ATOS-0.
 
-### 4.5 AOS Genesis
+### 4.5 ATOS Genesis
 
-AOS requires a trusted starting point. At system bring-up, there must already exist an initial authority root, an initial execution budget source, and an initial trusted configuration; otherwise no first agent could be created, no first capability could be granted, and no first budget could be delegated.
+ATOS requires a trusted starting point. At system bring-up, there must already exist an initial authority root, an initial execution budget source, and an initial trusted configuration; otherwise no first agent could be created, no first capability could be granted, and no first budget could be delegated.
 
-This bootstrap profile may be referred to as **AOS Genesis**.
+This bootstrap profile may be referred to as **ATOS Genesis**.
 
-It is similar in spirit to a blockchain genesis configuration, but it is not merely an initial balance table. AOS Genesis is the root initialization of:
+It is similar in spirit to a blockchain genesis configuration, but it is not merely an initial balance table. ATOS Genesis is the root initialization of:
 
 * **authority**: the root identity, root capability set, and initial trust anchors
 * **execution budget**: the initial usable energy budget from which later agent budgets are delegated
@@ -761,9 +761,9 @@ It is similar in spirit to a blockchain genesis configuration, but it is not mer
 * **policy identity**: the initial policy bundle, policy root, or equivalent enforcement baseline
 * **trusted state**: the initial registry, configuration, keyspace, or state commitments on which the node begins execution
 
-In Stage-1, AOS Genesis is still mostly **implicit** and compiled into the boot and initialization path. The kernel creates the root authority, grants the first broad capability set, assigns the initial usable execution budget, and instantiates the first built-in agents. Later stages may externalize this into a more explicit signed or attested genesis profile for appliance deployment, multi-tenant operation, or distributed execution.
+In Stage-1, ATOS Genesis is still mostly **implicit** and compiled into the boot and initialization path. The kernel creates the root authority, grants the first broad capability set, assigns the initial usable execution budget, and instantiates the first built-in agents. Later stages may externalize this into a more explicit signed or attested genesis profile for appliance deployment, multi-tenant operation, or distributed execution.
 
-The important distinction is that AOS Genesis is primarily an **execution and authority genesis**, not just a ledger genesis. It defines who may act first, under what initial policy, and with what starting execution budget.
+The important distinction is that ATOS Genesis is primarily an **execution and authority genesis**, not just a ledger genesis. It defines who may act first, under what initial policy, and with what starting execution budget.
 
 ---
 
@@ -771,7 +771,7 @@ The important distinction is that AOS Genesis is primarily an **execution and au
 
 ### 5.1 Agent
 
-An **agent** is the primary execution unit in AOS. It replaces the traditional conceptual centrality of the process.
+An **agent** is the primary execution unit in ATOS. It replaces the traditional conceptual centrality of the process.
 
 A minimal Stage-1 agent structure may be defined conceptually as:
 
@@ -866,7 +866,7 @@ Every agent should run under an execution budget. This is critical for:
 
 ### 5.6 Event log
 
-AOS must emit structured execution events from the beginning. Auditability is not an afterthought.
+ATOS must emit structured execution events from the beginning. Auditability is not an afterthought.
 
 ### 5.7 Checkpoint
 
@@ -874,9 +874,9 @@ Checkpointing may begin as a conceptual placeholder in Stage-1, but the system a
 
 ---
 
-## 6. Why AOS Must Be Written from Scratch
+## 6. Why ATOS Must Be Written from Scratch
 
-AOS is intentionally not defined as a Linux modification project.
+ATOS is intentionally not defined as a Linux modification project.
 
 ### 6.1 Why not modify Linux
 
@@ -889,7 +889,7 @@ Linux is powerful, but its core abstractions are deeply tied to historical compu
 * broad ambient authority patterns
 * complex legacy compatibility layers
 
-If AOS is implemented merely as a Linux adaptation, it risks becoming a middleware framework rather than a true operating system substrate.
+If ATOS is implemented merely as a Linux adaptation, it risks becoming a middleware framework rather than a true operating system substrate.
 
 ### 6.2 Why first run in a virtual machine
 
@@ -902,7 +902,7 @@ Writing from zero on real hardware would introduce major complexity too early:
 * multicore synchronization issues
 * hardware-specific debugging pain
 
-By targeting QEMU first, AOS gains:
+By targeting QEMU first, ATOS gains:
 
 * repeatable execution environment
 * serial-based debugging
@@ -991,9 +991,9 @@ The kernel must provide serial output and structured event emission. `[IMPL: ✅
 
 ## 8. Architecture Layers
 
-The layer naming from §4 is normative: boot, architecture, and kernel core together form **AOS-0**; the runtime host is **AOS-1**; agents and system services are **AOS-2**. `AOS-NET` is described later in the networking and distributed execution roadmap.
+The layer naming from §4 is normative: boot, architecture, and kernel core together form **ATOS-0**; the runtime host is **ATOS-1**; agents and system services are **ATOS-2**. `ATOS-NET` is described later in the networking and distributed execution roadmap.
 
-### 8.1 AOS-0 Boot layer `[IMPL: ✅]`
+### 8.1 ATOS-0 Boot layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -1002,7 +1002,7 @@ Responsibilities:
 * hand off memory information `[IMPL: ✅ multiboot magic + info passed to kernel_main]`
 * establish clean control flow into Rust kernel logic `[IMPL: ✅ BSS zeroed, stack set, call kernel_main]`
 
-### 8.2 AOS-0 x86_64 architecture layer `[IMPL: ✅]`
+### 8.2 ATOS-0 x86_64 architecture layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -1014,7 +1014,7 @@ Responsibilities:
 * MSR configuration (STAR, LSTAR, SFMASK for `syscall`/`sysret` support) `[IMPL: ⏳ syscall_entry.asm ready, MSR init deferred to ring-3 stage]`
 * low-level register, port, and serial I/O handling `[IMPL: ✅ serial.rs — COM1 0x3F8, outb/inb helpers]`
 
-### 8.3 AOS-0 Kernel core layer `[IMPL: ✅]`
+### 8.3 ATOS-0 Kernel core layer `[IMPL: ✅]`
 
 Responsibilities:
 
@@ -1026,22 +1026,22 @@ Responsibilities:
 * energy accounting `[IMPL: ✅ energy.rs]`
 * syscall dispatcher `[IMPL: ✅ syscall.rs]`
 
-### 8.4 AOS-1 Runtime host layer `[IMPL: ✅ native + WASM + eBPF-lite runtimes]`
+### 8.4 ATOS-1 Runtime host layer `[IMPL: ✅ native + WASM + eBPF-lite runtimes]`
 
 Responsibilities:
 
 * load and instantiate agent runtimes `[IMPL: ✅ native agents + WASM interpreter + eBPF-lite VM]`
-* bridge runtime-specific host calls into the AOS syscall ABI `[IMPL: ✅ WASM host bridge (6 imports) + eBPF map/helper interface]`
+* bridge runtime-specific host calls into the ATOS syscall ABI `[IMPL: ✅ WASM host bridge (6 imports) + eBPF map/helper interface]`
 * expose runtime checkpoint / restore hooks `[IMPL: ⏳ placeholder in Stage-1, implemented progressively in Stage-2/3]`
 * translate runtime-specific execution into scheduler-visible slices `[IMPL: ✅ native context switch + WASM fuel metering + eBPF instruction counting]`
 
-### 8.5 AOS-2 Agent / service layer `[IMPL: ✅ Stage-1 test agents, Stage-2+ system agents]`
+### 8.5 ATOS-2 Agent / service layer `[IMPL: ✅ Stage-1 test agents, Stage-2+ system agents]`
 
 Stage-1 should compile in a minimal set of test agents directly into the kernel image or a fixed internal image format. `[IMPL: ✅ 5 agents compiled in: idle, root, ping, pong, bad]`
 
 This avoids early distraction from general executable loaders.
 
-In later stages this layer expands to include system services such as stated, policyd, netd, accountd, and user-supplied agents running on top of the AOS-1 runtime host.
+In later stages this layer expands to include system services such as stated, policyd, netd, accountd, and user-supplied agents running on top of the ATOS-1 runtime host.
 
 ---
 
@@ -1049,7 +1049,7 @@ In later stages this layer expands to include system services such as stated, po
 
 ## 9. Programming Language Strategy
 
-AOS should use a mixed-language implementation model.
+ATOS should use a mixed-language implementation model.
 
 ### 9.1 Assembly responsibilities
 
@@ -1084,7 +1084,7 @@ This combination preserves control at the architectural boundary while improving
 
 ## 10. Agent Model
 
-AOS is agent-centric.
+ATOS is agent-centric.
 
 ### 10.1 Agent states
 
@@ -1129,7 +1129,7 @@ For native agents, the execution context is the CPU state saved and restored on 
 
 All other agent metadata (`energy_budget`, `mailbox_id`, `capability_set`, `memory_quota`) is stored in the Agent struct (§5.1), not in the execution context. The scheduler accesses agent metadata via the agent table, not via the saved context.
 
-For managed runtimes, the agent still has a minimal kernel scheduling context, but most VM-specific execution state lives in `runtime_state` and is advanced through the AOS-1 runtime host rather than directly by resuming native CPU registers.
+For managed runtimes, the agent still has a minimal kernel scheduling context, but most VM-specific execution state lives in `runtime_state` and is advanced through the ATOS-1 runtime host rather than directly by resuming native CPU registers.
 
 Conceptually:
 
@@ -1149,7 +1149,7 @@ The root agent's initial energy budget and memory quota are set to the system's 
 
 The root agent's entry point is a compiled-in initialization function that spawns the system's test agents in Stage-1.
 
-This is the concrete Stage-1 embodiment of the more general **AOS Genesis** concept introduced in §4.5.
+This is the concrete Stage-1 embodiment of the more general **ATOS Genesis** concept introduced in §4.5.
 
 ### 10.4 Agent lifecycle
 
@@ -1167,7 +1167,7 @@ This is the concrete Stage-1 embodiment of the more general **AOS Genesis** conc
 
 ### 10.5 Orphan Handling `[IMPL: ✅ reparent to ROOT + ChildAdopted event]`
 
-When a parent agent terminates, its children become orphans. AOS supports two policies, selectable at compile time:
+When a parent agent terminates, its children become orphans. ATOS supports two policies, selectable at compile time:
 
 * **Cascade termination** (Stage-1 default): all direct children are immediately moved to `Faulted` with reason "parent exited". This cascades recursively to all descendants. Simple but harsh — no grace period.
 * **Reparenting to root** (Stage-3+): orphaned children are adopted by the root agent. Their `parent_id` is updated to `ROOT_AGENT_ID`. The root agent receives a `CHILD_ADOPTED` audit event for each reparented child. Children continue running with their existing capabilities and energy budget. This is analogous to Linux's `init` process (PID 1) adopting orphans.
@@ -1178,7 +1178,7 @@ The reparenting policy is preferred for production deployments because it allows
 
 ## 11. Mailbox IPC Model
 
-Mailbox IPC is one of the core defining traits of AOS.
+Mailbox IPC is one of the core defining traits of ATOS.
 
 ### 11.1 Mailbox rules
 
@@ -1231,7 +1231,7 @@ In later stages, mailboxes may support:
 
 ## 12. Capability Model
 
-The capability system is central to AOS.
+The capability system is central to ATOS.
 
 ### 12.1 Principle
 
@@ -1314,7 +1314,7 @@ Energy budgeting exists to support:
 
 ### 13.2 Energy Provenance
 
-In AOS, energy is never ambient and never self-created. Every usable execution budget must have an explicit provenance.
+In ATOS, energy is never ambient and never self-created. Every usable execution budget must have an explicit provenance.
 
 The provenance rules are:
 
@@ -1323,7 +1323,7 @@ The provenance rules are:
 * **Replenished only through explicit authority**: a suspended agent may only be resumed if budget is replenished by a parent, the system, or a future accounting or settlement authority that is itself authorized to do so.
 * **Auditable at every boundary**: budget grant, transfer, exhaustion, and replenishment should all be observable through kernel state and audit events.
 
-This mirrors the broader AOS authority model. Just as capabilities are never ambient, energy is never ambient. An agent may hold energy, spend energy, transfer energy, or later receive settlement-backed credit, but it may not manufacture budget by itself.
+This mirrors the broader ATOS authority model. Just as capabilities are never ambient, energy is never ambient. An agent may hold energy, spend energy, transfer energy, or later receive settlement-backed credit, but it may not manufacture budget by itself.
 
 Future stages may introduce tenant roots, account roots, external payers, or settlement adapters. Even in those cases, new usable agent budget should only enter the system through an explicit, authority-checked, auditable credit path.
 
@@ -1354,7 +1354,7 @@ The Stage-1 syscall surface should be intentionally small.
 
 ### 14.1 Register convention
 
-On x86_64, AOS uses the `syscall` instruction with the following convention:
+On x86_64, ATOS uses the `syscall` instruction with the following convention:
 
 ```text
 rax = syscall number
@@ -1373,7 +1373,7 @@ rcx = destroyed (hardware saves rip here)
 r11 = destroyed (hardware saves rflags here)
 ```
 
-The `syscall` instruction unconditionally overwrites `rcx` and `r11`. Callers must not rely on these registers being preserved across a syscall. This convention is similar to the Linux x86_64 syscall ABI for familiarity, but the syscall numbers and semantics are entirely AOS-specific.
+The `syscall` instruction unconditionally overwrites `rcx` and `r11`. Callers must not rely on these registers being preserved across a syscall. This convention is similar to the Linux x86_64 syscall ABI for familiarity, but the syscall numbers and semantics are entirely ATOS-specific.
 
 ### 14.2 Initial syscall set `[IMPL: ✅ ALL IMPLEMENTED]`
 
@@ -1489,7 +1489,7 @@ Memory quota enforcement: each agent's `memory_quota` limits the number of physi
 
 ### 16.4 Agent Stack Safety `[IMPL: ✅]`
 
-Each agent runs on its own fixed-size kernel stack. Stack overflow must never silently corrupt adjacent agents' memory. AOS employs two defenses:
+Each agent runs on its own fixed-size kernel stack. Stack overflow must never silently corrupt adjacent agents' memory. ATOS employs two defenses:
 
 #### 16.4.1 Stack Guard Canaries
 
@@ -1675,7 +1675,7 @@ Replay is essential for:
 
 ## 20. Demo-Driven Validation
 
-The first successful version of AOS should not be judged by whether it runs a shell. It should be judged by whether the new OS model is alive.
+The first successful version of ATOS should not be judged by whether it runs a shell. It should be judged by whether the new OS model is alive.
 
 ### 20.1 Demo 1: message exchange (achievable after Phase 5) `[IMPL: ✅ VERIFIED]`
 
@@ -1728,7 +1728,7 @@ This validates:
 ## 21. Suggested Repository Layout
 
 ```text
-aos0/
+atos0/
   Cargo.toml
   Makefile
   rust-toolchain.toml
@@ -1792,7 +1792,7 @@ aos0/
 Goal:
 
 * boot in QEMU `[✅ Multiboot v1 via QEMU -kernel]`
-* print `AOS boot ok` over serial `[✅ COM1 0x3F8]`
+* print `ATOS boot ok` over serial `[✅ COM1 0x3F8]`
 
 ### Phase 1: architectural skeleton `[IMPL: ✅ COMPLETE]`
 
@@ -1844,7 +1844,7 @@ Goal:
 * decrement via timer ticks (for running and blocked agents) and syscall cost `[✅ tick_running + tick_blocked + charge_syscall]`
 * enforce zero-budget behavior: suspend agent, emit audit event, reschedule `[✅ Suspended state + BUDGET_EXHAUSTED event + schedule()]`
 
-At the end of Phase 6, AOS Stage-1 becomes a valid AI-native minimal kernel prototype. `[✅ ALL PHASES COMPLETE — verified 2026-03-22]`
+At the end of Phase 6, ATOS Stage-1 becomes a valid AI-native minimal kernel prototype. `[✅ ALL PHASES COMPLETE — verified 2026-03-22]`
 
 ---
 
@@ -1867,7 +1867,7 @@ To preserve implementation focus, the following are explicitly out of scope for 
 
 ## 24. Stage-2 Roadmap (Kernel Hardening + Runtime Foundation)
 
-Stage-2 transforms AOS from a kernel-mode prototype into a hardened execution platform with memory isolation, sandboxed runtimes, and persistent state.
+Stage-2 transforms ATOS from a kernel-mode prototype into a hardened execution platform with memory isolation, sandboxed runtimes, and persistent state.
 
 ### 24.1 Objectives
 
@@ -1914,11 +1914,11 @@ Stage-1 agents are compiled into the kernel image. Stage-2 must support loading 
 
 ### 24.3 Runtime Layer
 
-Stage-2 turns AOS-1 into a real subsystem rather than a thin Stage-1 placeholder.
+Stage-2 turns ATOS-1 into a real subsystem rather than a thin Stage-1 placeholder.
 
 #### 24.3.0 Runtime Abstraction Layer `[IMPL: ✅ native ring-3 agents + WASM interpreter + eBPF-lite policy engine]`
 
-AOS must not let each runtime grow as an unrelated special case. All agent runtimes must conform to a common conceptual lifecycle so that scheduling, accounting, syscall bridging, checkpointing, and replay remain runtime-neutral.
+ATOS must not let each runtime grow as an unrelated special case. All agent runtimes must conform to a common conceptual lifecycle so that scheduling, accounting, syscall bridging, checkpointing, and replay remain runtime-neutral.
 
 ```text
 AgentRuntime {
@@ -1938,11 +1938,11 @@ Runtime notes:
 * **Native runtime**: `load` parses an ELF or built-in image; `execute_slice` resumes user-mode or native execution until trap, yield, block, or exit.
 * **WASM runtime**: `load` parses and validates a WASM module; `execute_slice` consumes fuel and advances the interpreter.
 * **Future managed runtimes**: any future VM (custom VM, JVM-lite, TOS-specific VM, etc.) must fit this contract rather than introducing a separate kernel control path.
-* **eBPF-lite** is not an `AgentRuntime`; it is the policy execution layer of AOS. It follows similar bounded-lifecycle principles, but it is kernel-resident and attachment-driven rather than agent-scheduled.
+* **eBPF-lite** is not an `AgentRuntime`; it is the policy execution layer of ATOS. It follows similar bounded-lifecycle principles, but it is kernel-resident and attachment-driven rather than agent-scheduled.
 
 #### 24.3.1 WASM Runtime `[IMPL: ✅ 1,981 lines]`
 
-WASM is the primary sandboxed runtime for AOS agents. It provides portable, deterministic execution with fine-grained memory safety.
+WASM is the primary sandboxed runtime for ATOS agents. It provides portable, deterministic execution with fine-grained memory safety.
 
 Runtime host interface:
 
@@ -1951,7 +1951,7 @@ WasmRuntime {
     load(wasm_bytes) -> module_id       // parse and validate WASM module
     instantiate(module_id) -> instance  // create execution instance
     execute_slice(instance, fuel) -> result  // run with bounded fuel
-    handle_syscall(instance, num, args) -> result  // bridge WASM → AOS syscalls
+    handle_syscall(instance, num, args) -> result  // bridge WASM → ATOS syscalls
     snapshot(instance) -> checkpoint    // capture execution state
     restore(checkpoint) -> instance     // resume from checkpoint
 }
@@ -1961,13 +1961,13 @@ Design constraints:
 
 * **No JIT in Stage-2**: use an interpreter (e.g., a minimal stack-based WASM interpreter written in Rust). JIT compilation may be explored in Stage-3.
 * **Fuel-based metering**: WASM execution is bounded by a fuel counter that maps to the agent's energy budget. Each WASM instruction consumes fuel.
-* **Syscall bridging**: WASM agents invoke AOS syscalls by calling imported host functions (WASM `call` to host-provided imports). The runtime translates these calls into kernel syscalls.
+* **Syscall bridging**: WASM agents invoke ATOS syscalls by calling imported host functions (WASM `call` to host-provided imports). The runtime translates these calls into kernel syscalls.
 * **Memory model**: WASM linear memory is backed by agent-allocated frames. The `memory.grow` instruction is gated by `memory_quota`.
 * **Determinism**: WASM is inherently deterministic (no threads, no system clock access). This makes it ideal for checkpoint/replay.
 
 #### 24.3.2 eBPF-lite Policy Runtime `[IMPL: ✅ 1,010 lines]`
 
-eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode. It serves as the policy execution layer of AOS, providing verifiable, bounded, low-cost rule enforcement at kernel-defined attachment points.
+eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode. It serves as the policy execution layer of ATOS, providing verifiable, bounded, low-cost rule enforcement at kernel-defined attachment points.
 
 ```text
 EbpfProgram {
@@ -2061,7 +2061,7 @@ This provides **redo-only recovery** — all committed state mutations are repla
 
 ### 24.6.1 Disk Layout Specification
 
-AOS uses ATA PIO with 28-bit LBA addressing (Stage-2/3), supporting up to 128 GB per disk. The disk is divided into fixed regions managed by a superblock. All values are in 512-byte sectors.
+ATOS uses ATA PIO with 28-bit LBA addressing (Stage-2/3), supporting up to 128 GB per disk. The disk is divided into fixed regions managed by a superblock. All values are in 512-byte sectors.
 
 ```text
 Sector 0:                       Superblock
@@ -2076,7 +2076,7 @@ Sector 4,198,408 - 268,435,455: Agent Storage Region   (~126 GB)
 
 | Region | Start Sector | Size | Purpose |
 |--------|-------------|------|---------|
-| **Superblock** | 0 | 4 KB (1 sector + reserved) | Disk magic (`0x414F5344`), version, region table (start/end sector for each region), creation timestamp, last checkpoint tick |
+| **Superblock** | 0 | 4 KB (1 sector + reserved) | Disk magic (`0x41545344`), version, region table (start/end sector for each region), creation timestamp, last checkpoint tick |
 | **State Log** | 8 | 1 GB | Append-only key-value mutation log. ~2 million entries at 512 bytes each. Each entry: `[sequence, keyspace_id, key_u64, len, value_bytes, crc32]`. Log is replayed on boot to rebuild in-memory index. |
 | **Checkpoint** | 2,097,160 | 2 MB | Serialized system snapshot. Header (1 sector) + agent states (1 sector per agent, up to 4,096 agents) + Merkle roots (packed, 1 sector per 32 keyspaces). Overwritten on each checkpoint. |
 | **Trace Log** | 2,101,256 | 1 GB | I/O trace entries for deterministic replay (Stage-3). Each entry records: tick, event type (timer/disk/network), agent ID, data. ~2 million entries. |
@@ -2086,7 +2086,7 @@ Sector 4,198,408 - 268,435,455: Agent Storage Region   (~126 GB)
 
 ```text
 Superblock {
-    magic: u32,                // 0x414F5344 ("AOSD")
+    magic: u32,                // 0x41545344 ("ATSD")
     version: u32,              // disk format version = 1
     state_log_start: u32,      // sector 8
     state_log_end: u32,        // sector 2,097,159
@@ -2144,7 +2144,7 @@ When upgrading to 48-bit LBA or NVMe, the superblock region table allows each re
 
 * WASM interpreter (stack-based, no JIT) `[✅ wasm/runtime.rs — 959 lines, 40+ opcodes]`
 * Fuel-based metering mapped to energy budget `[✅ per-instruction fuel decrement]`
-* Syscall bridging (WASM host imports → AOS syscalls) `[✅ wasm/host.rs — 6 host functions]`
+* Syscall bridging (WASM host imports → ATOS syscalls) `[✅ wasm/host.rs — 6 host functions]`
 * Verify: ping/pong demo rewritten in WASM runs correctly `[✅ hand-crafted WASM binary: 25,000 sys_yield host calls, fuel metering verified]`
 
 #### Phase 10: eBPF-lite runtime `[IMPL: ✅ COMPLETE]`
@@ -2184,7 +2184,7 @@ Stage-2 is successful when:
 
 ## 25. Stage-3 Roadmap (Production-Ready Execution Layer)
 
-Stage-3 transforms AOS into a production-capable execution substrate with deterministic replay, networking, multi-core support, and an economic model.
+Stage-3 transforms ATOS into a production-capable execution substrate with deterministic replay, networking, multi-core support, and an economic model.
 
 ### 25.1 Objectives
 
@@ -2211,11 +2211,11 @@ Determinism guarantees:
 * **Partial determinism**: native agents, where scheduling order and external input replay are deterministic but instruction-level behavior may still vary by CPU microarchitecture
 * **Policy determinism**: eBPF-lite programs, which are deterministic for a given verified bytecode image, input context, and helper results, but remain subordinate to the determinism class of the kernel and triggering event
 
-Claims about replay, proof, or blockchain-style execution guarantees must therefore name the runtime class, not treat "AOS determinism" as uniform across all agents.
+Claims about replay, proof, or blockchain-style execution guarantees must therefore name the runtime class, not treat "ATOS determinism" as uniform across all agents.
 
 #### 25.2.2 SMP / Multi-Core Support `[IMPL: ✅ ACPI+LAPIC+AP boot, SpinLock run queue, per-core contexts]`
 
-Extend AOS to run on multiple CPU cores:
+Extend ATOS to run on multiple CPU cores:
 
 * Per-core run queues with work-stealing
 * Spinlock-based synchronization for shared kernel data structures (agent table, mailbox queues, capability sets)
@@ -2272,11 +2272,11 @@ Build on Stage-2 basic checkpointing to achieve deterministic replay:
 
 Extend per-agent energy budgets into a unified economic model:
 
-Energy in AOS is conceptually equivalent to gas in blockchain systems, but generalized to the entire operating system. It meters native agents, WASM agents, brokered I/O, and kernel-side policy execution under one conserved accounting model instead of restricting gas to a single smart-contract VM.
+Energy in ATOS is conceptually equivalent to gas in blockchain systems, but generalized to the entire operating system. It meters native agents, WASM agents, brokered I/O, and kernel-side policy execution under one conserved accounting model instead of restricting gas to a single smart-contract VM.
 
 * **Cost table**: define energy cost per operation type: syscall (1), timer tick (1), frame allocation (10), virtio-blk read (100), virtio-blk write (200), network request (500). Costs are configurable at compile time.
 * **Energy transfer**: `sys_energy_grant` allows a parent to transfer energy to a child. Energy is conserved — the parent's budget decreases by the granted amount.
-* **Energy accounting across runtimes**: WASM fuel consumption is mapped to AOS energy units. The default mapping is 1 WASM fuel unit = 1 AOS energy unit (a simple approximation; instruction-class-weighted mapping may be introduced later if metering precision is needed).
+* **Energy accounting across runtimes**: WASM fuel consumption is mapped to ATOS energy units. The default mapping is 1 WASM fuel unit = 1 ATOS energy unit (a simple approximation; instruction-class-weighted mapping may be introduced later if metering precision is needed).
 * **External billing interface**: a new **accountd** system agent exposes per-agent cumulative energy consumption. External systems can query accountd via mailbox for billing or token integration. accountd is introduced in Stage-3 alongside the cost table.
 
 #### 25.2.7 eBPF-lite Enhancements `[IMPL: ✅ run_at() wired, Allow/Deny programs active at MailboxSend]`
@@ -2360,7 +2360,7 @@ The installing agent calls skill functions via mailbox messages:
 ```text
 Agent → sys_send(skill_mailbox, {
     method: "search",
-    args: { query: "AOS kernel" },
+    args: { query: "ATOS kernel" },
     reply_to: agent_mailbox,
 })
 
@@ -2391,7 +2391,7 @@ Each skill invocation is:
 
 #### 25.4.5 Comparison with External Plugin Systems
 
-| Aspect | Traditional Plugins | AOS Skills |
+| Aspect | Traditional Plugins | ATOS Skills |
 |--------|-------------------|------------|
 | Isolation | Same process (shared memory) | Separate agent (separate page tables) |
 | Permissions | Full process authority | Capability subset of parent |
@@ -2449,7 +2449,7 @@ Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY
 * Merkle tree over keyspace entries `[✅ merkle.rs with FNV-1a 128-bit, wired into state.rs put()]`
 * I/O trace recording and replay `[✅ checkpoint.rs enable_tracing/record_trace + replay.rs enter_replay/check_divergence]`
 * Execution diffing `[✅ replay.rs DiffReport with per-keyspace Merkle root comparison]`
-* Verify: checkpoint, modify state, replay from checkpoint, observe identical event log `[✅ save_to_disk verified: Magic=AOSC, tick=24, 9 agents, 9 Merkle roots, disk roundtrip tested]`
+* Verify: checkpoint, modify state, replay from checkpoint, observe identical event log `[✅ save_to_disk verified: Magic=ATSC, tick=24, 9 agents, 9 Merkle roots, disk roundtrip tested]`
 
 #### Phase 16: energy/economic model + multi-mailbox `[IMPL: ✅ COMPLETE]`
 
@@ -2462,7 +2462,7 @@ Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY
 
 Stage-3 is successful when:
 
-* A checkpoint can be replayed deterministically with identical event output `[✅ save_to_disk writes Magic=AOSC to LBA 2048, disk roundtrip verified, replay.rs + DiffReport]`
+* A checkpoint can be replayed deterministically with identical event output `[✅ save_to_disk writes Magic=ATSC to LBA 2048, disk roundtrip verified, replay.rs + DiffReport]`
 * Agents on different cores exchange messages via mailbox `[✅ 2 CPUs detected, AP booted via INIT+SIPI, SpinLock-protected shared run queue, 6,635 sends]`
 * An agent sends an HTTP request through netd and receives a response `[✅ virtio-net PCI driver: MAC 52:54:00:12:34:56, RX/TX virtqueues initialized]`
 * State transitions produce verifiable Merkle proofs `[✅ merkle.rs wired into state.rs, 9 Merkle roots in checkpoint]`
@@ -2475,13 +2475,13 @@ Stage-3 is successful when:
 
 ## 26. Stage-4 Roadmap (Ecosystem and Hardware)
 
-Stage-4 expands AOS from a QEMU-only platform into a deployable system with real hardware support, distributed execution, and developer tooling.
+Stage-4 expands ATOS from a QEMU-only platform into a deployable system with real hardware support, distributed execution, and developer tooling.
 
 ### 26.1 Objectives
 
 * Run on real hardware (not just QEMU) `[IMPL: ⚠️ UEFI+GOP+framebuffer console ready; QEMU+OVMF verified; awaiting physical machine test]`
 * Support distributed agent execution across multiple nodes `[IMPL: ✅ routerd + UDP + capability signing + cross-node test passing]`
-* Provide developer SDK and tooling for building and deploying agents `[IMPL: ✅ sdk/aos-sdk + sdk/aos-wasm-sdk + sdk/aos-cli]`
+* Provide developer SDK and tooling for building and deploying agents `[IMPL: ✅ sdk/atos-sdk + sdk/atos-wasm-sdk + sdk/atos-cli]`
 * Establish security attestation for verifiable execution `[IMPL: ✅ attestation.rs + capability signing + proof verifier implemented]`
 
 ### 26.2 Core Additions
@@ -2499,8 +2499,8 @@ Replace Multiboot v1 with UEFI boot for modern hardware. UEFI provides a standar
 
 ```text
 UEFI firmware
-  → loads AOS UEFI application (PE/COFF format) from ESP partition
-  → AOS UEFI app:
+  → loads ATOS UEFI application (PE/COFF format) from ESP partition
+  → ATOS UEFI app:
       1. Query memory map via BootServices->GetMemoryMap()
       2. Allocate pages for kernel page tables
       3. Set up higher-half mapping (kernel at 0xFFFFFFFF80000000)
@@ -2748,19 +2748,19 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 * **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes cross-node messages to a **routerd** system agent, which serializes them and sends them over the network via the kernel's minimal UDP transport (a kernel-internal network stack separate from the user-facing netd broker). This separation ensures that inter-kernel routing does not depend on user-mode system agents for liveness. `[IMPL: ✅ routerd.rs cross-node mailbox routing via kernel UDP]`
 * **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list) `[IMPL: ✅ routerd.rs HELLO protocol; 8-peer table]`
 * **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message. `[IMPL: ✅ capability.rs sign_capability/verify_capability/SignedCapability]`
-* **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible AOS kernels (same syscall ABI version and checkpoint format). `[IMPL: ✅ checkpoint.rs serialize_agent/deserialize_agent]`
+* **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible ATOS kernels (same syscall ABI version and checkpoint format). `[IMPL: ✅ checkpoint.rs serialize_agent/deserialize_agent]`
 
-#### 26.2.7 Developer SDK `[IMPL: ✅ sdk/aos-sdk, sdk/aos-wasm-sdk, sdk/aos-cli implemented]`
+#### 26.2.7 Developer SDK `[IMPL: ✅ sdk/atos-sdk, sdk/atos-wasm-sdk, sdk/atos-cli implemented]`
 
-* **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries `[IMPL: ✅ sdk/aos-sdk — 22 syscalls, AosError/AosResult, prelude]`
-* **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with AOS syscall bindings via imported host functions `[IMPL: ✅ sdk/aos-wasm-sdk — host function imports, example agent]`
-* **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier `[IMPL: ✅ sdk/aos-ebpf-sdk — assembler, verifier, disassembler]`
-* **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs) `[IMPL: ✅ sdk/aos-cli — build, deploy, replay, inspect, verify commands]`
+* **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around ATOS syscalls, mailbox send/recv helpers, state get/put, and energy queries `[IMPL: ✅ sdk/atos-sdk — 22 syscalls, AtosError/AtosResult, prelude]`
+* **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with ATOS syscall bindings via imported host functions `[IMPL: ✅ sdk/atos-wasm-sdk — host function imports, example agent]`
+* **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier `[IMPL: ✅ sdk/atos-ebpf-sdk — assembler, verifier, disassembler]`
+* **CLI tools**: `atos-build` (compile agent), `atos-deploy` (load agent into running ATOS), `atos-replay` (replay a checkpoint), `atos-inspect` (query agent state and event logs) `[IMPL: ✅ sdk/atos-cli — build, deploy, replay, inspect, verify commands]`
 
 #### 26.2.8 Security & Attestation `[IMPL: ✅ execution proofs + remote attestation (software stub) + capability signing implemented]`
 
 * **Execution proofs**: produce a cryptographic proof that a specific event log was generated by a specific checkpoint under deterministic replay `[IMPL: ✅ src/proof.rs — hash-chain over checkpoint + events]`
-* **Remote attestation**: a node can prove to a verifier that it is running unmodified AOS kernel code (via TPM or secure boot chain) `[IMPL: ✅ attestation.rs measure_kernel/generate_report/verify_report (software stub; no hardware TPM)]`
+* **Remote attestation**: a node can prove to a verifier that it is running unmodified ATOS kernel code (via TPM or secure boot chain) `[IMPL: ✅ attestation.rs measure_kernel/generate_report/verify_report (software stub; no hardware TPM)]`
 * **Capability signing**: capabilities include a digital signature (e.g., ed25519) from the granting agent, enabling offline verification of authority chains `[IMPL: ✅ capability.rs sign_capability/verify_capability/SignedCapability]`
 
 ### 26.3 Suggested Development Order (Stage-4)
@@ -2778,7 +2778,7 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 * Implement minimal UEFI application (PE/COFF entry point) `[IMPL: ✅ uefi/ crate, x86_64-unknown-uefi target, ELF parser + symbol lookup]`
 * Query memory map, allocate page tables, exit boot services `[IMPL: ✅ AllocatePages + GetMemoryMap + ExitBootServices with retry]`
 * Replace Multiboot info parsing with UEFI memory map in frame allocator `[IMPL: ✅ init_from_uefi_mmap() parses EfiMemoryDescriptor array; verified 84 descriptors, 111MB on OVMF]`
-* Verify: AOS boots via UEFI on QEMU (`-bios OVMF.fd`) `[IMPL: ✅ make uefi-run verified with full 12-agent boot]`
+* Verify: ATOS boots via UEFI on QEMU (`-bios OVMF.fd`) `[IMPL: ✅ make uefi-run verified with full 12-agent boot]`
 
 #### Phase 17c: PCI bus enumeration `[IMPL: ✅ COMPLETE]`
 
@@ -2815,22 +2815,22 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 
 #### Phase 20: developer SDK + attestation `[IMPL: ✅ SDK + CLI + proof + attestation all implemented]`
 
-* Agent SDK crates (Rust native + WASM) `[IMPL: ✅ sdk/aos-sdk (22 syscalls) + sdk/aos-wasm-sdk (host imports)]`
-* eBPF-lite SDK with compiler and verifier `[IMPL: ✅ sdk/aos-ebpf-sdk — assembler, verifier, disassembler]`
-* CLI tools (aos-build, aos-deploy, aos-replay, aos-inspect) `[IMPL: ✅ sdk/aos-cli — all 5 commands implemented and tested]`
+* Agent SDK crates (Rust native + WASM) `[IMPL: ✅ sdk/atos-sdk (22 syscalls) + sdk/atos-wasm-sdk (host imports)]`
+* eBPF-lite SDK with compiler and verifier `[IMPL: ✅ sdk/atos-ebpf-sdk — assembler, verifier, disassembler]`
+* CLI tools (atos-build, atos-deploy, atos-replay, atos-inspect) `[IMPL: ✅ sdk/atos-cli — all 5 commands implemented and tested]`
 * Execution proof generator: given a checkpoint + replay trace, produce a hash-chain proof of the event log `[IMPL: ✅ src/proof.rs — hash-chain over checkpoint + events]`
-* Execution proof verifier: standalone tool that verifies a proof without running AOS (enables third-party verification) `[IMPL: ✅ sdk/aos-cli verify + proof.rs verify_proof_standalone]`
+* Execution proof verifier: standalone tool that verifies a proof without running ATOS (enables third-party verification) `[IMPL: ✅ sdk/atos-cli verify + proof.rs verify_proof_standalone]`
 * Remote attestation via QEMU swtpm (for testing) or hardware TPM `[IMPL: ✅ attestation.rs measure_kernel/generate_report/verify_report (software stub)]`
-* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK; execution proof verified independently `[IMPL: ✅ tools/test_sdk_e2e.sh — WASM agent compiled (841 bytes), magic validated, 64 KB limit checked, deploy validated (11 sections), all 5 CLI commands verified, aos-sdk native build confirmed; all 4 stages pass]`
+* Verify: third-party developer builds, deploys, and runs a WASM agent using the SDK; execution proof verified independently `[IMPL: ✅ tools/test_sdk_e2e.sh — WASM agent compiled (841 bytes), magic validated, 64 KB limit checked, deploy validated (11 sections), all 5 CLI commands verified, atos-sdk native build confirmed; all 4 stages pass]`
 
 ### 26.4 Stage-4 Success Criteria `[IMPL: ✅ 4/4 criteria met (real hardware via UEFI+OVMF; cross-node via QEMU socket)]`
 
 Stage-4 is successful when:
 
-* AOS boots on real x86_64 hardware (not just QEMU) `[IMPL: ⚠️ UEFI+GOP framebuffer ready; QEMU+OVMF verified; REAL_HARDWARE_TEST.md written; awaiting physical machine]`
+* ATOS boots on real x86_64 hardware (not just QEMU) `[IMPL: ⚠️ UEFI+GOP framebuffer ready; QEMU+OVMF verified; REAL_HARDWARE_TEST.md written; awaiting physical machine]`
 * An agent on node A sends a message to an agent on node B via remote mailbox `[IMPL: ✅ routerd + UDP routing; cross-node test (2 QEMU nodes) passing]`
-* A developer writes, compiles, and deploys a WASM agent using the SDK `[IMPL: ✅ sdk/aos-sdk + sdk/aos-wasm-sdk + sdk/aos-cli all implemented]`
-* An execution proof can be independently verified by a third party `[IMPL: ✅ sdk/aos-cli verify + proof.rs verify_proof_standalone]`
+* A developer writes, compiles, and deploys a WASM agent using the SDK `[IMPL: ✅ sdk/atos-sdk + sdk/atos-wasm-sdk + sdk/atos-cli all implemented]`
+* An execution proof can be independently verified by a third party `[IMPL: ✅ sdk/atos-cli verify + proof.rs verify_proof_standalone]`
 
 ---
 
@@ -2838,7 +2838,7 @@ Stage-4 is successful when:
 
 The executive roadmap near the beginning of this document gives the strategic end-to-end view. This section expands Stage-5 through Stage-10 in more engineering detail so that the later roadmap remains aligned with the first principles in §0 rather than drifting toward a generic desktop or POSIX-compatibility agenda.
 
-The purpose of Stage-5 through Stage-10 is therefore not to add familiar operating-system surface area for its own sake. It is to deepen the properties that justify AOS existing at all:
+The purpose of Stage-5 through Stage-10 is therefore not to add familiar operating-system surface area for its own sake. It is to deepen the properties that justify ATOS existing at all:
 
 * explicit authority
 * agent-native execution
@@ -2900,7 +2900,7 @@ Success criteria:
 
 Stage-6 should answer the next foundational question: **what state exists, which version is authoritative, and how can that state be verified, recovered, or moved?**
 
-The AOS state model must become more than "structured storage inside the kernel." It must become the durable, versioned, proof-friendly substrate on which long-lived agents, distributed services, and execution receipts depend.
+The ATOS state model must become more than "structured storage inside the kernel." It must become the durable, versioned, proof-friendly substrate on which long-lived agents, distributed services, and execution receipts depend.
 
 Objectives:
 
@@ -2928,9 +2928,9 @@ Success criteria:
 
 ### 27.4 Stage-7: Agent Package and Skill Ecosystem `[IMPL: ⏳ Planned]`
 
-Stage-7 should answer the packaging question: **how are agents and skills built, signed, distributed, installed, upgraded, and removed without violating AOS authority and isolation rules?**
+Stage-7 should answer the packaging question: **how are agents and skills built, signed, distributed, installed, upgraded, and removed without violating ATOS authority and isolation rules?**
 
-By this point, AOS should stop being only a kernel plus demos. It should become a platform where deployable agent artifacts are treated as first-class objects with explicit lifecycle, compatibility, and capability contracts.
+By this point, ATOS should stop being only a kernel plus demos. It should become a platform where deployable agent artifacts are treated as first-class objects with explicit lifecycle, compatibility, and capability contracts.
 
 Objectives:
 
@@ -2942,7 +2942,7 @@ Objectives:
 
 Core additions:
 
-* **Package format**: define an AOS package manifest containing runtime kind, entry points, capability requests, resource quotas, ABI version, and content hash
+* **Package format**: define an ATOS package manifest containing runtime kind, entry points, capability requests, resource quotas, ABI version, and content hash
 * **Signing and provenance**: require packages and manifests to be signed so installation and replay can verify origin and integrity
 * **Registry / distribution model**: support content-addressed retrieval from local bundles, cluster registries, or external repositories
 * **Upgrade semantics**: define canary rollout, rollback, compatibility checks, and state migration hooks for package upgrades
@@ -2958,31 +2958,31 @@ Success criteria:
 
 ### 27.5 Stage-8: Distributed Execution Fabric `[IMPL: ⏳ Planned]`
 
-Stage-8 should answer the fabric question: **how does AOS behave when the system is not one node, but a fleet of nodes with failures, movement, and contested resources?**
+Stage-8 should answer the fabric question: **how does ATOS behave when the system is not one node, but a fleet of nodes with failures, movement, and contested resources?**
 
-Stage-4 introduces cross-node messaging and migration primitives. Stage-8 must turn those primitives into a coherent AOS-NET execution fabric with explicit delivery, placement, and recovery semantics.
+Stage-4 introduces cross-node messaging and migration primitives. Stage-8 must turn those primitives into a coherent ATOS-NET execution fabric with explicit delivery, placement, and recovery semantics.
 
 #### 27.5.1 Distributed Execution Fabric Explained
 
-AOS distributed execution is easy to misread as blockchain-style consensus execution. That is **not** the intended model.
+ATOS distributed execution is easy to misread as blockchain-style consensus execution. That is **not** the intended model.
 
-AOS distributed execution does **not** mean:
+ATOS distributed execution does **not** mean:
 
 * every node executes the same program
 * every node replicates the same global state
 * every workload is ordered through one global consensus path
 * one agent is split into a WAN-scale shared-memory thread
 
-AOS distributed execution **does** mean:
+ATOS distributed execution **does** mean:
 
-* different agents may run on different AOS nodes
+* different agents may run on different ATOS nodes
 * mailbox communication may cross node boundaries
 * an agent may be checkpointed on one node and resumed on another
 * trust, authority, state integrity, and accounting are preserved across that movement
 
 The thing being distributed is therefore not a single instruction stream. What is distributed is **execution responsibility**: which node currently runs an agent, holds its mailbox, serves its state path, enforces its delegated authority, and produces the resulting audit and accounting artifacts.
 
-This is why AOS-NET should be read as an **execution fabric**, not as a replicated global ledger. A ledger may grow above the fabric later (§27.6), but the fabric itself is the network that lets trusted execution be placed, routed, moved, resumed, and verified across nodes.
+This is why ATOS-NET should be read as an **execution fabric**, not as a replicated global ledger. A ledger may grow above the fabric later (§27.6), but the fabric itself is the network that lets trusted execution be placed, routed, moved, resumed, and verified across nodes.
 
 #### 27.5.2 Operational Forms
 
@@ -2993,7 +2993,7 @@ Stage-8 distributed execution appears in four main forms:
 * **Checkpoint-based migration**: an agent is suspended, checkpointed, transferred, restored on another node, and resumed with preserved authority and state references
 * **Distributed workload pipelines**: a larger workload is decomposed into multiple agents or stages across nodes, each with its own message flow, state transition, budget consumption, and receipt
 
-The last form is intentionally higher-level than traditional parallel computing. AOS is not optimized around distributed shared memory. It is optimized around agents, mailboxes, state roots, and explicit handoff points.
+The last form is intentionally higher-level than traditional parallel computing. ATOS is not optimized around distributed shared memory. It is optimized around agents, mailboxes, state roots, and explicit handoff points.
 
 #### 27.5.3 Required Fabric Mechanisms
 
@@ -3007,10 +3007,10 @@ To make distributed execution real rather than aspirational, Stage-8 must combin
 * **Placement and failure semantics**: the system must specify where an agent should run, when it may move, how failover works, and how duplicate resume is prevented after node loss or partition
 * **Execution receipts**: Stage-8 should expose the hooks needed for Stage-9 receipts, even if the full settlement model arrives later
 
-#### 27.5.4 AOS Stage-8 Distributed Execution Fabric
+#### 27.5.4 ATOS Stage-8 Distributed Execution Fabric
 
 ```text
-                        AOS STAGE-8 DISTRIBUTED EXECUTION FABRIC
+                        ATOS STAGE-8 DISTRIBUTED EXECUTION FABRIC
 
              logical control plane: membership | placement | leases | policy | attestation
 +--------------------------------------------------------------------------------------------------+
@@ -3023,7 +3023,7 @@ To make distributed execution real rather than aspirational, Stage-8 must combin
 
 +-------------------------------------------+          +-------------------------------------------+
 |                  Node A                   |          |                  Node B                   |
-| AOS-0 | AOS-1 | AOS-2                     |          | AOS-0 | AOS-1 | AOS-2                     |
+| ATOS-0 | ATOS-1 | ATOS-2                     |          | ATOS-0 | ATOS-1 | ATOS-2                     |
 |                                           |          |                                           |
 | agent_x                                   |          | routerd                                   |
 | mailbox_x                                 |=========>| mailbox_y                                 |
@@ -3036,7 +3036,7 @@ To make distributed execution real rather than aspirational, Stage-8 must combin
                          v                                                      |
               +----------+-----------------------+                              |
               |                Node C            |------------------------------+
-              | AOS-0 | AOS-1 | AOS-2            |     migrated mailbox owner /
+              | ATOS-0 | ATOS-1 | ATOS-2            |     migrated mailbox owner /
               | restored agent_x                 |     resumed execution target
               | restored runtime state           |
               | state access or synced snapshot  |
@@ -3082,7 +3082,7 @@ Success criteria:
 
 ### 27.6 Stage-9: Verifiable Execution Economy `[IMPL: ⏳ Planned]`
 
-Stage-9 should answer the economic question: **how does AOS turn execution, energy, policy, and proof into a receipt that outside systems can trust?**
+Stage-9 should answer the economic question: **how does ATOS turn execution, energy, policy, and proof into a receipt that outside systems can trust?**
 
 Energy is already treated as OS-wide gas. The next step is to make execution economically intelligible to systems outside the kernel: billing, settlement, reputation, dispute resolution, and proof-backed accounting.
 
@@ -3196,13 +3196,13 @@ This receipt should normally be accompanied by one or both of the following:
 #### 27.6.4 Receipt / Replay / Proof / Settlement Relationships
 
 ```text
-                     AOS STAGE-9 VERIFIABLE EXECUTION ECONOMY
+                     ATOS STAGE-9 VERIFIABLE EXECUTION ECONOMY
 
                                  execution on trusted node
                                            |
                                            v
 +--------------------------------------------------------------------------------------+
-|                               AOS Execution Outcome                                   |
+|                               ATOS Execution Outcome                                   |
 | code hash | runtime class | state transition | energy use | policy result | trace    |
 +--------------------------------------+-----------------------------------------------+
                                        |
@@ -3265,7 +3265,7 @@ Core additions:
 * **Runtime-class pricing**: price native, WASM, brokered I/O, policy execution, and remote execution explicitly rather than treating all work as homogeneous
 * **Quote and admission path**: allow an agent or operator to request an execution quote before launching a costly workload
 * **Billing and settlement adapters**: expose structured receipts to external systems without making token economics part of the kernel trust base
-* **External verifier SDK**: provide verifier tooling for receipts, transcripts, Merkle proofs, policy bindings, and attestation references without requiring the verifier to run a full trusted AOS node
+* **External verifier SDK**: provide verifier tooling for receipts, transcripts, Merkle proofs, policy bindings, and attestation references without requiring the verifier to run a full trusted ATOS node
 * **Dispute workflow**: define how replay traces, proofs, and policy hashes are used to settle disagreements about what happened and what should be charged
 
 Success criteria:
@@ -3275,15 +3275,15 @@ Success criteria:
 * energy charges reconcile with replay traces, broker usage, and policy execution costs
 * disputed executions can be resolved through replay and proof rather than operator assertions
 
-### 27.7 Stage-10: Appliance-Grade AOS `[IMPL: ⏳ Planned]`
+### 27.7 Stage-10: Appliance-Grade ATOS `[IMPL: ⏳ Planned]`
 
-Stage-10 should answer the deployment question: **what does AOS look like when it is trusted as a real productized execution appliance rather than as a research kernel?**
+Stage-10 should answer the deployment question: **what does ATOS look like when it is trusted as a real productized execution appliance rather than as a research kernel?**
 
-This stage is not about turning AOS into a conventional general-purpose operating system. It is about making AOS reliable enough to operate as a dedicated agent node or trusted execution appliance in production environments.
+This stage is not about turning ATOS into a conventional general-purpose operating system. It is about making ATOS reliable enough to operate as a dedicated agent node or trusted execution appliance in production environments.
 
-#### 27.7.1 Appliance-Grade AOS Explained
+#### 27.7.1 Appliance-Grade ATOS Explained
 
-Stage-1 through Stage-9 primarily prove that the AOS model is coherent:
+Stage-1 through Stage-9 primarily prove that the ATOS model is coherent:
 
 * the kernel substrate works
 * the agent, mailbox, capability, state, energy, checkpoint, and proof abstractions are sound
@@ -3293,9 +3293,9 @@ Stage-10 asks a different question:
 
 > can this system be delivered, deployed, operated, upgraded, audited, and relied on for years as a real trusted product profile?
 
-This is the correct sense of **appliance-grade** in AOS. It does **not** mean:
+This is the correct sense of **appliance-grade** in ATOS. It does **not** mean:
 
-* turning AOS into a desktop operating system
+* turning ATOS into a desktop operating system
 * maximizing app compatibility or shell flexibility
 * recreating Linux-style general server administration
 * broadening the system until it becomes another general-purpose platform
@@ -3313,14 +3313,14 @@ The goal is therefore not "more freedom for local operators." The goal is **more
 
 The main outcomes of Stage-10 should be understood in six dimensions:
 
-* **Deliverable**: AOS must have an official appliance profile, install image, signed artifacts, reproducible build story, and deployment guidance
+* **Deliverable**: ATOS must have an official appliance profile, install image, signed artifacts, reproducible build story, and deployment guidance
 * **Operable**: nodes must expose remote diagnostics, health reporting, audit export, crash evidence, watchdog recovery, and rollback workflows
 * **Upgradable**: updates must be signed, staged, policy-gated, rollback-safe, and attested as part of the normal lifecycle
 * **Provably trusted**: the node must prove it is running approved code and policy; receipts and execution artifacts must remain externally verifiable during routine operations, not only in research demos
 * **Multi-tenant capable**: the platform must support tenant isolation, organization-level authority roots, per-tenant quotas, policy bundles, and operational boundaries
 * **Long-term dependable**: failure modes must be bounded, recovery paths deterministic, trusted computing base minimal, and versioning discipline stable enough for support contracts
 
-This is the stage where AOS stops being merely an interesting execution architecture and becomes a system that outside parties can confidently procure, deploy, and depend on.
+This is the stage where ATOS stops being merely an interesting execution architecture and becomes a system that outside parties can confidently procure, deploy, and depend on.
 
 #### 27.7.3 Position Relative To Stage-8 And Stage-9
 
@@ -3332,11 +3332,11 @@ The distinction between the last three stages should remain explicit:
 
 Stage-10 therefore does not primarily introduce new kernel abstractions. It operationalizes the results of the earlier stages into a coherent deployment profile: attested boot, signed upgrade, mailbox-based administration, structured observability, tenant isolation, and controlled recovery.
 
-This sequencing is important. If appliance concerns dominate too early, AOS risks drifting toward device-management busywork or toward Linux-shaped usability goals. By placing appliance-grade hardening last, the project preserves its first principles and only then packages them into a product form.
+This sequencing is important. If appliance concerns dominate too early, ATOS risks drifting toward device-management busywork or toward Linux-shaped usability goals. By placing appliance-grade hardening last, the project preserves its first principles and only then packages them into a product form.
 
 Objectives:
 
-* define a reference hardware and deployment profile for AOS nodes
+* define a reference hardware and deployment profile for ATOS nodes
 * harden the boot, upgrade, recovery, and attestation chain
 * provide remote operations without collapsing back to unrestricted shell administration
 * make observability, incident response, and disaster recovery native to the agent-first model
@@ -3356,7 +3356,7 @@ Success criteria:
 * a fresh appliance boots into an attested, policy-identified, remotely manageable state without requiring a general shell environment
 * upgrades are signed, auditable, rollback-safe, and recoverable after interruption
 * operators can inspect health, replay incidents, and collect forensic artifacts through explicit system services
-* production deployment guidance remains aligned with the AOS principle of explicit authority rather than ambient administrative access
+* production deployment guidance remains aligned with the ATOS principle of explicit authority rather than ambient administrative access
 
 ### 27.8 Through-Line
 
@@ -3369,7 +3369,7 @@ The intended sequence of Stage-5 through Stage-10 is:
 * Stage-9: make execution receipts economically and cryptographically meaningful
 * Stage-10: make the whole system deployable as a trusted appliance
 
-If these later stages are executed correctly, AOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems.
+If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems.
 
 ---
 
@@ -3377,7 +3377,7 @@ If these later stages are executed correctly, AOS remains faithful to its origin
 
 ## 28. Long-Term Vision
 
-AOS evolves from a minimal kernel into a foundational execution layer for the agent economy.
+ATOS evolves from a minimal kernel into a foundational execution layer for the agent economy.
 
 ```text
 +-----------------------------------------+
@@ -3385,22 +3385,22 @@ AOS evolves from a minimal kernel into a foundational execution layer for the ag
 +-----------------------------------------+
 |          Agent Layer (WASM/Native)       |
 +-----------------------------------------+
-|    AOS Runtime (scheduler, IPC, caps)   |
+|    ATOS Runtime (scheduler, IPC, caps)   |
 +-----------------------------------------+
-|    AOS Kernel (mm, trap, syscall)       |
+|    ATOS Kernel (mm, trap, syscall)       |
 +-----------------------------------------+
 |    Hardware / Distributed Network       |
 +-----------------------------------------+
 ```
 
-### 28.1 What AOS Is
+### 28.1 What ATOS Is
 
 * An execution substrate for autonomous agents
 * A deterministic, replayable computation layer
 * A capability-secured runtime where every action is explicitly authorized
 * A bridge between AI systems, economic systems, and verifiable computation
 
-### 28.2 What AOS Is Not
+### 28.2 What ATOS Is Not
 
 * A desktop operating system
 * A Linux replacement for server administration
@@ -3408,7 +3408,7 @@ AOS evolves from a minimal kernel into a foundational execution layer for the ag
 
 ### 28.3 Closing Statement
 
-> AOS begins as a minimal kernel. It evolves into the execution layer where autonomous systems operate, interact, and transact — with every action auditable, every resource budgeted, and every authority explicit.
+> ATOS begins as a minimal kernel. It evolves into the execution layer where autonomous systems operate, interact, and transact — with every action auditable, every resource budgeted, and every authority explicit.
 
 ---
 
@@ -3427,7 +3427,7 @@ This yellow paper is intended as a practical guide for implementation work.
 
 ### 29.2 Suggested first success metric `[IMPL: ✅ ALL MET]`
 
-AOS should be considered meaningfully alive when all of the following are true:
+ATOS should be considered meaningfully alive when all of the following are true:
 
 * it boots in QEMU `[✅ Multiboot v1, boots in < 1 second]`
 * it prints structured serial logs `[✅ [EVENT seq=N tick=T agent=A type=TYPE ...] format]`
@@ -3437,15 +3437,15 @@ AOS should be considered meaningfully alive when all of the following are true:
 * budget enforcement works `[✅ 237 BUDGET_EXHAUSTED events, agents suspended at zero energy]`
 * traps and panics are inspectable `[✅ vector/error_code/rip/agent logged, panic handler with location]`
 
-When these conditions are met, AOS is no longer a toy boot project. It becomes a genuine first-stage AI-native minimal operating system. **`[✅ AOS Stage-1 is alive. Verified 2026-03-22.]`**
+When these conditions are met, ATOS is no longer a toy boot project. It becomes a genuine first-stage AI-native minimal operating system. **`[✅ ATOS Stage-1 is alive. Verified 2026-03-22.]`**
 
 ---
 
 ## 30. Conclusion
 
-AOS proposes a different starting point for operating system design in the AI era.
+ATOS proposes a different starting point for operating system design in the AI era.
 
-Rather than inheriting the historical center of gravity of processes, files, sockets, and ambient authority, AOS begins with:
+Rather than inheriting the historical center of gravity of processes, files, sockets, and ambient authority, ATOS begins with:
 
 * agents
 * mailboxes
@@ -3468,4 +3468,4 @@ This is the correct path for building a minimal AI-native OS foundation without 
 
 ## 31. One-Sentence Definition
 
-**AOS is a from-scratch, VM-first, AI-native minimal operating system built around agents, mailboxes, capabilities, structured state, execution budgets, and auditable kernel behavior.**
+**ATOS is a from-scratch, VM-first, AI-native minimal operating system built around agents, mailboxes, capabilities, structured state, execution budgets, and auditable kernel behavior.**

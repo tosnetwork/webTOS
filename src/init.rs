@@ -1,4 +1,4 @@
-//! AOS System Initialization
+//! ATOS System Initialization
 //!
 //! Creates the root agent, idle agent, and test agents (ping/pong) during boot.
 //! Kernel-mode agents (idle, root, stated, policyd) run in ring 0.

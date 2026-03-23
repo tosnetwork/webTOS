@@ -1,0 +1,10 @@
+[package]
+name = "atos-cli"
+version = "0.1.0"
+edition = "2021"
+description = "ATOS CLI tools — build, deploy, replay, and inspect ATOS agents"
+license = "MIT"
+
+[[bin]]
+name = "atos"
+path = "src/main.rs"

@@ -1,4 +1,4 @@
-//! AOS Synchronization Primitives
+//! ATOS Synchronization Primitives
 //!
 //! Provides a simple spinlock for protecting shared kernel data.
 //! In Stage-2 (single-core), the spinlock disables interrupts.

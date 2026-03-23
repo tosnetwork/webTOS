@@ -1,8 +1,8 @@
 [package]
-name = "aos-uefi"
+name = "atos-uefi"
 version = "0.1.0"
 edition = "2021"
-description = "AOS UEFI boot loader — loads kernel via UEFI firmware"
+description = "ATOS UEFI boot loader — loads kernel via UEFI firmware"
 
 [profile.dev]
 panic = "abort"

@@ -1,4 +1,4 @@
-//! AOS Syscall Dispatcher
+//! ATOS Syscall Dispatcher
 //!
 //! Provides the syscall entry point for agents. In Stage-1, agents call
 //! `syscall::syscall()` directly as a Rust function call (no privilege

@@ -1,4 +1,4 @@
-// AOS Architecture Layer
+// ATOS Architecture Layer
 // Re-exports the x86_64 architecture implementation.
 
 pub mod x86_64;

@@ -1,4 +1,4 @@
-//! AOS x86_64 IDT (Interrupt Descriptor Table)
+//! ATOS x86_64 IDT (Interrupt Descriptor Table)
 //!
 //! Sets up a 256-entry IDT for CPU exceptions and hardware interrupts.
 //! Remaps the 8259 PIC so that IRQ0-7 map to vectors 32-39 and

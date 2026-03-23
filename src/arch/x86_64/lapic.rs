@@ -1,4 +1,4 @@
-//! AOS Local APIC Driver
+//! ATOS Local APIC Driver
 //!
 //! Provides access to the x86_64 Local APIC for:
 //! - Per-core timer interrupts (replaces PIT for SMP)
@@ -70,7 +70,7 @@ unsafe fn write(offset: u32, value: u32) {
 /// Initialize the Local APIC.
 ///
 /// `base` is the physical address of the LAPIC MMIO region (from ACPI MADT).
-/// In AOS Stage-3 with identity mapping, the physical address is directly usable.
+/// In ATOS Stage-3 with identity mapping, the physical address is directly usable.
 pub fn init(base: u64) {
     unsafe {
         LAPIC_BASE_ADDR = base;

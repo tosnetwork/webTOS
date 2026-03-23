@@ -1,4 +1,4 @@
-//! AOS Stage-1 Kernel Entry Point
+//! ATOS Stage-1 Kernel Entry Point
 //!
 //! Rust entry point called by boot.asm after transitioning to 64-bit long mode.
 
@@ -54,10 +54,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
 
     match multiboot_magic {
         MULTIBOOT_MAGIC => {
-            serial_println!("AOS boot ok (Multiboot)");
+            serial_println!("ATOS boot ok (Multiboot)");
         }
         UEFI_MAGIC => {
-            serial_println!("AOS boot ok (UEFI)");
+            serial_println!("ATOS boot ok (UEFI)");
 
             // Initialize framebuffer console if UEFI GOP provided FB info
             if multiboot_info != 0 {
@@ -80,7 +80,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
             serial_println!("[WARN] Unknown boot magic: 0x{:x}, continuing", multiboot_magic);
         }
     }
-    serial_println!("AOS v0.1 - AI-native Operating System");
+    serial_println!("ATOS v0.1 - AI-native Operating System");
 
     // 3. Initialize architecture (GDT, IDT, timer)
     arch::x86_64::init();
@@ -171,11 +171,11 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     // Interrupts were disabled since before init::init() to prevent
     // the timer from preempting kernel_main into agents prematurely.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-    serial_println!("[AOS] Entering scheduler loop");
+    serial_println!("[ATOS] Entering scheduler loop");
     sched::start();
 
     // Should not reach here
-    serial_println!("[AOS] Scheduler returned - halting");
+    serial_println!("[ATOS] Scheduler returned - halting");
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }

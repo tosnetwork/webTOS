@@ -1,4 +1,4 @@
-//! AOS Energy Accounting
+//! ATOS Energy Accounting
 //!
 //! Implements per-agent execution budgeting. Every agent runs under an
 //! energy budget that is decremented on timer ticks and syscall invocations.

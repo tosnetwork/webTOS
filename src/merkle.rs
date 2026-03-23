@@ -1,4 +1,4 @@
-//! AOS Merkle State Tree
+//! ATOS Merkle State Tree
 //!
 //! Provides a Merkle root hash over key-value state entries.
 //! Each keyspace maintains its own Merkle root. State transitions

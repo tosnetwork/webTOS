@@ -1,4 +1,4 @@
-//! AOS Persistent State Store
+//! ATOS Persistent State Store
 //!
 //! Append-only log on disk with in-memory index for fast lookups.
 //! Each log entry: [sequence: u64, keyspace_id: u16, key: u64, len: u16,
@@ -6,7 +6,7 @@
 //!
 //! Falls back to in-memory-only storage when no disk is present.
 //!
-//! Reference: AOS Yellow Paper §24.5.
+//! Reference: ATOS Yellow Paper §24.5.
 
 use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
 use crate::block::StorageDevice;

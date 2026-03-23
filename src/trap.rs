@@ -1,4 +1,4 @@
-//! AOS Trap Handling
+//! ATOS Trap Handling
 //!
 //! Provides high-level trap and fault handling logic for the kernel.
 //! The actual interrupt stubs and IDT setup live in arch::x86_64::idt.

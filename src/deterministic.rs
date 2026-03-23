@@ -1,4 +1,4 @@
-//! AOS Deterministic Scheduling
+//! ATOS Deterministic Scheduling
 //!
 //! Provides a fixed-tick-quota scheduler mode for replay-compatible execution.
 //! Each agent receives a fixed number of ticks per round. The execution

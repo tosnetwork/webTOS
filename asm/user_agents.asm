@@ -1,4 +1,4 @@
-; AOS user_agents.asm — Ring 3 test agents
+; ATOS user_agents.asm — Ring 3 test agents
 ;
 ; These agents run in ring 3 and use the SYSCALL instruction for all
 ; kernel interactions. They are position-independent and self-contained.

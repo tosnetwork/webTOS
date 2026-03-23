@@ -1,4 +1,4 @@
-//! AOS skilld — Skill Module Manager
+//! ATOS skilld — Skill Module Manager
 //!
 //! System agent that manages skill module installation. Agents send
 //! WASM bytecode + manifest to skilld, which validates, spawns a

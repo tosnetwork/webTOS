@@ -1,7 +1,7 @@
-//! AOS Agent Model
+//! ATOS Agent Model
 //!
 //! Defines the Agent struct, agent table, and lifecycle management.
-//! An agent is the primary execution unit in AOS, replacing the traditional process.
+//! An agent is the primary execution unit in ATOS, replacing the traditional process.
 
 use crate::capability::Capability;
 

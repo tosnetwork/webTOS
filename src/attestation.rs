@@ -1,4 +1,4 @@
-//! Remote Attestation for AOS
+//! Remote Attestation for ATOS
 //!
 //! Provides kernel measurement and attestation report generation.
 //! In production, this would use TPM PCR values. For QEMU testing,

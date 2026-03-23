@@ -1,7 +1,7 @@
-//! AOS WASM Agent
+//! ATOS WASM Agent
 //!
 //! A kernel-mode agent that runs a hand-crafted WASM binary through
-//! the AOS WASM interpreter. Demonstrates that WASM and native agents
+//! the ATOS WASM interpreter. Demonstrates that WASM and native agents
 //! can coexist in the same system.
 
 use crate::serial_println;
@@ -14,7 +14,7 @@ use crate::wasm;
 ///
 /// Module structure:
 ///   - Type section:   1 func type `() -> ()`
-///   - Import section: 1 import `"aos"."sys_yield"` as func (type 0)
+///   - Import section: 1 import `"atos"."sys_yield"` as func (type 0)
 ///   - Function section: 1 local function (type 0)
 ///   - Export section:   export `"run"` as function index 1
 ///   - Code section:     function body = `loop { call 0; br 0; } end`
@@ -36,12 +36,12 @@ static WASM_BINARY: &[u8] = &[
     0x00,                   // result count: 0
 
     // ── Import section (id=2, size=17) ───────────────────────────
-    // 1 import: "aos"."sys_yield" : func type 0
+    // 1 import: "atos"."sys_yield" : func type 0
     0x02,                   // section id: Import
     0x11,                   // section size: 17 bytes
     0x01,                   // count: 1 import
     0x03,                   // module name length: 3
-    0x61, 0x6F, 0x73,      // module name: "aos"
+    0x61, 0x6F, 0x73,      // module name: "atos"
     0x09,                   // field name length: 9
     0x73, 0x79, 0x73, 0x5F, // field name: "sys_"
     0x79, 0x69, 0x65, 0x6C, // field name: "yiel"

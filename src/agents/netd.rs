@@ -1,4 +1,4 @@
-//! AOS netd — Network Broker Agent
+//! ATOS netd — Network Broker Agent
 //!
 //! System agent that brokers all network access. Agents send HTTP-like
 //! requests via mailbox; netd validates, logs, and (when a network driver
@@ -67,7 +67,7 @@ fn get_mac() -> [u8; 6] {
 /// Build and send a test UDP packet:
 ///   Ethernet broadcast, IPv4, UDP
 ///   src=10.0.2.15:12345 -> dst=10.0.2.2:9999
-///   payload: b"AOS NETD ALIVE"
+///   payload: b"ATOS NETD ALIVE"
 fn send_test_packet(mac: [u8; 6]) {
     let mut packet = [0u8; 56]; // 14 (eth) + 20 (ip) + 8 (udp) + 14 (payload)
 
@@ -98,12 +98,12 @@ fn send_test_packet(mac: [u8; 6]) {
     packet[38..40].copy_from_slice(&udp_len.to_be_bytes());
     packet[40..42].copy_from_slice(&[0x00, 0x00]); // checksum (0 = skip)
 
-    // Payload: "AOS NETD ALIVE"
-    packet[42..56].copy_from_slice(b"AOS NETD ALIVE");
+    // Payload: "ATOS NETD ALIVE"
+    packet[42..56].copy_from_slice(b"ATOS NETD ALIVE");
 
     match send_raw(&packet) {
         Ok(()) => serial_println!(
-            "[NETD] Test packet sent! (UDP 10.0.2.15:12345 -> 10.0.2.2:9999, 'AOS NETD ALIVE')"
+            "[NETD] Test packet sent! (UDP 10.0.2.15:12345 -> 10.0.2.2:9999, 'ATOS NETD ALIVE')"
         ),
         Err(e) => serial_println!("[NETD] Test packet failed: {}", e),
     }

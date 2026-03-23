@@ -1,4 +1,4 @@
-//! AOS Root Agent
+//! ATOS Root Agent
 //!
 //! The root agent is the system supervisor. It holds wildcard capabilities
 //! for all capability types, enabling it to delegate narrowed capabilities
@@ -43,8 +43,8 @@ pub extern "C" fn root_entry() -> ! {
                     header.tick, header.event_sequence, header.agent_count, header.merkle_root_count);
 
                 // Verify magic
-                if header.magic == 0x414F5343 {
-                    serial_println!("[ROOT] \u{2713} Magic: AOSC (valid)");
+                if header.magic == 0x41545343 {
+                    serial_println!("[ROOT] \u{2713} Magic: ATSC (valid)");
                 } else {
                     serial_println!("[ROOT] \u{2717} Magic: {:#x} (INVALID)", header.magic);
                 }

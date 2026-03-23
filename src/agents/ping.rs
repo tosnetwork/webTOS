@@ -1,4 +1,4 @@
-//! AOS Ping Agent
+//! ATOS Ping Agent
 //!
 //! Test agent that sends "ping" messages to the pong agent's mailbox
 //! and waits for "pong" replies. Demonstrates mailbox IPC, capability

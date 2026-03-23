@@ -1,4 +1,4 @@
-//! AOS policyd — Policy Engine
+//! ATOS policyd — Policy Engine
 //!
 //! System agent that manages eBPF-lite program loading and attachment.
 //!

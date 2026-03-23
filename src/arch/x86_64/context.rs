@@ -1,4 +1,4 @@
-//! AOS x86_64 Execution Context
+//! ATOS x86_64 Execution Context
 //!
 //! Links to the assembly context_switch routine in switch.asm and provides
 //! helpers for creating new agent contexts.

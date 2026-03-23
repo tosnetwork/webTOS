@@ -1,5 +1,5 @@
 /*
- * AOS Linker Script — Higher-Half Kernel
+ * ATOS Linker Script — Higher-Half Kernel
  *
  * Multiboot v1 compatible layout for QEMU -kernel loading.
  * Kernel loaded at physical address 0x100000 (1 MB) by Multiboot.

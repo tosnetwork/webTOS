@@ -1,4 +1,4 @@
-; AOS syscall_entry.asm — SYSCALL/SYSRET entry point for ring 3 agents
+; ATOS syscall_entry.asm — SYSCALL/SYSRET entry point for ring 3 agents
 ;
 ; On SYSCALL instruction (from ring 3):
 ;   RCX = saved user RIP (return address)

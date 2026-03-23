@@ -1,4 +1,4 @@
-//! AOS Intel e1000 Ethernet Driver
+//! ATOS Intel e1000 Ethernet Driver
 //!
 //! Minimal e1000/e1000e driver for real hardware and QEMU.
 //! Uses MMIO registers and DMA descriptor rings for packet TX/RX.

@@ -1,4 +1,4 @@
-; AOS Multiboot v1 Header
+; ATOS Multiboot v1 Header
 ;
 ; Uses the AOUT_KLUDGE (flag bit 16) to provide explicit load addresses,
 ; bypassing ELF program header parsing. This is necessary because the kernel

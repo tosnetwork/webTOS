@@ -1,4 +1,4 @@
-//! AOS Checkpoint & Replay
+//! ATOS Checkpoint & Replay
 //!
 //! Captures execution state and serializes it to disk via ATA PIO.
 //! Checkpoint includes: agent contexts, energy counters, scheduler state,
@@ -23,7 +23,7 @@ const CHECKPOINT_START_SECTOR: u32 = 2048;
 /// Checkpoint header (serialized to disk, padded to 512 bytes)
 #[repr(C)]
 pub struct CheckpointHeader {
-    pub magic: u32,           // 0x414F5343 = "AOSC"
+    pub magic: u32,           // 0x41545343 = "ATSC"
     pub version: u32,         // format version = 1
     pub tick: u64,
     pub event_sequence: u64,
@@ -163,7 +163,7 @@ pub fn save_to_disk() -> bool {
     // ── Write header (sector 0) ──
     let total_sectors = 1 + agent_count as u32 + 1; // header + agents + merkle
     let header = CheckpointHeader {
-        magic: 0x414F5343,
+        magic: 0x41545343,
         version: 1,
         tick,
         event_sequence: event_seq,
@@ -243,7 +243,7 @@ pub fn load_header_from_disk() -> Option<CheckpointHeader> {
 
     // Verify magic
     let magic = u32::from_le_bytes([sector_buf[0], sector_buf[1], sector_buf[2], sector_buf[3]]);
-    if magic != 0x414F5343 {
+    if magic != 0x41545343 {
         return None;
     }
 
@@ -273,7 +273,7 @@ pub fn take_checkpoint() -> CheckpointHeader {
     });
 
     let header = CheckpointHeader {
-        magic: 0x414F5343,
+        magic: 0x41545343,
         version: 1,
         tick,
         event_sequence: event_seq,
@@ -320,7 +320,7 @@ pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAge
 //
 // Wire format for a single migrated agent (little-endian throughout):
 //
-//   [magic: 4B = 0x414F_5341 ("AOSA")]
+//   [magic: 4B = 0x4154_5341 ("ATSA")]
 //   [id: 2B]
 //   [status: 1B]
 //   [mode: 1B]
@@ -331,7 +331,7 @@ pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAge
 //   [state_entry_count: 2B]
 //   [state_entries: state_entry_count × (key:8B + len:2B + value:256B)]
 
-const AGENT_MAGIC: u32 = 0x414F_5341; // "AOSA"
+const AGENT_MAGIC: u32 = 0x4154_5341; // "ATSA"
 const MAX_VALUE_SIZE: usize = 256; // mirrors state.rs
 
 /// Serialize a single agent's live state into a byte buffer suitable for

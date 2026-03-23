@@ -1,5 +1,5 @@
 #!/bin/bash
-# AOS Cross-Node Test
+# ATOS Cross-Node Test
 #
 # Launches two QEMU instances connected via UDP multicast,
 # verifying that routerd on each node can exchange messages.
@@ -8,10 +8,10 @@
 
 set -e
 
-KERNEL="${1:-target/x86_64-unknown-none/release/aos}"
-ELF32="/tmp/aos_crossnode.elf"
+KERNEL="${1:-target/x86_64-unknown-none/release/atos}"
+ELF32="/tmp/atos_crossnode.elf"
 
-echo "=== AOS Cross-Node Test ==="
+echo "=== ATOS Cross-Node Test ==="
 echo "Building kernel..."
 cargo build --release 2>/dev/null
 objcopy -I elf64-x86-64 -O elf32-i386 "$KERNEL" "$ELF32"

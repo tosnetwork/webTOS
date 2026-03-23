@@ -1,4 +1,4 @@
-//! AOS Execution Proof
+//! ATOS Execution Proof
 //!
 //! Generates and verifies cryptographic proofs that a specific event log
 //! was produced from a specific checkpoint state. Enables third-party
@@ -158,8 +158,8 @@ pub fn verify_proof(proof: &ExecutionProof) -> ProofResult {
 
 // ─── Standalone verification and serialization ───────────────────────────
 
-/// Magic bytes for portable proof format: "AOSP"
-const PROOF_MAGIC: [u8; 4] = *b"AOSP";
+/// Magic bytes for portable proof format: "ATSP"
+const PROOF_MAGIC: [u8; 4] = *b"ATSP";
 /// Format version
 const PROOF_VERSION: u8 = 1;
 
@@ -179,7 +179,7 @@ pub fn verify_proof_standalone(proof: &ExecutionProof) -> bool {
 
 /// Serialize a proof to a portable byte format.
 ///
-/// Format: [magic: 4B "AOSP"][version: 1B][tick: 8B][event_count: 4B]
+/// Format: [magic: 4B "ATSP"][version: 1B][tick: 8B][event_count: 4B]
 ///         [checkpoint_root: 16B][proof_hash: 16B]
 ///         [start_seq: 8B][end_seq: 8B]
 pub fn proof_to_bytes(proof: &ExecutionProof) -> alloc::vec::Vec<u8> {

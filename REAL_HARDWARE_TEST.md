@@ -1,6 +1,6 @@
-# AOS Real Hardware Testing Guide
+# ATOS Real Hardware Testing Guide
 
-This document describes how to boot AOS on a physical x86_64 machine using the UEFI boot path. AOS was developed VM-first, so real hardware testing requires extra steps. Follow this guide carefully.
+This document describes how to boot ATOS on a physical x86_64 machine using the UEFI boot path. ATOS was developed VM-first, so real hardware testing requires extra steps. Follow this guide carefully.
 
 ---
 
@@ -9,14 +9,14 @@ This document describes how to boot AOS on a physical x86_64 machine using the U
 ### Hardware Requirements
 
 - **CPU:** Any x86_64 (64-bit) processor, 2010 or later. Intel Core i3/i5/i7 or AMD Ryzen recommended.
-- **RAM:** 512 MB minimum (AOS identity-maps the first 512 MB). 1 GB or more is fine.
+- **RAM:** 512 MB minimum (ATOS identity-maps the first 512 MB). 1 GB or more is fine.
 - **Storage:** Any USB 2.0 or 3.0 flash drive (1 GB minimum) to boot from.
-- **Serial port (recommended):** DB9 RS-232 COM1 port, or a USB-to-serial adapter (FTDI chip preferred). Required to see any output — AOS has no video driver and produces no screen output.
-- **USB keyboard:** Required to interact with BIOS/UEFI firmware menus only. AOS itself has no keyboard driver.
+- **Serial port (recommended):** DB9 RS-232 COM1 port, or a USB-to-serial adapter (FTDI chip preferred). Required to see any output — ATOS has no video driver and produces no screen output.
+- **USB keyboard:** Required to interact with BIOS/UEFI firmware menus only. ATOS itself has no keyboard driver.
 
 ### Build Host Requirements
 
-The build host (where you compile AOS) must have:
+The build host (where you compile ATOS) must have:
 
 ```bash
 # Rust nightly toolchain — managed via rust-toolchain.toml
@@ -30,20 +30,20 @@ Verify the UEFI build succeeds before touching any hardware:
 
 ```bash
 make uefi-build
-# Confirm: uefi/target/x86_64-unknown-uefi/release/aos-uefi.efi exists
-ls -lh uefi/target/x86_64-unknown-uefi/release/aos-uefi.efi
+# Confirm: uefi/target/x86_64-unknown-uefi/release/atos-uefi.efi exists
+ls -lh uefi/target/x86_64-unknown-uefi/release/atos-uefi.efi
 ```
 
 ---
 
 ## 2. Creating the Boot USB
 
-AOS boots as a standard UEFI application placed at `EFI/BOOT/BOOTX64.EFI` on a FAT32 ESP (EFI System Partition).
+ATOS boots as a standard UEFI application placed at `EFI/BOOT/BOOTX64.EFI` on a FAT32 ESP (EFI System Partition).
 
 ### Step 1 — Build the UEFI image
 
 ```bash
-cd ~/aos
+cd ~/atos
 make uefi-build
 ```
 
@@ -75,21 +75,21 @@ sudo mkfs.fat -F32 /dev/sdX1
 
 ```bash
 # Mount the USB partition
-sudo mkdir -p /mnt/aos-usb
-sudo mount /dev/sdX1 /mnt/aos-usb
+sudo mkdir -p /mnt/atos-usb
+sudo mount /dev/sdX1 /mnt/atos-usb
 
 # Create the UEFI boot path
-sudo mkdir -p /mnt/aos-usb/EFI/BOOT
+sudo mkdir -p /mnt/atos-usb/EFI/BOOT
 
-# Copy the AOS UEFI loader
-sudo cp uefi/target/x86_64-unknown-uefi/release/aos-uefi.efi \
-        /mnt/aos-usb/EFI/BOOT/BOOTX64.EFI
+# Copy the ATOS UEFI loader
+sudo cp uefi/target/x86_64-unknown-uefi/release/atos-uefi.efi \
+        /mnt/atos-usb/EFI/BOOT/BOOTX64.EFI
 
 # Verify
-ls -lh /mnt/aos-usb/EFI/BOOT/BOOTX64.EFI
+ls -lh /mnt/atos-usb/EFI/BOOT/BOOTX64.EFI
 
 # Unmount cleanly
-sudo umount /mnt/aos-usb
+sudo umount /mnt/atos-usb
 sync
 ```
 
@@ -103,7 +103,7 @@ Boot the test machine and enter the BIOS/UEFI setup menu (usually Del, F2, F10, 
 
 ### 3.1 Disable Secure Boot
 
-Secure Boot will refuse to run AOS because the `.efi` binary is not signed by a trusted certificate authority.
+Secure Boot will refuse to run ATOS because the `.efi` binary is not signed by a trusted certificate authority.
 
 - Navigate to: **Security** or **Boot** tab.
 - Find: **Secure Boot** or **Secure Boot Control**.
@@ -137,22 +137,22 @@ Select **Save & Exit** (usually F10). The machine will reboot.
 
 ### What to Expect
 
-AOS has **no video driver**. The screen will either stay blank or show only the UEFI firmware splash. All AOS output goes to COM1 serial at 115200 baud 8N1.
+ATOS has **no video driver**. The screen will either stay blank or show only the UEFI firmware splash. All ATOS output goes to COM1 serial at 115200 baud 8N1.
 
 If you do not have a serial connection attached yet, proceed anyway. The machine will either:
-- Boot silently (AOS is running but you cannot see output), or
+- Boot silently (ATOS is running but you cannot see output), or
 - Hang at a black screen (a failure occurred before the kernel halted).
 
 ### Verifying a Successful Boot Without Serial
 
-A successful UEFI boot with no serial cable shows no visible activity after the firmware splash disappears. The CPU will be executing the AOS kernel idle loop. If the machine reboots in a loop or shows a UEFI "Boot Manager" error screen, something went wrong — see Section 6 (Troubleshooting).
+A successful UEFI boot with no serial cable shows no visible activity after the firmware splash disappears. The CPU will be executing the ATOS kernel idle loop. If the machine reboots in a loop or shows a UEFI "Boot Manager" error screen, something went wrong — see Section 6 (Troubleshooting).
 
 ### Expected Serial Output — UEFI Phase
 
 The UEFI loader (`uefi/src/main.rs`) emits these lines over COM1 before jumping to the kernel:
 
 ```
-[UEFI] AOS UEFI boot loader starting
+[UEFI] ATOS UEFI boot loader starting
 [UEFI] Loading kernel ELF...
 [UEFI] Page tables allocated at: 0x<address>
 [UEFI] Dual page tables configured (identity + higher-half)
@@ -168,8 +168,8 @@ The UEFI loader (`uefi/src/main.rs`) emits these lines over COM1 before jumping 
 After the jump to `kernel_main`, the kernel (`src/main.rs`) produces:
 
 ```
-AOS boot ok
-AOS v0.1 - AI-native Operating System
+ATOS boot ok
+ATOS v0.1 - AI-native Operating System
 [OK] Architecture initialized
 [OK] Scheduler initialized
 [EVENT seq=0 tick=0 agent=0 type=SYSTEM_BOOT arg0=0 arg1=0 status=0]
@@ -184,7 +184,7 @@ AOS v0.1 - AI-native Operating System
 [PING] Received reply: "pong"
 ```
 
-If you see all of the above, AOS is running correctly on real hardware.
+If you see all of the above, ATOS is running correctly on real hardware.
 
 ---
 
@@ -194,7 +194,7 @@ Serial is the only output channel. Setting it up is mandatory for any meaningful
 
 ### 5.1 Serial Parameters
 
-AOS initializes COM1 to:
+ATOS initializes COM1 to:
 - **Port:** COM1 (I/O base address 0x3F8)
 - **Baud rate:** 115200
 - **Data bits:** 8
@@ -222,7 +222,7 @@ If the monitoring host has no serial port:
 
 **Option C — USB-serial adapter on the test machine**
 
-If the test machine has no DB9 port: AOS does not support USB serial. COM1 (port 0x3F8) must be a physical 16550-compatible UART. Check the motherboard manual — many desktop boards with no external DB9 connector still have a COM1 header on the PCB (9-pin shrouded header). A DB9 bracket cable can expose it.
+If the test machine has no DB9 port: ATOS does not support USB serial. COM1 (port 0x3F8) must be a physical 16550-compatible UART. Check the motherboard manual — many desktop boards with no external DB9 connector still have a COM1 header on the PCB (9-pin shrouded header). A DB9 bracket cable can expose it.
 
 ### 5.3 Terminal Software
 
@@ -257,15 +257,15 @@ On Windows: use PuTTY, set connection type Serial, speed 115200, the correct COM
 ### 5.4 Capturing a Full Log
 
 ```bash
-picocom -b 115200 /dev/ttyUSB0 --logfile /tmp/aos-boot-$(date +%Y%m%d-%H%M%S).txt
+picocom -b 115200 /dev/ttyUSB0 --logfile /tmp/atos-boot-$(date +%Y%m%d-%H%M%S).txt
 ```
 
-This saves everything to a timestamped file for later inspection with `sdk/aos-cli`:
+This saves everything to a timestamped file for later inspection with `sdk/atos-cli`:
 
 ```bash
-cd sdk/aos-cli
+cd sdk/atos-cli
 cargo build --release
-./target/x86_64-unknown-linux-gnu/release/aos inspect /tmp/aos-boot-*.txt
+./target/x86_64-unknown-linux-gnu/release/atos inspect /tmp/atos-boot-*.txt
 ```
 
 ---
@@ -305,9 +305,9 @@ cargo build --release
 - Run `make uefi-test` in QEMU first to confirm the full boot sequence works before going to hardware.
 - Check that the machine has at least 512 MB of RAM below the 4 GB boundary — the UEFI loader identity-maps the first 512 MB using 2 MB huge pages (`uefi/src/main.rs`, `setup_page_tables`).
 
-### Kernel panics after "AOS boot ok"
+### Kernel panics after "ATOS boot ok"
 
-**Cause:** A hardware feature assumed by AOS is absent or behaves differently than on QEMU.
+**Cause:** A hardware feature assumed by ATOS is absent or behaves differently than on QEMU.
 
 **Most common causes:**
 - ACPI table parsing (`src/arch/x86_64/acpi.rs`) failing on unusual MADT layout.
@@ -345,7 +345,7 @@ Work through these stages in order. Each stage depends on the previous one succe
 
 - [ ] `make uefi-test` runs without error and exits within 10 seconds
 - [ ] Serial output shows all UEFI phase messages
-- [ ] Serial output shows `AOS boot ok` and agent startup messages
+- [ ] Serial output shows `ATOS boot ok` and agent startup messages
 - [ ] `make test` passes (single-node test with disk and network)
 
 ### Stage 1 — USB Boot
@@ -360,7 +360,7 @@ Work through these stages in order. Each stage depends on the previous one succe
 ### Stage 2 — UEFI Phase Output
 
 - [ ] Serial terminal connected and receiving characters
-- [ ] `[UEFI] AOS UEFI boot loader starting` appears
+- [ ] `[UEFI] ATOS UEFI boot loader starting` appears
 - [ ] `[UEFI] Loading kernel ELF...` appears
 - [ ] `[UEFI] Dual page tables configured` appears
 - [ ] `[UEFI] BootInfo written at 0x7000` appears
@@ -368,7 +368,7 @@ Work through these stages in order. Each stage depends on the previous one succe
 
 ### Stage 3 — Kernel Startup
 
-- [ ] `AOS boot ok` appears
+- [ ] `ATOS boot ok` appears
 - [ ] `[OK] Architecture initialized` appears
 - [ ] `[OK] Scheduler initialized` appears
 - [ ] `[EVENT seq=0 tick=0 ... type=SYSTEM_BOOT]` appears
@@ -387,7 +387,7 @@ Work through these stages in order. Each stage depends on the previous one succe
 
 - [ ] System runs stably for 5 minutes without hang or reset
 - [ ] Serial log saved to file using picocom `--logfile`
-- [ ] Log analyzed with `aos inspect` from the SDK CLI
+- [ ] Log analyzed with `atos inspect` from the SDK CLI
 - [ ] No unexpected PANIC or fault messages in the log
 
 ---
@@ -398,11 +398,11 @@ The following features work in QEMU but will not function correctly on real hard
 
 ### No Video Output
 
-AOS has no framebuffer driver, no VGA driver, and no GOP (Graphics Output Protocol) initialization. The screen remains blank or shows only the firmware splash. All output is COM1 serial only.
+ATOS has no framebuffer driver, no VGA driver, and no GOP (Graphics Output Protocol) initialization. The screen remains blank or shows only the firmware splash. All output is COM1 serial only.
 
 ### No USB Input
 
-AOS has no USB HID driver. Keyboards and mice connected via USB are non-functional inside AOS. The only input path is serial, and AOS currently has no interactive serial shell — serial is output-only.
+ATOS has no USB HID driver. Keyboards and mice connected via USB are non-functional inside ATOS. The only input path is serial, and ATOS currently has no interactive serial shell — serial is output-only.
 
 ### Network Drivers are QEMU-Specific
 
@@ -414,7 +414,7 @@ AOS has no USB HID driver. Keyboards and mice connected via USB are non-function
 
 ### SMP May Not Start APs
 
-The AP trampoline in `asm/ap_trampoline.asm` sends INIT/SIPI sequences to bring up secondary cores. QEMU responds predictably. Real hardware BIOS/firmware may park APs in a different state (ACPI parking protocol or PSCI on some platforms). If APs do not start, AOS falls back to single-core operation — the scheduler will run but only on CPU 0.
+The AP trampoline in `asm/ap_trampoline.asm` sends INIT/SIPI sequences to bring up secondary cores. QEMU responds predictably. Real hardware BIOS/firmware may park APs in a different state (ACPI parking protocol or PSCI on some platforms). If APs do not start, ATOS falls back to single-core operation — the scheduler will run but only on CPU 0.
 
 ### ACPI Parsing is Minimal
 
@@ -422,12 +422,12 @@ The AP trampoline in `asm/ap_trampoline.asm` sends INIT/SIPI sequences to bring 
 
 ### No IOMMU / VT-d Support
 
-AOS does not configure the IOMMU. DMA from devices with an IOMMU-enforcing firmware (VT-d enabled) may be blocked or fault silently.
+ATOS does not configure the IOMMU. DMA from devices with an IOMMU-enforcing firmware (VT-d enabled) may be blocked or fault silently.
 
 ### No Power Management
 
-AOS has no ACPI power management, no sleep states, and no thermal management. The machine will run at full power until physically powered off. There is no `shutdown` or `reboot` command — power off the test machine using its physical power button.
+ATOS has no ACPI power management, no sleep states, and no thermal management. The machine will run at full power until physically powered off. There is no `shutdown` or `reboot` command — power off the test machine using its physical power button.
 
 ### Hardware Watchdog
 
-Some enterprise machines have a hardware watchdog that the BIOS arms and expects the OS to service. AOS does not service any watchdog. If the target machine has an armed watchdog, it will reset the machine after a timeout (commonly 60–300 seconds). Disable the watchdog in BIOS if present, or look for a **Watchdog Timer** setting under the **Advanced** or **Server Management** tab.
+Some enterprise machines have a hardware watchdog that the BIOS arms and expects the OS to service. ATOS does not service any watchdog. If the target machine has an armed watchdog, it will reset the machine after a timeout (commonly 60–300 seconds). Disable the watchdog in BIOS if present, or look for a **Watchdog Timer** setting under the **Advanced** or **Server Management** tab.

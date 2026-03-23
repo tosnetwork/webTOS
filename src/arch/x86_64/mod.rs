@@ -1,7 +1,7 @@
-// AOS x86_64 Architecture Layer
+// ATOS x86_64 Architecture Layer
 //
 // Provides GDT, IDT, serial I/O, paging, timer, and context switching
-// for the AOS kernel running on x86_64 (QEMU target).
+// for the ATOS kernel running on x86_64 (QEMU target).
 
 pub mod gdt;
 pub mod idt;

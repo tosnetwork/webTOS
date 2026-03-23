@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="AOS.png" alt="AOS Logo" width="200">
+  <img src="ATOS.png" alt="ATOS Logo" width="200">
 </p>
 
-<h1 align="center">AOS</h1>
+<h1 align="center">ATOS</h1>
 
 <p align="center">
   <strong>An AI-native operating system built from scratch.</strong><br>
@@ -18,11 +18,11 @@
 
 ---
 
-## What is AOS?
+## What is ATOS?
 
-AOS is a minimal operating system designed from first principles for AI agent execution. It is **not** a Linux distribution, not a POSIX-compatible environment, and not a desktop OS. It is a bare-metal execution substrate where agents, mailboxes, and capabilities replace processes, sockets, and ambient authority.
+ATOS is a minimal operating system designed from first principles for AI agent execution. It is **not** a Linux distribution, not a POSIX-compatible environment, and not a desktop OS. It is a bare-metal execution substrate where agents, mailboxes, and capabilities replace processes, sockets, and ambient authority.
 
-Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. AOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
+Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. ATOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
 
 ### Design Principles
 
@@ -43,9 +43,9 @@ Modern operating systems were designed for human-operated computing. Their core 
 | **Energy Budget** | (none) | Per-agent execution metering, enforced by the kernel |
 | **Event Log** | (afterthought) | Built-in structured audit from day one |
 
-### Who Uses AOS
+### Who Uses ATOS
 
-AOS is not a general-purpose operating system. Its users are autonomous systems that need deterministic execution, minimal privilege, and verifiable behavior.
+ATOS is not a general-purpose operating system. Its users are autonomous systems that need deterministic execution, minimal privilege, and verifiable behavior.
 
 **AI Agent Platforms** — Run AI agents in isolated, auditable sandboxes. Agents are written in WASM or native Rust, communicate via mailboxes, and operate under capability-scoped authority. Every action is logged. Agents can be checkpointed, migrated, and replayed. If an agent crashes, it cannot affect other agents.
 
@@ -53,15 +53,15 @@ AOS is not a general-purpose operating system. Its users are autonomous systems 
 
 **Secure Edge Devices** — Deploy on embedded hardware where the attack surface must be minimal. No shell, no root, no filesystem, no ambient authority. Each agent holds only the capabilities it was explicitly granted. Agent crashes are isolated by hardware-enforced memory boundaries. Energy budgets prevent runaway execution.
 
-**AOS is not for:** desktop users, server administration, running existing Linux/POSIX programs, or any workload that requires a traditional OS interface.
+**ATOS is not for:** desktop users, server administration, running existing Linux/POSIX programs, or any workload that requires a traditional OS interface.
 
 ### Layering
 
-- **AOS** = the full system architecture
-- **AOS-0** = the privileged kernel substrate
-- **AOS-1** = the runtime host for native, WASM, and future managed runtimes
-- **AOS-2** = the agent and system-service layer
-- **AOS-NET** = the brokered / distributed execution layer
+- **ATOS** = the full system architecture
+- **ATOS-0** = the privileged kernel substrate
+- **ATOS-1** = the runtime host for native, WASM, and future managed runtimes
+- **ATOS-2** = the agent and system-service layer
+- **ATOS-NET** = the brokered / distributed execution layer
 
 ## Quickstart
 
@@ -83,16 +83,16 @@ brew install nasm qemu
 ### Build & Run
 
 ```bash
-git clone https://github.com/tos-network/aos.git
-cd aos
+git clone https://github.com/tos-network/atos.git
+cd atos
 make run
 ```
 
 This builds the kernel in release mode, converts the ELF64 binary to ELF32 for Multiboot compatibility, and boots it in QEMU. You will see serial output like:
 
 ```
-AOS boot ok
-AOS v0.1 - AI-native Operating System
+ATOS boot ok
+ATOS v0.1 - AI-native Operating System
 [OK] Architecture initialized
 [OK] Scheduler initialized
 [EVENT seq=0 tick=0 agent=0 type=SYSTEM_BOOT arg0=0 arg1=0 status=0]
@@ -122,7 +122,7 @@ make test        # Single-node test with SMP + disk + network
 
 ### UEFI Boot
 
-AOS supports both Multiboot v1 and UEFI boot:
+ATOS supports both Multiboot v1 and UEFI boot:
 
 ```bash
 # Install OVMF firmware
@@ -136,22 +136,22 @@ The UEFI loader (`uefi/`) is a standalone PE/COFF application that embeds the ke
 
 ## Architecture
 
-AOS is the umbrella system. The early kernel is AOS-0, not the whole stack.
+ATOS is the umbrella system. The early kernel is ATOS-0, not the whole stack.
 
 ```
 +---------------------------------------------------+
 |           Applications / External Systems         |
 +---------------------------------------------------+
-| AOS-NET                                           |
+| ATOS-NET                                           |
 | brokered network | distributed execution | replay |
 +---------------------------------------------------+
-| AOS-2 Agent / Service Layer                       |
+| ATOS-2 Agent / Service Layer                       |
 | root | stated | policyd | netd | accountd | user  |
 +---------------------------------------------------+
-| AOS-1 Runtime Host                                |
+| ATOS-1 Runtime Host                                |
 | native | WASM | future managed runtimes           |
 +---------------------------------------------------+
-| AOS-0 Kernel                                      |
+| ATOS-0 Kernel                                      |
 | sched | mailbox | capability | state | audit      |
 | energy | syscall | checkpoint                     |
 +---------------------------------------------------+
@@ -162,7 +162,7 @@ AOS is the umbrella system. The early kernel is AOS-0, not the whole stack.
 +---------------------------------------------------+
 ```
 
-Stage-1 is intentionally concentrated in AOS-0. AOS-1 is a thin native execution layer at first, AOS-2 starts as built-in bootstrap/test agents, and AOS-NET arrives later in the roadmap.
+Stage-1 is intentionally concentrated in ATOS-0. ATOS-1 is a thin native execution layer at first, ATOS-2 starts as built-in bootstrap/test agents, and ATOS-NET arrives later in the roadmap.
 
 ### Syscall ABI
 
@@ -196,7 +196,7 @@ Stage-1 is intentionally concentrated in AOS-0. AOS-1 is a thin native execution
 ### Project Structure
 
 ```
-aos/
+atos/
   asm/                        # x86_64 assembly (NASM)
     boot.asm                  #   32→64 bit boot, 512MB identity map
     multiboot_header.asm      #   Multiboot v1 header
@@ -250,9 +250,9 @@ aos/
       skilld.rs               #   WASM skill installer
       idle.rs  bad.rs         #   Idle loop / unauthorized test
   sdk/
-    aos-sdk/                  # Native agent SDK (#![no_std])
-    aos-wasm-sdk/             # WASM agent SDK (wasm32 target)
-    aos-cli/                  # CLI tools (build/deploy/inspect/replay/verify)
+    atos-sdk/                  # Native agent SDK (#![no_std])
+    atos-wasm-sdk/             # WASM agent SDK (wasm32 target)
+    atos-cli/                  # CLI tools (build/deploy/inspect/replay/verify)
   linker.ld                   # Linker script (kernel at 1MB)
   build.rs                    # NASM build integration
   yellowpaper.md              # Full engineering specification
@@ -298,31 +298,31 @@ aos/
 
 ## Developer SDK
 
-Build agents for AOS using the SDK:
+Build agents for ATOS using the SDK:
 
 ```bash
 # Native agent (x86_64)
-cd sdk/aos-sdk
+cd sdk/atos-sdk
 cargo build --target x86_64-unknown-none
 
 # WASM agent
-cd sdk/aos-wasm-sdk
+cd sdk/atos-wasm-sdk
 cargo build --target wasm32-unknown-unknown --release
 
 # CLI tools
-cd sdk/aos-cli
+cd sdk/atos-cli
 cargo build --release
-./target/x86_64-unknown-linux-gnu/release/aos help
+./target/x86_64-unknown-linux-gnu/release/atos help
 ```
 
 ### CLI Commands
 
 ```bash
-aos build [--target native|wasm] <dir>   # Build an agent
-aos deploy <agent.wasm>                  # Validate + deploy info
-aos inspect <serial-log.txt>             # Analyze event log
-aos replay <disk-image.img>              # Parse checkpoint
-aos verify <proof.bin>                   # Verify execution proof
+atos build [--target native|wasm] <dir>   # Build an agent
+atos deploy <agent.wasm>                  # Validate + deploy info
+atos inspect <serial-log.txt>             # Analyze event log
+atos replay <disk-image.img>              # Parse checkpoint
+atos verify <proof.bin>                   # Verify execution proof
 ```
 
 See the [Yellow Paper](yellowpaper.md) for the full specification and roadmap.

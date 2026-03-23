@@ -1,4 +1,4 @@
-//! AOS Minimal Kernel UDP
+//! ATOS Minimal Kernel UDP
 //!
 //! Simple UDP send/receive for inter-node mailbox routing.
 //! Uses raw Ethernet frames with IPv4/UDP headers.

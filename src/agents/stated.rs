@@ -1,4 +1,4 @@
-//! AOS stated — State Persistence Manager
+//! ATOS stated — State Persistence Manager
 //!
 //! System agent that manages durable key-value state for shared keyspaces.
 //! Agents send state requests via mailbox; stated handles persistence.

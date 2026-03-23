@@ -1,7 +1,7 @@
 //! KASLR — Kernel Address Space Layout Randomization (stack/heap variant)
 //!
 //! True code KASLR requires a position-independent (PIE) kernel binary so
-//! that absolute symbol addresses can be relocated at boot time. AOS is
+//! that absolute symbol addresses can be relocated at boot time. ATOS is
 //! currently linked at the fixed higher-half VMA 0xFFFFFFFF80000000, so
 //! relocating the code segment is not yet possible without substantial
 //! toolchain changes.

@@ -1,0 +1,9 @@
+[package]
+name = "atos-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "ATOS Agent SDK — safe Rust wrappers for ATOS syscalls"
+license = "MIT"
+
+[features]
+default = []

@@ -1,0 +1,10 @@
+[package]
+name = "atos-ebpf-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "ATOS eBPF-lite SDK — assembler, verifier, and disassembler for ATOS eBPF policy programs"
+license = "MIT"
+
+[[bin]]
+name = "atos-ebpf"
+path = "src/main.rs"

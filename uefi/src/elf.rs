@@ -1,4 +1,4 @@
-//! Minimal ELF64 loader for the embedded AOS kernel binary.
+//! Minimal ELF64 loader for the embedded ATOS kernel binary.
 //!
 //! Parses ELF64 headers, copies PT_LOAD segments to their physical
 //! addresses, and returns the entry point and stack top.

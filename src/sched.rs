@@ -1,4 +1,4 @@
-//! AOS Scheduler
+//! ATOS Scheduler
 //!
 //! Implements a round-robin scheduler with SMP support.
 //! The run queue is protected by a SpinLock for safe concurrent access

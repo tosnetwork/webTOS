@@ -1,4 +1,4 @@
-//! AOS x86_64 GDT (Global Descriptor Table)
+//! ATOS x86_64 GDT (Global Descriptor Table)
 //!
 //! Sets up a 64-bit GDT with kernel code/data segments and a TSS.
 //! The TSS provides RSP0 (kernel stack for privilege transitions) and

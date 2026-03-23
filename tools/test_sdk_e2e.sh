@@ -5,15 +5,15 @@ set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "=== AOS SDK End-to-End Test ==="
+echo "=== ATOS SDK End-to-End Test ==="
 echo "Repo: $REPO_ROOT"
 echo ""
 
 # 1. Build WASM agent from source
-echo "[1/4] Building WASM agent with aos-wasm-sdk..."
-cd "$REPO_ROOT/sdk/aos-wasm-sdk"
+echo "[1/4] Building WASM agent with atos-wasm-sdk..."
+cd "$REPO_ROOT/sdk/atos-wasm-sdk"
 cargo build --target wasm32-unknown-unknown --release --example hello 2>/dev/null
-WASM="$REPO_ROOT/sdk/aos-wasm-sdk/target/wasm32-unknown-unknown/release/examples/hello.wasm"
+WASM="$REPO_ROOT/sdk/atos-wasm-sdk/target/wasm32-unknown-unknown/release/examples/hello.wasm"
 if [ -f "$WASM" ]; then
     SIZE=$(stat -c%s "$WASM")
     echo "  PASS  WASM agent built: hello.wasm ($SIZE bytes)"
@@ -31,33 +31,33 @@ else
     exit 1
 fi
 
-# Enforce AOS 64 KB code size limit
+# Enforce ATOS 64 KB code size limit
 if [ "$SIZE" -gt 65536 ]; then
-    echo "  FAIL  WASM binary exceeds AOS 64 KB limit ($SIZE bytes)"
+    echo "  FAIL  WASM binary exceeds ATOS 64 KB limit ($SIZE bytes)"
     exit 1
 else
-    echo "  PASS  Size within AOS 64 KB limit"
+    echo "  PASS  Size within ATOS 64 KB limit"
 fi
 
-# 2. Build aos-cli and validate binary with deploy command
+# 2. Build atos-cli and validate binary with deploy command
 echo ""
-echo "[2/4] Building aos-cli and validating WASM binary..."
-cd "$REPO_ROOT/sdk/aos-cli"
+echo "[2/4] Building atos-cli and validating WASM binary..."
+cd "$REPO_ROOT/sdk/atos-cli"
 cargo build --release 2>/dev/null
 
 # The build target depends on the host; find the binary
-CLI=$(find "$REPO_ROOT/sdk/aos-cli/target" -name "aos" -type f | head -1)
+CLI=$(find "$REPO_ROOT/sdk/atos-cli/target" -name "atos" -type f | head -1)
 if [ -z "$CLI" ]; then
-    echo "  FAIL  aos CLI binary not found after build"
+    echo "  FAIL  atos CLI binary not found after build"
     exit 1
 fi
-echo "  PASS  aos CLI built: $CLI"
+echo "  PASS  atos CLI built: $CLI"
 
 DEPLOY_OUT=$("$CLI" deploy "$WASM" 2>&1)
-if echo "$DEPLOY_OUT" | grep -q "\[aos-deploy\] WASM version: 1"; then
-    echo "  PASS  aos deploy validated WASM (version 1)"
+if echo "$DEPLOY_OUT" | grep -q "\[atos-deploy\] WASM version: 1"; then
+    echo "  PASS  atos deploy validated WASM (version 1)"
 else
-    echo "  FAIL  aos deploy did not recognise WASM binary"
+    echo "  FAIL  atos deploy did not recognise WASM binary"
     echo "$DEPLOY_OUT"
     exit 1
 fi
@@ -78,17 +78,17 @@ for CMD in build deploy replay inspect verify; do
     fi
 done
 
-# 4. Verify aos-sdk (native) compiles cleanly
+# 4. Verify atos-sdk (native) compiles cleanly
 echo ""
-echo "[4/4] Building aos-sdk (native agent SDK)..."
-cd "$REPO_ROOT/sdk/aos-sdk"
+echo "[4/4] Building atos-sdk (native agent SDK)..."
+cd "$REPO_ROOT/sdk/atos-sdk"
 cargo build --release 2>/dev/null
-echo "  PASS  aos-sdk compiled"
+echo "  PASS  atos-sdk compiled"
 
 # Summary
 echo ""
 echo "==================================================="
-echo "=== AOS SDK End-to-End Test: ALL CHECKS PASSED ==="
+echo "=== ATOS SDK End-to-End Test: ALL CHECKS PASSED ==="
 echo "==================================================="
 echo ""
 echo "Artifacts:"

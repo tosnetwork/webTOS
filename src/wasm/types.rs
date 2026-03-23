@@ -1,4 +1,4 @@
-//! WASM binary format types for the AOS minimal interpreter.
+//! WASM binary format types for the ATOS minimal interpreter.
 //!
 //! Small tables use fixed-size arrays; large buffers (code, memory)
 //! are heap-allocated via `Vec`.

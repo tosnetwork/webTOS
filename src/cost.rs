@@ -1,4 +1,4 @@
-//! AOS Energy Cost Table
+//! ATOS Energy Cost Table
 //!
 //! Defines energy costs per operation type. Costs are configurable
 //! at compile time and used by the syscall dispatcher and timer.
@@ -12,7 +12,7 @@ pub struct CostTable {
     pub disk_write: u64,      // Cost per disk sector write
     pub network_request: u64, // Cost per network request
     pub mailbox_create: u64,  // Cost per mailbox creation
-    pub wasm_fuel_unit: u64,  // AOS energy per WASM fuel unit
+    pub wasm_fuel_unit: u64,  // ATOS energy per WASM fuel unit
 }
 
 /// Default cost table (Yellow Paper §25.2.6)

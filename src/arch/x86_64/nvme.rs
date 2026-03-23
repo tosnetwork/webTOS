@@ -1,9 +1,9 @@
-//! AOS NVMe Storage Driver
+//! ATOS NVMe Storage Driver
 //!
 //! Minimal NVMe driver for QEMU. Uses memory-mapped command queues
 //! and DMA for block I/O. Replaces ATA PIO for high-performance storage.
 //!
-//! QEMU: -device nvme,drive=d0,serial=aos-nvme -drive file=disk.img,id=d0,format=raw,if=none
+//! QEMU: -device nvme,drive=d0,serial=atos-nvme -drive file=disk.img,id=d0,format=raw,if=none
 
 use crate::serial_println;
 use super::paging;

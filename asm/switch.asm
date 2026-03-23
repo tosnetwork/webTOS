@@ -1,4 +1,4 @@
-; AOS switch.asm - context switch between agents
+; ATOS switch.asm - context switch between agents
 ;
 ; Saves the callee-saved register state of the old agent and restores
 ; the register state of the new agent. This is the core primitive that

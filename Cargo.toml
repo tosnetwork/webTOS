@@ -1,9 +1,9 @@
 [package]
-name = "aos"
+name = "atos"
 version = "0.1.0"
 edition = "2021"
-authors = ["AOS Project"]
-description = "AOS Stage-1: AI-native minimal operating system kernel"
+authors = ["ATOS Project"]
+description = "ATOS Stage-1: AI-native minimal operating system kernel"
 
 [dependencies]
 

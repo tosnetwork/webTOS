@@ -1,4 +1,4 @@
-//! AOS Kernel Logger
+//! ATOS Kernel Logger
 //!
 //! Provides log-level-gated macros for kernel logging over serial output.
 //! The log level can be adjusted at runtime via `set_level()`.

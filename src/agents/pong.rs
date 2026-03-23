@@ -1,4 +1,4 @@
-//! AOS Pong Agent
+//! ATOS Pong Agent
 //!
 //! Test agent that receives "ping" messages from the ping agent and
 //! replies with "pong". Demonstrates the responder side of mailbox IPC,

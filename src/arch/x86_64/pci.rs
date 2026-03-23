@@ -1,4 +1,4 @@
-//! AOS PCI Bus Enumeration
+//! ATOS PCI Bus Enumeration
 //!
 //! Discovers PCI devices via configuration space access (ports 0xCF8/0xCFC).
 //! Provides device registry and BAR decoding for NVMe, NIC, and other drivers.

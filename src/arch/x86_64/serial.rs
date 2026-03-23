@@ -1,4 +1,4 @@
-// AOS x86_64 Serial Port Driver (COM1)
+// ATOS x86_64 Serial Port Driver (COM1)
 //
 // Provides serial output over COM1 (port 0x3F8) for kernel logging
 // and audit event emission. This is the primary output channel in Stage-1.
