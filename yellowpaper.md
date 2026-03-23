@@ -1222,6 +1222,60 @@ Introduce execution snapshots for debugging and replay:
 * **Restore**: on boot, if a checkpoint is present, the kernel can restore all agents to the checkpointed state instead of running init.
 * **Limitation**: Stage-2 checkpointing is not yet deterministic. Timer interrupt timing and I/O ordering may differ across replays. Full deterministic replay requires Stage-3.
 
+### 24.6.1 Disk Layout Specification
+
+AOS uses ATA PIO with 28-bit LBA addressing (Stage-2/3), supporting up to 128 GB per disk. The disk is divided into fixed regions managed by a superblock. All values are in 512-byte sectors.
+
+```text
+Sector 0:                       Superblock
+Sector 1-7:                     Reserved (boot metadata)
+Sector 8 - 2,097,159:           State Log Region      (1 GB)
+Sector 2,097,160 - 2,101,255:   Checkpoint Region     (2 MB)
+Sector 2,101,256 - 4,198,407:   Trace Log Region      (1 GB)
+Sector 4,198,408 - 268,435,455: Agent Storage Region   (~126 GB)
+```
+
+**Region details:**
+
+| Region | Start Sector | Size | Purpose |
+|--------|-------------|------|---------|
+| **Superblock** | 0 | 4 KB (1 sector + reserved) | Disk magic (`0x414F5344`), version, region table (start/end sector for each region), creation timestamp, last checkpoint tick |
+| **State Log** | 8 | 1 GB | Append-only key-value mutation log. ~2 million entries at 512 bytes each. Each entry: `[sequence, keyspace_id, key_u64, len, value_bytes, crc32]`. Log is replayed on boot to rebuild in-memory index. |
+| **Checkpoint** | 2,097,160 | 2 MB | Serialized system snapshot. Header (1 sector) + agent states (1 sector per agent, up to 4,096 agents) + Merkle roots (packed, 1 sector per 32 keyspaces). Overwritten on each checkpoint. |
+| **Trace Log** | 2,101,256 | 1 GB | I/O trace entries for deterministic replay (Stage-3). Each entry records: tick, event type (timer/disk/network), agent ID, data. ~2 million entries. |
+| **Agent Storage** | 4,198,408 | ~126 GB | Agent binary images (ELF/WASM), large state objects, shared memory region persistence. Managed by a simple sector-level free list stored in the superblock reserved area. |
+
+**Superblock structure:**
+
+```text
+Superblock {
+    magic: u32,                // 0x414F5344 ("AOSD")
+    version: u32,              // disk format version = 1
+    state_log_start: u32,      // sector 8
+    state_log_end: u32,        // sector 2,097,159
+    state_log_head: u32,       // next write position (append cursor)
+    checkpoint_start: u32,     // sector 2,097,160
+    checkpoint_end: u32,       // sector 2,101,255
+    checkpoint_tick: u64,      // tick of last checkpoint (0 = none)
+    trace_log_start: u32,      // sector 2,101,256
+    trace_log_end: u32,        // sector 4,198,407
+    trace_log_head: u32,       // next write position
+    agent_storage_start: u32,  // sector 4,198,408
+    agent_storage_end: u32,    // sector 268,435,455 (28-bit LBA max)
+    created_tick: u64,         // disk creation timestamp (kernel tick)
+}
+```
+
+**Capacity scaling:**
+
+| Addressing Mode | Max Disk Size | Available In |
+|----------------|---------------|-------------|
+| ATA 28-bit LBA | 128 GB | Stage-2/3 (current) |
+| ATA 48-bit LBA | 128 PB | Requires driver upgrade |
+| NVMe | Limited by device | Stage-4 (§26.2.1) |
+
+When upgrading to 48-bit LBA or NVMe, the superblock region table allows each region to grow independently. The Agent Storage region benefits most from larger disks.
+
 ### 24.7 Additional Syscalls (Stage-2) `[IMPL: ✅ ALL 7 IMPLEMENTED]`
 
 | # | Name | Description | Status |
