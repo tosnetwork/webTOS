@@ -1,0 +1,10 @@
+[package]
+name = "aos-ebpf-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "AOS eBPF-lite SDK — assembler, verifier, and disassembler for AOS eBPF policy programs"
+license = "MIT"
+
+[[bin]]
+name = "aos-ebpf"
+path = "src/main.rs"

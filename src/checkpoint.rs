@@ -11,7 +11,7 @@
 
 use crate::serial_println;
 use crate::agent::*;
-use crate::arch::x86_64::ata;
+use crate::block::StorageDevice;
 use crate::merkle;
 use crate::capability::Capability;
 extern crate alloc;
@@ -117,11 +117,16 @@ pub fn get_trace(index: usize) -> Option<TraceEntry> {
 /// Returns true if the checkpoint was written successfully, false if
 /// no disk is available or the write failed.
 pub fn save_to_disk() -> bool {
-    // Check if ATA disk is available
-    if !ata::init() {
-        serial_println!("[CHECKPOINT] No disk available, checkpoint skipped");
-        return false;
-    }
+    // Detect the best available storage device
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => {
+            serial_println!("[CHECKPOINT] No disk available, checkpoint skipped");
+            return false;
+        }
+    };
+
+    const SECTOR_SIZE: usize = 512;
 
     let tick = crate::arch::x86_64::timer::get_ticks();
     let event_seq = crate::event::get_sequence();
@@ -164,10 +169,10 @@ pub fn save_to_disk() -> bool {
         event_sequence: event_seq,
         agent_count,
         merkle_root_count: merkle_count,
-        total_size: total_sectors as u64 * ata::SECTOR_SIZE as u64,
+        total_size: total_sectors as u64 * SECTOR_SIZE as u64,
     };
 
-    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
+    let mut sector_buf = [0u8; SECTOR_SIZE];
 
     // Serialize header into sector buffer
     let header_bytes = unsafe {
@@ -176,17 +181,17 @@ pub fn save_to_disk() -> bool {
             core::mem::size_of::<CheckpointHeader>(),
         )
     };
-    let copy_len = header_bytes.len().min(ata::SECTOR_SIZE);
+    let copy_len = header_bytes.len().min(SECTOR_SIZE);
     sector_buf[..copy_len].copy_from_slice(&header_bytes[..copy_len]);
 
-    if ata::write_sectors(CHECKPOINT_START_SECTOR, 1, &sector_buf).is_err() {
+    if device.write(CHECKPOINT_START_SECTOR as u64, 1, &sector_buf).is_err() {
         serial_println!("[CHECKPOINT] Failed to write header");
         return false;
     }
 
     // ── Write agent states (sectors 1..N) ──
     for i in 0..agent_count as usize {
-        sector_buf = [0u8; ata::SECTOR_SIZE];
+        sector_buf = [0u8; SECTOR_SIZE];
         if let Some(ref agent) = agents[i] {
             let agent_bytes = unsafe {
                 core::slice::from_raw_parts(
@@ -194,24 +199,24 @@ pub fn save_to_disk() -> bool {
                     core::mem::size_of::<CheckpointAgent>(),
                 )
             };
-            let copy_len = agent_bytes.len().min(ata::SECTOR_SIZE);
+            let copy_len = agent_bytes.len().min(SECTOR_SIZE);
             sector_buf[..copy_len].copy_from_slice(&agent_bytes[..copy_len]);
         }
         let sector = CHECKPOINT_START_SECTOR + 1 + i as u32;
-        if ata::write_sectors(sector, 1, &sector_buf).is_err() {
+        if device.write(sector as u64, 1, &sector_buf).is_err() {
             serial_println!("[CHECKPOINT] Failed to write agent {}", i);
             return false;
         }
     }
 
     // ── Write Merkle roots (packed into one sector) ──
-    sector_buf = [0u8; ata::SECTOR_SIZE];
+    sector_buf = [0u8; SECTOR_SIZE];
     for i in 0..MAX_AGENTS.min(32) {
         // 32 roots × 16 bytes = 512 bytes = exactly one sector
         sector_buf[i * 16..(i + 1) * 16].copy_from_slice(&merkle_roots[i]);
     }
     let merkle_sector = CHECKPOINT_START_SECTOR + 1 + agent_count as u32;
-    if ata::write_sectors(merkle_sector, 1, &sector_buf).is_err() {
+    if device.write(merkle_sector as u64, 1, &sector_buf).is_err() {
         serial_println!("[CHECKPOINT] Failed to write Merkle roots");
         return false;
     }
@@ -228,12 +233,11 @@ pub fn save_to_disk() -> bool {
 ///
 /// Returns Some(header) if a valid checkpoint exists, None otherwise.
 pub fn load_header_from_disk() -> Option<CheckpointHeader> {
-    if !ata::init() {
-        return None;
-    }
+    let device = StorageDevice::detect()?;
 
-    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
-    if ata::read_sectors(CHECKPOINT_START_SECTOR, 1, &mut sector_buf).is_err() {
+    const SECTOR_SIZE: usize = 512;
+    let mut sector_buf = [0u8; SECTOR_SIZE];
+    if device.read(CHECKPOINT_START_SECTOR as u64, 1, &mut sector_buf).is_err() {
         return None;
     }
 
@@ -290,12 +294,18 @@ pub fn take_checkpoint() -> CheckpointHeader {
 /// Returns an array of CheckpointAgent entries read from sectors after the header.
 pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAgent>; MAX_AGENTS] {
     let mut agents: [Option<CheckpointAgent>; MAX_AGENTS] = [const { None }; MAX_AGENTS];
-    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
+    const SECTOR_SIZE: usize = 512;
+    let mut sector_buf = [0u8; SECTOR_SIZE];
+
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => return agents,
+    };
 
     for i in 0..header.agent_count as usize {
         if i >= MAX_AGENTS { break; }
         let sector = CHECKPOINT_START_SECTOR + 1 + i as u32;
-        if ata::read_sectors(sector, 1, &mut sector_buf).is_ok() {
+        if device.read(sector as u64, 1, &mut sector_buf).is_ok() {
             let agent = unsafe {
                 core::ptr::read(sector_buf.as_ptr() as *const CheckpointAgent)
             };
@@ -501,12 +511,15 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
 /// Returns an array of MerkleHash values.
 pub fn load_merkle_from_disk(header: &CheckpointHeader) -> [crate::merkle::MerkleHash; MAX_AGENTS] {
     let mut roots: [crate::merkle::MerkleHash; MAX_AGENTS] = [[0u8; 16]; MAX_AGENTS];
-    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
+    const SECTOR_SIZE: usize = 512;
+    let mut sector_buf = [0u8; SECTOR_SIZE];
 
-    let merkle_sector = CHECKPOINT_START_SECTOR + 1 + header.agent_count as u32;
-    if ata::read_sectors(merkle_sector, 1, &mut sector_buf).is_ok() {
-        for i in 0..MAX_AGENTS.min(32) {
-            roots[i].copy_from_slice(&sector_buf[i * 16..(i + 1) * 16]);
+    if let Some(device) = StorageDevice::detect() {
+        let merkle_sector = CHECKPOINT_START_SECTOR + 1 + header.agent_count as u32;
+        if device.read(merkle_sector as u64, 1, &mut sector_buf).is_ok() {
+            for i in 0..MAX_AGENTS.min(32) {
+                roots[i].copy_from_slice(&sector_buf[i * 16..(i + 1) * 16]);
+            }
         }
     }
 

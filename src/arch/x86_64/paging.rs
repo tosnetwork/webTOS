@@ -7,6 +7,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::serial_println;
+use super::kaslr;
 
 /// Page/frame size: 4 KiB.
 pub const PAGE_SIZE: usize = 4096;
@@ -207,14 +208,32 @@ pub fn init() {
         }
     }
 
-    NEXT_FREE.store(reserved_frames as u64, Ordering::Relaxed);
+    // Apply heap ASLR: skip a random number of frames after the kernel image
+    // so that the first heap allocation lands at a non-deterministic address.
+    // kaslr::heap_skip_frames() returns 0 if kaslr::init() has not yet been
+    // called (entropy = 0), which is safe but non-random.
+    let skip = kaslr::heap_skip_frames();
+    let first_free = reserved_frames + skip;
 
-    let available = MAX_FRAMES - reserved_frames;
-    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB), kernel reserved {} frames ({} KB)",
+    // Mark the skipped frames as allocated so they are never handed out.
+    // This wastes at most 63 × 4 KiB = 252 KiB, an acceptable trade-off.
+    for i in reserved_frames..first_free {
+        if i < MAX_FRAMES {
+            let word = i / 64;
+            let bit = i % 64;
+            unsafe { BITMAP[word] |= 1u64 << bit; }
+        }
+    }
+
+    NEXT_FREE.store(first_free as u64, Ordering::Relaxed);
+
+    let available = MAX_FRAMES.saturating_sub(first_free);
+    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB), kernel reserved {} frames ({} KB), heap ASLR skip {} frames",
         available,
         available * PAGE_SIZE / (1024 * 1024),
         reserved_frames,
-        reserved_frames * PAGE_SIZE / 1024);
+        reserved_frames * PAGE_SIZE / 1024,
+        skip);
 }
 
 /// Allocate a single 4KB physical frame.

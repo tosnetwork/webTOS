@@ -18,6 +18,7 @@ pub mod virtio_net;
 pub mod e1000;
 pub mod nvme;
 pub mod security;
+pub mod kaslr;
 pub mod framebuffer;
 
 pub use serial::{serial_print, serial_println};

@@ -9,7 +9,7 @@
 //! Reference: AOS Yellow Paper §24.5.
 
 use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
-use crate::arch::x86_64::ata;
+use crate::block::StorageDevice;
 
 const MAX_ENTRIES_PER_KEYSPACE: usize = 64;
 const MAX_VALUE_SIZE: usize = 256;
@@ -55,7 +55,7 @@ fn crc32(data: &[u8]) -> u32 {
 ///   offset 292..512: unused padding (zeroed)
 ///
 /// The CRC32 covers bytes 0..288 (everything before the CRC field).
-const ENTRY_SIZE: usize = ata::SECTOR_SIZE; // 512 bytes
+const ENTRY_SIZE: usize = 512; // one ATA/NVMe sector
 const CRC_OFFSET: usize = 288;
 const VALUE_OFFSET: usize = 32;
 
@@ -247,7 +247,8 @@ fn index_apply(keyspace_id: KeyspaceId, key: u64, value: &[u8]) {
 /// 2. If found, replays the append-only log to rebuild the in-memory index.
 /// 3. If not found, operates in in-memory-only mode (identical to Stage-1).
 pub fn init() {
-    let disk_present = ata::init();
+    let device = StorageDevice::detect();
+    let disk_present = device.is_some();
 
     // Safety: single-core init
     unsafe {
@@ -255,18 +256,19 @@ pub fn init() {
     }
 
     if !disk_present {
-        crate::serial_println!("[persist] no ATA disk detected — in-memory only");
+        crate::serial_println!("[persist] no storage device detected — in-memory only");
         return;
     }
 
-    crate::serial_println!("[persist] ATA disk detected — replaying state log...");
+    let device = device.unwrap();
+    crate::serial_println!("[persist] {} detected — replaying state log...", device.name());
 
     // Replay log from sector 0
     let mut sector_buf = [0u8; ENTRY_SIZE];
     let mut replayed: u64 = 0;
 
     for sector in STATE_START_SECTOR..MAX_LOG_SECTORS {
-        if ata::read_sectors(sector, 1, &mut sector_buf).is_err() {
+        if device.read(sector as u64, 1, &mut sector_buf).is_err() {
             break;
         }
 
@@ -402,7 +404,9 @@ pub fn put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64> {
             let mut sector_buf = [0u8; ENTRY_SIZE];
             serialize_entry(&mut sector_buf, NEXT_SEQUENCE, keyspace, key, value);
 
-            if ata::write_sectors(NEXT_SECTOR, 1, &sector_buf).is_err() {
+            let dev = StorageDevice::detect();
+            let write_ok = dev.map_or(false, |d| d.write(NEXT_SECTOR as u64, 1, &sector_buf).is_ok());
+            if !write_ok {
                 // Disk write failed — still update in-memory
                 crate::serial_println!("[persist] WARNING: disk write failed at sector {}", NEXT_SECTOR);
             } else {

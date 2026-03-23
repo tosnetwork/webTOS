@@ -1,0 +1,4 @@
+# Override the workspace-level config that forces x86_64-unknown-none.
+# aos-ebpf-sdk is a host-side tool and must build for the host (native) target.
+[build]
+target = "x86_64-unknown-linux-gnu"

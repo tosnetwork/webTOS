@@ -8,6 +8,7 @@
 //! - STIBP (Single Thread Indirect Branch Predictor): IA32_SPEC_CTRL bit 1
 
 use crate::serial_println;
+use super::kaslr;
 
 /// CR4 bit 20: Supervisor Mode Execution Prevention
 const CR4_SMEP: u64 = 1 << 20;
@@ -281,6 +282,10 @@ pub unsafe fn clac() {
 /// logs results. Gracefully skips features not supported by the CPU (e.g.
 /// older QEMU configurations).
 pub fn init() {
+    // Seed KASLR entropy first so that subsequent allocations (heap, stacks)
+    // can use the randomised offsets before any subsystem is initialised.
+    kaslr::init();
+
     let (smep_ok, smap_ok, nx_ok, ibrs_ok, stibp_ok) = cpuid_check();
 
     serial_println!(

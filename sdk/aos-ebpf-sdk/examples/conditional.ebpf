@@ -1,0 +1,14 @@
+; Conditional policy example.
+; r1 = context pointer (passed by AOS kernel)
+; Load a field from the context and decide allow/deny.
+;
+; This example checks the value at [r1+0]:
+;   if [r1+0] == 0  ->  allow (r0 = 0)
+;   else            ->  deny  (r0 = 1)
+
+ldxw  r0, [r1+0]       ; r0 = *(u32*)(ctx + 0)
+jeq   r0, 0, +2        ; if r0 == 0, jump to allow
+mov   r0, 1            ; r0 = 1  (deny)
+ja    +1               ; jump to exit
+mov   r0, 0            ; r0 = 0  (allow)
+exit
