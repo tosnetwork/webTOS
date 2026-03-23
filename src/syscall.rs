@@ -409,8 +409,9 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
             }
 
             serial_println!("[SYSCALL] Checkpoint triggered by root agent");
+            let saved = crate::checkpoint::save_to_disk();
             crate::event::checkpoint_triggered(caller_id);
-            E_OK
+            if saved { E_OK } else { E_NOT_FOUND } // E_NOT_FOUND = no disk
         }
 
         // ── 16: sys_mmap ─────────────────────────────────────────────────
