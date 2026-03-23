@@ -32,6 +32,43 @@ This yellow paper covers the whole AOS stack, but Stage-1 is primarily an **AOS-
 
 ---
 
+## 0. AOS First Principles / Original Intent
+
+AOS began from a simple premise: autonomous software agents should not be treated as an afterthought running on top of abstractions designed for human users. The system is therefore intentionally built around the needs of agent execution, not around the needs of desktop sessions, shell users, or POSIX-era application compatibility.
+
+The original intent of AOS is:
+
+* to provide an **agent-native execution substrate**, not a general-purpose consumer operating system
+* to make **authority explicit** through capabilities and policy, rather than ambient privilege
+* to make **messaging, structured state, budgeting, and auditability** first-class system concepts
+* to prefer **deterministic or replayable behavior** over convenience inherited from legacy APIs
+* to keep the privileged kernel narrow, while allowing richer runtime, service, and distributed layers to grow above it
+* to validate this model first in **virtual machines and controlled environments**, before expanding toward broader hardware support
+
+In practical terms, AOS is centered on:
+
+* agents
+* mailboxes
+* capabilities
+* state objects
+* energy budgets
+* checkpoints
+* event logs
+
+It is intentionally not centered on:
+
+* files as the primary execution abstraction
+* fork/exec as the process model
+* raw sockets as the default communication model
+* shell sessions as the primary operator interface
+* unrestricted global authority
+
+This distinction matters. If AOS drifts into becoming "Linux with agent tooling," it loses the architectural reason for existing. The project only remains true to its original intent if agent execution, bounded authority, auditability, replay, and brokered resource access remain the primary design constraints from kernel to runtime to network layer.
+
+Stage-1 should therefore be read as proof of the substrate, not as the final product shape. The purpose of the early kernel is to validate the first principles above so that later layers can grow on top of a coherent base rather than on inherited legacy assumptions.
+
+---
+
 ## 1. Motivation
 
 Modern operating systems were designed for human-operated computing environments. Their core abstractions center around:
@@ -2312,7 +2349,493 @@ Stage-4 is successful when:
 
 ---
 
-## 27. Long-Term Vision
+## 27. Stage-5 to Stage-10 Roadmap (Toward the Original Intent)
+
+Stage-1 through Stage-4 establish that AOS can boot, isolate agents, host multiple runtimes, replay execution, broker networking, run across nodes, and expose developer tooling. The later roadmap must now stay aligned with the first principles in §0 rather than drifting toward a generic desktop or POSIX-compatibility agenda.
+
+The purpose of Stage-5 through Stage-10 is therefore not to add familiar operating-system surface area for its own sake. It is to deepen the properties that justify AOS existing at all:
+
+* explicit authority
+* agent-native execution
+* verifiable state transitions
+* replayable and attestable execution
+* brokered access to expensive or dangerous resources
+* deployable, distributed, appliance-grade operation
+
+The negative constraint is equally important. The later roadmap should not be reinterpreted as:
+
+* a shell-first roadmap
+* an SSH-first roadmap
+* a POSIX-compatibility roadmap
+* a desktop-user environment roadmap
+
+### 27.1 Immediate Stage-4 closure items `[IMPL: ⚠️ still required before Stage-5 becomes primary focus]`
+
+Before the Stage-5 roadmap becomes the mainline engineering focus, the remaining Stage-4 obligations should be closed so that the next stages are built on a complete substrate rather than on partially validated hardware and tooling assumptions.
+
+Priority closure items:
+
+* real x86_64 UEFI hardware boot validation, not only QEMU + OVMF
+* `BlockDevice` unification across ATA PIO and NVMe so persistence, checkpoint, and replay stop depending on direct driver-specific calls
+* eBPF-lite SDK and toolchain so policy is not limited to hand-assembled bytecode
+* MSI-X wiring for real hardware interrupt delivery
+* complete brokered HTTP/TCP path in `netd`, rather than UDP-only transport and HTTP-like stubs
+
+### 27.2 Stage-5: Trusted Authority Plane `[IMPL: ⏳ Planned]`
+
+Stage-5 should answer a foundational question: **who is allowed to cause what, for how long, and under which proof of authority?**
+
+Stage-1 through Stage-4 prove capability enforcement at the kernel boundary. Stage-5 must turn that into a full authority plane spanning local execution, policy rollout, node identity, remote delegation, revocation, and attested admission.
+
+Objectives:
+
+* define durable principals distinct from transient `AgentId`
+* formalize signed capability leases with expiry, delegation depth, and replay protection
+* make revocation a first-class system operation across reboot and cross-node execution
+* bind authority roots and policy bundles to node attestation
+* make admission control explicit for spawn, migration, remote mailbox, and privileged broker access
+
+Core additions:
+
+* **Principal model**: introduce stable principals for root authorities, system services, users, organizations, and remote nodes
+* **Capability leases**: extend capabilities with issuer, subject, scope, expiry, nonce, and signature fields so authority can be verified offline
+* **Revocation service**: add an `authd` or equivalent authority service responsible for revocation lists, lease status, and propagation
+* **Policy bundles**: package eBPF-lite policy, static rules, and authority roots as signed, versioned bundles with rollback support
+* **Attested admission**: require privileged brokers and remote nodes to prove the policy hash and authority root they are enforcing
+* **Authority audit chain**: persist grant, delegate, revoke, renew, and deny events as a separate queryable audit class
+
+Success criteria:
+
+* a third party can validate a delegation chain without trusting the local node's memory state
+* a revoked capability is denied after reboot and across remote mailbox paths
+* a node can produce an attestation report naming the authority root and policy bundle hash it is enforcing
+* every privileged action can be traced back to an explicit grant, delegation, or policy rule
+
+### 27.3 Stage-6: Durable State Plane `[IMPL: ⏳ Planned]`
+
+Stage-6 should answer the next foundational question: **what state exists, which version is authoritative, and how can that state be verified, recovered, or moved?**
+
+The AOS state model must become more than "structured storage inside the kernel." It must become the durable, versioned, proof-friendly substrate on which long-lived agents, distributed services, and execution receipts depend.
+
+Objectives:
+
+* upgrade state objects into a versioned, recoverable, proof-bearing storage plane
+* support snapshots, compaction, rollback, and crash-consistent recovery
+* make state proofs and historical roots first-class external artifacts
+* support encrypted or sealed keyspaces for sensitive agent state
+* prepare the state layer for replication and migration across nodes
+
+Core additions:
+
+* **Versioned keyspaces**: every keyspace advances through explicit state roots rather than opaque mutation history
+* **Transactional mutation groups**: allow atomic multi-key updates within a bounded state transaction model
+* **Compaction and garbage collection**: retain proof history while preventing the append-only log from growing without bound
+* **Historical proofs**: support inclusion and exclusion proofs against current and historical Merkle roots
+* **Encrypted keyspaces**: allow capability-scoped sealed storage where plaintext is not exposed outside the authorized execution path
+* **Replication hooks**: define the log, snapshot, and proof interfaces needed by future cross-node replication services
+
+Success criteria:
+
+* crash recovery always reconstructs a consistent state root and transaction boundary
+* an external verifier can validate inclusion or exclusion against a historical root without replaying the entire node
+* agent migration and checkpoint restore preserve keyspace integrity and state proofs
+* state growth remains operationally bounded through compaction and snapshot lifecycle management
+
+### 27.4 Stage-7: Agent Package and Skill Ecosystem `[IMPL: ⏳ Planned]`
+
+Stage-7 should answer the packaging question: **how are agents and skills built, signed, distributed, installed, upgraded, and removed without violating AOS authority and isolation rules?**
+
+By this point, AOS should stop being only a kernel plus demos. It should become a platform where deployable agent artifacts are treated as first-class objects with explicit lifecycle, compatibility, and capability contracts.
+
+Objectives:
+
+* finalize `skilld` and the mailbox-based skill installation protocol
+* define a signed package format for native agents, WASM agents, and skills
+* support capability declarations, runtime declarations, version compatibility, and upgrade/rollback policy
+* provide a reproducible developer and operator workflow from source to deployable artifact
+* keep plugin extensibility aligned with agent isolation rather than in-process extension
+
+Core additions:
+
+* **Package format**: define an AOS package manifest containing runtime kind, entry points, capability requests, resource quotas, ABI version, and content hash
+* **Signing and provenance**: require packages and manifests to be signed so installation and replay can verify origin and integrity
+* **Registry / distribution model**: support content-addressed retrieval from local bundles, cluster registries, or external repositories
+* **Upgrade semantics**: define canary rollout, rollback, compatibility checks, and state migration hooks for package upgrades
+* **Skill governance**: make `skilld` enforce capability subset rules, quota checks, policy checks, and package signature validation
+* **Build metadata**: capture reproducible build inputs so deployed artifacts can be matched to source and proofs
+
+Success criteria:
+
+* a developer can build, sign, publish, install, invoke, update, and roll back a skill without manual kernel editing
+* package installation never escalates capability beyond the installing authority chain
+* a third party can independently verify the package hash, signer identity, and runtime declaration of a deployed agent
+* skill lifecycle events are auditable and replay-compatible
+
+### 27.5 Stage-8: Distributed Execution Fabric `[IMPL: ⏳ Planned]`
+
+Stage-8 should answer the fabric question: **how does AOS behave when the system is not one node, but a fleet of nodes with failures, movement, and contested resources?**
+
+Stage-4 introduces cross-node messaging and migration primitives. Stage-8 must turn those primitives into a coherent AOS-NET execution fabric with explicit delivery, placement, and recovery semantics.
+
+#### 27.5.1 Distributed Execution Fabric Explained
+
+AOS distributed execution is easy to misread as blockchain-style consensus execution. That is **not** the intended model.
+
+AOS distributed execution does **not** mean:
+
+* every node executes the same program
+* every node replicates the same global state
+* every workload is ordered through one global consensus path
+* one agent is split into a WAN-scale shared-memory thread
+
+AOS distributed execution **does** mean:
+
+* different agents may run on different AOS nodes
+* mailbox communication may cross node boundaries
+* an agent may be checkpointed on one node and resumed on another
+* trust, authority, state integrity, and accounting are preserved across that movement
+
+The thing being distributed is therefore not a single instruction stream. What is distributed is **execution responsibility**: which node currently runs an agent, holds its mailbox, serves its state path, enforces its delegated authority, and produces the resulting audit and accounting artifacts.
+
+This is why AOS-NET should be read as an **execution fabric**, not as a replicated global ledger. A ledger may grow above the fabric later (§27.6), but the fabric itself is the network that lets trusted execution be placed, routed, moved, resumed, and verified across nodes.
+
+#### 27.5.2 Operational Forms
+
+Stage-8 distributed execution appears in four main forms:
+
+* **Distributed placement**: different agents run on different nodes according to locality, hardware class, policy, and available energy
+* **Cross-node mailbox execution**: a local `sys_send` may become a remote mailbox delivery through `routerd` and the network fabric
+* **Checkpoint-based migration**: an agent is suspended, checkpointed, transferred, restored on another node, and resumed with preserved authority and state references
+* **Distributed workload pipelines**: a larger workload is decomposed into multiple agents or stages across nodes, each with its own message flow, state transition, budget consumption, and receipt
+
+The last form is intentionally higher-level than traditional parallel computing. AOS is not optimized around distributed shared memory. It is optimized around agents, mailboxes, state roots, and explicit handoff points.
+
+#### 27.5.3 Required Fabric Mechanisms
+
+To make distributed execution real rather than aspirational, Stage-8 must combine several mechanisms that earlier stages only introduce in partial form:
+
+* **Node identity and attestation**: every node needs a stable identity, signing key, and attestation story so remote execution is attributable and verifiable
+* **Remote mailbox routing**: the fabric must resolve mailbox ownership, route inter-node messages, and define timeout, retry, ordering, and deduplication behavior
+* **Cross-node authority verification**: a receiving node must verify the sender's capability or lease, not merely trust a claimed sender ID in the message body
+* **Checkpoint transfer and restore**: migration requires a portable checkpoint format carrying runtime state, mailbox continuity, authority context, budget state, and checkpoint provenance
+* **State access modes**: the fabric must support at least three state patterns: state moves with the agent, state stays remote and is broker-accessed, or a snapshot is copied and later reconciled
+* **Placement and failure semantics**: the system must specify where an agent should run, when it may move, how failover works, and how duplicate resume is prevented after node loss or partition
+* **Execution receipts**: Stage-8 should expose the hooks needed for Stage-9 receipts, even if the full settlement model arrives later
+
+#### 27.5.4 AOS Stage-8 Distributed Execution Fabric
+
+```text
+                        AOS STAGE-8 DISTRIBUTED EXECUTION FABRIC
+
+             logical control plane: membership | placement | leases | policy | attestation
++--------------------------------------------------------------------------------------------------+
+|                                 Fabric Control And Verification                                  |
++-------------------------------+---------------------------------------+--------------------------+
+                                |                                       |
+                                |                                       |
+                                v                                       v
+      remote mailbox / checkpoint / trace / receipt traffic     remote mailbox / checkpoint / trace / receipt traffic
+
++-------------------------------------------+          +-------------------------------------------+
+|                  Node A                   |          |                  Node B                   |
+| AOS-0 | AOS-1 | AOS-2                     |          | AOS-0 | AOS-1 | AOS-2                     |
+|                                           |          |                                           |
+| agent_x                                   |          | routerd                                   |
+| mailbox_x                                 |=========>| mailbox_y                                 |
+| routerd                                   |  remote  | agent_y                                   |
+| state shard / checkpoint store            |  send    | state shard / checkpoint store            |
+| local audit / energy / replay artifacts   |<=========| local audit / energy / replay artifacts   |
++------------------------+------------------+  reply   +--------------------------+----------------+
+                         |                                                      ^
+                         | checkpoint transfer / restore                        |
+                         v                                                      |
+              +----------+-----------------------+                              |
+              |                Node C            |------------------------------+
+              | AOS-0 | AOS-1 | AOS-2            |     migrated mailbox owner /
+              | restored agent_x                 |     resumed execution target
+              | restored runtime state           |
+              | state access or synced snapshot  |
+              | local proof / receipt emission   |
+              +----------------------------------+
+```
+
+How to read this figure:
+
+* The top control band is **logical**, not necessarily one centralized controller. Membership, placement, lease, policy, and attestation services may themselves be distributed.
+* `routerd` turns a mailbox send into a network-routed delivery when the destination mailbox is remote.
+* Migration is modeled as **checkpoint -> transfer -> restore -> resume**, not as remote shared-memory continuation.
+* State does not have to move in the same way for every workload. Small state may migrate; large state may remain remote; batch workloads may use snapshot-and-sync.
+* The fabric is the layer that preserves continuity of execution, trust, and accounting across nodes. Full billing and settlement semantics remain a Stage-9 concern.
+
+One compact definition is:
+
+> **Distributed Execution Fabric = remote mailbox routing + checkpoint migration + cross-node authority verification + placement and failure semantics.**
+
+Objectives:
+
+* formalize cross-node mailbox semantics, delivery guarantees, and replay behavior
+* add cluster membership, node labeling, and placement policies
+* support controlled agent mobility, restart, and failover
+* make remote state, authority, and energy accounting consistent enough for production use
+* contain failures so one bad node, partition, or broker does not collapse the whole execution fabric
+
+Core additions:
+
+* **Membership service**: define node discovery, liveness, lease renewal, and trust bootstrap semantics
+* **Placement engine**: schedule agents based on capability needs, data locality, energy availability, hardware class, and policy
+* **Remote mailbox classes**: declare ordering, retry, timeout, and deduplication behavior for inter-node messages rather than leaving it implicit
+* **Migration contracts**: formalize cold move, warm move, restart-from-checkpoint, and failover semantics
+* **Distributed accounting**: reconcile per-node energy consumption, state ownership, and authority status for mobile agents
+* **Failure domains**: isolate fabric faults by broker, node, keyspace, and policy domain so partial failure remains inspectable and recoverable
+
+Success criteria:
+
+* an agent can move or restart on another node without losing authority provenance, state integrity, or replay continuity
+* remote mailbox delivery semantics are explicit, tested, and externally documented
+* node loss or partition produces bounded failure modes rather than undefined cross-node behavior
+* cluster placement decisions are auditable in terms of policy, capacity, and authority
+
+### 27.6 Stage-9: Verifiable Execution Economy `[IMPL: ⏳ Planned]`
+
+Stage-9 should answer the economic question: **how does AOS turn execution, energy, policy, and proof into a receipt that outside systems can trust?**
+
+Energy is already treated as OS-wide gas. The next step is to make execution economically intelligible to systems outside the kernel: billing, settlement, reputation, dispute resolution, and proof-backed accounting.
+
+#### 27.6.1 Verifiable Execution Economy Explained
+
+Stage-8 makes execution possible across nodes. Stage-9 makes that execution **trustworthy, billable, disputable, and externally verifiable**.
+
+The key transition is this:
+
+* Stage-8 answers: can an agent run, move, communicate, and resume across nodes?
+* Stage-9 answers: when that execution finishes, what artifact can an outside system trust?
+
+Stage-9 should therefore not end with "the agent returned output bytes." It should end with a portable execution artifact that ties together:
+
+* what code ran
+* which trust class ran it
+* what inputs and outputs were committed
+* how state changed
+* what authority and policy were in force
+* how much energy was consumed
+* which node attested to the execution
+* how a third party can verify or dispute the result
+
+This stage is **not** synonymous with:
+
+* global consensus over every workload
+* mandatory blockchain settlement
+* requiring every execution to produce a zero-knowledge proof
+* pretending that native and WASM execution provide the same determinism guarantees
+
+Instead, Stage-9 formalizes an **execution receipt system**. The kernel and system services expose the evidence needed for billing, proof, replay, and settlement, while actual market or token mechanics may remain outside the trusted kernel base.
+
+#### 27.6.2 Receipt Design Principles
+
+The receipt model should follow a few hard constraints:
+
+* **Commitment-oriented**: receipts should carry hashes, roots, and content references rather than embedding large or sensitive raw payloads
+* **Runtime-class aware**: every receipt must name the determinism and trust class of the execution rather than implying one uniform guarantee for all runtimes
+* **Authority-bound**: the receipt must bind the effective authority set or lease set that was active during execution
+* **Policy-bound**: the receipt must name the policy bundle and decision commitment that constrained execution
+* **Replay-anchorable**: the receipt must point to the checkpoint and transcript material needed for replay or proof
+* **Cross-node stable**: durable identities such as `workload_id`, `execution_id`, `principal_id`, and `node_id` are primary; a local `agent_id` is only diagnostic metadata
+* **Privacy-preserving**: raw inputs, outputs, and traces may be referenced by content hash or encrypted blob reference rather than disclosed directly in the receipt
+
+#### 27.6.3 Draft `ExecutionReceipt` Specification
+
+The minimum useful Stage-9 receipt should look like this:
+
+```text
+ExecutionReceipt {
+    receipt_version: u16,
+    receipt_id: Hash256,
+
+    workload_id: Hash256,          // stable user-visible job or request identity
+    execution_id: Hash256,         // this concrete run / retry / resumed attempt
+    principal_id: PrincipalId,     // durable authority-bearing identity
+    local_agent_id: Option<u16>,   // optional diagnostic field; not cross-node canonical
+    node_id: NodeId,
+
+    runtime_class: RuntimeClass,   // e.g. ProofGradeWasm, ReplayGradeNative, BrokerService
+    package_hash: Hash256,         // package / manifest hash
+    code_hash: Hash256,            // exact executable image hash
+
+    input_commitment: Hash256,
+    output_commitment: Hash256,
+
+    initial_state_root: Hash256,
+    final_state_root: Hash256,
+    event_log_commitment: Hash256,
+    trace_commitment: Hash256,
+
+    authority_commitment: Hash256, // granted capabilities / leases in force
+    policy_bundle_hash: Hash256,
+    policy_decision_commitment: Hash256,
+
+    energy_used: u64,
+    pricing_class: u32,
+    payer_ref: PrincipalRef,
+
+    checkpoint_ref: ContentRef,
+    attestation_ref: ContentRef,
+
+    tick_start: u64,
+    tick_end: u64,
+    wall_clock_hint: Option<u64>,  // optional metadata; not the canonical replay anchor
+
+    signer_ref: PrincipalRef,
+    signature: Signature,
+}
+```
+
+Field notes:
+
+* `workload_id` identifies the user-visible job; `execution_id` distinguishes one concrete attempt, replay, migration resume, or retry from another
+* `principal_id` is the durable identity that requested or owns the execution; `local_agent_id` may still appear for debugging but must not be treated as the cross-node identity
+* `runtime_class` is mandatory because trust claims differ across execution classes; a receipt must not imply that native replay-grade execution is equivalent to proof-grade WASM
+* `input_commitment` and `output_commitment` commit to the actual payloads, which may live in separate content-addressed or encrypted blobs
+* `initial_state_root` and `final_state_root` capture the state transition boundary without requiring the receipt to embed the full state delta
+* `event_log_commitment` captures the semantic execution history; `trace_commitment` captures the replay-oriented transcript or I/O trace material
+* `authority_commitment` binds the effective capability or lease set in force during execution; this is more stable than relying on local in-memory capability tables
+* `policy_bundle_hash` identifies which policy bundle constrained the run; `policy_decision_commitment` captures the effective allow, deny, or override decisions relevant to the receipt
+* `tick_start` and `tick_end` are the canonical time anchors for replay semantics; wall-clock time may be recorded, but it is secondary metadata
+* `checkpoint_ref` and `attestation_ref` point to separately stored artifacts used for replay, proof, or node-trust verification
+* `signature` is the accountable attestation over the receipt itself; verification of the signer is part of the Stage-5 authority plane
+
+This receipt should normally be accompanied by one or both of the following:
+
+* a **replay bundle**: checkpoint, transcript, and referenced blobs sufficient for independent replay verification
+* a **proof bundle**: compact proof artifacts or commitments suitable for faster external verification without full replay
+
+#### 27.6.4 Receipt / Replay / Proof / Settlement Relationships
+
+```text
+                     AOS STAGE-9 VERIFIABLE EXECUTION ECONOMY
+
+                                 execution on trusted node
+                                           |
+                                           v
++--------------------------------------------------------------------------------------+
+|                               AOS Execution Outcome                                   |
+| code hash | runtime class | state transition | energy use | policy result | trace    |
++--------------------------------------+-----------------------------------------------+
+                                       |
+                                       v
++--------------------------------------------------------------------------------------+
+|                                 ExecutionReceipt                                      |
+| receipt_id | workload_id | execution_id | node_id | principal_id                      |
+| package/code commitments | input/output commitments | state roots                      |
+| event/trace commitments | authority commitment | policy bundle hash                    |
+| energy_used | checkpoint_ref | attestation_ref | signer_ref | signature                |
++------------------------------+------------------------------+----------------------------+
+                               |                              |
+                               | references                   | references
+                               v                              v
+                 +---------------------------+      +---------------------------+
+                 |       Replay Bundle       |      |        Proof Bundle       |
+                 | checkpoint image          |      | compact proof artifacts   |
+                 | execution transcript      |      | proof commitments         |
+                 | I/O trace                 |      | optional verifier hints   |
+                 | referenced blobs          |      | faster external checks    |
+                 +-------------+-------------+      +-------------+-------------+
+                               |                              |
+                               | verify / dispute            | verify / fast-path
+                               v                              v
+                 +---------------------------+      +---------------------------+
+                 |     Replay Verifier       |      |      Proof Verifier       |
+                 | deterministic re-run      |      | commitment / proof check  |
+                 | divergence detection      |      | no full replay required   |
+                 +-------------+-------------+      +-------------+-------------+
+                               \                              /
+                                \                            /
+                                 \                          /
+                                  v                        v
+                          +--------------------------------------------+
+                          |      Billing / Settlement Adapters         |
+                          | invoices | marketplace settlement | chain   |
+                          | accounting export | dispute resolution      |
+                          +--------------------------------------------+
+```
+
+How to read this figure:
+
+* The **ExecutionReceipt** is the canonical portable artifact. External systems should key off the receipt first, not off raw logs or ad hoc node-local state.
+* The **Replay Bundle** is the high-fidelity verification path. It is heavier, but it supports independent re-execution, divergence checks, and dispute resolution.
+* The **Proof Bundle** is the compact verification path. It exists for faster or cheaper external checks when full replay is unnecessary or too expensive.
+* Billing and settlement systems should consume the receipt plus whichever verification path their trust model requires. They do not need to become part of the kernel trust base.
+* Not every workload needs both bundles in the same form. Some workloads may ship only a replay bundle; others may ship a replay bundle plus a compact proof bundle; proof-grade runtimes may later support stronger cryptographic artifacts than replay-grade runtimes.
+
+Objectives:
+
+* unify energy accounting, execution proof, policy identity, and attestation into one receipt model
+* support runtime-aware pricing that distinguishes deterministic and non-deterministic execution classes
+* make execution receipts portable to external billing, settlement, and verification systems
+* support replay-backed dispute resolution when charges, outputs, or policy enforcement are contested
+
+Core additions:
+
+* **Canonical execution transcript**: define a content-addressed transcript and replay bundle format that receipts can reference for verification and dispute resolution
+* **Execution receipt format**: define a commitment-oriented receipt carrying workload identity, execution identity, runtime class, code/package hash, input/output commitments, state roots, transcript commitments, authority commitment, policy identity, energy usage, and attestation reference
+* **Runtime-class pricing**: price native, WASM, brokered I/O, policy execution, and remote execution explicitly rather than treating all work as homogeneous
+* **Quote and admission path**: allow an agent or operator to request an execution quote before launching a costly workload
+* **Billing and settlement adapters**: expose structured receipts to external systems without making token economics part of the kernel trust base
+* **External verifier SDK**: provide verifier tooling for receipts, transcripts, Merkle proofs, policy bindings, and attestation references without requiring the verifier to run a full trusted AOS node
+* **Dispute workflow**: define how replay traces, proofs, and policy hashes are used to settle disagreements about what happened and what should be charged
+
+Success criteria:
+
+* a third party can verify an execution receipt and its referenced transcript or proof bundle without trusting the originating node's live memory state
+* receipts always name the runtime determinism class rather than claiming uniform guarantees across native and WASM execution
+* energy charges reconcile with replay traces, broker usage, and policy execution costs
+* disputed executions can be resolved through replay and proof rather than operator assertions
+
+### 27.7 Stage-10: Appliance-Grade AOS `[IMPL: ⏳ Planned]`
+
+Stage-10 should answer the deployment question: **what does AOS look like when it is trusted as a real productized execution appliance rather than as a research kernel?**
+
+This stage is not about turning AOS into a conventional general-purpose operating system. It is about making AOS reliable enough to operate as a dedicated agent node or trusted execution appliance in production environments.
+
+Objectives:
+
+* define a reference hardware and deployment profile for AOS nodes
+* harden the boot, upgrade, recovery, and attestation chain
+* provide remote operations without collapsing back to unrestricted shell administration
+* make observability, incident response, and disaster recovery native to the agent-first model
+* support operational multi-tenancy with explicit isolation and metering boundaries
+
+Core additions:
+
+* **Reference appliance profile**: publish supported hardware classes, firmware expectations, memory and storage tiers, and required security features
+* **Measured boot chain**: connect Secure Boot, TPM-backed attestation, package trust, and policy identity into one operational chain
+* **Signed upgrade system**: add atomic upgrade, rollback, and version-gating for kernel, policy bundle, runtime host, and system agents
+* **Mailbox-based administration plane**: provide remote operator workflows through authenticated service agents rather than ambient shell access
+* **Observability and forensics**: standardize metrics, crash dumps, replay capture, and post-mortem evidence export
+* **Tenant isolation profile**: document and enforce how multiple authorities or customers can safely share one appliance or cluster
+
+Success criteria:
+
+* a fresh appliance boots into an attested, policy-identified, remotely manageable state without requiring a general shell environment
+* upgrades are signed, auditable, rollback-safe, and recoverable after interruption
+* operators can inspect health, replay incidents, and collect forensic artifacts through explicit system services
+* production deployment guidance remains aligned with the AOS principle of explicit authority rather than ambient administrative access
+
+### 27.8 Through-Line
+
+The intended sequence of Stage-5 through Stage-10 is:
+
+* Stage-5: make authority durable and attestable
+* Stage-6: make state durable and provable
+* Stage-7: make agent artifacts installable and governable
+* Stage-8: make multi-node execution explicit and survivable
+* Stage-9: make execution receipts economically and cryptographically meaningful
+* Stage-10: make the whole system deployable as a trusted appliance
+
+If these later stages are executed correctly, AOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems.
+
+---
+
+## 28. Long-Term Vision
 
 AOS evolves from a minimal kernel into a foundational execution layer for the agent economy.
 
@@ -2330,30 +2853,30 @@ AOS evolves from a minimal kernel into a foundational execution layer for the ag
 +-----------------------------------------+
 ```
 
-### 27.1 What AOS Is
+### 28.1 What AOS Is
 
 * An execution substrate for autonomous agents
 * A deterministic, replayable computation layer
 * A capability-secured runtime where every action is explicitly authorized
 * A bridge between AI systems, economic systems, and verifiable computation
 
-### 27.2 What AOS Is Not
+### 28.2 What AOS Is Not
 
 * A desktop operating system
 * A Linux replacement for server administration
 * A general-purpose consumer platform
 
-### 27.3 Closing Statement
+### 28.3 Closing Statement
 
 > AOS begins as a minimal kernel. It evolves into the execution layer where autonomous systems operate, interact, and transact — with every action auditable, every resource budgeted, and every authority explicit.
 
 ---
 
-## 28. Engineering Guidance for Implementation
+## 29. Engineering Guidance for Implementation
 
 This yellow paper is intended as a practical guide for implementation work.
 
-### 28.1 Preferred implementation style
+### 29.1 Preferred implementation style
 
 * keep subsystems small and explicit
 * prefer compile-time simplicity over generic abstraction too early
@@ -2362,7 +2885,7 @@ This yellow paper is intended as a practical guide for implementation work.
 * keep early data structures fixed-size where possible
 * avoid introducing general compatibility layers prematurely
 
-### 28.2 Suggested first success metric `[IMPL: ✅ ALL MET]`
+### 29.2 Suggested first success metric `[IMPL: ✅ ALL MET]`
 
 AOS should be considered meaningfully alive when all of the following are true:
 
@@ -2378,7 +2901,7 @@ When these conditions are met, AOS is no longer a toy boot project. It becomes a
 
 ---
 
-## 29. Conclusion
+## 30. Conclusion
 
 AOS proposes a different starting point for operating system design in the AI era.
 
@@ -2403,6 +2926,6 @@ This is the correct path for building a minimal AI-native OS foundation without 
 
 ---
 
-## 30. One-Sentence Definition
+## 31. One-Sentence Definition
 
 **AOS is a from-scratch, VM-first, AI-native minimal operating system built around agents, mailboxes, capabilities, structured state, execution budgets, and auditable kernel behavior.**
