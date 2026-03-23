@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ATOS.png" alt="ATOS Logo" width="200">
+  <img src="ATOS.png?v=2" alt="ATOS Logo" width="200">
 </p>
 
 <h1 align="center">ATOS</h1>
