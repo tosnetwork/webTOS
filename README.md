@@ -43,6 +43,26 @@ Modern operating systems were designed for human-operated computing. Their core 
 | **Energy Budget** | (none) | Per-agent execution metering, enforced by the kernel |
 | **Event Log** | (afterthought) | Built-in structured audit from day one |
 
+### Who Uses AOS
+
+AOS is not a general-purpose operating system. Its users are autonomous systems that need deterministic execution, minimal privilege, and verifiable behavior.
+
+**AI Agent Platforms** — Run AI agents in isolated, auditable sandboxes. Agents are written in WASM or native Rust, communicate via mailboxes, and operate under capability-scoped authority. Every action is logged. Agents can be checkpointed, migrated, and replayed. If an agent crashes, it cannot affect other agents.
+
+**Verifiable Computation** — Execute workloads where results must be provably correct. WASM agents run deterministically (fuel-counted). State transitions produce Merkle proofs. Checkpoints enable independent replay verification. The energy model maps directly to metered execution (gas, tokens, billing units).
+
+**Secure Edge Devices** — Deploy on embedded hardware where the attack surface must be minimal. No shell, no root, no filesystem, no ambient authority. Each agent holds only the capabilities it was explicitly granted. Agent crashes are isolated by hardware-enforced memory boundaries. Energy budgets prevent runaway execution.
+
+**AOS is not for:** desktop users, server administration, running existing Linux/POSIX programs, or any workload that requires a traditional OS interface.
+
+### Layering
+
+- **AOS** = the full system architecture
+- **AOS-0** = the privileged kernel substrate
+- **AOS-1** = the runtime host for native, WASM, and future managed runtimes
+- **AOS-2** = the agent and system-service layer
+- **AOS-NET** = the brokered / distributed execution layer
+
 ## Quickstart
 
 ### Prerequisites
@@ -100,26 +120,33 @@ make debug-run   # Build debug + launch QEMU with GDB stub (-s -S)
 
 ## Architecture
 
+AOS is the umbrella system. The early kernel is AOS-0, not the whole stack.
+
 ```
 +---------------------------------------------------+
-|              Test Agents / Runtimes                |
-|   ping agent | pong agent | idle agent             |
+|           Applications / External Systems         |
 +---------------------------------------------------+
-|              AI-native Syscall ABI                 |
-| yield | spawn | exit | send | recv | cap | energy  |
+| AOS-NET                                           |
+| brokered network | distributed execution | replay |
 +---------------------------------------------------+
-|                 Kernel Core                        |
-| sched | mm | trap | syscall | ipc | cap | audit    |
+| AOS-2 Agent / Service Layer                       |
+| root | stated | policyd | netd | accountd | user  |
 +---------------------------------------------------+
-|                x86_64 Arch Layer                   |
-| gdt | idt | paging | timer | irq | context         |
+| AOS-1 Runtime Host                                |
+| native | WASM | future managed runtimes           |
 +---------------------------------------------------+
-|               Boot / Loader Layer                  |
-|                  (Multiboot v1)                    |
+| AOS-0 Kernel                                      |
+| sched | mailbox | capability | state | audit      |
+| energy | syscall | checkpoint                     |
 +---------------------------------------------------+
-|                    QEMU VM                         |
+| x86_64 Architecture + Boot                        |
+| gdt | idt | paging | timer | trap | multiboot     |
++---------------------------------------------------+
+|                    QEMU / Hardware                |
 +---------------------------------------------------+
 ```
+
+Stage-1 is intentionally concentrated in AOS-0. AOS-1 is a thin native execution layer at first, AOS-2 starts as built-in bootstrap/test agents, and AOS-NET arrives later in the roadmap.
 
 ### Syscall ABI
 
