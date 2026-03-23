@@ -53,7 +53,20 @@ uefi-test: uefi-build
 		-drive format=raw,file=fat:rw:$(ESP_DIR) \
 		-serial stdio -display none -no-reboot -no-shutdown 2>&1 | head -40
 
+# ─── VirtualBox / USB disk image ──────────────────────────────
+UEFI_IMG = target/aos-uefi.img
+
+uefi-img: uefi-build
+	@echo "Creating UEFI boot disk image..."
+	dd if=/dev/zero of=$(UEFI_IMG) bs=1M count=64 2>/dev/null
+	mformat -i $(UEFI_IMG) -F ::
+	mmd -i $(UEFI_IMG) ::/EFI
+	mmd -i $(UEFI_IMG) ::/EFI/BOOT
+	mcopy -i $(UEFI_IMG) $(UEFI_EFI) ::/EFI/BOOT/BOOTX64.EFI
+	@echo "Done: $(UEFI_IMG)"
+	@echo "Use with VirtualBox (EFI enabled) or dd to USB drive"
+
 clean:
 	cargo clean
-	rm -f $(KERNEL_ELF32)
+	rm -f $(KERNEL_ELF32) $(UEFI_IMG)
 	rm -rf $(ESP_DIR)
