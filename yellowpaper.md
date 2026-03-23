@@ -446,7 +446,7 @@ The kernel must handle:
 * software interrupts or syscall entry `[IMPL: ✅ direct call in Stage-1, syscall_entry.asm ready for ring-3]`
 * NMI (vector 2): non-maskable interrupts from hardware errors `[IMPL: ⏳ deferred to Stage-4]`
 
-#### 7.1.3.1 Kernel Panic Policy
+#### 7.1.3.1 Kernel Panic Policy `[IMPL: ✅ cli + emergency checkpoint + halt]`
 
 When the kernel encounters an unrecoverable error, the panic handler must:
 
@@ -660,7 +660,7 @@ The root agent's entry point is a compiled-in initialization function that spawn
 10. When a parent agent terminates, orphan handling policy applies (see §10.5).
 11. Emit audit events throughout lifecycle.
 
-### 10.5 Orphan Handling
+### 10.5 Orphan Handling `[IMPL: ✅ reparent to ROOT + ChildAdopted event]`
 
 When a parent agent terminates, its children become orphans. AOS supports two policies, selectable at compile time:
 
@@ -704,7 +704,7 @@ Message {
 
 Use a ring-buffer mailbox with fixed-size messages. The recommended maximum payload size for Stage-1 is **256 bytes**. This keeps the ring buffer implementation simple with fixed-slot allocation. Messages exceeding this limit must be rejected with an explicit error.
 
-### 11.4 Backpressure and Flow Control (Planned for Stage-3)
+### 11.4 Backpressure and Flow Control `[IMPL: ✅ MAILBOX_PRESSURE at 75%]`
 
 The Stage-1 mailbox is a fixed 16-slot ring buffer with no flow control. Production systems require:
 
@@ -771,7 +771,7 @@ These implicit capabilities cannot be revoked.
 
 Syscalls must validate capability requirements before execution.
 
-### 12.6 Capability Audit Trail
+### 12.6 Capability Audit Trail `[IMPL: ✅ granter/revoker in event agent_id]`
 
 Every capability operation must produce an audit event containing the full context:
 
@@ -915,7 +915,7 @@ Context switching may occur on:
 * timer interrupt
 * fault event
 
-### 15.4 Priority Levels (Planned for Stage-3)
+### 15.4 Priority Levels `[IMPL: ✅ 4-level priority in sched.rs]`
 
 Stage-1/2 use equal-priority round-robin. Production systems require priority differentiation:
 
@@ -928,7 +928,7 @@ Stage-1/2 use equal-priority round-robin. Production systems require priority di
 
 The scheduler selects the highest-priority Ready agent. Within the same priority level, round-robin (or deterministic fixed-quota) ordering applies. Energy budgets are consumed regardless of priority.
 
-### 15.5 Syscall Timeouts (Planned for Stage-3)
+### 15.5 Syscall Timeouts `[IMPL: ✅ SYS_RECV_TIMEOUT (syscall 21) + E_TIMEOUT]`
 
 Blocking syscalls (`sys_recv`, `sys_send_blocking`) must accept an optional timeout parameter to prevent indefinite blocking and deadlock:
 
@@ -1118,7 +1118,7 @@ Event {
 
 Stage-1 should emit events over serial output in a structured and parseable format.
 
-### 18.4 Event Ring Buffer (Planned for Stage-3)
+### 18.4 Event Ring Buffer `[IMPL: ✅ ringbuf.rs wired into event.rs emit()]`
 
 Serial output is slow (~115200 baud = ~11 KB/s) and blocking. Production systems need an in-kernel ring buffer:
 
@@ -1528,7 +1528,7 @@ This double-buffering scheme ensures that a crash during step 1 or 2 leaves the 
 
 #### Crash Recovery for State Log
 
-The state log (§24.5) uses append-only writes with per-entry CRC32. On crash recovery:
+The state log (§24.5) uses append-only writes with per-entry CRC32. On crash recovery: `[IMPL: ✅ persist.rs init() validates CRC + truncates]`
 
 1. Replay the log from the beginning
 2. For each entry: validate CRC32. If invalid, stop replay at that point (the entry was partially written during a crash).
