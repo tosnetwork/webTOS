@@ -171,10 +171,25 @@ pub extern "C" fn ap_entry() -> ! {
     // 4. Signal to BSP that this AP is ready
     AP_STARTED.fetch_add(1, Ordering::Release);
     let apic_id = lapic::id();
-    serial_println!("[SMP] AP {} ready, entering scheduler", apic_id);
+    serial_println!("[SMP] AP {} ready, idle (multi-core scheduling requires per-core stacks)", apic_id);
 
-    // 5. Enable interrupts and enter scheduler idle loop.
-    //    The LAPIC timer will fire and call timer_tick -> schedule.
+    // Mask the LAPIC timer on this AP to prevent timer interrupts from
+    // interfering with BSP scheduling (CURRENT_KERNEL_RSP is shared).
+    // The AP sits idle until per-core infrastructure is implemented.
+    unsafe {
+        // Mask the LAPIC timer LVT entry (bit 16 = masked)
+        let timer_lvt_addr = crate::arch::x86_64::lapic::get_base() + 0x320;
+        let current = core::ptr::read_volatile(timer_lvt_addr as *const u32);
+        core::ptr::write_volatile(timer_lvt_addr as *mut u32, current | (1 << 16));
+    }
+
+    // 5. Enter idle loop. The AP is booted and its LAPIC is active, but
+    //    multi-core agent scheduling is deferred to Stage-4 because:
+    //    - CURRENT_KERNEL_RSP is a global variable (needs per-core via swapgs)
+    //    - SAVED_USER_RSP is a global variable (same issue)
+    //    - TSS.rsp0 is shared (needs per-core GDT+TSS)
+    //    The AP proves SMP bootstrap works and can be activated when
+    //    per-core infrastructure (swapgs, per-core TSS) is implemented.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
     // Idle loop: wait for timer interrupts to trigger scheduling.

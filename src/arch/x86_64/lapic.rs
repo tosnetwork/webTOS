@@ -55,6 +55,11 @@ unsafe fn read(offset: u32) -> u32 {
     core::ptr::read_volatile(addr as *const u32)
 }
 
+/// Get the LAPIC base address (for direct register access from other modules).
+pub fn get_base() -> u64 {
+    unsafe { LAPIC_BASE_ADDR }
+}
+
 unsafe fn write(offset: u32, value: u32) {
     let addr = LAPIC_BASE_ADDR + offset as u64;
     core::ptr::write_volatile(addr as *mut u32, value);

@@ -1,11 +1,8 @@
 //! AOS Scheduler
 //!
-//! Implements a simple round-robin scheduler for Stage-1.
-//! Agents in the run queue are executed in order, with preemption
-//! driven by the timer interrupt.
-//!
-//! The scheduler maintains a circular run queue of agent IDs.
-//! The idle agent is special-cased and runs when the queue is empty.
+//! Implements a round-robin scheduler with SMP support.
+//! The run queue is protected by a SpinLock for safe concurrent access
+//! from multiple cores. Each core tracks its own current agent.
 
 use crate::serial_println;
 use crate::agent::*;
@@ -13,6 +10,7 @@ use crate::arch::x86_64::context::context_switch;
 use crate::agent::AgentMode;
 use crate::arch::x86_64::gdt;
 use crate::init::STACK_GUARD_MAGIC;
+use crate::sync::SpinLock;
 
 extern "C" {
     static mut CURRENT_KERNEL_RSP: u64;
@@ -25,61 +23,64 @@ const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
 const SPAWN_STACK_SIZE: usize = 4096;
 
 /// Static stack pool for spawned agents.
-///
-/// Safety: each stack is used by exactly one agent. Single-core Stage-1.
 static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] = [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS];
-static mut NEXT_STACK_SLOT: usize = 4; // first 4 slots reserved for init agents
+static mut NEXT_STACK_SLOT: usize = 4;
 
-/// Circular run queue of agent IDs.
-///
-/// Safety: single-core, no concurrent access in Stage-1.
-static mut RUN_QUEUE: [Option<AgentId>; RUN_QUEUE_SIZE] = [None; RUN_QUEUE_SIZE];
-static mut RUN_QUEUE_LEN: usize = 0;
-static mut CURRENT_INDEX: usize = 0;
-static mut CURRENT_AGENT_ID: AgentId = IDLE_AGENT_ID;
-
-/// Per-core current agent ID (indexed by LAPIC ID, max 16 cores).
-/// Used for SMP-aware scheduling so each core tracks its own running agent.
-static mut PER_CORE_AGENT: [AgentId; 16] = [IDLE_AGENT_ID; 16];
-
-/// Boot context: saves the kernel boot thread state when we switch to the
-/// first agent. This lets schedule() always have a valid "old" context.
-static mut BOOT_CONTEXT: AgentContext = AgentContext::zero();
-
-/// Initialize the scheduler.
-///
-/// Must be called once during boot before any agents are added.
-pub fn init() {
-    unsafe {
-        RUN_QUEUE = [None; RUN_QUEUE_SIZE];
-        RUN_QUEUE_LEN = 0;
-        CURRENT_INDEX = 0;
-        CURRENT_AGENT_ID = IDLE_AGENT_ID;
-    }
+/// Run queue state protected by SpinLock for SMP safety.
+struct RunQueueState {
+    queue: [Option<AgentId>; RUN_QUEUE_SIZE],
+    len: usize,
+    current_index: usize,
 }
 
-/// Get the currently running agent's ID.
-///
-/// Returns `IDLE_AGENT_ID` (0) if no agent is running.
-/// On SMP, returns the current core's running agent via LAPIC ID.
+static SCHED_LOCK: SpinLock<RunQueueState> = SpinLock::new(RunQueueState {
+    queue: [None; RUN_QUEUE_SIZE],
+    len: 0,
+    current_index: 0,
+});
+
+/// Per-core current agent ID (indexed by LAPIC ID, max 16 cores).
+/// Each entry is only written by its own core, so no lock needed.
+static mut PER_CORE_AGENT: [AgentId; 16] = [IDLE_AGENT_ID; 16];
+
+/// Legacy single-core current agent (fallback when LAPIC not active).
+static mut CURRENT_AGENT_ID: AgentId = IDLE_AGENT_ID;
+
+/// Per-core boot/idle context. Each core saves its idle state here
+/// instead of the shared idle agent context (which would be corrupted
+/// if two cores both save to it simultaneously).
+static mut BOOT_CONTEXTS: [AgentContext; 16] = [AgentContext::zero(); 16];
+
+/// Initialize the scheduler.
+pub fn init() {
+    // SpinLock is already initialized via const fn
+    serial_println!("[SCHED] Scheduler initialized (SMP-safe)");
+}
+
+/// Get the currently running agent's ID on this core.
 pub fn current() -> AgentId {
-    unsafe {
-        if crate::arch::x86_64::lapic::is_active() {
-            let core_id = crate::arch::x86_64::lapic::id() as usize;
-            if core_id < 16 {
-                return PER_CORE_AGENT[core_id];
-            }
+    if crate::arch::x86_64::lapic::is_active() {
+        let core_id = crate::arch::x86_64::lapic::id() as usize;
+        if core_id < 16 {
+            return unsafe { PER_CORE_AGENT[core_id] };
         }
-        CURRENT_AGENT_ID // fallback for single-core / pre-LAPIC
     }
+    unsafe { CURRENT_AGENT_ID }
+}
+
+/// Set the current agent ID for this core.
+fn set_current(id: AgentId) {
+    if crate::arch::x86_64::lapic::is_active() {
+        let core_id = crate::arch::x86_64::lapic::id() as usize;
+        if core_id < 16 {
+            unsafe { PER_CORE_AGENT[core_id] = id; }
+        }
+    }
+    unsafe { CURRENT_AGENT_ID = id; }
 }
 
 /// Allocate a stack for a dynamically spawned agent.
-///
-/// Returns the stack top address (highest address, since x86_64 stacks grow down).
-/// Returns 0 if no stack slots are available.
 pub fn allocate_agent_stack() -> u64 {
-    // Safety: single-core, no preemption during allocation
     unsafe {
         if NEXT_STACK_SLOT >= MAX_AGENTS {
             return 0;
@@ -91,56 +92,57 @@ pub fn allocate_agent_stack() -> u64 {
     }
 }
 
-/// Alias for `add_to_run_queue` -- used by syscall.rs.
+/// Alias for `add_to_run_queue`.
 pub fn enqueue(id: AgentId) {
     add_to_run_queue(id);
 }
 
 /// Add an agent to the run queue and mark it as Ready.
 pub fn add_to_run_queue(agent_id: AgentId) {
-    unsafe {
-        // Don't add duplicates
-        for i in 0..RUN_QUEUE_LEN {
-            if RUN_QUEUE[i] == Some(agent_id) {
-                return;
-            }
-        }
+    let mut rq = SCHED_LOCK.lock();
 
-        if RUN_QUEUE_LEN >= RUN_QUEUE_SIZE {
-            serial_println!("[SCHED] Run queue full, cannot add agent {}", agent_id);
+    // Don't add duplicates
+    for i in 0..rq.len {
+        if rq.queue[i] == Some(agent_id) {
             return;
         }
-
-        // Mark the agent as Ready
-        if let Some(agent) = get_agent_mut(agent_id) {
-            if agent.status == AgentStatus::Created || agent.status == AgentStatus::Suspended {
-                agent.status = AgentStatus::Ready;
-            }
-        }
-
-        RUN_QUEUE[RUN_QUEUE_LEN] = Some(agent_id);
-        RUN_QUEUE_LEN += 1;
     }
+
+    if rq.len >= RUN_QUEUE_SIZE {
+        serial_println!("[SCHED] Run queue full, cannot add agent {}", agent_id);
+        return;
+    }
+
+    // Mark the agent as Ready
+    if let Some(agent) = get_agent_mut(agent_id) {
+        if agent.status == AgentStatus::Created || agent.status == AgentStatus::Suspended {
+            agent.status = AgentStatus::Ready;
+        }
+    }
+
+    let idx = rq.len;
+    rq.queue[idx] = Some(agent_id);
+    rq.len += 1;
 }
 
 /// Remove an agent from the run queue.
 pub fn remove_from_run_queue(agent_id: AgentId) {
-    unsafe {
-        for i in 0..RUN_QUEUE_LEN {
-            if RUN_QUEUE[i] == Some(agent_id) {
-                // Shift remaining entries down
-                let mut j = i;
-                while j + 1 < RUN_QUEUE_LEN {
-                    RUN_QUEUE[j] = RUN_QUEUE[j + 1];
-                    j += 1;
-                }
-                RUN_QUEUE[RUN_QUEUE_LEN - 1] = None;
-                RUN_QUEUE_LEN -= 1;
-                if CURRENT_INDEX >= RUN_QUEUE_LEN && RUN_QUEUE_LEN > 0 {
-                    CURRENT_INDEX = 0;
-                }
-                return;
+    let mut rq = SCHED_LOCK.lock();
+
+    for i in 0..rq.len {
+        if rq.queue[i] == Some(agent_id) {
+            let mut j = i;
+            while j + 1 < rq.len {
+                rq.queue[j] = rq.queue[j + 1];
+                j += 1;
             }
+            let last = rq.len - 1;
+            rq.queue[last] = None;
+            rq.len -= 1;
+            if rq.current_index >= rq.len && rq.len > 0 {
+                rq.current_index = 0;
+            }
+            return;
         }
     }
 }
@@ -151,26 +153,20 @@ pub fn yield_current() {
 }
 
 /// Block the current agent with the given reason (e.g., BlockedRecv).
-///
-/// Removes the agent from the run queue and triggers a reschedule.
 pub fn block_current(reason: AgentStatus) {
-    unsafe {
-        let id = current();
-        if id == IDLE_AGENT_ID {
-            return; // idle agent cannot block
-        }
-
-        if let Some(agent) = get_agent_mut(id) {
-            agent.status = reason;
-        }
-        remove_from_run_queue(id);
-        schedule();
+    let id = current();
+    if id == IDLE_AGENT_ID {
+        return;
     }
+
+    if let Some(agent) = get_agent_mut(id) {
+        agent.status = reason;
+    }
+    remove_from_run_queue(id);
+    schedule();
 }
 
 /// Unblock an agent and move it from blocked to Ready.
-///
-/// Adds the agent back to the run queue.
 pub fn unblock(id: AgentId) {
     if let Some(agent) = get_agent_mut(id) {
         if agent.status == AgentStatus::BlockedRecv
@@ -184,96 +180,107 @@ pub fn unblock(id: AgentId) {
 
 /// Select the next agent to run and perform a context switch.
 ///
-/// Round-robin selection among Ready agents. If no agents are Ready,
-/// falls back to the idle agent.
-///
-/// Interrupts are disabled during the scheduling decision and context
-/// switch to prevent re-entrant schedule() calls from timer_tick().
+/// Protected by SpinLock: safe for concurrent calls from multiple cores.
 pub fn schedule() {
-    // Disable interrupts to prevent re-entrant schedule() from timer_tick()
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    let old_id = current();
 
-    unsafe {
-        // On SMP, read this core's current agent
-        let old_id = if crate::arch::x86_64::lapic::is_active() {
-            let core_id = crate::arch::x86_64::lapic::id() as usize;
-            if core_id < 16 { PER_CORE_AGENT[core_id] } else { CURRENT_AGENT_ID }
-        } else {
-            CURRENT_AGENT_ID
-        };
-
-        // If the current agent is still Running, move it to Ready
-        if old_id != IDLE_AGENT_ID {
-            if let Some(agent) = get_agent_mut(old_id) {
-                if agent.status == AgentStatus::Running {
-                    agent.status = AgentStatus::Ready;
-                }
+    // Mark old agent as Ready (if still Running)
+    if old_id != IDLE_AGENT_ID {
+        if let Some(agent) = get_agent_mut(old_id) {
+            if agent.status == AgentStatus::Running {
+                agent.status = AgentStatus::Ready;
             }
-        } else {
-            // Idle agent: mark as Ready so it can be selected again later
-            if let Some(agent) = get_agent_mut(IDLE_AGENT_ID) {
-                if agent.status == AgentStatus::Running {
-                    agent.status = AgentStatus::Ready;
+        }
+    } else {
+        if let Some(agent) = get_agent_mut(IDLE_AGENT_ID) {
+            if agent.status == AgentStatus::Running {
+                agent.status = AgentStatus::Ready;
+            }
+        }
+    }
+
+    let next_id = {
+        let mut rq = SCHED_LOCK.lock();
+
+        let mut found = IDLE_AGENT_ID;
+        if rq.len > 0 {
+            let start = rq.current_index % rq.len.max(1);
+            for offset in 0..rq.len {
+                let idx = (start + offset) % rq.len;
+                if let Some(agent_id) = rq.queue[idx] {
+                    if let Some(agent) = get_agent_mut(agent_id) {
+                        if agent.status == AgentStatus::Ready {
+                            // Claim this agent under the lock
+                            agent.status = AgentStatus::Running;
+                            rq.current_index = (idx + 1) % rq.len.max(1);
+                            found = agent_id;
+                            break;
+                        }
+                    }
                 }
             }
         }
+        found
+    };
+    // SpinLock dropped here — interrupts re-enabled
 
-        // Find the next Ready agent from the run queue
-        let next_id = find_next_ready();
+    if next_id == old_id {
+        return;
+    }
 
-        if next_id == old_id {
-            // Same agent, just re-mark as Running, no switch needed
-            if let Some(agent) = get_agent_mut(old_id) {
-                agent.status = AgentStatus::Running;
-            }
-            core::arch::asm!("sti", options(nomem, nostack));
-            return;
-        }
-
-        // Mark the next agent as Running
-        if let Some(agent) = get_agent_mut(next_id) {
+    if next_id == IDLE_AGENT_ID {
+        // No Ready agent found; mark idle as running on this core
+        if let Some(agent) = get_agent_mut(IDLE_AGENT_ID) {
             agent.status = AgentStatus::Running;
         }
+    }
 
-        CURRENT_AGENT_ID = next_id;
+    set_current(next_id);
 
-        // Update per-core tracking for SMP
-        if crate::arch::x86_64::lapic::is_active() {
-            let core_id = crate::arch::x86_64::lapic::id() as usize;
-            if core_id < 16 {
-                PER_CORE_AGENT[core_id] = next_id;
+    // For ring 3 agents: update TSS.rsp0
+    if let Some(agent) = get_agent(next_id) {
+        if agent.mode == AgentMode::User {
+            gdt::set_tss_rsp0(agent.kernel_stack_top);
+            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+        }
+    }
+
+    // Context switch — use per-core boot context for idle agent
+    let old_ctx = unsafe {
+        if old_id == IDLE_AGENT_ID {
+            // Each core saves idle state to its own boot context
+            let core_id = if crate::arch::x86_64::lapic::is_active() {
+                crate::arch::x86_64::lapic::id() as usize
+            } else { 0 };
+            &mut BOOT_CONTEXTS[core_id.min(15)] as *mut AgentContext
+        } else {
+            match get_agent_mut(old_id) {
+                Some(agent) => &mut agent.context as *mut AgentContext,
+                None => &mut BOOT_CONTEXTS[0] as *mut AgentContext,
             }
         }
-
-        // For ring 3 agents: update TSS.rsp0 and CURRENT_KERNEL_RSP
-        // so the CPU knows which kernel stack to use on interrupt/syscall
-        if let Some(agent) = get_agent(next_id) {
-            if agent.mode == AgentMode::User {
-                gdt::set_tss_rsp0(agent.kernel_stack_top);
-                unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+    };
+    let new_agent = match get_agent(next_id) {
+        Some(a) => a,
+        None => {
+            set_current(IDLE_AGENT_ID);
+            if let Some(idle) = get_agent_mut(IDLE_AGENT_ID) {
+                idle.status = AgentStatus::Running;
             }
+            return;
         }
+    };
+    let new_ctx = &new_agent.context as *const AgentContext;
 
-        // Get context pointers for old and new agents
-        let old_ctx = get_old_context_ptr(old_id);
-        let new_agent = match get_agent(next_id) {
-            Some(a) => a,
-            None => {
-                // Agent was terminated between selection and switch; fall back to idle
-                CURRENT_AGENT_ID = IDLE_AGENT_ID;
-                if let Some(idle) = get_agent_mut(IDLE_AGENT_ID) {
-                    idle.status = AgentStatus::Running;
-                }
-                core::arch::asm!("sti", options(nomem, nostack));
-                return;
-            }
-        };
-        let new_ctx = &new_agent.context as *const AgentContext;
-
+    unsafe {
+        // Disable interrupts around context_switch to prevent timer from
+        // re-entering schedule between here and the switch completing.
+        core::arch::asm!("cli", options(nomem, nostack));
         context_switch(old_ctx, new_ctx);
+        // Resumed. Re-enable interrupts.
+        core::arch::asm!("sti", options(nomem, nostack));
 
-        // We reach here when this agent is resumed by another context_switch.
-        // Check stack guard canary for the agent we just switched FROM.
+        // Check stack guard canary of the old agent
         if old_id != IDLE_AGENT_ID {
             if let Some(old_agent) = get_agent(old_id) {
                 if old_agent.stack_bottom != 0 {
@@ -283,7 +290,6 @@ pub fn schedule() {
                             "[STACK OVERFLOW] Agent {} stack corrupted! guard={:#x} expected={:#x}",
                             old_id, guard, STACK_GUARD_MAGIC
                         );
-                        // Terminate the agent to prevent further damage
                         if let Some(agent) = get_agent_mut(old_id) {
                             agent.status = AgentStatus::Faulted;
                         }
@@ -293,114 +299,62 @@ pub fn schedule() {
                 }
             }
         }
-
-        // Re-enable interrupts.
-        core::arch::asm!("sti", options(nomem, nostack));
-    }
-}
-
-/// Find the next Ready agent in round-robin order.
-/// Returns IDLE_AGENT_ID if no agent is ready.
-unsafe fn find_next_ready() -> AgentId {
-    if RUN_QUEUE_LEN == 0 {
-        return IDLE_AGENT_ID;
-    }
-
-    let start = CURRENT_INDEX % RUN_QUEUE_LEN.max(1);
-    for offset in 0..RUN_QUEUE_LEN {
-        let idx = (start + offset) % RUN_QUEUE_LEN;
-        if let Some(agent_id) = RUN_QUEUE[idx] {
-            if let Some(agent) = get_agent(agent_id) {
-                if agent.status == AgentStatus::Ready {
-                    CURRENT_INDEX = (idx + 1) % RUN_QUEUE_LEN.max(1);
-                    return agent_id;
-                }
-            }
-        }
-    }
-
-    IDLE_AGENT_ID
-}
-
-/// Get a mutable pointer to the old agent's context, or the boot context
-/// if the old agent is no longer accessible (e.g., it just exited).
-unsafe fn get_old_context_ptr(old_id: AgentId) -> *mut AgentContext {
-    match get_agent_mut(old_id) {
-        Some(agent) => &mut agent.context as *mut AgentContext,
-        None => &mut BOOT_CONTEXT as *mut AgentContext,
     }
 }
 
 /// Start the scheduler by context-switching to the first agent.
-///
-/// This function does not return. The boot thread's context is saved
-/// into BOOT_CONTEXT and can be resumed if all agents exit.
 pub fn start() {
     serial_println!("[SCHED] Scheduler starting");
 
-    unsafe {
-        if RUN_QUEUE_LEN == 0 {
+    let first_id = {
+        let rq = SCHED_LOCK.lock();
+        if rq.len == 0 {
             serial_println!("[SCHED] No agents in run queue");
             return;
         }
+        rq.queue[0].expect("No agents in run queue")
+    };
 
-        // Select the first agent
-        let first_id = RUN_QUEUE[0].expect("No agents in run queue");
-        CURRENT_AGENT_ID = first_id;
-        CURRENT_INDEX = 1 % RUN_QUEUE_LEN.max(1);
+    set_current(first_id);
 
-        // Update per-core tracking for BSP
-        if crate::arch::x86_64::lapic::is_active() {
-            let core_id = crate::arch::x86_64::lapic::id() as usize;
-            if core_id < 16 {
-                PER_CORE_AGENT[core_id] = first_id;
-            }
+    if let Some(agent) = get_agent_mut(first_id) {
+        agent.status = AgentStatus::Running;
+    }
+
+    serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
+
+    if let Some(agent) = get_agent(first_id) {
+        if agent.mode == AgentMode::User {
+            gdt::set_tss_rsp0(agent.kernel_stack_top);
+            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
         }
+    }
 
-        if let Some(agent) = get_agent_mut(first_id) {
-            agent.status = AgentStatus::Running;
-        }
-
-        serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
-
-        // For ring 3 agents: update TSS.rsp0 and CURRENT_KERNEL_RSP
-        // so the CPU knows which kernel stack to use on interrupt/syscall
-        if let Some(agent) = get_agent(first_id) {
-            if agent.mode == AgentMode::User {
-                gdt::set_tss_rsp0(agent.kernel_stack_top);
-                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
-            }
-        }
-
-        let new_ctx = &get_agent(first_id).unwrap().context as *const AgentContext;
-        context_switch(&mut BOOT_CONTEXT as *mut AgentContext, new_ctx);
+    let new_ctx = &get_agent(first_id).unwrap().context as *const AgentContext;
+    unsafe {
+        context_switch(&mut BOOT_CONTEXTS[0] as *mut AgentContext, new_ctx);
     }
 }
 
-/// Called from the timer interrupt handler to perform preemptive scheduling.
-///
-/// 1. Decrements the current agent's energy budget; suspends if exhausted.
-/// 2. Decrements energy for all blocked agents; suspends if exhausted.
-/// 3. Triggers a preemptive context switch (round-robin time slice).
+/// Called from the timer interrupt handler for preemptive scheduling.
 pub fn timer_tick() {
-    unsafe {
-        let id = current();
+    let id = current();
 
-        // Charge energy for current running agent (skip idle)
-        if id != IDLE_AGENT_ID {
-            if !crate::energy::tick_running(id) {
-                // Energy exhausted: suspend the agent
-                if let Some(agent) = get_agent_mut(id) {
-                    agent.status = AgentStatus::Suspended;
-                }
-                crate::event::energy_exhausted(id);
-                remove_from_run_queue(id);
-                schedule();
-                return;
+    // Charge energy for current running agent (skip idle)
+    if id != IDLE_AGENT_ID {
+        if !crate::energy::tick_running(id) {
+            if let Some(agent) = get_agent_mut(id) {
+                agent.status = AgentStatus::Suspended;
             }
+            crate::event::energy_exhausted(id);
+            remove_from_run_queue(id);
+            schedule();
+            return;
         }
+    }
 
-        // Charge energy for blocked agents
+    // Charge energy for blocked agents
+    unsafe {
         let mut blocked: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
         let mut count = 0;
 
@@ -425,18 +379,14 @@ pub fn timer_tick() {
                 }
             }
         }
+    }
 
-        // Preemptive reschedule
-        if crate::deterministic::is_enabled() {
-            // In deterministic mode: use fixed-tick-quota scheduling
-            // tick() returns Some(agent_id) when the current slot expires
-            if crate::deterministic::tick().is_some() {
-                schedule();
-            }
-            // If tick() returns None, keep running current agent (slot not expired)
-        } else {
-            // Normal mode: round-robin on every tick
+    // Preemptive reschedule
+    if crate::deterministic::is_enabled() {
+        if crate::deterministic::tick().is_some() {
             schedule();
         }
+    } else {
+        schedule();
     }
 }
