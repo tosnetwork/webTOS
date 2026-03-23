@@ -747,6 +747,24 @@ Stage-1 intentionally realizes only a thin slice of the full stack:
 
 AOS should therefore be understood not as a file-centric Unix derivative, but as an **agent execution substrate** that expands upward from AOS-0.
 
+### 4.5 AOS Genesis
+
+AOS requires a trusted starting point. At system bring-up, there must already exist an initial authority root, an initial execution budget source, and an initial trusted configuration; otherwise no first agent could be created, no first capability could be granted, and no first budget could be delegated.
+
+This bootstrap profile may be referred to as **AOS Genesis**.
+
+It is similar in spirit to a blockchain genesis configuration, but it is not merely an initial balance table. AOS Genesis is the root initialization of:
+
+* **authority**: the root identity, root capability set, and initial trust anchors
+* **execution budget**: the initial usable energy budget from which later agent budgets are delegated
+* **bootstrap services**: the system agents or built-in services that must exist from the start
+* **policy identity**: the initial policy bundle, policy root, or equivalent enforcement baseline
+* **trusted state**: the initial registry, configuration, keyspace, or state commitments on which the node begins execution
+
+In Stage-1, AOS Genesis is still mostly **implicit** and compiled into the boot and initialization path. The kernel creates the root authority, grants the first broad capability set, assigns the initial usable execution budget, and instantiates the first built-in agents. Later stages may externalize this into a more explicit signed or attested genesis profile for appliance deployment, multi-tenant operation, or distributed execution.
+
+The important distinction is that AOS Genesis is primarily an **execution and authority genesis**, not just a ledger genesis. It defines who may act first, under what initial policy, and with what starting execution budget.
+
 ---
 
 ## 5. Core System Concepts
@@ -1130,6 +1148,8 @@ All other agents are descendants of the root agent and can only hold capabilitie
 The root agent's initial energy budget and memory quota are set to the system's total available resources. As it spawns children, these resources are subdivided via the delegation rules in §12.2.
 
 The root agent's entry point is a compiled-in initialization function that spawns the system's test agents in Stage-1.
+
+This is the concrete Stage-1 embodiment of the more general **AOS Genesis** concept introduced in §4.5.
 
 ### 10.4 Agent lifecycle
 
