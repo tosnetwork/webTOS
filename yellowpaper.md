@@ -2796,6 +2796,59 @@ Stage-10 should answer the deployment question: **what does AOS look like when i
 
 This stage is not about turning AOS into a conventional general-purpose operating system. It is about making AOS reliable enough to operate as a dedicated agent node or trusted execution appliance in production environments.
 
+#### 27.7.1 Appliance-Grade AOS Explained
+
+Stage-1 through Stage-9 primarily prove that the AOS model is coherent:
+
+* the kernel substrate works
+* the agent, mailbox, capability, state, energy, checkpoint, and proof abstractions are sound
+* execution can be isolated, replayed, distributed, verified, and economically described
+
+Stage-10 asks a different question:
+
+> can this system be delivered, deployed, operated, upgraded, audited, and relied on for years as a real trusted product profile?
+
+This is the correct sense of **appliance-grade** in AOS. It does **not** mean:
+
+* turning AOS into a desktop operating system
+* maximizing app compatibility or shell flexibility
+* recreating Linux-style general server administration
+* broadening the system until it becomes another general-purpose platform
+
+It **does** mean:
+
+* defining a narrow, explicit, supportable deployment profile
+* shipping a trusted agent appliance or agent node operating system
+* keeping the operational boundary controlled, auditable, and remotely manageable
+* making recovery, upgrade, attestation, and observability part of the default product shape
+
+The goal is therefore not "more freedom for local operators." The goal is **more dependable operation under explicit trust boundaries**.
+
+#### 27.7.2 Product-Grade Trust And Operations
+
+The main outcomes of Stage-10 should be understood in six dimensions:
+
+* **Deliverable**: AOS must have an official appliance profile, install image, signed artifacts, reproducible build story, and deployment guidance
+* **Operable**: nodes must expose remote diagnostics, health reporting, audit export, crash evidence, watchdog recovery, and rollback workflows
+* **Upgradable**: updates must be signed, staged, policy-gated, rollback-safe, and attested as part of the normal lifecycle
+* **Provably trusted**: the node must prove it is running approved code and policy; receipts and execution artifacts must remain externally verifiable during routine operations, not only in research demos
+* **Multi-tenant capable**: the platform must support tenant isolation, organization-level authority roots, per-tenant quotas, policy bundles, and operational boundaries
+* **Long-term dependable**: failure modes must be bounded, recovery paths deterministic, trusted computing base minimal, and versioning discipline stable enough for support contracts
+
+This is the stage where AOS stops being merely an interesting execution architecture and becomes a system that outside parties can confidently procure, deploy, and depend on.
+
+#### 27.7.3 Position Relative To Stage-8 And Stage-9
+
+The distinction between the last three stages should remain explicit:
+
+* **Stage-8** makes multi-node execution possible and survivable
+* **Stage-9** makes that execution externally verifiable, billable, and settleable
+* **Stage-10** makes the overall system operationally trustworthy as a long-lived appliance
+
+Stage-10 therefore does not primarily introduce new kernel abstractions. It operationalizes the results of the earlier stages into a coherent deployment profile: attested boot, signed upgrade, mailbox-based administration, structured observability, tenant isolation, and controlled recovery.
+
+This sequencing is important. If appliance concerns dominate too early, AOS risks drifting toward device-management busywork or toward Linux-shaped usability goals. By placing appliance-grade hardening last, the project preserves its first principles and only then packages them into a product form.
+
 Objectives:
 
 * define a reference hardware and deployment profile for AOS nodes
