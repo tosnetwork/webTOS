@@ -2255,7 +2255,7 @@ This is deferred to post-Stage-4 (no engineering specification yet). The interfa
 
 * Implement minimal UEFI application (PE/COFF entry point) `[IMPL: ✅ uefi/ crate, x86_64-unknown-uefi target, ELF parser + symbol lookup]`
 * Query memory map, allocate page tables, exit boot services `[IMPL: ✅ AllocatePages + GetMemoryMap + ExitBootServices with retry]`
-* Replace Multiboot info parsing with UEFI memory map in frame allocator `[IMPL: ⚠️ frame allocator uses fixed 128MB; UEFI memory map passed but not parsed yet]`
+* Replace Multiboot info parsing with UEFI memory map in frame allocator `[IMPL: ✅ init_from_uefi_mmap() parses EfiMemoryDescriptor array; verified 84 descriptors, 111MB on OVMF]`
 * Verify: AOS boots via UEFI on QEMU (`-bios OVMF.fd`) `[IMPL: ✅ make uefi-run verified with full 12-agent boot]`
 
 #### Phase 17c: PCI bus enumeration `[IMPL: ✅ COMPLETE]`
