@@ -33,11 +33,12 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
 
     // Charge energy for the syscall (except for idle agent)
     if caller_id != IDLE_AGENT_ID {
-        if !energy::charge_syscall(caller_id) {
-            // Energy exhausted
+        let cost = crate::cost::COSTS.syscall;
+        if !crate::cost::charge(caller_id, cost) {
             crate::event::energy_exhausted(caller_id);
             return E_NO_BUDGET;
         }
+        crate::cost::record_consumption(caller_id, cost);
     }
 
     match num {

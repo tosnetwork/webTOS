@@ -4,20 +4,23 @@
 //! energy budget that is decremented on timer ticks and syscall invocations.
 //! When the budget reaches zero, the agent is suspended.
 
-use crate::agent::{AgentId, EnergyUnit, TICK_ENERGY_COST, SYSCALL_ENERGY_COST};
+use crate::agent::{AgentId, EnergyUnit};
 
 /// Decrement energy for a running agent on timer tick.
+/// Uses the cost table for the tick cost.
 ///
 /// Returns `true` if the agent still has budget remaining,
 /// `false` if the budget is now exhausted.
 pub fn tick_running(agent_id: AgentId) -> bool {
+    let cost = crate::cost::COSTS.timer_tick;
     let agent = match crate::agent::get_agent_mut(agent_id) {
         Some(a) => a,
         None => return false,
     };
 
-    if agent.energy_budget >= TICK_ENERGY_COST {
-        agent.energy_budget -= TICK_ENERGY_COST;
+    if agent.energy_budget >= cost {
+        agent.energy_budget -= cost;
+        crate::cost::record_consumption(agent_id, cost);
         agent.energy_budget > 0
     } else {
         agent.energy_budget = 0;
@@ -34,13 +37,15 @@ pub fn tick_running(agent_id: AgentId) -> bool {
 /// Returns `true` if the agent still has budget remaining,
 /// `false` if the budget is now exhausted.
 pub fn tick_blocked(agent_id: AgentId) -> bool {
+    let cost = crate::cost::COSTS.timer_tick;
     let agent = match crate::agent::get_agent_mut(agent_id) {
         Some(a) => a,
         None => return false,
     };
 
-    if agent.energy_budget >= TICK_ENERGY_COST {
-        agent.energy_budget -= TICK_ENERGY_COST;
+    if agent.energy_budget >= cost {
+        agent.energy_budget -= cost;
+        crate::cost::record_consumption(agent_id, cost);
         agent.energy_budget > 0
     } else {
         agent.energy_budget = 0;
@@ -49,20 +54,17 @@ pub fn tick_blocked(agent_id: AgentId) -> bool {
 }
 
 /// Charge a syscall cost to an agent's energy budget.
-///
-/// Prevents agents from avoiding budget consumption by performing
-/// many cheap syscalls between timer ticks.
-///
-/// Returns `true` if the agent still has budget remaining,
-/// `false` if the budget is now exhausted.
+/// Uses the cost table for the syscall cost.
 pub fn charge_syscall(agent_id: AgentId) -> bool {
+    let cost = crate::cost::COSTS.syscall;
     let agent = match crate::agent::get_agent_mut(agent_id) {
         Some(a) => a,
         None => return false,
     };
 
-    if agent.energy_budget >= SYSCALL_ENERGY_COST {
-        agent.energy_budget -= SYSCALL_ENERGY_COST;
+    if agent.energy_budget >= cost {
+        agent.energy_budget -= cost;
+        crate::cost::record_consumption(agent_id, cost);
         agent.energy_budget > 0
     } else {
         agent.energy_budget = 0;

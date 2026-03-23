@@ -7,6 +7,7 @@
 //! its own private keyspace.
 
 use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
+use crate::merkle;
 
 const MAX_ENTRIES_PER_KEYSPACE: usize = 64;
 const MAX_VALUE_SIZE: usize = 256;
@@ -56,28 +57,28 @@ impl Keyspace {
         None
     }
 
-    fn put(&mut self, key: u64, value: &[u8]) -> Result<(), i64> {
+    fn put(&mut self, key: u64, value: &[u8]) -> Result<usize, i64> {
         if value.len() > MAX_VALUE_SIZE {
             return Err(E_PAYLOAD_TOO_LARGE);
         }
 
         // Try to find an existing entry with this key
-        for entry in self.entries.iter_mut() {
+        for (i, entry) in self.entries.iter_mut().enumerate() {
             if entry.active && entry.key == key {
                 entry.value[..value.len()].copy_from_slice(value);
                 entry.len = value.len();
-                return Ok(());
+                return Ok(i); // return entry index for Merkle update
             }
         }
 
         // Find a free slot
-        for entry in self.entries.iter_mut() {
+        for (i, entry) in self.entries.iter_mut().enumerate() {
             if !entry.active {
                 entry.key = key;
                 entry.value[..value.len()].copy_from_slice(value);
                 entry.len = value.len();
                 entry.active = true;
-                return Ok(());
+                return Ok(i); // return entry index for Merkle update
             }
         }
 
@@ -104,6 +105,7 @@ pub fn create_keyspace(id: KeyspaceId) -> Result<(), i64> {
             return Err(E_INVALID_ARG);
         }
         KEYSPACES[idx] = Some(Keyspace::new(id));
+        merkle::init_tree(id);
         Ok(())
     }
 }
@@ -153,7 +155,12 @@ pub fn put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64> {
             return Err(E_INVALID_ARG);
         }
         match KEYSPACES[idx].as_mut() {
-            Some(ks) => ks.put(key, value),
+            Some(ks) => {
+                let entry_idx = ks.put(key, value)?;
+                // Update Merkle tree with the new/changed entry
+                merkle::on_state_put(keyspace, entry_idx, key, value);
+                Ok(())
+            }
             None => Err(E_NOT_FOUND),
         }
     }

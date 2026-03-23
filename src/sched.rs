@@ -229,7 +229,19 @@ pub fn schedule() {
 
         // Get context pointers for old and new agents
         let old_ctx = get_old_context_ptr(old_id);
-        let new_ctx = &get_agent(next_id).unwrap().context as *const AgentContext;
+        let new_agent = match get_agent(next_id) {
+            Some(a) => a,
+            None => {
+                // Agent was terminated between selection and switch; fall back to idle
+                CURRENT_AGENT_ID = IDLE_AGENT_ID;
+                if let Some(idle) = get_agent_mut(IDLE_AGENT_ID) {
+                    idle.status = AgentStatus::Running;
+                }
+                core::arch::asm!("sti", options(nomem, nostack));
+                return;
+            }
+        };
+        let new_ctx = &new_agent.context as *const AgentContext;
 
         context_switch(old_ctx, new_ctx);
         // We reach here when this agent is resumed by another context_switch.
