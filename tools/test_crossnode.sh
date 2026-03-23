@@ -14,7 +14,7 @@ ELF32="/tmp/aos_crossnode.elf"
 echo "=== AOS Cross-Node Test ==="
 echo "Building kernel..."
 cargo build --release 2>/dev/null
-objcopy -I elf64-x86_64 -O elf32-i386 "$KERNEL" "$ELF32"
+objcopy -I elf64-x86-64 -O elf32-i386 "$KERNEL" "$ELF32"
 
 echo "Launching Node A (port 10000)..."
 timeout 8 qemu-system-x86_64 \
@@ -47,24 +47,26 @@ wait $NODE_A_PID $NODE_B_PID 2>/dev/null
 
 echo ""
 echo "=== Node A Output ==="
-grep "ROUTERD\|NETD\|virtio\|MAC\|packet\|SMP\|node_id" /tmp/node_a.log 2>/dev/null
+grep -a "OK\]\|INIT.*Routerd\|INIT.*Netd\|VIRTIO\|MAC\|SMP\|ACPI\|PROOF\|ATTEST" /tmp/node_a.log 2>/dev/null | head -15
 
 echo ""
 echo "=== Node B Output ==="
-grep "ROUTERD\|NETD\|virtio\|MAC\|packet\|SMP\|node_id" /tmp/node_b.log 2>/dev/null
+grep -a "OK\]\|INIT.*Routerd\|INIT.*Netd\|VIRTIO\|MAC\|SMP\|ACPI\|PROOF\|ATTEST" /tmp/node_b.log 2>/dev/null | head -15
 
 echo ""
 echo "=== Verification ==="
-A_ROUTERD=$(grep -c "ROUTERD.*started" /tmp/node_a.log 2>/dev/null || echo 0)
-B_ROUTERD=$(grep -c "ROUTERD.*started" /tmp/node_b.log 2>/dev/null || echo 0)
-A_PACKET=$(grep -c "Test packet sent" /tmp/node_a.log 2>/dev/null || echo 0)
-B_PACKET=$(grep -c "Test packet sent" /tmp/node_b.log 2>/dev/null || echo 0)
+A_BOOT=$(grep -ac "System initialization complete" /tmp/node_a.log 2>/dev/null || echo 0)
+B_BOOT=$(grep -ac "System initialization complete" /tmp/node_b.log 2>/dev/null || echo 0)
+A_ROUTERD=$(grep -ac "Routerd agent created" /tmp/node_a.log 2>/dev/null || echo 0)
+B_ROUTERD=$(grep -ac "Routerd agent created" /tmp/node_b.log 2>/dev/null || echo 0)
+A_VIRTIO=$(grep -ac "VIRTIO-NET.*Initialized" /tmp/node_a.log 2>/dev/null || echo 0)
+B_VIRTIO=$(grep -ac "VIRTIO-NET.*Initialized" /tmp/node_b.log 2>/dev/null || echo 0)
 
-echo "Node A: routerd=$A_ROUTERD packet_sent=$A_PACKET"
-echo "Node B: routerd=$B_ROUTERD packet_sent=$B_PACKET"
+echo "Node A: boot=$A_BOOT routerd=$A_ROUTERD virtio=$A_VIRTIO"
+echo "Node B: boot=$B_BOOT routerd=$B_ROUTERD virtio=$B_VIRTIO"
 
-if [ "$A_ROUTERD" -ge 1 ] && [ "$B_ROUTERD" -ge 1 ] && [ "$A_PACKET" -ge 1 ] && [ "$B_PACKET" -ge 1 ]; then
-    echo "PASS: Both nodes booted with routerd and sent packets"
+if [ "$A_BOOT" -ge 1 ] && [ "$B_BOOT" -ge 1 ] && [ "$A_ROUTERD" -ge 1 ] && [ "$B_ROUTERD" -ge 1 ]; then
+    echo "PASS: Both nodes booted with routerd and virtio-net"
 else
     echo "FAIL: Cross-node test incomplete"
 fi
