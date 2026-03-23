@@ -35,6 +35,7 @@ mod checkpoint;
 mod replay;
 mod large_msg;
 mod smp;
+mod ringbuf;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -70,7 +71,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     init::init();
     serial_println!("[OK] System initialization complete");
 
-    // 8. Discover CPUs and boot APs (if multi-core)
+    // 8. Initialize virtio-net (if present)
+    arch::x86_64::virtio_net::init();
+
+    // 9. Discover CPUs and boot APs (if multi-core)
     if let Some(acpi_info) = arch::x86_64::acpi::init() {
         serial_println!("[SMP] {} CPU(s) detected", acpi_info.cpu_count);
         if acpi_info.cpu_count > 1 {
@@ -85,7 +89,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
         serial_println!("[SMP] ACPI not found, running single-core");
     }
 
-    // 9. Start scheduling
+    // 10. Start scheduling
     serial_println!("[AOS] Entering scheduler loop");
     sched::start();
 

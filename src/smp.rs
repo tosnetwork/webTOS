@@ -137,22 +137,31 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
 /// Entry point for Application Processors (called from trampoline).
 ///
 /// Each AP arrives here in 64-bit long mode with its own stack.
-/// It initializes its local APIC and enters an idle loop.
+/// It initializes per-core hardware state and enters the scheduler loop.
 #[no_mangle]
 pub extern "C" fn ap_entry() -> ! {
-    // Initialize this core's LAPIC
+    // 1. Load the shared IDT on this core (IDT is in memory, each core must execute lidt)
+    crate::arch::x86_64::idt::reload();
+
+    // 2. Init LAPIC (per-core timer)
     lapic::init_ap();
 
-    // Signal to BSP that this AP is ready
+    // 3. Set up SYSCALL MSRs (per-core)
+    crate::arch::x86_64::syscall_msr::init();
+
+    // 4. Signal to BSP that this AP is ready
     AP_STARTED.fetch_add(1, Ordering::Release);
-
     let apic_id = lapic::id();
-    serial_println!("[SMP] AP (APIC ID {}) entered idle loop", apic_id);
+    serial_println!("[SMP] AP {} ready, entering scheduler", apic_id);
 
-    // Idle loop -- this core will be woken by IPIs for future work
+    // 5. Enable interrupts and enter scheduler idle loop.
+    //    The LAPIC timer will fire and call timer_tick -> schedule.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
+    // Idle loop: wait for timer interrupts to trigger scheduling.
+    // When woken by timer, trap handler runs timer_tick -> schedule.
+    // If an agent is Ready, schedule() will switch to it.
     loop {
-        unsafe {
-            core::arch::asm!("hlt");
-        }
+        unsafe { core::arch::asm!("hlt"); }
     }
 }

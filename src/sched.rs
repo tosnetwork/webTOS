@@ -38,6 +38,10 @@ static mut RUN_QUEUE_LEN: usize = 0;
 static mut CURRENT_INDEX: usize = 0;
 static mut CURRENT_AGENT_ID: AgentId = IDLE_AGENT_ID;
 
+/// Per-core current agent ID (indexed by LAPIC ID, max 16 cores).
+/// Used for SMP-aware scheduling so each core tracks its own running agent.
+static mut PER_CORE_AGENT: [AgentId; 16] = [IDLE_AGENT_ID; 16];
+
 /// Boot context: saves the kernel boot thread state when we switch to the
 /// first agent. This lets schedule() always have a valid "old" context.
 static mut BOOT_CONTEXT: AgentContext = AgentContext::zero();
@@ -57,9 +61,17 @@ pub fn init() {
 /// Get the currently running agent's ID.
 ///
 /// Returns `IDLE_AGENT_ID` (0) if no agent is running.
+/// On SMP, returns the current core's running agent via LAPIC ID.
 pub fn current() -> AgentId {
-    // Safety: single-core read
-    unsafe { CURRENT_AGENT_ID }
+    unsafe {
+        if crate::arch::x86_64::lapic::is_active() {
+            let core_id = crate::arch::x86_64::lapic::id() as usize;
+            if core_id < 16 {
+                return PER_CORE_AGENT[core_id];
+            }
+        }
+        CURRENT_AGENT_ID // fallback for single-core / pre-LAPIC
+    }
 }
 
 /// Allocate a stack for a dynamically spawned agent.
@@ -143,7 +155,7 @@ pub fn yield_current() {
 /// Removes the agent from the run queue and triggers a reschedule.
 pub fn block_current(reason: AgentStatus) {
     unsafe {
-        let id = CURRENT_AGENT_ID;
+        let id = current();
         if id == IDLE_AGENT_ID {
             return; // idle agent cannot block
         }
@@ -182,7 +194,13 @@ pub fn schedule() {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
 
     unsafe {
-        let old_id = CURRENT_AGENT_ID;
+        // On SMP, read this core's current agent
+        let old_id = if crate::arch::x86_64::lapic::is_active() {
+            let core_id = crate::arch::x86_64::lapic::id() as usize;
+            if core_id < 16 { PER_CORE_AGENT[core_id] } else { CURRENT_AGENT_ID }
+        } else {
+            CURRENT_AGENT_ID
+        };
 
         // If the current agent is still Running, move it to Ready
         if old_id != IDLE_AGENT_ID {
@@ -218,6 +236,14 @@ pub fn schedule() {
         }
 
         CURRENT_AGENT_ID = next_id;
+
+        // Update per-core tracking for SMP
+        if crate::arch::x86_64::lapic::is_active() {
+            let core_id = crate::arch::x86_64::lapic::id() as usize;
+            if core_id < 16 {
+                PER_CORE_AGENT[core_id] = next_id;
+            }
+        }
 
         // For ring 3 agents: update TSS.rsp0 and CURRENT_KERNEL_RSP
         // so the CPU knows which kernel stack to use on interrupt/syscall
@@ -323,6 +349,14 @@ pub fn start() {
         CURRENT_AGENT_ID = first_id;
         CURRENT_INDEX = 1 % RUN_QUEUE_LEN.max(1);
 
+        // Update per-core tracking for BSP
+        if crate::arch::x86_64::lapic::is_active() {
+            let core_id = crate::arch::x86_64::lapic::id() as usize;
+            if core_id < 16 {
+                PER_CORE_AGENT[core_id] = first_id;
+            }
+        }
+
         if let Some(agent) = get_agent_mut(first_id) {
             agent.status = AgentStatus::Running;
         }
@@ -350,7 +384,7 @@ pub fn start() {
 /// 3. Triggers a preemptive context switch (round-robin time slice).
 pub fn timer_tick() {
     unsafe {
-        let id = CURRENT_AGENT_ID;
+        let id = current();
 
         // Charge energy for current running agent (skip idle)
         if id != IDLE_AGENT_ID {

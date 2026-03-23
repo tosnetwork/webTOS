@@ -150,3 +150,19 @@ pub fn init() {
 
     serial_println!("[idt] IDT loaded ({} entries), PIC remapped, interrupts enabled", 256);
 }
+
+/// Reload the IDT on the current core.
+/// Used by APs to load the shared IDT into their IDTR.
+pub fn reload() {
+    unsafe {
+        let idt_ptr = IdtPtr {
+            limit: (core::mem::size_of_val(&IDT) - 1) as u16,
+            base: IDT.as_ptr() as u64,
+        };
+        core::arch::asm!(
+            "lidt [{}]",
+            in(reg) &idt_ptr,
+            options(nostack)
+        );
+    }
+}

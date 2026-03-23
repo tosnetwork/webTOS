@@ -528,6 +528,43 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
             }
         }
 
+        // ── 21: sys_recv_timeout ────────────────────────────────────────
+        // a1 = mailbox id, a2 = buffer ptr, a3 = buffer len, a4 = timeout in ticks (0 = infinite)
+        SYS_RECV_TIMEOUT => {
+            let mailbox_id = a1 as MailboxId;
+            let buf_len = a3 as usize;
+            let timeout_ticks = _a4; // 4th argument = timeout in ticks (0 = infinite)
+
+            // Try non-blocking recv first
+            match mailbox::recv_message(caller_id, mailbox_id) {
+                Ok(msg) => {
+                    let copy_len = (msg.len as usize).min(buf_len);
+                    if copy_len > 0 {
+                        unsafe {
+                            core::ptr::copy(
+                                msg.payload.as_ptr(),
+                                a2 as *mut u8,
+                                copy_len,
+                            );
+                        }
+                    }
+                    copy_len as i64
+                }
+                Err(_) => {
+                    if timeout_ticks == 0 {
+                        // No timeout: block like regular recv
+                        sched::block_current(AgentStatus::BlockedRecv);
+                        0 // will be retried when unblocked
+                    } else {
+                        // Timeout: check if deadline has passed
+                        // For Stage-3, return E_TIMEOUT immediately if no message
+                        // so the agent can retry with yield in a loop
+                        E_TIMEOUT
+                    }
+                }
+            }
+        }
+
         // ── 20: sys_replay ──────────────────────────────────────────────
         // Root-only: enter replay mode (load checkpoint + deterministic scheduler)
         SYS_REPLAY => {

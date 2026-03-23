@@ -13,6 +13,7 @@ pub mod syscall_msr;
 pub mod ata;
 pub mod acpi;
 pub mod lapic;
+pub mod virtio_net;
 
 pub use serial::{serial_print, serial_println};
 

@@ -47,6 +47,7 @@ pub const SYS_MUNMAP: u64 = 17;
 pub const SYS_MAILBOX_CREATE: u64 = 18;
 pub const SYS_MAILBOX_DESTROY: u64 = 19;
 pub const SYS_REPLAY: u64 = 20;
+pub const SYS_RECV_TIMEOUT: u64 = 21;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ pub const E_NOT_FOUND: i64 = -5;
 pub const E_QUOTA_EXCEEDED: i64 = -6;
 pub const E_PAYLOAD_TOO_LARGE: i64 = -7;
 pub const E_CHECKPOINT_NOT_ROOT: i64 = -9;
+pub const E_TIMEOUT: i64 = -10;
 
 // ─── Agent mode ─────────────────────────────────────────────────────────────
 
