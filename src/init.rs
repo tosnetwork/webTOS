@@ -61,12 +61,13 @@ extern "C" {
     fn user_bad_end();
 }
 
-/// User virtual address base for code (16 MB — outside the 0-16 MB
-/// identity-mapped huge page region, avoiding conflicts with 2 MB PD entries).
+/// User virtual address base for code (1 GB — in PDPT[1], completely outside
+/// the boot identity-mapped region in PDPT[0] which uses 2MB huge pages).
+/// This avoids conflicts with huge page PD entries that map_page() cannot split.
 /// Each user agent has its own page table, so all agents share these
 /// virtual addresses but map them to different physical frames.
-const USER_CODE_VADDR: u64 = 0x0100_0000; // 16 MB
-const USER_STACK_VADDR: u64 = 0x0100_1000; // 16 MB + 4 KB
+const USER_CODE_VADDR: u64 = 0x4000_0000; // 1 GB
+const USER_STACK_VADDR: u64 = 0x4000_1000; // 1 GB + 4 KB
 
 /// Create a user-mode agent with its own address space.
 ///
