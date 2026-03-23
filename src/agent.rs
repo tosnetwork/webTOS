@@ -46,6 +46,7 @@ pub const SYS_MMAP: u64 = 16;
 pub const SYS_MUNMAP: u64 = 17;
 pub const SYS_MAILBOX_CREATE: u64 = 18;
 pub const SYS_MAILBOX_DESTROY: u64 = 19;
+pub const SYS_REPLAY: u64 = 20;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 

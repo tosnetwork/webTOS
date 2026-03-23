@@ -528,6 +528,20 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
             }
         }
 
+        // ── 20: sys_replay ──────────────────────────────────────────────
+        // Root-only: enter replay mode (load checkpoint + deterministic scheduler)
+        SYS_REPLAY => {
+            if caller_id != ROOT_AGENT_ID {
+                return E_NO_CAP;
+            }
+
+            serial_println!("[SYSCALL] Replay mode requested by root agent");
+            match crate::replay::enter_replay() {
+                Ok(()) => E_OK,
+                Err(e) => e,
+            }
+        }
+
         _ => {
             serial_println!(
                 "[SYSCALL] Unknown syscall {} from agent {}",

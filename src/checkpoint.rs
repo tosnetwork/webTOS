@@ -282,3 +282,39 @@ pub fn take_checkpoint() -> CheckpointHeader {
 
     header
 }
+
+/// Load agent states from a checkpoint on disk.
+/// Returns an array of CheckpointAgent entries read from sectors after the header.
+pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAgent>; MAX_AGENTS] {
+    let mut agents: [Option<CheckpointAgent>; MAX_AGENTS] = [const { None }; MAX_AGENTS];
+    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
+
+    for i in 0..header.agent_count as usize {
+        if i >= MAX_AGENTS { break; }
+        let sector = CHECKPOINT_START_SECTOR + 1 + i as u32;
+        if ata::read_sectors(sector, 1, &mut sector_buf).is_ok() {
+            let agent = unsafe {
+                core::ptr::read(sector_buf.as_ptr() as *const CheckpointAgent)
+            };
+            agents[i] = Some(agent);
+        }
+    }
+
+    agents
+}
+
+/// Load Merkle roots from a checkpoint on disk.
+/// Returns an array of MerkleHash values.
+pub fn load_merkle_from_disk(header: &CheckpointHeader) -> [crate::merkle::MerkleHash; MAX_AGENTS] {
+    let mut roots: [crate::merkle::MerkleHash; MAX_AGENTS] = [[0u8; 16]; MAX_AGENTS];
+    let mut sector_buf = [0u8; ata::SECTOR_SIZE];
+
+    let merkle_sector = CHECKPOINT_START_SECTOR + 1 + header.agent_count as u32;
+    if ata::read_sectors(merkle_sector, 1, &mut sector_buf).is_ok() {
+        for i in 0..MAX_AGENTS.min(32) {
+            roots[i].copy_from_slice(&sector_buf[i * 16..(i + 1) * 16]);
+        }
+    }
+
+    roots
+}

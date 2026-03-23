@@ -369,7 +369,17 @@ pub fn timer_tick() {
             }
         }
 
-        // Preemptive reschedule: switch to the next ready agent
-        schedule();
+        // Preemptive reschedule
+        if crate::deterministic::is_enabled() {
+            // In deterministic mode: use fixed-tick-quota scheduling
+            // tick() returns Some(agent_id) when the current slot expires
+            if crate::deterministic::tick().is_some() {
+                schedule();
+            }
+            // If tick() returns None, keep running current agent (slot not expired)
+        } else {
+            // Normal mode: round-robin on every tick
+            schedule();
+        }
     }
 }
