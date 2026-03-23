@@ -1519,29 +1519,278 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 ### 26.2 Core Additions
 
-#### 26.2.1 Hardware Support
+#### 26.2.1 UEFI Boot
 
-* **PCI bus enumeration**: discover and initialize devices on a real PCI bus
-* **NVMe storage driver**: replace ATA PIO (Stage-2) with NVMe for real hardware deployment
-* **Real NIC driver**: e1000 or virtio-net on real hardware
-* **UEFI boot**: replace Multiboot v1 with UEFI boot path for modern hardware
-* **GPU/NPU access**: brokered through a system agent (gpud), not directly accessible to agents. The broker model from netd applies here.
+Replace Multiboot v1 with UEFI boot for modern hardware. UEFI provides a standardized firmware interface, memory map, and GOP framebuffer.
 
-#### 26.2.2 Distributed Execution
+**Prerequisites:**
+
+* Higher-half kernel: relink kernel at `0xFFFFFFFF80000000`. UEFI firmware uses low memory (0-2MB+) for its own data structures, so the kernel cannot remain identity-mapped at 1MB. This was deferred from Stage-2 §24.2.1.
+* Updated boot page tables: map kernel in upper half, UEFI runtime services in a reserved region.
+
+**Boot sequence:**
+
+```text
+UEFI firmware
+  → loads AOS UEFI application (PE/COFF format) from ESP partition
+  → AOS UEFI app:
+      1. Query memory map via BootServices->GetMemoryMap()
+      2. Allocate pages for kernel page tables
+      3. Set up higher-half mapping (kernel at 0xFFFFFFFF80000000)
+      4. Exit boot services (ExitBootServices)
+      5. Switch to kernel page tables (load CR3)
+      6. Jump to kernel_main(uefi_memory_map, uefi_runtime_services)
+```
+
+**Implementation:**
+
+* `asm/uefi_entry.asm` or Rust-based UEFI application using `uefi-rs` patterns (no external crate — implement minimal EFI protocol handling from scratch)
+* Parse UEFI memory map to initialize frame allocator (replaces Multiboot memory info)
+* GOP framebuffer discovery (optional, serial remains primary output)
+
+#### 26.2.2 PCI Bus Enumeration
+
+Discover and initialize PCI devices. Required for NVMe and real NIC drivers.
+
+**PCI Configuration Space access:**
+
+```text
+PCI Config Address (port 0xCF8):
+  [31]    Enable bit
+  [23:16] Bus number (0-255)
+  [15:11] Device number (0-31)
+  [10:8]  Function number (0-7)
+  [7:2]   Register offset (dword-aligned)
+
+PCI Config Data (port 0xCFC):
+  Read/write 32-bit config register
+```
+
+**Enumeration algorithm:**
+
+```text
+for bus in 0..256:
+  for device in 0..32:
+    vendor_id = pci_read(bus, device, 0, 0x00) & 0xFFFF
+    if vendor_id == 0xFFFF: continue  // no device
+    device_id = pci_read(bus, device, 0, 0x00) >> 16
+    class_code = pci_read(bus, device, 0, 0x08) >> 24
+    subclass = (pci_read(bus, device, 0, 0x08) >> 16) & 0xFF
+
+    match (class_code, subclass):
+      (0x01, 0x08) => register_nvme(bus, device)   // NVMe controller
+      (0x02, 0x00) => register_nic(bus, device)     // Ethernet controller
+```
+
+**BAR (Base Address Register) handling:**
+
+* Read BAR0-BAR5 from PCI config space (offsets 0x10-0x24)
+* Determine BAR type: memory-mapped (MMIO) or I/O port
+* For MMIO BARs: map the physical address range into kernel virtual space
+* For NVMe: BAR0 provides the NVMe controller registers (MMIO, typically 16KB)
+
+**MSI-X interrupt setup:**
+
+* Read MSI-X capability from PCI capability list
+* Allocate MSI-X table entries and map them
+* Configure interrupt vectors for NVMe completion and NIC receive
+
+**Implementation: `src/arch/x86_64/pci.rs`**
+
+```text
+PciDevice {
+    bus: u8,
+    device: u8,
+    function: u8,
+    vendor_id: u16,
+    device_id: u16,
+    class_code: u8,
+    subclass: u8,
+    bars: [PciBar; 6],
+}
+
+PciBar {
+    bar_type: BarType,    // Mmio32, Mmio64, IoPort
+    base: u64,            // physical address or port
+    size: u64,
+}
+
+pub fn enumerate() -> [Option<PciDevice>; 32]
+pub fn read_config(bus: u8, dev: u8, func: u8, offset: u8) -> u32
+pub fn write_config(bus: u8, dev: u8, func: u8, offset: u8, val: u32)
+pub fn map_bar(device: &PciDevice, bar_index: usize) -> Option<u64>  // returns kernel virtual addr
+```
+
+#### 26.2.3 NVMe Storage Driver
+
+Replace ATA PIO with NVMe for high-performance block I/O. NVMe uses memory-mapped command queues and DMA — no CPU-driven byte-by-byte transfer.
+
+**NVMe architecture overview:**
+
+```text
+CPU                           NVMe Controller (via PCIe)
+ │                                  │
+ ├─ Submission Queue (SQ) ──────────┤  (host memory, DMA-read by controller)
+ │   [command 0] [command 1] ...    │
+ │                                  │
+ ├─ Completion Queue (CQ) ◄─────────┤  (host memory, DMA-written by controller)
+ │   [result 0] [result 1] ...      │
+ │                                  │
+ └─ Doorbell registers (MMIO) ──────┘  (BAR0 + offset)
+```
+
+**Controller initialization sequence:**
+
+1. Read Controller Capabilities (CAP) register from BAR0+0x00
+2. Disable controller: clear CC.EN (BAR0+0x14, bit 0), wait for CSTS.RDY=0
+3. Configure Admin Queue:
+   * Allocate Admin Submission Queue (ASQ): 64 entries × 64 bytes = 4KB (page-aligned)
+   * Allocate Admin Completion Queue (ACQ): 64 entries × 16 bytes = 1KB (page-aligned)
+   * Write ASQ base address to AQA/ASQ registers (BAR0+0x24, BAR0+0x28)
+   * Write ACQ base address to ACQ register (BAR0+0x30)
+   * Set AQA (Admin Queue Attributes): SQ size and CQ size
+4. Enable controller: set CC.EN=1, select NVMe command set (CC.CSS=0), page size (CC.MPS), arbitration
+5. Wait for CSTS.RDY=1
+6. Send Identify Controller command via Admin SQ to discover device capabilities
+7. Send Create I/O Completion Queue command
+8. Send Create I/O Submission Queue command
+
+**NVMe command format (64 bytes):**
+
+```text
+NvmeCommand {
+    opcode: u8,           // 0x01=Write, 0x02=Read, 0x06=Identify
+    flags: u8,
+    command_id: u16,
+    nsid: u32,            // namespace ID (usually 1)
+    reserved: u64,
+    metadata_ptr: u64,
+    prp1: u64,            // Physical Region Page 1 (data buffer address)
+    prp2: u64,            // PRP2 (for >4KB transfers: second page or PRP list)
+    cdw10-cdw15: [u32; 6], // command-specific dwords
+}
+```
+
+**NVMe completion entry (16 bytes):**
+
+```text
+NvmeCompletion {
+    command_specific: u32,
+    reserved: u32,
+    sq_head: u16,         // SQ head pointer (for SQ doorbell update)
+    sq_id: u16,
+    command_id: u16,      // matches the submitted command
+    status: u16,          // phase bit + status code
+}
+```
+
+**Read/Write commands:**
+
+* `cdw10` = starting LBA (lower 32 bits)
+* `cdw11` = starting LBA (upper 32 bits) — supports 64-bit LBA (billions of TB)
+* `cdw12[15:0]` = number of logical blocks - 1 (0 = 1 block)
+* `prp1` = physical address of data buffer (must be page-aligned for multi-page)
+* `prp2` = second page or PRP list pointer (for transfers > 4KB)
+
+**DMA buffer management:**
+
+* Allocate physically contiguous pages via the frame allocator for SQ, CQ, and data buffers
+* PRP (Physical Region Page) entries point directly to physical frame addresses
+* For transfers spanning multiple pages: build a PRP list (array of physical addresses)
+* The kernel must ensure DMA buffers are not freed while commands are in-flight
+
+**Doorbell registers (command submission):**
+
+* After writing a command to the SQ tail: write the new tail index to the SQ Tail Doorbell register at BAR0 + 0x1000 + (2 × queue_id × doorbell_stride)
+* After processing a completion from the CQ: write the new head index to the CQ Head Doorbell register at BAR0 + 0x1000 + ((2 × queue_id + 1) × doorbell_stride)
+
+**Implementation: `src/arch/x86_64/nvme.rs`**
+
+```text
+NvmeController {
+    bar0: u64,                    // MMIO base (mapped from PCI BAR0)
+    admin_sq: *mut NvmeCommand,   // Admin Submission Queue (DMA buffer)
+    admin_cq: *mut NvmeCompletion, // Admin Completion Queue
+    io_sq: *mut NvmeCommand,      // I/O Submission Queue
+    io_cq: *mut NvmeCompletion,   // I/O Completion Queue
+    sq_tail: u16,                 // current SQ tail index
+    cq_head: u16,                 // current CQ head index
+    cq_phase: bool,               // completion phase bit
+    doorbell_stride: u32,         // from CAP register
+    max_transfer_size: u32,       // from Identify Controller
+}
+
+pub fn init(pci_device: &PciDevice) -> Result<NvmeController, NvmeError>
+pub fn read_sectors(ctrl: &mut NvmeController, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), NvmeError>
+pub fn write_sectors(ctrl: &mut NvmeController, lba: u64, count: u32, buf: &[u8]) -> Result<(), NvmeError>
+pub fn identify(ctrl: &mut NvmeController) -> NvmeIdentifyData
+```
+
+**Integration with existing storage layer:**
+
+* `persist.rs` and `checkpoint.rs` call `read_sectors`/`write_sectors` via a trait or function pointer
+* Stage-4 introduces a `BlockDevice` trait: `{ fn read(&mut self, lba: u64, buf: &mut [u8]); fn write(&mut self, lba: u64, buf: &[u8]); }`
+* ATA PIO and NVMe both implement `BlockDevice`; the kernel selects the driver based on PCI enumeration at boot
+
+**NVMe capacity:**
+
+* 64-bit LBA addressing: supports up to 2^64 logical blocks
+* With 512-byte sectors: theoretical maximum = 8 ZB (zettabytes)
+* Practical limit: determined by the physical SSD/device capacity
+
+#### 26.2.4 Real NIC Driver
+
+Replace virtio-net (Stage-3) with a real Ethernet controller driver for hardware deployment. The initial target is Intel e1000/e1000e, the most widely supported NIC in both QEMU and real hardware.
+
+**e1000 architecture:**
+
+* MMIO registers via PCI BAR0
+* Descriptor ring buffers for TX and RX (similar to NVMe SQ/CQ pattern)
+* DMA: the NIC reads TX descriptors and writes RX descriptors directly to host memory
+* Interrupt on packet receive (or polling mode for high throughput)
+
+**Implementation: `src/arch/x86_64/e1000.rs`**
+
+```text
+E1000 {
+    bar0: u64,                      // MMIO base
+    rx_ring: *mut E1000RxDesc,      // Receive descriptor ring (DMA buffer)
+    tx_ring: *mut E1000TxDesc,      // Transmit descriptor ring
+    rx_buffers: [*mut u8; 32],      // Receive packet buffers
+    rx_tail: u16,
+    tx_tail: u16,
+    mac_addr: [u8; 6],
+}
+
+pub fn init(pci_device: &PciDevice) -> Result<E1000, E1000Error>
+pub fn send_packet(nic: &mut E1000, data: &[u8]) -> Result<(), E1000Error>
+pub fn recv_packet(nic: &mut E1000, buf: &mut [u8]) -> Result<usize, E1000Error>
+pub fn mac_address(nic: &E1000) -> [u8; 6]
+```
+
+**Integration:** The netd system agent (Stage-3 stub) is updated to call `e1000::send_packet`/`recv_packet` instead of logging stubs. The IP/UDP/TCP protocol handling is done by netd in user mode, not in the kernel driver.
+
+#### 26.2.5 GPU/NPU Access
+
+Brokered through a **gpud** system agent, not directly accessible to agents. The broker model from netd applies: agents send compute requests via mailbox, gpud dispatches to the GPU/NPU hardware.
+
+This is deferred to post-Stage-4 (no engineering specification yet). The interface will follow the same pattern as netd: mailbox protocol, capability-gated, audit-logged.
+
+#### 26.2.6 Distributed Execution
 
 * **Remote mailbox**: agents on different nodes communicate via mailbox transparently. The kernel routes cross-node messages to a **routerd** system agent, which serializes them and sends them over the network via the kernel's minimal UDP transport (a kernel-internal network stack separate from the user-facing netd broker). This separation ensures that inter-kernel routing does not depend on user-mode system agents for liveness.
 * **Node discovery**: a bootstrap protocol for nodes to find each other (multicast or seed node list)
 * **Cross-node capability verification**: capabilities include a node ID and a cryptographic signature. The receiving node verifies the capability before accepting a remote message.
 * **Agent migration**: move a checkpointed agent from one node to another. The agent resumes on the new node with its full state. Both nodes must run binary-compatible AOS kernels (same syscall ABI version and checkpoint format).
 
-#### 26.2.3 Developer SDK
+#### 26.2.7 Developer SDK
 
 * **Agent SDK (Rust)**: a `#![no_std]` crate providing safe wrappers around AOS syscalls, mailbox send/recv helpers, state get/put, and energy queries
 * **Agent SDK (WASM)**: Rust-to-WASM toolchain (`wasm32-unknown-unknown` target) for writing WASM agents with AOS syscall bindings via imported host functions
 * **eBPF-lite SDK**: a compiler from a restricted C/Rust subset to eBPF-lite bytecode, with a local verifier
 * **CLI tools**: `aos-build` (compile agent), `aos-deploy` (load agent into running AOS), `aos-replay` (replay a checkpoint), `aos-inspect` (query agent state and event logs)
 
-#### 26.2.4 Security & Attestation
+#### 26.2.8 Security & Attestation
 
 * **Execution proofs**: produce a cryptographic proof that a specific event log was generated by a specific checkpoint under deterministic replay
 * **Remote attestation**: a node can prove to a verifier that it is running unmodified AOS kernel code (via TPM or secure boot chain)
@@ -1549,18 +1798,45 @@ Stage-4 expands AOS from a QEMU-only platform into a deployable system with real
 
 ### 26.3 Suggested Development Order (Stage-4)
 
-#### Phase 17: higher-half kernel + UEFI boot + PCI enumeration
+#### Phase 17a: higher-half kernel
 
-* Higher-half kernel: relink kernel at `0xFFFFFFFF80000000`, update boot page tables and linker script. This is a prerequisite for UEFI boot (UEFI firmware uses low memory) and was deferred from Stage-2 §24.2.1.
-* UEFI boot path (replaces Multiboot v1): parse UEFI memory map, set up page tables, call kernel entry
-* PCI bus enumeration: discover and initialize devices on a real PCI bus
-* Verify: AOS boots via UEFI on real x86_64 hardware
+* Relink kernel at `0xFFFFFFFF80000000`, update linker.ld
+* Update boot.asm: set up page tables mapping kernel in upper half before jumping to kernel_main
+* Update all hardcoded physical address assumptions (stack, page tables, BSS)
+* Update per-agent page table creation to map kernel in upper half
+* Verify: kernel boots and runs all agents with higher-half mapping (still Multiboot v1 on QEMU)
 
-#### Phase 18: NVMe + real NIC
+#### Phase 17b: UEFI boot
 
-* NVMe storage driver (replaces ATA PIO from Stage-2)
-* Real NIC driver (e1000 or similar, replaces virtio-net from Stage-3)
-* Verify: persistent state and networking work on real hardware
+* Implement minimal UEFI application (PE/COFF entry point)
+* Query memory map, allocate page tables, exit boot services
+* Replace Multiboot info parsing with UEFI memory map in frame allocator
+* Verify: AOS boots via UEFI on QEMU (`-bios OVMF.fd`)
+
+#### Phase 17c: PCI bus enumeration
+
+* Implement PCI config space access via ports 0xCF8/0xCFC
+* Enumerate all devices, read vendor/device/class/subclass
+* Read and decode BARs, map MMIO regions into kernel virtual space
+* Detect MSI-X capability for interrupt setup
+* Verify: PCI enumeration discovers NVMe controller and NIC in QEMU
+
+#### Phase 18a: NVMe storage driver
+
+* Controller initialization: Admin Queue setup, CC.EN, wait CSTS.RDY
+* Identify Controller command to discover device capabilities
+* Create I/O Submission/Completion Queue pair
+* Implement read_sectors/write_sectors via NVMe Read/Write commands with PRP
+* Implement BlockDevice trait; update persist.rs and checkpoint.rs to use trait dispatch
+* Verify: state persistence and checkpoint work via NVMe on QEMU (`-device nvme`)
+
+#### Phase 18b: real NIC driver (e1000)
+
+* Initialize e1000 via PCI BAR0 MMIO
+* Set up RX/TX descriptor rings with DMA buffers
+* Implement send_packet/recv_packet
+* Wire into netd system agent (replace stub mode)
+* Verify: agent sends HTTP request through netd on real NIC, receives response
 
 #### Phase 19: distributed execution
 
