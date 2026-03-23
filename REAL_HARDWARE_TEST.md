@@ -43,7 +43,7 @@ AOS boots as a standard UEFI application placed at `EFI/BOOT/BOOTX64.EFI` on a F
 ### Step 1 — Build the UEFI image
 
 ```bash
-cd /home/tomi/aos
+cd ~/aos
 make uefi-build
 ```
 
