@@ -1038,7 +1038,7 @@ When an agent's stack grows into the guard page, the CPU triggers a page fault b
 
 Future versions may add explicit immutable shared regions or capability-scoped shared pages.
 
-### 16.8 CPU Security Features (Planned for Stage-4) `[IMPL: ⚠️ SMEP/SMAP/NX implemented; KASLR + Spectre deferred]`
+### 16.8 CPU Security Features (Planned for Stage-4) `[IMPL: ✅ SMEP/SMAP/NX/IBRS/STIBP implemented; KASLR deferred]`
 
 Production deployment requires enabling hardware security features:
 
@@ -1046,7 +1046,7 @@ Production deployment requires enabling hardware security features:
 * **SMAP** (Supervisor Mode Access Prevention): set CR4.SMAP to prevent kernel from reading/writing user-mode pages except in explicit `stac`/`clac` windows. Mitigates data leaks. `[IMPL: ✅ detection + CR4 enable; stac/clac wrappers in syscall handlers]`
 * **NX enforcement**: all stack pages and data pages must have the NX (No-Execute) bit set. Only `.text` sections should be executable. `[IMPL: ✅ EFER.NXE enabled; PTE_NX on data/stack pages]`
 * **KASLR** (Kernel Address Space Layout Randomization): randomize the kernel's virtual base address at boot (requires higher-half kernel). Mitigates ROP/JOP attacks. `[IMPL: ❌ requires higher-half kernel first]`
-* **Spectre mitigations**: enable IBRS/STIBP on context switch between agents with different trust levels (kernel ↔ ring 3). `[IMPL: ❌]`
+* **Spectre mitigations**: enable IBRS/STIBP on context switch between agents with different trust levels (kernel ↔ ring 3). `[IMPL: ✅ IBRS/STIBP via IA32_SPEC_CTRL on syscall entry/exit; graceful skip on unsupported CPUs]`
 
 ---
 

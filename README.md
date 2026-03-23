@@ -116,7 +116,23 @@ Press `Ctrl+C` to stop.
 make build       # Build release binary only
 make clean       # Remove build artifacts
 make debug-run   # Build debug + launch QEMU with GDB stub (-s -S)
+make uefi-run    # Boot via UEFI (QEMU + OVMF firmware)
+make test        # Single-node test with SMP + disk + network
 ```
+
+### UEFI Boot
+
+AOS supports both Multiboot v1 and UEFI boot:
+
+```bash
+# Install OVMF firmware
+sudo apt install ovmf
+
+# Build and run via UEFI
+make uefi-run
+```
+
+The UEFI loader (`uefi/`) is a standalone PE/COFF application that embeds the kernel ELF, sets up higher-half page tables, exits UEFI boot services, and jumps to `kernel_main`. This is the same approach Linux uses with its EFI stub.
 
 ## Architecture
 
