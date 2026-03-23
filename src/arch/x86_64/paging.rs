@@ -215,13 +215,27 @@ pub fn create_address_space() -> Option<u64> {
 /// Frees the PML4 and all page table frames allocated for user-space mappings.
 /// Does NOT free the kernel mappings (those are shared).
 pub fn destroy_address_space(pml4_phys: u64) {
-    // 1. Walk the PML4 entries that belong to user space (entries 4..256)
-    // 2. For each present entry, walk down and free all page table frames
-    // 3. Free the PML4 frame itself
-
     let pml4 = pml4_phys as *const u64;
     unsafe {
-        // Only free user-space entries (4..256, skipping kernel entries 0..4 and 256..512)
+        // 1. Free PML4[0]'s PDPT and PD (allocated per-agent in create_address_space).
+        //    We free only the PDPT and PD frames — NOT the huge page entries
+        //    (those map shared physical memory, not allocated page tables).
+        let pml4_0 = core::ptr::read_volatile(pml4);
+        if pml4_0 & PTE_PRESENT != 0 {
+            let pdpt_phys = pml4_0 & 0x000F_FFFF_FFFF_F000;
+            let pdpt = pdpt_phys as *const u64;
+            let pdpt_0 = core::ptr::read_volatile(pdpt);
+            if pdpt_0 & PTE_PRESENT != 0 {
+                // Free PD frame (contains huge page entries, not sub-tables)
+                let pd_phys = pdpt_0 & 0x000F_FFFF_FFFF_F000;
+                dealloc_frame(pd_phys);
+            }
+            // Free PDPT frame
+            dealloc_frame(pdpt_phys);
+        }
+
+        // 2. Free user-space entries (PML4[4..256] — may have page tables
+        //    allocated by map_page for user code/stack)
         for i in 4..256 {
             let pml4e = core::ptr::read_volatile(pml4.add(i));
             if pml4e & PTE_PRESENT != 0 {
@@ -229,6 +243,8 @@ pub fn destroy_address_space(pml4_phys: u64) {
                 free_page_table_level(pdpt_phys, 3);
             }
         }
+
+        // 3. PML4[511] is the shared higher-half kernel mapping — do NOT free.
     }
 
     dealloc_frame(pml4_phys);
