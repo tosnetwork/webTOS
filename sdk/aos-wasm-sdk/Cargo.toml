@@ -1,0 +1,13 @@
+[package]
+name = "aos-wasm-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "AOS WASM Agent SDK — write WASM agents for AOS in Rust"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,10 @@
+[package]
+name = "aos-cli"
+version = "0.1.0"
+edition = "2021"
+description = "AOS CLI tools — build, deploy, replay, and inspect AOS agents"
+license = "MIT"
+
+[[bin]]
+name = "aos"
+path = "src/main.rs"

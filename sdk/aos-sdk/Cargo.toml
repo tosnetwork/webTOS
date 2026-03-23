@@ -1,0 +1,9 @@
+[package]
+name = "aos-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "AOS Agent SDK — safe Rust wrappers for AOS syscalls"
+license = "MIT"
+
+[features]
+default = []
