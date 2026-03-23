@@ -15,6 +15,7 @@ fn main() {
         "trap_entry.asm",
         "switch.asm",
         "user_agents.asm",
+        "ap_trampoline.asm",
     ];
 
     for asm_file in &asm_files {

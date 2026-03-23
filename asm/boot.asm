@@ -131,13 +131,15 @@ _start:
     jmp .error
 
 ; ---------------------------------------------------------------------------
-; Set up identity-mapped page tables for the first 16 MB
+; Set up identity-mapped page tables for the first 512 MB
 ;
 ; PML4[0] -> PDPT
 ; PDPT[0] -> PD
-; PD[0..7] -> 0x000000..0xE00000 (8 x 2 MB huge pages)
+; PD[0..255] -> 0x000000..0x1FE00000 (256 x 2 MB huge pages = 512 MB)
 ;
-; 16 MB covers kernel code + BSS + page tables + 64KB stack with room to spare
+; 512 MB covers kernel, ACPI tables (at ~128MB), and LAPIC MMIO.
+; QEMU places ACPI tables near the top of RAM, so we need to map
+; beyond the kernel's own memory footprint.
 ; ---------------------------------------------------------------------------
 .setup_page_tables:
     ; Zero all page table memory first
@@ -156,15 +158,31 @@ _start:
     or eax, 0x3              ; Present | Writable
     mov [pdpt_table], eax
 
-    ; Map 8 x 2MB pages (= 16 MB)
+    ; Map 256 x 2MB pages (= 512 MB) for RAM + ACPI tables
     mov ecx, 0              ; counter
     mov eax, 0x83            ; Present | Writable | Huge, physical addr = 0
 .map_page:
     mov [pd_table + ecx * 8], eax
     add eax, 0x200000        ; next 2MB
     inc ecx
-    cmp ecx, 8
+    cmp ecx, 256
     jb .map_page
+
+    ; Also map LAPIC MMIO at 0xFEE00000 (3GB + 0xEE00000)
+    ; PDPT[3] -> pd_table2 for the 3-4GB region
+    ; PD entry for 0xFEE00000: PD index = (0xFEE00000 >> 21) & 0x1FF = 0x1F7 = 503
+    ; But we only have one PD (512 entries for PDPT[0]).
+    ; For LAPIC, we need PDPT[3] which covers 3GB-4GB.
+    ; Quick fix: map LAPIC as a single 2MB huge page at PDPT[3]->PD[0x77]
+    ; Actually, simplest: create the mapping via the existing PD if we extend PDPT.
+    ; For now, we'll map the LAPIC region by adding PDPT[3] inline.
+    ; PDPT[3] needs its own PD. But we only allocated one PD.
+    ; Simplest approach: use a 1GB huge page for PDPT[3] if supported.
+    ; 1GB pages: PDPT entry with PS bit set → maps 1GB.
+    ; PDPT[3] = 0xC0000000 | Present | Writable | Huge(PS)
+    ; This maps 3GB-4GB as one huge page, covering LAPIC at 0xFEE00000.
+    mov dword [pdpt_table + 3 * 8], 0xC0000083  ; 3GB, Present|Writable|Huge
+    mov dword [pdpt_table + 3 * 8 + 4], 0       ; high 32 bits = 0
 
     ret
 

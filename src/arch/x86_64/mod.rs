@@ -11,6 +11,8 @@ pub mod timer;
 pub mod context;
 pub mod syscall_msr;
 pub mod ata;
+pub mod acpi;
+pub mod lapic;
 
 pub use serial::{serial_print, serial_println};
 

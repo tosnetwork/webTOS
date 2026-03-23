@@ -85,14 +85,17 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
         32 => {
             // Increment the global tick counter
             crate::arch::x86_64::timer::tick();
-            // Send EOI to PIC (must be sent before scheduling, since
-            // schedule() may context-switch and never return here)
-            unsafe {
-                core::arch::asm!(
-                    "mov al, 0x20",
-                    "out 0x20, al",
-                    options(nomem, nostack)
-                );
+            // Send EOI: use LAPIC if active, otherwise PIC
+            if crate::arch::x86_64::lapic::is_active() {
+                crate::arch::x86_64::lapic::eoi();
+            } else {
+                unsafe {
+                    core::arch::asm!(
+                        "mov al, 0x20",
+                        "out 0x20, al",
+                        options(nomem, nostack)
+                    );
+                }
             }
             // Energy accounting + preemptive reschedule
             crate::sched::timer_tick();

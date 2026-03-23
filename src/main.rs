@@ -34,6 +34,7 @@ mod merkle;
 mod checkpoint;
 mod replay;
 mod large_msg;
+mod smp;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -69,7 +70,22 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     init::init();
     serial_println!("[OK] System initialization complete");
 
-    // 8. Start scheduling
+    // 8. Discover CPUs and boot APs (if multi-core)
+    if let Some(acpi_info) = arch::x86_64::acpi::init() {
+        serial_println!("[SMP] {} CPU(s) detected", acpi_info.cpu_count);
+        if acpi_info.cpu_count > 1 {
+            // Initialize LAPIC on BSP
+            arch::x86_64::lapic::init(acpi_info.lapic_base);
+            // Disable PIT since LAPIC timer replaces it
+            arch::x86_64::lapic::disable_pit();
+            // Boot Application Processors
+            smp::boot_aps(&acpi_info);
+        }
+    } else {
+        serial_println!("[SMP] ACPI not found, running single-core");
+    }
+
+    // 9. Start scheduling
     serial_println!("[AOS] Entering scheduler loop");
     sched::start();
 
