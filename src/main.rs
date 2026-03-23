@@ -64,6 +64,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     sched::init();
     serial_println!("[OK] Scheduler initialized");
 
+    // 5b. Initialize persistent storage (ATA disk detection + state log replay)
+    persist::init();
+    serial_println!("[OK] Persistent storage initialized");
+
     // 6. Emit boot event
     event::boot();
 
