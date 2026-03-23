@@ -143,7 +143,7 @@ pub fn init() {
     unsafe { SERIAL.init() };
 }
 
-/// Write formatted arguments to COM1.
+/// Write formatted arguments to COM1 and the framebuffer (if initialized).
 ///
 /// Used by the serial_print! and serial_println! macros.
 #[doc(hidden)]
@@ -154,6 +154,12 @@ pub fn _serial_print(args: fmt::Arguments) {
     // for serial output in a way that corrupts state (worst case: interleaved bytes).
     let serial = unsafe { &mut *core::ptr::addr_of!(SERIAL).cast_mut() };
     serial.write_fmt(args).unwrap();
+
+    // Mirror to framebuffer console if available
+    if super::framebuffer::is_initialized() {
+        let mut fb_writer = super::framebuffer::FbWriter;
+        let _ = fb_writer.write_fmt(args);
+    }
 }
 
 /// Print to the serial console (COM1).

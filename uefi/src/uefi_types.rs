@@ -1,7 +1,8 @@
 //! Minimal UEFI FFI type definitions.
 //!
 //! Hand-crafted to match UEFI 2.10 specification. No external crate.
-//! Only the types needed for GetMemoryMap, AllocatePages, and ExitBootServices.
+//! Only the types needed for GetMemoryMap, AllocatePages, ExitBootServices,
+//! and LocateProtocol (for GOP).
 
 pub type EfiHandle = *mut core::ffi::c_void;
 pub type EfiStatus = usize;
@@ -49,21 +50,14 @@ pub struct EfiSystemTable {
 /// Unused slots are typed as `usize` placeholders.
 ///
 /// Offsets (in function pointer slots after header):
-///   0: RaiseTPL
-///   1: RestoreTPL
-///   2: AllocatePages      ← we use this
-///   3: FreePages
-///   4: GetMemoryMap        ← we use this
-///   5: AllocatePool
-///   6: FreePool
-///   7-17: Event/Protocol services (11 slots)
-///   18: LocateDevicePath
-///   19: InstallConfigurationTable
-///   20: LoadImage
-///   21: StartImage
-///   22: Exit
-///   23: UnloadImage
-///   24: ExitBootServices   ← we use this
+///   0: RaiseTPL              7-12: Event services
+///   1: RestoreTPL            13-17: Protocol handler services
+///   2: AllocatePages         18-21: Image/config services
+///   3: FreePages             22-26: Image/boot services
+///   4: GetMemoryMap          27-29: Misc services
+///   5: AllocatePool          30-31: Driver support
+///   6: FreePool              32-36: Protocol services
+///   24: ExitBootServices     37: LocateProtocol
 #[repr(C)]
 pub struct EfiBootServices {
     pub hdr: EfiTableHeader,
@@ -113,7 +107,7 @@ pub struct EfiBootServices {
     // 16: HandleProtocol
     pub handle_protocol: usize,
     // 17: Reserved
-    pub reserved: usize,
+    pub reserved2: usize,
     // 18: RegisterProtocolNotify
     pub register_protocol_notify: usize,
     // 19: LocateHandle
@@ -135,6 +129,80 @@ pub struct EfiBootServices {
         image_handle: EfiHandle,
         map_key: usize,
     ) -> EfiStatus,
+    // 27: GetNextHighMonotonicCount
+    pub get_next_high_monotonic_count: usize,
+    // 28: Stall
+    pub stall: usize,
+    // 29: SetWatchdogTimer
+    pub set_watchdog_timer: usize,
+    // 30: ConnectController
+    pub connect_controller: usize,
+    // 31: DisconnectController
+    pub disconnect_controller: usize,
+    // 32: OpenProtocol
+    pub open_protocol: usize,
+    // 33: CloseProtocol
+    pub close_protocol: usize,
+    // 34: OpenProtocolInformation
+    pub open_protocol_information: usize,
+    // 35: ProtocolsPerHandle
+    pub protocols_per_handle: usize,
+    // 36: LocateHandleBuffer
+    pub locate_handle_buffer: usize,
+    // 37: LocateProtocol
+    pub locate_protocol: extern "efiapi" fn(
+        protocol: *const EfiGuid,
+        registration: *const core::ffi::c_void,
+        interface: *mut *mut core::ffi::c_void,
+    ) -> EfiStatus,
+}
+
+// ─── EFI GUID ────────────────────────────────────────────────────────────────
+
+#[repr(C)]
+pub struct EfiGuid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+/// GUID for EFI_GRAPHICS_OUTPUT_PROTOCOL
+pub const EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID: EfiGuid = EfiGuid {
+    data1: 0x9042a9de,
+    data2: 0x23dc,
+    data3: 0x4a38,
+    data4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a],
+};
+
+// ─── UEFI Graphics Output Protocol (GOP) ────────────────────────────────────
+
+#[repr(C)]
+pub struct EfiGraphicsOutputProtocol {
+    pub query_mode: usize,
+    pub set_mode: usize,
+    pub blt: usize,
+    pub mode: *const EfiGraphicsOutputMode,
+}
+
+#[repr(C)]
+pub struct EfiGraphicsOutputMode {
+    pub max_mode: u32,
+    pub mode: u32,
+    pub info: *const EfiGraphicsOutputModeInfo,
+    pub size_of_info: usize,
+    pub framebuffer_base: u64,
+    pub framebuffer_size: usize,
+}
+
+#[repr(C)]
+pub struct EfiGraphicsOutputModeInfo {
+    pub version: u32,
+    pub horizontal_resolution: u32,
+    pub vertical_resolution: u32,
+    pub pixel_format: u32, // 0=RGBX, 1=BGRX, 2=BitMask, 3=BltOnly
+    pub pixel_info: [u32; 4],
+    pub pixels_per_scan_line: u32,
 }
 
 /// UEFI memory map descriptor.

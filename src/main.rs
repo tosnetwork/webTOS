@@ -58,6 +58,23 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
         }
         UEFI_MAGIC => {
             serial_println!("AOS boot ok (UEFI)");
+
+            // Initialize framebuffer console if UEFI GOP provided FB info
+            if multiboot_info != 0 {
+                let boot_info_ptr = multiboot_info as *const arch::x86_64::paging::BootInfo;
+                let bi = unsafe { &*boot_info_ptr };
+                if bi.fb_addr != 0 {
+                    arch::x86_64::framebuffer::init(
+                        bi.fb_addr,
+                        bi.fb_width,
+                        bi.fb_height,
+                        bi.fb_stride,
+                        bi.fb_pixel_format,
+                    );
+                    serial_println!("[OK] Framebuffer console: {}x{} @ 0x{:x}",
+                        bi.fb_width, bi.fb_height, bi.fb_addr);
+                }
+            }
         }
         _ => {
             serial_println!("[WARN] Unknown boot magic: 0x{:x}, continuing", multiboot_magic);

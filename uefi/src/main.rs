@@ -28,8 +28,8 @@ const UEFI_MAGIC: u32 = 0xAE51_0EF1;
 const BOOT_INFO_PHYS: u64 = 0x7000;
 
 /// Byte offset within the 0x7000 page where the raw memory map is copied.
-/// Provides 32 bytes for the BootInfo header (padded to 32 for alignment).
-const MMAP_DATA_OFFSET: u64 = 32;
+/// Provides space for the BootInfo header (56 bytes, padded to 64 for alignment).
+const MMAP_DATA_OFFSET: u64 = 64;
 
 /// Hand-off structure written at BOOT_INFO_PHYS before jumping to kernel_main.
 ///
@@ -46,6 +46,17 @@ struct BootInfo {
     desc_size: u32,
     /// Number of descriptors in the map.
     desc_count: u32,
+    // ── Framebuffer info (from UEFI GOP) ──
+    /// Physical address of the GOP framebuffer (0 if unavailable).
+    fb_addr: u64,
+    /// Horizontal resolution in pixels.
+    fb_width: u32,
+    /// Vertical resolution in pixels.
+    fb_height: u32,
+    /// Pixels per scan line (stride).
+    fb_stride: u32,
+    /// Pixel format: 0=RGBX, 1=BGRX.
+    fb_pixel_format: u32,
 }
 
 /// Kernel higher-half virtual address offset.
@@ -55,6 +66,57 @@ const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_HUGE: u64 = 1 << 7;
+
+/// Framebuffer info gathered from GOP before ExitBootServices.
+struct FbInfo {
+    addr: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: u32,
+}
+
+/// Query UEFI GOP for framebuffer information.
+///
+/// Must be called BEFORE ExitBootServices. Returns None if GOP is
+/// not available (e.g., headless/serial-only firmware).
+fn query_gop(bs: &EfiBootServices) -> Option<FbInfo> {
+    let mut gop_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.locate_protocol)(
+        &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID,
+        core::ptr::null(),
+        &mut gop_ptr,
+    );
+    if status != EFI_SUCCESS || gop_ptr.is_null() {
+        return None;
+    }
+
+    let gop = unsafe { &*(gop_ptr as *const EfiGraphicsOutputProtocol) };
+    if gop.mode.is_null() {
+        return None;
+    }
+
+    let mode = unsafe { &*gop.mode };
+    if mode.info.is_null() || mode.framebuffer_base == 0 {
+        return None;
+    }
+
+    let info = unsafe { &*mode.info };
+
+    // Only support RGB and BGR pixel formats (not BitMask or BltOnly)
+    if info.pixel_format > 1 {
+        serial::println("[UEFI] GOP: unsupported pixel format, skipping framebuffer");
+        return None;
+    }
+
+    Some(FbInfo {
+        addr: mode.framebuffer_base,
+        width: info.horizontal_resolution,
+        height: info.vertical_resolution,
+        stride: info.pixels_per_scan_line,
+        pixel_format: info.pixel_format,
+    })
+}
 
 /// UEFI application entry point.
 ///
@@ -87,11 +149,30 @@ pub extern "efiapi" fn efi_main(
     serial::print_hex(pt_base);
     serial::println("");
 
-    // 4. Set up dual page table mapping (same as boot.asm)
-    setup_page_tables(pt_base);
+    // 4. Query GOP for framebuffer info (must be done before ExitBootServices)
+    let fb_info = query_gop(bs);
+    if let Some(ref fb) = fb_info {
+        serial::print("[UEFI] GOP framebuffer: ");
+        serial::print_hex(fb.addr);
+        serial::print(" ");
+        serial::print_hex(fb.width as u64);
+        serial::print("x");
+        serial::print_hex(fb.height as u64);
+        serial::print(" stride=");
+        serial::print_hex(fb.stride as u64);
+        serial::print(" fmt=");
+        serial::print_hex(fb.pixel_format as u64);
+        serial::println("");
+    } else {
+        serial::println("[UEFI] GOP not available (serial-only mode)");
+    }
+
+    // 5. Set up dual page table mapping (same as boot.asm)
+    let fb_addr = fb_info.as_ref().map(|f| f.addr).unwrap_or(0);
+    setup_page_tables(pt_base, fb_addr);
     serial::println("[UEFI] Dual page tables configured (identity + higher-half)");
 
-    // 5. Get memory map (required for ExitBootServices map_key)
+    // 6. Get memory map (required for ExitBootServices map_key)
     let mut map_buf = [0u8; 16384];
     let mut map_size: usize = map_buf.len();
     let mut map_key: usize = 0;
@@ -116,7 +197,7 @@ pub extern "efiapi" fn efi_main(
     serial::print_hex(desc_size as u64);
     serial::println("");
 
-    // 6. Exit boot services — after this, NO UEFI calls allowed
+    // 7. Exit boot services — after this, NO UEFI calls allowed
     serial::println("[UEFI] Calling ExitBootServices...");
     let status = (bs.exit_boot_services)(image_handle, map_key);
     if status != EFI_SUCCESS {
@@ -140,19 +221,10 @@ pub extern "efiapi" fn efi_main(
 
     serial::println("[UEFI] Boot services exited. Saving memory map...");
 
-    // 7. Copy the UEFI memory map to a known physical address (0x7000 + 32)
+    // 8. Copy the UEFI memory map to a known physical address (0x7000 + 48)
     //    and write a BootInfo header at 0x7000 so the kernel can find it.
-    //
-    //    Layout at 0x7000:
-    //      [0x7000 ..  0x7020)  BootInfo header (32 bytes, padded)
-    //      [0x7020 .. 0x7020+map_size)  raw EFI_MEMORY_DESCRIPTOR array
-    //
-    //    The identity mapping covers the first 512 MB, so 0x7000 is always
-    //    accessible at this point (it is well below any loaded firmware).
     let mmap_dest = (BOOT_INFO_PHYS + MMAP_DATA_OFFSET) as *mut u8;
-    // Clamp map_size to what fits in the rest of the 4 KB page (0x7020..0x8000 = ~4064 bytes).
-    // A typical UEFI map is well under 4 KB.
-    let max_mmap_bytes: usize = 0x1000 - MMAP_DATA_OFFSET as usize; // 4064 bytes
+    let max_mmap_bytes: usize = 0x1000 - MMAP_DATA_OFFSET as usize;
     let copy_size = if map_size <= max_mmap_bytes { map_size } else { max_mmap_bytes };
     let desc_count = copy_size / desc_size;
 
@@ -162,12 +234,21 @@ pub extern "efiapi" fn efi_main(
 
         // Write BootInfo header at 0x7000
         let boot_info_ptr = BOOT_INFO_PHYS as *mut BootInfo;
+        let (fb_a, fb_w, fb_h, fb_s, fb_f) = match fb_info {
+            Some(ref fb) => (fb.addr, fb.width, fb.height, fb.stride, fb.pixel_format),
+            None => (0, 0, 0, 0, 0),
+        };
         core::ptr::write_volatile(boot_info_ptr, BootInfo {
             magic:      UEFI_MAGIC,
             mmap_addr:  BOOT_INFO_PHYS + MMAP_DATA_OFFSET,
             mmap_size:  copy_size as u32,
             desc_size:  desc_size as u32,
             desc_count: desc_count as u32,
+            fb_addr:    fb_a,
+            fb_width:   fb_w,
+            fb_height:  fb_h,
+            fb_stride:  fb_s,
+            fb_pixel_format: fb_f,
         });
     }
 
@@ -177,7 +258,7 @@ pub extern "efiapi" fn efi_main(
     serial::print_hex(desc_count as u64);
     serial::println("");
 
-    // 8. Load our page tables (replaces UEFI firmware's mapping)
+    // 9. Load our page tables (replaces UEFI firmware's mapping)
     unsafe {
         core::arch::asm!(
             "mov cr3, {}",
@@ -188,7 +269,7 @@ pub extern "efiapi" fn efi_main(
 
     serial::println("[UEFI] CR3 loaded. Jumping to kernel...");
 
-    // 9. Jump to kernel_main at its higher-half virtual address.
+    // 10. Jump to kernel_main at its higher-half virtual address.
     //    Calling convention (System V AMD64):
     //      RDI = first arg  = boot_magic  (UEFI_MAGIC, u32 in EDI)
     //      RSI = second arg = boot_info   (physical address of BootInfo = 0x7000)
@@ -213,8 +294,11 @@ pub extern "efiapi" fn efi_main(
 ///   PML4[0]   → PDPT → PD (256 × 2MB huge pages = 512 MB identity)
 ///   PDPT[3]   → 1GB huge page at 3GB (LAPIC at 0xFEE00000)
 ///   PML4[511] → PDPT_HIGH → PD (shared, higher-half kernel)
-///   PDPT_HIGH[511] → 1GB huge page at 3GB (LAPIC at 0xFFFFFFFFC0000000)
-fn setup_page_tables(base: u64) {
+///   PDPT_HIGH[511] → 1GB huge page at 3GB (LAPIC high alias)
+///
+/// If a framebuffer address is provided, the corresponding 1GB PDPT entry
+/// is added to identity-map the framebuffer region.
+fn setup_page_tables(base: u64, fb_addr: u64) {
     let pml4 = base as *mut u64;
     let pdpt = (base + 0x1000) as *mut u64;
     let pd = (base + 0x2000) as *mut u64;
@@ -238,6 +322,18 @@ fn setup_page_tables(base: u64) {
 
         // PDPT[3] → 1GB huge page at 3GB (LAPIC MMIO at 0xFEE00000)
         *pdpt.add(3) = 0xC000_0000 | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
+
+        // ── Framebuffer identity mapping ────────────────────────────
+        // If the framebuffer is above the first 512MB, add a 1GB huge
+        // page entry in the PDPT to cover it. Each PDPT entry covers 1GB.
+        if fb_addr != 0 {
+            let gb_index = (fb_addr >> 30) as usize; // which 1GB region
+            if gb_index > 0 && gb_index < 512 && gb_index != 3 {
+                // Don't overwrite PDPT[0] (identity) or PDPT[3] (LAPIC)
+                let gb_base = (gb_index as u64) << 30;
+                *pdpt.add(gb_index) = gb_base | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE;
+            }
+        }
 
         // ── Higher-half mapping (PML4[511]) ─────────────────────────
         // PML4[511] → PDPT_HIGH

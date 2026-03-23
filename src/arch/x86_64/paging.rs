@@ -40,7 +40,7 @@ pub const KERNEL_VMA_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
 /// UEFI boot-info header placed at physical 0x7000 by the UEFI stub.
 ///
 /// The stub writes this struct at 0x7000, then copies the raw UEFI memory
-/// map directly after it (at 0x7000 + 32). `mmap_addr` points to that copy.
+/// map directly after it (at 0x7000 + 64). `mmap_addr` points to that copy.
 #[repr(C)]
 pub struct BootInfo {
     /// Magic value — must equal 0xAE510EF1 to confirm UEFI boot.
@@ -53,6 +53,17 @@ pub struct BootInfo {
     pub desc_size: u32,
     /// Number of descriptors in the map.
     pub desc_count: u32,
+    // ── Framebuffer info (from UEFI GOP) ──
+    /// Physical address of the GOP framebuffer (0 if unavailable).
+    pub fb_addr: u64,
+    /// Horizontal resolution in pixels.
+    pub fb_width: u32,
+    /// Vertical resolution in pixels.
+    pub fb_height: u32,
+    /// Pixels per scan line (stride).
+    pub fb_stride: u32,
+    /// Pixel format: 0=RGBX, 1=BGRX.
+    pub fb_pixel_format: u32,
 }
 
 /// EFI memory descriptor as defined by the UEFI specification.
