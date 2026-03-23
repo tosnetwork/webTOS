@@ -1140,7 +1140,7 @@ The root agent's entry point is a compiled-in initialization function that spawn
 5. Kernel assigns initial energy budget and memory quota.
 6. Place in run queue.
 7. Execute until yield, block, exit, budget exhaustion, or fault.
-8. On budget exhaustion, the agent is suspended (see §13.3). It may be resumed if budget is replenished.
+8. On budget exhaustion, the agent is suspended (see §13.4). It may be resumed if budget is replenished.
 9. On termination (`sys_exit` or fault), the kernel reclaims all resources (mailbox, memory, capabilities) and moves the agent to a terminal state.
 10. When a parent agent terminates, orphan handling policy applies (see §10.5).
 11. Emit audit events throughout lifecycle.
@@ -1292,7 +1292,22 @@ Energy budgeting exists to support:
 * future billing/meters
 * future blockchain-style gas/energy semantics
 
-### 13.2 Stage-1 strategy
+### 13.2 Energy Provenance
+
+In AOS, energy is never ambient and never self-created. Every usable execution budget must have an explicit provenance.
+
+The provenance rules are:
+
+* **Bootstrapped by the system**: at boot, the kernel initializes the system's starting resource budget and grants the initial usable energy budget to the root agent. The idle agent is a special kernel-internal exception and is not part of the normal economic model.
+* **Transferred, not minted**: when a parent spawns a child or grants additional budget, the child's energy is deducted from the parent's remaining budget. Energy is subdivided and transferred; it does not appear from nowhere.
+* **Replenished only through explicit authority**: a suspended agent may only be resumed if budget is replenished by a parent, the system, or a future accounting or settlement authority that is itself authorized to do so.
+* **Auditable at every boundary**: budget grant, transfer, exhaustion, and replenishment should all be observable through kernel state and audit events.
+
+This mirrors the broader AOS authority model. Just as capabilities are never ambient, energy is never ambient. An agent may hold energy, spend energy, transfer energy, or later receive settlement-backed credit, but it may not manufacture budget by itself.
+
+Future stages may introduce tenant roots, account roots, external payers, or settlement adapters. Even in those cases, new usable agent budget should only enter the system through an explicit, authority-checked, auditable credit path.
+
+### 13.3 Stage-1 strategy
 
 Stage-1 should implement a simple per-agent decrementing budget based on:
 
@@ -1301,7 +1316,7 @@ Stage-1 should implement a simple per-agent decrementing budget based on:
 
 Note: precise per-instruction counting is not feasible on x86_64 without hardware performance counters and is inherently non-deterministic due to out-of-order execution. Tick-based accounting is the correct Stage-1 approach.
 
-### 13.3 Exhaustion policy
+### 13.4 Exhaustion policy
 
 When the budget reaches zero, the kernel must:
 
