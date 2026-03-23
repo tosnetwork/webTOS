@@ -63,10 +63,29 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
         // ── CPU exceptions (vectors 0-19) ───────────────────────────────
         0..=19 => {
             let agent_id = crate::sched::current();
-            serial_println!(
-                "[TRAP] Exception vector={} error_code={:#x} agent={} rip={:#x}",
-                vector, frame.error_code, agent_id, frame.rip
-            );
+
+            // Page fault (vector 14): check if faulting address is in a stack guard region
+            if vector == 14 {
+                let cr2: u64;
+                unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); }
+
+                if let Some(slot) = crate::init::is_guard_region(cr2) {
+                    serial_println!(
+                        "[GUARD PAGE] Stack overflow detected! agent={} slot={} cr2={:#x} rip={:#x}",
+                        agent_id, slot, cr2, frame.rip
+                    );
+                } else {
+                    serial_println!(
+                        "[TRAP] Page fault: agent={} cr2={:#x} error_code={:#x} rip={:#x}",
+                        agent_id, cr2, frame.error_code, frame.rip
+                    );
+                }
+            } else {
+                serial_println!(
+                    "[TRAP] Exception vector={} error_code={:#x} agent={} rip={:#x}",
+                    vector, frame.error_code, agent_id, frame.rip
+                );
+            }
 
             if agent_id != IDLE_AGENT_ID {
                 // Fault the agent and reschedule

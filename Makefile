@@ -1,4 +1,4 @@
-.PHONY: build run release clean debug
+.PHONY: build run release clean debug test test-crossnode
 
 KERNEL_DEBUG = target/x86_64-unknown-none/debug/aos
 KERNEL_RELEASE = target/x86_64-unknown-none/release/aos
@@ -18,6 +18,17 @@ debug-run: debug-build
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_DEBUG) $(KERNEL_ELF32)
 	qemu-system-x86_64 -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown -s -S &
 	@echo "GDB: target remote :1234"
+
+test: build
+	@echo "Running single-node test..."
+	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
+	timeout 8 qemu-system-x86_64 -serial stdio -display none -kernel $(KERNEL_ELF32) \
+		-device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
+		-drive file=/tmp/aos_test.img,format=raw,if=ide \
+		-no-reboot -no-shutdown 2>&1 | head -50
+
+test-crossnode:
+	./tools/test_crossnode.sh
 
 clean:
 	cargo clean

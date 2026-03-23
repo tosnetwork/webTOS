@@ -16,6 +16,14 @@ pub struct SpinLock<T> {
 unsafe impl<T: Send> Sync for SpinLock<T> {}
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
+/// Read the RFLAGS register.
+#[inline(always)]
+fn read_rflags() -> u64 {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem)); }
+    flags
+}
+
 impl<T> SpinLock<T> {
     pub const fn new(data: T) -> Self {
         SpinLock {
@@ -25,7 +33,9 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<T> {
-        // Disable interrupts to prevent deadlock on single-core
+        // Save interrupt state and disable interrupts
+        let flags = read_rflags();
+        let irq_was_enabled = flags & (1 << 9) != 0;
         unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
 
         // Spin until we acquire the lock
@@ -35,7 +45,7 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         }
 
-        SpinLockGuard { lock: self, restore_irq: true }
+        SpinLockGuard { lock: self, irq_was_enabled }
     }
 
     /// Acquire the lock WITHOUT disabling/restoring interrupts.
@@ -48,13 +58,13 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         }
 
-        SpinLockGuard { lock: self, restore_irq: false }
+        SpinLockGuard { lock: self, irq_was_enabled: false }
     }
 }
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
-    restore_irq: bool,
+    irq_was_enabled: bool,
 }
 
 impl<'a, T> core::ops::Deref for SpinLockGuard<'a, T> {
@@ -73,7 +83,8 @@ impl<'a, T> core::ops::DerefMut for SpinLockGuard<'a, T> {
 impl<'a, T> Drop for SpinLockGuard<'a, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
-        if self.restore_irq {
+        // Only restore interrupts if they were enabled before we acquired the lock
+        if self.irq_was_enabled {
             unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
         }
     }

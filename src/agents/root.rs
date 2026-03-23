@@ -78,6 +78,13 @@ pub extern "C" fn root_entry() -> ! {
             }
         }
 
+        // Generate execution proof at tick 700
+        if count == 700 {
+            serial_println!("[ROOT] Generating execution proof...");
+            let proof = crate::proof::generate_proof();
+            crate::proof::print_proof(&proof);
+        }
+
         // Yield to let other agents run
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     }

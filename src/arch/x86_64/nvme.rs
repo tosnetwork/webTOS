@@ -6,6 +6,7 @@
 //! QEMU: -device nvme,drive=d0,serial=aos-nvme -drive file=disk.img,id=d0,format=raw,if=none
 
 use crate::serial_println;
+use super::paging;
 
 // ─── NVMe Controller Registers (MMIO offsets from BAR0) ─────────────────
 
@@ -14,24 +15,17 @@ const REG_CAP: u64 = 0x00;      // Controller Capabilities
 const REG_VS: u64 = 0x08;       // Version
 const REG_CC: u64 = 0x14;       // Controller Configuration
 const REG_CSTS: u64 = 0x1C;     // Controller Status
-#[allow(dead_code)]
 const REG_AQA: u64 = 0x24;      // Admin Queue Attributes
-#[allow(dead_code)]
 const REG_ASQ: u64 = 0x28;      // Admin Submission Queue Base
-#[allow(dead_code)]
 const REG_ACQ: u64 = 0x30;      // Admin Completion Queue Base
 
 // ─── NVMe Command Opcodes ───────────────────────────────────────────────
 
 #[allow(dead_code)]
 const NVME_CMD_IDENTIFY: u8 = 0x06;
-#[allow(dead_code)]
 const NVME_CMD_CREATE_IO_CQ: u8 = 0x05;
-#[allow(dead_code)]
 const NVME_CMD_CREATE_IO_SQ: u8 = 0x01;
-#[allow(dead_code)]
 const NVME_CMD_READ: u8 = 0x02;
-#[allow(dead_code)]
 const NVME_CMD_WRITE: u8 = 0x01;
 
 // ─── NVMe Submission Queue Entry (64 bytes) ─────────────────────────────
@@ -79,6 +73,16 @@ pub struct NvmeController {
     pub initialized: bool,
     pub doorbell_stride: u32,
     pub max_queue_entries: u16,
+    pub asq: u64,
+    pub acq: u64,
+    pub sq_tail: u16,
+    pub cq_head: u16,
+    pub cq_phase: bool,
+    pub io_sq: u64,
+    pub io_cq: u64,
+    pub io_sq_tail: u16,
+    pub io_cq_head: u16,
+    pub io_cq_phase: bool,
 }
 
 static mut NVME: NvmeController = NvmeController {
@@ -86,6 +90,16 @@ static mut NVME: NvmeController = NvmeController {
     initialized: false,
     doorbell_stride: 4,
     max_queue_entries: 64,
+    asq: 0,
+    acq: 0,
+    sq_tail: 0,
+    cq_head: 0,
+    cq_phase: true,
+    io_sq: 0,
+    io_cq: 0,
+    io_sq_tail: 0,
+    io_cq_head: 0,
+    io_cq_phase: true,
 };
 
 // ─── PCI Discovery ──────────────────────────────────────────────────────
@@ -254,13 +268,110 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
 
     serial_println!("[NVMe] Controller disabled, ready for configuration");
 
-    // NOTE: Full initialization (admin queue setup, IO queue creation,
-    // identify command) requires DMA buffer allocation and MMIO mapping.
-    // This is deferred until higher-half kernel provides proper MMIO support.
-    // For now, we prove the controller is detected and responds to register reads.
+    // 1. Allocate Admin Submission Queue (ASQ) — 64 entries x 64 bytes = 4KB
+    let asq_phys = match paging::alloc_frame() {
+        Some(f) => f,
+        None => { serial_println!("[NVMe] Failed to allocate ASQ frame"); return false; }
+    };
+    core::ptr::write_bytes(asq_phys as *mut u8, 0, 4096);
+
+    // 2. Allocate Admin Completion Queue (ACQ) — 64 entries x 16 bytes = 1KB (4KB frame)
+    let acq_phys = match paging::alloc_frame() {
+        Some(f) => f,
+        None => { serial_println!("[NVMe] Failed to allocate ACQ frame"); return false; }
+    };
+    core::ptr::write_bytes(acq_phys as *mut u8, 0, 4096);
+
+    // 3. Configure Admin Queue Attributes (AQA) — 63 entries each (0-indexed)
+    write_reg32(REG_AQA, (63 << 16) | 63);
+
+    // 4. Write ASQ and ACQ base addresses
+    write_reg64(REG_ASQ, asq_phys);
+    write_reg64(REG_ACQ, acq_phys);
+
+    // 5. Enable controller: CC.EN=1, CSS=0, MPS=0 (4KB pages), AMS=0
+    //    CC bits: EN(0), CSS(4-6)=0, MPS(7-10)=0, AMS(11-13)=0,
+    //    SHN(14-15)=0, IOSQES(16-19)=6(64B), IOCQES(20-23)=4(16B)
+    let cc_val: u32 = 1 | (6 << 16) | (4 << 20);
+    write_reg32(REG_CC, cc_val);
+
+    // 6. Wait for CSTS.RDY=1
+    let mut timeout2 = 0u32;
+    while read_reg32(REG_CSTS) & 1 == 0 {
+        timeout2 += 1;
+        if timeout2 > 1_000_000 {
+            serial_println!("[NVMe] Timeout waiting for controller ready");
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    serial_println!("[NVMe] Controller enabled and ready");
+
+    // Store queue pointers
+    NVME.asq = asq_phys;
+    NVME.acq = acq_phys;
+    NVME.sq_tail = 0;
+    NVME.cq_head = 0;
+    NVME.cq_phase = true;
+
+    // 7. Create IO Completion Queue (queue ID=1) via admin command
+    let io_cq_phys = match paging::alloc_frame() {
+        Some(f) => f,
+        None => { serial_println!("[NVMe] Failed to allocate IO CQ frame"); return false; }
+    };
+    core::ptr::write_bytes(io_cq_phys as *mut u8, 0, 4096);
+
+    let create_cq = NvmeCommand {
+        opcode: NVME_CMD_CREATE_IO_CQ,
+        flags: 0,
+        command_id: 10,
+        nsid: 0,
+        reserved: [0; 2],
+        prp1: io_cq_phys,
+        prp2: 0,
+        cdw10: (63 << 16) | 1, // size=63 (0-indexed) | QID=1
+        cdw11: 1,              // physically contiguous
+        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+    submit_admin_cmd(&create_cq);
+    match poll_admin_completion(10) {
+        Ok(_) => serial_println!("[NVMe] IO Completion Queue created"),
+        Err(e) => { serial_println!("[NVMe] Create IO CQ failed: {}", e); return false; }
+    }
+
+    // 8. Create IO Submission Queue (queue ID=1, CQ ID=1) via admin command
+    let io_sq_phys = match paging::alloc_frame() {
+        Some(f) => f,
+        None => { serial_println!("[NVMe] Failed to allocate IO SQ frame"); return false; }
+    };
+    core::ptr::write_bytes(io_sq_phys as *mut u8, 0, 4096);
+
+    let create_sq = NvmeCommand {
+        opcode: NVME_CMD_CREATE_IO_SQ,
+        flags: 0,
+        command_id: 11,
+        nsid: 0,
+        reserved: [0; 2],
+        prp1: io_sq_phys,
+        prp2: 0,
+        cdw10: (63 << 16) | 1, // size=63 (0-indexed) | QID=1
+        cdw11: (1 << 16) | 1,  // CQID=1 | physically contiguous
+        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+    };
+    submit_admin_cmd(&create_sq);
+    match poll_admin_completion(11) {
+        Ok(_) => serial_println!("[NVMe] IO Submission Queue created"),
+        Err(e) => { serial_println!("[NVMe] Create IO SQ failed: {}", e); return false; }
+    }
+
+    NVME.io_sq = io_sq_phys;
+    NVME.io_cq = io_cq_phys;
+    NVME.io_sq_tail = 0;
+    NVME.io_cq_head = 0;
+    NVME.io_cq_phase = true;
 
     NVME.initialized = true;
-    serial_println!("[NVMe] Controller detected and responsive (full init requires MMIO mapping)");
+    serial_println!("[NVMe] Fully initialized with admin + IO queues");
 
     true
 }
@@ -282,4 +393,171 @@ unsafe fn read_reg64(offset: u64) -> u64 {
 
 unsafe fn write_reg32(offset: u64, val: u32) {
     core::ptr::write_volatile((NVME.bar0 + offset) as *mut u32, val);
+}
+
+unsafe fn write_reg64(offset: u64, val: u64) {
+    core::ptr::write_volatile((NVME.bar0 + offset) as *mut u64, val);
+}
+
+// ─── Admin Queue Operations ─────────────────────────────────────────────
+
+/// Submit a command to the admin submission queue.
+/// Returns the command_id for later completion polling.
+unsafe fn submit_admin_cmd(cmd: &NvmeCommand) -> u16 {
+    let sq = NVME.asq as *mut NvmeCommand;
+    let tail = NVME.sq_tail;
+    core::ptr::write_volatile(sq.add(tail as usize), *cmd);
+    NVME.sq_tail = (tail + 1) % 64;
+    // Ring ASQ doorbell at BAR0 + 0x1000 (SQ 0 tail doorbell)
+    write_reg32(0x1000, NVME.sq_tail as u32);
+    cmd.command_id
+}
+
+/// Poll admin completion queue for a specific command.
+unsafe fn poll_admin_completion(cmd_id: u16) -> Result<u32, &'static str> {
+    for _ in 0..1_000_000u32 {
+        let cq = NVME.acq as *const NvmeCompletion;
+        let entry = core::ptr::read_volatile(cq.add(NVME.cq_head as usize));
+        let phase = (entry.status & 1) != 0;
+        if phase == NVME.cq_phase && entry.command_id == cmd_id {
+            // Advance CQ head
+            NVME.cq_head = (NVME.cq_head + 1) % 64;
+            if NVME.cq_head == 0 {
+                NVME.cq_phase = !NVME.cq_phase;
+            }
+            // Ring ACQ doorbell: CQ 0 head doorbell at 0x1000 + doorbell_stride
+            write_reg32(0x1000 + NVME.doorbell_stride as u64, NVME.cq_head as u32);
+            let status_code = (entry.status >> 1) & 0xFF;
+            if status_code != 0 {
+                return Err("NVMe admin command failed");
+            }
+            return Ok(entry.command_specific);
+        }
+        core::hint::spin_loop();
+    }
+    Err("NVMe admin completion timeout")
+}
+
+// ─── IO Queue Operations ────────────────────────────────────────────────
+
+/// Submit a command to the IO submission queue (QID=1).
+unsafe fn submit_io_cmd(cmd: &NvmeCommand) -> u16 {
+    let sq = NVME.io_sq as *mut NvmeCommand;
+    let tail = NVME.io_sq_tail;
+    core::ptr::write_volatile(sq.add(tail as usize), *cmd);
+    NVME.io_sq_tail = (tail + 1) % 64;
+    // IO SQ 1 tail doorbell: 0x1000 + 2 * 1 * doorbell_stride
+    let doorbell_off = 0x1000u64 + 2 * NVME.doorbell_stride as u64;
+    write_reg32(doorbell_off, NVME.io_sq_tail as u32);
+    cmd.command_id
+}
+
+/// Poll IO completion queue (QID=1) for a specific command.
+unsafe fn poll_io_completion(cmd_id: u16) -> Result<u32, &'static str> {
+    for _ in 0..1_000_000u32 {
+        let cq = NVME.io_cq as *const NvmeCompletion;
+        let entry = core::ptr::read_volatile(cq.add(NVME.io_cq_head as usize));
+        let phase = (entry.status & 1) != 0;
+        if phase == NVME.io_cq_phase && entry.command_id == cmd_id {
+            NVME.io_cq_head = (NVME.io_cq_head + 1) % 64;
+            if NVME.io_cq_head == 0 {
+                NVME.io_cq_phase = !NVME.io_cq_phase;
+            }
+            // IO CQ 1 head doorbell: 0x1000 + (2*1 + 1) * doorbell_stride
+            let doorbell_off = 0x1000u64 + 3 * NVME.doorbell_stride as u64;
+            write_reg32(doorbell_off, NVME.io_cq_head as u32);
+            let status_code = (entry.status >> 1) & 0xFF;
+            if status_code != 0 {
+                return Err("NVMe IO command failed");
+            }
+            return Ok(entry.command_specific);
+        }
+        core::hint::spin_loop();
+    }
+    Err("NVMe IO completion timeout")
+}
+
+// ─── Public Read / Write API ────────────────────────────────────────────
+
+static mut CMD_SEQ: u16 = 100;
+
+/// Allocate a unique command ID.
+unsafe fn next_cmd_id() -> u16 {
+    let id = CMD_SEQ;
+    CMD_SEQ = CMD_SEQ.wrapping_add(1);
+    id
+}
+
+/// Read sectors from NVMe namespace 1 via the IO queue.
+///
+/// * `lba`   — starting logical block address
+/// * `count` — number of 512-byte sectors to read (max limited by single PRP)
+/// * `buf`   — destination buffer (must be identity-mapped, at least `count * 512` bytes)
+pub fn read_sectors(lba: u64, count: u32, buf: &mut [u8]) -> Result<(), &'static str> {
+    if !is_initialized() {
+        return Err("NVMe not initialized");
+    }
+    let needed = count as usize * 512;
+    if buf.len() < needed {
+        return Err("NVMe read: buffer too small");
+    }
+    unsafe {
+        let data_phys = buf.as_mut_ptr() as u64; // identity-mapped
+        let cid = next_cmd_id();
+        let cmd = NvmeCommand {
+            opcode: NVME_CMD_READ,
+            flags: 0,
+            command_id: cid,
+            nsid: 1,
+            reserved: [0; 2],
+            prp1: data_phys,
+            prp2: 0,
+            cdw10: lba as u32,
+            cdw11: (lba >> 32) as u32,
+            cdw12: count - 1, // 0-based count
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        };
+        submit_io_cmd(&cmd);
+        poll_io_completion(cid)?;
+        Ok(())
+    }
+}
+
+/// Write sectors to NVMe namespace 1 via the IO queue.
+///
+/// * `lba`   — starting logical block address
+/// * `count` — number of 512-byte sectors to write
+/// * `buf`   — source buffer (must be identity-mapped, at least `count * 512` bytes)
+pub fn write_sectors(lba: u64, count: u32, buf: &[u8]) -> Result<(), &'static str> {
+    if !is_initialized() {
+        return Err("NVMe not initialized");
+    }
+    let needed = count as usize * 512;
+    if buf.len() < needed {
+        return Err("NVMe write: buffer too small");
+    }
+    unsafe {
+        let data_phys = buf.as_ptr() as u64; // identity-mapped
+        let cid = next_cmd_id();
+        let cmd = NvmeCommand {
+            opcode: NVME_CMD_WRITE,
+            flags: 0,
+            command_id: cid,
+            nsid: 1,
+            reserved: [0; 2],
+            prp1: data_phys,
+            prp2: 0,
+            cdw10: lba as u32,
+            cdw11: (lba >> 32) as u32,
+            cdw12: count - 1, // 0-based count
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+        };
+        submit_io_cmd(&cmd);
+        poll_io_completion(cid)?;
+        Ok(())
+    }
 }

@@ -70,6 +70,38 @@ fn stack_top(agent_index: usize) -> u64 {
     }
 }
 
+/// Guard region size: the bottom 4KB of each stack is the guard zone.
+/// Writes to this region indicate stack overflow.
+pub const GUARD_REGION_SIZE: u64 = 4096;
+
+/// Check if an address falls within any agent's stack guard region.
+///
+/// The guard region is the bottom 4KB of each agent stack and kernel stack.
+/// Since the kernel uses identity-mapped 2MB huge pages, we cannot actually
+/// unmap these pages. Instead we detect accesses in the guard zone at fault
+/// time and report them as stack overflows.
+///
+/// Returns `Some(slot)` if the address is in a guard region:
+///   - slots 0..MAX_AGENTS are agent stacks
+///   - slots MAX_AGENTS..2*MAX_AGENTS are kernel stacks
+pub fn is_guard_region(addr: u64) -> Option<usize> {
+    unsafe {
+        for i in 0..MAX_AGENTS {
+            let bottom = AGENT_STACKS.stacks[i].as_ptr() as u64;
+            if addr >= bottom && addr < bottom + GUARD_REGION_SIZE {
+                return Some(i);
+            }
+        }
+        for i in 0..MAX_AGENTS {
+            let bottom = KERNEL_STACKS.stacks[i].as_ptr() as u64;
+            if addr >= bottom && addr < bottom + GUARD_REGION_SIZE {
+                return Some(i + MAX_AGENTS);
+            }
+        }
+    }
+    None
+}
+
 /// Write stack guard canary at the bottom of each agent's stack.
 /// Called once during init, after all stacks are allocated.
 fn write_stack_guards() {

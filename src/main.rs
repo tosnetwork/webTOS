@@ -38,6 +38,7 @@ mod smp;
 mod net;
 mod ringbuf;
 mod block;
+mod proof;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -77,6 +78,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     // 6. Emit boot event
     event::boot();
 
+    // Disable interrupts during agent creation and subsystem init to prevent
+    // the timer from preempting into agents before sched::start() is called.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
     // 7. Create agents and set up the system
     init::init();
     serial_println!("[OK] System initialization complete");
@@ -102,7 +107,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
         serial_println!("[SMP] ACPI not found, running single-core");
     }
 
-    // 10. Start scheduling
+    // 10. Re-enable interrupts and start scheduling
+    // Interrupts were disabled since before init::init() to prevent
+    // the timer from preempting kernel_main into agents prematurely.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
     serial_println!("[AOS] Entering scheduler loop");
     sched::start();
 

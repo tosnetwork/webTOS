@@ -84,7 +84,7 @@ pub enum AgentMode {
     User = 1,
 }
 
-pub const KERNEL_STACK_SIZE: usize = 8192;
+pub const KERNEL_STACK_SIZE: usize = 16384;
 
 // ─── Agent status ───────────────────────────────────────────────────────────
 

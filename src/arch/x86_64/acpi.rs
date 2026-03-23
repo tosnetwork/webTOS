@@ -71,7 +71,7 @@ const RSDP_SEARCH_END: usize = 0x000F_FFFF;
 /// Initialize ACPI: find RSDP, parse RSDT, extract MADT.
 /// Returns None if ACPI tables are not found.
 pub fn init() -> Option<AcpiInfo> {
-    // 1. Find RSDP by scanning BIOS area
+    // 1. Find RSDP by scanning EBDA and BIOS ROM area
     let rsdp = find_rsdp()?;
 
     let rsdt_addr = unsafe { core::ptr::addr_of!((*rsdp).rsdt_address).read_unaligned() };
@@ -123,19 +123,32 @@ pub fn init() -> Option<AcpiInfo> {
     Some(info)
 }
 
-/// Scan BIOS memory area for RSDP signature
+/// Scan BIOS memory area for RSDP signature.
+/// Searches both the EBDA (Extended BIOS Data Area) and the main BIOS ROM area.
 fn find_rsdp() -> Option<&'static Rsdp> {
-    let mut addr = RSDP_SEARCH_START;
-    while addr < RSDP_SEARCH_END {
+    // 1. Try EBDA first (base pointer at BDA address 0x040E, shifted left 4)
+    let ebda_base = unsafe { (*(0x040E as *const u16)) as usize } << 4;
+    if ebda_base >= 0x80000 && ebda_base < 0xA0000 {
+        if let Some(rsdp) = scan_for_rsdp(ebda_base, ebda_base + 1024) {
+            return Some(rsdp);
+        }
+    }
+
+    // 2. Scan main BIOS ROM area
+    scan_for_rsdp(RSDP_SEARCH_START, RSDP_SEARCH_END)
+}
+
+fn scan_for_rsdp(start: usize, end: usize) -> Option<&'static Rsdp> {
+    let mut addr = start;
+    while addr < end {
         let ptr = addr as *const u8;
         let sig = unsafe { core::slice::from_raw_parts(ptr, 8) };
         if sig == RSDP_SIGNATURE {
             // Validate checksum
-            let rsdp = unsafe { &*(addr as *const Rsdp) };
             let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 20) };
             let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
             if sum == 0 {
-                return Some(rsdp);
+                return Some(unsafe { &*(addr as *const Rsdp) });
             }
         }
         addr += 16; // RSDP is always 16-byte aligned
