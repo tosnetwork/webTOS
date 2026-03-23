@@ -1,9 +1,11 @@
-//! CPU Security Features: SMEP, SMAP, NX enforcement
+//! CPU Security Features: SMEP, SMAP, NX, Spectre mitigations
 //!
 //! Implements Yellow Paper §16.8 requirements:
 //! - SMEP (Supervisor Mode Execution Prevention): CR4 bit 20
 //! - SMAP (Supervisor Mode Access Prevention): CR4 bit 21
 //! - NX (No-Execute): IA32_EFER bit 11
+//! - IBRS (Indirect Branch Restricted Speculation): IA32_SPEC_CTRL bit 0
+//! - STIBP (Single Thread Indirect Branch Predictor): IA32_SPEC_CTRL bit 1
 
 use crate::serial_println;
 
@@ -28,32 +30,59 @@ const CPUID7_EBX_SMAP: u32 = 1 << 20;
 /// CPUID extended leaf 0x80000001 — EDX bit 20: NX support
 const CPUID_EXT1_EDX_NX: u32 = 1 << 20;
 
+/// CPUID leaf 7, subleaf 0 — EDX bit 26: IBRS/IBPB support
+const CPUID7_EDX_IBRS: u32 = 1 << 26;
+
+/// CPUID leaf 7, subleaf 0 — EDX bit 27: STIBP support
+const CPUID7_EDX_STIBP: u32 = 1 << 27;
+
+/// IA32_SPEC_CTRL MSR (0x48) — controls Spectre mitigations
+const MSR_SPEC_CTRL: u32 = 0x48;
+
+/// IA32_SPEC_CTRL bit 0: IBRS — restrict indirect branch speculation
+const SPEC_CTRL_IBRS: u64 = 1 << 0;
+
+/// IA32_SPEC_CTRL bit 1: STIBP — single-thread indirect branch predictor
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
+
+/// Global flag: true if IBRS is supported and should be used on context switch
+static mut IBRS_SUPPORTED: bool = false;
+
+/// Global flag: true if STIBP is supported
+static mut STIBP_SUPPORTED: bool = false;
+
 /// Check CPU feature support via CPUID.
 ///
-/// Returns `(smep_supported, smap_supported, nx_supported)`.
-pub fn cpuid_check() -> (bool, bool, bool) {
+/// Returns `(smep, smap, nx, ibrs, stibp)`.
+pub fn cpuid_check() -> (bool, bool, bool, bool, bool) {
     let smep;
     let smap;
     let nx;
+    let ibrs;
+    let stibp;
 
     unsafe {
         // CPUID leaf 7, subleaf 0: structured extended feature flags
         let ebx7: u32;
+        let edx7: u32;
         core::arch::asm!(
             "push rbx",
             "xor ecx, ecx",    // subleaf = 0
             "mov eax, 7",
             "cpuid",
-            "mov {:e}, ebx",   // {:e} forces 32-bit (eXX) register name
+            "mov {:e}, ebx",
+            "mov {:e}, edx",
             "pop rbx",
             out(reg) ebx7,
+            out(reg) edx7,
             out("eax") _,
             out("ecx") _,
-            out("edx") _,
             options(nomem, nostack, preserves_flags),
         );
         smep = (ebx7 & CPUID7_EBX_SMEP) != 0;
         smap = (ebx7 & CPUID7_EBX_SMAP) != 0;
+        ibrs = (edx7 & CPUID7_EDX_IBRS) != 0;
+        stibp = (edx7 & CPUID7_EDX_STIBP) != 0;
 
         // CPUID extended leaf 0x80000001: NX support in EDX
         let edx_ext: u32;
@@ -71,7 +100,7 @@ pub fn cpuid_check() -> (bool, bool, bool) {
         nx = (edx_ext & CPUID_EXT1_EDX_NX) != 0;
     }
 
-    (smep, smap, nx)
+    (smep, smap, nx, ibrs, stibp)
 }
 
 /// Read the current value of CR4.
@@ -169,6 +198,59 @@ pub fn enable_nx() {
     }
 }
 
+/// Enable IBRS: set IA32_SPEC_CTRL bit 0.
+///
+/// Restricts indirect branch speculation to prevent Spectre v2 attacks.
+/// Should be set when transitioning from user mode to kernel mode.
+pub fn enable_ibrs() {
+    unsafe {
+        let val = rdmsr(MSR_SPEC_CTRL);
+        wrmsr(MSR_SPEC_CTRL, val | SPEC_CTRL_IBRS);
+    }
+}
+
+/// Enable STIBP: set IA32_SPEC_CTRL bit 1.
+///
+/// Prevents indirect branch predictions from being shared across
+/// hyperthreads. Set permanently when running untrusted agents.
+pub fn enable_stibp() {
+    unsafe {
+        let val = rdmsr(MSR_SPEC_CTRL);
+        wrmsr(MSR_SPEC_CTRL, val | SPEC_CTRL_STIBP);
+    }
+}
+
+/// Set IA32_SPEC_CTRL for kernel entry (IBRS + STIBP if supported).
+/// Called on context switch to kernel-mode or after returning from ring 3.
+#[inline]
+pub fn spectre_kernel_enter() {
+    unsafe {
+        if IBRS_SUPPORTED {
+            let mut val: u64 = 0;
+            if IBRS_SUPPORTED { val |= SPEC_CTRL_IBRS; }
+            if STIBP_SUPPORTED { val |= SPEC_CTRL_STIBP; }
+            wrmsr(MSR_SPEC_CTRL, val);
+        }
+    }
+}
+
+/// Clear IBRS for user-mode entry (speculation restrictions lifted).
+/// STIBP stays set if supported (cross-thread protection always on).
+#[inline]
+pub fn spectre_user_enter() {
+    unsafe {
+        if IBRS_SUPPORTED {
+            let val = if STIBP_SUPPORTED { SPEC_CTRL_STIBP } else { 0 };
+            wrmsr(MSR_SPEC_CTRL, val);
+        }
+    }
+}
+
+/// Check if IBRS is available on this CPU.
+pub fn ibrs_available() -> bool {
+    unsafe { IBRS_SUPPORTED }
+}
+
 /// Temporarily allow supervisor access to user pages (SMAP bypass).
 ///
 /// Sets the AC flag in RFLAGS. Must be paired with a `clac()` call as soon
@@ -199,11 +281,11 @@ pub unsafe fn clac() {
 /// logs results. Gracefully skips features not supported by the CPU (e.g.
 /// older QEMU configurations).
 pub fn init() {
-    let (smep_ok, smap_ok, nx_ok) = cpuid_check();
+    let (smep_ok, smap_ok, nx_ok, ibrs_ok, stibp_ok) = cpuid_check();
 
     serial_println!(
-        "[security] CPUID: SMEP={} SMAP={} NX={}",
-        smep_ok, smap_ok, nx_ok
+        "[security] CPUID: SMEP={} SMAP={} NX={} IBRS={} STIBP={}",
+        smep_ok, smap_ok, nx_ok, ibrs_ok, stibp_ok
     );
 
     if nx_ok {
@@ -225,5 +307,25 @@ pub fn init() {
         serial_println!("[security] SMAP (CR4.21) enabled");
     } else {
         serial_println!("[security] SMAP not supported by CPU, skipping");
+    }
+
+    // Spectre mitigations
+    unsafe {
+        IBRS_SUPPORTED = ibrs_ok;
+        STIBP_SUPPORTED = stibp_ok;
+    }
+
+    if ibrs_ok {
+        enable_ibrs();
+        serial_println!("[security] IBRS (Spectre v2) enabled");
+    } else {
+        serial_println!("[security] IBRS not supported by CPU, skipping");
+    }
+
+    if stibp_ok {
+        enable_stibp();
+        serial_println!("[security] STIBP (cross-thread) enabled");
+    } else {
+        serial_println!("[security] STIBP not supported by CPU, skipping");
     }
 }

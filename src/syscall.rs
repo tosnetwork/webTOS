@@ -30,6 +30,18 @@ use crate::arch::x86_64::security;
 ///
 /// In Stage-1, this is a direct function call. No privilege transition occurs.
 pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
+    // Spectre v2: restrict indirect branch speculation on kernel entry
+    security::spectre_kernel_enter();
+
+    let result = syscall_inner(num, a1, a2, a3, _a4, _a5);
+
+    // Spectre v2: relax speculation restrictions before returning to user mode
+    security::spectre_user_enter();
+
+    result
+}
+
+fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
     let caller_id = sched::current();
 
     // Charge energy for the syscall (except for idle agent)
