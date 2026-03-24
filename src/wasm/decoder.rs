@@ -74,10 +74,11 @@ impl ImportDef {
     }
 }
 
-/// Import kind — currently only function imports are supported.
+/// Import kind.
 #[derive(Debug, Clone, Copy)]
 pub enum ImportKind {
-    Func(u32), // type index
+    Func(u32),        // type index
+    Global(u8, bool), // valtype byte, mutable
 }
 
 /// A WASM export definition.
@@ -102,7 +103,41 @@ impl ExportDef {
 #[derive(Debug, Clone, Copy)]
 pub enum ExportKind {
     Func(u32),
-    // Table, Memory, Global not yet needed
+    Table(u32),
+    Memory(u32),
+    Global(u32),
+}
+
+/// A global variable definition.
+#[derive(Clone)]
+pub struct GlobalDef {
+    pub val_type: ValType,
+    pub mutable: bool,
+    pub init_value: Value,
+}
+
+/// A table definition.
+#[derive(Clone)]
+pub struct TableDef {
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+/// A data segment for memory initialization.
+#[derive(Clone)]
+pub struct DataSegment {
+    pub memory_idx: u32,
+    pub offset: u32,
+    pub data_offset: usize, // offset into module.code (reused for data bytes)
+    pub data_len: usize,
+}
+
+/// An element segment for table initialization.
+#[derive(Clone)]
+pub struct ElementSegment {
+    pub table_idx: u32,
+    pub offset: u32,
+    pub func_indices: alloc::vec::Vec<u32>,
 }
 
 /// A fully decoded WASM module.
@@ -113,11 +148,16 @@ pub struct WasmModule {
     pub functions: Vec<FuncDef>,
     pub imports: Vec<ImportDef>,
     pub exports: Vec<ExportDef>,
+    pub globals: Vec<GlobalDef>,
+    pub tables: Vec<TableDef>,
+    pub data_segments: Vec<DataSegment>,
+    pub element_segments: Vec<ElementSegment>,
+    pub start_func: Option<u32>,
 
     pub memory_min_pages: u32,
     pub memory_max_pages: u32,
 
-    /// Raw bytecode storage — function bodies are copied here during decoding.
+    /// Raw bytecode + data segment bytes storage.
     pub code: Vec<u8>,
 
     /// Name bytes — import/export names are copied here.
@@ -131,6 +171,11 @@ impl WasmModule {
             functions: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
+            globals: Vec::new(),
+            tables: Vec::new(),
+            data_segments: Vec::new(),
+            element_segments: Vec::new(),
+            start_func: None,
             memory_min_pages: 0,
             memory_max_pages: 0,
             code: Vec::new(),
@@ -146,10 +191,11 @@ impl WasmModule {
     /// Find an exported function index by name.
     pub fn find_export_func(&self, name: &[u8]) -> Option<u32> {
         for exp in &self.exports {
-            let ExportKind::Func(idx) = exp.kind;
-            let exp_name = self.get_name(exp.name_offset, exp.name_len);
-            if exp_name == name {
-                return Some(idx);
+            if let ExportKind::Func(idx) = exp.kind {
+                let exp_name = self.get_name(exp.name_offset, exp.name_len);
+                if exp_name == name {
+                    return Some(idx);
+                }
             }
         }
         None
@@ -232,9 +278,14 @@ pub fn decode_leb128_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, WasmError
 const SECTION_TYPE: u8 = 1;
 const SECTION_IMPORT: u8 = 2;
 const SECTION_FUNCTION: u8 = 3;
+const SECTION_TABLE: u8 = 4;
 const SECTION_MEMORY: u8 = 5;
+const SECTION_GLOBAL: u8 = 6;
 const SECTION_EXPORT: u8 = 7;
+const SECTION_START: u8 = 8;
+const SECTION_ELEMENT: u8 = 9;
 const SECTION_CODE: u8 = 10;
+const SECTION_DATA: u8 = 11;
 
 // ─── WASM magic & version ───────────────────────────────────────────────────
 
@@ -277,9 +328,14 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
             SECTION_TYPE => decode_type_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_IMPORT => decode_import_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_FUNCTION => decode_function_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_TABLE => decode_table_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_MEMORY => decode_memory_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_GLOBAL => decode_global_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_EXPORT => decode_export_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_START => decode_start_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_ELEMENT => decode_element_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_CODE => decode_code_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_DATA => decode_data_section(bytes, &mut pos, section_end, &mut module)?,
             _ => {
                 // Skip unknown sections (pos is reset to section_end below)
             }
@@ -298,6 +354,8 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
     match b {
         0x7F => Ok(ValType::I32),
         0x7E => Ok(ValType::I64),
+        0x7D => if !STRICT_DETERMINISM { Ok(ValType::F32) } else { Err(WasmError::FloatsDisabled) },
+        0x7C => if !STRICT_DETERMINISM { Ok(ValType::F64) } else { Err(WasmError::FloatsDisabled) },
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -387,9 +445,28 @@ fn decode_import_section(
                 let type_idx = decode_leb128_u32(bytes, pos)?;
                 imp.kind = ImportKind::Func(type_idx);
             }
+            0x01 => {
+                // Table import: elemtype + limits
+                let _elemtype = bytes[*pos]; *pos += 1;
+                let flags = decode_leb128_u32(bytes, pos)?;
+                let _min = decode_leb128_u32(bytes, pos)?;
+                if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
+                imp.kind = ImportKind::Func(0); // placeholder
+            }
+            0x02 => {
+                // Memory import: limits
+                let flags = decode_leb128_u32(bytes, pos)?;
+                let _min = decode_leb128_u32(bytes, pos)?;
+                if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
+                imp.kind = ImportKind::Func(0); // placeholder
+            }
+            0x03 => {
+                // Global import: valtype + mutability
+                let vt = bytes[*pos]; *pos += 1;
+                let mt = bytes[*pos]; *pos += 1;
+                imp.kind = ImportKind::Global(vt, mt != 0);
+            }
             _ => {
-                // Skip unsupported import kinds (table, memory, global)
-                // For now, treat as error
                 return Err(WasmError::InvalidSection);
             }
         }
@@ -480,10 +557,10 @@ fn decode_export_section(
         let idx = decode_leb128_u32(bytes, pos)?;
         match kind_byte {
             0x00 => exp.kind = ExportKind::Func(idx),
-            _ => {
-                // Skip non-function exports but still record them
-                exp.kind = ExportKind::Func(idx); // placeholder
-            }
+            0x01 => exp.kind = ExportKind::Table(idx),
+            0x02 => exp.kind = ExportKind::Memory(idx),
+            0x03 => exp.kind = ExportKind::Global(idx),
+            _ => exp.kind = ExportKind::Func(idx), // fallback
         }
 
         module.exports.push(exp);
@@ -543,4 +620,163 @@ fn decode_code_section(
     }
 
     Ok(())
+}
+
+// ─── New section decoders (Batch 3) ─────────────────────────────────────────
+
+fn decode_table_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    let count = decode_leb128_u32(bytes, pos)? as usize;
+    for _ in 0..count {
+        // elemtype: 0x70 = funcref (only valid in MVP)
+        let elemtype = bytes[*pos]; *pos += 1;
+        if elemtype != 0x70 {
+            return Err(WasmError::InvalidSection);
+        }
+        let flags = decode_leb128_u32(bytes, pos)?;
+        let min = decode_leb128_u32(bytes, pos)?;
+        let max = if flags & 1 != 0 {
+            Some(decode_leb128_u32(bytes, pos)?)
+        } else {
+            None
+        };
+        module.tables.push(TableDef { min, max });
+    }
+    Ok(())
+}
+
+fn decode_global_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    let count = decode_leb128_u32(bytes, pos)? as usize;
+    if count > MAX_GLOBALS {
+        return Err(WasmError::TooManyFunctions);
+    }
+    for _ in 0..count {
+        let vt_byte = bytes[*pos]; *pos += 1;
+        let val_type = decode_valtype(vt_byte)?;
+        let mutable = bytes[*pos] != 0; *pos += 1;
+        let init_value = eval_init_expr(bytes, pos)?;
+        module.globals.push(GlobalDef { val_type, mutable, init_value });
+    }
+    Ok(())
+}
+
+fn decode_start_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    let func_idx = decode_leb128_u32(bytes, pos)?;
+    module.start_func = Some(func_idx);
+    Ok(())
+}
+
+fn decode_element_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    let count = decode_leb128_u32(bytes, pos)? as usize;
+    if count > MAX_ELEMENT_SEGMENTS {
+        return Err(WasmError::InvalidSection);
+    }
+    for _ in 0..count {
+        let table_idx = decode_leb128_u32(bytes, pos)?;
+        let offset_val = eval_init_expr(bytes, pos)?;
+        let offset = match offset_val {
+            Value::I32(v) => v as u32,
+            Value::I64(v) => v as u32,
+            _ => 0,
+        };
+        let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+        let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+        for _ in 0..num_elems {
+            func_indices.push(decode_leb128_u32(bytes, pos)?);
+        }
+        module.element_segments.push(ElementSegment {
+            table_idx,
+            offset,
+            func_indices,
+        });
+    }
+    Ok(())
+}
+
+fn decode_data_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    let count = decode_leb128_u32(bytes, pos)? as usize;
+    if count > MAX_DATA_SEGMENTS {
+        return Err(WasmError::InvalidSection);
+    }
+    for _ in 0..count {
+        let memory_idx = decode_leb128_u32(bytes, pos)?;
+        let offset_val = eval_init_expr(bytes, pos)?;
+        let offset = match offset_val {
+            Value::I32(v) => v as u32,
+            Value::I64(v) => v as u32,
+            _ => 0,
+        };
+        let data_len = decode_leb128_u32(bytes, pos)? as usize;
+        // Store data bytes in module.code (reused buffer)
+        let data_offset = module.code.len();
+        if *pos + data_len > bytes.len() {
+            return Err(WasmError::UnexpectedEnd);
+        }
+        module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
+        *pos += data_len;
+        module.data_segments.push(DataSegment {
+            memory_idx,
+            offset,
+            data_offset,
+            data_len,
+        });
+    }
+    Ok(())
+}
+
+/// Evaluate a constant init expression (for globals and segment offsets).
+/// MVP allows: i32.const, i64.const, global.get (of imported global), end.
+fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
+    if *pos >= bytes.len() {
+        return Err(WasmError::UnexpectedEnd);
+    }
+    let opcode = bytes[*pos]; *pos += 1;
+    let value = match opcode {
+        0x41 => {
+            // i32.const
+            let v = decode_leb128_i32(bytes, pos)?;
+            Value::I32(v)
+        }
+        0x42 => {
+            // i64.const
+            let v = decode_leb128_i64(bytes, pos)?;
+            Value::I64(v)
+        }
+        0x23 => {
+            // global.get (reference to imported global — return placeholder)
+            let _idx = decode_leb128_u32(bytes, pos)?;
+            Value::I32(0)
+        }
+        _ => return Err(WasmError::InvalidSection),
+    };
+    // Expect 0x0B (end)
+    if *pos >= bytes.len() || bytes[*pos] != 0x0B {
+        return Err(WasmError::InvalidSection);
+    }
+    *pos += 1;
+    Ok(value)
 }

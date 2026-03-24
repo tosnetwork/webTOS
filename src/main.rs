@@ -27,6 +27,7 @@ mod agents;
 mod ebpf;
 mod wasm;
 mod loader;
+mod agent_loader;
 mod sync;
 mod deterministic;
 mod cost;

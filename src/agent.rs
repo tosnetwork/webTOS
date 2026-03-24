@@ -48,6 +48,7 @@ pub const SYS_MAILBOX_CREATE: u64 = 18;
 pub const SYS_MAILBOX_DESTROY: u64 = 19;
 pub const SYS_REPLAY: u64 = 20;
 pub const SYS_RECV_TIMEOUT: u64 = 21;
+pub const SYS_SPAWN_IMAGE: u64 = 22;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -61,6 +62,17 @@ pub const E_QUOTA_EXCEEDED: i64 = -6;
 pub const E_PAYLOAD_TOO_LARGE: i64 = -7;
 pub const E_CHECKPOINT_NOT_ROOT: i64 = -9;
 pub const E_TIMEOUT: i64 = -10;
+pub const E_BAD_IMAGE: i64 = -11;
+
+// ─── Runtime kind ──────────────────────────────────────────────────────────
+
+/// Runtime kind for agent loading (Yellow Paper §24.2.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeKind {
+    Native = 0,
+    Wasm = 1,
+}
 
 // ─── Agent priority ─────────────────────────────────────────────────────────
 

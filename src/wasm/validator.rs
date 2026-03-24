@@ -30,6 +30,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                     return Err(WasmError::FunctionNotFound(type_idx));
                 }
             }
+            crate::wasm::decoder::ImportKind::Global(_, _) => {}
         }
     }
 
@@ -42,6 +43,9 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                     return Err(WasmError::FunctionNotFound(idx));
                 }
             }
+            crate::wasm::decoder::ExportKind::Table(_)
+            | crate::wasm::decoder::ExportKind::Memory(_)
+            | crate::wasm::decoder::ExportKind::Global(_) => {}
         }
     }
 

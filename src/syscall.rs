@@ -11,6 +11,7 @@
 
 use crate::serial_println;
 use crate::agent::*;
+use crate::agent::RuntimeKind;
 use crate::capability::{self, CapType, Capability};
 use crate::energy;
 use crate::sched;
@@ -598,6 +599,50 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                         E_TIMEOUT
                     }
                 }
+            }
+        }
+
+        // ── 22: sys_spawn_image ─────────────────────────────────────────
+        // a1 = image_ptr, a2 = image_len, a3 = runtime_kind (0=Native, 1=WASM)
+        // a4 = energy_budget, a5 = mem_quota (pages)
+        SYS_SPAWN_IMAGE => {
+            // Check spawn capability
+            if !capability::agent_try_cap(caller_id, CapType::AgentSpawn, 0) {
+                crate::event::cap_denied(caller_id, CapType::AgentSpawn as u64, 0);
+                return E_NO_CAP;
+            }
+
+            let image_ptr = a1;
+            let image_len = a2 as usize;
+            let runtime_kind_raw = a3;
+            let energy_budget = _a4;
+            let mem_quota = _a5 as u32;
+
+            // Validate image length
+            if image_len == 0 || image_len > 4 * 1024 * 1024 {
+                return E_INVALID_ARG;
+            }
+
+            // Parse runtime kind
+            let kind = match runtime_kind_raw {
+                0 => RuntimeKind::Native,
+                1 => RuntimeKind::Wasm,
+                _ => return E_INVALID_ARG,
+            };
+
+            // Read image bytes from caller's address space
+            let image = unsafe {
+                security::stac();
+                let s = core::slice::from_raw_parts(image_ptr as *const u8, image_len);
+                security::clac();
+                s
+            };
+
+            match crate::agent_loader::spawn_from_image(
+                caller_id, image, kind, energy_budget, mem_quota,
+            ) {
+                Ok(new_id) => new_id as i64,
+                Err(e) => e,
             }
         }
 

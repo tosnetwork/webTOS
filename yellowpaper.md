@@ -1903,14 +1903,79 @@ Stage-1 has only a frame allocator (4KB pages). Stage-2 requires a heap for dyna
 * Integrate with Rust's `#[global_allocator]` to enable `alloc` crate (`Vec`, `Box`, `String`) `[IMPL: ✅ #[global_allocator] + #[alloc_error_handler]]`
 * Heap is kernel-only; agents allocate via `memory_quota`-bounded frame allocation `[IMPL: ✅]`
 
-#### 24.2.3 Agent Binary Loader `[IMPL: ✅]`
+#### 24.2.3 Agent Binary Loader `[IMPL: ⚠️ parsers exist, runtime loading path not wired]`
 
 Stage-1 agents are compiled into the kernel image. Stage-2 must support loading agent code from external sources:
 
-* **Native agents**: minimal ELF64 loader that maps `.text`, `.data`, `.bss` into the agent's address space and sets the entry point `[IMPL: ✅ loader.rs — parse_elf64 + load_elf64]`
-* **WASM agents**: WASM binary is loaded into kernel memory and executed by the WASM runtime (§24.3.1) `[IMPL: ✅ wasm/decoder.rs]`
+* **Native agents**: minimal ELF64 loader that maps `.text`, `.data`, `.bss` into the agent's address space and sets the entry point `[IMPL: ⚠️ loader.rs parse_elf64/load_elf64 exist but are never called — dead code]`
+* **WASM agents**: WASM binary is loaded into kernel memory and executed by the WASM runtime (§24.3.1) `[IMPL: ⚠️ wasm/decoder.rs works but only for embedded binaries; no disk or mailbox loading path connected]`
 * **eBPF-lite programs**: bytecode is loaded and verified before attachment (§24.3.2) `[IMPL: ✅ ebpf/verifier.rs]`
-* Agent binaries may be embedded in the kernel image initially (initramfs-style), with virtio-blk loading added when persistent storage is available `[IMPL: ✅ ring 3 agents use copied code pages from kernel image]`
+* Agent binaries may be embedded in the kernel image initially (initramfs-style), with virtio-blk loading added when persistent storage is available `[IMPL: ⚠️ ring 3 agents use copied code pages from kernel image; disk-based loading not implemented]`
+
+##### 24.2.3.1 Runtime Agent Loading from Disk and Memory `[IMPL: ✅ agent_loader.rs — spawn_from_image + load_from_disk + wasm_runner_entry + SYS_SPAWN_IMAGE (syscall 22)]`
+
+The complete runtime agent loading path requires connecting existing components into an end-to-end pipeline:
+
+```text
+Source (disk or mailbox)
+  → binary bytes (ELF64 or WASM)
+  → parser (loader.rs or wasm/decoder.rs)
+  → address space creation (paging.rs)
+  → segment mapping (.text, .data, .bss or WASM linear memory)
+  → agent creation (agent.rs + sched.rs)
+  → running agent
+```
+
+**New syscall: `sys_spawn_image` (syscall 22)**
+
+Extends the spawn model to accept binary image data instead of a kernel memory address:
+
+```text
+sys_spawn_image(image_ptr, image_len, runtime_kind, energy_quota, mem_quota) -> agent_id
+
+  image_ptr:     pointer to ELF64 or WASM binary in caller's address space
+  image_len:     size in bytes (max 4 MB)
+  runtime_kind:  0 = Native (ELF64), 1 = WASM
+  energy_quota:  deducted from caller's remaining budget
+  mem_quota:     page frame limit for the new agent
+
+  Returns: new agent_id (positive) or error code (negative)
+  Requires: CAP_AGENT_SPAWN
+```
+
+**New kernel module: `agent_loader.rs`**
+
+Provides two internal loading paths:
+
+* `spawn_from_image(caller_id, image_bytes, runtime_kind, energy, mem_quota)` — creates an agent from in-memory binary data. Used by `sys_spawn_image` and `skilld`.
+* `load_from_disk(caller_id, disk_offset, size, runtime_kind, energy, mem_quota)` — reads binary from the Agent Storage Region (§24.6.1), then calls `spawn_from_image`. Used by system agents for on-demand agent loading.
+
+**Native (ELF64) loading path:**
+
+1. `loader::parse_elf64(image)` → extract entry point and loadable segments
+2. `paging::create_address_space()` → new PML4 for the agent
+3. For each PT_LOAD segment: allocate frames, copy data, zero BSS, map pages (code as executable, data as writable)
+4. Allocate user stack pages, map at `USER_STACK_VADDR`
+5. `agent::create_agent()` with ELF entry point in user address space
+6. Set `AgentMode::User`, configure `cr3`, allocate kernel stack for syscall handling
+
+**WASM loading path:**
+
+1. `wasm::decoder::decode(image)` → validate and parse WASM module
+2. Validate: module must export a `"run"` function (entry point convention)
+3. Store `WasmModule` in kernel-side `WASM_MODULES` table (indexed by agent_id)
+4. Create kernel-mode agent with generic `wasm_runner_entry` as entry point
+5. `wasm_runner_entry` retrieves the module from the table, creates `WasmInstance`, and runs the host-call interpreter loop
+
+**Disk-based loading:**
+
+The Agent Storage Region (sector 4,198,408+, ~126 GB) stores agent binary images. The loading path:
+
+1. Validate offset falls within Agent Storage Region bounds
+2. Read sectors via `StorageDevice` (ATA PIO or NVMe)
+3. Pass loaded bytes to `spawn_from_image()`
+
+This enables the `atos-deploy` CLI tool (§26.2.7) to write agent binaries to the Agent Storage Region, and system agents (skilld, root) to load them at runtime.
 
 ### 24.3 Runtime Layer
 
@@ -1966,6 +2031,8 @@ Design constraints:
 * **Determinism**: WASM is inherently deterministic (no threads, no system clock access). This makes it ideal for checkpoint/replay.
 
 #### 24.3.2 eBPF-lite Policy Runtime `[IMPL: ✅ 1,010 lines]`
+
+> **Full specification:** [`eBPF-lite-spec.md`](eBPF-lite-spec.md) — complete ABI reference including instruction set tables, register convention, helper function signatures, context structure layouts, verifier rules, memory model, SDK assembly syntax, and implementation status markers.
 
 eBPF-lite is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs inside the kernel, not in user mode. It serves as the policy execution layer of ATOS, providing verifiable, bounded, low-cost rule enforcement at kernel-defined attachment points.
 
@@ -2457,6 +2524,16 @@ Stage-2 reduced WASM type sizes for stack safety (MAX_CODE_SIZE=4096, MAX_MEMORY
 * accountd system agent `[✅ agents/accountd.rs with query/query_all protocol]`
 * Multi-mailbox agent support `[✅ sys_mailbox_create(18)/destroy(19), MAILBOXES expanded to 32]`
 * Verify: agent energy consumption matches expected cost across native + WASM operations `[✅ cumulative tracking via cost::record_consumption()]`
+
+### 25.5b Additional Syscalls (Stage-3) `[IMPL: ✅ ALL 5 IMPLEMENTED]`
+
+| # | Name | Signature | Description | Status |
+|---|------|-----------|-------------|--------|
+| 18 | `sys_mailbox_create` | `() -> mailbox_id` | Create an additional mailbox for the calling agent | ✅ |
+| 19 | `sys_mailbox_destroy` | `(mailbox_id) -> error_code` | Destroy a non-primary mailbox owned by the caller | ✅ |
+| 20 | `sys_replay` | `(checkpoint_tick) -> error_code` | Enter replay mode from a checkpoint (root agent only) | ✅ |
+| 21 | `sys_recv_timeout` | `(mailbox_id, out_ptr, out_capacity, timeout_ticks) -> len` | Blocking receive with timeout; returns `E_TIMEOUT` if no message within N ticks | ✅ |
+| 22 | `sys_spawn_image` | `(image_ptr, image_len, runtime_kind, energy_quota, mem_quota) -> agent_id` | Spawn a new agent from an in-memory ELF64 or WASM binary image. `runtime_kind`: 0=Native, 1=WASM. Image max 4 MB. Requires `CAP_AGENT_SPAWN`. See §24.2.3.1 | ✅ |
 
 ### 25.6 Stage-3 Success Criteria `[IMPL: ✅ ALL 6/6 MET]`
 
