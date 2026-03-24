@@ -693,23 +693,72 @@ fn decode_element_section(
         return Err(WasmError::InvalidSection);
     }
     for _ in 0..count {
-        let table_idx = decode_leb128_u32(bytes, pos)?;
-        let offset_val = eval_init_expr(bytes, pos)?;
-        let offset = match offset_val {
-            Value::I32(v) => v as u32,
-            Value::I64(v) => v as u32,
-            _ => 0,
-        };
-        let num_elems = decode_leb128_u32(bytes, pos)? as usize;
-        let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
-        for _ in 0..num_elems {
-            func_indices.push(decode_leb128_u32(bytes, pos)?);
+        if *pos >= bytes.len() { return Err(WasmError::UnexpectedEnd); }
+        let flags = decode_leb128_u32(bytes, pos)?;
+
+        match flags {
+            0 => {
+                // Active segment: table_idx=0 (implicit), offset expr, func indices
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val {
+                    Value::I32(v) => v as u32,
+                    Value::I64(v) => v as u32,
+                    _ => 0,
+                };
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                for _ in 0..num_elems {
+                    func_indices.push(decode_leb128_u32(bytes, pos)?);
+                }
+                module.element_segments.push(ElementSegment {
+                    table_idx: 0,
+                    offset,
+                    func_indices,
+                });
+            }
+            1 => {
+                // Passive segment: kind byte + func indices (no table, no offset)
+                let _kind = bytes[*pos]; *pos += 1; // elemkind (0x00 = funcref)
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                for _ in 0..num_elems {
+                    let _ = decode_leb128_u32(bytes, pos)?; // skip func index
+                }
+                // Passive segments are not applied at init; used by table.init
+            }
+            2 => {
+                // Active segment with explicit table_idx
+                let table_idx = decode_leb128_u32(bytes, pos)?;
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val {
+                    Value::I32(v) => v as u32,
+                    Value::I64(v) => v as u32,
+                    _ => 0,
+                };
+                let _kind = bytes[*pos]; *pos += 1;
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                for _ in 0..num_elems {
+                    func_indices.push(decode_leb128_u32(bytes, pos)?);
+                }
+                module.element_segments.push(ElementSegment {
+                    table_idx,
+                    offset,
+                    func_indices,
+                });
+            }
+            3 => {
+                // Declarative segment: kind + func indices (dropped immediately)
+                let _kind = bytes[*pos]; *pos += 1;
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                for _ in 0..num_elems {
+                    let _ = decode_leb128_u32(bytes, pos)?;
+                }
+            }
+            _ => {
+                // flags 4-7: expression-based variants (skip for now)
+                return Err(WasmError::InvalidSection);
+            }
         }
-        module.element_segments.push(ElementSegment {
-            table_idx,
-            offset,
-            func_indices,
-        });
     }
     Ok(())
 }
@@ -725,27 +774,75 @@ fn decode_data_section(
         return Err(WasmError::InvalidSection);
     }
     for _ in 0..count {
-        let memory_idx = decode_leb128_u32(bytes, pos)?;
-        let offset_val = eval_init_expr(bytes, pos)?;
-        let offset = match offset_val {
-            Value::I32(v) => v as u32,
-            Value::I64(v) => v as u32,
-            _ => 0,
-        };
-        let data_len = decode_leb128_u32(bytes, pos)? as usize;
-        // Store data bytes in module.code (reused buffer)
-        let data_offset = module.code.len();
-        if *pos + data_len > bytes.len() {
-            return Err(WasmError::UnexpectedEnd);
+        if *pos >= bytes.len() { return Err(WasmError::UnexpectedEnd); }
+        let flags = decode_leb128_u32(bytes, pos)?;
+
+        match flags {
+            0 => {
+                // Active segment: memory_idx=0 (implicit), offset expr, data bytes
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val {
+                    Value::I32(v) => v as u32,
+                    Value::I64(v) => v as u32,
+                    _ => 0,
+                };
+                let data_len = decode_leb128_u32(bytes, pos)? as usize;
+                let data_offset = module.code.len();
+                if *pos + data_len > bytes.len() {
+                    return Err(WasmError::UnexpectedEnd);
+                }
+                module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
+                *pos += data_len;
+                module.data_segments.push(DataSegment {
+                    memory_idx: 0,
+                    offset,
+                    data_offset,
+                    data_len,
+                });
+            }
+            1 => {
+                // Passive segment: just data bytes (no memory, no offset)
+                let data_len = decode_leb128_u32(bytes, pos)? as usize;
+                if *pos + data_len > bytes.len() {
+                    return Err(WasmError::UnexpectedEnd);
+                }
+                // Store bytes but don't create an active segment
+                let data_offset = module.code.len();
+                module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
+                *pos += data_len;
+                // Passive segments used by memory.init; store with offset=u32::MAX as marker
+                module.data_segments.push(DataSegment {
+                    memory_idx: 0,
+                    offset: u32::MAX, // marker: passive segment
+                    data_offset,
+                    data_len,
+                });
+            }
+            2 => {
+                // Active segment with explicit memory_idx
+                let memory_idx = decode_leb128_u32(bytes, pos)?;
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val {
+                    Value::I32(v) => v as u32,
+                    Value::I64(v) => v as u32,
+                    _ => 0,
+                };
+                let data_len = decode_leb128_u32(bytes, pos)? as usize;
+                let data_offset = module.code.len();
+                if *pos + data_len > bytes.len() {
+                    return Err(WasmError::UnexpectedEnd);
+                }
+                module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
+                *pos += data_len;
+                module.data_segments.push(DataSegment {
+                    memory_idx,
+                    offset,
+                    data_offset,
+                    data_len,
+                });
+            }
+            _ => return Err(WasmError::InvalidSection),
         }
-        module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
-        *pos += data_len;
-        module.data_segments.push(DataSegment {
-            memory_idx,
-            offset,
-            data_offset,
-            data_len,
-        });
     }
     Ok(())
 }

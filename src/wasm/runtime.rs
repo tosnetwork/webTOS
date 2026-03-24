@@ -159,8 +159,11 @@ impl WasmInstance {
             finished: false,
         };
 
-        // Apply data segments to memory
+        // Apply active data segments to memory (skip passive segments marked with offset=u32::MAX)
         for seg in &inst.module.data_segments {
+            if seg.offset == u32::MAX {
+                continue; // passive segment — applied later by memory.init
+            }
             let dst_start = seg.offset as usize;
             let src_start = seg.data_offset;
             let len = seg.data_len;
@@ -409,51 +412,106 @@ impl WasmInstance {
         Ok(())
     }
 
+    // ─── Float NaN helpers (matching wasmi semantics) ──────────────────
+
+    /// Convert signaling NaN to quiet NaN, preserving payload.
+    /// WASM spec requires all NaN outputs to be quiet NaN.
+    fn quiet_nan_f32(v: f32) -> f32 {
+        if v.is_nan() {
+            f32::from_bits(v.to_bits() | 0x0040_0000) // set quiet bit
+        } else { v }
+    }
+
+    fn quiet_nan_f64(v: f64) -> f64 {
+        if v.is_nan() {
+            f64::from_bits(v.to_bits() | 0x0008_0000_0000_0000)
+        } else { v }
+    }
+
     /// WASM spec: f32.nearest rounds to nearest even.
-    /// Uses libm::rintf which implements IEEE 754 roundTiesToEven directly,
-    /// avoiding fragile float equality comparisons.
     fn wasm_nearest_f32(v: f32) -> f32 {
-        if v.is_nan() { return v; }
+        if v.is_nan() { return Self::quiet_nan_f32(v); }
         libm::rintf(v)
     }
 
-    /// WASM spec: f64.nearest rounds to nearest even.
     fn wasm_nearest_f64(v: f64) -> f64 {
-        if v.is_nan() { return v; }
+        if v.is_nan() { return Self::quiet_nan_f64(v); }
         libm::rint(v)
     }
 
-    /// WASM spec f32.min: propagate NaN, handle -0.0/+0.0.
+    /// Unary float ops: quiet NaN passthrough for ceil/floor/trunc/sqrt.
+    fn wasm_ceil_f32(v: f32) -> f32 {
+        if v.is_nan() { return Self::quiet_nan_f32(v); }
+        libm::ceilf(v)
+    }
+    fn wasm_floor_f32(v: f32) -> f32 {
+        if v.is_nan() { return Self::quiet_nan_f32(v); }
+        libm::floorf(v)
+    }
+    fn wasm_trunc_f32(v: f32) -> f32 {
+        if v.is_nan() { return Self::quiet_nan_f32(v); }
+        libm::truncf(v)
+    }
+    fn wasm_sqrt_f32(v: f32) -> f32 {
+        if v.is_nan() { return Self::quiet_nan_f32(v); }
+        libm::sqrtf(v)
+    }
+    fn wasm_ceil_f64(v: f64) -> f64 {
+        if v.is_nan() { return Self::quiet_nan_f64(v); }
+        libm::ceil(v)
+    }
+    fn wasm_floor_f64(v: f64) -> f64 {
+        if v.is_nan() { return Self::quiet_nan_f64(v); }
+        libm::floor(v)
+    }
+    fn wasm_trunc_f64(v: f64) -> f64 {
+        if v.is_nan() { return Self::quiet_nan_f64(v); }
+        libm::trunc(v)
+    }
+    fn wasm_sqrt_f64(v: f64) -> f64 {
+        if v.is_nan() { return Self::quiet_nan_f64(v); }
+        libm::sqrt(v)
+    }
+
+    /// WASM spec min/max: propagate NaN with quieting (using lhs+rhs),
+    /// handle -0.0/+0.0 sign correctly. Matches wasmi semantics.
     fn wasm_min_f32(a: f32, b: f32) -> f32 {
-        if a.is_nan() || b.is_nan() { return f32::NAN; }
-        if a == 0.0 && b == 0.0 {
-            if a.to_bits() == 0x8000_0000 || b.to_bits() == 0x8000_0000 { return -0.0f32; }
+        if a < b { a }
+        else if b < a { b }
+        else if a == b {
+            // Handle -0.0 vs +0.0: min(-0, +0) = -0
+            if a.is_sign_negative() && b.is_sign_positive() { a } else { b }
+        } else {
+            // At least one is NaN — use + to propagate and quiet
+            a + b
         }
-        if a < b { a } else { b }
     }
-
     fn wasm_max_f32(a: f32, b: f32) -> f32 {
-        if a.is_nan() || b.is_nan() { return f32::NAN; }
-        if a == 0.0 && b == 0.0 {
-            if a.to_bits() == 0 || b.to_bits() == 0 { return 0.0f32; }
+        if a > b { a }
+        else if b > a { b }
+        else if a == b {
+            if a.is_sign_positive() && b.is_sign_negative() { a } else { b }
+        } else {
+            a + b
         }
-        if a > b { a } else { b }
     }
-
     fn wasm_min_f64(a: f64, b: f64) -> f64 {
-        if a.is_nan() || b.is_nan() { return f64::NAN; }
-        if a == 0.0 && b == 0.0 {
-            if a.to_bits() == 0x8000_0000_0000_0000 || b.to_bits() == 0x8000_0000_0000_0000 { return -0.0f64; }
+        if a < b { a }
+        else if b < a { b }
+        else if a == b {
+            if a.is_sign_negative() && b.is_sign_positive() { a } else { b }
+        } else {
+            a + b
         }
-        if a < b { a } else { b }
     }
-
     fn wasm_max_f64(a: f64, b: f64) -> f64 {
-        if a.is_nan() || b.is_nan() { return f64::NAN; }
-        if a == 0.0 && b == 0.0 {
-            if a.to_bits() == 0 || b.to_bits() == 0 { return 0.0f64; }
+        if a > b { a }
+        else if b > a { b }
+        else if a == b {
+            if a.is_sign_positive() && b.is_sign_negative() { a } else { b }
+        } else {
+            a + b
         }
-        if a > b { a } else { b }
     }
 
     // ─── Block management ───────────────────────────────────────────────
@@ -567,7 +625,10 @@ impl WasmInstance {
             let result_count = target.result_count as usize;
             let mut results = [Value::I32(0); MAX_RESULTS];
             for i in (0..result_count).rev() {
-                results[i] = self.pop().unwrap_or(Value::I32(0));
+                results[i] = match self.pop() {
+                    Ok(v) => v,
+                    Err(_) => Value::I32(0),
+                };
             }
 
             self.stack_ptr = target.stack_base;
@@ -981,13 +1042,21 @@ impl WasmInstance {
                     Some(idx) => idx,
                     None => return ExecResult::Trap(WasmError::UndefinedElement),
                 };
-                if (func_idx as usize) >= self.module.imports.len() {
-                    let local_idx = func_idx as usize - self.module.imports.len();
-                    if local_idx < self.module.functions.len() {
-                        if self.module.functions[local_idx].type_idx != type_idx {
-                            return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
-                        }
+                // Validate type signature for both imports and local functions
+                let actual_type_idx = if (func_idx as usize) < self.module.imports.len() {
+                    match self.module.imports[func_idx as usize].kind {
+                        ImportKind::Func(ti) => ti,
+                        _ => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
                     }
+                } else {
+                    let local_idx = func_idx as usize - self.module.imports.len();
+                    if local_idx >= self.module.functions.len() {
+                        return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
+                    }
+                    self.module.functions[local_idx].type_idx
+                };
+                if actual_type_idx != type_idx {
+                    return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
                 }
                 // Pop current frame (tail call)
                 if self.call_depth > 0 {
@@ -1376,7 +1445,13 @@ impl WasmInstance {
                 let delta = try_exec!(self.pop_i32()) as u32;
                 let old_pages = (self.memory_size / WASM_PAGE_SIZE) as u32;
                 let new_pages = old_pages.saturating_add(delta);
-                if new_pages as usize > MAX_MEMORY_PAGES {
+                // Check both the module's declared max and the global hard limit
+                let module_max = if self.module.memory_max_pages > 0 {
+                    self.module.memory_max_pages as usize
+                } else {
+                    MAX_MEMORY_PAGES
+                };
+                if new_pages as usize > module_max || new_pages as usize > MAX_MEMORY_PAGES {
                     // Failure: push -1
                     try_exec!(self.push(Value::I32(-1)));
                 } else {
@@ -1859,11 +1934,11 @@ impl WasmInstance {
             // ── f32 unary ───────────────────────────────────────────
             0x8B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::fabsf(a)))); }
             0x8C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(-a))); }
-            0x8D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::ceilf(a)))); }
-            0x8E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::floorf(a)))); }
-            0x8F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::truncf(a)))); }
+            0x8D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_ceil_f32(a)))); }
+            0x8E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_floor_f32(a)))); }
+            0x8F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_trunc_f32(a)))); }
             0x90 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_nearest_f32(a)))); }
-            0x91 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::sqrtf(a)))); }
+            0x91 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_sqrt_f32(a)))); }
 
             // ── f32 binary ──────────────────────────────────────────
             0x92 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a + b))); }
@@ -1877,11 +1952,11 @@ impl WasmInstance {
             // ── f64 unary ───────────────────────────────────────────
             0x99 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::fabs(a)))); }
             0x9A => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(-a))); }
-            0x9B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::ceil(a)))); }
-            0x9C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::floor(a)))); }
-            0x9D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::trunc(a)))); }
+            0x9B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_ceil_f64(a)))); }
+            0x9C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_floor_f64(a)))); }
+            0x9D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_trunc_f64(a)))); }
             0x9E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_nearest_f64(a)))); }
-            0x9F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::sqrt(a)))); }
+            0x9F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_sqrt_f64(a)))); }
 
             // ── f64 binary ──────────────────────────────────────────
             0xA0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a + b))); }
@@ -2038,7 +2113,10 @@ impl WasmInstance {
         let result_count = frame.result_count as usize;
         let mut results = [Value::I32(0); MAX_RESULTS];
         for i in (0..result_count).rev() {
-            results[i] = self.pop().unwrap_or(Value::I32(0));
+            results[i] = match self.pop() {
+                Ok(v) => v,
+                Err(_) => Value::I32(0),
+            };
         }
 
         // Restore stack to caller's level
