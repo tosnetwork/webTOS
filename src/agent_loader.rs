@@ -308,7 +308,14 @@ pub extern "C" fn wasm_runner_entry() -> ! {
         None => 50_000,
     };
     let rc = unsafe { WASM_RUNTIME_CLASSES[agent_id as usize] };
-    let mut instance = wasm::runtime::WasmInstance::with_class(module, fuel, rc);
+    let mut instance = match wasm::runtime::WasmInstance::with_class(module, fuel, rc) {
+        Ok(inst) => inst,
+        Err(e) => {
+            serial_println!("[WASM_RUNNER] Agent {} instantiation trapped: {:?}", agent_id, e);
+            crate::syscall::syscall(SYS_EXIT, 1, 0, 0, 0, 0);
+            loop {} // unreachable
+        }
+    };
 
     // Run start function if present (WASM spec requirement)
     match instance.run_start() {

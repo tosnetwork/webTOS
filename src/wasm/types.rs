@@ -667,7 +667,7 @@ pub enum WasmError {
     IntegerOverflow,
     FloatsDisabled,
     UndefinedElement,
-    UninitializedElement,
+    UninitializedElement(u32),
     IndirectCallTypeMismatch,
     ImmutableGlobal,
     GlobalIndexOutOfBounds,
@@ -677,4 +677,6 @@ pub enum WasmError {
     InvalidConversionToInteger,
     MalformedUtf8,
     ZeroByteExpected,
+    ConstExprRequired,
+    UndeclaredFuncRef,
 }

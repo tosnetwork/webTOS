@@ -3,7 +3,7 @@
 //! Performs structural and instruction-level validation of a decoded WASM module,
 //! including stack-based type checking per the WebAssembly specification.
 
-use crate::wasm::decoder::{ExportKind, ImportKind, WasmModule};
+use crate::wasm::decoder::{ElemMode, ExportKind, ImportKind, WasmModule};
 use crate::wasm::types::{ValType, WasmError, MAX_MEMORY_PAGES, MAX_TABLE_SIZE};
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -15,7 +15,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     let func_import_count = module.func_import_count();
     let total_functions = func_import_count + module.functions.len();
     let has_memory = module.has_memory;
-    let total_tables = module.tables.len() + count_table_imports(module);
+    let total_tables = module.tables.len(); // tables vec already includes imports
     let total_globals = module.globals.len() + count_global_imports(module);
 
     // Validate function type indices
@@ -98,11 +98,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     }
 
     // Validate global init expressions:
-    // Without extended-const, global.get in init expr can only reference imported globals.
-    // The referenced global must have index < global_import_count AND be immutable.
+    // With extended-const, global.get can reference any previously defined global.
+    // The referenced global must have index < current global's absolute index AND be immutable.
     let global_import_count = count_global_imports(module);
-    for global in &module.globals {
+    let table_import_count = count_table_imports(module);
+    for (_g_idx, global) in module.globals.iter().enumerate() {
         if let Some(ref_idx) = global.init_global_ref {
+            // global.get in global init expressions can only reference imported globals
             if ref_idx as usize >= global_import_count {
                 return Err(WasmError::GlobalIndexOutOfBounds);
             }
@@ -120,6 +122,29 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                 }
             }
         }
+        // Validate global init expression stack depth (must be exactly 1)
+        if global.init_expr_stack_depth != 1 {
+            return Err(WasmError::TypeMismatch);
+        }
+        // Validate global init expression type matches declared type
+        if let Some(expr_type) = global.init_expr_type {
+            if expr_type != global.val_type {
+                // FuncRef/ExternRef are ref types - check compatibility
+                if !is_ref_compatible(expr_type, global.val_type) {
+                    return Err(WasmError::TypeMismatch);
+                }
+            }
+        } else if global.init_global_ref.is_some() {
+            // The expression is a global.get - resolve the type of the referenced global
+            if let Some(ref_idx) = global.init_global_ref {
+                let ref_type = get_imported_global_type(module, ref_idx);
+                if let Some(rt) = ref_type {
+                    if rt != global.val_type && !is_ref_compatible(rt, global.val_type) {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                }
+            }
+        }
     }
 
     // Validate start function
@@ -127,7 +152,6 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         if start_idx as usize >= total_functions {
             return Err(WasmError::FunctionNotFound(start_idx));
         }
-        // Start function must have no params and no results
         let type_idx = if (start_idx as usize) < func_import_count {
             module.func_import_type(start_idx).unwrap_or(0) as usize
         } else {
@@ -146,38 +170,197 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
-    // Validate elem seg table refs and func indices
+    // Build the set of "declared" function references.
+    // Per spec, a function is "declared" if it appears in:
+    // 1. An element segment (function indices)
+    // 2. A ref.func in any init expression (global init, elem expression)
+    // 3. An export
+    let mut declared_funcs: BTreeSet<u32> = BTreeSet::new();
+    for seg in &module.element_segments {
+        for &fi in &seg.func_indices {
+            if fi != u32::MAX {
+                declared_funcs.insert(fi);
+            }
+        }
+    }
+    // ref.func in global init expressions
+    for global in &module.globals {
+        if let Some(func_idx) = global.init_func_ref {
+            // Also validate function index bounds
+            if func_idx as usize >= total_functions {
+                return Err(WasmError::FunctionNotFound(func_idx));
+            }
+            declared_funcs.insert(func_idx);
+        }
+    }
+    // Exported functions
+    for exp in &module.exports {
+        if let ExportKind::Func(idx) = exp.kind {
+            declared_funcs.insert(idx);
+        }
+    }
+
+    // Validate element segments
     for seg in &module.element_segments {
         for &fi in &seg.func_indices {
             if fi != u32::MAX && fi as usize >= total_functions {
                 return Err(WasmError::FunctionNotFound(fi));
             }
         }
-        if total_tables == 0 || seg.table_idx as usize >= total_tables {
-            return Err(WasmError::TableIndexOutOfBounds);
+        if seg.mode == ElemMode::Active {
+            if total_tables == 0 || seg.table_idx as usize >= total_tables {
+                return Err(WasmError::TableIndexOutOfBounds);
+            }
+            // Validate element type compatibility with table
+            let tbl_et = table_elem_type(module, seg.table_idx, table_import_count);
+            if !ref_types_compatible(seg.elem_type, tbl_et) {
+                return Err(WasmError::TypeMismatch);
+            }
+            // Validate offset expression
+            validate_init_expr_for_segment(
+                &seg.offset_expr_info, global_import_count, total_globals,
+                module, ValType::I32,
+            )?;
         }
     }
+
+    // Validate data segments
     for seg in &module.data_segments {
-        if seg.offset != u32::MAX {
+        if seg.is_active {
             if !has_memory { return Err(WasmError::MemoryOutOfBounds); }
             if seg.memory_idx > 0 { return Err(WasmError::MemoryOutOfBounds); }
+            // Validate offset expression
+            validate_init_expr_for_segment(
+                &seg.offset_expr_info, global_import_count, total_globals,
+                module, ValType::I32,
+            )?;
         }
     }
 
     // Validate instruction sequences for each function
     for (i, func) in module.functions.iter().enumerate() {
-        validate_function_body(module, i, func, total_functions, has_memory, total_tables, total_globals)?;
+        validate_function_body(module, i, func, total_functions, has_memory,
+            total_tables, total_globals, table_import_count, &declared_funcs)?;
     }
 
     Ok(())
 }
 
+/// Get the ValType of an imported global by its global index.
+fn get_imported_global_type(module: &WasmModule, global_idx: u32) -> Option<ValType> {
+    let mut gi = 0u32;
+    for imp in &module.imports {
+        if let ImportKind::Global(vt_byte, _) = imp.kind {
+            if gi == global_idx {
+                return match vt_byte {
+                    0x7F => Some(ValType::I32),
+                    0x7E => Some(ValType::I64),
+                    0x7D => Some(ValType::F32),
+                    0x7C => Some(ValType::F64),
+                    0x7B => Some(ValType::V128),
+                    0x70 => Some(ValType::FuncRef),
+                    0x6F => Some(ValType::ExternRef),
+                    _ => None,
+                };
+            }
+            gi += 1;
+        }
+    }
+    None
+}
+
 fn count_table_imports(module: &WasmModule) -> usize {
-    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Table)).count()
+    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Table(_))).count()
 }
 
 fn count_global_imports(module: &WasmModule) -> usize {
     module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Global(_, _))).count()
+}
+
+/// Check if two types are ref-compatible (both ref types are interchangeable
+/// for the purpose of global init validation when the global type is a ref type).
+fn is_ref_compatible(a: ValType, b: ValType) -> bool {
+    let a_ref = matches!(a, ValType::FuncRef | ValType::ExternRef);
+    let b_ref = matches!(b, ValType::FuncRef | ValType::ExternRef);
+    // If both are the same ref type, they're compatible
+    if a == b { return true; }
+    // FuncRef and ExternRef are NOT compatible with each other
+    if a_ref && b_ref { return false; }
+    false
+}
+
+/// Validate an init expression used in a data or element segment offset.
+fn validate_init_expr_for_segment(
+    info: &crate::wasm::decoder::InitExprInfo,
+    global_import_count: usize,
+    _total_globals: usize,
+    module: &WasmModule,
+    expected_type: ValType,
+) -> Result<(), WasmError> {
+    // Check global references: without extended-const, only imported globals allowed
+    if let Some(ref_idx) = info.global_ref {
+        if ref_idx as usize >= global_import_count {
+            return Err(WasmError::GlobalIndexOutOfBounds);
+        }
+        // Referenced imported global must be immutable
+        let mut gi: usize = 0;
+        for imp in &module.imports {
+            if let ImportKind::Global(_, mutable) = imp.kind {
+                if gi == ref_idx as usize {
+                    if mutable {
+                        return Err(WasmError::ConstExprRequired);
+                    }
+                    break;
+                }
+                gi += 1;
+            }
+        }
+    }
+    // Check for non-constant instructions
+    if info.has_non_const {
+        return Err(WasmError::ConstExprRequired);
+    }
+    // Check expression type: must produce exactly 1 value of expected type
+    if info.stack_depth != 1 {
+        return Err(WasmError::TypeMismatch);
+    }
+    if let Some(result_type) = info.result_type {
+        if result_type != expected_type {
+            return Err(WasmError::TypeMismatch);
+        }
+    }
+    // If result_type is None, it came from a global.get - we can't check the type
+    // without looking up the global. For now, trust it.
+    Ok(())
+}
+
+/// Get the element type of a table by index (including imported tables).
+fn table_elem_type(module: &WasmModule, table_idx: u32, table_import_count: usize) -> ValType {
+    if (table_idx as usize) < table_import_count {
+        let mut ti = 0usize;
+        for imp in &module.imports {
+            if let ImportKind::Table(et) = imp.kind {
+                if ti == table_idx as usize {
+                    return et;
+                }
+                ti += 1;
+            }
+        }
+        ValType::FuncRef
+    } else {
+        let local_idx = table_idx as usize - table_import_count;
+        if local_idx < module.tables.len() {
+            module.tables[local_idx].elem_type
+        } else {
+            ValType::FuncRef
+        }
+    }
+}
+
+/// Check if source ref type is compatible with destination ref type.
+/// FuncRef is only compatible with FuncRef, ExternRef only with ExternRef.
+fn ref_types_compatible(src: ValType, dst: ValType) -> bool {
+    src == dst
 }
 
 // ─── Type checking structures ────────────────────────────────────────────────
@@ -224,6 +407,9 @@ struct Validator<'a> {
     total_tables: usize,
     total_globals: usize,
     func_import_count: usize,
+    table_import_count: usize,
+    /// Set of function indices declared in element segments (for ref.func validation)
+    declared_funcs: &'a BTreeSet<u32>,
 }
 
 impl<'a> Validator<'a> {
@@ -619,6 +805,11 @@ impl<'a> Validator<'a> {
                     if self.total_tables == 0 || table_idx as usize >= self.total_tables {
                         return Err(WasmError::TableIndexOutOfBounds);
                     }
+                    // call_indirect requires funcref table
+                    let tbl_et = table_elem_type(self.module, table_idx, self.table_import_count);
+                    if tbl_et != ValType::FuncRef {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     self.pop_expect(ValType::I32)?; // table index operand
                     let ft = &self.module.func_types[type_idx as usize];
                     let param_count = ft.param_count as usize;
@@ -655,6 +846,11 @@ impl<'a> Validator<'a> {
                     }
                     if self.total_tables == 0 || table_idx as usize >= self.total_tables {
                         return Err(WasmError::TableIndexOutOfBounds);
+                    }
+                    // return_call_indirect requires funcref table
+                    let tbl_et = table_elem_type(self.module, table_idx, self.table_import_count);
+                    if tbl_et != ValType::FuncRef {
+                        return Err(WasmError::TypeMismatch);
                     }
                     self.pop_expect(ValType::I32)?;
                     let ft = &self.module.func_types[type_idx as usize];
@@ -786,16 +982,22 @@ impl<'a> Validator<'a> {
                 }
                 // ── table.get ──
                 0x25 => {
-                    let _idx = self.read_u32()?;
+                    let tidx = self.read_u32()?;
+                    if self.total_tables == 0 || tidx as usize >= self.total_tables {
+                        return Err(WasmError::TableIndexOutOfBounds);
+                    }
                     self.pop_expect(ValType::I32)?;
-                    // Table element type - for now push I32 as a placeholder
-                    // (funcref/externref are not modeled as ValType)
-                    self.push_opd(StackType::Unknown);
+                    let et = table_elem_type(self.module, tidx, self.table_import_count);
+                    self.push_val(et);
                 }
                 // ── table.set ──
                 0x26 => {
-                    let _idx = self.read_u32()?;
-                    let _ = self.pop_opd()?; // value
+                    let tidx = self.read_u32()?;
+                    if self.total_tables == 0 || tidx as usize >= self.total_tables {
+                        return Err(WasmError::TableIndexOutOfBounds);
+                    }
+                    let et = table_elem_type(self.module, tidx, self.table_import_count);
+                    self.pop_expect(et)?; // value must match table element type
                     self.pop_expect(ValType::I32)?; // index
                 }
                 // ── memory loads ──
@@ -1098,6 +1300,10 @@ impl<'a> Validator<'a> {
                     if idx as usize >= self.total_functions {
                         return Err(WasmError::FunctionNotFound(idx));
                     }
+                    // Per spec, ref.func requires the function to be "declared"
+                    if !self.declared_funcs.contains(&idx) {
+                        return Err(WasmError::UndeclaredFuncRef);
+                    }
                     self.push_opd(StackType::Unknown);
                 }
 
@@ -1157,29 +1363,57 @@ impl<'a> Validator<'a> {
                         }
                         // table.init
                         12 => {
-                            let _ = self.read_u32()?;
-                            let _ = self.read_u32()?;
+                            let seg_idx = self.read_u32()?;
+                            let tbl_idx = self.read_u32()?;
+                            if seg_idx as usize >= self.module.element_segments.len() {
+                                return Err(WasmError::UndefinedElement);
+                            }
+                            if tbl_idx as usize >= self.total_tables {
+                                return Err(WasmError::TableIndexOutOfBounds);
+                            }
+                            // Check element type compatibility
+                            let tbl_et = table_elem_type(self.module, tbl_idx, self.table_import_count);
+                            let seg_et = self.module.element_segments[seg_idx as usize].elem_type;
+                            if !ref_types_compatible(seg_et, tbl_et) {
+                                return Err(WasmError::TypeMismatch);
+                            }
                             self.pop_expect(ValType::I32)?; // n
                             self.pop_expect(ValType::I32)?; // s
                             self.pop_expect(ValType::I32)?; // d
                         }
                         // elem.drop
                         13 => {
-                            let _ = self.read_u32()?;
+                            let seg_idx = self.read_u32()? as usize;
+                            if seg_idx >= self.module.element_segments.len() {
+                                return Err(WasmError::UndefinedElement);
+                            }
                         }
                         // table.copy
                         14 => {
-                            let _ = self.read_u32()?;
-                            let _ = self.read_u32()?;
+                            let dst_idx = self.read_u32()?;
+                            let src_idx = self.read_u32()?;
+                            if dst_idx as usize >= self.total_tables || src_idx as usize >= self.total_tables {
+                                return Err(WasmError::TableIndexOutOfBounds);
+                            }
+                            // Check element type compatibility: src must be subtype of dst
+                            let dst_et = table_elem_type(self.module, dst_idx, self.table_import_count);
+                            let src_et = table_elem_type(self.module, src_idx, self.table_import_count);
+                            if !ref_types_compatible(src_et, dst_et) {
+                                return Err(WasmError::TypeMismatch);
+                            }
                             self.pop_expect(ValType::I32)?; // n
                             self.pop_expect(ValType::I32)?; // s
                             self.pop_expect(ValType::I32)?; // d
                         }
                         // table.grow
                         15 => {
-                            let _ = self.read_u32()?;
+                            let tidx = self.read_u32()?;
+                            if tidx as usize >= self.total_tables {
+                                return Err(WasmError::TableIndexOutOfBounds);
+                            }
                             self.pop_expect(ValType::I32)?; // n
-                            let _ = self.pop_opd()?;         // init value
+                            let et = table_elem_type(self.module, tidx, self.table_import_count);
+                            self.pop_expect(et)?;            // init value must match table elem type
                             self.push_val(ValType::I32);
                         }
                         // table.size
@@ -1189,9 +1423,13 @@ impl<'a> Validator<'a> {
                         }
                         // table.fill
                         17 => {
-                            let _ = self.read_u32()?;
+                            let tidx = self.read_u32()?;
+                            if tidx as usize >= self.total_tables {
+                                return Err(WasmError::TableIndexOutOfBounds);
+                            }
                             self.pop_expect(ValType::I32)?; // n
-                            let _ = self.pop_opd()?;         // value
+                            let et = table_elem_type(self.module, tidx, self.table_import_count);
+                            self.pop_expect(et)?;            // value must match table elem type
                             self.pop_expect(ValType::I32)?; // i
                         }
                         _ => {}
@@ -1616,6 +1854,8 @@ fn validate_function_body(
     has_memory: bool,
     total_tables: usize,
     total_globals: usize,
+    table_import_count: usize,
+    declared_funcs: &BTreeSet<u32>,
 ) -> Result<(), WasmError> {
     let code = &module.code;
     let start = func.code_offset;
@@ -1658,6 +1898,8 @@ fn validate_function_body(
         total_tables,
         total_globals,
         func_import_count,
+        table_import_count,
+        declared_funcs,
     };
 
     validator.validate()

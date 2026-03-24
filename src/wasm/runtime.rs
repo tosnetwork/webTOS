@@ -110,7 +110,11 @@ pub struct WasmInstance {
     pub stack_ptr: usize,
     pub locals: Vec<Value>,
     pub globals: Vec<Value>,
-    pub table: Vec<Option<u32>>,
+    pub tables: Vec<Vec<Option<u32>>>,
+    /// Tracks which element segments have been dropped (by elem.drop or after active init).
+    pub dropped_elems: Vec<bool>,
+    /// Tracks which data segments have been dropped (by data.drop).
+    pub dropped_data: Vec<bool>,
     pub memory: Vec<u8>,
     pub memory_size: usize,
     /// Program counter — byte offset within `module.code`.
@@ -130,34 +134,91 @@ pub struct WasmInstance {
 impl WasmInstance {
     /// Create a new instance from a decoded module with the given fuel budget.
     /// Create a new instance with the default runtime class (ProofGrade).
-    pub fn new(module: WasmModule, fuel: u64) -> Self {
+    pub fn new(module: WasmModule, fuel: u64) -> Result<Self, WasmError> {
         Self::with_class(module, fuel, DEFAULT_RUNTIME_CLASS)
     }
 
     /// Create a new instance with a specific runtime class.
-    pub fn with_class(module: WasmModule, fuel: u64, runtime_class: RuntimeClass) -> Self {
+    pub fn with_class(module: WasmModule, fuel: u64, runtime_class: RuntimeClass) -> Result<Self, WasmError> {
         let mem_pages = module.memory_min_pages as usize;
         let mem_size = mem_pages.saturating_mul(WASM_PAGE_SIZE);
 
-        // Initialize globals from module definitions
+        // Initialize globals from module definitions.
+        // For globals with init_global_ref, resolve sequentially so that each global
+        // can reference previously initialized globals.
         let mut globals = Vec::with_capacity(module.globals.len());
         for g in &module.globals {
-            globals.push(g.init_value);
+            if let Some(ref_idx) = g.init_global_ref {
+                if let Some(&ref_val) = globals.get(ref_idx as usize) {
+                    // The init_value was computed with global.get=0 at decode time.
+                    // Add the actual referenced global's value.
+                    let val = match (ref_val, g.init_value) {
+                        (Value::I32(r), Value::I32(v)) => Value::I32(v.wrapping_add(r)),
+                        (Value::I64(r), Value::I64(v)) => Value::I64(v.wrapping_add(r)),
+                        (Value::F32(r), Value::F32(v)) => Value::F32(v + r),
+                        (Value::F64(r), Value::F64(v)) => Value::F64(v + r),
+                        (val, _) => val,
+                    };
+                    globals.push(val);
+                } else {
+                    globals.push(g.init_value);
+                }
+            } else {
+                globals.push(g.init_value);
+            }
         }
 
-        // Initialize table from module definitions
-        let table_size = module.tables.first().map_or(0, |t| t.min as usize);
-        let mut table: Vec<Option<u32>> = vec![None; table_size];
+        // Initialize tables from module definitions (support multiple tables)
+        let mut tables: Vec<Vec<Option<u32>>> = Vec::with_capacity(module.tables.len());
+        for t in &module.tables {
+            tables.push(vec![None; t.min as usize]);
+        }
+        // Ensure at least one table exists if element segments reference table 0
+        // (some modules have implicit table 0 via imports)
 
-        // Apply element segments to table
-        for seg in &module.element_segments {
+        // Total function count = imported functions + module-defined functions
+        let num_imported_funcs = module.imports.iter().filter(|i| matches!(i.kind, ImportKind::Func(_))).count() as u32;
+        let total_funcs = num_imported_funcs + module.functions.len() as u32;
+
+        // Track dropped element/data segments
+        let dropped_elems = vec![false; module.element_segments.len()];
+        let dropped_data = vec![false; module.data_segments.len()];
+
+        // Apply active element segments to tables
+        use crate::wasm::decoder::ElemMode;
+        for (seg_idx, seg) in module.element_segments.iter().enumerate() {
+            if seg.mode != ElemMode::Active {
+                continue;
+            }
+            let tbl_idx = seg.table_idx as usize;
+            if tbl_idx >= tables.len() {
+                return Err(WasmError::TableIndexOutOfBounds);
+            }
             let offset = seg.offset as usize;
-            for (i, &func_idx) in seg.func_indices.iter().enumerate() {
-                let idx = offset.saturating_add(i);
-                if idx < table.len() {
-                    table[idx] = Some(func_idx);
+            let count = seg.func_indices.len();
+
+            // Trap if segment goes out of bounds
+            if offset.saturating_add(count) > tables[tbl_idx].len() {
+                return Err(WasmError::TableIndexOutOfBounds);
+            }
+
+            // Trap if any function index is out of bounds
+            for &func_idx in &seg.func_indices {
+                if func_idx != u32::MAX && func_idx >= total_funcs {
+                    return Err(WasmError::UndefinedElement);
                 }
             }
+
+            for (i, &func_idx) in seg.func_indices.iter().enumerate() {
+                if func_idx == u32::MAX {
+                    tables[tbl_idx][offset + i] = None; // null ref
+                } else {
+                    tables[tbl_idx][offset + i] = Some(func_idx);
+                }
+            }
+            // Active segments are considered dropped after initialization
+            // (dropped_elems is not mutable yet, will set after inst creation)
+            let _ = seg_idx;
         }
 
         let mut inst = WasmInstance {
@@ -166,7 +227,9 @@ impl WasmInstance {
             stack_ptr: 0,
             locals: vec![Value::I32(0); MAX_TOTAL_LOCALS],
             globals,
-            table,
+            tables,
+            dropped_elems,
+            dropped_data,
             memory: vec![0u8; mem_size],
             memory_size: mem_size,
             pc: 0,
@@ -179,23 +242,46 @@ impl WasmInstance {
             runtime_class,
         };
 
-        // Apply active data segments to memory (skip passive segments marked with offset=u32::MAX)
+        // Apply active data segments to memory (skip passive segments)
         for seg in &inst.module.data_segments {
-            if seg.offset == u32::MAX {
+            if !seg.is_active {
                 continue; // passive segment — applied later by memory.init
             }
             let dst_start = seg.offset as usize;
             let src_start = seg.data_offset;
             let len = seg.data_len;
-            if dst_start.saturating_add(len) <= inst.memory_size
-                && src_start.saturating_add(len) <= inst.module.code.len()
-            {
+
+            // Trap if segment goes out of bounds of memory
+            if dst_start.saturating_add(len) > inst.memory_size {
+                return Err(WasmError::MemoryOutOfBounds);
+            }
+
+            if src_start.saturating_add(len) <= inst.module.code.len() {
                 inst.memory[dst_start..dst_start + len]
                     .copy_from_slice(&inst.module.code[src_start..src_start + len]);
             }
         }
 
-        inst
+        // Mark active and declarative element segments as dropped
+        for (i, seg) in inst.module.element_segments.iter().enumerate() {
+            if seg.mode == ElemMode::Active || seg.mode == ElemMode::Declarative {
+                inst.dropped_elems[i] = true;
+            }
+        }
+
+        Ok(inst)
+    }
+
+    // ─── Table helpers ──────────────────────────────────────────────────
+
+    /// Get a reference to a table by index (defaults to table 0).
+    fn table(&self, tbl_idx: usize) -> &Vec<Option<u32>> {
+        &self.tables[tbl_idx]
+    }
+
+    /// Get a mutable reference to a table by index (defaults to table 0).
+    fn table_mut(&mut self, tbl_idx: usize) -> &mut Vec<Option<u32>> {
+        &mut self.tables[tbl_idx]
     }
 
     // ─── Stack operations ───────────────────────────────────────────────
@@ -1236,9 +1322,36 @@ impl WasmInstance {
             }
 
             0x12 => {
-                // return_call (tail call proposal)
+                // return_call (tail call proposal): tail-call optimization
                 let func_idx = try_exec!(self.read_leb128_u32());
-                // Pop current frame first (tail call optimization)
+
+                // Get the number of parameters the target function expects
+                let param_count = if (func_idx as usize) < self.module.func_import_count() {
+                    match self.module.func_import_type(func_idx) {
+                        Some(ti) => {
+                            if (ti as usize) < self.module.func_types.len() {
+                                self.module.func_types[ti as usize].param_count as usize
+                            } else { 0 }
+                        }
+                        None => 0,
+                    }
+                } else {
+                    let li = (func_idx as usize) - self.module.func_import_count();
+                    if li < self.module.functions.len() {
+                        let ti = self.module.functions[li].type_idx as usize;
+                        if ti < self.module.func_types.len() {
+                            self.module.func_types[ti].param_count as usize
+                        } else { 0 }
+                    } else { 0 }
+                };
+
+                // Save the arguments from the stack
+                let mut args = [Value::I32(0); MAX_PARAMS];
+                for i in (0..param_count).rev() {
+                    args[i] = try_exec!(self.pop());
+                }
+
+                // Pop current frame (tail call: reuse the caller's slot)
                 if self.call_depth > 0 {
                     let frame = self.call_stack[self.call_depth - 1];
                     self.call_depth -= 1;
@@ -1246,6 +1359,12 @@ impl WasmInstance {
                     self.pc = frame.return_pc;
                     self.block_depth = frame.saved_block_depth;
                 }
+
+                // Push arguments back for the new function
+                for i in 0..param_count {
+                    try_exec!(self.push(args[i]));
+                }
+
                 if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
@@ -1259,14 +1378,15 @@ impl WasmInstance {
             0x13 => {
                 // return_call_indirect (tail call proposal)
                 let type_idx = try_exec!(self.read_leb128_u32());
-                let _table_idx = try_exec!(self.read_leb128_u32());
+                let table_idx = try_exec!(self.read_leb128_u32()) as usize;
                 let elem_idx = try_exec!(self.pop_i32()) as usize;
-                if elem_idx >= self.table.len() {
+                let tbl = if table_idx < self.tables.len() { &self.tables[table_idx] } else { return ExecResult::Trap(WasmError::TableIndexOutOfBounds); };
+                if elem_idx >= tbl.len() {
                     return ExecResult::Trap(WasmError::UndefinedElement);
                 }
-                let func_idx = match self.table[elem_idx] {
+                let func_idx = match tbl[elem_idx] {
                     Some(idx) => idx,
-                    None => return ExecResult::Trap(WasmError::UninitializedElement),
+                    None => return ExecResult::Trap(WasmError::UninitializedElement(elem_idx as u32)),
                 };
                 // Validate type signature for both imports and local functions
                 let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
@@ -1290,6 +1410,18 @@ impl WasmInstance {
                         return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
                     }
                 }
+
+                // Get param count for the target function
+                let param_count = if (type_idx as usize) < self.module.func_types.len() {
+                    self.module.func_types[type_idx as usize].param_count as usize
+                } else { 0 };
+
+                // Save arguments
+                let mut args = [Value::I32(0); MAX_PARAMS];
+                for i in (0..param_count).rev() {
+                    args[i] = try_exec!(self.pop());
+                }
+
                 // Pop current frame (tail call)
                 if self.call_depth > 0 {
                     let frame = self.call_stack[self.call_depth - 1];
@@ -1298,6 +1430,12 @@ impl WasmInstance {
                     self.pc = frame.return_pc;
                     self.block_depth = frame.saved_block_depth;
                 }
+
+                // Push arguments back
+                for i in 0..param_count {
+                    try_exec!(self.push(args[i]));
+                }
+
                 if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
@@ -1314,7 +1452,7 @@ impl WasmInstance {
                 let _type_idx = try_exec!(self.read_leb128_u32());
                 let func_ref = try_exec!(self.pop_i32());
                 if func_ref < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement);
+                    return ExecResult::Trap(WasmError::UninitializedElement(0));
                 }
                 let func_idx = func_ref as u32;
                 if (func_idx as usize) < self.module.func_import_count() {
@@ -1332,7 +1470,7 @@ impl WasmInstance {
                 let _type_idx = try_exec!(self.read_leb128_u32());
                 let func_ref = try_exec!(self.pop_i32());
                 if func_ref < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement);
+                    return ExecResult::Trap(WasmError::UninitializedElement(0));
                 }
                 let func_idx = func_ref as u32;
                 // Pop current frame first (tail call optimization)
@@ -1357,15 +1495,16 @@ impl WasmInstance {
             0x11 => {
                 // call_indirect
                 let type_idx = try_exec!(self.read_leb128_u32());
-                let _table_idx = try_exec!(self.read_leb128_u32()); // must be 0 in MVP
+                let table_idx = try_exec!(self.read_leb128_u32()) as usize;
                 let elem_idx = try_exec!(self.pop_i32()) as usize;
                 // Look up function in table
-                if elem_idx >= self.table.len() {
+                let tbl = if table_idx < self.tables.len() { table_idx } else { 0 };
+                if tbl >= self.tables.len() || elem_idx >= self.tables[tbl].len() {
                     return ExecResult::Trap(WasmError::UndefinedElement);
                 }
-                let func_idx = match self.table[elem_idx] {
+                let func_idx = match self.tables[tbl][elem_idx] {
                     Some(idx) => idx,
-                    None => return ExecResult::Trap(WasmError::UninitializedElement),
+                    None => return ExecResult::Trap(WasmError::UninitializedElement(elem_idx as u32)),
                 };
                 // Validate function signature matches expected type
                 let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
@@ -1448,7 +1587,7 @@ impl WasmInstance {
                 // ref.as_non_null
                 let val = try_exec!(self.pop_i32());
                 if val < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement);
+                    return ExecResult::Trap(WasmError::UninitializedElement(0));
                 }
                 try_exec!(self.push(Value::I32(val)));
             }
@@ -1525,24 +1664,28 @@ impl WasmInstance {
             0x25 => {
                 // table.get
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
-                let _ = table_idx; // MVP only has table 0
                 let idx = try_exec!(self.pop_i32()) as usize;
-                if idx >= self.table.len() {
+                if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                let val = self.table[idx].map_or(Value::I32(-1), |f| Value::I32(f as i32));
+                if idx >= self.tables[table_idx].len() {
+                    return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                }
+                let val = self.tables[table_idx][idx].map_or(Value::I32(-1), |f| Value::I32(f as i32));
                 try_exec!(self.push(val));
             }
             0x26 => {
                 // table.set
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
-                let _ = table_idx;
                 let val = try_exec!(self.pop_i32());
                 let idx = try_exec!(self.pop_i32()) as usize;
-                if idx >= self.table.len() {
+                if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                self.table[idx] = if val < 0 { None } else { Some(val as u32) };
+                if idx >= self.tables[table_idx].len() {
+                    return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                }
+                self.tables[table_idx][idx] = if val < 0 { None } else { Some(val as u32) };
             }
 
             // ── Memory ──────────────────────────────────────────────
@@ -2342,72 +2485,191 @@ impl WasmInstance {
                     6 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_i64(a)))); }
                     7 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_u64(a) as i64))); }
 
-                    // memory.init (8), data.drop (9)
-                    8 => { let _seg = try_exec!(self.read_leb128_u32()); let _mem = try_exec!(self.read_leb128_u32()); let n = try_exec!(self.pop_i32()) as usize; let s = try_exec!(self.pop_i32()) as usize; let d = try_exec!(self.pop_i32()) as usize; let seg_idx = _seg as usize; if seg_idx < self.module.data_segments.len() { let seg = &self.module.data_segments[seg_idx]; let src_start = seg.data_offset.saturating_add(s); let src_end = src_start.saturating_add(n); let dst_end = d.saturating_add(n); if src_end <= self.module.code.len() && dst_end <= self.memory_size { for i in 0..n { self.memory[d + i] = self.module.code[src_start + i]; } } else { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } } }
-                    9 => { let _seg = try_exec!(self.read_leb128_u32()); /* data.drop: no-op in interpreter */ }
+                    // memory.init (8)
+                    8 => {
+                        let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let _mem = try_exec!(self.read_leb128_u32());
+                        let n = try_exec!(self.pop_i32()) as u32;
+                        let s = try_exec!(self.pop_i32()) as u32;
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let is_dropped = seg_idx < self.dropped_data.len() && self.dropped_data[seg_idx];
+                        if is_dropped {
+                            // Dropped segment: n=0 is OK, but still validate d
+                            if n != 0 || s != 0 {
+                                return ExecResult::Trap(WasmError::MemoryOutOfBounds);
+                            }
+                            if (d as usize) > self.memory_size {
+                                return ExecResult::Trap(WasmError::MemoryOutOfBounds);
+                            }
+                        } else if seg_idx < self.module.data_segments.len() {
+                            let seg_data_offset = self.module.data_segments[seg_idx].data_offset;
+                            let seg_data_len = self.module.data_segments[seg_idx].data_len;
+                            let src_end = (s as u64) + (n as u64);
+                            let dst_end = (d as u64) + (n as u64);
+                            if src_end > seg_data_len as u64 || dst_end > self.memory_size as u64 {
+                                return ExecResult::Trap(WasmError::MemoryOutOfBounds);
+                            }
+                            for i in 0..(n as usize) {
+                                self.memory[(d as usize) + i] = self.module.code[seg_data_offset + (s as usize) + i];
+                            }
+                        } else {
+                            return ExecResult::Trap(WasmError::MemoryOutOfBounds);
+                        }
+                    }
+                    // data.drop (9)
+                    9 => {
+                        let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        if seg_idx < self.dropped_data.len() {
+                            self.dropped_data[seg_idx] = true;
+                        }
+                    }
 
-                    // memory.copy (10), memory.fill (11)
+                    // memory.copy (10)
                     10 => {
                         let _dst_mem = try_exec!(self.read_leb128_u32());
                         let _src_mem = try_exec!(self.read_leb128_u32());
-                        let n = try_exec!(self.pop_i32()) as usize;
-                        let s = try_exec!(self.pop_i32()) as usize;
-                        let d = try_exec!(self.pop_i32()) as usize;
-                        if s.saturating_add(n) > self.memory_size || d.saturating_add(n) > self.memory_size {
+                        let n = try_exec!(self.pop_i32()) as u32;
+                        let s = try_exec!(self.pop_i32()) as u32;
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let nu = n as usize; let su = s as usize; let du = d as usize;
+                        if su.saturating_add(nu) > self.memory_size || du.saturating_add(nu) > self.memory_size {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                         }
-                        if d <= s {
-                            for i in 0..n { self.memory[d + i] = self.memory[s + i]; }
+                        if du <= su {
+                            for i in 0..nu { self.memory[du + i] = self.memory[su + i]; }
                         } else {
-                            for i in (0..n).rev() { self.memory[d + i] = self.memory[s + i]; }
+                            for i in (0..nu).rev() { self.memory[du + i] = self.memory[su + i]; }
                         }
                     }
+                    // memory.fill (11)
                     11 => {
-                        // memory.fill: stack order is [d, val, n] → pop n, val, d
                         let _mem = try_exec!(self.read_leb128_u32());
-                        let n = try_exec!(self.pop_i32()) as usize;
+                        let n = try_exec!(self.pop_i32()) as u32;
                         let val = try_exec!(self.pop_i32()) as u8;
-                        let d = try_exec!(self.pop_i32()) as usize;
-                        if d.saturating_add(n) > self.memory_size {
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let nu = n as usize; let du = d as usize;
+                        if du.saturating_add(nu) > self.memory_size {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                         }
-                        for i in 0..n { self.memory[d + i] = val; }
+                        for i in 0..nu { self.memory[du + i] = val; }
                     }
 
-                    // table.init (12), elem.drop (13), table.copy (14),
-                    // table.grow (15), table.size (16), table.fill (17)
-                    12 => { let _seg = try_exec!(self.read_leb128_u32()); let _tbl = try_exec!(self.read_leb128_u32()); let _n = try_exec!(self.pop_i32()); let _s = try_exec!(self.pop_i32()); let _d = try_exec!(self.pop_i32()); /* table.init: simplified */ }
-                    13 => { let _seg = try_exec!(self.read_leb128_u32()); /* elem.drop: no-op */ }
-                    14 => { let _dst = try_exec!(self.read_leb128_u32()); let _src = try_exec!(self.read_leb128_u32()); let _n = try_exec!(self.pop_i32()); let _s = try_exec!(self.pop_i32()); let _d = try_exec!(self.pop_i32()); /* table.copy: simplified */ }
-                    15 => {
-                        // table.grow
-                        let _tbl = try_exec!(self.read_leb128_u32());
-                        let n = try_exec!(self.pop_i32()) as usize;
-                        let _init = try_exec!(self.pop());
-                        let old_size = self.table.len() as i32;
-                        if self.table.len().saturating_add(n) > MAX_TABLE_SIZE {
-                            try_exec!(self.push(Value::I32(-1)));
+                    // table.init (12)
+                    12 => {
+                        let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let n = try_exec!(self.pop_i32()) as u32;
+                        let s = try_exec!(self.pop_i32()) as u32;
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let is_dropped = seg_idx < self.dropped_elems.len() && self.dropped_elems[seg_idx];
+                        if is_dropped {
+                            if n != 0 || s != 0 {
+                                return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                            }
+                            if tbl_idx >= self.tables.len() || (d as usize) > self.tables[tbl_idx].len() {
+                                return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                            }
+                        } else if seg_idx < self.module.element_segments.len() {
+                            let seg_len = self.module.element_segments[seg_idx].func_indices.len();
+                            if tbl_idx >= self.tables.len() {
+                                return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                            }
+                            let tbl_len = self.tables[tbl_idx].len();
+                            let src_end = (s as u64) + (n as u64);
+                            let dst_end = (d as u64) + (n as u64);
+                            if src_end > seg_len as u64 || dst_end > tbl_len as u64 {
+                                return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                            }
+                            for i in 0..(n as usize) {
+                                let func_idx = self.module.element_segments[seg_idx].func_indices[(s as usize) + i];
+                                if func_idx == u32::MAX {
+                                    self.tables[tbl_idx][(d as usize) + i] = None;
+                                } else {
+                                    self.tables[tbl_idx][(d as usize) + i] = Some(func_idx);
+                                }
+                            }
                         } else {
-                            self.table.resize(self.table.len() + n, None);
-                            try_exec!(self.push(Value::I32(old_size)));
+                            return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
                     }
-                    16 => {
-                        // table.size
-                        let _tbl = try_exec!(self.read_leb128_u32());
-                        try_exec!(self.push(Value::I32(self.table.len() as i32)));
+                    // elem.drop (13)
+                    13 => {
+                        let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        if seg_idx < self.dropped_elems.len() {
+                            self.dropped_elems[seg_idx] = true;
+                        }
                     }
+                    // table.copy (14)
+                    14 => {
+                        let dst_tbl = try_exec!(self.read_leb128_u32()) as usize;
+                        let src_tbl = try_exec!(self.read_leb128_u32()) as usize;
+                        let n = try_exec!(self.pop_i32()) as u32;
+                        let s = try_exec!(self.pop_i32()) as u32;
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let nu = n as usize; let su = s as usize; let du = d as usize;
+                        if dst_tbl >= self.tables.len() || src_tbl >= self.tables.len() {
+                            return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                        }
+                        if su.saturating_add(nu) > self.tables[src_tbl].len()
+                            || du.saturating_add(nu) > self.tables[dst_tbl].len()
+                        {
+                            return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
+                        }
+                        if dst_tbl == src_tbl {
+                            if du <= su {
+                                for i in 0..nu { self.tables[dst_tbl][du + i] = self.tables[src_tbl][su + i]; }
+                            } else {
+                                for i in (0..nu).rev() { self.tables[dst_tbl][du + i] = self.tables[src_tbl][su + i]; }
+                            }
+                        } else {
+                            for i in 0..nu {
+                                let val = self.tables[src_tbl][su + i];
+                                self.tables[dst_tbl][du + i] = val;
+                            }
+                        }
+                    }
+                    // table.grow (15)
+                    15 => {
+                        let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let n = try_exec!(self.pop_i32()) as u32;
+                        let init = try_exec!(self.pop());
+                        if tbl_idx >= self.tables.len() {
+                            try_exec!(self.push(Value::I32(-1)));
+                        } else {
+                            let old_size = self.tables[tbl_idx].len() as u32;
+                            let new_size = old_size as u64 + n as u64;
+                            let max = self.module.tables.get(tbl_idx).and_then(|t| t.max);
+                            let limit = max.map_or(MAX_TABLE_SIZE as u64, |m| m as u64);
+                            if new_size > limit || new_size > MAX_TABLE_SIZE as u64 {
+                                try_exec!(self.push(Value::I32(-1)));
+                            } else {
+                                let fill_val = match init {
+                                    Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
+                                    _ => None,
+                                };
+                                self.tables[tbl_idx].resize(new_size as usize, fill_val);
+                                try_exec!(self.push(Value::I32(old_size as i32)));
+                            }
+                        }
+                    }
+                    // table.size (16)
+                    16 => {
+                        let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let size = if tbl_idx < self.tables.len() { self.tables[tbl_idx].len() } else { 0 };
+                        try_exec!(self.push(Value::I32(size as i32)));
+                    }
+                    // table.fill (17)
                     17 => {
-                        // table.fill
-                        let _tbl = try_exec!(self.read_leb128_u32());
-                        let n = try_exec!(self.pop_i32()) as usize;
+                        let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let n = try_exec!(self.pop_i32()) as u32;
                         let val = try_exec!(self.pop_i32());
-                        let d = try_exec!(self.pop_i32()) as usize;
-                        if d.saturating_add(n) > self.table.len() {
+                        let d = try_exec!(self.pop_i32()) as u32;
+                        let nu = n as usize; let du = d as usize;
+                        if tbl_idx >= self.tables.len() || du.saturating_add(nu) > self.tables[tbl_idx].len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
                         let entry = if val < 0 { None } else { Some(val as u32) };
-                        for i in 0..n { self.table[d + i] = entry; }
+                        for i in 0..nu { self.tables[tbl_idx][du + i] = entry; }
                     }
 
                     _ => return ExecResult::Trap(WasmError::InvalidOpcode(0xFC)),

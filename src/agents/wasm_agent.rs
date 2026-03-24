@@ -131,7 +131,13 @@ pub extern "C" fn wasm_agent_entry() -> ! {
     };
 
     // 3. Create instance with fuel budget
-    let mut instance = wasm::runtime::WasmInstance::new(module, 50_000);
+    let mut instance = match wasm::runtime::WasmInstance::new(module, 50_000) {
+        Ok(inst) => inst,
+        Err(e) => {
+            serial_println!("[WASM_AGENT] Instantiation trapped: {:?}", e);
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+    };
     serial_println!("[WASM_AGENT] Instance created with 50000 fuel");
 
     // 3b. Run start function if present (WASM spec requirement)

@@ -77,10 +77,10 @@ impl ImportDef {
 /// Import kind.
 #[derive(Debug, Clone, Copy)]
 pub enum ImportKind {
-    Func(u32),        // type index
-    Table,            // table import
-    Memory,           // memory import
-    Global(u8, bool), // valtype byte, mutable
+    Func(u32),           // type index
+    Table(ValType),      // table import with element type
+    Memory,              // memory import
+    Global(u8, bool),    // valtype byte, mutable
 }
 
 /// A WASM export definition.
@@ -118,6 +118,12 @@ pub struct GlobalDef {
     pub init_value: Value,
     /// If the init expression uses global.get, this is Some(global_index).
     pub init_global_ref: Option<u32>,
+    /// Type produced by the init expression (for validation).
+    pub init_expr_type: Option<ValType>,
+    /// Stack depth of the init expression (must be 1).
+    pub init_expr_stack_depth: u32,
+    /// If the init expression uses ref.func, this is the function index.
+    pub init_func_ref: Option<u32>,
 }
 
 /// A table definition.
@@ -125,6 +131,8 @@ pub struct GlobalDef {
 pub struct TableDef {
     pub min: u32,
     pub max: Option<u32>,
+    /// Element type: FuncRef (0x70) or ExternRef (0x6F).
+    pub elem_type: ValType,
 }
 
 /// A data segment for memory initialization.
@@ -132,8 +140,20 @@ pub struct TableDef {
 pub struct DataSegment {
     pub memory_idx: u32,
     pub offset: u32,
+    /// Whether this is an active segment (true) or passive (false).
+    pub is_active: bool,
     pub data_offset: usize, // offset into module.code (reused for data bytes)
     pub data_len: usize,
+    /// Info from scanning the offset init expression for validation.
+    pub offset_expr_info: InitExprInfo,
+}
+
+/// Element segment mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ElemMode {
+    Active,
+    Passive,
+    Declarative,
 }
 
 /// An element segment for table initialization.
@@ -142,6 +162,28 @@ pub struct ElementSegment {
     pub table_idx: u32,
     pub offset: u32,
     pub func_indices: alloc::vec::Vec<u32>,
+    pub mode: ElemMode,
+    /// Element type of this segment (funcref or externref).
+    pub elem_type: ValType,
+    /// Info from scanning the offset init expression for validation.
+    pub offset_expr_info: InitExprInfo,
+}
+
+/// Information extracted from scanning an init expression for validation.
+#[derive(Clone, Copy, Default)]
+pub struct InitExprInfo {
+    /// The highest global.get index found, if any.
+    pub global_ref: Option<u32>,
+    /// The result type of the expression, if determinable.
+    pub result_type: Option<ValType>,
+    /// Number of values produced on the type stack.
+    pub stack_depth: u32,
+    /// Whether the expression uses a non-constant instruction.
+    pub has_non_const: bool,
+    /// Whether the expression references a mutable global.
+    pub has_mutable_global: bool,
+    /// If a ref.func is found, the function index (first one only).
+    pub func_ref: Option<u32>,
 }
 
 /// A fully decoded WASM module.
@@ -620,6 +662,37 @@ fn decode_reftype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
     }
 }
 
+/// Convert a reftype byte to the actual ValType (FuncRef/ExternRef).
+fn reftype_byte_to_valtype(b: u8) -> ValType {
+    match b {
+        0x70 => ValType::FuncRef,
+        0x6F => ValType::ExternRef,
+        _ => ValType::FuncRef, // default for typed ref types
+    }
+}
+
+/// Convert a decoded reftype (which uses I32 placeholder) to the actual ref ValType.
+fn reftype_to_valtype(_rt: ValType) -> ValType {
+    // This is called after decode_reftype_from_stream which always returns I32.
+    // We can't recover the original type from I32, so this is a no-op.
+    // Instead, callers should use decode_reftype_real.
+    ValType::FuncRef
+}
+
+/// Decode a reftype from the byte stream, returning the real ValType.
+fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmError> {
+    let b = read_byte(bytes, pos)?;
+    match b {
+        0x70 => Ok(ValType::FuncRef),
+        0x6F => Ok(ValType::ExternRef),
+        0x63 | 0x64 => {
+            let _ = decode_leb128_i32(bytes, pos)?;
+            Ok(if b == 0x63 { ValType::FuncRef } else { ValType::FuncRef })
+        }
+        _ => Err(WasmError::TypeMismatch),
+    }
+}
+
 /// Skip a storage type (used in struct/array field types).
 /// Storage types: 0x78 = i8, 0x77 = i16, or a full valtype.
 fn skip_storage_type(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
@@ -761,16 +834,24 @@ fn decode_import_section(
             0x01 => {
                 // Table import: elemtype + limits
                 let elemtype = read_byte(bytes, pos)?;
-                if elemtype == 0x63 || elemtype == 0x64 {
-                    let _ = decode_leb128_i32(bytes, pos)?;
-                }
+                let et = match elemtype {
+                    0x70 => ValType::FuncRef,
+                    0x6F => ValType::ExternRef,
+                    0x63 | 0x64 => {
+                        let _ = decode_leb128_i32(bytes, pos)?;
+                        if elemtype == 0x63 { ValType::FuncRef } else { ValType::FuncRef }
+                    }
+                    _ => ValType::FuncRef,
+                };
                 let flags = read_byte(bytes, pos)?;
                 if (flags & !0b111) != 0 {
                     return Err(WasmError::InvalidSection);
                 }
-                let _min = decode_leb128_u32(bytes, pos)?;
-                if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
-                imp.kind = ImportKind::Table;
+                let min = decode_leb128_u32(bytes, pos)?;
+                let max = if flags & 1 != 0 { Some(decode_leb128_u32(bytes, pos)?) } else { None };
+                // Add imported table to module tables so runtime can create it
+                module.tables.push(TableDef { min, max, elem_type: et });
+                imp.kind = ImportKind::Table(et);
             }
             0x02 => {
                 // Memory import: limits
@@ -780,8 +861,16 @@ fn decode_import_section(
                 if flags > 3 || flags == 2 {
                     return Err(WasmError::InvalidSection);
                 }
-                let _min = decode_leb128_u32(bytes, pos)?;
-                if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
+                let min = decode_leb128_u32(bytes, pos)?;
+                let has_max = flags & 1 != 0;
+                let max = if has_max { decode_leb128_u32(bytes, pos)? } else { u32::MAX };
+                module.memory_min_pages = min;
+                if has_max {
+                    module.has_memory_max = true;
+                    module.memory_max_pages = max;
+                } else {
+                    module.memory_max_pages = u32::MAX;
+                }
                 imp.kind = ImportKind::Memory;
             }
             0x03 => {
@@ -801,7 +890,7 @@ fn decode_import_section(
                 // Tag import (exception handling proposal): attribute byte + type index
                 let _attribute = read_byte(bytes, pos)?;
                 let _type_idx = decode_leb128_u32(bytes, pos)?;
-                imp.kind = ImportKind::Table; // placeholder
+                imp.kind = ImportKind::Table(ValType::FuncRef); // placeholder
             }
             _ => {
                 return Err(WasmError::InvalidSection);
@@ -1051,7 +1140,12 @@ fn decode_table_section(
             let _ = eval_init_expr(bytes, pos)?;
         }
 
-        module.tables.push(TableDef { min, max });
+        let et = match elemtype {
+            0x70 => ValType::FuncRef,
+            0x6F => ValType::ExternRef,
+            _ => ValType::FuncRef, // 0x63/0x64 ref types default to funcref
+        };
+        module.tables.push(TableDef { min, max, elem_type: et });
     }
     Ok(())
 }
@@ -1074,11 +1168,14 @@ fn decode_global_section(
             return Err(WasmError::InvalidSection);
         }
         let mutable = mt != 0;
-        // Scan init expr bytes to find global.get references before consuming them.
-        // We scan from current pos until we find 0x0B (end), tracking 0x23 (global.get).
-        let init_global_ref = scan_init_expr_global_refs(bytes, *pos);
+        // Scan init expr bytes to find global.get references and type info before consuming them.
+        let expr_info = scan_init_expr_info(bytes, *pos);
+        let init_global_ref = expr_info.global_ref;
+        let init_expr_type = expr_info.result_type;
+        let init_expr_stack_depth = expr_info.stack_depth;
+        let init_func_ref = expr_info.func_ref;
         let init_value = eval_init_expr(bytes, pos)?;
-        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref });
+        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref });
     }
     Ok(())
 }
@@ -1111,6 +1208,7 @@ fn decode_element_section(
         match flags {
             0 => {
                 // Active segment: table_idx=0 (implicit), offset expr, func indices
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
@@ -1126,6 +1224,9 @@ fn decode_element_section(
                     table_idx: 0,
                     offset,
                     func_indices,
+                    mode: ElemMode::Active,
+                    elem_type: ValType::FuncRef,
+                    offset_expr_info: expr_info,
                 });
             }
             1 => {
@@ -1135,14 +1236,23 @@ fn decode_element_section(
                     return Err(WasmError::InvalidSection);
                 }
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
-                    let _ = decode_leb128_u32(bytes, pos)?; // skip func index
+                    func_indices.push(decode_leb128_u32(bytes, pos)?);
                 }
-                // Passive segments are not applied at init; used by table.init
+                module.element_segments.push(ElementSegment {
+                    table_idx: 0,
+                    offset: 0,
+                    func_indices,
+                    mode: ElemMode::Passive,
+                    elem_type: ValType::FuncRef,
+                    offset_expr_info: Default::default(),
+                });
             }
             2 => {
                 // Active segment with explicit table_idx
                 let table_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
@@ -1162,6 +1272,9 @@ fn decode_element_section(
                     table_idx,
                     offset,
                     func_indices,
+                    mode: ElemMode::Active,
+                    elem_type: ValType::FuncRef,
+                    offset_expr_info: expr_info,
                 });
             }
             3 => {
@@ -1171,12 +1284,22 @@ fn decode_element_section(
                     return Err(WasmError::InvalidSection);
                 }
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
-                    let _ = decode_leb128_u32(bytes, pos)?;
+                    func_indices.push(decode_leb128_u32(bytes, pos)?);
                 }
+                module.element_segments.push(ElementSegment {
+                    table_idx: 0,
+                    offset: 0,
+                    func_indices,
+                    mode: ElemMode::Declarative,
+                    elem_type: ValType::FuncRef,
+                    offset_expr_info: Default::default(),
+                });
             }
             4 => {
                 // Active, table 0 implicit, offset expr, expression elements
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
@@ -1185,38 +1308,58 @@ fn decode_element_section(
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                 }
-                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices });
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info });
             }
             5 => {
                 // Passive, reftype, expression elements
-                let _reftype = decode_reftype_from_stream(bytes, pos)?;
+                let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
-                    let _ = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr(bytes, pos)?;
+                    func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                 }
-                // Passive — not applied at init
+                module.element_segments.push(ElementSegment {
+                    table_idx: 0,
+                    offset: 0,
+                    func_indices,
+                    mode: ElemMode::Passive,
+                    elem_type,
+                    offset_expr_info: Default::default(),
+                });
             }
             6 => {
                 // Active, explicit table_idx, offset expr, reftype, expression elements
                 let table_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
-                let _reftype = decode_reftype_from_stream(bytes, pos)?;
+                let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                 }
-                module.element_segments.push(ElementSegment { table_idx, offset, func_indices });
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info });
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
-                let _reftype = decode_reftype_from_stream(bytes, pos)?;
+                let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
-                    let _ = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr(bytes, pos)?;
+                    func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                 }
+                module.element_segments.push(ElementSegment {
+                    table_idx: 0,
+                    offset: 0,
+                    func_indices,
+                    mode: ElemMode::Declarative,
+                    elem_type,
+                    offset_expr_info: Default::default(),
+                });
             }
             _ => {
                 return Err(WasmError::InvalidSection);
@@ -1243,6 +1386,7 @@ fn decode_data_section(
         match flags {
             0 => {
                 // Active segment: memory_idx=0 (implicit), offset expr, data bytes
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
@@ -1259,8 +1403,10 @@ fn decode_data_section(
                 module.data_segments.push(DataSegment {
                     memory_idx: 0,
                     offset,
+                    is_active: true,
                     data_offset,
                     data_len,
+                    offset_expr_info: expr_info,
                 });
             }
             1 => {
@@ -1273,17 +1419,19 @@ fn decode_data_section(
                 let data_offset = module.code.len();
                 module.code.extend_from_slice(&bytes[*pos..*pos + data_len]);
                 *pos += data_len;
-                // Passive segments used by memory.init; store with offset=u32::MAX as marker
                 module.data_segments.push(DataSegment {
                     memory_idx: 0,
-                    offset: u32::MAX, // marker: passive segment
+                    offset: 0,
+                    is_active: false,
                     data_offset,
                     data_len,
+                    offset_expr_info: Default::default(),
                 });
             }
             2 => {
                 // Active segment with explicit memory_idx
                 let memory_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
@@ -1300,8 +1448,10 @@ fn decode_data_section(
                 module.data_segments.push(DataSegment {
                     memory_idx,
                     offset,
+                    is_active: true,
                     data_offset,
                     data_len,
+                    offset_expr_info: expr_info,
                 });
             }
             _ => return Err(WasmError::InvalidSection),
@@ -1359,12 +1509,15 @@ fn skip_init_expr(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
     }
 }
 
-/// Scan init expression bytes to find the maximum global.get reference index.
-/// This does a best-effort scan: it looks for 0x23 opcodes followed by LEB128 indices.
-/// Returns Some(max_index) if any global.get is found, None otherwise.
-fn scan_init_expr_global_refs(bytes: &[u8], start: usize) -> Option<u32> {
+/// Scan init expression bytes to extract validation info.
+/// Returns InitExprInfo with global refs, result type, stack depth, etc.
+pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
     let mut p = start;
-    let mut max_ref: Option<u32> = None;
+    let mut info = InitExprInfo::default();
+    // Track a small type stack
+    let mut type_stack: [Option<ValType>; 16] = [None; 16];
+    let mut sp: usize = 0;
+
     while p < bytes.len() {
         let b = bytes[p];
         p += 1;
@@ -1373,29 +1526,77 @@ fn scan_init_expr_global_refs(bytes: &[u8], start: usize) -> Option<u32> {
             0x23 => {
                 // global.get - read the index
                 if let Ok(idx) = decode_leb128_u32(bytes, &mut p) {
-                    max_ref = Some(match max_ref {
+                    info.global_ref = Some(match info.global_ref {
                         Some(cur) => cur.max(idx),
                         None => idx,
                     });
+                    // We don't know the type without looking up the global,
+                    // so push None (unknown type)
+                    if sp < 16 { type_stack[sp] = None; sp += 1; }
                 }
             }
-            0x41 => { let _ = decode_leb128_i32(bytes, &mut p); } // i32.const
-            0x42 => { let _ = decode_leb128_i64(bytes, &mut p); } // i64.const
-            0x43 => { p += 4; } // f32.const
-            0x44 => { p += 8; } // f64.const
-            0xD0 => { let _ = decode_leb128_i32(bytes, &mut p); } // ref.null
-            0xD2 => { let _ = decode_leb128_u32(bytes, &mut p); } // ref.func
-            0xFD => {
-                // SIMD prefix
-                let _ = decode_leb128_u32(bytes, &mut p);
-                p += 16; // v128.const immediate
+            0x41 => {
+                let _ = decode_leb128_i32(bytes, &mut p);
+                if sp < 16 { type_stack[sp] = Some(ValType::I32); sp += 1; }
             }
-            // i32/i64 arithmetic (extended-const): no immediates
-            0x6A | 0x6B | 0x6C | 0x7C | 0x7D | 0x7E => {}
-            _ => break, // unknown opcode, stop scanning
+            0x42 => {
+                let _ = decode_leb128_i64(bytes, &mut p);
+                if sp < 16 { type_stack[sp] = Some(ValType::I64); sp += 1; }
+            }
+            0x43 => {
+                p += 4;
+                if sp < 16 { type_stack[sp] = Some(ValType::F32); sp += 1; }
+            }
+            0x44 => {
+                p += 8;
+                if sp < 16 { type_stack[sp] = Some(ValType::F64); sp += 1; }
+            }
+            0xD0 => {
+                let ht = decode_leb128_i32(bytes, &mut p);
+                let vt = match ht {
+                    Ok(-0x10) => Some(ValType::FuncRef),
+                    Ok(-0x11) => Some(ValType::ExternRef),
+                    _ => None,
+                };
+                if sp < 16 { type_stack[sp] = vt; sp += 1; }
+            }
+            0xD2 => {
+                if let Ok(idx) = decode_leb128_u32(bytes, &mut p) {
+                    if info.func_ref.is_none() {
+                        info.func_ref = Some(idx);
+                    }
+                }
+                if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+            }
+            0xFD => {
+                let _ = decode_leb128_u32(bytes, &mut p);
+                p += 16;
+                if sp < 16 { type_stack[sp] = Some(ValType::V128); sp += 1; }
+            }
+            // i32 arithmetic (extended-const): pop 2, push 1
+            0x6A | 0x6B | 0x6C => {
+                if sp >= 2 { sp -= 1; type_stack[sp - 1] = Some(ValType::I32); }
+            }
+            // i64 arithmetic (extended-const): pop 2, push 1
+            0x7C | 0x7D | 0x7E => {
+                if sp >= 2 { sp -= 1; type_stack[sp - 1] = Some(ValType::I64); }
+            }
+            _ => {
+                info.has_non_const = true;
+                break;
+            }
         }
     }
-    max_ref
+
+    info.stack_depth = sp as u32;
+    info.result_type = if sp > 0 { type_stack[sp - 1] } else { None };
+    info
+}
+
+/// Scan init expression bytes to find the maximum global.get reference index.
+/// Wrapper for backward compat.
+fn scan_init_expr_global_refs(bytes: &[u8], start: usize) -> Option<u32> {
+    scan_init_expr_info(bytes, start).global_ref
 }
 
 /// Evaluate a constant init expression (for globals and segment offsets).

@@ -355,14 +355,124 @@ impl WastRunner {
     fn instantiate_module_bytes(&mut self, name: Option<&str>, bytes: &[u8]) -> RunnerResult<InstanceHandle> {
         let mut module = self.decode_module(bytes)?;
         self.inject_imported_globals(&mut module)?;
-        self.ensure_linkable_function_imports(&module)?;
+        self.inject_imported_memory(&mut module)?;
+        self.inject_imported_tables(&mut module)?;
+        self.ensure_linkable_imports(&module)?;
+
+        // Collect info about memory/table imports before creating the instance
+        let memory_source = self.find_memory_source(&module);
+        let table_sources = self.find_table_sources(&module);
 
         if name.is_none() {
             self.anonymous_instances += 1;
         }
+        let instance = WasmInstance::with_class(module, DEFAULT_FUEL, RuntimeClass::BestEffort)
+            .map_err(|err| RunnerError::trap(err))?;
         let handle = Rc::new(RefCell::new(InstanceRecord {
-            instance: WasmInstance::with_class(module, DEFAULT_FUEL, RuntimeClass::BestEffort),
+            instance,
         }));
+
+        // Share memory: copy exporter's memory, then re-apply importer's data segments
+        if let Some(src_handle) = &memory_source {
+            let mut record = handle.borrow_mut();
+            let src = src_handle.borrow();
+            // Copy the exporter's memory content
+            let copy_len = src.instance.memory_size.min(record.instance.memory_size);
+            record.instance.memory[..copy_len].copy_from_slice(&src.instance.memory[..copy_len]);
+            // If exporter's memory is larger, grow the importer's memory to match
+            if src.instance.memory_size > record.instance.memory_size {
+                record.instance.memory.resize(src.instance.memory_size, 0);
+                let extra_start = record.instance.memory_size;
+                let extra_end = src.instance.memory_size;
+                record.instance.memory[extra_start..extra_end]
+                    .copy_from_slice(&src.instance.memory[extra_start..extra_end]);
+                record.instance.memory_size = src.instance.memory_size;
+            }
+            drop(src);
+            // Re-apply the importer's own active data segments on top
+            // Collect segment info first to avoid borrow conflict
+            let segs: Vec<(usize, usize, usize)> = record.instance.module.data_segments.iter()
+                .filter(|seg| seg.is_active)
+                .map(|seg| (seg.offset as usize, seg.data_offset, seg.data_len))
+                .collect();
+            for (dst_start, src_start, len) in segs {
+                if dst_start.saturating_add(len) <= record.instance.memory_size
+                    && src_start.saturating_add(len) <= record.instance.module.code.len()
+                {
+                    let code_bytes = record.instance.module.code[src_start..src_start + len].to_vec();
+                    record.instance.memory[dst_start..dst_start + len]
+                        .copy_from_slice(&code_bytes);
+                }
+            }
+            // Copy the result back to the exporter so both share the same state
+            let src = src_handle.borrow();
+            let copy_back = record.instance.memory_size.min(src.instance.memory.len());
+            drop(src);
+            let mut src_mut = src_handle.borrow_mut();
+            if record.instance.memory_size > src_mut.instance.memory_size {
+                src_mut.instance.memory.resize(record.instance.memory_size, 0);
+                src_mut.instance.memory_size = record.instance.memory_size;
+            }
+            let copy_back = record.instance.memory_size.min(src_mut.instance.memory_size);
+            src_mut.instance.memory[..copy_back]
+                .copy_from_slice(&record.instance.memory[..copy_back]);
+        }
+
+        // Share tables: copy exporter's table entries, then re-apply element segments
+        for (tbl_idx, src_handle) in &table_sources {
+            let tbl_idx = *tbl_idx;
+            let mut record = handle.borrow_mut();
+            let src = src_handle.borrow();
+            // Find the source table index from the export
+            let src_module_name = self.find_table_import_module(&record.instance.module, tbl_idx);
+            let src_tbl_idx = if let Some((mod_name, fld_name)) = &src_module_name {
+                if let Some(sh) = self.instances.get(mod_name.as_str()) {
+                    if Rc::ptr_eq(sh, src_handle) {
+                        exported_table_index(&src.instance.module, fld_name)
+                            .unwrap_or(0) as usize
+                    } else { 0 }
+                } else { 0 }
+            } else { 0 };
+
+            if let Some(src_table) = src.instance.tables.get(src_tbl_idx) {
+                if tbl_idx < record.instance.tables.len() {
+                    // Resize importer table to match exporter
+                    if record.instance.tables[tbl_idx].len() < src_table.len() {
+                        record.instance.tables[tbl_idx].resize(src_table.len(), None);
+                    }
+                    // Copy entries
+                    let copy_len = src_table.len().min(record.instance.tables[tbl_idx].len());
+                    record.instance.tables[tbl_idx][..copy_len]
+                        .copy_from_slice(&src_table[..copy_len]);
+                }
+            }
+            drop(src);
+            // Re-apply importer's active element segments for this table
+            use crate::wasm::decoder::ElemMode;
+            let segs: Vec<_> = record.instance.module.element_segments.iter()
+                .filter(|s| s.mode == ElemMode::Active && s.table_idx as usize == tbl_idx)
+                .map(|s| (s.offset as usize, s.func_indices.clone()))
+                .collect();
+            for (offset, func_indices) in segs {
+                for (i, &func_idx) in func_indices.iter().enumerate() {
+                    let idx = offset + i;
+                    if idx < record.instance.tables[tbl_idx].len() {
+                        record.instance.tables[tbl_idx][idx] =
+                            if func_idx == u32::MAX { None } else { Some(func_idx) };
+                    }
+                }
+            }
+            // Copy back to exporter
+            let record_table = record.instance.tables.get(tbl_idx).cloned();
+            drop(record);
+            if let Some(new_table) = record_table {
+                let mut src_mut = src_handle.borrow_mut();
+                let src_tbl_idx_val = src_tbl_idx;
+                if src_tbl_idx_val < src_mut.instance.tables.len() {
+                    src_mut.instance.tables[src_tbl_idx_val] = new_table;
+                }
+            }
+        }
 
         let inserted_name = name.map(str::to_string);
         if let Some(name) = &inserted_name {
@@ -378,6 +488,66 @@ impl WastRunner {
 
         self.current = Some(handle.clone());
         Ok(handle)
+    }
+
+    fn find_memory_source(&self, module: &WasmModule) -> Option<InstanceHandle> {
+        for import in &module.imports {
+            if !matches!(import.kind, ImportKind::Memory) {
+                continue;
+            }
+            let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
+            let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
+            if module_name == SPECTEST_MODULE {
+                return None; // spectest memory is virtual, not shareable
+            }
+            if let Some(handle) = self.instances.get(&module_name) {
+                // Verify the export exists as a memory
+                let record = handle.borrow();
+                let has_mem = record.instance.module.exports.iter().any(|e| {
+                    record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                        && matches!(e.kind, ExportKind::Memory(_))
+                });
+                if has_mem {
+                    return Some(handle.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn find_table_sources(&self, module: &WasmModule) -> Vec<(usize, InstanceHandle)> {
+        let mut result = Vec::new();
+        let mut tbl_idx = 0usize;
+        for import in &module.imports {
+            if !matches!(import.kind, ImportKind::Table(_)) {
+                continue;
+            }
+            let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
+            let _field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
+            if module_name != SPECTEST_MODULE {
+                if let Some(handle) = self.instances.get(&module_name) {
+                    result.push((tbl_idx, handle.clone()));
+                }
+            }
+            tbl_idx += 1;
+        }
+        result
+    }
+
+    fn find_table_import_module(&self, module: &WasmModule, target_tbl_idx: usize) -> Option<(String, String)> {
+        let mut tbl_idx = 0usize;
+        for import in &module.imports {
+            if !matches!(import.kind, ImportKind::Table(_)) {
+                continue;
+            }
+            if tbl_idx == target_tbl_idx {
+                let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
+                let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
+                return Some((module_name, field_name));
+            }
+            tbl_idx += 1;
+        }
+        None
     }
 
     fn run_start(&mut self, handle: &InstanceHandle) -> RunnerResult<()> {
@@ -469,8 +639,90 @@ impl WastRunner {
         }
     }
 
+    fn sync_imported_globals(&self, handle: &InstanceHandle) {
+        let mut record = handle.borrow_mut();
+        let num_global_imports = record.instance.module.imports.iter()
+            .filter(|i| matches!(i.kind, ImportKind::Global(_, _)))
+            .count();
+
+        // Collect import info first to avoid borrow conflict
+        let global_imports: Vec<(usize, bool, String, String)> = {
+            let mut global_idx = 0usize;
+            let mut result = Vec::new();
+            for import in &record.instance.module.imports {
+                let ImportKind::Global(_, mutable) = import.kind else {
+                    continue;
+                };
+                let module_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+                let field_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+                result.push((global_idx, mutable, module_name, field_name));
+                global_idx += 1;
+            }
+            result
+        };
+        for (global_idx, mutable, module_name, field_name) in &global_imports {
+            if !mutable {
+                continue;
+            }
+
+            if *module_name != SPECTEST_MODULE {
+                if let Some(src_handle) = self.instances.get(module_name.as_str()) {
+                    if !Rc::ptr_eq(src_handle, handle) {
+                        if let Ok(src) = src_handle.try_borrow() {
+                            if let Some(src_idx) = exported_global_index(&src.instance.module, field_name) {
+                                if let Some(&val) = src.instance.globals.get(src_idx as usize) {
+                                    if *global_idx < record.instance.globals.len() {
+                                        record.instance.globals[*global_idx] = val;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = num_global_imports;
+    }
+
+    fn sync_globals_back(&self, handle: &InstanceHandle) {
+        let record = handle.borrow();
+        let mut global_idx = 0usize;
+        for import in &record.instance.module.imports {
+            let ImportKind::Global(_, mutable) = import.kind else {
+                continue;
+            };
+            if !mutable {
+                global_idx += 1;
+                continue;
+            }
+            let module_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+            let field_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+
+            if module_name != SPECTEST_MODULE {
+                if let Some(src_handle) = self.instances.get(&module_name) {
+                    if !Rc::ptr_eq(src_handle, handle) {
+                        if let Some(val) = record.instance.globals.get(global_idx).copied() {
+                            drop(record);
+                            if let Ok(mut src) = src_handle.try_borrow_mut() {
+                                if let Some(src_idx) = exported_global_index(&src.instance.module, &field_name) {
+                                    if let Some(slot) = src.instance.globals.get_mut(src_idx as usize) {
+                                        *slot = val;
+                                    }
+                                }
+                            }
+                            // Since we dropped record, we can't continue the loop safely
+                            return;
+                        }
+                    }
+                }
+            }
+            global_idx += 1;
+        }
+    }
+
     fn get_global(&self, module: Option<Id<'_>>, global_name: &str) -> RunnerResult<Value> {
         let handle = self.get_instance_handle(module)?;
+        self.sync_imported_globals(&handle);
         let record = handle.borrow();
         let idx = exported_global_index(&record.instance.module, global_name).ok_or_else(|| {
             RunnerError::new("link", format!("missing exported global `{global_name}`"))
@@ -579,89 +831,503 @@ impl WastRunner {
                 mutable,
                 init_value: value,
                 init_global_ref: None,
+                init_func_ref: None,
+                init_expr_type: Some(val_type),
+                init_expr_stack_depth: 1,
             });
         }
 
         if !imported.is_empty() {
+            let num_imported = imported.len();
             let mut globals = imported;
             globals.extend(module.globals.iter().cloned());
             module.globals = globals;
+
+            // Re-evaluate init expressions for module-defined globals that reference
+            // imported globals. At decode time, global.get returns 0 as a placeholder.
+            // Now that imported globals have their actual values, add the reference value.
+            for i in num_imported..module.globals.len() {
+                if let Some(ref_idx) = module.globals[i].init_global_ref {
+                    if (ref_idx as usize) < i {
+                        let ref_val = module.globals[ref_idx as usize].init_value;
+                        let init = &mut module.globals[i].init_value;
+                        match (ref_val, *init) {
+                            (Value::I32(r), Value::I32(v)) => *init = Value::I32(v.wrapping_add(r)),
+                            (Value::I64(r), Value::I64(v)) => *init = Value::I64(v.wrapping_add(r)),
+                            (Value::F32(r), Value::F32(v)) => *init = Value::F32(v + r),
+                            (Value::F64(r), Value::F64(v)) => *init = Value::F64(v + r),
+                            (val, _) => *init = val,
+                        }
+                        // Clear the ref so the runtime doesn't re-process
+                        module.globals[i].init_global_ref = None;
+                    }
+                }
+            }
         }
         Ok(())
     }
 
-    fn ensure_linkable_function_imports(&self, module: &WasmModule) -> RunnerResult<()> {
-        let mut func_idx = 0u32;
+    fn inject_imported_memory(&self, module: &mut WasmModule) -> RunnerResult<()> {
         for import in &module.imports {
-            // Skip non-function imports (table, memory, global handled elsewhere)
-            match import.kind {
-                ImportKind::Func(_) => {}
-                _ => continue,
+            if !matches!(import.kind, ImportKind::Memory) {
+                continue;
             }
             let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
             let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
-            let signature = function_type(module, func_idx).ok_or_else(|| {
-                RunnerError::new("link", format!("missing function type for import `{module_name}::{field_name}`"))
-            })?;
 
-            if signature.result_count > 1 {
+            let (actual_min_pages, actual_max_pages) = if module_name == SPECTEST_MODULE && field_name == "memory" {
+                // spectest memory: min=1, max=2
+                (1u32, Some(2u32))
+            } else if let Some(handle) = self.instances.get(&module_name) {
+                let record = handle.borrow();
+                // Use the actual memory size of the exporting instance
+                let actual_pages = (record.instance.memory_size / 65536) as u32;
+                let actual_max = if record.instance.module.has_memory_max {
+                    Some(record.instance.module.memory_max_pages)
+                } else {
+                    None
+                };
+                (actual_pages, actual_max)
+            } else {
+                continue;
+            };
+
+            // Upgrade memory_min_pages to the actual provider's size
+            if module.memory_min_pages < actual_min_pages {
+                module.memory_min_pages = actual_min_pages;
+            }
+            // Cap memory_max_pages to the actual provider's max
+            if let Some(actual_max) = actual_max_pages {
+                if module.has_memory_max {
+                    if module.memory_max_pages > actual_max {
+                        module.memory_max_pages = actual_max;
+                    }
+                } else {
+                    module.has_memory_max = true;
+                    module.memory_max_pages = actual_max;
+                }
+            }
+            break; // only one memory in MVP
+        }
+        Ok(())
+    }
+
+    fn inject_imported_tables(&self, module: &mut WasmModule) -> RunnerResult<()> {
+        let mut table_idx = 0usize;
+        for import in &module.imports {
+            if !matches!(import.kind, ImportKind::Table(_)) {
+                continue;
+            }
+            let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
+            let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
+
+            let actual_min = if module_name == SPECTEST_MODULE && field_name == "table" {
+                // spectest table: min=10, max=20
+                10u32
+            } else if let Some(handle) = self.instances.get(&module_name) {
+                let record = handle.borrow();
+                let export_tbl_idx = exported_table_index(&record.instance.module, &field_name)
+                    .unwrap_or(0) as usize;
+                record.instance.tables.get(export_tbl_idx)
+                    .map(|t| t.len() as u32)
+                    .unwrap_or(0)
+            } else {
+                table_idx += 1;
+                continue;
+            };
+
+            // Upgrade the table's min to the actual provider's size
+            if table_idx < module.tables.len() && module.tables[table_idx].min < actual_min {
+                module.tables[table_idx].min = actual_min;
+            }
+            table_idx += 1;
+        }
+        Ok(())
+    }
+
+    fn ensure_linkable_imports(&self, module: &WasmModule) -> RunnerResult<()> {
+        let mut func_idx = 0u32;
+        for import in &module.imports {
+            let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
+            let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
+
+            match import.kind {
+                ImportKind::Func(_) => {
+                    self.validate_func_import(module, &module_name, &field_name, func_idx)?;
+                    func_idx = func_idx.saturating_add(1);
+                }
+                ImportKind::Table(_) => {
+                    self.validate_table_import(module, &module_name, &field_name, import)?;
+                }
+                ImportKind::Memory => {
+                    self.validate_memory_import(module, &module_name, &field_name)?;
+                }
+                ImportKind::Global(val_type_byte, mutable) => {
+                    self.validate_global_import(&module_name, &field_name, val_type_byte, mutable)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_func_import(
+        &self,
+        module: &WasmModule,
+        module_name: &str,
+        field_name: &str,
+        func_idx: u32,
+    ) -> RunnerResult<()> {
+        let signature = function_type(module, func_idx).ok_or_else(|| {
+            RunnerError::new("link", format!("missing function type for import `{module_name}::{field_name}`"))
+        })?;
+
+        if signature.result_count > 1 {
+            return Err(RunnerError::new(
+                "link",
+                format!(
+                    "imported function `{module_name}::{field_name}` uses {} results; ATOS host-call ABI supports at most one",
+                    signature.result_count
+                ),
+            ));
+        }
+
+        if module_name == "atos" {
+            let host_func = crate::wasm::host::resolve_import(module, func_idx);
+            if matches!(host_func, crate::wasm::host::HostFunc::Unknown) {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("unknown ATOS host function `{field_name}`"),
+                ));
+            }
+        } else if module_name == SPECTEST_MODULE {
+            ensure_spectest_function(field_name)?;
+            // Also validate signature against known spectest function signatures
+            validate_spectest_func_signature(field_name, signature)?;
+        } else if let Some(handle) = self.instances.get(module_name) {
+            let record = handle.borrow();
+            let target_idx = record
+                .instance
+                .module
+                .find_export_func(field_name.as_bytes())
+                .ok_or_else(|| {
+                    RunnerError::new(
+                        "link",
+                        format!("module `{module_name}` does not export function `{field_name}`"),
+                    )
+                })?;
+            let target_ty = function_type(&record.instance.module, target_idx).ok_or_else(|| {
+                RunnerError::new(
+                    "link",
+                    format!("missing function type for `{module_name}::{field_name}`"),
+                )
+            })?;
+            if !func_types_match(signature, target_ty) {
                 return Err(RunnerError::new(
                     "link",
                     format!(
-                        "imported function `{module_name}::{field_name}` uses {} results; ATOS host-call ABI supports at most one",
-                        signature.result_count
+                        "incompatible import type for function `{module_name}::{field_name}`",
                     ),
                 ));
             }
+        } else {
+            return Err(RunnerError::new(
+                "link",
+                format!("unknown import: module `{module_name}` function `{field_name}`"),
+            ));
+        }
+        Ok(())
+    }
 
-            if module_name == "atos" {
-                let host_func = crate::wasm::host::resolve_import(module, func_idx);
-                if matches!(host_func, crate::wasm::host::HostFunc::Unknown) {
-                    return Err(RunnerError::new(
-                        "link",
-                        format!("unknown ATOS host function `{field_name}`"),
-                    ));
-                }
-            } else if module_name == SPECTEST_MODULE {
-                ensure_spectest_function(&field_name)?;
-            } else if let Some(handle) = self.instances.get(&module_name) {
-                let record = handle.borrow();
-                let target_idx = record
-                    .instance
-                    .module
-                    .find_export_func(field_name.as_bytes())
-                    .ok_or_else(|| {
-                        RunnerError::new(
-                            "link",
-                            format!("module `{module_name}` does not export function `{field_name}`"),
-                        )
-                    })?;
-                let target_ty = function_type(&record.instance.module, target_idx).ok_or_else(|| {
-                    RunnerError::new(
-                        "link",
-                        format!("missing function type for `{module_name}::{field_name}`"),
-                    )
-                })?;
-                if target_ty.param_count != signature.param_count || target_ty.result_count != signature.result_count {
-                    return Err(RunnerError::new(
-                        "link",
-                        format!(
-                            "imported function `{module_name}::{field_name}` signature mismatch; expected {} params/{} results, got {} params/{} results",
-                            signature.param_count,
-                            signature.result_count,
-                            target_ty.param_count,
-                            target_ty.result_count
-                        ),
-                    ));
-                }
-            } else {
+    fn validate_table_import(
+        &self,
+        _module: &WasmModule,
+        module_name: &str,
+        field_name: &str,
+        import: &crate::wasm::decoder::ImportDef,
+    ) -> RunnerResult<()> {
+        // Find the table definition for this import from the importing module's table section
+        // The import's table limits are encoded in the module's tables list
+        let import_table_idx = self.count_table_imports_before(_module, import);
+        let import_table = _module.tables.get(import_table_idx);
+
+        if module_name == SPECTEST_MODULE {
+            // spectest table: min=10, max=20, funcref
+            if field_name != "table" {
                 return Err(RunnerError::new(
                     "link",
-                    format!("unknown import module `{module_name}`"),
+                    format!("unknown import: spectest does not export table `{field_name}`"),
                 ));
             }
+            if let Some(tbl) = import_table {
+                // spectest table has min=10, max=20
+                if tbl.min > 10 {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for table `{module_name}::{field_name}`: requested min {} > available 10", tbl.min),
+                    ));
+                }
+                if let Some(import_max) = tbl.max {
+                    // spectest table has max=20; import max must be >= actual max
+                    if import_max < 20 {
+                        return Err(RunnerError::new(
+                            "link",
+                            format!("incompatible import type for table `{module_name}::{field_name}`: requested max {} < available 20", import_max),
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
 
-            func_idx = func_idx.saturating_add(1);
+        if let Some(handle) = self.instances.get(module_name) {
+            let record = handle.borrow();
+            // Find the exported table
+            let export_table_idx = exported_table_index(&record.instance.module, field_name);
+            if export_table_idx.is_none() {
+                // Check if the name exists but as a different kind
+                let has_any = record.instance.module.exports.iter().any(|e| {
+                    record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                });
+                if has_any {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for `{module_name}::{field_name}`: not a table export"),
+                    ));
+                }
+                return Err(RunnerError::new(
+                    "link",
+                    format!("unknown import: module `{module_name}` does not export table `{field_name}`"),
+                ));
+            }
+            let export_idx = export_table_idx.unwrap() as usize;
+            let export_table = record.instance.module.tables.get(export_idx);
+            let actual_size = record.instance.tables.get(export_idx).map(|t| t.len() as u32).unwrap_or(0);
+
+            if let (Some(imp_tbl), Some(exp_tbl)) = (import_table, export_table) {
+                // Check element type compatibility
+                if imp_tbl.elem_type != exp_tbl.elem_type {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for table `{module_name}::{field_name}`: element type mismatch"),
+                    ));
+                }
+                // Import min must be <= actual current size (or export min)
+                let available_min = actual_size.max(exp_tbl.min);
+                if imp_tbl.min > available_min {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for table `{module_name}::{field_name}`"),
+                    ));
+                }
+                // If import specifies max, export must also have max, and export max <= import max
+                if let Some(import_max) = imp_tbl.max {
+                    match exp_tbl.max {
+                        None => {
+                            return Err(RunnerError::new(
+                                "link",
+                                format!("incompatible import type for table `{module_name}::{field_name}`"),
+                            ));
+                        }
+                        Some(export_max) => {
+                            if export_max > import_max {
+                                return Err(RunnerError::new(
+                                    "link",
+                                    format!("incompatible import type for table `{module_name}::{field_name}`"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            return Err(RunnerError::new(
+                "link",
+                format!("unknown import: module `{module_name}` table `{field_name}`"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn count_table_imports_before(&self, module: &WasmModule, target: &crate::wasm::decoder::ImportDef) -> usize {
+        let mut count = 0;
+        for import in &module.imports {
+            if core::ptr::eq(import, target) {
+                break;
+            }
+            if matches!(import.kind, ImportKind::Table(_)) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn validate_memory_import(
+        &self,
+        _module: &WasmModule,
+        module_name: &str,
+        field_name: &str,
+    ) -> RunnerResult<()> {
+        // The importing module's memory limits are in module.memory_min_pages / memory_max_pages
+        let import_min = _module.memory_min_pages;
+        let import_has_max = _module.has_memory_max;
+        let import_max = _module.memory_max_pages;
+
+        if module_name == SPECTEST_MODULE {
+            if field_name != "memory" {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("unknown import: spectest does not export memory `{field_name}`"),
+                ));
+            }
+            // spectest memory: min=1, max=2
+            if import_min > 1 {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for memory `{module_name}::{field_name}`: requested min {} > available 1", import_min),
+                ));
+            }
+            if import_has_max && import_max < 2 {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for memory `{module_name}::{field_name}`: requested max {} < available 2", import_max),
+                ));
+            }
+            return Ok(());
+        }
+
+        if let Some(handle) = self.instances.get(module_name) {
+            let record = handle.borrow();
+            // Check if the export exists and is a memory
+            let has_memory_export = record.instance.module.exports.iter().any(|e| {
+                record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                    && matches!(e.kind, ExportKind::Memory(_))
+            });
+            if !has_memory_export {
+                // Check if the name exists as a different kind
+                let has_any = record.instance.module.exports.iter().any(|e| {
+                    record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                });
+                if has_any {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for `{module_name}::{field_name}`: not a memory export"),
+                    ));
+                }
+                return Err(RunnerError::new(
+                    "link",
+                    format!("unknown import: module `{module_name}` does not export memory `{field_name}`"),
+                ));
+            }
+            // Validate limits
+            let export_min = record.instance.module.memory_min_pages;
+            let export_has_max = record.instance.module.has_memory_max;
+            let export_max = record.instance.module.memory_max_pages;
+            let actual_pages = (record.instance.memory_size / 65536) as u32;
+            let available_min = actual_pages.max(export_min);
+
+            if import_min > available_min {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for memory `{module_name}::{field_name}`"),
+                ));
+            }
+            if import_has_max {
+                if !export_has_max {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for memory `{module_name}::{field_name}`"),
+                    ));
+                }
+                if export_max > import_max {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for memory `{module_name}::{field_name}`"),
+                    ));
+                }
+            }
+        } else {
+            return Err(RunnerError::new(
+                "link",
+                format!("unknown import: module `{module_name}` memory `{field_name}`"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_global_import(
+        &self,
+        module_name: &str,
+        field_name: &str,
+        val_type_byte: u8,
+        mutable: bool,
+    ) -> RunnerResult<()> {
+        let val_type = decode_valtype_byte(val_type_byte).ok_or_else(|| {
+            RunnerError::new("link", format!("unsupported imported global type 0x{val_type_byte:02x}"))
+        })?;
+
+        if module_name == SPECTEST_MODULE {
+            // Spectest globals are all immutable
+            let spectest_val = spectest_global(field_name).ok_or_else(|| {
+                RunnerError::new("link", format!("unknown import: spectest does not export global `{field_name}`"))
+            })?;
+            // Check type match
+            if !value_matches_type(spectest_val, val_type) {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for global `{module_name}::{field_name}`"),
+                ));
+            }
+            // spectest globals are immutable - importing as mutable is an error
+            if mutable {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for global `{module_name}::{field_name}`: mutability mismatch"),
+                ));
+            }
+            return Ok(());
+        }
+
+        if let Some(handle) = self.instances.get(module_name) {
+            let record = handle.borrow();
+            // Find the exported global
+            let global_idx = exported_global_index(&record.instance.module, field_name);
+            if global_idx.is_none() {
+                // Check if name exists as different kind
+                let has_any = record.instance.module.exports.iter().any(|e| {
+                    record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                });
+                if has_any {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for `{module_name}::{field_name}`: not a global export"),
+                    ));
+                }
+                return Err(RunnerError::new(
+                    "link",
+                    format!("unknown import: module `{module_name}` does not export global `{field_name}`"),
+                ));
+            }
+            let idx = global_idx.unwrap() as usize;
+            // Check type
+            if let Some(gdef) = record.instance.module.globals.get(idx) {
+                if gdef.val_type != val_type {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for global `{module_name}::{field_name}`: type mismatch"),
+                    ));
+                }
+                if gdef.mutable != mutable {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for global `{module_name}::{field_name}`: mutability mismatch"),
+                    ));
+                }
+            }
+        } else {
+            return Err(RunnerError::new(
+                "link",
+                format!("unknown import: module `{module_name}` global `{field_name}`"),
+            ));
         }
         Ok(())
     }
@@ -971,6 +1637,74 @@ fn exported_global_index(module: &WasmModule, name: &str) -> Option<u32> {
     None
 }
 
+fn exported_table_index(module: &WasmModule, name: &str) -> Option<u32> {
+    for export in &module.exports {
+        if module.get_name(export.name_offset, export.name_len) == name.as_bytes() {
+            if let ExportKind::Table(idx) = export.kind {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn func_types_match(a: &FuncTypeDef, b: &FuncTypeDef) -> bool {
+    if a.param_count != b.param_count || a.result_count != b.result_count {
+        return false;
+    }
+    for i in 0..a.param_count as usize {
+        if a.params[i] != b.params[i] {
+            return false;
+        }
+    }
+    for i in 0..a.result_count as usize {
+        if a.results[i] != b.results[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_spectest_func_signature(name: &str, sig: &FuncTypeDef) -> RunnerResult<()> {
+    let (expected_params, expected_results): (&[ValType], &[ValType]) = match name {
+        "print" => (&[], &[]),
+        "print_i32" => (&[ValType::I32], &[]),
+        "print_i64" => (&[ValType::I64], &[]),
+        "print_f32" => (&[ValType::F32], &[]),
+        "print_f64" => (&[ValType::F64], &[]),
+        "print_i32_f32" => (&[ValType::I32, ValType::F32], &[]),
+        "print_f64_f64" => (&[ValType::F64, ValType::F64], &[]),
+        "print32" | "print64" => return Ok(()),
+        _ => return Ok(()),
+    };
+
+    if sig.param_count as usize != expected_params.len()
+        || sig.result_count as usize != expected_results.len()
+    {
+        return Err(RunnerError::new(
+            "link",
+            format!("incompatible import type for spectest function `{name}`"),
+        ));
+    }
+    for (i, expected) in expected_params.iter().enumerate() {
+        if sig.params[i] != *expected {
+            return Err(RunnerError::new(
+                "link",
+                format!("incompatible import type for spectest function `{name}`"),
+            ));
+        }
+    }
+    for (i, expected) in expected_results.iter().enumerate() {
+        if sig.results[i] != *expected {
+            return Err(RunnerError::new(
+                "link",
+                format!("incompatible import type for spectest function `{name}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_spectest_function(name: &str) -> RunnerResult<()> {
     match name {
         "print"
@@ -1075,7 +1809,8 @@ fn decode_valtype_byte(byte: u8) -> Option<ValType> {
         0x7D => Some(ValType::F32),
         0x7C => Some(ValType::F64),
         0x7B => Some(ValType::V128),
-        0x70 | 0x6F => Some(ValType::I32), // funcref, externref -> I32 placeholder
+        0x70 => Some(ValType::FuncRef),
+        0x6F => Some(ValType::ExternRef),
         _ => None,
     }
 }
@@ -1088,6 +1823,8 @@ fn value_matches_type(value: Value, val_type: ValType) -> bool {
             | (Value::F32(_), ValType::F32)
             | (Value::F64(_), ValType::F64)
             | (Value::V128(_), ValType::V128)
+            | (Value::I32(_), ValType::FuncRef)
+            | (Value::I32(_), ValType::ExternRef)
     )
 }
 
@@ -1102,7 +1839,7 @@ fn trap_message(err: &WasmError) -> String {
         }
         WasmError::UnreachableExecuted => "unreachable".to_string(),
         WasmError::UndefinedElement => "undefined element".to_string(),
-        WasmError::UninitializedElement => "uninitialized element".to_string(),
+        WasmError::UninitializedElement(idx) => format!("uninitialized element {idx}"),
         WasmError::IndirectCallTypeMismatch => "indirect call type mismatch".to_string(),
         WasmError::ImmutableGlobal => "global is immutable".to_string(),
         WasmError::TableIndexOutOfBounds => "out of bounds table access".to_string(),
