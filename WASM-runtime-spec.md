@@ -1,8 +1,9 @@
 # ATOS WASM Runtime Specification
 
-**Version:** 2.0 (Per-Agent RuntimeClass)
+**Version:** 2.1 (SIMD + Relaxed SIMD Complete)
 **Status:** Implementation Reference
 **Companion to:** Yellow Paper §24.3.1
+**Last Updated:** 2026-03-24
 
 > This document is the normative specification for the ATOS WASM runtime. The yellow paper provides architectural context and roadmap; this document provides the complete opcode support matrix, runtime class policy, host function ABI, limits, and implementation contract.
 
@@ -48,7 +49,7 @@ WASM is an `AgentRuntime` (unlike eBPF-lite, which is the policy layer). WASM ag
 
 The yellowpaper §25.2.4 states: *"Full instruction-level determinism is only guaranteed for WASM agents (fuel-counted). Native agents have deterministic scheduling order but may produce different results per tick depending on CPU microarchitecture."* For maximum replay and proof guarantees, production agents should prefer WASM with ProofGrade RuntimeClass.
 
-`[IMPL: ✅ ~4,661 lines across 6 kernel modules + agent_loader + SDK crate]`
+`[IMPL: ✅ ~5,212 lines across 6 kernel modules + agent_loader + SDK crate]`
 
 ---
 
@@ -76,8 +77,9 @@ RuntimeClass is a **per-instance** property of `WasmInstance`, not a global comp
 |---------|-----------|-------------|------------|
 | Integer ops (i32/i64) | ✅ | ✅ | ✅ |
 | Floating-point (f32/f64) | ❌ trap | ✅ | ✅ |
-| SIMD (v128) | ❌ trap | ❌ trap | ❌ trap (future: ✅) |
-| Threads / atomics | ❌ trap | ❌ trap | ❌ trap (future: ✅) |
+| SIMD (v128, 256 sub-opcodes) | ✅ | ✅ | ✅ |
+| Relaxed SIMD (20 sub-opcodes) | ✅ | ✅ | ✅ |
+| Threads / atomics | ❌ trap | ❌ trap | ❌ trap (future) |
 | Deterministic replay | ✅ full | ⚠️ same-hardware only | ❌ |
 | ExecutionReceipt / proof | ✅ | ❌ | ❌ |
 | Fuel metering | ✅ | ✅ | ✅ |
@@ -291,9 +293,10 @@ All section sizes, counts, and instruction immediates use LEB128 variable-length
 | Sign extension | 5 | ✅ | ✅ |
 | Saturating trunc (0xFC 0-7) | 8 | ❌ FloatsDisabled | ✅ |
 | Bulk memory (0xFC 8-17) | 10 | ✅ | ✅ |
-| SIMD (0xFD prefix) | — | ❌ UnsupportedProposal | ❌ UnsupportedProposal |
+| SIMD (0xFD 0x00-0xff) | 256 | ✅ | ✅ |
+| Relaxed SIMD (0xFD 0x100-0x113) | 20 | ✅ | ✅ |
 | Threads (0xFE prefix) | — | ❌ UnsupportedProposal | ❌ UnsupportedProposal |
-| **Total defined** | **203** | **134 active / 69 disabled** | **196 active / 7 disabled** |
+| **Total defined** | **479** | **410 active / 69 disabled** | **472 active / 7 disabled** |
 
 ### 5.2 Control flow opcodes
 
@@ -477,14 +480,38 @@ In ProofGrade mode, all these opcodes trap with `FloatsDisabled`.
 | 16 | `table.size` | Get table element count | ✅ all classes |
 | 17 | `table.fill` | Fill table with value | ✅ all classes |
 
-### 5.16 Unsupported proposals
+### 5.16 SIMD (0xFD prefix)
+
+Full WASM SIMD support with 256 standard sub-opcodes (0x00-0xff) + 20 Relaxed SIMD sub-opcodes (0x100-0x113), all numbered per wasmparser 0.228.0 authoritative encoding.
+
+| Sub-range | Operations | Count |
+|-----------|-----------|-------|
+| 0x00-0x0b | Memory (load/store) | 12 |
+| 0x0c-0x0e | Const, shuffle, swizzle | 3 |
+| 0x0f-0x14 | Splat | 6 |
+| 0x15-0x22 | Extract/replace lane | 14 |
+| 0x23-0x4c | Compare (i8x16/i16x8/i32x4/f32x4/f64x2) | 42 |
+| 0x4d-0x53 | Bitwise + any_true | 7 |
+| 0x54-0x5d | Load/store lane, load zero | 10 |
+| 0x5e-0x5f | Demote/promote | 2 |
+| 0x60-0x7b | i8x16 arithmetic + f32x4/f64x2 rounding (interleaved) | 28 |
+| 0x7c-0x7f | Pairwise add | 4 |
+| 0x80-0x9f | i16x8 arithmetic + f64x2 nearest (interleaved) | 30 |
+| 0xa0-0xbf | i32x4 arithmetic | 24 |
+| 0xc0-0xdf | i64x2 arithmetic + compare + extmul | 24 |
+| 0xe0-0xf7 | f32x4/f64x2 float arithmetic | 22 |
+| 0xf8-0xff | Conversion (trunc_sat, convert) | 8 |
+| 0x100-0x113 | Relaxed SIMD (swizzle, trunc, madd, laneselect, min/max, dot) | 20 |
+
+SIMD is available in **all RuntimeClasses** (ProofGrade, ReplayGrade, BestEffort).
+
+### 5.17 Unsupported proposals
 
 | Prefix | Proposal | Status | Planned |
 |--------|----------|--------|---------|
-| `0xFD` | SIMD (v128) | ❌ `UnsupportedProposal` | ReplayGrade/BestEffort in future stage |
 | `0xFE` | Threads / Atomics | ❌ `UnsupportedProposal` | BestEffort only in future stage |
 
-`[IMPL: ✅ runtime.rs — 203 opcodes defined, per-instance RuntimeClass check on all float ops]`
+`[IMPL: ✅ runtime.rs — 479 opcodes total (203 MVP + 276 SIMD), per-instance RuntimeClass, 100% wasmparser alignment]`
 
 ---
 
@@ -881,7 +908,8 @@ extern "C" {
 | Feature | Standard WASM | ProofGrade | ReplayGrade | BestEffort |
 |---------|--------------|-----------|-------------|------------|
 | Floating-point (f32/f64) | ✅ | ❌ | ✅ | ✅ |
-| SIMD (128-bit vectors) | ✅ (proposal) | ❌ | ❌ (future) | ❌ (future) |
+| SIMD (v128, 256 ops) | ✅ (proposal) | ✅ | ✅ | ✅ |
+| Relaxed SIMD (20 ops) | ✅ (proposal) | ✅ | ✅ | ✅ |
 | Threads / atomics | ✅ (proposal) | ❌ | ❌ | ❌ (future) |
 | Multi-memory | ✅ (proposal) | ❌ | ❌ | ❌ |
 | Reference types (externref) | ✅ (proposal) | ❌ | ❌ | ❌ |
@@ -913,6 +941,8 @@ ATOS limits are aligned with [wasmi](https://github.com/wasmi-labs/wasmi) to ens
 | Bulk memory ops | Post-MVP proposal | ✅ | memory.copy/fill/init, data.drop |
 | Table operations | Post-MVP proposal | ✅ | table.grow/size/fill/copy/init |
 | Saturating trunc | Post-MVP proposal | ✅ (ReplayGrade+) | Safe float→int without trap |
+| SIMD (v128) | Post-MVP proposal | ✅ | 256 sub-opcodes, all RuntimeClasses |
+| Relaxed SIMD | Post-MVP proposal | ✅ | 20 sub-opcodes (madd, laneselect, dot) |
 
 ### 15.4 Behavioral differences
 
@@ -942,9 +972,11 @@ Per Yellow Paper §24.3.1, §25.2, and §27:
 | Instruction-class-weighted fuel | Different cost per opcode class (load=2, call=5, etc.) | Planned |
 | Memory quota enforcement | `memory.grow` gated by agent's `memory_quota` | Planned |
 | Checkpoint/snapshot | Serialize WasmInstance state for checkpoint/restore | Planned |
-| JIT compilation | Optional JIT for ReplayGrade/BestEffort agents | Planned (Stage-3+) |
-| SIMD for ReplayGrade | Enable 0xFD prefix for non-proof workloads | Planned |
+| JIT compilation | Optional JIT via Cranelift backend | Planned (Stage-5+) |
+| ~~SIMD~~ | ~~Enable 0xFD prefix~~ | ✅ Done (v2.1) — 276 sub-opcodes |
+| ~~Relaxed SIMD~~ | ~~Enable 0x100+ sub-opcodes~~ | ✅ Done (v2.1) — 20 sub-opcodes |
 | Threads for BestEffort | Enable 0xFE prefix for tool agents | Planned |
+| **Spec testsuite compliance** | Run 147 official WebAssembly spec tests | **In Progress** — framework designed, awaiting implementation |
 
 ### 16.2 Host function extensions (recommended)
 
@@ -967,11 +999,29 @@ All limits have been raised to support standard compiler output (see §12). No f
 | File | Lines | Description |
 |------|-------|-------------|
 | `src/wasm/mod.rs` | ~5 | Module declaration |
-| `src/wasm/types.rs` | ~581 | RuntimeClass, value types, 203 opcodes, 30 error variants, all limits |
-| `src/wasm/decoder.rs` | ~931 | Binary format parser, 12 section decoders, func_import_count/type, LEB128 |
+| `src/wasm/types.rs` | ~673 | V128 type, RuntimeClass, value types, all opcodes, 30 error variants, limits |
+| `src/wasm/decoder.rs` | ~932 | Binary format parser, 12 section decoders, func_import_count/type, LEB128 |
 | `src/wasm/validator.rs` | ~58 | Basic structural validation |
-| `src/wasm/runtime.rs` | ~2,228 | Stack machine interpreter, per-instance RuntimeClass, all opcode handlers |
+| `src/wasm/runtime.rs` | ~2,686 | Stack machine interpreter, per-instance RuntimeClass, 479 opcode handlers (203 MVP + 276 SIMD) |
 | `src/wasm/host.rs` | ~177 | Host function resolver (N-th func import scan), 6 syscall bridges |
 | `src/agents/wasm_agent.rs` | ~209 | Demo WASM agent with hand-crafted binary |
 | `src/agent_loader.rs` | ~472 | Agent loading: spawn_from_image_with_class, multi-entry-point support |
 | `sdk/atos-wasm-sdk/src/lib.rs` | ~92 | Agent SDK (optional): safe host function wrappers |
+| **Total** | **~5,212** | |
+
+### Implementation Progress
+
+| Milestone | Status | Date |
+|-----------|--------|------|
+| MVP opcodes (42 → 203) | ✅ Complete | 2026-03-24 |
+| wasmi comparison audit (12 rounds, 23 bugs fixed) | ✅ Complete | 2026-03-24 |
+| Per-agent RuntimeClass | ✅ Complete | 2026-03-24 |
+| Limits aligned with wasmi | ✅ Complete | 2026-03-24 |
+| Default BestEffort (most permissive) | ✅ Complete | 2026-03-24 |
+| SIMD (256 sub-opcodes, wasmparser-aligned) | ✅ Complete | 2026-03-24 |
+| Relaxed SIMD (20 sub-opcodes) | ✅ Complete | 2026-03-24 |
+| Agent loading from disk (sys_spawn_image) | ✅ Complete | 2026-03-24 |
+| Multi-entry-point (run/_start/main) | ✅ Complete | 2026-03-24 |
+| WebAssembly spec testsuite (147 .wast files) | ⏳ Framework designed | — |
+| JIT compilation (Cranelift backend) | 📋 Planned | — |
+| Threads / Atomics (0xFE prefix) | 📋 Planned | — |
