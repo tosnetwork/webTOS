@@ -83,14 +83,8 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 
     // Validate table limits
     for table in &module.tables {
-        if table.min as usize > MAX_TABLE_SIZE {
-            return Err(WasmError::TableIndexOutOfBounds);
-        }
         if let Some(max) = table.max {
             if table.min > max {
-                return Err(WasmError::TableIndexOutOfBounds);
-            }
-            if max as usize > MAX_TABLE_SIZE {
                 return Err(WasmError::TableIndexOutOfBounds);
             }
         }
@@ -120,6 +114,23 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
+    // Validate elem seg table refs and func indices
+    for seg in &module.element_segments {
+        for &fi in &seg.func_indices {
+            if fi != u32::MAX && fi as usize >= total_functions {
+                return Err(WasmError::FunctionNotFound(fi));
+            }
+        }
+        if total_tables == 0 || seg.table_idx as usize >= total_tables {
+            return Err(WasmError::TableIndexOutOfBounds);
+        }
+    }
+    for seg in &module.data_segments {
+        if seg.offset != u32::MAX && !has_memory {
+            return Err(WasmError::MemoryOutOfBounds);
+        }
+    }
+
     // Validate instruction sequences for each function
     for (i, func) in module.functions.iter().enumerate() {
         validate_function_body(module, i, func, total_functions, has_memory, total_tables, total_globals)?;
@@ -128,8 +139,8 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     Ok(())
 }
 
-fn count_table_imports(_module: &WasmModule) -> usize {
-    0
+fn count_table_imports(module: &WasmModule) -> usize {
+    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Table | ImportKind::TableWithLimits { .. })).count()
 }
 
 fn count_global_imports(module: &WasmModule) -> usize {
@@ -592,6 +603,40 @@ impl<'a> Validator<'a> {
                     let ft = &self.module.func_types[type_idx as usize];
                     let param_count = ft.param_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
+                    for i in (0..params.len()).rev() {
+                        self.pop_expect(params[i])?;
+                    }
+                    self.set_unreachable();
+                }
+                // ── call_ref (GC proposal, opcode 0x14) ──
+                0x14 => {
+                    let type_idx = self.read_u32()?;
+                    if type_idx as usize >= self.module.func_types.len() {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    let ft = &self.module.func_types[type_idx as usize];
+                    let param_count = ft.param_count as usize;
+                    let result_count = ft.result_count as usize;
+                    let params: Vec<ValType> = ft.params[..param_count].to_vec();
+                    let results: Vec<ValType> = ft.results[..result_count].to_vec();
+                    let _ = self.pop_opd()?; // function reference
+                    for i in (0..params.len()).rev() {
+                        self.pop_expect(params[i])?;
+                    }
+                    for &t in &results {
+                        self.push_val(t);
+                    }
+                }
+                // ── return_call_ref (GC proposal, opcode 0x15) ──
+                0x15 => {
+                    let type_idx = self.read_u32()?;
+                    if type_idx as usize >= self.module.func_types.len() {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    let ft = &self.module.func_types[type_idx as usize];
+                    let param_count = ft.param_count as usize;
+                    let params: Vec<ValType> = ft.params[..param_count].to_vec();
+                    let _ = self.pop_opd()?; // function reference
                     for i in (0..params.len()).rev() {
                         self.pop_expect(params[i])?;
                     }

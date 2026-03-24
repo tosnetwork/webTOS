@@ -23,6 +23,7 @@ pub struct CallFrame {
     pub stack_base: usize,        // operand stack depth at function entry
     pub result_count: u8,         // how many values to return
     pub saved_block_depth: usize, // caller's block_depth to restore on return
+    pub block_stack_base: usize,  // index in block_stack where this function's blocks start
 }
 
 impl CallFrame {
@@ -37,6 +38,7 @@ impl CallFrame {
             stack_base: 0,
             result_count: 0,
             saved_block_depth: 0,
+            block_stack_base: 0,
         }
     }
 }
@@ -633,7 +635,7 @@ impl WasmInstance {
                     for _ in 0..count { let _ = self.read_leb128_u32()?; }
                     let _ = self.read_leb128_u32()?; // default
                 }
-                0x10 | 0x12 => { let _ = self.read_leb128_u32()?; } // call, return_call
+                0x10 | 0x12 | 0x14 | 0x15 => { let _ = self.read_leb128_u32()?; } // call, return_call, call_ref, return_call_ref
                 0x11 | 0x13 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // call_indirect, return_call_indirect
                 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 => { let _ = self.read_leb128_u32()?; } // local/global/table get/set
                 0xFC => {
@@ -694,7 +696,14 @@ impl WasmInstance {
 
     /// Branch to the label at the given depth on the block stack.
     fn branch(&mut self, depth: u32) -> Result<(), WasmError> {
-        if depth as usize >= self.block_depth {
+        // Branch depth is relative to the current function's block scope.
+        let base = if self.call_depth > 0 {
+            self.call_stack[self.call_depth - 1].block_stack_base
+        } else {
+            0
+        };
+        let func_block_count = self.block_depth - base;
+        if depth as usize >= func_block_count {
             return Err(WasmError::BranchDepthExceeded);
         }
         let target_idx = self.block_depth - 1 - depth as usize;
@@ -809,6 +818,7 @@ impl WasmInstance {
             stack_base: self.stack_ptr,
             result_count,
             saved_block_depth: self.block_depth,
+            block_stack_base: self.block_depth,
         };
 
         self.call_stack[self.call_depth] = frame;
@@ -817,8 +827,8 @@ impl WasmInstance {
         // Set PC to function body
         self.pc = func_code_offset;
 
-        // Reset block stack for new function
-        self.block_depth = 0;
+        // NOTE: We do NOT reset block_depth. The callee's blocks stack on top of the
+        // caller's blocks so they don't clobber each other.
 
         // Push an implicit block frame for the function body.
         // This allows `br 0` at the function level to work correctly (behaves like return).
@@ -1071,8 +1081,9 @@ impl WasmInstance {
                 }
             }
             0x05 => {
-                // else — skip to end of if block
-                if self.block_depth > 0 {
+                // else — skip to end of if block (for the "then" path)
+                let base05 = if self.call_depth > 0 { self.call_stack[self.call_depth - 1].block_stack_base } else { 0 };
+                if self.block_depth > base05 {
                     let bf = self.block_stack[self.block_depth - 1];
                     self.pc = bf.end_pc;
                     let _ = self.pop_block();
@@ -1080,7 +1091,8 @@ impl WasmInstance {
             }
             0x0B => {
                 // end
-                if self.block_depth > 0 {
+                let base0b = if self.call_depth > 0 { self.call_stack[self.call_depth - 1].block_stack_base } else { 0 };
+                if self.block_depth > base0b {
                     let _ = self.pop_block();
                 } else {
                     // End of function body
@@ -1145,7 +1157,7 @@ impl WasmInstance {
                     self.call_depth -= 1;
                     self.stack_ptr = frame.stack_base;
                     self.pc = frame.return_pc;
-                    self.block_depth = 0;
+                    self.block_depth = frame.saved_block_depth;
                 }
                 if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
@@ -1194,7 +1206,7 @@ impl WasmInstance {
                     self.call_depth -= 1;
                     self.stack_ptr = frame.stack_base;
                     self.pc = frame.return_pc;
-                    self.block_depth = 0;
+                    self.block_depth = frame.saved_block_depth;
                 }
                 if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {

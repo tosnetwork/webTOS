@@ -595,7 +595,7 @@ impl WastRunner {
             // Skip non-function imports (table, memory, global handled elsewhere)
             match import.kind {
                 ImportKind::Func(_) => {}
-                ImportKind::Table | ImportKind::Memory | ImportKind::Global(_, _) => continue,
+                _ => continue,
             }
             let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
             let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));

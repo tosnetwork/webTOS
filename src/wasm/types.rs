@@ -11,6 +11,8 @@ pub enum ValType {
     F32,
     F64,
     V128,
+    FuncRef,
+    ExternRef,
 }
 
 /// A 128-bit SIMD value (v128), stored as little-endian byte array.
@@ -104,7 +106,7 @@ impl Value {
     /// Return zero for the given type.
     pub const fn default_for(ty: ValType) -> Self {
         match ty {
-            ValType::I32 => Value::I32(0),
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef => Value::I32(0),
             ValType::I64 => Value::I64(0),
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
@@ -629,7 +631,7 @@ pub const MAX_CALL_DEPTH: usize = 1_000;       // wasmi: 1000
 pub const MAX_PARAMS: usize = 128;
 pub const MAX_RESULTS: usize = 128;
 pub const MAX_NAME_BYTES: usize = 1_024;
-pub const MAX_BLOCK_DEPTH: usize = 1_000;
+pub const MAX_BLOCK_DEPTH: usize = 10_000;
 pub const MAX_GLOBALS: usize = 1_000;          // wasmi: 1000
 pub const MAX_TABLE_SIZE: usize = 65_536;
 pub const MAX_DATA_SEGMENTS: usize = 1_000;    // wasmi: 1000
