@@ -1099,10 +1099,9 @@ impl WasmInstance {
                 };
                 // Validate function signature matches expected type
                 let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
-                    // Imported function: get type from import definition
-                    match self.module.imports[func_idx as usize].kind {
-                        ImportKind::Func(ti) => ti,
-                        _ => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
+                    match self.module.func_import_type(func_idx) {
+                        Some(ti) => ti,
+                        None => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
                     }
                 } else {
                     // Local function: get type from function definition
