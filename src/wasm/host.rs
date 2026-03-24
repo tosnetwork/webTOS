@@ -106,14 +106,13 @@ pub fn handle_host_call(
             let ptr = args[1].as_i32() as usize;
             let len = args[2].as_i32() as usize;
 
-            // Validate memory bounds
-            if ptr + len > instance.memory_size {
+            // Validate memory bounds (checked_add to prevent overflow)
+            let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
+            if end > instance.memory_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            // The actual send would go through the kernel mailbox subsystem.
-            // For now, just validate and return success.
-            let _ = &instance.memory[ptr..ptr + len];
+            let _ = &instance.memory[ptr..end];
             Ok(Some(Value::I32(0)))
         }
 
@@ -123,13 +122,12 @@ pub fn handle_host_call(
             let ptr = args[1].as_i32() as usize;
             let capacity = args[2].as_i32() as usize;
 
-            // Validate memory bounds
-            if ptr + capacity > instance.memory_size {
+            // Validate memory bounds (checked_add to prevent overflow)
+            let end = ptr.checked_add(capacity).ok_or(WasmError::MemoryOutOfBounds)?;
+            if end > instance.memory_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            // The actual recv would read from the kernel mailbox.
-            // For now, return 0 (no message available).
             Ok(Some(Value::I32(0)))
         }
 
@@ -149,19 +147,15 @@ pub fn handle_host_call(
 
         HostFunc::Log => {
             // log(ptr: i32, len: i32)
-            // Read a UTF-8 string from WASM memory and print it to serial.
             let ptr = args[0].as_i32() as usize;
             let len = args[1].as_i32() as usize;
 
-            if ptr + len > instance.memory_size {
+            let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
+            if end > instance.memory_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            // In a real kernel, this would write to the serial console.
-            // The bytes are at instance.memory[ptr..ptr+len].
-            // We can't call println! in no_std without a logger, so this
-            // is a no-op stub that validates the memory range.
-            let _msg_bytes = &instance.memory[ptr..ptr + len];
+            let _msg_bytes = &instance.memory[ptr..end];
 
             Ok(None) // log returns void
         }

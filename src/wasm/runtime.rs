@@ -892,55 +892,48 @@ impl WasmInstance {
                 }));
             }
             0x04 => {
-                // if
+                // if — two-pass scan: first find else/end boundary, then find true end
                 let block_type = try_exec!(self.read_leb128_i32());
                 let result_count = if block_type == -0x40 { 0u8 } else { 1u8 };
                 let condition = try_exec!(self.pop_i32());
 
-                let start_pc = self.pc;
-                // Scan to find else/end
-                let end_or_else_pc = try_exec!(self.skip_to_end());
+                let body_pc = self.pc;
+                // First skip_to_end: stops at else (depth=1) or end (depth=0)
+                let else_or_end_pc = try_exec!(self.skip_to_end());
+                let has_else = else_or_end_pc > 0
+                    && self.module.code[else_or_end_pc - 1] == 0x05;
+
+                // If there's an else, scan past it to find the true end
+                let true_end_pc = if has_else {
+                    // pc is now right after the else opcode; scan to find matching end
+                    try_exec!(self.skip_to_end())
+                } else {
+                    else_or_end_pc
+                };
 
                 if condition != 0 {
-                    // Execute the "then" branch
-                    self.pc = start_pc;
-                    // We need to re-scan to find the true end_pc
-                    // The skip_to_end may have stopped at else
-                    // We'll push a block and handle else/end in opcode 0x05/0x0B
-                    let saved = self.pc;
-                    let _end_pc = try_exec!(self.skip_to_end());
-                    self.pc = saved;
-                    // Actually, we need to properly find the end. Let's rescan from start.
-                    // Re-approach: save current pc, skip to find structure
-                    self.pc = start_pc;
+                    // Execute the "then" branch; block end_pc = true end of if/else/end
+                    self.pc = body_pc;
                     try_exec!(self.push_block(BlockFrame {
-                        start_pc,
-                        end_pc: end_or_else_pc,
+                        start_pc: body_pc,
+                        end_pc: true_end_pc,
+                        stack_base: self.stack_ptr,
+                        result_count,
+                        is_loop: false,
+                    }));
+                } else if has_else {
+                    // Condition false, has else: execute the else branch
+                    self.pc = else_or_end_pc; // right after the 0x05 else opcode
+                    try_exec!(self.push_block(BlockFrame {
+                        start_pc: else_or_end_pc,
+                        end_pc: true_end_pc,
                         stack_base: self.stack_ptr,
                         result_count,
                         is_loop: false,
                     }));
                 } else {
-                    // Skip to else or end
-                    self.pc = end_or_else_pc;
-                    // Check if we stopped at else (byte before was 0x05) — tricky.
-                    // Actually skip_to_end returns pc past the marker, so we need
-                    // to check the byte before. For simplicity: check if the byte
-                    // before end_or_else_pc is 0x05.
-                    if end_or_else_pc > 0 && self.module.code[end_or_else_pc - 1] == 0x05 {
-                        // We're at the else branch — push block for else→end
-                        let saved = self.pc;
-                        let real_end = try_exec!(self.skip_to_end());
-                        self.pc = saved;
-                        try_exec!(self.push_block(BlockFrame {
-                            start_pc: self.pc,
-                            end_pc: real_end,
-                            stack_base: self.stack_ptr,
-                            result_count,
-                            is_loop: false,
-                        }));
-                    }
-                    // else: condition false, no else branch → skip past end, no block pushed
+                    // Condition false, no else: skip past end entirely
+                    self.pc = true_end_pc;
                 }
             }
             0x05 => {
