@@ -88,7 +88,7 @@ pub enum ExecResult {
 // ─── Locals storage ─────────────────────────────────────────────────────────
 
 /// Maximum total locals across all active call frames.
-const MAX_TOTAL_LOCALS: usize = 256;
+const MAX_TOTAL_LOCALS: usize = 4096;
 
 // ─── WASM instance ─────────────────────────────────────────────────────────
 

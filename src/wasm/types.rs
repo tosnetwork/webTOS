@@ -525,23 +525,23 @@ impl Opcode {
 
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
-pub const MAX_FUNCTIONS: usize = 64;
-pub const MAX_LOCALS: usize = 32;
-pub const MAX_STACK: usize = 256;
-pub const MAX_MEMORY_PAGES: usize = 16;      // 16 * 64 KiB = 1 MiB max
+pub const MAX_FUNCTIONS: usize = 1024;
+pub const MAX_LOCALS: usize = 128;
+pub const MAX_STACK: usize = 1024;
+pub const MAX_MEMORY_PAGES: usize = 256;      // 256 * 64 KiB = 16 MiB max (gated by agent mem_quota)
 pub const WASM_PAGE_SIZE: usize = 65536;      // Standard WASM page size (64 KiB)
-pub const MAX_IMPORTS: usize = 16;
-pub const MAX_EXPORTS: usize = 16;
-pub const MAX_CODE_SIZE: usize = 65536;       // 64 KB max code
-pub const MAX_CALL_DEPTH: usize = 64;
-pub const MAX_PARAMS: usize = 8;
-pub const MAX_RESULTS: usize = 4;
-pub const MAX_NAME_BYTES: usize = 256;
-pub const MAX_BLOCK_DEPTH: usize = 64;
-pub const MAX_GLOBALS: usize = 64;
-pub const MAX_TABLE_SIZE: usize = 4096;
-pub const MAX_DATA_SEGMENTS: usize = 64;
-pub const MAX_ELEMENT_SEGMENTS: usize = 64;
+pub const MAX_IMPORTS: usize = 64;
+pub const MAX_EXPORTS: usize = 64;
+pub const MAX_CODE_SIZE: usize = 1048576;     // 1 MB max code
+pub const MAX_CALL_DEPTH: usize = 256;
+pub const MAX_PARAMS: usize = 16;
+pub const MAX_RESULTS: usize = 16;
+pub const MAX_NAME_BYTES: usize = 1024;
+pub const MAX_BLOCK_DEPTH: usize = 256;
+pub const MAX_GLOBALS: usize = 256;
+pub const MAX_TABLE_SIZE: usize = 65536;
+pub const MAX_DATA_SEGMENTS: usize = 256;
+pub const MAX_ELEMENT_SEGMENTS: usize = 256;
 pub const MAX_BR_TABLE_SIZE: usize = 256;
 
 // ─── Error type ──────────────────────────────────────────────────────────────

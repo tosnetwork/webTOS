@@ -211,9 +211,12 @@ fn spawn_wasm_with_class(
     // 1. Decode and validate the WASM module
     let module = wasm::decoder::decode(image).map_err(|_| E_BAD_IMAGE)?;
 
-    // 2. Validate: must have a "run" export
-    if module.find_export_func(b"run").is_none() {
-        serial_println!("[AGENT_LOADER] WASM module missing 'run' export");
+    // 2. Validate: must have an entry point (run, _start, or main)
+    if module.find_export_func(b"run").is_none()
+        && module.find_export_func(b"_start").is_none()
+        && module.find_export_func(b"main").is_none()
+    {
+        serial_println!("[AGENT_LOADER] WASM module missing entry point (run/_start/main)");
         return Err(E_BAD_IMAGE);
     }
 
@@ -287,11 +290,14 @@ pub extern "C" fn wasm_runner_entry() -> ! {
         }
     };
 
-    // Find the "run" export
-    let run_idx = match module.find_export_func(b"run") {
+    // Find entry point: try "run", "_start", "main" in order
+    let run_idx = match module.find_export_func(b"run")
+        .or_else(|| module.find_export_func(b"_start"))
+        .or_else(|| module.find_export_func(b"main"))
+    {
         Some(idx) => idx,
         None => {
-            serial_println!("[WASM_RUNNER] Agent {} missing 'run' export", agent_id);
+            serial_println!("[WASM_RUNNER] Agent {} missing entry point", agent_id);
             loop { crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
         }
     };
