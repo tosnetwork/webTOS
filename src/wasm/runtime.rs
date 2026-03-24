@@ -2030,9 +2030,10 @@ impl WasmInstance {
                         }
                     }
                     11 => {
+                        // memory.fill: stack order is [d, val, n] → pop n, val, d
                         let _mem = try_exec!(self.read_leb128_u32());
-                        let val = try_exec!(self.pop_i32()) as u8;
                         let n = try_exec!(self.pop_i32()) as usize;
+                        let val = try_exec!(self.pop_i32()) as u8;
                         let d = try_exec!(self.pop_i32()) as usize;
                         if d.saturating_add(n) > self.memory_size {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
