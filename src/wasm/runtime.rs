@@ -646,7 +646,7 @@ impl WasmInstance {
 
     /// Enter a WASM-defined function (not an import).
     fn enter_function(&mut self, func_idx: u32, keep_args_on_stack: bool) -> Result<(), WasmError> {
-        let local_func_idx = func_idx as usize - self.module.func_import_count();
+        let local_func_idx = (func_idx as usize).checked_sub(self.module.func_import_count()).ok_or(WasmError::FunctionNotFound(func_idx))?;
 
         // Extract everything we need from the module into local variables
         // so we don't hold any borrows of self.module during mutation.
@@ -1053,7 +1053,10 @@ impl WasmInstance {
                         None => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
                     }
                 } else {
-                    let local_idx = func_idx as usize - self.module.func_import_count();
+                    let local_idx = match (func_idx as usize).checked_sub(self.module.func_import_count()) {
+                        Some(i) => i,
+                        None => return ExecResult::Trap(WasmError::FunctionNotFound(func_idx)),
+                    };
                     if local_idx >= self.module.functions.len() {
                         return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
                     }
@@ -1103,7 +1106,10 @@ impl WasmInstance {
                     }
                 } else {
                     // Local function: get type from function definition
-                    let local_idx = func_idx as usize - self.module.func_import_count();
+                    let local_idx = match (func_idx as usize).checked_sub(self.module.func_import_count()) {
+                        Some(i) => i,
+                        None => return ExecResult::Trap(WasmError::FunctionNotFound(func_idx)),
+                    };
                     if local_idx >= self.module.functions.len() {
                         return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
                     }

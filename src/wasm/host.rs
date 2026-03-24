@@ -34,13 +34,23 @@ pub enum HostFunc {
 }
 
 /// Resolve an import index to a `HostFunc` by examining the import names.
-pub fn resolve_import(module: &WasmModule, import_idx: u32) -> HostFunc {
-    let idx = import_idx as usize;
-    if idx >= module.imports.len() {
-        return HostFunc::Unknown;
+pub fn resolve_import(module: &WasmModule, func_idx: u32) -> HostFunc {
+    // Find the N-th function import (func_idx is a function index, not import array index)
+    let mut func_count: u32 = 0;
+    let mut found_imp = None;
+    for imp in &module.imports {
+        if let crate::wasm::decoder::ImportKind::Func(_) = imp.kind {
+            if func_count == func_idx {
+                found_imp = Some(imp);
+                break;
+            }
+            func_count = func_count.saturating_add(1);
+        }
     }
-
-    let imp = &module.imports[idx];
+    let imp = match found_imp {
+        Some(i) => i,
+        None => return HostFunc::Unknown,
+    };
 
     let mod_name = module.get_name(imp.module_name_offset, imp.module_name_len);
     let field_name = module.get_name(imp.field_name_offset, imp.field_name_len);
