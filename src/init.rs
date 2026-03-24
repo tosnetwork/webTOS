@@ -523,7 +523,7 @@ pub fn init() {
             },
         ];
 
-        match attach::attach(&program, attach::AttachPoint::MailboxSend(3)) {
+        match attach::attach(&program, attach::AttachPoint::MailboxSend(3), 128) {
             Ok(idx) => {
                 serial_println!("[INIT] eBPF program attached at MailboxSend(3), index={}", idx);
             }
@@ -555,7 +555,7 @@ pub fn init() {
             },
         ];
 
-        match attach::attach(&deny_program, attach::AttachPoint::MailboxSend(1)) {
+        match attach::attach(&deny_program, attach::AttachPoint::MailboxSend(1), 128) {
             Ok(idx) => {
                 serial_println!("[INIT] eBPF DENY program attached at MailboxSend(1), index={}", idx);
             }

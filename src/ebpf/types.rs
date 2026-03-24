@@ -7,7 +7,7 @@
 pub const NUM_REGS: usize = 11;
 
 /// Maximum program size in instructions
-pub const MAX_INSNS: usize = 256;
+pub const MAX_INSNS: usize = 1024;
 
 /// Maximum stack size (in bytes)
 pub const STACK_SIZE: usize = 512;
@@ -53,6 +53,7 @@ pub const BPF_NEG: u8 = 0x80;
 pub const BPF_MOD: u8 = 0x90;
 pub const BPF_XOR: u8 = 0xA0;
 pub const BPF_MOV: u8 = 0xB0;
+pub const BPF_ARSH: u8 = 0xC0;
 
 // Source operand (opcode & 0x08)
 pub const BPF_K: u8 = 0x00; // immediate
@@ -69,6 +70,10 @@ pub const BPF_CALL: u8 = 0x80;
 pub const BPF_EXIT: u8 = 0x90;
 pub const BPF_JLT: u8 = 0xA0;
 pub const BPF_JLE: u8 = 0xB0;
+pub const BPF_JSGT: u8 = 0x60;
+pub const BPF_JSGE: u8 = 0x70;
+pub const BPF_JSLT: u8 = 0xC0;
+pub const BPF_JSLE: u8 = 0xD0;
 
 // Memory sizes (opcode & 0x18 for LD/ST classes)
 pub const BPF_W: u8 = 0x00;  // 32-bit
@@ -77,6 +82,7 @@ pub const BPF_B: u8 = 0x10;  // 8-bit
 pub const BPF_DW: u8 = 0x18; // 64-bit
 
 pub const BPF_MEM: u8 = 0x60;
+pub const BPF_IMM: u8 = 0x00;
 
 // Helper function IDs
 pub const HELPER_MAP_LOOKUP: u32 = 1;
@@ -86,6 +92,13 @@ pub const HELPER_GET_AGENT_ID: u32 = 4;
 pub const HELPER_GET_ENERGY: u32 = 5;
 pub const HELPER_EMIT_EVENT: u32 = 6;
 pub const HELPER_GET_TICK: u32 = 7;
+pub const HELPER_GET_MAILBOX_PRESSURE: u32 = 8;
+pub const HELPER_GET_AGENT_PARENT: u32 = 9;
+pub const HELPER_GET_CAPABILITY_COUNT: u32 = 10;
+pub const HELPER_INCREMENT_COUNTER: u32 = 11;
+pub const HELPER_READ_GAUGE: u32 = 12;
+pub const HELPER_MAP_PERSIST: u32 = 13;
+pub const HELPER_MAP_RESTORE: u32 = 14;
 
 /// Action codes returned by eBPF programs
 #[derive(Debug, Clone, Copy, PartialEq)]

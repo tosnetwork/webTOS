@@ -60,6 +60,22 @@ impl EbpfVm {
                 BPF_LDX => self.exec_ldx(&insn)?,
                 BPF_STX => self.exec_stx(&insn)?,
                 BPF_ST => self.exec_st(&insn)?,
+                BPF_LD => {
+                    // BPF_LD_IMM64: two-instruction 64-bit immediate load
+                    // opcode must be 0x18 (BPF_LD | BPF_IMM | BPF_DW)
+                    if insn.opcode != 0x18 {
+                        return Err(EbpfError::InvalidOpcode(insn.opcode));
+                    }
+                    let next_pc = self.pc + 1;
+                    if next_pc >= program.len() {
+                        return Err(EbpfError::OutOfBounds);
+                    }
+                    let next_insn = &program[next_pc];
+                    let lo = insn.imm as u32 as u64;
+                    let hi = next_insn.imm as u32 as u64;
+                    self.regs[insn.dst()] = (hi << 32) | lo;
+                    self.pc += 1; // skip the second pseudo-instruction (main loop adds +1 more)
+                }
                 _ => return Err(EbpfError::InvalidOpcode(insn.opcode)),
             }
 
@@ -99,6 +115,9 @@ impl EbpfVm {
             BPF_LSH => self.regs[dst] <<= src_val & 63,
             BPF_RSH => self.regs[dst] >>= src_val & 63,
             BPF_NEG => self.regs[dst] = (-(self.regs[dst] as i64)) as u64,
+            BPF_ARSH => {
+                self.regs[dst] = ((self.regs[dst] as i64) >> (src_val & 63)) as u64;
+            }
             _ => return Err(EbpfError::InvalidOpcode(insn.opcode)),
         }
         Ok(())
@@ -139,6 +158,7 @@ impl EbpfVm {
             BPF_LSH => dst_val << (src_val & 31),
             BPF_RSH => dst_val >> (src_val & 31),
             BPF_NEG => (-(dst_val as i32)) as u32,
+            BPF_ARSH => ((dst_val as i32) >> (src_val & 31)) as u32,
             _ => return Err(EbpfError::InvalidOpcode(insn.opcode)),
         };
 
@@ -180,6 +200,10 @@ impl EbpfVm {
             BPF_JNE => dst_val != src_val,
             BPF_JLT => dst_val < src_val,
             BPF_JLE => dst_val <= src_val,
+            BPF_JSGT => (dst_val as i64) > (src_val as i64),
+            BPF_JSGE => (dst_val as i64) >= (src_val as i64),
+            BPF_JSLT => (dst_val as i64) < (src_val as i64),
+            BPF_JSLE => (dst_val as i64) <= (src_val as i64),
             _ => return Err(EbpfError::InvalidOpcode(insn.opcode)),
         };
 
@@ -416,6 +440,106 @@ impl EbpfVm {
             }
             HELPER_GET_TICK => {
                 self.regs[0] = crate::arch::x86_64::timer::get_ticks();
+            }
+            HELPER_GET_MAILBOX_PRESSURE => {
+                // r1 = mailbox_id -> r0 = fill count (0-16)
+                let mailbox_id = self.regs[1] as u16;
+                self.regs[0] = match crate::mailbox::get_mailbox(mailbox_id) {
+                    Some(mb) => mb.count as u64,
+                    None => 0,
+                };
+            }
+            HELPER_GET_AGENT_PARENT => {
+                // r1 = agent_id -> r0 = parent_id (0xFFFF if none/not found)
+                let agent_id = self.regs[1] as u16;
+                self.regs[0] = match crate::agent::get_agent(agent_id) {
+                    Some(agent) => match agent.parent_id {
+                        Some(pid) => pid as u64,
+                        None => 0xFFFF,
+                    },
+                    None => 0xFFFF,
+                };
+            }
+            HELPER_GET_CAPABILITY_COUNT => {
+                // r1 = agent_id -> r0 = capability count
+                let agent_id = self.regs[1] as u16;
+                self.regs[0] = match crate::agent::get_agent(agent_id) {
+                    Some(agent) => agent.cap_count as u64,
+                    None => 0,
+                };
+            }
+            HELPER_INCREMENT_COUNTER => {
+                // r1 = map_id, r2 = key_ptr, r3 = key_len -> r0 = 0/1
+                let map_id = self.regs[1] as u32;
+                let key_ptr = self.regs[2];
+                let key_len = self.regs[3] as usize;
+                if key_len > super::maps::MAX_KEY_SIZE {
+                    self.regs[0] = 1;
+                    return Ok(());
+                }
+                let mut key_buf = [0u8; super::maps::MAX_KEY_SIZE];
+                if key_len > 0 && self.check_read(key_ptr, key_len) {
+                    let src = key_ptr as *const u8;
+                    for i in 0..key_len {
+                        key_buf[i] = unsafe { *src.add(i) };
+                    }
+                }
+                if let Some(map) = super::maps::get_map_mut(map_id) {
+                    let current: u64 = match map.lookup(&key_buf[..key_len]) {
+                        Some(val) if val.len() >= 8 => u64::from_le_bytes([
+                            val[0], val[1], val[2], val[3],
+                            val[4], val[5], val[6], val[7],
+                        ]),
+                        _ => 0,
+                    };
+                    let new_val = (current.wrapping_add(1)).to_le_bytes();
+                    match map.update(&key_buf[..key_len], &new_val) {
+                        Ok(()) => self.regs[0] = 0,
+                        Err(_) => self.regs[0] = 1,
+                    }
+                } else {
+                    self.regs[0] = 1;
+                }
+            }
+            HELPER_READ_GAUGE => {
+                // r1 = map_id, r2 = key_ptr, r3 = key_len -> r0 = u64 value
+                let map_id = self.regs[1] as u32;
+                let key_ptr = self.regs[2];
+                let key_len = self.regs[3] as usize;
+                if key_len > super::maps::MAX_KEY_SIZE {
+                    self.regs[0] = 0;
+                    return Ok(());
+                }
+                let mut key_buf = [0u8; super::maps::MAX_KEY_SIZE];
+                if key_len > 0 && self.check_read(key_ptr, key_len) {
+                    let src = key_ptr as *const u8;
+                    for i in 0..key_len {
+                        key_buf[i] = unsafe { *src.add(i) };
+                    }
+                }
+                if let Some(map) = super::maps::get_map(map_id) {
+                    self.regs[0] = match map.lookup(&key_buf[..key_len]) {
+                        Some(val) if val.len() >= 8 => u64::from_le_bytes([
+                            val[0], val[1], val[2], val[3],
+                            val[4], val[5], val[6], val[7],
+                        ]),
+                        _ => 0,
+                    };
+                } else {
+                    self.regs[0] = 0;
+                }
+            }
+            HELPER_MAP_PERSIST => {
+                // r1 = map_id -> r0 = 0 success, 1 failure
+                let map_id = self.regs[1] as u32;
+                let agent_id = crate::sched::current();
+                self.regs[0] = super::maps::persist_map(map_id, agent_id as u16) as u64;
+            }
+            HELPER_MAP_RESTORE => {
+                // r1 = map_id -> r0 = 0 success, 1 failure
+                let map_id = self.regs[1] as u32;
+                let agent_id = crate::sched::current();
+                self.regs[0] = super::maps::restore_map(map_id, agent_id as u16) as u64;
             }
             _ => return Err(EbpfError::InvalidHelper(helper_id)),
         }

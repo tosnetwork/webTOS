@@ -31,7 +31,12 @@ pub fn verify(program: &[Insn]) -> Result<(), EbpfError> {
         ));
     }
 
+    let mut skip_next = false;
     for (pc, insn) in program.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
         let class = insn.opcode & 0x07;
         let op = insn.opcode & 0xF0;
 
@@ -79,7 +84,8 @@ pub fn verify(program: &[Insn]) -> Result<(), EbpfError> {
                             ));
                         }
                     }
-                    BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET | BPF_JNE | BPF_JLT | BPF_JLE => {
+                    BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET | BPF_JNE | BPF_JLT | BPF_JLE
+                    | BPF_JSGT | BPF_JSGE | BPF_JSLT | BPF_JSLE => {
                         // Conditional jump
                         if insn.opcode & BPF_X != 0 {
                             if src >= NUM_REGS {
@@ -126,6 +132,27 @@ pub fn verify(program: &[Insn]) -> Result<(), EbpfError> {
                 if src >= NUM_REGS {
                     return Err(EbpfError::InvalidRegister(src as u8));
                 }
+            }
+            BPF_LD => {
+                // Only BPF_LD_IMM64 (opcode 0x18) is supported
+                if insn.opcode != 0x18 {
+                    return Err(EbpfError::InvalidOpcode(insn.opcode));
+                }
+                // Must have a following pseudo-instruction
+                if pc + 1 >= program.len() {
+                    return Err(EbpfError::VerificationFailed(
+                        "BPF_LD_IMM64 at end of program (missing second instruction)",
+                    ));
+                }
+                // Validate destination register
+                let dst = insn.dst();
+                if dst >= NUM_REGS {
+                    return Err(EbpfError::InvalidRegister(dst as u8));
+                }
+                if dst == 10 {
+                    return Err(EbpfError::VerificationFailed("r10 (frame pointer) is read-only"));
+                }
+                skip_next = true;
             }
             _ => {
                 return Err(EbpfError::InvalidOpcode(insn.opcode));
