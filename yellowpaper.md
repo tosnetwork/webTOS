@@ -3013,20 +3013,26 @@ Stage-7 should answer the packaging question: **how are agents and skills built,
 
 By this point, ATOS should stop being only a kernel plus demos. It should become a platform where deployable agent artifacts are treated as first-class objects with explicit lifecycle, compatibility, and capability contracts.
 
+The full package manager design is specified in [PackageManager.md](PackageManager.md).
+
 Objectives:
 
 * finalize `skilld` and the mailbox-based skill installation protocol
-* define a signed package format for native agents, WASM agents, and skills
+* implement `pkgd` system agent for package lifecycle management (install, upgrade, rollback, uninstall, verify)
+* define the `.apkg` signed package format (TOML manifest + binary + Ed25519 signature)
+* implement `atos pkg` CLI tool (build, sign, install, list, upgrade, rollback, verify)
 * support capability declarations, runtime declarations, version compatibility, and upgrade/rollback policy
 * provide a reproducible developer and operator workflow from source to deployable artifact
 * keep plugin extensibility aligned with agent isolation rather than in-process extension
 
 Core additions:
 
-* **Package format**: define an ATOS package manifest containing runtime kind, entry points, capability requests, resource quotas, ABI version, and content hash
-* **Signing and provenance**: require packages and manifests to be signed so installation and replay can verify origin and integrity
+* **Package format (`.apkg`)**: TOML manifest containing runtime kind, entry point, capability requests, resource quotas, ABI version, content hash, and upgrade policy. Packages are content-addressed by `sha256` hash.
+* **Signing and provenance**: require packages and manifests to be signed with Ed25519 so installation and replay can verify origin and integrity
+* **pkgd system agent**: manages install/upgrade/rollback/uninstall lifecycle; delegates spawning to skilld; stores version metadata in its own keyspace
+* **Atomic upgrade**: checkpoint old agent → spawn new → migrate state → verify → terminate old. Failure at any step restores the checkpoint.
 * **Registry / distribution model**: support content-addressed retrieval from local bundles, cluster registries, or external repositories
-* **Upgrade semantics**: define canary rollout, rollback, compatibility checks, and state migration hooks for package upgrades
+* **Upgrade semantics**: define canary rollout, rollback, compatibility checks, and state migration hooks for package upgrades (auto/manual/none modes)
 * **Skill governance**: make `skilld` enforce capability subset rules, quota checks, policy checks, and package signature validation
 * **Build metadata**: capture reproducible build inputs so deployed artifacts can be matched to source and proofs
 
