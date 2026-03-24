@@ -494,7 +494,7 @@ In ProofGrade mode, all these opcodes trap with `FloatsDisabled`.
 - Page size: **65,536 bytes** (64 KiB) per WASM standard
 - Initial size: `memory_min_pages × 65,536` bytes
 - Maximum: `min(module_max_pages, MAX_MEMORY_PAGES)` pages
-- Hard limit: **MAX_MEMORY_PAGES = 16** → **1 MiB** maximum
+- Hard limit: **MAX_MEMORY_PAGES = 65,536** → **4 GiB** (WASM spec maximum, actual usage gated by agent `mem_quota`)
 
 ### 6.2 Memory access
 
@@ -538,8 +538,8 @@ CallFrame {
 }
 ```
 
-- Maximum call depth: **256 frames** (`MAX_CALL_DEPTH`)
-- Maximum total locals across all frames: **4,096** (`MAX_TOTAL_LOCALS`)
+- Maximum call depth: **1,000 frames** (`MAX_CALL_DEPTH`)
+- Maximum total locals across all frames: **65,536** (`MAX_TOTAL_LOCALS`)
 
 ### 7.2 Call mechanisms
 
@@ -565,7 +565,7 @@ BlockFrame {
 }
 ```
 
-- Maximum block nesting: **256** (`MAX_BLOCK_DEPTH`)
+- Maximum block nesting: **1,000** (`MAX_BLOCK_DEPTH`)
 - `br N` branches to the Nth enclosing label (0 = innermost)
 - For `block`/`if`: branch goes to `end` (forward)
 - For `loop`: branch goes to `start` (backward — loop re-entry)
@@ -581,7 +581,7 @@ BlockFrame {
 ### 7.5 Indirect call table
 
 - Element type: `funcref` only (WASM MVP)
-- Maximum table size: **65,536 entries** (`MAX_TABLE_SIZE`)
+- Maximum table size: **65,536 entries** (`MAX_TABLE_SIZE`, WASM spec limit)
 - Populated from element segments at instantiation
 - `call_indirect` validates the function type signature using `func_import_type()` for imports and `functions[].type_idx` for local functions; traps with `IndirectCallTypeMismatch` on mismatch
 - Null table entries (uninitialized) trap with `UndefinedElement`
@@ -750,27 +750,29 @@ runtime_class: 0 = ProofGrade, 1 = ReplayGrade, 2 = BestEffort
 
 ## 12. Implementation Limits
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_FUNCTIONS` | 1,024 | Total functions (imports + local) |
-| `MAX_IMPORTS` | 64 | Maximum imported functions/globals |
-| `MAX_EXPORTS` | 64 | Maximum exported items |
-| `MAX_LOCALS` | 128 | Locals per function (params + declared) |
-| `MAX_PARAMS` | 16 | Parameters per function type |
-| `MAX_RESULTS` | 16 | Return values per function type |
-| `MAX_STACK` | 1,024 | Operand stack depth |
-| `MAX_TOTAL_LOCALS` | 4,096 | Total locals across all call frames |
-| `MAX_CALL_DEPTH` | 256 | Maximum nested function calls |
-| `MAX_BLOCK_DEPTH` | 256 | Maximum nested blocks/loops/ifs |
-| `MAX_MEMORY_PAGES` | 256 | Maximum memory pages (16 MiB, gated by agent mem_quota) |
-| `WASM_PAGE_SIZE` | 65,536 | Bytes per memory page (64 KiB) |
-| `MAX_CODE_SIZE` | 1,048,576 | Maximum bytecode size (1 MiB) |
-| `MAX_GLOBALS` | 256 | Maximum global variables |
-| `MAX_TABLE_SIZE` | 65,536 | Maximum indirect call table entries |
-| `MAX_DATA_SEGMENTS` | 256 | Maximum data segments |
-| `MAX_ELEMENT_SEGMENTS` | 256 | Maximum element segments |
-| `MAX_BR_TABLE_SIZE` | 256 | Maximum br_table labels |
-| `MAX_NAME_BYTES` | 1,024 | Name buffer for imports/exports |
+Limits are aligned with [wasmi](https://github.com/wasmi-labs/wasmi) defaults. Actual memory usage is gated by the agent's `mem_quota`.
+
+| Constant | Value | wasmi default | Description |
+|----------|-------|-------------|-------------|
+| `MAX_FUNCTIONS` | 10,000 | 10,000 | Total functions (imports + local) |
+| `MAX_IMPORTS` | 10,000 | — | Maximum imported functions/globals |
+| `MAX_EXPORTS` | 10,000 | — | Maximum exported items |
+| `MAX_LOCALS` | 128 | — | Locals per function (params + declared) |
+| `MAX_PARAMS` | 32 | 32 | Parameters per function type |
+| `MAX_RESULTS` | 32 | 32 | Return values per function type |
+| `MAX_STACK` | 65,536 | ~1 MB | Operand stack depth (values) |
+| `MAX_TOTAL_LOCALS` | 65,536 | — | Total locals across all call frames |
+| `MAX_CALL_DEPTH` | 1,000 | 1,000 | Maximum nested function calls |
+| `MAX_BLOCK_DEPTH` | 1,000 | — | Maximum nested blocks/loops/ifs |
+| `MAX_MEMORY_PAGES` | 65,536 | unlimited | 4 GiB max (WASM spec limit, gated by agent mem_quota) |
+| `WASM_PAGE_SIZE` | 65,536 | 65,536 | Bytes per memory page (64 KiB) |
+| `MAX_CODE_SIZE` | 10,485,760 | unlimited | Maximum bytecode size (10 MiB) |
+| `MAX_GLOBALS` | 1,000 | 1,000 | Maximum global variables |
+| `MAX_TABLE_SIZE` | 65,536 | unlimited | Maximum indirect call table entries |
+| `MAX_DATA_SEGMENTS` | 1,000 | 1,000 | Maximum data segments |
+| `MAX_ELEMENT_SEGMENTS` | 1,000 | 1,000 | Maximum element segments |
+| `MAX_BR_TABLE_SIZE` | 4,096 | — | Maximum br_table labels |
+| `MAX_NAME_BYTES` | 1,024 | — | Name buffer for imports/exports |
 
 `[IMPL: ✅ types.rs — all constants]`
 
@@ -882,18 +884,23 @@ extern "C" {
 | Multi-memory | ✅ (proposal) | ❌ | ❌ | ❌ |
 | Reference types (externref) | ✅ (proposal) | ❌ | ❌ | ❌ |
 
-### 15.2 Limits (reduced from WASM spec but sufficient for standard compiler output)
+### 15.2 Limits (aligned with wasmi defaults)
 
-| Resource | Standard WASM | ATOS | Reason |
-|----------|--------------|------|--------|
-| Max memory | 4 GiB (65,536 pages) | **16 MiB** (256 pages) | Gated by agent mem_quota |
-| Max functions | Unlimited | **1,024** | Sufficient for most no_std programs |
-| Max code size | Unlimited | **1 MiB** | Sufficient for most no_std programs |
-| Max call depth | Unlimited | **256** | Stack overflow prevention |
-| Max locals per function | Unlimited | **128** | Sufficient for complex functions |
-| Max stack depth | Unlimited | **1,024** | Sufficient for deep expression trees |
-| Max params per function | Unlimited | **16** | Sufficient for most function signatures |
-| Max results per function | Unlimited | **16** | Multi-value support |
+ATOS limits are aligned with [wasmi](https://github.com/wasmi-labs/wasmi) to ensure compatibility with standard WASM toolchain output. Actual resource usage is controlled per-agent by `mem_quota` and `energy_budget`.
+
+| Resource | Standard WASM | ATOS | wasmi |
+|----------|--------------|------|-------|
+| Max memory | 4 GiB (65,536 pages) | **4 GiB** (65,536 pages) | unlimited (by Store) |
+| Max functions | Unlimited | **10,000** | 10,000 |
+| Max code size | Unlimited | **10 MiB** | unlimited |
+| Max call depth | Unlimited | **1,000** | 1,000 |
+| Max locals per function | Unlimited | **128** | — |
+| Max stack depth | Unlimited | **65,536 values** | ~1 MB |
+| Max params per function | Unlimited | **32** | 32 |
+| Max results per function | Unlimited | **32** | 32 |
+| Max globals | Unlimited | **1,000** | 1,000 |
+| Max data segments | Unlimited | **1,000** | 1,000 |
+| Max element segments | Unlimited | **1,000** | 1,000 |
 
 ### 15.3 Extensions beyond MVP
 

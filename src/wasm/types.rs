@@ -525,24 +525,25 @@ impl Opcode {
 
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
-pub const MAX_FUNCTIONS: usize = 1024;
+// Limits aligned with wasmi defaults (https://github.com/wasmi-labs/wasmi)
+pub const MAX_FUNCTIONS: usize = 10_000;
 pub const MAX_LOCALS: usize = 128;
-pub const MAX_STACK: usize = 1024;
-pub const MAX_MEMORY_PAGES: usize = 256;      // 256 * 64 KiB = 16 MiB max (gated by agent mem_quota)
-pub const WASM_PAGE_SIZE: usize = 65536;      // Standard WASM page size (64 KiB)
-pub const MAX_IMPORTS: usize = 64;
-pub const MAX_EXPORTS: usize = 64;
-pub const MAX_CODE_SIZE: usize = 1048576;     // 1 MB max code
-pub const MAX_CALL_DEPTH: usize = 256;
-pub const MAX_PARAMS: usize = 16;
-pub const MAX_RESULTS: usize = 16;
-pub const MAX_NAME_BYTES: usize = 1024;
-pub const MAX_BLOCK_DEPTH: usize = 256;
-pub const MAX_GLOBALS: usize = 256;
-pub const MAX_TABLE_SIZE: usize = 65536;
-pub const MAX_DATA_SEGMENTS: usize = 256;
-pub const MAX_ELEMENT_SEGMENTS: usize = 256;
-pub const MAX_BR_TABLE_SIZE: usize = 256;
+pub const MAX_STACK: usize = 65_536;           // ~1 MB of Value cells (wasmi: 1MB)
+pub const MAX_MEMORY_PAGES: usize = 65_536;    // 4 GiB max (WASM spec limit, gated by agent mem_quota)
+pub const WASM_PAGE_SIZE: usize = 65_536;      // Standard WASM page size (64 KiB)
+pub const MAX_IMPORTS: usize = 10_000;
+pub const MAX_EXPORTS: usize = 10_000;
+pub const MAX_CODE_SIZE: usize = 10_485_760;   // 10 MB max code
+pub const MAX_CALL_DEPTH: usize = 1_000;       // wasmi: 1000
+pub const MAX_PARAMS: usize = 32;              // wasmi: 32
+pub const MAX_RESULTS: usize = 32;             // wasmi: 32
+pub const MAX_NAME_BYTES: usize = 1_024;
+pub const MAX_BLOCK_DEPTH: usize = 1_000;
+pub const MAX_GLOBALS: usize = 1_000;          // wasmi: 1000
+pub const MAX_TABLE_SIZE: usize = 65_536;
+pub const MAX_DATA_SEGMENTS: usize = 1_000;    // wasmi: 1000
+pub const MAX_ELEMENT_SEGMENTS: usize = 1_000; // wasmi: 1000
+pub const MAX_BR_TABLE_SIZE: usize = 4_096;
 
 // ─── Error type ──────────────────────────────────────────────────────────────
 
