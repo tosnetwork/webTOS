@@ -1203,21 +1203,18 @@ impl WasmInstance {
                 }
             }
             0x0E => {
-                // br_table
+                // br_table — streaming: don't store all labels, just find the target
                 let count = try_exec!(self.read_leb128_u32()) as usize;
-                if count > MAX_BR_TABLE_SIZE {
-                    return ExecResult::Trap(WasmError::OutOfBounds);
-                }
-                // Read all label depths
-                let mut labels = [0u32; MAX_BR_TABLE_SIZE];
-                for i in 0..count {
-                    labels[i] = try_exec!(self.read_leb128_u32());
-                }
-                // Default label (always present after the count labels)
-                let default_label = try_exec!(self.read_leb128_u32());
-                // Pop index
                 let idx = try_exec!(self.pop_i32()) as usize;
-                let depth = if idx < count { labels[idx] } else { default_label };
+                let mut target_depth = 0u32;
+                for i in 0..count {
+                    let label = try_exec!(self.read_leb128_u32());
+                    if i == idx {
+                        target_depth = label;
+                    }
+                }
+                let default_label = try_exec!(self.read_leb128_u32());
+                let depth = if idx < count { target_depth } else { default_label };
                 try_exec!(self.branch(depth));
             }
             0x0F => {
@@ -2590,10 +2587,10 @@ impl WasmInstance {
                     0x64 => { let a = try_exec!(self.pop_v128()); let aa = a.as_u8x16(); let mut r = 0u32; for i in 0..16 { if aa[i] & 0x80 != 0 { r |= 1 << i; } } try_exec!(self.push(Value::I32(r as i32))); }
                     0x65 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); let (aa, bb) = (a.as_i16x8(), b.as_i16x8()); let mut r = [0u8; 16]; for i in 0..8 { r[i] = aa[i].clamp(-128,127) as i8 as u8; } for i in 0..8 { r[i+8] = bb[i].clamp(-128,127) as i8 as u8; } try_exec!(self.push(Value::V128(V128(r)))); }
                     0x66 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); let (aa, bb) = (a.as_i16x8(), b.as_i16x8()); let mut r = [0u8; 16]; for i in 0..8 { r[i] = aa[i].clamp(0,255) as u8; } for i in 0..8 { r[i+8] = bb[i].clamp(0,255) as u8; } try_exec!(self.push(Value::V128(V128(r)))); }
-                    0x67 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| libm::ceilf(a.as_f32x4()[i])))))); }
-                    0x68 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| libm::floorf(a.as_f32x4()[i])))))); }
-                    0x69 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| libm::truncf(a.as_f32x4()[i])))))); }
-                    0x6a => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| libm::rintf(a.as_f32x4()[i])))))); }
+                    0x67 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_ceil_f32(a.as_f32x4()[i])))))); }
+                    0x68 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_floor_f32(a.as_f32x4()[i])))))); }
+                    0x69 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_trunc_f32(a.as_f32x4()[i])))))); }
+                    0x6a => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_nearest_f32(a.as_f32x4()[i])))))); }
                     0x6b => { let s = try_exec!(self.pop_i32()) as u32; let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].wrapping_shl(s & 7)))))); }
                     0x6c => { let s = try_exec!(self.pop_i32()) as u32; let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i8x16(core::array::from_fn(|i| a.as_i8x16()[i].wrapping_shr(s & 7)))))); }
                     0x6d => { let s = try_exec!(self.pop_i32()) as u32; let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].wrapping_shr(s & 7)))))); }
@@ -2603,13 +2600,13 @@ impl WasmInstance {
                     0x71 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].wrapping_sub(b.as_u8x16()[i])))))); }
                     0x72 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i8x16(core::array::from_fn(|i| a.as_i8x16()[i].saturating_sub(b.as_i8x16()[i])))))); }
                     0x73 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].saturating_sub(b.as_u8x16()[i])))))); }
-                    0x74 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| libm::ceil(a.as_f64x2()[i])))))); }
-                    0x75 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| libm::floor(a.as_f64x2()[i])))))); }
+                    0x74 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_ceil_f64(a.as_f64x2()[i])))))); }
+                    0x75 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_floor_f64(a.as_f64x2()[i])))))); }
                     0x76 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i8x16(core::array::from_fn(|i| a.as_i8x16()[i].min(b.as_i8x16()[i])))))); }
                     0x77 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].min(b.as_u8x16()[i])))))); }
                     0x78 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i8x16(core::array::from_fn(|i| a.as_i8x16()[i].max(b.as_i8x16()[i])))))); }
                     0x79 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| a.as_u8x16()[i].max(b.as_u8x16()[i])))))); }
-                    0x7a => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| libm::trunc(a.as_f64x2()[i])))))); }
+                    0x7a => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_trunc_f64(a.as_f64x2()[i])))))); }
                     0x7b => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u8x16(core::array::from_fn(|i| ((a.as_u8x16()[i] as u16 + b.as_u8x16()[i] as u16 + 1) / 2) as u8))))); }
                     // ── Pairwise add (0x7c-0x7f) ─────────────────
                     0x7c => { let a = try_exec!(self.pop_v128()); let aa = a.as_i8x16(); try_exec!(self.push(Value::V128(V128::from_i16x8(core::array::from_fn(|i| aa[i*2] as i16 + aa[i*2+1] as i16))))); }
@@ -2637,7 +2634,7 @@ impl WasmInstance {
                     0x91 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i16x8(core::array::from_fn(|i| a.as_i16x8()[i].wrapping_sub(b.as_i16x8()[i])))))); }
                     0x92 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i16x8(core::array::from_fn(|i| a.as_i16x8()[i].saturating_sub(b.as_i16x8()[i])))))); }
                     0x93 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); let r: [i16; 8] = core::array::from_fn(|i| a.as_u16x8()[i].saturating_sub(b.as_u16x8()[i]) as i16); try_exec!(self.push(Value::V128(V128::from_i16x8(r)))); }
-                    0x94 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| libm::rint(a.as_f64x2()[i])))))); }
+                    0x94 => { let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_nearest_f64(a.as_f64x2()[i])))))); }
                     0x95 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i16x8(core::array::from_fn(|i| a.as_i16x8()[i].wrapping_mul(b.as_i16x8()[i])))))); }
                     0x96 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i16x8(core::array::from_fn(|i| a.as_i16x8()[i].min(b.as_i16x8()[i])))))); }
                     0x97 => { let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128()); let r: [i16; 8] = core::array::from_fn(|i| a.as_u16x8()[i].min(b.as_u16x8()[i]) as i16); try_exec!(self.push(Value::V128(V128::from_i16x8(r)))); }
