@@ -54,8 +54,14 @@ struct BlockFrame {
     end_pc: usize,
     /// Stack depth at block entry.
     stack_base: usize,
-    /// Number of result values the block produces.
+    /// Number of values consumed/produced on branch.
+    /// For blocks/if: this is the result count.
+    /// For loops: this is the param count (branch restarts with params).
     result_count: u8,
+    /// Number of result values produced when the block ends normally (falls through to End).
+    /// For blocks/if: same as result_count.
+    /// For loops: the actual result count from the block type.
+    end_result_count: u8,
     /// True if this is a Loop (branch goes to start), false for Block/If (branch goes to end).
     is_loop: bool,
 }
@@ -67,6 +73,7 @@ impl BlockFrame {
             end_pc: 0,
             stack_base: 0,
             result_count: 0,
+            end_result_count: 0,
             is_loop: false,
         }
     }
@@ -560,6 +567,33 @@ impl WasmInstance {
         Ok(())
     }
 
+    // ─── Type comparison ─────────────────────────────────────────────────
+
+    /// Check if two type indices refer to structurally equivalent function types.
+    fn types_structurally_equal(&self, type_a: u32, type_b: u32) -> bool {
+        let types = &self.module.func_types;
+        let (a_idx, b_idx) = (type_a as usize, type_b as usize);
+        if a_idx >= types.len() || b_idx >= types.len() {
+            return false;
+        }
+        let a = &types[a_idx];
+        let b = &types[b_idx];
+        if a.param_count != b.param_count || a.result_count != b.result_count {
+            return false;
+        }
+        for i in 0..a.param_count as usize {
+            if a.params[i] != b.params[i] {
+                return false;
+            }
+        }
+        for i in 0..a.result_count as usize {
+            if a.results[i] != b.results[i] {
+                return false;
+            }
+        }
+        true
+    }
+
     // ─── Block type decoding ────────────────────────────────────────────
 
     /// Decode a block type and return (param_count, result_count).
@@ -686,6 +720,40 @@ impl WasmInstance {
                 }
                 0xD0 => { let _ = self.read_leb128_i32()?; } // ref.null heaptype
                 0xD2 => { let _ = self.read_leb128_u32()?; } // ref.func funcidx
+                0xD5 | 0xD6 => { let _ = self.read_leb128_u32()?; } // br_on_null, br_on_non_null: label
+                0xFB => {
+                    // GC prefix: read sub-opcode, then skip its immediates
+                    let sub = self.read_leb128_u32()?;
+                    match sub {
+                        0 | 1 => { let _ = self.read_leb128_u32()?; } // struct.new, struct.new_default: typeidx
+                        2 | 3 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // struct.get, struct.get_s: typeidx fieldidx
+                        4 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // struct.get_u: typeidx fieldidx
+                        5 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // struct.set: typeidx fieldidx
+                        6 | 7 => { let _ = self.read_leb128_u32()?; } // array.new, array.new_default: typeidx
+                        8 => { let _ = self.read_leb128_u32()?; } // array.new_fixed: typeidx + size
+                            // Actually array.new_fixed has typeidx + u32 size
+                        9 | 10 | 11 => { let _ = self.read_leb128_u32()?; } // array.new_data/elem, array.get: typeidx
+                        12 | 13 => { let _ = self.read_leb128_u32()?; } // array.get_s, array.get_u: typeidx
+                        14 => { let _ = self.read_leb128_u32()?; } // array.set: typeidx
+                        15 => {} // array.len: no immediates
+                        16 => { let _ = self.read_leb128_u32()?; } // array.fill: typeidx
+                        17 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // array.copy: typeidx typeidx
+                        18 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // array.init_data
+                        19 => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // array.init_elem
+                        20 | 21 => { let _ = self.read_leb128_u32()?; } // ref.test, ref.test (nullable): heaptype
+                        22 | 23 => { let _ = self.read_leb128_u32()?; } // ref.cast, ref.cast (nullable): heaptype
+                        24 | 25 => { // br_on_cast, br_on_cast_fail
+                            let _ = self.read_byte()?; // flags
+                            let _ = self.read_leb128_u32()?; // label
+                            let _ = self.read_leb128_i32()?; // ht1
+                            let _ = self.read_leb128_i32()?; // ht2
+                        }
+                        26 => {} // any.convert_extern: no immediates
+                        27 => {} // extern.convert_any: no immediates
+                        28 => { let _ = self.read_leb128_u32()?; } // ref.i31
+                        _ => {} // Unknown GC sub-opcode — assume no immediates
+                    }
+                }
                 _ => {
                     // Most instructions have no immediates — just skip the opcode byte
                 }
@@ -837,6 +905,7 @@ impl WasmInstance {
             end_pc: func_code_offset + func_code_len,
             stack_base: self.stack_ptr,
             result_count,
+            end_result_count: result_count,
             is_loop: false,
         })?;
 
@@ -1012,13 +1081,14 @@ impl WasmInstance {
                     end_pc,
                     stack_base,
                     result_count,
+                    end_result_count: result_count,
                     is_loop: false,
                 }));
             }
             0x03 => {
                 // loop
                 let block_type = try_exec!(self.read_leb128_i32());
-                let (param_count, _result_count) = self.decode_block_type(block_type);
+                let (param_count, result_count) = self.decode_block_type(block_type);
                 let start_pc = self.pc;
                 let saved_pc = self.pc;
                 let end_pc = try_exec!(self.skip_to_end());
@@ -1031,6 +1101,7 @@ impl WasmInstance {
                     end_pc,
                     stack_base,
                     result_count: param_count,
+                    end_result_count: result_count,
                     is_loop: true,
                 }));
             }
@@ -1063,6 +1134,7 @@ impl WasmInstance {
                         end_pc: true_end_pc,
                         stack_base,
                         result_count,
+                        end_result_count: result_count,
                         is_loop: false,
                     }));
                 } else if has_else {
@@ -1073,6 +1145,7 @@ impl WasmInstance {
                         end_pc: true_end_pc,
                         stack_base,
                         result_count,
+                        end_result_count: result_count,
                         is_loop: false,
                     }));
                 } else {
@@ -1093,7 +1166,24 @@ impl WasmInstance {
                 // end
                 let base0b = if self.call_depth > 0 { self.call_stack[self.call_depth - 1].block_stack_base } else { 0 };
                 if self.block_depth > base0b {
-                    let _ = self.pop_block();
+                    let bf = try_exec!(self.pop_block());
+                    // Adjust stack: save results, reset to block's stack_base, push results back.
+                    // This handles multi-value blocks where stack_base includes params.
+                    // Use end_result_count for normal block end (not branch).
+                    let result_count = bf.end_result_count as usize;
+                    if self.stack_ptr != bf.stack_base + result_count {
+                        let mut results = [Value::I32(0); MAX_RESULTS];
+                        for i in (0..result_count).rev() {
+                            results[i] = match self.pop() {
+                                Ok(v) => v,
+                                Err(_) => Value::I32(0),
+                            };
+                        }
+                        self.stack_ptr = bf.stack_base;
+                        for i in 0..result_count {
+                            let _ = self.push(results[i]);
+                        }
+                    }
                 } else {
                     // End of function body
                     return self.do_return();
@@ -1198,9 +1288,57 @@ impl WasmInstance {
                     self.module.functions[local_idx].type_idx
                 };
                 if actual_type_idx != type_idx {
-                    return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
+                    // Structural type equivalence: compare actual signatures
+                    if !self.types_structurally_equal(actual_type_idx, type_idx) {
+                        return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
+                    }
                 }
                 // Pop current frame (tail call)
+                if self.call_depth > 0 {
+                    let frame = self.call_stack[self.call_depth - 1];
+                    self.call_depth -= 1;
+                    self.stack_ptr = frame.stack_base;
+                    self.pc = frame.return_pc;
+                    self.block_depth = frame.saved_block_depth;
+                }
+                if (func_idx as usize) < self.module.func_import_count() {
+                    return match self.handle_import_call(func_idx) {
+                        Ok(result) => result,
+                        Err(e) => ExecResult::Trap(e),
+                    };
+                }
+                if let Err(e) = self.enter_function(func_idx, true) {
+                    return ExecResult::Trap(e);
+                }
+            }
+
+            0x14 => {
+                // call_ref (typed function references proposal)
+                let _type_idx = try_exec!(self.read_leb128_u32());
+                let func_ref = try_exec!(self.pop_i32());
+                if func_ref < 0 {
+                    return ExecResult::Trap(WasmError::UninitializedElement);
+                }
+                let func_idx = func_ref as u32;
+                if (func_idx as usize) < self.module.func_import_count() {
+                    return match self.handle_import_call(func_idx) {
+                        Ok(result) => result,
+                        Err(e) => ExecResult::Trap(e),
+                    };
+                }
+                if let Err(e) = self.enter_function(func_idx, true) {
+                    return ExecResult::Trap(e);
+                }
+            }
+            0x15 => {
+                // return_call_ref (typed function references proposal)
+                let _type_idx = try_exec!(self.read_leb128_u32());
+                let func_ref = try_exec!(self.pop_i32());
+                if func_ref < 0 {
+                    return ExecResult::Trap(WasmError::UninitializedElement);
+                }
+                let func_idx = func_ref as u32;
+                // Pop current frame first (tail call optimization)
                 if self.call_depth > 0 {
                     let frame = self.call_stack[self.call_depth - 1];
                     self.call_depth -= 1;
@@ -1250,7 +1388,10 @@ impl WasmInstance {
                     self.module.functions[local_idx].type_idx
                 };
                 if actual_type_idx != type_idx {
-                    return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
+                    // Structural type equivalence: compare actual signatures
+                    if !self.types_structurally_equal(actual_type_idx, type_idx) {
+                        return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
+                    }
                 }
                 // Call the function (same as regular call)
                 if (func_idx as usize) < self.module.func_import_count() {
@@ -1305,6 +1446,37 @@ impl WasmInstance {
                 // ref.func funcidx
                 let idx = try_exec!(self.read_leb128_u32());
                 try_exec!(self.push(Value::I32(idx as i32)));
+            }
+            0xD4 => {
+                // ref.as_non_null
+                let val = try_exec!(self.pop_i32());
+                if val < 0 {
+                    return ExecResult::Trap(WasmError::UninitializedElement);
+                }
+                try_exec!(self.push(Value::I32(val)));
+            }
+            0xD5 => {
+                // br_on_null: read label, pop ref, if null branch, else push ref back
+                let label = try_exec!(self.read_leb128_u32());
+                let val = try_exec!(self.pop_i32());
+                if val < 0 {
+                    // null ref — branch
+                    try_exec!(self.branch(label));
+                } else {
+                    // non-null — push ref back and continue
+                    try_exec!(self.push(Value::I32(val)));
+                }
+            }
+            0xD6 => {
+                // br_on_non_null: read label, pop ref, if non-null push ref and branch, else continue
+                let label = try_exec!(self.read_leb128_u32());
+                let val = try_exec!(self.pop_i32());
+                if val >= 0 {
+                    // non-null — push ref and branch
+                    try_exec!(self.push(Value::I32(val)));
+                    try_exec!(self.branch(label));
+                }
+                // null — continue (don't push)
             }
 
             // ── Variable access ─────────────────────────────────────
@@ -2659,6 +2831,12 @@ impl WasmInstance {
 
                     _ => { return ExecResult::Trap(WasmError::InvalidOpcode(0xFD)); }
                 }
+            }
+
+            // ── 0xFB prefix: GC proposal (unsupported — trap) ───
+            0xFB => {
+                let _sub = try_exec!(self.read_leb128_u32());
+                return ExecResult::Trap(WasmError::UnsupportedProposal);
             }
 
             // ── 0xFE prefix: Threads/Atomics (unsupported — trap) ───

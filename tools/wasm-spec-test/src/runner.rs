@@ -578,6 +578,7 @@ impl WastRunner {
                 val_type,
                 mutable,
                 init_value: value,
+                init_global_ref: None,
             });
         }
 

@@ -34,6 +34,11 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
+    // Validate: no multi-memory (total memories must be <= 1)
+    if module.memory_count > 1 {
+        return Err(WasmError::InvalidSection);
+    }
+
     // Validate export indices and check for duplicate export names
     {
         let mut export_names = BTreeSet::new();
@@ -71,14 +76,16 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     }
 
     // Validate memory limits
-    if module.memory_min_pages > MAX_MEMORY_PAGES as u32 {
+    if module.memory_min_pages as u64 > MAX_MEMORY_PAGES as u64 {
         return Err(WasmError::MemoryOutOfBounds);
     }
-    if module.memory_max_pages != u32::MAX && module.memory_min_pages > module.memory_max_pages {
-        return Err(WasmError::MemoryOutOfBounds);
-    }
-    if module.memory_max_pages != u32::MAX && module.memory_max_pages as usize > MAX_MEMORY_PAGES {
-        return Err(WasmError::MemoryOutOfBounds);
+    if module.has_memory_max {
+        if module.memory_min_pages > module.memory_max_pages {
+            return Err(WasmError::MemoryOutOfBounds);
+        }
+        if module.memory_max_pages as u64 > MAX_MEMORY_PAGES as u64 {
+            return Err(WasmError::MemoryOutOfBounds);
+        }
     }
 
     // Validate table limits
@@ -86,6 +93,31 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         if let Some(max) = table.max {
             if table.min > max {
                 return Err(WasmError::TableIndexOutOfBounds);
+            }
+        }
+    }
+
+    // Validate global init expressions:
+    // Without extended-const, global.get in init expr can only reference imported globals.
+    // The referenced global must have index < global_import_count AND be immutable.
+    let global_import_count = count_global_imports(module);
+    for global in &module.globals {
+        if let Some(ref_idx) = global.init_global_ref {
+            if ref_idx as usize >= global_import_count {
+                return Err(WasmError::GlobalIndexOutOfBounds);
+            }
+            // The referenced imported global must be immutable
+            let mut gi: usize = 0;
+            for imp in &module.imports {
+                if let ImportKind::Global(_, mutable) = imp.kind {
+                    if gi == ref_idx as usize {
+                        if mutable {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        break;
+                    }
+                    gi += 1;
+                }
             }
         }
     }
@@ -140,7 +172,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 }
 
 fn count_table_imports(module: &WasmModule) -> usize {
-    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Table | ImportKind::TableWithLimits { .. })).count()
+    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Table)).count()
 }
 
 fn count_global_imports(module: &WasmModule) -> usize {
@@ -301,6 +333,30 @@ impl<'a> Validator<'a> {
 
     fn read_i64(&mut self) -> Result<i64, WasmError> {
         crate::wasm::decoder::decode_leb128_i64(self.code, &mut self.pc)
+    }
+
+    /// Read a memarg (alignment + offset) and validate alignment against max_align.
+    /// max_align is log2 of the natural alignment (0=1byte, 1=2byte, 2=4byte, 3=8byte, 4=16byte).
+    fn read_memarg(&mut self, max_align: u32) -> Result<(), WasmError> {
+        let align = self.read_u32()?;
+        // In non-multi-memory mode, if bit 6 is set it's a multi-memory encoding
+        if align >= 64 {
+            return Err(WasmError::TypeMismatch);
+        }
+        if align > max_align {
+            return Err(WasmError::TypeMismatch);
+        }
+        let _offset = self.read_u32()?;
+        Ok(())
+    }
+
+    /// Read a single byte and check it's 0x00 (for memory.size/memory.grow).
+    fn read_zero_byte(&mut self) -> Result<(), WasmError> {
+        let b = self.read_u8()?;
+        if b != 0x00 {
+            return Err(WasmError::ZeroByteExpected);
+        }
+        Ok(())
     }
 
     /// Decode a block type: -0x40 = void, -0x01..-0x04/-0x05 = single valtype, else type index
@@ -742,80 +798,142 @@ impl<'a> Validator<'a> {
                     self.pop_expect(ValType::I32)?; // index
                 }
                 // ── memory loads ──
-                // i32.load, i32.load8_s/u, i32.load16_s/u
-                0x28 | 0x2C | 0x2D | 0x2E | 0x2F => {
+                // i32.load
+                0x28 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
-                    self.pop_expect(ValType::I32)?; // address
+                    self.read_memarg(2)?;
+                    self.pop_expect(ValType::I32)?;
                     self.push_val(ValType::I32);
                 }
-                // i64.load, i64.load8_s/u, i64.load16_s/u, i64.load32_s/u
-                0x29 | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
+                // i32.load8_s, i32.load8_u
+                0x2C | 0x2D => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(0)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.push_val(ValType::I32);
+                }
+                // i32.load16_s, i32.load16_u
+                0x2E | 0x2F => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(1)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.push_val(ValType::I32);
+                }
+                // i64.load
+                0x29 => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(3)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.push_val(ValType::I64);
+                }
+                // i64.load8_s, i64.load8_u
+                0x30 | 0x31 => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(0)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.push_val(ValType::I64);
+                }
+                // i64.load16_s, i64.load16_u
+                0x32 | 0x33 => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(1)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.push_val(ValType::I64);
+                }
+                // i64.load32_s, i64.load32_u
+                0x34 | 0x35 => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(2)?;
                     self.pop_expect(ValType::I32)?;
                     self.push_val(ValType::I64);
                 }
                 // f32.load
                 0x2A => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(2)?;
                     self.pop_expect(ValType::I32)?;
                     self.push_val(ValType::F32);
                 }
                 // f64.load
                 0x2B => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(3)?;
                     self.pop_expect(ValType::I32)?;
                     self.push_val(ValType::F64);
                 }
-                // i32.store, i32.store8, i32.store16
-                0x36 | 0x3A | 0x3B => {
+                // i32.store
+                0x36 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(2)?;
                     self.pop_expect(ValType::I32)?; // value
                     self.pop_expect(ValType::I32)?; // address
                 }
-                // i64.store, i64.store8, i64.store16, i64.store32
-                0x37 | 0x3C | 0x3D | 0x3E => {
+                // i32.store8
+                0x3A => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
-                    self.pop_expect(ValType::I64)?; // value
-                    self.pop_expect(ValType::I32)?; // address
+                    self.read_memarg(0)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(ValType::I32)?;
+                }
+                // i32.store16
+                0x3B => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(1)?;
+                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(ValType::I32)?;
+                }
+                // i64.store
+                0x37 => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(3)?;
+                    self.pop_expect(ValType::I64)?;
+                    self.pop_expect(ValType::I32)?;
+                }
+                // i64.store8
+                0x3C => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(0)?;
+                    self.pop_expect(ValType::I64)?;
+                    self.pop_expect(ValType::I32)?;
+                }
+                // i64.store16
+                0x3D => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(1)?;
+                    self.pop_expect(ValType::I64)?;
+                    self.pop_expect(ValType::I32)?;
+                }
+                // i64.store32
+                0x3E => {
+                    if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                    self.read_memarg(2)?;
+                    self.pop_expect(ValType::I64)?;
+                    self.pop_expect(ValType::I32)?;
                 }
                 // f32.store
                 0x38 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(2)?;
                     self.pop_expect(ValType::F32)?;
                     self.pop_expect(ValType::I32)?;
                 }
                 // f64.store
                 0x39 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _align = self.read_u32()?;
-                    let _offset = self.read_u32()?;
+                    self.read_memarg(3)?;
                     self.pop_expect(ValType::F64)?;
                     self.pop_expect(ValType::I32)?;
                 }
                 // ── memory.size ──
                 0x3F => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _ = self.read_u32()?;
+                    self.read_zero_byte()?;
                     self.push_val(ValType::I32);
                 }
                 // ── memory.grow ──
                 0x40 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    let _ = self.read_u32()?;
+                    self.read_zero_byte()?;
                     self.pop_expect(ValType::I32)?;
                     self.push_val(ValType::I32);
                 }
@@ -997,7 +1115,10 @@ impl<'a> Validator<'a> {
                         // memory.init
                         8 => {
                             let data_idx = self.read_u32()?;
-                            let _mem_idx = self.read_u32()?;
+                            let mem_idx = self.read_u32()?;
+                            if !self.module.has_memory || mem_idx > 0 {
+                                return Err(WasmError::MemoryOutOfBounds);
+                            }
                             if data_idx as usize >= self.module.data_segments.len() {
                                 return Err(WasmError::OutOfBounds);
                             }
@@ -1014,15 +1135,21 @@ impl<'a> Validator<'a> {
                         }
                         // memory.copy
                         10 => {
-                            let _ = self.read_u32()?;
-                            let _ = self.read_u32()?;
+                            let dst = self.read_u32()?;
+                            let src = self.read_u32()?;
+                            if !self.module.has_memory || dst > 0 || src > 0 {
+                                return Err(WasmError::MemoryOutOfBounds);
+                            }
                             self.pop_expect(ValType::I32)?; // size
                             self.pop_expect(ValType::I32)?; // src
                             self.pop_expect(ValType::I32)?; // dest
                         }
                         // memory.fill
                         11 => {
-                            let _ = self.read_u32()?;
+                            let mem = self.read_u32()?;
+                            if !self.module.has_memory || mem > 0 {
+                                return Err(WasmError::MemoryOutOfBounds);
+                            }
                             self.pop_expect(ValType::I32)?; // size
                             self.pop_expect(ValType::I32)?; // value
                             self.pop_expect(ValType::I32)?; // dest
@@ -1102,29 +1229,43 @@ impl<'a> Validator<'a> {
         match sub {
             // v128.load
             0x00 => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+                self.read_memarg(4)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
             }
             // v128.load8x8_s/u, v128.load16x4_s/u, v128.load32x2_s/u
             0x01..=0x06 => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+                self.read_memarg(3)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
             }
-            // v128.load8_splat, v128.load16_splat, v128.load32_splat, v128.load64_splat
-            0x07..=0x0A => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+            // v128.load8_splat
+            0x07 => {
+                self.read_memarg(0)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load16_splat
+            0x08 => {
+                self.read_memarg(1)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load32_splat
+            0x09 => {
+                self.read_memarg(2)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load64_splat
+            0x0A => {
+                self.read_memarg(3)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
             }
             // v128.store
             0x0B => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+                self.read_memarg(4)?;
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
@@ -1277,29 +1418,83 @@ impl<'a> Validator<'a> {
                 self.push_val(ValType::V128);
             }
 
-            // v128.load8_lane..v128.load64_lane (0x54..0x57)
-            0x54..=0x57 => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+            // v128.load8_lane
+            0x54 => {
+                self.read_memarg(0)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
                 let _lane = self.code[self.pc]; self.pc += 1;
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
             }
-            // v128.store8_lane..v128.store64_lane (0x58..0x5B)
-            0x58..=0x5B => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+            // v128.load16_lane
+            0x55 => {
+                self.read_memarg(1)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load32_lane
+            0x56 => {
+                self.read_memarg(2)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load64_lane
+            0x57 => {
+                self.read_memarg(3)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.store8_lane
+            0x58 => {
+                self.read_memarg(0)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
                 let _lane = self.code[self.pc]; self.pc += 1;
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
-            // v128.load32_zero, v128.load64_zero (0x5C, 0x5D)
-            0x5C | 0x5D => {
-                let _align = self.read_u32()?;
-                let _offset = self.read_u32()?;
+            // v128.store16_lane
+            0x59 => {
+                self.read_memarg(1)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+            }
+            // v128.store32_lane
+            0x5A => {
+                self.read_memarg(2)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+            }
+            // v128.store64_lane
+            0x5B => {
+                self.read_memarg(3)?;
+                if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
+                let _lane = self.code[self.pc]; self.pc += 1;
+                self.pop_expect(ValType::V128)?;
+                self.pop_expect(ValType::I32)?;
+            }
+            // v128.load32_zero
+            0x5C => {
+                self.read_memarg(2)?;
+                self.pop_expect(ValType::I32)?;
+                self.push_val(ValType::V128);
+            }
+            // v128.load64_zero
+            0x5D => {
+                self.read_memarg(3)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
             }

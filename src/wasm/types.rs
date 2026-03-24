@@ -676,4 +676,5 @@ pub enum WasmError {
     DuplicateExport,
     InvalidConversionToInteger,
     MalformedUtf8,
+    ZeroByteExpected,
 }
