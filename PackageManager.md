@@ -4,7 +4,7 @@
 **Companion to:** Yellow Paper §27.4 (Stage-7)
 **Depends on:** skilld agent, wasmi integration, Ristretto integration
 
-> This document defines `atos-pkg` — the ATOS package manager. It plays the same role as `apt` on Debian or `cargo install` in Rust, but built on ATOS primitives: agents, capabilities, keyspaces, and cryptographic verification.
+> This document defines `atp` — the ATOS package manager. It plays the same role as `apt` on Debian or `cargo install` in Rust, but built on ATOS primitives: agents, capabilities, keyspaces, and cryptographic verification.
 
 ---
 
@@ -72,14 +72,14 @@ Packages are identified by their content hash, not by name+version. This enables
 - Reproducible builds (same source → same hash → same package)
 
 ```
-atos-pkg:sha256:a1b2c3d4...   ← globally unique, content-addressed
+atp:sha256:a1b2c3d4...   ← globally unique, content-addressed
 ```
 
 ## 3. Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  atos pkg install web-search-1.2.0.atos             │
+│  atp install web-search-1.2.0.atos             │
 │  (CLI tool, runs on developer machine)              │
 └─────────────────┬───────────────────────────────────┘
                   │ writes .atos to Agent Storage Region
@@ -142,31 +142,31 @@ Uninstall:
   Agent ← pkgd: { status: "ok" }
 ```
 
-## 4. CLI Tool: `atos pkg`
+## 4. CLI Tool: `atp`
 
 Runs on the developer's machine (Linux/macOS), communicates with ATOS via serial or network.
 
 ```bash
 # Build a package from source
-atos pkg build ./my-agent/
+atp build ./my-agent/
 # → my-agent-1.2.0.atos
 
 # Sign a package
-atos pkg sign my-agent-1.2.0.atos --key ~/.atos/signing-key.ed25519
+atp sign my-agent-1.2.0.atos --key ~/.atos/signing-key.ed25519
 # → signature.ed25519 embedded in package
 
 # Install to a running ATOS instance
-atos pkg install my-agent-1.2.0.atos --target serial:/dev/ttyUSB0
-atos pkg install my-agent-1.2.0.atos --target udp:192.168.1.100:9000
+atp install my-agent-1.2.0.atos --target serial:/dev/ttyUSB0
+atp install my-agent-1.2.0.atos --target udp:192.168.1.100:9000
 
 # Manage packages on a running instance
-atos pkg list --target serial:/dev/ttyUSB0
-atos pkg upgrade web-search --target udp:192.168.1.100:9000
-atos pkg rollback web-search --target serial:/dev/ttyUSB0
-atos pkg uninstall web-search --target serial:/dev/ttyUSB0
+atp list --target serial:/dev/ttyUSB0
+atp upgrade web-search --target udp:192.168.1.100:9000
+atp rollback web-search --target serial:/dev/ttyUSB0
+atp uninstall web-search --target serial:/dev/ttyUSB0
 
 # Verify a package offline (no ATOS instance needed)
-atos pkg verify my-agent-1.2.0.atos --pubkey alice.pub
+atp verify my-agent-1.2.0.atos --pubkey alice.pub
 ```
 
 ## 5. Upgrade Lifecycle
@@ -229,13 +229,13 @@ Phase 2 adds registry support:
 
 ```bash
 # Publish to a registry
-atos pkg publish my-agent-1.2.0.atos --registry https://pkg.atos.network
+atp publish my-agent-1.2.0.atos --registry https://pkg.atos.network
 
 # Install from registry
-atos pkg install web-search@1.2.0 --registry https://pkg.atos.network --target ...
+atp install web-search@1.2.0 --registry https://pkg.atos.network --target ...
 
 # Search
-atos pkg search "web search" --registry https://pkg.atos.network
+atp search "web search" --registry https://pkg.atos.network
 ```
 
 Registry is a simple content-addressed store:
@@ -246,7 +246,7 @@ Registry is a simple content-addressed store:
 
 ## 7. Comparison with Linux Package Managers
 
-| Feature | apt (Debian) | atos-pkg (ATOS) |
+| Feature | apt (Debian) | atp (ATOS) |
 |---------|-------------|-------------|
 | Dependency resolution | Complex (SAT solver) | **None needed** (self-contained agents) |
 | Shared libraries | Yes (DLL hell) | **No** (agents are isolated) |
@@ -265,7 +265,7 @@ Registry is a simple content-addressed store:
 
 - Define `.atos` format (TOML manifest + binary + signature)
 - Implement `pkgd` system agent (~300 lines): install, list, uninstall
-- Implement `atos pkg build/sign/install/list` CLI commands
+- Implement `atp build/sign/install/list` CLI commands
 - Transport: serial protocol (write to Agent Storage Region)
 
 ### Phase 2: Upgrade & Rollback (Stage-7)
@@ -278,7 +278,7 @@ Registry is a simple content-addressed store:
 ### Phase 3: Registry & Distribution (Stage-7+)
 
 - Content-addressed remote registry
-- `atos pkg publish/search` commands
+- `atp publish/search` commands
 - Cross-node package distribution via routerd
 - Canary rollout (partial traffic to new version)
 

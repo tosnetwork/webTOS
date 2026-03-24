@@ -3020,7 +3020,7 @@ Objectives:
 * finalize `skilld` and the mailbox-based skill installation protocol
 * implement `pkgd` system agent for package lifecycle management (install, upgrade, rollback, uninstall, verify)
 * define the `.atos` signed package format (TOML manifest + binary + Ed25519 signature)
-* implement `atos pkg` CLI tool (build, sign, install, list, upgrade, rollback, verify)
+* implement `atp` CLI tool (build, sign, install, list, upgrade, rollback, verify)
 * support capability declarations, runtime declarations, version compatibility, and upgrade/rollback policy
 * provide a reproducible developer and operator workflow from source to deployable artifact
 * keep plugin extensibility aligned with agent isolation rather than in-process extension
