@@ -60,11 +60,13 @@ ATOS does **not** impose a single determinism policy on all agents. Different ag
 
 ```rust
 pub enum RuntimeClass {
-    ProofGrade   = 0,  // strict determinism — no floats, no SIMD, no threads
-    ReplayGrade  = 1,  // relaxed — floats + SIMD allowed, no threads
-    BestEffort   = 2,  // full features — everything allowed (threads future)
+    BestEffort   = 0,  // default — full features, no restrictions
+    ReplayGrade  = 1,  // floats + SIMD allowed, no threads
+    ProofGrade   = 2,  // strict determinism — no floats, no SIMD, no threads
 }
 ```
+
+Default is **BestEffort** — agents get full WASM features out of the box. Agents that need verifiable execution explicitly opt in to ProofGrade. This is "open by default, restrict when needed" — the same principle as ATOS's capability model but applied to execution features.
 
 RuntimeClass is a **per-instance** property of `WasmInstance`, not a global compile-time flag. The same WASM module can be loaded under different classes by different agents.
 
@@ -726,7 +728,7 @@ sys_spawn_image(
 ) → agent_id or error
 
 runtime_kind:  0 = Native (ELF64), 1 = WASM
-runtime_class: 0 = ProofGrade, 1 = ReplayGrade, 2 = BestEffort
+runtime_class: 0 = BestEffort (default), 1 = ReplayGrade, 2 = ProofGrade
 ```
 
 ### 11.2 Loading flow

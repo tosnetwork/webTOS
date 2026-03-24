@@ -635,10 +635,11 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             };
 
             // Parse runtime class
+            // runtime_class: 0=BestEffort (default), 1=ReplayGrade, 2=ProofGrade
             let runtime_class = match runtime_class_raw {
-                0 => crate::wasm::types::RuntimeClass::ProofGrade,
+                0 => crate::wasm::types::RuntimeClass::BestEffort,
                 1 => crate::wasm::types::RuntimeClass::ReplayGrade,
-                2 => crate::wasm::types::RuntimeClass::BestEffort,
+                2 => crate::wasm::types::RuntimeClass::ProofGrade,
                 _ => return E_INVALID_ARG,
             };
 

@@ -71,28 +71,28 @@ impl Value {
 
 /// Per-agent execution class controlling which WASM features are allowed.
 ///
+/// Default is **BestEffort** (most permissive) — agents opt IN to stricter
+/// modes when they need verifiability, not opt OUT of features they need.
+///
+/// - **BestEffort** (default): full features — floats, SIMD, threads (future).
+///   No replay or proof guarantees. Suitable for general agents, AI inference,
+///   data processing, tool agents, and any workload that just needs to run.
+/// - **ReplayGrade**: floats and SIMD allowed, no threads.
+///   Execution is reproducible on the same hardware but not formally provable.
 /// - **ProofGrade**: strict determinism — no floats, no SIMD, no threads.
 ///   Execution can be replayed and independently verified. Produces
 ///   cryptographically meaningful ExecutionReceipts.
-/// - **ReplayGrade**: relaxed — floats and SIMD allowed, no threads.
-///   Execution is reproducible on the same hardware but not formally provable.
-///   Suitable for AI inference, data processing, and general computation.
-/// - **BestEffort**: full features — floats, SIMD, threads (future).
-///   No replay or proof guarantees. Suitable for tool agents and I/O helpers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RuntimeClass {
-    ProofGrade = 0,
+    BestEffort = 0,
     ReplayGrade = 1,
-    BestEffort = 2,
+    ProofGrade = 2,
 }
 
-/// Default runtime class for new agents.
-pub const DEFAULT_RUNTIME_CLASS: RuntimeClass = RuntimeClass::ProofGrade;
-
-/// Legacy constant — kept for backward compatibility during transition.
-/// New code should use `RuntimeClass` per-instance instead.
-pub const STRICT_DETERMINISM: bool = true;
+/// Default runtime class for new agents — most permissive.
+/// Agents that need verifiability explicitly request ProofGrade.
+pub const DEFAULT_RUNTIME_CLASS: RuntimeClass = RuntimeClass::BestEffort;
 
 /// WASM instruction opcodes — full MVP set (float opcodes always defined,
 /// enforcement is per-instance via RuntimeClass).
