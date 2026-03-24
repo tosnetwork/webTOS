@@ -158,8 +158,9 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
     for seg in &module.data_segments {
-        if seg.offset != u32::MAX && !has_memory {
-            return Err(WasmError::MemoryOutOfBounds);
+        if seg.offset != u32::MAX {
+            if !has_memory { return Err(WasmError::MemoryOutOfBounds); }
+            if seg.memory_idx > 0 { return Err(WasmError::MemoryOutOfBounds); }
         }
     }
 
@@ -373,8 +374,8 @@ impl<'a> Validator<'a> {
                 -0x03 => ValType::F32,   // 0x7D
                 -0x04 => ValType::F64,   // 0x7C
                 -0x05 => ValType::V128,  // 0x7B
-                -0x10 => ValType::I32,   // 0x70 = funcref (mapped to I32)
-                -0x11 => ValType::I32,   // 0x6F = externref (mapped to I32)
+                -0x10 => ValType::FuncRef,   // 0x70 = funcref
+                -0x11 => ValType::ExternRef, // 0x6F = externref
                 _ => return Err(WasmError::InvalidBlockType),
             };
             Ok((Vec::new(), alloc::vec![vt]))
@@ -615,7 +616,7 @@ impl<'a> Validator<'a> {
                     if type_idx as usize >= self.module.func_types.len() {
                         return Err(WasmError::TypeMismatch);
                     }
-                    if table_idx as usize >= self.total_tables && self.total_tables > 0 {
+                    if self.total_tables == 0 || table_idx as usize >= self.total_tables {
                         return Err(WasmError::TableIndexOutOfBounds);
                     }
                     self.pop_expect(ValType::I32)?; // table index operand
@@ -652,7 +653,7 @@ impl<'a> Validator<'a> {
                     if type_idx as usize >= self.module.func_types.len() {
                         return Err(WasmError::TypeMismatch);
                     }
-                    if table_idx as usize >= self.total_tables && self.total_tables > 0 {
+                    if self.total_tables == 0 || table_idx as usize >= self.total_tables {
                         return Err(WasmError::TableIndexOutOfBounds);
                     }
                     self.pop_expect(ValType::I32)?;
@@ -714,19 +715,19 @@ impl<'a> Validator<'a> {
                                 return Err(WasmError::TypeMismatch);
                             }
                             // Untyped select doesn't allow V128 or ref types
-                            if a == ValType::V128 {
+                            if a == ValType::V128 || a == ValType::FuncRef || a == ValType::ExternRef {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(a);
                         }
                         (StackType::Known(a), StackType::Unknown) => {
-                            if a == ValType::V128 {
+                            if a == ValType::V128 || a == ValType::FuncRef || a == ValType::ExternRef {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(a);
                         }
                         (StackType::Unknown, StackType::Known(b)) => {
-                            if b == ValType::V128 {
+                            if b == ValType::V128 || b == ValType::FuncRef || b == ValType::ExternRef {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(b);
@@ -1422,7 +1423,8 @@ impl<'a> Validator<'a> {
             0x54 => {
                 self.read_memarg(0)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 16 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
@@ -1431,7 +1433,8 @@ impl<'a> Validator<'a> {
             0x55 => {
                 self.read_memarg(1)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 8 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
@@ -1440,7 +1443,8 @@ impl<'a> Validator<'a> {
             0x56 => {
                 self.read_memarg(2)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 4 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
@@ -1449,7 +1453,8 @@ impl<'a> Validator<'a> {
             0x57 => {
                 self.read_memarg(3)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 2 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
                 self.push_val(ValType::V128);
@@ -1458,7 +1463,8 @@ impl<'a> Validator<'a> {
             0x58 => {
                 self.read_memarg(0)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 16 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
@@ -1466,7 +1472,8 @@ impl<'a> Validator<'a> {
             0x59 => {
                 self.read_memarg(1)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 8 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
@@ -1474,7 +1481,8 @@ impl<'a> Validator<'a> {
             0x5A => {
                 self.read_memarg(2)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 4 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
@@ -1482,7 +1490,8 @@ impl<'a> Validator<'a> {
             0x5B => {
                 self.read_memarg(3)?;
                 if self.pc >= self.end { return Err(WasmError::UnexpectedEnd); }
-                let _lane = self.code[self.pc]; self.pc += 1;
+                let lane = self.code[self.pc]; self.pc += 1;
+                if lane >= 2 { return Err(WasmError::OutOfBounds); }
                 self.pop_expect(ValType::V128)?;
                 self.pop_expect(ValType::I32)?;
             }
@@ -1592,7 +1601,8 @@ fn byte_to_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7C => Ok(ValType::F64),
         0x7B => Ok(ValType::V128),
         // funcref and externref — mapped to I32 like the decoder does
-        0x70 | 0x6F => Ok(ValType::I32),
+        0x70 => Ok(ValType::FuncRef),
+        0x6F => Ok(ValType::ExternRef),
         _ => Err(WasmError::TypeMismatch),
     }
 }

@@ -576,9 +576,8 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7D => Ok(ValType::F32),
         0x7C => Ok(ValType::F64),
         0x7B => Ok(ValType::V128),
-        // Reference types: funcref (0x70), externref (0x6F)
-        // Map to I32 as placeholder since we don't fully support them
-        0x70 | 0x6F => Ok(ValType::I32),
+        0x70 => Ok(ValType::FuncRef),
+        0x6F => Ok(ValType::ExternRef),
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -596,11 +595,11 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
         0x7D => Ok(ValType::F32),
         0x7C => Ok(ValType::F64),
         0x7B => Ok(ValType::V128),
-        0x70 | 0x6F => Ok(ValType::I32), // funcref, externref
+        0x70 => Ok(ValType::FuncRef),
+        0x6F => Ok(ValType::ExternRef),
         0x63 | 0x64 => {
-            // ref null/non-null heaptype: read and discard the heap type index
-            let _ = decode_leb128_i32(bytes, pos)?;
-            Ok(ValType::I32) // placeholder
+            let heap_type = decode_leb128_i32(bytes, pos)?;
+            if heap_type == -0x11 { Ok(ValType::ExternRef) } else { Ok(ValType::FuncRef) }
         }
         _ => Err(WasmError::TypeMismatch),
     }
