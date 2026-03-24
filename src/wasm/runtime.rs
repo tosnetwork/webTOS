@@ -2461,6 +2461,103 @@ impl WasmInstance {
                     0xfd => { let a = try_exec!(self.pop_v128()); let aa = a.as_f64x2(); try_exec!(self.push(Value::V128(V128::from_u32x4([sat_trunc_f64_u32(aa[0]), sat_trunc_f64_u32(aa[1]), 0, 0])))); }
                     0xfe => { let a = try_exec!(self.pop_v128()); let aa = a.as_i32x4(); try_exec!(self.push(Value::V128(V128::from_f64x2([aa[0] as f64, aa[1] as f64])))); }
                     0xff => { let a = try_exec!(self.pop_v128()); let aa = a.as_u32x4(); try_exec!(self.push(Value::V128(V128::from_f64x2([aa[0] as f64, aa[1] as f64])))); }
+                    // ── Relaxed SIMD (0x100-0x113) ────────────
+                    0x100 => { // i8x16.relaxed_swizzle (same as swizzle)
+                        let s = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let mut r = [0u8; 16]; for i in 0..16 { let idx = s.0[i]; r[i] = if idx < 16 { a.0[idx as usize] } else { 0 }; }
+                        try_exec!(self.push(Value::V128(V128(r))));
+                    }
+                    0x101 => { // i32x4.relaxed_trunc_f32x4_s (same as trunc_sat)
+                        let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_i32x4(core::array::from_fn(|i| sat_trunc_f32_i32(a.as_f32x4()[i]))))));
+                    }
+                    0x102 => { // i32x4.relaxed_trunc_f32x4_u
+                        let a = try_exec!(self.pop_v128()); try_exec!(self.push(Value::V128(V128::from_u32x4(core::array::from_fn(|i| sat_trunc_f32_u32(a.as_f32x4()[i]))))));
+                    }
+                    0x103 => { // i32x4.relaxed_trunc_f64x2_s_zero
+                        let a = try_exec!(self.pop_v128()); let aa = a.as_f64x2(); try_exec!(self.push(Value::V128(V128::from_i32x4([sat_trunc_f64_i32(aa[0]), sat_trunc_f64_i32(aa[1]), 0, 0]))));
+                    }
+                    0x104 => { // i32x4.relaxed_trunc_f64x2_u_zero
+                        let a = try_exec!(self.pop_v128()); let aa = a.as_f64x2(); try_exec!(self.push(Value::V128(V128::from_u32x4([sat_trunc_f64_u32(aa[0]), sat_trunc_f64_u32(aa[1]), 0, 0]))));
+                    }
+                    0x105 => { // f32x4.relaxed_madd (a*b+c)
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb, cc) = (a.as_f32x4(), b.as_f32x4(), c.as_f32x4());
+                        try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| aa[i] * bb[i] + cc[i])))));
+                    }
+                    0x106 => { // f32x4.relaxed_nmadd (-a*b+c)
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb, cc) = (a.as_f32x4(), b.as_f32x4(), c.as_f32x4());
+                        try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| -(aa[i] * bb[i]) + cc[i])))));
+                    }
+                    0x107 => { // f64x2.relaxed_madd (a*b+c)
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb, cc) = (a.as_f64x2(), b.as_f64x2(), c.as_f64x2());
+                        try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| aa[i] * bb[i] + cc[i])))));
+                    }
+                    0x108 => { // f64x2.relaxed_nmadd (-a*b+c)
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb, cc) = (a.as_f64x2(), b.as_f64x2(), c.as_f64x2());
+                        try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| -(aa[i] * bb[i]) + cc[i])))));
+                    }
+                    0x109 => { // i8x16.relaxed_laneselect (same as bitselect)
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let mut r = [0u8; 16]; for i in 0..16 { r[i] = (a.0[i] & c.0[i]) | (b.0[i] & !c.0[i]); }
+                        try_exec!(self.push(Value::V128(V128(r))));
+                    }
+                    0x10a => { // i16x8.relaxed_laneselect
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let mut r = [0u8; 16]; for i in 0..16 { r[i] = (a.0[i] & c.0[i]) | (b.0[i] & !c.0[i]); }
+                        try_exec!(self.push(Value::V128(V128(r))));
+                    }
+                    0x10b => { // i32x4.relaxed_laneselect
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let mut r = [0u8; 16]; for i in 0..16 { r[i] = (a.0[i] & c.0[i]) | (b.0[i] & !c.0[i]); }
+                        try_exec!(self.push(Value::V128(V128(r))));
+                    }
+                    0x10c => { // i64x2.relaxed_laneselect
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let mut r = [0u8; 16]; for i in 0..16 { r[i] = (a.0[i] & c.0[i]) | (b.0[i] & !c.0[i]); }
+                        try_exec!(self.push(Value::V128(V128(r))));
+                    }
+                    0x10d => { // f32x4.relaxed_min (same as min)
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_min_f32(a.as_f32x4()[i], b.as_f32x4()[i]))))));
+                    }
+                    0x10e => { // f32x4.relaxed_max (same as max)
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        try_exec!(self.push(Value::V128(V128::from_f32x4(core::array::from_fn(|i| Self::wasm_max_f32(a.as_f32x4()[i], b.as_f32x4()[i]))))));
+                    }
+                    0x10f => { // f64x2.relaxed_min
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_min_f64(a.as_f64x2()[i], b.as_f64x2()[i]))))));
+                    }
+                    0x110 => { // f64x2.relaxed_max
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        try_exec!(self.push(Value::V128(V128::from_f64x2(core::array::from_fn(|i| Self::wasm_max_f64(a.as_f64x2()[i], b.as_f64x2()[i]))))));
+                    }
+                    0x111 => { // i16x8.relaxed_q15mulr_s (same as q15mulr_sat_s)
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb) = (a.as_i16x8(), b.as_i16x8());
+                        let r: [i16; 8] = core::array::from_fn(|i| { let x = aa[i] as i32; let y = bb[i] as i32; ((x*y+(1<<14))>>15).clamp(i16::MIN as i32, i16::MAX as i32) as i16 });
+                        try_exec!(self.push(Value::V128(V128::from_i16x8(r))));
+                    }
+                    0x112 => { // i16x8.relaxed_dot_i8x16_i7x16_s
+                        let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb) = (a.as_i8x16(), b.as_i8x16());
+                        let r: [i16; 8] = core::array::from_fn(|i| (aa[i*2] as i16 * bb[i*2] as i16).saturating_add(aa[i*2+1] as i16 * bb[i*2+1] as i16));
+                        try_exec!(self.push(Value::V128(V128::from_i16x8(r))));
+                    }
+                    0x113 => { // i32x4.relaxed_dot_i8x16_i7x16_add_s
+                        let c = try_exec!(self.pop_v128()); let b = try_exec!(self.pop_v128()); let a = try_exec!(self.pop_v128());
+                        let (aa, bb) = (a.as_i8x16(), b.as_i8x16()); let cc = c.as_i32x4();
+                        let r: [i32; 4] = core::array::from_fn(|i| {
+                            let base = i * 4;
+                            let dot = (aa[base] as i32 * bb[base] as i32) + (aa[base+1] as i32 * bb[base+1] as i32) + (aa[base+2] as i32 * bb[base+2] as i32) + (aa[base+3] as i32 * bb[base+3] as i32);
+                            dot.wrapping_add(cc[i])
+                        });
+                        try_exec!(self.push(Value::V128(V128::from_i32x4(r))));
+                    }
+
                     _ => { return ExecResult::Trap(WasmError::InvalidOpcode(0xFD)); }
                 }
             }
