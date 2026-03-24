@@ -55,7 +55,30 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         crate::cost::record_consumption(caller_id, cost);
     }
 
-    match num {
+    // ── eBPF SyscallEntry hook ──
+    // Skip SYS_YIELD for performance (idle agent calls it constantly)
+    if num != SYS_YIELD {
+        let entry_ctx = crate::ebpf::attach::SyscallContext {
+            agent_id: caller_id,
+            syscall_num: num,
+            arg0: a1,
+            arg1: a2,
+            arg2: a3,
+        };
+        let entry_action = crate::ebpf::attach::run_at(
+            crate::ebpf::attach::AttachPoint::SyscallEntry(num),
+            &entry_ctx as *const crate::ebpf::attach::SyscallContext as u64,
+        );
+        if entry_action == crate::ebpf::types::Action::Deny {
+            crate::event::cap_denied(caller_id, 0xFE, num); // 0xFE = eBPF syscall entry denial
+            return E_NO_CAP;
+        }
+        if entry_action == crate::ebpf::types::Action::Log {
+            crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, num, 0, 0);
+        }
+    }
+
+    let result = match num {
         // ── 0: sys_yield ────────────────────────────────────────────────
         SYS_YIELD => {
             sched::yield_current();
@@ -69,6 +92,24 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             if !capability::agent_try_cap(caller_id, CapType::AgentSpawn, 0) {
                 crate::event::cap_denied(caller_id, CapType::AgentSpawn as u64, 0);
                 return E_NO_CAP;
+            }
+
+            // ── eBPF AgentSpawn check ──
+            let spawn_ctx = crate::ebpf::attach::SpawnContext {
+                parent_id: caller_id,
+                energy_quota: a2,
+                mem_quota: a3 as u32,
+            };
+            let spawn_action = crate::ebpf::attach::run_at(
+                crate::ebpf::attach::AttachPoint::AgentSpawn,
+                &spawn_ctx as *const crate::ebpf::attach::SpawnContext as u64,
+            );
+            if spawn_action == crate::ebpf::types::Action::Deny {
+                crate::event::cap_denied(caller_id, 0xFD, 0); // 0xFD = eBPF spawn denial
+                return E_NO_CAP;
+            }
+            if spawn_action == crate::ebpf::types::Action::Log {
+                crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, 0xFD, 0, 0);
             }
 
             let entry = a1;
@@ -134,6 +175,9 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 crate::event::cap_denied(caller_id, 0xFF, target_mailbox as u64); // 0xFF = eBPF policy denial
                 return E_NO_CAP;
             }
+            if ebpf_action == crate::ebpf::types::Action::Log {
+                crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, target_mailbox as u64, 0, 0);
+            }
 
             // Safety: the payload pointer comes from the calling agent's stack,
             // which is valid memory in Stage-1 (all agents share the kernel address space).
@@ -159,6 +203,24 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 
             match mailbox::recv_message(caller_id, mailbox_id) {
                 Ok(msg) => {
+                    // ── eBPF MailboxRecv check ──
+                    let recv_ctx = crate::ebpf::attach::MailboxContext {
+                        sender_id: msg.sender_id,
+                        target_mailbox: mailbox_id,
+                        payload_len: msg.len,
+                    };
+                    let recv_action = crate::ebpf::attach::run_at(
+                        crate::ebpf::attach::AttachPoint::MailboxRecv(mailbox_id),
+                        &recv_ctx as *const crate::ebpf::attach::MailboxContext as u64,
+                    );
+                    if recv_action == crate::ebpf::types::Action::Deny {
+                        // Message already dequeued; discard and return 0
+                        return 0;
+                    }
+                    if recv_action == crate::ebpf::types::Action::Log {
+                        crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, mailbox_id as u64, msg.sender_id as u64, 0);
+                    }
+
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         // Safety: the buffer pointer comes from the calling agent's stack.
@@ -195,6 +257,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
                 6 => CapType::Network,
+                7 => CapType::PolicyLoad,
                 _ => return E_INVALID_ARG,
             };
 
@@ -220,6 +283,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
                 6 => CapType::Network,
+                7 => CapType::PolicyLoad,
                 _ => return E_INVALID_ARG,
             };
 
@@ -323,6 +387,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 4 => CapType::StateRead,
                 5 => CapType::StateWrite,
                 6 => CapType::Network,
+                7 => CapType::PolicyLoad,
                 _ => return E_INVALID_ARG,
             };
 
@@ -343,6 +408,20 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 
             match mailbox::recv_message(caller_id, mailbox_id) {
                 Ok(msg) => {
+                    // ── eBPF MailboxRecv check ──
+                    let recv_ctx = crate::ebpf::attach::MailboxContext {
+                        sender_id: msg.sender_id,
+                        target_mailbox: mailbox_id,
+                        payload_len: msg.len,
+                    };
+                    let recv_action = crate::ebpf::attach::run_at(
+                        crate::ebpf::attach::AttachPoint::MailboxRecv(mailbox_id),
+                        &recv_ctx as *const crate::ebpf::attach::MailboxContext as u64,
+                    );
+                    if recv_action == crate::ebpf::types::Action::Deny {
+                        return 0;
+                    }
+
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         unsafe {
@@ -369,6 +448,24 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 
             if payload_len > MAX_MESSAGE_PAYLOAD {
                 return E_PAYLOAD_TOO_LARGE;
+            }
+
+            // ── eBPF policy check (same as SYS_SEND) ──
+            let ebpf_ctx = crate::ebpf::attach::MailboxContext {
+                sender_id: caller_id,
+                target_mailbox,
+                payload_len: payload_len as u16,
+            };
+            let ebpf_action = crate::ebpf::attach::run_at(
+                crate::ebpf::attach::AttachPoint::MailboxSend(target_mailbox),
+                &ebpf_ctx as *const crate::ebpf::attach::MailboxContext as u64,
+            );
+            if ebpf_action == crate::ebpf::types::Action::Deny {
+                crate::event::cap_denied(caller_id, 0xFF, target_mailbox as u64);
+                return E_NO_CAP;
+            }
+            if ebpf_action == crate::ebpf::types::Action::Log {
+                crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, target_mailbox as u64, 0, 0);
             }
 
             let payload = unsafe {
@@ -573,6 +670,20 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             // Try non-blocking recv first
             match mailbox::recv_message(caller_id, mailbox_id) {
                 Ok(msg) => {
+                    // ── eBPF MailboxRecv check ──
+                    let recv_ctx = crate::ebpf::attach::MailboxContext {
+                        sender_id: msg.sender_id,
+                        target_mailbox: mailbox_id,
+                        payload_len: msg.len,
+                    };
+                    let recv_action = crate::ebpf::attach::run_at(
+                        crate::ebpf::attach::AttachPoint::MailboxRecv(mailbox_id),
+                        &recv_ctx as *const crate::ebpf::attach::MailboxContext as u64,
+                    );
+                    if recv_action == crate::ebpf::types::Action::Deny {
+                        return 0;
+                    }
+
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
                         unsafe {
@@ -612,6 +723,21 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             // Check spawn capability
             if !capability::agent_try_cap(caller_id, CapType::AgentSpawn, 0) {
                 crate::event::cap_denied(caller_id, CapType::AgentSpawn as u64, 0);
+                return E_NO_CAP;
+            }
+
+            // ── eBPF AgentSpawn check ──
+            let spawn_ctx = crate::ebpf::attach::SpawnContext {
+                parent_id: caller_id,
+                energy_quota: _a4,
+                mem_quota: _a5 as u32,
+            };
+            let spawn_action = crate::ebpf::attach::run_at(
+                crate::ebpf::attach::AttachPoint::AgentSpawn,
+                &spawn_ctx as *const crate::ebpf::attach::SpawnContext as u64,
+            );
+            if spawn_action == crate::ebpf::types::Action::Deny {
+                crate::event::cap_denied(caller_id, 0xFD, 0);
                 return E_NO_CAP;
             }
 
@@ -680,7 +806,27 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             );
             E_INVALID_ARG
         }
+    };
+
+    // ── eBPF SyscallExit hook (audit only) ──
+    if num != SYS_YIELD {
+        let exit_ctx = crate::ebpf::attach::SyscallContext {
+            agent_id: caller_id,
+            syscall_num: num,
+            arg0: result as u64,
+            arg1: 0,
+            arg2: 0,
+        };
+        let exit_action = crate::ebpf::attach::run_at(
+            crate::ebpf::attach::AttachPoint::SyscallExit(num),
+            &exit_ctx as *const crate::ebpf::attach::SyscallContext as u64,
+        );
+        if exit_action == crate::ebpf::types::Action::Log {
+            crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, num, result as u64, 0);
+        }
     }
+
+    result
 }
 
 /// Entry point called from syscall_entry.asm when a ring 3 agent executes

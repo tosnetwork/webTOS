@@ -153,3 +153,21 @@ pub struct SpawnContext {
     pub energy_quota: u64,
     pub mem_quota: u32,
 }
+
+/// Iterate attached programs and call a callback for each active one.
+/// Returns the count of active programs.
+pub fn for_each_attached(mut f: impl FnMut(usize, &AttachPoint, usize)) -> usize {
+    let mut count = 0;
+    // Safety: single-core, no preemption in Stage-1
+    unsafe {
+        for i in 0..MAX_ATTACHED {
+            if let Some(ref prog) = PROGRAMS[i] {
+                if prog.active {
+                    f(i, &prog.attach_point, prog.len);
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}

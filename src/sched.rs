@@ -410,6 +410,20 @@ pub fn timer_tick() {
         }
     }
 
+    // ── eBPF TimerTick hook ──
+    // Run any eBPF programs attached at TimerTick.
+    // When no programs are attached, run_at short-circuits after
+    // scanning 16 empty slots — trivial cost at 100 Hz.
+    {
+        let tick_count = crate::arch::x86_64::timer::get_ticks();
+        let _action = crate::ebpf::attach::run_at(
+            crate::ebpf::attach::AttachPoint::TimerTick,
+            tick_count,
+        );
+        // Action is ignored for TimerTick — observational only.
+        // Programs use map helpers to record metrics or trigger alerts.
+    }
+
     // Preemptive reschedule
     if crate::deterministic::is_enabled() {
         if crate::deterministic::tick().is_some() {

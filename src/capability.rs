@@ -21,6 +21,7 @@ pub enum CapType {
     StateRead = 4,
     StateWrite = 5,
     Network = 6,
+    PolicyLoad = 7,
 }
 
 // ─── Capability struct ──────────────────────────────────────────────────────
@@ -240,12 +241,14 @@ pub fn create_root_capabilities() -> [Option<Capability>; MAX_CAPABILITIES_PER_A
     caps[4] = Some(Capability::new(CapType::StateRead, CAP_TARGET_WILDCARD));
     caps[5] = Some(Capability::new(CapType::StateWrite, CAP_TARGET_WILDCARD));
     caps[6] = Some(Capability::new(CapType::Network, CAP_TARGET_WILDCARD));
+    // PolicyLoad — root can load eBPF policies
+    caps[7] = Some(Capability::new(CapType::PolicyLoad, CAP_TARGET_WILDCARD));
 
     caps
 }
 
 /// Return the number of root capabilities (for setting cap_count).
-pub const ROOT_CAP_COUNT: usize = 7;
+pub const ROOT_CAP_COUNT: usize = 8;
 
 // ─── Cross-node capability signing ──────────────────────────────────────────
 

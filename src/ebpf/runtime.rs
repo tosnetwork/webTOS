@@ -403,8 +403,15 @@ impl EbpfVm {
                 }
             }
             HELPER_EMIT_EVENT => {
-                // r1 = event_code — fire-and-forget, always succeeds
-                // In a full implementation this would call into the event subsystem.
+                // r1 = event_code
+                let agent_id = crate::sched::current();
+                crate::event::emit(
+                    agent_id,
+                    crate::event::EventType::Custom,
+                    self.regs[1],  // event_code from eBPF program
+                    0,
+                    0,
+                );
                 self.regs[0] = 0;
             }
             HELPER_GET_TICK => {

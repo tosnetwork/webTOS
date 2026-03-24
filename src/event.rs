@@ -39,6 +39,7 @@ pub enum EventType {
     EnergyGranted = 19,
     MailboxPressure = 20,
     ChildAdopted = 21,
+    EbpfPolicy = 22,
 }
 
 impl EventType {
@@ -67,6 +68,7 @@ impl EventType {
             EventType::EnergyGranted => "ENERGY_GRANTED",
             EventType::MailboxPressure => "MAILBOX_PRESSURE",
             EventType::ChildAdopted => "CHILD_ADOPTED",
+            EventType::EbpfPolicy => "EBPF_POLICY",
         }
     }
 }

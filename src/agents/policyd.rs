@@ -9,7 +9,6 @@
 
 use crate::serial_println;
 use crate::agent::*;
-use crate::syscall;
 use crate::ebpf;
 
 const OP_ATTACH: u8 = 0x01;
@@ -19,32 +18,56 @@ const OP_LIST: u8 = 0x03;
 pub extern "C" fn policyd_entry() -> ! {
     serial_println!("[POLICYD] Policy engine started");
 
-    let my_mailbox: u64 = 6;
-    let mut recv_buf = [0u8; MAX_MESSAGE_PAYLOAD];
+    let my_id: crate::agent::AgentId = 6;
+    let my_mailbox: crate::agent::MailboxId = 6;
 
     loop {
-        let len = syscall::syscall(
-            SYS_RECV,
-            my_mailbox,
-            recv_buf.as_mut_ptr() as u64,
-            recv_buf.len() as u64,
-            0, 0,
-        );
-
-        if len > 0 {
-            let msg_len = len as usize;
-            if msg_len >= 1 {
-                let op = recv_buf[0];
-                match op {
-                    OP_ATTACH => handle_attach(&recv_buf, msg_len),
-                    OP_DETACH => handle_detach(&recv_buf, msg_len),
-                    OP_LIST => serial_println!("[POLICYD] Listing attached programs"),
-                    _ => {}
+        match crate::mailbox::recv_message(my_id, my_mailbox) {
+            Ok(msg) => {
+                let msg_len = msg.len as usize;
+                if msg_len >= 1 {
+                    let op = msg.payload[0];
+                    match op {
+                        OP_ATTACH => {
+                            if !crate::capability::agent_has_cap(
+                                msg.sender_id,
+                                crate::capability::CapType::PolicyLoad,
+                                0,
+                            ) {
+                                serial_println!(
+                                    "[POLICYD] Agent {} denied OP_ATTACH: no CAP_POLICY_LOAD",
+                                    msg.sender_id
+                                );
+                            } else {
+                                handle_attach(&msg.payload, msg_len);
+                            }
+                        }
+                        OP_DETACH => {
+                            if !crate::capability::agent_has_cap(
+                                msg.sender_id,
+                                crate::capability::CapType::PolicyLoad,
+                                0,
+                            ) {
+                                serial_println!(
+                                    "[POLICYD] Agent {} denied OP_DETACH: no CAP_POLICY_LOAD",
+                                    msg.sender_id
+                                );
+                            } else {
+                                handle_detach(&msg.payload, msg_len);
+                            }
+                        }
+                        OP_LIST => handle_list(),
+                        _ => {
+                            serial_println!("[POLICYD] Unknown opcode: {}", op);
+                        }
+                    }
                 }
             }
+            Err(_) => {} // no message available
         }
 
-        syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+        // Yield to other agents
+        crate::syscall::syscall(crate::agent::SYS_YIELD, 0, 0, 0, 0, 0);
     }
 }
 
@@ -106,4 +129,12 @@ fn handle_detach(recv_buf: &[u8], msg_len: usize) {
         ebpf::attach::detach(index);
         serial_println!("[POLICYD] Program detached: index={}", index);
     }
+}
+
+fn handle_list() {
+    serial_println!("[POLICYD] Attached programs:");
+    let count = crate::ebpf::attach::for_each_attached(|slot, point, len| {
+        serial_println!("[POLICYD]   slot={} point={:?} len={}", slot, point, len);
+    });
+    serial_println!("[POLICYD] Total: {} programs", count);
 }
