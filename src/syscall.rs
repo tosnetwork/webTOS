@@ -421,6 +421,9 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                     if recv_action == crate::ebpf::types::Action::Deny {
                         return 0;
                     }
+                    if recv_action == crate::ebpf::types::Action::Log {
+                        crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, mailbox_id as u64, msg.sender_id as u64, 0);
+                    }
 
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
@@ -683,6 +686,9 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                     if recv_action == crate::ebpf::types::Action::Deny {
                         return 0;
                     }
+                    if recv_action == crate::ebpf::types::Action::Log {
+                        crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, mailbox_id as u64, msg.sender_id as u64, 0);
+                    }
 
                     let copy_len = (msg.len as usize).min(buf_len);
                     if copy_len > 0 {
@@ -739,6 +745,9 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             if spawn_action == crate::ebpf::types::Action::Deny {
                 crate::event::cap_denied(caller_id, 0xFD, 0);
                 return E_NO_CAP;
+            }
+            if spawn_action == crate::ebpf::types::Action::Log {
+                crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, 0xFD, 0, 0);
             }
 
             let image_ptr = a1;
