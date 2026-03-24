@@ -134,6 +134,16 @@ pub extern "C" fn wasm_agent_entry() -> ! {
     let mut instance = wasm::runtime::WasmInstance::new(module, 50_000);
     serial_println!("[WASM_AGENT] Instance created with 50000 fuel");
 
+    // 3b. Run start function if present (WASM spec requirement)
+    match instance.run_start() {
+        wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
+        wasm::runtime::ExecResult::Trap(e) => {
+            serial_println!("[WASM_AGENT] Start function trapped: {:?}", e);
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+        _ => {}
+    }
+
     // 4. Call the run function and handle host calls in a loop
     let mut result = instance.call_func(run_idx, &[]);
     let mut host_calls = 0u64;

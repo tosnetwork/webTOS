@@ -410,24 +410,17 @@ impl WasmInstance {
     }
 
     /// WASM spec: f32.nearest rounds to nearest even.
+    /// Uses libm::rintf which implements IEEE 754 roundTiesToEven directly,
+    /// avoiding fragile float equality comparisons.
     fn wasm_nearest_f32(v: f32) -> f32 {
-        let rounded = libm::roundf(v);
-        // If exactly halfway, round to even
-        if libm::fabsf(v - rounded) == 0.5 && rounded as i64 % 2 != 0 {
-            if v > 0.0 { rounded - 1.0 } else { rounded + 1.0 }
-        } else {
-            rounded
-        }
+        if v.is_nan() { return v; }
+        libm::rintf(v)
     }
 
     /// WASM spec: f64.nearest rounds to nearest even.
     fn wasm_nearest_f64(v: f64) -> f64 {
-        let rounded = libm::round(v);
-        if libm::fabs(v - rounded) == 0.5 && rounded as i64 % 2 != 0 {
-            if v > 0.0 { rounded - 1.0 } else { rounded + 1.0 }
-        } else {
-            rounded
-        }
+        if v.is_nan() { return v; }
+        libm::rint(v)
     }
 
     /// WASM spec f32.min: propagate NaN, handle -0.0/+0.0.
@@ -698,6 +691,17 @@ impl WasmInstance {
     }
 
     // ─── Public API ─────────────────────────────────────────────────────
+
+    /// Run the module's start function if one is defined.
+    /// The WASM spec requires the start function to be invoked automatically
+    /// at instantiation before any exports are called.
+    pub fn run_start(&mut self) -> ExecResult {
+        if let Some(start_idx) = self.module.start_func {
+            self.call_func(start_idx, &[])
+        } else {
+            ExecResult::Ok
+        }
+    }
 
     /// Call a function by its absolute index (imports + local functions).
     pub fn call_func(&mut self, func_idx: u32, args: &[Value]) -> ExecResult {
@@ -1018,14 +1022,22 @@ impl WasmInstance {
                     None => return ExecResult::Trap(WasmError::UndefinedElement),
                 };
                 // Validate function signature matches expected type
-                if (func_idx as usize) >= self.module.imports.len() {
-                    let local_idx = func_idx as usize - self.module.imports.len();
-                    if local_idx < self.module.functions.len() {
-                        let actual_type = self.module.functions[local_idx].type_idx;
-                        if actual_type != type_idx {
-                            return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
-                        }
+                let actual_type_idx = if (func_idx as usize) < self.module.imports.len() {
+                    // Imported function: get type from import definition
+                    match self.module.imports[func_idx as usize].kind {
+                        ImportKind::Func(ti) => ti,
+                        _ => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
                     }
+                } else {
+                    // Local function: get type from function definition
+                    let local_idx = func_idx as usize - self.module.imports.len();
+                    if local_idx >= self.module.functions.len() {
+                        return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
+                    }
+                    self.module.functions[local_idx].type_idx
+                };
+                if actual_type_idx != type_idx {
+                    return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
                 }
                 // Call the function (same as regular call)
                 if (func_idx as usize) < self.module.imports.len() {
@@ -1045,10 +1057,20 @@ impl WasmInstance {
                 let _ = try_exec!(self.pop());
             }
             0x1B => {
-                // select
+                // select — WASM spec requires both operands to be same type
                 let c = try_exec!(self.pop_i32());
                 let val2 = try_exec!(self.pop());
                 let val1 = try_exec!(self.pop());
+                let types_match = match (&val1, &val2) {
+                    (Value::I32(_), Value::I32(_)) => true,
+                    (Value::I64(_), Value::I64(_)) => true,
+                    (Value::F32(_), Value::F32(_)) => true,
+                    (Value::F64(_), Value::F64(_)) => true,
+                    _ => false,
+                };
+                if !types_match {
+                    return ExecResult::Trap(WasmError::TypeMismatch);
+                }
                 try_exec!(self.push(if c != 0 { val1 } else { val2 }));
             }
 

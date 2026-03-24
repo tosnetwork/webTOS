@@ -285,6 +285,16 @@ pub extern "C" fn wasm_runner_entry() -> ! {
     };
     let mut instance = wasm::runtime::WasmInstance::new(module, fuel);
 
+    // Run start function if present (WASM spec requirement)
+    match instance.run_start() {
+        wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
+        wasm::runtime::ExecResult::Trap(e) => {
+            serial_println!("[WASM_RUNNER] Agent {} start function trapped: {:?}", agent_id, e);
+            crate::syscall::syscall(SYS_EXIT, 1, 0, 0, 0, 0);
+        }
+        _ => {}
+    }
+
     // Run the host-call interpreter loop (same pattern as wasm_agent.rs)
     let mut result = instance.call_func(run_idx, &[]);
     let mut host_calls = 0u64;

@@ -286,6 +286,7 @@ const SECTION_START: u8 = 8;
 const SECTION_ELEMENT: u8 = 9;
 const SECTION_CODE: u8 = 10;
 const SECTION_DATA: u8 = 11;
+const SECTION_DATA_COUNT: u8 = 12;
 
 // ─── WASM magic & version ───────────────────────────────────────────────────
 
@@ -336,6 +337,7 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
             SECTION_ELEMENT => decode_element_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_CODE => decode_code_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_DATA => decode_data_section(bytes, &mut pos, section_end, &mut module)?,
+            SECTION_DATA_COUNT => decode_data_count_section(bytes, &mut pos, section_end, &mut module)?,
             _ => {
                 // Skip unknown sections (pos is reset to section_end below)
             }
@@ -745,6 +747,19 @@ fn decode_data_section(
             data_len,
         });
     }
+    Ok(())
+}
+
+fn decode_data_count_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    _end: usize,
+    _module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    // DataCount section contains a single u32: the number of data segments.
+    // This is used by bulk-memory proposal for validation; we read and discard
+    // it since our data section decoder handles counting independently.
+    let _count = decode_leb128_u32(bytes, pos)?;
     Ok(())
 }
 
