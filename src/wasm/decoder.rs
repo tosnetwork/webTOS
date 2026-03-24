@@ -380,6 +380,7 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7E => Ok(ValType::I64),
         0x7D => Ok(ValType::F32),
         0x7C => Ok(ValType::F64),
+        0x7B => Ok(ValType::V128),
         _ => Err(WasmError::TypeMismatch),
     }
 }
