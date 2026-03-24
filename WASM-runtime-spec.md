@@ -48,7 +48,7 @@ WASM is an `AgentRuntime` (unlike eBPF-lite, which is the policy layer). WASM ag
 
 The yellowpaper §25.2.4 states: *"Full instruction-level determinism is only guaranteed for WASM agents (fuel-counted). Native agents have deterministic scheduling order but may produce different results per tick depending on CPU microarchitecture."* For maximum replay and proof guarantees, production agents should prefer WASM with ProofGrade RuntimeClass.
 
-`[IMPL: ✅ ~4,200 lines across 6 kernel modules + SDK crate]`
+`[IMPL: ✅ ~4,661 lines across 6 kernel modules + agent_loader + SDK crate]`
 
 ---
 
@@ -538,8 +538,8 @@ CallFrame {
 }
 ```
 
-- Maximum call depth: **64 frames** (`MAX_CALL_DEPTH`)
-- Maximum total locals across all frames: **256** (`MAX_TOTAL_LOCALS`)
+- Maximum call depth: **256 frames** (`MAX_CALL_DEPTH`)
+- Maximum total locals across all frames: **4,096** (`MAX_TOTAL_LOCALS`)
 
 ### 7.2 Call mechanisms
 
@@ -565,7 +565,7 @@ BlockFrame {
 }
 ```
 
-- Maximum block nesting: **64** (`MAX_BLOCK_DEPTH`)
+- Maximum block nesting: **256** (`MAX_BLOCK_DEPTH`)
 - `br N` branches to the Nth enclosing label (0 = innermost)
 - For `block`/`if`: branch goes to `end` (forward)
 - For `loop`: branch goes to `start` (backward — loop re-entry)
@@ -581,7 +581,7 @@ BlockFrame {
 ### 7.5 Indirect call table
 
 - Element type: `funcref` only (WASM MVP)
-- Maximum table size: **4,096 entries** (`MAX_TABLE_SIZE`)
+- Maximum table size: **65,536 entries** (`MAX_TABLE_SIZE`)
 - Populated from element segments at instantiation
 - `call_indirect` validates the function type signature using `func_import_type()` for imports and `functions[].type_idx` for local functions; traps with `IndirectCallTypeMismatch` on mismatch
 - Null table entries (uninitialized) trap with `UndefinedElement`
@@ -698,7 +698,13 @@ instance.resume(value)         // resume after host call
 
 ### 10.4 Entry point convention
 
-WASM agents must export a function named `"run"` as their entry point. The agent loader finds this export via `module.find_export_func(b"run")`.
+The agent loader searches for an entry point in this priority order:
+
+1. `"run"` — ATOS convention (preferred for SDK agents)
+2. `"_start"` — WASI / standard WASM convention
+3. `"main"` — C/Rust convention
+
+The first one found is used. This allows standard `rustc --target wasm32-unknown-unknown` compiled programs to run without requiring the ATOS SDK.
 
 `[IMPL: ✅ runtime.rs — WasmInstance with runtime_class, ExecResult, call_func/resume/run/run_start]`
 
@@ -727,14 +733,14 @@ runtime_class: 0 = ProofGrade, 1 = ReplayGrade, 2 = BestEffort
 
 ```text
 1. wasm::decoder::decode(image_bytes) → WasmModule  (class-agnostic)
-2. Validate: module must export a "run" function
+2. Validate: module must export an entry point ("run", "_start", or "main")
 3. Store WasmModule + RuntimeClass in kernel tables (indexed by agent_id)
 4. Create kernel-mode agent with wasm_runner_entry as entry point
 5. wasm_runner_entry:
    a. Retrieve module and runtime_class from tables
    b. Create WasmInstance::with_class(module, fuel, runtime_class)
    c. Run start function (if present)
-   d. Call exported "run" function
+   d. Call entry point ("run" or "_start" or "main", first found)
    e. Loop: dispatch host calls, resume, until completion/trap/fuel
 ```
 
@@ -746,25 +752,25 @@ runtime_class: 0 = ProofGrade, 1 = ReplayGrade, 2 = BestEffort
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `MAX_FUNCTIONS` | 64 | Total functions (imports + local) |
-| `MAX_IMPORTS` | 16 | Maximum imported functions/globals |
-| `MAX_EXPORTS` | 16 | Maximum exported items |
-| `MAX_LOCALS` | 32 | Locals per function (params + declared) |
-| `MAX_PARAMS` | 8 | Parameters per function type |
-| `MAX_RESULTS` | 4 | Return values per function type |
-| `MAX_STACK` | 256 | Operand stack depth |
-| `MAX_TOTAL_LOCALS` | 256 | Total locals across all call frames |
-| `MAX_CALL_DEPTH` | 64 | Maximum nested function calls |
-| `MAX_BLOCK_DEPTH` | 64 | Maximum nested blocks/loops/ifs |
-| `MAX_MEMORY_PAGES` | 16 | Maximum memory pages (1 MiB) |
+| `MAX_FUNCTIONS` | 1,024 | Total functions (imports + local) |
+| `MAX_IMPORTS` | 64 | Maximum imported functions/globals |
+| `MAX_EXPORTS` | 64 | Maximum exported items |
+| `MAX_LOCALS` | 128 | Locals per function (params + declared) |
+| `MAX_PARAMS` | 16 | Parameters per function type |
+| `MAX_RESULTS` | 16 | Return values per function type |
+| `MAX_STACK` | 1,024 | Operand stack depth |
+| `MAX_TOTAL_LOCALS` | 4,096 | Total locals across all call frames |
+| `MAX_CALL_DEPTH` | 256 | Maximum nested function calls |
+| `MAX_BLOCK_DEPTH` | 256 | Maximum nested blocks/loops/ifs |
+| `MAX_MEMORY_PAGES` | 256 | Maximum memory pages (16 MiB, gated by agent mem_quota) |
 | `WASM_PAGE_SIZE` | 65,536 | Bytes per memory page (64 KiB) |
-| `MAX_CODE_SIZE` | 65,536 | Maximum bytecode size (64 KiB) |
-| `MAX_GLOBALS` | 64 | Maximum global variables |
-| `MAX_TABLE_SIZE` | 4,096 | Maximum indirect call table entries |
-| `MAX_DATA_SEGMENTS` | 64 | Maximum data segments |
-| `MAX_ELEMENT_SEGMENTS` | 64 | Maximum element segments |
+| `MAX_CODE_SIZE` | 1,048,576 | Maximum bytecode size (1 MiB) |
+| `MAX_GLOBALS` | 256 | Maximum global variables |
+| `MAX_TABLE_SIZE` | 65,536 | Maximum indirect call table entries |
+| `MAX_DATA_SEGMENTS` | 256 | Maximum data segments |
+| `MAX_ELEMENT_SEGMENTS` | 256 | Maximum element segments |
 | `MAX_BR_TABLE_SIZE` | 256 | Maximum br_table labels |
-| `MAX_NAME_BYTES` | 256 | Name buffer for imports/exports |
+| `MAX_NAME_BYTES` | 1,024 | Name buffer for imports/exports |
 
 `[IMPL: ✅ types.rs — all constants]`
 
@@ -811,7 +817,7 @@ runtime_class: 0 = ProofGrade, 1 = ReplayGrade, 2 = BestEffort
 
 ## 14. SDK (atos-wasm-sdk)
 
-The `atos-wasm-sdk` Rust crate provides safe wrappers for writing WASM agents.
+The `atos-wasm-sdk` Rust crate provides **optional** safe wrappers for writing WASM agents. The SDK is not required — any `no_std` Rust program compiled with `rustc --target wasm32-unknown-unknown` that exports `run`, `_start`, or `main` can run on ATOS directly. The SDK simply makes it more convenient to interact with ATOS host functions.
 
 ### 14.1 Usage
 
@@ -876,18 +882,18 @@ extern "C" {
 | Multi-memory | ✅ (proposal) | ❌ | ❌ | ❌ |
 | Reference types (externref) | ✅ (proposal) | ❌ | ❌ | ❌ |
 
-### 15.2 Reduced limits
+### 15.2 Limits (reduced from WASM spec but sufficient for standard compiler output)
 
 | Resource | Standard WASM | ATOS | Reason |
 |----------|--------------|------|--------|
-| Max memory | 4 GiB (65,536 pages) | **1 MiB** (16 pages) | Kernel memory conservation |
-| Max functions | Unlimited | **64** | Bounded complexity |
-| Max code size | Unlimited | **64 KiB** | Bounded decoding time |
-| Max call depth | Unlimited | **64** | Stack overflow prevention |
-| Max locals per function | Unlimited | **32** | Memory conservation |
-| Max stack depth | Unlimited | **256** | Memory conservation |
-| Max params per function | Unlimited | **8** | Bounded call frames |
-| Max results per function | Unlimited | **4** | Bounded return handling |
+| Max memory | 4 GiB (65,536 pages) | **16 MiB** (256 pages) | Gated by agent mem_quota |
+| Max functions | Unlimited | **1,024** | Sufficient for most no_std programs |
+| Max code size | Unlimited | **1 MiB** | Sufficient for most no_std programs |
+| Max call depth | Unlimited | **256** | Stack overflow prevention |
+| Max locals per function | Unlimited | **128** | Sufficient for complex functions |
+| Max stack depth | Unlimited | **1,024** | Sufficient for deep expression trees |
+| Max params per function | Unlimited | **16** | Sufficient for most function signatures |
+| Max results per function | Unlimited | **16** | Multi-value support |
 
 ### 15.3 Extensions beyond MVP
 
@@ -941,13 +947,9 @@ Per Yellow Paper §24.3.1, §25.2, and §27:
 | `sys_cap_query` | Query own capabilities | Medium |
 | `sys_time_get` | Read deterministic tick counter | Medium |
 
-### 16.3 Limit increases (recommended)
+### 16.3 Limit increases
 
-| Limit | Current | Recommended | Reason |
-|-------|---------|-------------|--------|
-| MAX_MEMORY_PAGES | 16 (1 MiB) | 256 (16 MiB) | Complex agents need more working memory |
-| MAX_CODE_SIZE | 64 KiB | 256 KiB | Larger programs with u256 library code |
-| MAX_FUNCTIONS | 64 | 256 | Programs with many helper functions |
+All limits have been raised to support standard compiler output (see §12). No further increases are currently planned.
 
 ---
 
@@ -956,11 +958,11 @@ Per Yellow Paper §24.3.1, §25.2, and §27:
 | File | Lines | Description |
 |------|-------|-------------|
 | `src/wasm/mod.rs` | ~5 | Module declaration |
-| `src/wasm/types.rs` | ~520 | RuntimeClass, value types, 203 opcodes, 30 error variants, all limits |
-| `src/wasm/decoder.rs` | ~900 | Binary format parser, 12 section decoders, func_import_count/type, LEB128 |
+| `src/wasm/types.rs` | ~581 | RuntimeClass, value types, 203 opcodes, 30 error variants, all limits |
+| `src/wasm/decoder.rs` | ~931 | Binary format parser, 12 section decoders, func_import_count/type, LEB128 |
 | `src/wasm/validator.rs` | ~58 | Basic structural validation |
-| `src/wasm/runtime.rs` | ~2,300 | Stack machine interpreter, per-instance RuntimeClass, all opcode handlers |
-| `src/wasm/host.rs` | ~175 | Host function resolver (N-th func import scan), 6 syscall bridges |
-| `src/agents/wasm_agent.rs` | ~210 | Demo WASM agent with hand-crafted binary |
-| `src/agent_loader.rs` | ~430 | Agent loading: spawn_from_image_with_class, WASM_RUNTIME_CLASSES table |
-| `sdk/atos-wasm-sdk/src/lib.rs` | ~92 | Agent SDK: safe host function wrappers |
+| `src/wasm/runtime.rs` | ~2,228 | Stack machine interpreter, per-instance RuntimeClass, all opcode handlers |
+| `src/wasm/host.rs` | ~177 | Host function resolver (N-th func import scan), 6 syscall bridges |
+| `src/agents/wasm_agent.rs` | ~209 | Demo WASM agent with hand-crafted binary |
+| `src/agent_loader.rs` | ~472 | Agent loading: spawn_from_image_with_class, multi-entry-point support |
+| `sdk/atos-wasm-sdk/src/lib.rs` | ~92 | Agent SDK (optional): safe host function wrappers |
