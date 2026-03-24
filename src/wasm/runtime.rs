@@ -646,7 +646,7 @@ impl WasmInstance {
 
     /// Enter a WASM-defined function (not an import).
     fn enter_function(&mut self, func_idx: u32, keep_args_on_stack: bool) -> Result<(), WasmError> {
-        let local_func_idx = func_idx as usize - self.module.imports.len();
+        let local_func_idx = func_idx as usize - self.module.func_import_count();
 
         // Extract everything we need from the module into local variables
         // so we don't hold any borrows of self.module during mutation.
@@ -724,20 +724,31 @@ impl WasmInstance {
     }
 
     /// Prepare a host call (import invocation).
-    fn handle_import_call(&mut self, import_idx: u32) -> Result<ExecResult, WasmError> {
-        let idx = import_idx as usize;
-        if idx >= self.module.imports.len() {
-            return Err(WasmError::ImportNotFound(import_idx));
+    fn handle_import_call(&mut self, func_idx: u32) -> Result<ExecResult, WasmError> {
+        // Find the N-th function import (func_idx indexes only function imports)
+        let mut func_count: u32 = 0;
+        let mut found_imp = None;
+        for imp in &self.module.imports {
+            if let ImportKind::Func(_) = imp.kind {
+                if func_count == func_idx {
+                    found_imp = Some(imp);
+                    break;
+                }
+                func_count = func_count.saturating_add(1);
+            }
         }
-        let imp = &self.module.imports[idx];
+        let imp = match found_imp {
+            Some(i) => i,
+            None => return Err(WasmError::ImportNotFound(func_idx)),
+        };
 
         let type_idx = match imp.kind {
             ImportKind::Func(ti) => ti as usize,
-            _ => return Err(WasmError::ImportNotFound(import_idx)),
+            _ => return Err(WasmError::ImportNotFound(func_idx)),
         };
 
         if type_idx >= self.module.func_types.len() {
-            return Err(WasmError::FunctionNotFound(import_idx));
+            return Err(WasmError::FunctionNotFound(func_idx));
         }
         let ft = &self.module.func_types[type_idx];
 
@@ -748,7 +759,7 @@ impl WasmInstance {
             args[i] = self.pop()?;
         }
 
-        Ok(ExecResult::HostCall(import_idx, args, param_count))
+        Ok(ExecResult::HostCall(func_idx, args, param_count))
     }
 
     // ─── Public API ─────────────────────────────────────────────────────
@@ -774,7 +785,7 @@ impl WasmInstance {
         }
 
         // Check if it's an import
-        if (func_idx as usize) < self.module.imports.len() {
+        if (func_idx as usize) < self.module.func_import_count() {
             return match self.handle_import_call(func_idx) {
                 Ok(result) => result,
                 Err(e) => ExecResult::Trap(e),
@@ -991,7 +1002,7 @@ impl WasmInstance {
             0x10 => {
                 // call
                 let func_idx = try_exec!(self.read_leb128_u32());
-                if (func_idx as usize) < self.module.imports.len() {
+                if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
                         Err(e) => ExecResult::Trap(e),
@@ -1013,7 +1024,7 @@ impl WasmInstance {
                     self.pc = frame.return_pc;
                     self.block_depth = 0;
                 }
-                if (func_idx as usize) < self.module.imports.len() {
+                if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
                         Err(e) => ExecResult::Trap(e),
@@ -1036,13 +1047,13 @@ impl WasmInstance {
                     None => return ExecResult::Trap(WasmError::UndefinedElement),
                 };
                 // Validate type signature for both imports and local functions
-                let actual_type_idx = if (func_idx as usize) < self.module.imports.len() {
-                    match self.module.imports[func_idx as usize].kind {
-                        ImportKind::Func(ti) => ti,
-                        _ => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
+                let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
+                    match self.module.func_import_type(func_idx) {
+                        Some(ti) => ti,
+                        None => return ExecResult::Trap(WasmError::IndirectCallTypeMismatch),
                     }
                 } else {
-                    let local_idx = func_idx as usize - self.module.imports.len();
+                    let local_idx = func_idx as usize - self.module.func_import_count();
                     if local_idx >= self.module.functions.len() {
                         return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
                     }
@@ -1059,7 +1070,7 @@ impl WasmInstance {
                     self.pc = frame.return_pc;
                     self.block_depth = 0;
                 }
-                if (func_idx as usize) < self.module.imports.len() {
+                if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
                         Err(e) => ExecResult::Trap(e),
@@ -1084,7 +1095,7 @@ impl WasmInstance {
                     None => return ExecResult::Trap(WasmError::UndefinedElement),
                 };
                 // Validate function signature matches expected type
-                let actual_type_idx = if (func_idx as usize) < self.module.imports.len() {
+                let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
                     // Imported function: get type from import definition
                     match self.module.imports[func_idx as usize].kind {
                         ImportKind::Func(ti) => ti,
@@ -1092,7 +1103,7 @@ impl WasmInstance {
                     }
                 } else {
                     // Local function: get type from function definition
-                    let local_idx = func_idx as usize - self.module.imports.len();
+                    let local_idx = func_idx as usize - self.module.func_import_count();
                     if local_idx >= self.module.functions.len() {
                         return ExecResult::Trap(WasmError::FunctionNotFound(func_idx));
                     }
@@ -1102,7 +1113,7 @@ impl WasmInstance {
                     return ExecResult::Trap(WasmError::IndirectCallTypeMismatch);
                 }
                 // Call the function (same as regular call)
-                if (func_idx as usize) < self.module.imports.len() {
+                if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
                         Err(e) => ExecResult::Trap(e),

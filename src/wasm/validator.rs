@@ -35,7 +35,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     }
 
     // Validate export function indices
-    let total_functions = module.imports.len() + module.functions.len();
+    let total_functions = module.func_import_count() + module.functions.len();
     for exp in &module.exports {
         match exp.kind {
             crate::wasm::decoder::ExportKind::Func(idx) => {

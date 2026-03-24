@@ -185,7 +185,29 @@ impl WasmModule {
 
     /// Look up a name stored in the names buffer.
     pub fn get_name(&self, offset: usize, len: usize) -> &[u8] {
-        &self.names[offset..offset + len]
+        let end = offset.saturating_add(len).min(self.names.len());
+        let start = offset.min(end);
+        &self.names[start..end]
+    }
+
+    /// Count the number of function imports (not global/table/memory imports).
+    /// WASM function index space = func_import_count + local function count.
+    pub fn func_import_count(&self) -> usize {
+        self.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Func(_))).count()
+    }
+
+    /// Get the type index of the N-th function import.
+    pub fn func_import_type(&self, func_idx: u32) -> Option<u32> {
+        let mut count: u32 = 0;
+        for imp in &self.imports {
+            if let ImportKind::Func(ti) = imp.kind {
+                if count == func_idx {
+                    return Some(ti);
+                }
+                count = count.saturating_add(1);
+            }
+        }
+        None
     }
 
     /// Find an exported function index by name.
@@ -877,6 +899,27 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
             // i64.const
             let v = decode_leb128_i64(bytes, pos)?;
             Value::I64(v)
+        }
+        0x43 => {
+            // f32.const
+            if STRICT_DETERMINISM {
+                return Err(WasmError::FloatsDisabled);
+            }
+            if *pos + 4 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
+            let v = f32::from_le_bytes([bytes[*pos], bytes[*pos+1], bytes[*pos+2], bytes[*pos+3]]);
+            *pos += 4;
+            Value::F32(v)
+        }
+        0x44 => {
+            // f64.const
+            if STRICT_DETERMINISM {
+                return Err(WasmError::FloatsDisabled);
+            }
+            if *pos + 8 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
+            let mut b8 = [0u8; 8];
+            b8.copy_from_slice(&bytes[*pos..*pos+8]);
+            *pos += 8;
+            Value::F64(f64::from_le_bytes(b8))
         }
         0x23 => {
             // global.get (reference to imported global — return placeholder)
