@@ -22,12 +22,12 @@ apt solves packaging for a shared-everything OS. ATOS is a shared-nothing OS. Th
 
 ATOS needs a package manager not for dependency management, but for **lifecycle management**: install, upgrade, rollback, verify, and uninstall agents with signed provenance and capability control.
 
-## 2. Package Format: `.atos`
+## 2. Package Format: `.tos`
 
 An ATOS package is a simple archive containing a manifest and one or more binaries:
 
 ```
-my-agent-1.2.0.atos
+my-agent-1.2.0.tos
 ├── manifest.toml          # Package metadata
 ├── agent.wasm             # or agent.jar, agent.elf
 └── signature.ed25519      # Ed25519 signature over manifest + binary hash
@@ -79,15 +79,15 @@ atp:sha256:a1b2c3d4...   ← globally unique, content-addressed
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  atp install web-search-1.2.0.atos             │
+│  atp install web-search-1.2.0.tos             │
 │  (CLI tool, runs on developer machine)              │
 └─────────────────┬───────────────────────────────────┘
-                  │ writes .atos to Agent Storage Region
+                  │ writes .tos to Agent Storage Region
                   │ or sends via serial/network
                   ▼
 ┌─────────────────────────────────────────────────────┐
 │  pkgd (Package Manager Agent)                       │
-│  - Reads .atos from storage or mailbox              │
+│  - Reads .tos from storage or mailbox              │
 │  - Verifies signature + manifest                    │
 │  - Checks capability subset rule                    │
 │  - Calls skilld to spawn the agent                  │
@@ -110,8 +110,8 @@ A new system agent (like policyd, stated, netd) that manages the package lifecyc
 
 | Operation | Protocol |
 |-----------|----------|
-| `install` | Receive .atos bytes → verify → skilld spawn → record metadata |
-| `upgrade` | Receive new .atos → checkpoint old agent → spawn new → migrate keyspace → terminate old |
+| `install` | Receive .tos bytes → verify → skilld spawn → record metadata |
+| `upgrade` | Receive new .tos → checkpoint old agent → spawn new → migrate keyspace → terminate old |
 | `rollback` | Restore checkpoint of previous version (code + state) |
 | `uninstall` | Terminate agent → clean keyspace → remove metadata |
 | `list` | Return all installed packages with versions |
@@ -149,15 +149,15 @@ Runs on the developer's machine (Linux/macOS), communicates with ATOS via serial
 ```bash
 # Build a package from source
 atp build ./my-agent/
-# → my-agent-1.2.0.atos
+# → my-agent-1.2.0.tos
 
 # Sign a package
-atp sign my-agent-1.2.0.atos --key ~/.atos/signing-key.ed25519
+atp sign my-agent-1.2.0.tos --key ~/.tos/signing-key.ed25519
 # → signature.ed25519 embedded in package
 
 # Install to a running ATOS instance
-atp install my-agent-1.2.0.atos --target serial:/dev/ttyUSB0
-atp install my-agent-1.2.0.atos --target udp:192.168.1.100:9000
+atp install my-agent-1.2.0.tos --target serial:/dev/ttyUSB0
+atp install my-agent-1.2.0.tos --target udp:192.168.1.100:9000
 
 # Manage packages on a running instance
 atp list --target serial:/dev/ttyUSB0
@@ -166,7 +166,7 @@ atp rollback web-search --target serial:/dev/ttyUSB0
 atp uninstall web-search --target serial:/dev/ttyUSB0
 
 # Verify a package offline (no ATOS instance needed)
-atp verify my-agent-1.2.0.atos --pubkey alice.pub
+atp verify my-agent-1.2.0.tos --pubkey alice.pub
 ```
 
 ## 5. Upgrade Lifecycle
@@ -174,7 +174,7 @@ atp verify my-agent-1.2.0.atos --pubkey alice.pub
 ```
 v1.0.0 running                    v1.1.0 arrives
 ┌──────────┐                      ┌──────────┐
-│ Agent A  │                      │ .atos    │
+│ Agent A  │                      │ .tos    │
 │ keyspace │                      │ (new bin)│
 │ caps     │                      └────┬─────┘
 └────┬─────┘                           │
@@ -223,24 +223,24 @@ Three modes declared in manifest:
 
 ## 6. Registry (Future)
 
-Phase 1 uses local `.atos` files (CLI → serial/network → pkgd).
+Phase 1 uses local `.tos` files (CLI → serial/network → pkgd).
 
 Phase 2 adds registry support:
 
 ```bash
 # Publish to a registry
-atp publish my-agent-1.2.0.atos --registry https://pkg.atos.network
+atp publish my-agent-1.2.0.tos --registry https://pkg.tos.network
 
 # Install from registry
-atp install web-search@1.2.0 --registry https://pkg.atos.network --target ...
+atp install web-search@1.2.0 --registry https://pkg.tos.network --target ...
 
 # Search
-atp search "web search" --registry https://pkg.atos.network
+atp search "web search" --registry https://pkg.tos.network
 ```
 
 Registry is a simple content-addressed store:
-- Upload: `PUT /pkg/{sha256-hash}` with `.atos` body
-- Download: `GET /pkg/{sha256-hash}` → `.atos` body
+- Upload: `PUT /pkg/{sha256-hash}` with `.tos` body
+- Download: `GET /pkg/{sha256-hash}` → `.tos` body
 - Search: `GET /search?q=...` → manifest list
 - No server-side trust needed — packages are self-verifying (signature + hash)
 
@@ -263,7 +263,7 @@ Registry is a simple content-addressed store:
 
 ### Phase 1: pkgd Agent + CLI (Stage-4 closure)
 
-- Define `.atos` format (TOML manifest + binary + signature)
+- Define `.tos` format (TOML manifest + binary + signature)
 - Implement `pkgd` system agent (~300 lines): install, list, uninstall
 - Implement `atp build/sign/install/list` CLI commands
 - Transport: serial protocol (write to Agent Storage Region)
