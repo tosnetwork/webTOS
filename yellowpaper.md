@@ -2007,6 +2007,8 @@ Runtime notes:
 
 #### 24.3.1 WASM Runtime `[IMPL: ✅ 1,981 lines]`
 
+> **Full specification:** [`WASM-runtime-spec.md`](WASM-runtime-spec.md) — complete reference including determinism policy, supported opcode matrix (196 opcodes, 134 active / 62 float-disabled), host function ABI, memory model, fuel metering, implementation limits, SDK usage, and differences from standard WASM MVP.
+
 WASM is the primary sandboxed runtime for ATOS agents. It provides portable, deterministic execution with fine-grained memory safety.
 
 Runtime host interface:
