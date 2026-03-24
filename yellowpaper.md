@@ -2944,6 +2944,7 @@ Priority closure items:
 * eBPF-lite SDK and toolchain so policy is not limited to hand-assembled bytecode
 * MSI-X wiring for real hardware interrupt delivery
 * complete brokered HTTP/TCP path in `netd`, rather than UDP-only transport and HTTP-like stubs
+* **Ristretto JVM integration** (Phase 1–2): port [Ristretto](https://github.com/theseus-rs/ristretto) as a native ATOS agent to provide Java execution capability. Java's standard APIs (file I/O, networking, threading) are virtualized through ATOS primitives — files map to keyspaces, sockets map to netd mailbox proxy, threads map to child agents. Java programs run unmodified, gaining ATOS capability isolation, eBPF policy filtering, energy metering, and verifiable execution for free. See [Ristretto.md](Ristretto.md) for the full porting plan. `[IMPL: ⏳ Planned]`
 
 ### 27.2 Stage-5: Trusted Authority Plane `[IMPL: ⏳ Planned]`
 
