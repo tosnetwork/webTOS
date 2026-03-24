@@ -1,0 +1,10 @@
+[package]
+name = "wasm-spec-test"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side WebAssembly spec testsuite runner for the ATOS WASM engine"
+
+[dependencies]
+anyhow = "1"
+libm = "0.2"
+wast = { version = "228.0.0", features = ["wasm-module"] }
