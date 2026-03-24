@@ -1452,7 +1452,7 @@ impl WasmInstance {
                 let _type_idx = try_exec!(self.read_leb128_u32());
                 let func_ref = try_exec!(self.pop_i32());
                 if func_ref < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement(0));
+                    return ExecResult::Trap(WasmError::NullFunctionReference);
                 }
                 let func_idx = func_ref as u32;
                 if (func_idx as usize) < self.module.func_import_count() {
@@ -1470,7 +1470,7 @@ impl WasmInstance {
                 let _type_idx = try_exec!(self.read_leb128_u32());
                 let func_ref = try_exec!(self.pop_i32());
                 if func_ref < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement(0));
+                    return ExecResult::Trap(WasmError::NullFunctionReference);
                 }
                 let func_idx = func_ref as u32;
                 // Pop current frame first (tail call optimization)
@@ -1587,7 +1587,7 @@ impl WasmInstance {
                 // ref.as_non_null
                 let val = try_exec!(self.pop_i32());
                 if val < 0 {
-                    return ExecResult::Trap(WasmError::UninitializedElement(0));
+                    return ExecResult::Trap(WasmError::NullReference);
                 }
                 try_exec!(self.push(Value::I32(val)));
             }

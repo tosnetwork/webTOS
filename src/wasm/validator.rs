@@ -71,6 +71,9 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                         return Err(WasmError::OutOfBounds);
                     }
                 }
+                ExportKind::Tag(_) => {
+                    // Tag exports are not validated further (exception handling proposal)
+                }
             }
         }
     }
@@ -221,6 +224,19 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                 &seg.offset_expr_info, global_import_count, total_globals,
                 module, ValType::I32,
             )?;
+        }
+        // Validate per-item expression types for expression-based segments (flags 4-7)
+        for item_info in &seg.item_expr_infos {
+            // Each item expression must produce exactly 1 value
+            if item_info.stack_depth != 1 {
+                return Err(WasmError::TypeMismatch);
+            }
+            // The item expression result type must match the segment's elem_type
+            if let Some(item_type) = item_info.result_type {
+                if !ref_types_compatible(item_type, seg.elem_type) {
+                    return Err(WasmError::TypeMismatch);
+                }
+            }
         }
     }
 
@@ -830,6 +846,12 @@ impl<'a> Validator<'a> {
                         return Err(WasmError::FunctionNotFound(func_idx));
                     }
                     let ft = self.func_type(func_idx)?;
+                    // return_call: callee return types must match current function's return types
+                    let result_count = ft.result_count as usize;
+                    let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
+                    if callee_results != self.return_types {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     let param_count = ft.param_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
                     for i in (0..params.len()).rev() {
@@ -854,6 +876,12 @@ impl<'a> Validator<'a> {
                     }
                     self.pop_expect(ValType::I32)?;
                     let ft = &self.module.func_types[type_idx as usize];
+                    // return_call_indirect: callee return types must match current function's
+                    let result_count = ft.result_count as usize;
+                    let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
+                    if callee_results != self.return_types {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     let param_count = ft.param_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
                     for i in (0..params.len()).rev() {
@@ -872,7 +900,11 @@ impl<'a> Validator<'a> {
                     let result_count = ft.result_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
                     let results: Vec<ValType> = ft.results[..result_count].to_vec();
-                    let _ = self.pop_opd()?; // function reference
+                    // call_ref requires (ref null $type_idx); reject ExternRef
+                    let ref_val = self.pop_opd()?;
+                    if ref_val == StackType::Known(ValType::ExternRef) {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     for i in (0..params.len()).rev() {
                         self.pop_expect(params[i])?;
                     }

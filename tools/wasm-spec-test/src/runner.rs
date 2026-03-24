@@ -119,6 +119,9 @@ pub struct WastRunner {
     instances: HashMap<String, InstanceHandle>,
     current: Option<InstanceHandle>,
     anonymous_instances: usize,
+    /// Memory sharing pairs: (importer, exporter).
+    /// When either side's memory changes, sync to the other.
+    memory_shares: Vec<(InstanceHandle, InstanceHandle)>,
 }
 
 impl WastRunner {
@@ -129,6 +132,7 @@ impl WastRunner {
             instances: HashMap::new(),
             current: None,
             anonymous_instances: 0,
+            memory_shares: Vec::new(),
         }
     }
 
@@ -355,6 +359,7 @@ impl WastRunner {
     fn instantiate_module_bytes(&mut self, name: Option<&str>, bytes: &[u8]) -> RunnerResult<InstanceHandle> {
         let mut module = self.decode_module(bytes)?;
         self.inject_imported_globals(&mut module)?;
+        self.fixup_funcref_globals(&mut module)?;
         self.inject_imported_memory(&mut module)?;
         self.inject_imported_tables(&mut module)?;
         self.ensure_linkable_imports(&module)?;
@@ -366,8 +371,24 @@ impl WastRunner {
         if name.is_none() {
             self.anonymous_instances += 1;
         }
-        let instance = WasmInstance::with_class(module, DEFAULT_FUEL, RuntimeClass::BestEffort)
-            .map_err(|err| RunnerError::trap(err))?;
+        let instance = match WasmInstance::with_class(module, DEFAULT_FUEL, RuntimeClass::BestEffort) {
+            Ok(inst) => inst,
+            Err(err) => {
+                // On instantiation failure (e.g., OOB data/element segments), the spec
+                // requires that segments applied *before* the failure persist in shared
+                // memory/tables.  Apply partial segments to the exporter before returning.
+                // We need the module back; re-decode it cheaply just for segment info.
+                if let (Some(mem_src), Ok(failed_module)) = (&memory_source, self.decode_module(bytes)) {
+                    self.apply_partial_data_segments_to_shared(&failed_module, mem_src);
+                }
+                if !table_sources.is_empty() {
+                    if let Ok(failed_module) = self.decode_module(bytes) {
+                        self.apply_partial_elem_segments_to_shared(&failed_module, &table_sources);
+                    }
+                }
+                return Err(RunnerError::trap(err));
+            }
+        };
         let handle = Rc::new(RefCell::new(InstanceRecord {
             instance,
         }));
@@ -416,6 +437,8 @@ impl WastRunner {
             let copy_back = record.instance.memory_size.min(src_mut.instance.memory_size);
             src_mut.instance.memory[..copy_back]
                 .copy_from_slice(&record.instance.memory[..copy_back]);
+            // Track memory sharing for later sync
+            self.memory_shares.push((handle.clone(), src_handle.clone()));
         }
 
         // Share tables: copy exporter's table entries, then re-apply element segments
@@ -447,29 +470,88 @@ impl WastRunner {
                 }
             }
             drop(src);
-            // Re-apply importer's active element segments for this table
+            // Re-apply importer's active element segments for this table.
             use crate::wasm::decoder::ElemMode;
             let segs: Vec<_> = record.instance.module.element_segments.iter()
                 .filter(|s| s.mode == ElemMode::Active && s.table_idx as usize == tbl_idx)
                 .map(|s| (s.offset as usize, s.func_indices.clone()))
                 .collect();
-            for (offset, func_indices) in segs {
+
+            // Track which positions are from the importer's element segments
+            let mut importer_positions: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (offset, func_indices) in &segs {
                 for (i, &func_idx) in func_indices.iter().enumerate() {
                     let idx = offset + i;
                     if idx < record.instance.tables[tbl_idx].len() {
+                        importer_positions.insert(idx);
                         record.instance.tables[tbl_idx][idx] =
                             if func_idx == u32::MAX { None } else { Some(func_idx) };
                     }
                 }
             }
-            // Copy back to exporter
-            let record_table = record.instance.tables.get(tbl_idx).cloned();
+
+            // Build the exporter's table: resolve importer entries to exporter's space
+            let importer_table = record.instance.tables.get(tbl_idx).cloned().unwrap_or_default();
             drop(record);
-            if let Some(new_table) = record_table {
-                let mut src_mut = src_handle.borrow_mut();
-                let src_tbl_idx_val = src_tbl_idx;
-                if src_tbl_idx_val < src_mut.instance.tables.len() {
-                    src_mut.instance.tables[src_tbl_idx_val] = new_table;
+            let mut src_mut = src_handle.borrow_mut();
+            let src_tbl_idx_val = src_tbl_idx;
+
+            // Exporter's table: start from current exporter table, then overlay
+            // resolved importer entries
+            let mut exporter_table = if src_tbl_idx_val < src_mut.instance.tables.len() {
+                src_mut.instance.tables[src_tbl_idx_val].clone()
+            } else {
+                Vec::new()
+            };
+            // Resize if needed
+            if exporter_table.len() < importer_table.len() {
+                exporter_table.resize(importer_table.len(), None);
+            }
+            // For positions from the importer's element segments, resolve to exporter's space
+            for &pos in &importer_positions {
+                if pos < importer_table.len() {
+                    if let Some(func_idx) = importer_table[pos] {
+                        let resolved = resolve_cross_module_function(
+                            &mut src_mut.instance.module,
+                            &handle,
+                            func_idx,
+                            &self.instances,
+                        );
+                        exporter_table[pos] = Some(resolved);
+                    } else {
+                        exporter_table[pos] = None;
+                    }
+                }
+            }
+
+            // Save exporter table
+            if src_tbl_idx_val < src_mut.instance.tables.len() {
+                src_mut.instance.tables[src_tbl_idx_val] = exporter_table;
+            }
+            drop(src_mut);
+
+            // Importer's table: resolve exporter's entries to importer's space
+            let mut importer_resolved = importer_table.clone();
+            {
+                let mut imp_mut = handle.borrow_mut();
+                for pos in 0..importer_resolved.len() {
+                    if importer_positions.contains(&pos) {
+                        // Already has the importer's own func idx, keep as-is
+                        continue;
+                    }
+                    if let Some(func_idx) = importer_resolved[pos] {
+                        // This is an exporter's func idx, resolve to importer's space
+                        let resolved = resolve_cross_module_function(
+                            &mut imp_mut.instance.module,
+                            src_handle,
+                            func_idx,
+                            &self.instances,
+                        );
+                        importer_resolved[pos] = Some(resolved);
+                    }
+                }
+                if tbl_idx < imp_mut.instance.tables.len() {
+                    imp_mut.instance.tables[tbl_idx] = importer_resolved;
                 }
             }
         }
@@ -532,6 +614,124 @@ impl WastRunner {
             tbl_idx += 1;
         }
         result
+    }
+
+    /// Apply data segments from a failed module to the shared (exporter) memory.
+    /// Stops at the first OOB segment, matching spec instantiation semantics.
+    fn apply_partial_data_segments_to_shared(&self, module: &WasmModule, mem_src: &InstanceHandle) {
+        let mut src_mut = mem_src.borrow_mut();
+        for seg in &module.data_segments {
+            if !seg.is_active {
+                continue;
+            }
+            let dst_start = seg.offset as usize;
+            let len = seg.data_len;
+            // Stop at first OOB segment (the one that caused the trap)
+            if dst_start.saturating_add(len) > src_mut.instance.memory_size {
+                break;
+            }
+            let src_start = seg.data_offset;
+            if src_start.saturating_add(len) <= module.code.len() {
+                src_mut.instance.memory[dst_start..dst_start + len]
+                    .copy_from_slice(&module.code[src_start..src_start + len]);
+            }
+        }
+    }
+
+    /// Apply element segments from a failed module to the shared (exporter) tables.
+    /// Stops at the first OOB segment, matching spec instantiation semantics.
+    /// Resolves cross-module function references so the exporter can call them.
+    fn apply_partial_elem_segments_to_shared(&self, module: &WasmModule, table_sources: &[(usize, InstanceHandle)]) {
+        use crate::wasm::decoder::ElemMode;
+        for (tbl_idx, src_handle) in table_sources {
+            let mut src_mut = src_handle.borrow_mut();
+            // Find the exporter's table index
+            let src_module_name = self.find_table_import_module(module, *tbl_idx);
+            let src_tbl_idx = if let Some((mod_name, fld_name)) = &src_module_name {
+                if let Some(sh) = self.instances.get(mod_name.as_str()) {
+                    if Rc::ptr_eq(sh, src_handle) {
+                        exported_table_index(&src_mut.instance.module, fld_name)
+                            .unwrap_or(0) as usize
+                    } else { 0 }
+                } else { 0 }
+            } else { 0 };
+
+            // First resolve all function indices, then apply to the table
+            let mut resolved_segs: Vec<(usize, Vec<Option<u32>>)> = Vec::new();
+            for seg in &module.element_segments {
+                if seg.mode != ElemMode::Active || seg.table_idx as usize != *tbl_idx {
+                    continue;
+                }
+                let offset = seg.offset as usize;
+                let count = seg.func_indices.len();
+                let tbl_len = src_mut.instance.tables.get(src_tbl_idx).map(|t| t.len()).unwrap_or(0);
+                if offset.saturating_add(count) > tbl_len {
+                    break; // OOB segment: stop here
+                }
+                let mut resolved = Vec::with_capacity(count);
+                for &func_idx in &seg.func_indices {
+                    if func_idx == u32::MAX {
+                        resolved.push(None);
+                    } else {
+                        let r = copy_function_from_module(
+                            &mut src_mut.instance.module,
+                            module,
+                            func_idx,
+                        );
+                        resolved.push(Some(r));
+                    }
+                }
+                resolved_segs.push((offset, resolved));
+            }
+            // Apply resolved segments to the table
+            if let Some(tbl) = src_mut.instance.tables.get_mut(src_tbl_idx) {
+                for (offset, entries) in &resolved_segs {
+                    for (i, entry) in entries.iter().enumerate() {
+                        tbl[offset + i] = *entry;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sync shared memory between all instances that share it.
+    /// After any call that might do memory.grow, both sides need to see the same memory.
+    fn sync_shared_memory(&self) {
+        for (importer, exporter) in &self.memory_shares {
+            if Rc::ptr_eq(importer, exporter) {
+                continue;
+            }
+            // Find the larger memory and sync to the smaller
+            let (imp_size, exp_size) = {
+                let imp = importer.borrow();
+                let exp = exporter.borrow();
+                (imp.instance.memory_size, exp.instance.memory_size)
+            };
+            if imp_size > exp_size {
+                // Importer grew; sync to exporter
+                let imp = importer.borrow();
+                let mut exp = exporter.borrow_mut();
+                exp.instance.memory.resize(imp_size, 0);
+                exp.instance.memory[..imp_size].copy_from_slice(&imp.instance.memory[..imp_size]);
+                exp.instance.memory_size = imp_size;
+            } else if exp_size > imp_size {
+                // Exporter grew; sync to importer
+                let exp = exporter.borrow();
+                let mut imp = importer.borrow_mut();
+                imp.instance.memory.resize(exp_size, 0);
+                imp.instance.memory[..exp_size].copy_from_slice(&exp.instance.memory[..exp_size]);
+                imp.instance.memory_size = exp_size;
+            } else if imp_size == exp_size && imp_size > 0 {
+                // Same size, sync contents (bidirectional: use the most recently modified)
+                // Simple approach: copy from the instance that was just executed.
+                // Since we can't easily tell which was just executed, sync bidirectionally
+                // by preferring the one with different content.
+                // For simplicity, just sync from importer to exporter (most common case).
+                let imp = importer.borrow();
+                let mut exp = exporter.borrow_mut();
+                exp.instance.memory[..imp_size].copy_from_slice(&imp.instance.memory[..imp_size]);
+            }
+        }
     }
 
     fn find_table_import_module(&self, module: &WasmModule, target_tbl_idx: usize) -> Option<(String, String)> {
@@ -611,7 +811,9 @@ impl WastRunner {
                     )
                 })?
         };
-        self.execute_call(&handle, func_idx, &args)
+        let result = self.execute_call(&handle, func_idx, &args);
+        self.sync_shared_memory();
+        result
     }
 
     fn execute_call(&mut self, handle: &InstanceHandle, func_idx: u32, args: &[Value]) -> RunnerResult<Vec<Value>> {
@@ -867,6 +1069,66 @@ impl WastRunner {
         Ok(())
     }
 
+    /// For funcref globals imported from other modules, the global's value is a
+    /// function index in the *source* module. Copy the function into the current
+    /// module and update both the global value and any element segments that
+    /// reference it via global.get.
+    fn fixup_funcref_globals(&self, module: &mut WasmModule) -> RunnerResult<()> {
+        use crate::wasm::decoder::ElemMode;
+
+        // Collect funcref global imports: (global_idx, source_module_name, func_idx_in_source)
+        let mut funcref_fixups: Vec<(usize, String, u32)> = Vec::new();
+        let mut global_idx = 0usize;
+        for import in &module.imports {
+            if let ImportKind::Global(vt_byte, _) = import.kind {
+                // funcref = 0x70, externref = 0x6F
+                if vt_byte == 0x70 {
+                    let module_name = bytes_to_string(module.get_name(
+                        import.module_name_offset,
+                        import.module_name_len,
+                    ));
+                    if module_name != SPECTEST_MODULE {
+                        // The global value is the function index in the source module
+                        if global_idx < module.globals.len() {
+                            let func_idx = match module.globals[global_idx].init_value {
+                                Value::I32(v) if v >= 0 => v as u32,
+                                _ => { global_idx += 1; continue; }
+                            };
+                            funcref_fixups.push((global_idx, module_name.clone(), func_idx));
+                        }
+                    }
+                }
+                global_idx += 1;
+            }
+        }
+
+        // Process each fixup: copy the function and update indices
+        for (gidx, module_name, source_func_idx) in funcref_fixups {
+            if let Some(handle) = self.instances.get(&module_name) {
+                let new_idx = resolve_cross_module_function(module, handle, source_func_idx, &self.instances);
+                // Update the global's value to point to the copied function
+                if gidx < module.globals.len() {
+                    module.globals[gidx].init_value = Value::I32(new_idx as i32);
+                }
+                // Update element segments that reference this global
+                for seg in &mut module.element_segments {
+                    for (i, info) in seg.item_expr_infos.iter().enumerate() {
+                        if let Some(ref_idx) = info.global_ref {
+                            if ref_idx as usize == gidx {
+                                // This element was initialized from global.get gidx
+                                if i < seg.func_indices.len() {
+                                    seg.func_indices[i] = new_idx;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn inject_imported_memory(&self, module: &mut WasmModule) -> RunnerResult<()> {
         for import in &module.imports {
             if !matches!(import.kind, ImportKind::Memory) {
@@ -964,6 +1226,66 @@ impl WastRunner {
                 }
                 ImportKind::Global(val_type_byte, mutable) => {
                     self.validate_global_import(&module_name, &field_name, val_type_byte, mutable)?;
+                }
+                ImportKind::Tag(type_idx) => {
+                    // Tag imports: validate that the source module exports a compatible tag
+                    if module_name == SPECTEST_MODULE {
+                        // spectest module doesn't export any tags
+                        return Err(RunnerError::new(
+                            "link",
+                            format!("unknown import: spectest does not export tag `{field_name}`"),
+                        ));
+                    }
+                    let handle = self.instances.get(&module_name).ok_or_else(|| {
+                        RunnerError::new("link", format!("unknown import: module `{module_name}` tag `{field_name}`"))
+                    })?;
+                    let record = handle.borrow();
+                    // Check that the export exists and is a tag
+                    let has_tag_export = record.instance.module.exports.iter().any(|e| {
+                        record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                            && matches!(e.kind, ExportKind::Tag(_))
+                    });
+                    if !has_tag_export {
+                        // Check if it exists as another kind
+                        let has_any = record.instance.module.exports.iter().any(|e| {
+                            record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                        });
+                        if has_any {
+                            return Err(RunnerError::new(
+                                "link",
+                                format!("incompatible import type for `{module_name}::{field_name}`"),
+                            ));
+                        }
+                        return Err(RunnerError::new(
+                            "link",
+                            format!("unknown import: module `{module_name}` does not export tag `{field_name}`"),
+                        ));
+                    }
+                    // Validate tag type compatibility
+                    if let Some(exp_tag_idx) = record.instance.module.exports.iter()
+                        .filter(|e| {
+                            record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
+                                && matches!(e.kind, ExportKind::Tag(_))
+                        })
+                        .map(|e| if let ExportKind::Tag(idx) = e.kind { idx } else { 0 })
+                        .next()
+                    {
+                        // Map tag index to type index
+                        let exp_type_idx = record.instance.module.tag_types
+                            .get(exp_tag_idx as usize)
+                            .copied();
+                        if let (Some(import_ft), Some(exp_ti)) = (
+                            module.func_types.get(type_idx as usize),
+                            exp_type_idx.and_then(|ti| record.instance.module.func_types.get(ti as usize)),
+                        ) {
+                            if !func_types_match(import_ft, exp_ti) {
+                                return Err(RunnerError::new(
+                                    "link",
+                                    format!("incompatible import type for tag `{module_name}::{field_name}`"),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1599,6 +1921,168 @@ fn is_core_module(module: &QuoteWat<'_>) -> bool {
     matches!(module, QuoteWat::Wat(Wat::Module(_)) | QuoteWat::QuoteModule(..))
 }
 
+/// Copy a local function from `src_module` at `func_idx` into `host_module`.
+/// For import functions, returns `func_idx` unchanged (best effort).
+/// Used when we only have a WasmModule (not an InstanceHandle).
+fn copy_function_from_module(
+    host_module: &mut WasmModule,
+    src_module: &WasmModule,
+    func_idx: u32,
+) -> u32 {
+    let src_import_count = src_module.func_import_count();
+    if (func_idx as usize) >= src_import_count {
+        let local_idx = (func_idx as usize) - src_import_count;
+        if local_idx < src_module.functions.len() {
+            let src_func = &src_module.functions[local_idx];
+            let source_ft = if (src_func.type_idx as usize) < src_module.func_types.len() {
+                src_module.func_types[src_func.type_idx as usize].clone()
+            } else {
+                crate::wasm::decoder::FuncTypeDef::empty()
+            };
+            let host_type_idx = find_or_add_func_type(host_module, &source_ft);
+            let host_code_offset = host_module.code.len();
+            let code_start = src_func.code_offset;
+            let code_len = src_func.code_len;
+            if code_start + code_len <= src_module.code.len() {
+                host_module.code.extend_from_slice(&src_module.code[code_start..code_start + code_len]);
+            }
+            host_module.functions.push(crate::wasm::decoder::FuncDef {
+                type_idx: host_type_idx,
+                code_offset: host_code_offset,
+                code_len,
+                local_count: src_func.local_count,
+                locals: src_func.locals,
+            });
+            return host_module.func_import_count() as u32
+                + (host_module.functions.len() as u32 - 1);
+        }
+    }
+    // For imports, we can't reliably resolve without instance info
+    func_idx
+}
+
+/// Resolve a function reference from `source_handle` at `source_func_idx` into
+/// the `host_module`'s function index space.
+///
+/// For local functions in the source: copies the function body into host_module
+/// and returns the new function index.
+///
+/// For import functions in the source: if the import points to a function that
+/// exists in host_module (i.e., the source imported from the host), returns the
+/// host's own function index directly. Otherwise copies from the ultimate source.
+fn resolve_cross_module_function(
+    host_module: &mut WasmModule,
+    source_handle: &InstanceHandle,
+    source_func_idx: u32,
+    instances: &HashMap<String, InstanceHandle>,
+) -> u32 {
+    let source = source_handle.borrow();
+    let src_mod = &source.instance.module;
+    let src_import_count = src_mod.func_import_count();
+
+    if (source_func_idx as usize) < src_import_count {
+        // Source function is an import. Resolve the import to the actual module.
+        let mut func_seen = 0u32;
+        for imp in &src_mod.imports {
+            if let ImportKind::Func(_) = imp.kind {
+                if func_seen == source_func_idx {
+                    let mod_name = bytes_to_string(src_mod.get_name(
+                        imp.module_name_offset,
+                        imp.module_name_len,
+                    ));
+                    let fld_name = bytes_to_string(src_mod.get_name(
+                        imp.field_name_offset,
+                        imp.field_name_len,
+                    ));
+                    drop(source);
+
+                    // First check if the target is the host module itself
+                    // (avoids RefCell borrow conflicts)
+                    if let Some(host_idx) = host_module.find_export_func(fld_name.as_bytes()) {
+                        return host_idx;
+                    }
+
+                    // Find the target function in the named module
+                    if let Some(target_handle) = instances.get(&mod_name) {
+                        if let Ok(target) = target_handle.try_borrow() {
+                            if let Some(target_idx) = target.instance.module.find_export_func(fld_name.as_bytes()) {
+                                drop(target);
+                                // Copy from the target module
+                                return resolve_cross_module_function(
+                                    host_module,
+                                    target_handle,
+                                    target_idx,
+                                    instances,
+                                );
+                            }
+                        }
+                    }
+                    // Fallback
+                    return source_func_idx;
+                }
+                func_seen += 1;
+            }
+        }
+        drop(source);
+        return source_func_idx;
+    }
+
+    // Local function: copy it
+    let local_idx = (source_func_idx as usize) - src_import_count;
+    if local_idx < src_mod.functions.len() {
+        let src_func = &src_mod.functions[local_idx];
+        let src_type_idx = src_func.type_idx;
+
+        let source_ft = if (src_type_idx as usize) < src_mod.func_types.len() {
+            src_mod.func_types[src_type_idx as usize].clone()
+        } else {
+            crate::wasm::decoder::FuncTypeDef::empty()
+        };
+
+        let host_type_idx = find_or_add_func_type(host_module, &source_ft);
+
+        let code_start = src_func.code_offset;
+        let code_len = src_func.code_len;
+        let host_code_offset = host_module.code.len();
+        if code_start + code_len <= src_mod.code.len() {
+            host_module.code.extend_from_slice(&src_mod.code[code_start..code_start + code_len]);
+        }
+
+        let new_func = crate::wasm::decoder::FuncDef {
+            type_idx: host_type_idx,
+            code_offset: host_code_offset,
+            code_len,
+            local_count: src_func.local_count,
+            locals: src_func.locals,
+        };
+        host_module.functions.push(new_func);
+
+        let new_idx = host_module.func_import_count() as u32
+            + (host_module.functions.len() as u32 - 1);
+        drop(source);
+        return new_idx;
+    }
+
+    drop(source);
+    source_func_idx
+}
+
+/// Find a matching FuncTypeDef in the module's type list, or add a new one.
+fn find_or_add_func_type(module: &mut WasmModule, ft: &crate::wasm::decoder::FuncTypeDef) -> u32 {
+    for (i, existing) in module.func_types.iter().enumerate() {
+        if existing.param_count == ft.param_count
+            && existing.result_count == ft.result_count
+            && existing.params[..existing.param_count as usize] == ft.params[..ft.param_count as usize]
+            && existing.results[..existing.result_count as usize] == ft.results[..ft.result_count as usize]
+        {
+            return i as u32;
+        }
+    }
+    let idx = module.func_types.len() as u32;
+    module.func_types.push(ft.clone());
+    idx
+}
+
 fn bytes_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -1845,6 +2329,8 @@ fn trap_message(err: &WasmError) -> String {
         WasmError::TableIndexOutOfBounds => "out of bounds table access".to_string(),
         WasmError::FloatsDisabled => "floats disabled".to_string(),
         WasmError::UnsupportedProposal => "unsupported proposal".to_string(),
+        WasmError::NullFunctionReference => "null function reference".to_string(),
+        WasmError::NullReference => "null reference".to_string(),
         other => format!("{other:?}"),
     }
 }

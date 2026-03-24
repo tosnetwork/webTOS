@@ -81,6 +81,7 @@ pub enum ImportKind {
     Table(ValType),      // table import with element type
     Memory,              // memory import
     Global(u8, bool),    // valtype byte, mutable
+    Tag(u32),            // tag import: type index (exception handling proposal)
 }
 
 /// A WASM export definition.
@@ -108,6 +109,7 @@ pub enum ExportKind {
     Table(u32),
     Memory(u32),
     Global(u32),
+    Tag(u32),
 }
 
 /// A global variable definition.
@@ -167,6 +169,9 @@ pub struct ElementSegment {
     pub elem_type: ValType,
     /// Info from scanning the offset init expression for validation.
     pub offset_expr_info: InitExprInfo,
+    /// Per-item expression info for expression-based segments (flags 4-7).
+    /// Empty for index-based segments (flags 0-3).
+    pub item_expr_infos: alloc::vec::Vec<InitExprInfo>,
 }
 
 /// Information extracted from scanning an init expression for validation.
@@ -212,6 +217,10 @@ pub struct WasmModule {
     /// Whether the code section references data segments (memory.init, data.drop).
     pub code_uses_data_count: bool,
 
+    /// Tag type indices (exception handling proposal).
+    /// Each entry is the function type index for that tag.
+    pub tag_types: Vec<u32>,
+
     /// Raw bytecode + data segment bytes storage.
     pub code: Vec<u8>,
 
@@ -238,6 +247,7 @@ impl WasmModule {
             memory_max_pages: 0,
             data_count: None,
             code_uses_data_count: false,
+            tag_types: Vec::new(),
             code: Vec::new(),
             names: Vec::new(),
         }
@@ -541,8 +551,19 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
             }
             SECTION_DATA_COUNT => decode_data_count_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_TAG => {
-                // Tag section (exception handling proposal): skip it
-                pos = section_end;
+                // Tag section (exception handling proposal): decode and validate
+                let count = decode_leb128_u32(bytes, &mut pos)? as usize;
+                for _ in 0..count {
+                    let _attribute = read_byte(bytes, &mut pos)?; // must be 0x00
+                    let type_idx = decode_leb128_u32(bytes, &mut pos)?;
+                    // Validate: tag type must have no results
+                    if (type_idx as usize) < module.func_types.len() {
+                        if module.func_types[type_idx as usize].result_count > 0 {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                    }
+                    module.tag_types.push(type_idx);
+                }
             }
             0 => {
                 // Custom section: validate the name (LEB128 + UTF-8), skip payload
@@ -748,7 +769,10 @@ fn decode_composite_type(
         0x5E => {
             // array type (GC proposal): single field (storage_type + mutability)
             skip_storage_type(bytes, pos)?;
-            let _ = read_byte(bytes, pos)?; // mutability
+            let mt = read_byte(bytes, pos)?; // mutability
+            if mt > 1 {
+                return Err(WasmError::InvalidSection);
+            }
             // Push a placeholder func type so type indices stay aligned
             module.func_types.push(FuncTypeDef::empty());
         }
@@ -757,7 +781,10 @@ fn decode_composite_type(
             let field_count = decode_leb128_u32(bytes, pos)? as usize;
             for _ in 0..field_count {
                 skip_storage_type(bytes, pos)?;
-                let _ = read_byte(bytes, pos)?; // mutability
+                let mt = read_byte(bytes, pos)?; // mutability
+                if mt > 1 {
+                    return Err(WasmError::InvalidSection);
+                }
             }
             // Push a placeholder func type so type indices stay aligned
             module.func_types.push(FuncTypeDef::empty());
@@ -889,8 +916,8 @@ fn decode_import_section(
             0x04 => {
                 // Tag import (exception handling proposal): attribute byte + type index
                 let _attribute = read_byte(bytes, pos)?;
-                let _type_idx = decode_leb128_u32(bytes, pos)?;
-                imp.kind = ImportKind::Table(ValType::FuncRef); // placeholder
+                let type_idx = decode_leb128_u32(bytes, pos)?;
+                imp.kind = ImportKind::Tag(type_idx);
             }
             _ => {
                 return Err(WasmError::InvalidSection);
@@ -994,6 +1021,7 @@ fn decode_export_section(
             0x01 => exp.kind = ExportKind::Table(idx),
             0x02 => exp.kind = ExportKind::Memory(idx),
             0x03 => exp.kind = ExportKind::Global(idx),
+            0x04 => exp.kind = ExportKind::Tag(idx),
             _ => exp.kind = ExportKind::Func(idx), // fallback
         }
 
@@ -1227,6 +1255,7 @@ fn decode_element_section(
                     mode: ElemMode::Active,
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
+                    item_expr_infos: alloc::vec::Vec::new(),
                 });
             }
             1 => {
@@ -1247,6 +1276,7 @@ fn decode_element_section(
                     mode: ElemMode::Passive,
                     elem_type: ValType::FuncRef,
                     offset_expr_info: Default::default(),
+                    item_expr_infos: alloc::vec::Vec::new(),
                 });
             }
             2 => {
@@ -1275,6 +1305,7 @@ fn decode_element_section(
                     mode: ElemMode::Active,
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
+                    item_expr_infos: alloc::vec::Vec::new(),
                 });
             }
             3 => {
@@ -1295,6 +1326,7 @@ fn decode_element_section(
                     mode: ElemMode::Declarative,
                     elem_type: ValType::FuncRef,
                     offset_expr_info: Default::default(),
+                    item_expr_infos: alloc::vec::Vec::new(),
                 });
             }
             4 => {
@@ -1304,20 +1336,26 @@ fn decode_element_section(
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                    item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info });
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos });
             }
             5 => {
                 // Passive, reftype, expression elements
                 let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                    item_expr_infos.push(item_info);
                 }
                 module.element_segments.push(ElementSegment {
                     table_idx: 0,
@@ -1326,6 +1364,7 @@ fn decode_element_section(
                     mode: ElemMode::Passive,
                     elem_type,
                     offset_expr_info: Default::default(),
+                    item_expr_infos,
                 });
             }
             6 => {
@@ -1337,20 +1376,26 @@ fn decode_element_section(
                 let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                    item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info });
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos });
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
                 let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                    item_expr_infos.push(item_info);
                 }
                 module.element_segments.push(ElementSegment {
                     table_idx: 0,
@@ -1359,6 +1404,7 @@ fn decode_element_section(
                     mode: ElemMode::Declarative,
                     elem_type,
                     offset_expr_info: Default::default(),
+                    item_expr_infos,
                 });
             }
             _ => {

@@ -679,4 +679,6 @@ pub enum WasmError {
     ZeroByteExpected,
     ConstExprRequired,
     UndeclaredFuncRef,
+    NullFunctionReference,
+    NullReference,
 }
