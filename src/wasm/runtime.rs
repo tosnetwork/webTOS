@@ -1968,14 +1968,16 @@ impl WasmInstance {
             0xA6 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::copysign(a, b)))); }
 
             // ── Float-integer conversion ─────────────────────────────
-            0xA8 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a.is_infinite() || a < i32::MIN as f32 || a > i32::MAX as f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xA9 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a.is_infinite() || a < 0.0 || a > u32::MAX as f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAA => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a.is_infinite() || a < i32::MIN as f64 || a > i32::MAX as f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xAB => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a.is_infinite() || a < 0.0 || a > u32::MAX as f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAE => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a.is_infinite() || a < i64::MIN as f32 || a > i64::MAX as f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xAF => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a.is_infinite() || a < 0.0 || a > u64::MAX as f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
-            0xB0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a.is_infinite() || a < i64::MIN as f64 || a > i64::MAX as f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xB1 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a.is_infinite() || a < 0.0 || a > u64::MAX as f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            // Trunc boundaries use exact float constants matching wasmi/WASM spec.
+            // i32::MAX (2147483647) rounds up to 2147483648.0 in f32, so >= traps.
+            0xA8 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xA9 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAA => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -2147483649.0_f64 || a >= 2147483648.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xAB => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 4294967296.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAE => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -9223373136366403584.0_f32 || a >= 9223372036854775808.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xAF => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 18446744073709551616.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            0xB0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -9223372036854777856.0_f64 || a >= 9223372036854775808.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xB1 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 18446744073709551616.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
             // int → float
             0xB2 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(a as f32))); }
             0xB3 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32((a as u32) as f32))); }
@@ -2147,47 +2149,61 @@ impl WasmInstance {
 
 // ─── Saturating float-to-int conversions (0xFC 0x00-0x07) ────────────────
 
+/// Saturating float-to-int conversions matching wasmi semantics.
+/// NaN → 0, +inf → MAX, -inf → MIN (or 0 for unsigned), out-of-range → saturate.
 fn sat_trunc_f32_i32(v: f32) -> i32 {
     if v.is_nan() { return 0; }
-    if v >= i32::MAX as f32 { return i32::MAX; }
-    if v <= i32::MIN as f32 { return i32::MIN; }
+    if v.is_infinite() { return if v.is_sign_positive() { i32::MAX } else { i32::MIN }; }
+    if v >= 2147483648.0_f32 { return i32::MAX; }
+    if v <= -2147483904.0_f32 { return i32::MIN; }
     v as i32
 }
 fn sat_trunc_f32_u32(v: f32) -> u32 {
-    if v.is_nan() || v < 0.0 { return 0; }
-    if v >= u32::MAX as f32 { return u32::MAX; }
+    if v.is_nan() { return 0; }
+    if v.is_infinite() { return if v.is_sign_positive() { u32::MAX } else { 0 }; }
+    if v >= 4294967296.0_f32 { return u32::MAX; }
+    if v <= -1.0_f32 { return 0; }
     v as u32
 }
 fn sat_trunc_f64_i32(v: f64) -> i32 {
     if v.is_nan() { return 0; }
-    if v >= i32::MAX as f64 { return i32::MAX; }
-    if v <= i32::MIN as f64 { return i32::MIN; }
+    if v.is_infinite() { return if v.is_sign_positive() { i32::MAX } else { i32::MIN }; }
+    if v >= 2147483648.0_f64 { return i32::MAX; }
+    if v <= -2147483649.0_f64 { return i32::MIN; }
     v as i32
 }
 fn sat_trunc_f64_u32(v: f64) -> u32 {
-    if v.is_nan() || v < 0.0 { return 0; }
-    if v >= u32::MAX as f64 { return u32::MAX; }
+    if v.is_nan() { return 0; }
+    if v.is_infinite() { return if v.is_sign_positive() { u32::MAX } else { 0 }; }
+    if v >= 4294967296.0_f64 { return u32::MAX; }
+    if v <= -1.0_f64 { return 0; }
     v as u32
 }
 fn sat_trunc_f32_i64(v: f32) -> i64 {
     if v.is_nan() { return 0; }
-    if v >= i64::MAX as f32 { return i64::MAX; }
-    if v <= i64::MIN as f32 { return i64::MIN; }
+    if v.is_infinite() { return if v.is_sign_positive() { i64::MAX } else { i64::MIN }; }
+    if v >= 9223372036854775808.0_f32 { return i64::MAX; }
+    if v <= -9223373136366403584.0_f32 { return i64::MIN; }
     v as i64
 }
 fn sat_trunc_f32_u64(v: f32) -> u64 {
-    if v.is_nan() || v < 0.0 { return 0; }
-    if v >= u64::MAX as f32 { return u64::MAX; }
+    if v.is_nan() { return 0; }
+    if v.is_infinite() { return if v.is_sign_positive() { u64::MAX } else { 0 }; }
+    if v >= 18446744073709551616.0_f32 { return u64::MAX; }
+    if v <= -1.0_f32 { return 0; }
     v as u64
 }
 fn sat_trunc_f64_i64(v: f64) -> i64 {
     if v.is_nan() { return 0; }
-    if v >= i64::MAX as f64 { return i64::MAX; }
-    if v <= i64::MIN as f64 { return i64::MIN; }
+    if v.is_infinite() { return if v.is_sign_positive() { i64::MAX } else { i64::MIN }; }
+    if v >= 9223372036854775808.0_f64 { return i64::MAX; }
+    if v <= -9223372036854777856.0_f64 { return i64::MIN; }
     v as i64
 }
 fn sat_trunc_f64_u64(v: f64) -> u64 {
-    if v.is_nan() || v < 0.0 { return 0; }
-    if v >= u64::MAX as f64 { return u64::MAX; }
+    if v.is_nan() { return 0; }
+    if v.is_infinite() { return if v.is_sign_positive() { u64::MAX } else { 0 }; }
+    if v >= 18446744073709551616.0_f64 { return u64::MAX; }
+    if v <= -1.0_f64 { return 0; }
     v as u64
 }
