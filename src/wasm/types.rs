@@ -618,7 +618,7 @@ impl Opcode {
 
 // Limits aligned with wasmi defaults (https://github.com/wasmi-labs/wasmi)
 pub const MAX_FUNCTIONS: usize = 10_000;
-pub const MAX_LOCALS: usize = 128;
+pub const MAX_LOCALS: usize = 1024;
 pub const MAX_STACK: usize = 65_536;           // ~1 MB of Value cells (wasmi: 1MB)
 pub const MAX_MEMORY_PAGES: usize = 65_536;    // 4 GiB max (WASM spec limit, gated by agent mem_quota)
 pub const WASM_PAGE_SIZE: usize = 65_536;      // Standard WASM page size (64 KiB)
@@ -626,8 +626,8 @@ pub const MAX_IMPORTS: usize = 10_000;
 pub const MAX_EXPORTS: usize = 10_000;
 pub const MAX_CODE_SIZE: usize = 10_485_760;   // 10 MB max code
 pub const MAX_CALL_DEPTH: usize = 1_000;       // wasmi: 1000
-pub const MAX_PARAMS: usize = 32;              // wasmi: 32
-pub const MAX_RESULTS: usize = 32;             // wasmi: 32
+pub const MAX_PARAMS: usize = 128;
+pub const MAX_RESULTS: usize = 128;
 pub const MAX_NAME_BYTES: usize = 1_024;
 pub const MAX_BLOCK_DEPTH: usize = 1_000;
 pub const MAX_GLOBALS: usize = 1_000;          // wasmi: 1000
@@ -665,9 +665,13 @@ pub enum WasmError {
     IntegerOverflow,
     FloatsDisabled,
     UndefinedElement,
+    UninitializedElement,
     IndirectCallTypeMismatch,
     ImmutableGlobal,
     GlobalIndexOutOfBounds,
     UnsupportedProposal,
     TableIndexOutOfBounds,
+    DuplicateExport,
+    InvalidConversionToInteger,
+    MalformedUtf8,
 }

@@ -22,6 +22,7 @@ pub struct CallFrame {
     pub local_count: usize,       // number of locals (params + declared locals)
     pub stack_base: usize,        // operand stack depth at function entry
     pub result_count: u8,         // how many values to return
+    pub saved_block_depth: usize, // caller's block_depth to restore on return
 }
 
 impl CallFrame {
@@ -35,6 +36,7 @@ impl CallFrame {
             local_count: 0,
             stack_base: 0,
             result_count: 0,
+            saved_block_depth: 0,
         }
     }
 }
@@ -556,6 +558,28 @@ impl WasmInstance {
         Ok(())
     }
 
+    // ─── Block type decoding ────────────────────────────────────────────
+
+    /// Decode a block type and return (param_count, result_count).
+    fn decode_block_type(&self, block_type: i32) -> (u8, u8) {
+        if block_type == -0x40 {
+            // void block
+            (0, 0)
+        } else if block_type < 0 {
+            // valtype: i32=-1, i64=-2, f32=-3, f64=-4, v128=-5
+            (0, 1)
+        } else {
+            // type index: look up function type
+            let type_idx = block_type as usize;
+            if type_idx < self.module.func_types.len() {
+                let ft = &self.module.func_types[type_idx];
+                (ft.param_count, ft.result_count)
+            } else {
+                (0, 0)
+            }
+        }
+    }
+
     // ─── Block management ───────────────────────────────────────────────
 
     fn push_block(&mut self, bf: BlockFrame) -> Result<(), WasmError> {
@@ -653,6 +677,13 @@ impl WasmInstance {
                 0x43 => { self.pc += 4; } // f32.const (4 bytes IEEE 754)
                 0x44 => { self.pc += 8; } // f64.const (8 bytes IEEE 754)
                 0x0F => {} // return
+                0x1C => {
+                    // select (typed): vector of value types
+                    let count = self.read_leb128_u32()? as usize;
+                    for _ in 0..count { let _ = self.read_leb128_u32()?; }
+                }
+                0xD0 => { let _ = self.read_leb128_i32()?; } // ref.null heaptype
+                0xD2 => { let _ = self.read_leb128_u32()?; } // ref.func funcidx
                 _ => {
                     // Most instructions have no immediates — just skip the opcode byte
                 }
@@ -670,10 +701,23 @@ impl WasmInstance {
         let target = self.block_stack[target_idx];
 
         if target.is_loop {
-            // Branch to loop start
-            self.pc = target.start_pc;
-            // Truncate the stack to block's base
+            // Branch to loop start — pop all blocks above the loop
+            // but keep the loop block itself (we re-enter it)
+            let result_count = target.result_count as usize;
+            let mut results = [Value::I32(0); MAX_RESULTS];
+            for i in (0..result_count).rev() {
+                results[i] = match self.pop() {
+                    Ok(v) => v,
+                    Err(_) => Value::I32(0),
+                };
+            }
             self.stack_ptr = target.stack_base;
+            for i in 0..result_count {
+                let _ = self.push(results[i]);
+            }
+            self.pc = target.start_pc;
+            // Pop blocks above the loop, keeping the loop itself
+            self.block_depth = target_idx + 1;
         } else {
             // Branch to block end — pop all blocks up to and including target
             // Save any result values
@@ -754,7 +798,7 @@ impl WasmInstance {
             self.locals[local_base + param_count + i] = Value::default_for(ty);
         }
 
-        // Push call frame
+        // Push call frame, saving caller's block_depth
         let frame = CallFrame {
             func_idx,
             return_pc: self.pc,
@@ -764,6 +808,7 @@ impl WasmInstance {
             local_count: total_locals,
             stack_base: self.stack_ptr,
             result_count,
+            saved_block_depth: self.block_depth,
         };
 
         self.call_stack[self.call_depth] = frame;
@@ -774,6 +819,16 @@ impl WasmInstance {
 
         // Reset block stack for new function
         self.block_depth = 0;
+
+        // Push an implicit block frame for the function body.
+        // This allows `br 0` at the function level to work correctly (behaves like return).
+        self.push_block(BlockFrame {
+            start_pc: func_code_offset,
+            end_pc: func_code_offset + func_code_len,
+            stack_base: self.stack_ptr,
+            result_count,
+            is_loop: false,
+        })?;
 
         Ok(())
     }
@@ -832,6 +887,11 @@ impl WasmInstance {
 
     /// Call a function by its absolute index (imports + local functions).
     pub fn call_func(&mut self, func_idx: u32, args: &[Value]) -> ExecResult {
+        // Reset execution state for new call (important after traps)
+        self.finished = false;
+        self.call_depth = 0;
+        self.block_depth = 0;
+
         // Push arguments onto the stack
         for arg in args {
             if let Err(e) = self.push(*arg) {
@@ -853,6 +913,7 @@ impl WasmInstance {
         }
 
         self.finished = false;
+
         self.run()
     }
 
@@ -870,7 +931,11 @@ impl WasmInstance {
     pub fn run(&mut self) -> ExecResult {
         loop {
             match self.step() {
-                ExecResult::Ok => continue,
+                ExecResult::Ok => {
+                    if self.finished {
+                        return ExecResult::Ok;
+                    }
+                }
                 other => return other,
             }
         }
@@ -925,17 +990,17 @@ impl WasmInstance {
             0x02 => {
                 // block
                 let block_type = try_exec!(self.read_leb128_i32());
-                let result_count = if block_type == -0x40 { 0u8 } else { 1u8 };
+                let (param_count, result_count) = self.decode_block_type(block_type);
                 // We need to find the matching End to know end_pc.
-                // Save current position, scan forward, then restore.
                 let start_pc = self.pc;
                 let end_pc = try_exec!(self.skip_to_end());
-                // Restore pc to execute the block body
                 self.pc = start_pc;
+                // For multi-value blocks with params, the stack_base accounts for params
+                let stack_base = self.stack_ptr - param_count as usize;
                 try_exec!(self.push_block(BlockFrame {
                     start_pc,
                     end_pc,
-                    stack_base: self.stack_ptr,
+                    stack_base,
                     result_count,
                     is_loop: false,
                 }));
@@ -943,24 +1008,26 @@ impl WasmInstance {
             0x03 => {
                 // loop
                 let block_type = try_exec!(self.read_leb128_i32());
-                let _result_count = if block_type == -0x40 { 0u8 } else { 1u8 };
+                let (param_count, _result_count) = self.decode_block_type(block_type);
                 let start_pc = self.pc;
                 let saved_pc = self.pc;
                 let end_pc = try_exec!(self.skip_to_end());
                 self.pc = saved_pc;
-                // Loop blocks produce 0 results on branch (branch goes to start)
+                // Loop blocks: on branch, jump back to start with params consumed
+                // The result_count for loop branch is the param_count (loop restarts with params)
+                let stack_base = self.stack_ptr - param_count as usize;
                 try_exec!(self.push_block(BlockFrame {
                     start_pc,
                     end_pc,
-                    stack_base: self.stack_ptr,
-                    result_count: 0,
+                    stack_base,
+                    result_count: param_count,
                     is_loop: true,
                 }));
             }
             0x04 => {
                 // if — two-pass scan: first find else/end boundary, then find true end
                 let block_type = try_exec!(self.read_leb128_i32());
-                let result_count = if block_type == -0x40 { 0u8 } else { 1u8 };
+                let (param_count, result_count) = self.decode_block_type(block_type);
                 let condition = try_exec!(self.pop_i32());
 
                 let body_pc = self.pc;
@@ -977,13 +1044,14 @@ impl WasmInstance {
                     else_or_end_pc
                 };
 
+                let stack_base = self.stack_ptr - param_count as usize;
                 if condition != 0 {
                     // Execute the "then" branch; block end_pc = true end of if/else/end
                     self.pc = body_pc;
                     try_exec!(self.push_block(BlockFrame {
                         start_pc: body_pc,
                         end_pc: true_end_pc,
-                        stack_base: self.stack_ptr,
+                        stack_base,
                         result_count,
                         is_loop: false,
                     }));
@@ -993,7 +1061,7 @@ impl WasmInstance {
                     try_exec!(self.push_block(BlockFrame {
                         start_pc: else_or_end_pc,
                         end_pc: true_end_pc,
-                        stack_base: self.stack_ptr,
+                        stack_base,
                         result_count,
                         is_loop: false,
                     }));
@@ -1099,7 +1167,7 @@ impl WasmInstance {
                 }
                 let func_idx = match self.table[elem_idx] {
                     Some(idx) => idx,
-                    None => return ExecResult::Trap(WasmError::UndefinedElement),
+                    None => return ExecResult::Trap(WasmError::UninitializedElement),
                 };
                 // Validate type signature for both imports and local functions
                 let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
@@ -1150,7 +1218,7 @@ impl WasmInstance {
                 }
                 let func_idx = match self.table[elem_idx] {
                     Some(idx) => idx,
-                    None => return ExecResult::Trap(WasmError::UndefinedElement),
+                    None => return ExecResult::Trap(WasmError::UninitializedElement),
                 };
                 // Validate function signature matches expected type
                 let actual_type_idx = if (func_idx as usize) < self.module.func_import_count() {
@@ -1190,22 +1258,41 @@ impl WasmInstance {
                 let _ = try_exec!(self.pop());
             }
             0x1B => {
-                // select — WASM spec requires both operands to be same type
+                // select (untyped)
                 let c = try_exec!(self.pop_i32());
                 let val2 = try_exec!(self.pop());
                 let val1 = try_exec!(self.pop());
-                let types_match = match (&val1, &val2) {
-                    (Value::I32(_), Value::I32(_)) => true,
-                    (Value::I64(_), Value::I64(_)) => true,
-                    (Value::F32(_), Value::F32(_)) => true,
-                    (Value::F64(_), Value::F64(_)) => true,
-                    (Value::V128(_), Value::V128(_)) => true,
-                    _ => false,
-                };
-                if !types_match {
-                    return ExecResult::Trap(WasmError::TypeMismatch);
-                }
                 try_exec!(self.push(if c != 0 { val1 } else { val2 }));
+            }
+            0x1C => {
+                // select (typed) — has a vector of value types
+                let count = try_exec!(self.read_leb128_u32());
+                for _ in 0..count {
+                    let _ = try_exec!(self.read_leb128_u32()); // skip type annotations
+                }
+                let c = try_exec!(self.pop_i32());
+                let val2 = try_exec!(self.pop());
+                let val1 = try_exec!(self.pop());
+                try_exec!(self.push(if c != 0 { val1 } else { val2 }));
+            }
+            0xD0 => {
+                // ref.null heaptype
+                let _ = try_exec!(self.read_leb128_i32());
+                try_exec!(self.push(Value::I32(-1))); // null ref sentinel
+            }
+            0xD1 => {
+                // ref.is_null
+                let val = try_exec!(self.pop());
+                let is_null = match val {
+                    Value::I32(-1) => 1i32, // our null sentinel
+                    _ => 0i32,
+                };
+                try_exec!(self.push(Value::I32(is_null)));
+            }
+            0xD2 => {
+                // ref.func funcidx
+                let idx = try_exec!(self.read_leb128_u32());
+                try_exec!(self.push(Value::I32(idx as i32)));
             }
 
             // ── Variable access ─────────────────────────────────────
@@ -1511,7 +1598,7 @@ impl WasmInstance {
                 let old_pages = (self.memory_size / WASM_PAGE_SIZE) as u32;
                 let new_pages = old_pages.saturating_add(delta);
                 // Check both the module's declared max and the global hard limit
-                let module_max = if self.module.memory_max_pages > 0 {
+                let module_max = if self.module.memory_max_pages != u32::MAX {
                     self.module.memory_max_pages as usize
                 } else {
                     MAX_MEMORY_PAGES
@@ -2035,14 +2122,14 @@ impl WasmInstance {
             // ── Float-integer conversion ─────────────────────────────
             // Trunc boundaries use exact float constants matching wasmi/WASM spec.
             // i32::MAX (2147483647) rounds up to 2147483648.0 in f32, so >= traps.
-            0xA8 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xA9 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAA => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -2147483649.0_f64 || a >= 2147483648.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xAB => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 4294967296.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAE => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -9223373136366403584.0_f32 || a >= 9223372036854775808.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xAF => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 18446744073709551616.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
-            0xB0 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -9223372036854777856.0_f64 || a >= 9223372036854775808.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xB1 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 18446744073709551616.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            0xA8 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xA9 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAA => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -2147483649.0_f64 || a >= 2147483648.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xAB => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -1.0_f64 || a >= 4294967296.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAE => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -9223373136366403584.0_f32 || a >= 9223372036854775808.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xAF => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -1.0_f32 || a >= 18446744073709551616.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            0xB0 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -9223372036854777856.0_f64 || a >= 9223372036854775808.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xB1 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -1.0_f64 || a >= 18446744073709551616.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
             // int → float
             0xB2 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(a as f32))); }
             0xB3 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32((a as u32) as f32))); }
@@ -2606,11 +2693,9 @@ impl WasmInstance {
             let _ = self.push(results[i]);
         }
 
-        // Restore PC
+        // Restore PC and block depth
         self.pc = frame.return_pc;
-
-        // Reset block stack (it's per-function conceptually)
-        self.block_depth = 0;
+        self.block_depth = frame.saved_block_depth;
 
         if self.call_depth == 0 {
             self.finished = true;

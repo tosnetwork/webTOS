@@ -78,6 +78,8 @@ impl ImportDef {
 #[derive(Debug, Clone, Copy)]
 pub enum ImportKind {
     Func(u32),        // type index
+    Table,            // table import
+    Memory,           // memory import
     Global(u8, bool), // valtype byte, mutable
 }
 
@@ -154,8 +156,15 @@ pub struct WasmModule {
     pub element_segments: Vec<ElementSegment>,
     pub start_func: Option<u32>,
 
+    pub has_memory: bool,
     pub memory_min_pages: u32,
     pub memory_max_pages: u32,
+
+    /// DataCount section value (if present); None if no DataCount section.
+    pub data_count: Option<u32>,
+
+    /// Whether the code section references data segments (memory.init, data.drop).
+    pub code_uses_data_count: bool,
 
     /// Raw bytecode + data segment bytes storage.
     pub code: Vec<u8>,
@@ -176,8 +185,11 @@ impl WasmModule {
             data_segments: Vec::new(),
             element_segments: Vec::new(),
             start_func: None,
+            has_memory: false,
             memory_min_pages: 0,
             memory_max_pages: 0,
+            data_count: None,
+            code_uses_data_count: false,
             code: Vec::new(),
             names: Vec::new(),
         }
@@ -224,6 +236,24 @@ impl WasmModule {
     }
 }
 
+// ─── Byte reading helper ────────────────────────────────────────────────────
+
+fn read_byte(bytes: &[u8], pos: &mut usize) -> Result<u8, WasmError> {
+    if *pos >= bytes.len() {
+        return Err(WasmError::UnexpectedEnd);
+    }
+    let b = bytes[*pos];
+    *pos += 1;
+    Ok(b)
+}
+
+fn peek_byte(bytes: &[u8], pos: usize) -> Result<u8, WasmError> {
+    if pos >= bytes.len() {
+        return Err(WasmError::UnexpectedEnd);
+    }
+    Ok(bytes[pos])
+}
+
 // ─── LEB128 helpers ─────────────────────────────────────────────────────────
 
 pub fn decode_leb128_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, WasmError> {
@@ -235,6 +265,9 @@ pub fn decode_leb128_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, WasmError
         }
         let byte = bytes[*pos];
         *pos += 1;
+        if shift == 28 && byte > 0x0F {
+            return Err(WasmError::InvalidLEB128);
+        }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
             return Ok(result);
@@ -256,6 +289,29 @@ pub fn decode_leb128_i32(bytes: &[u8], pos: &mut usize) -> Result<i32, WasmError
         }
         let byte = bytes[*pos];
         *pos += 1;
+        if shift == 28 {
+            // 5th byte for i32: only lower 4 bits contribute to the value.
+            // Bit 3 is the sign bit. Bits 4-6 must be copies of bit 3.
+            // Also, the continuation bit (bit 7) must be 0.
+            if byte & 0x80 != 0 {
+                return Err(WasmError::InvalidLEB128);
+            }
+            let sign_bit = (byte >> 3) & 1;
+            let upper = (byte >> 4) & 0x07;
+            if sign_bit == 0 && upper != 0 {
+                return Err(WasmError::InvalidLEB128);
+            }
+            if sign_bit == 1 && upper != 0x07 {
+                return Err(WasmError::InvalidLEB128);
+            }
+            result |= ((byte & 0x7F) as i32) << shift;
+            shift += 7;
+            // Sign extend if needed
+            if shift < size && (byte & 0x40) != 0 {
+                result |= !0 << shift;
+            }
+            return Ok(result);
+        }
         result |= ((byte & 0x7F) as i32) << shift;
         shift += 7;
         if byte & 0x80 == 0 {
@@ -281,6 +337,24 @@ pub fn decode_leb128_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, WasmError
         }
         let byte = bytes[*pos];
         *pos += 1;
+        if shift == 63 {
+            // 10th byte for i64: only bit 0 contributes (bit 63 of the value).
+            // Continuation bit (bit 7) must be 0.
+            // Bits 1-6 must be copies of bit 0 (sign-consistent).
+            if byte & 0x80 != 0 {
+                return Err(WasmError::InvalidLEB128);
+            }
+            // Valid values: 0x00 (positive) or 0x7F (negative)
+            if byte != 0x00 && byte != 0x7F {
+                return Err(WasmError::InvalidLEB128);
+            }
+            result |= ((byte & 0x7F) as i64) << shift;
+            // Sign extend if needed (bit 6 = 0x40 set means negative)
+            if (byte & 0x40) != 0 {
+                // No need to sign-extend past 64 bits
+            }
+            return Ok(result);
+        }
         result |= ((byte & 0x7F) as i64) << shift;
         shift += 7;
         if byte & 0x80 == 0 {
@@ -310,6 +384,25 @@ const SECTION_CODE: u8 = 10;
 const SECTION_DATA: u8 = 11;
 const SECTION_DATA_COUNT: u8 = 12;
 
+// ─── UTF-8 validation ───────────────────────────────────────────────────────
+
+fn validate_utf8(bytes: &[u8]) -> Result<(), WasmError> {
+    core::str::from_utf8(bytes).map_err(|_| WasmError::MalformedUtf8)?;
+    Ok(())
+}
+
+/// Read a length-prefixed name from the byte stream and validate UTF-8.
+fn read_name<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], WasmError> {
+    let len = decode_leb128_u32(bytes, pos)? as usize;
+    if *pos + len > bytes.len() {
+        return Err(WasmError::UnexpectedEnd);
+    }
+    let name = &bytes[*pos..*pos + len];
+    validate_utf8(name)?;
+    *pos += len;
+    Ok(name)
+}
+
 // ─── WASM magic & version ───────────────────────────────────────────────────
 
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D]; // \0asm
@@ -336,9 +429,41 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
     let mut module = WasmModule::new();
     let mut pos: usize = 8;
 
+    // Track the last non-custom section id for ordering validation.
+    // Custom sections (id 0) can appear anywhere and don't affect ordering.
+    let mut last_non_custom_section_id: u8 = 0;
+    let mut has_code_section = false;
+    let mut has_data_section = false;
+
     while pos < bytes.len() {
-        let section_id = bytes[pos];
-        pos += 1;
+        let section_id = read_byte(bytes, &mut pos)?;
+
+        // Reject unknown section IDs (valid: 0-12)
+        if section_id > SECTION_DATA_COUNT {
+            return Err(WasmError::InvalidSection);
+        }
+
+        // Section ordering: non-custom sections must appear in order.
+        // Custom sections (id 0) can appear anywhere.
+        // Each non-custom section can appear at most once, and must be in
+        // ascending id order (except DataCount=12, which appears between
+        // Element=9 and Code=10 in canonical order, but the spec allows
+        // it after Import and before Code).
+        if section_id != 0 {
+            if section_id == last_non_custom_section_id {
+                // Duplicate section (not custom)
+                return Err(WasmError::InvalidSection);
+            }
+            // DataCount (12) must come after Element (9) but before Code (10).
+            // In the binary ordering, DataCount is placed between Element and Code.
+            // We map it to a canonical order position between Element and Code.
+            let order = section_order(section_id);
+            let last_order = section_order(last_non_custom_section_id);
+            if order <= last_order {
+                return Err(WasmError::InvalidSection);
+            }
+            last_non_custom_section_id = section_id;
+        }
 
         let section_len = decode_leb128_u32(bytes, &mut pos)? as usize;
         let section_end = pos + section_len;
@@ -357,19 +482,77 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
             SECTION_EXPORT => decode_export_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_START => decode_start_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_ELEMENT => decode_element_section(bytes, &mut pos, section_end, &mut module)?,
-            SECTION_CODE => decode_code_section(bytes, &mut pos, section_end, &mut module)?,
-            SECTION_DATA => decode_data_section(bytes, &mut pos, section_end, &mut module)?,
-            SECTION_DATA_COUNT => decode_data_count_section(bytes, &mut pos, section_end, &mut module)?,
-            _ => {
-                // Skip unknown sections (pos is reset to section_end below)
+            SECTION_CODE => {
+                has_code_section = true;
+                decode_code_section(bytes, &mut pos, section_end, &mut module)?;
             }
+            SECTION_DATA => {
+                has_data_section = true;
+                decode_data_section(bytes, &mut pos, section_end, &mut module)?;
+            }
+            SECTION_DATA_COUNT => decode_data_count_section(bytes, &mut pos, section_end, &mut module)?,
+            0 => {
+                // Custom section: validate the name (LEB128 + UTF-8), skip payload
+                let name_len = decode_leb128_u32(bytes, &mut pos)? as usize;
+                if pos + name_len > section_end {
+                    return Err(WasmError::UnexpectedEnd);
+                }
+                // UTF-8 validation of custom section name
+                let name_bytes = &bytes[pos..pos + name_len];
+                core::str::from_utf8(name_bytes).map_err(|_| WasmError::MalformedUtf8)?;
+                pos = section_end;
+            }
+            _ => unreachable!(), // covered by the > 12 check above
         }
 
-        // Make sure we consumed exactly to section_end
-        pos = section_end;
+        // Section size mismatch: for non-custom sections, ensure we consumed
+        // exactly to section_end. Custom sections are already advanced to section_end above.
+        if section_id != 0 {
+            if pos != section_end {
+                return Err(WasmError::InvalidSection);
+            }
+        }
+    }
+
+    // Validate data count vs data section consistency
+    if let Some(data_count) = module.data_count {
+        if has_data_section {
+            if module.data_segments.len() != data_count as usize {
+                return Err(WasmError::InvalidSection);
+            }
+        } else if data_count != 0 {
+            return Err(WasmError::InvalidSection);
+        }
+    }
+
+    // If code section uses bulk-memory data instructions (memory.init, data.drop),
+    // the data count section is required.
+    if module.code_uses_data_count && module.data_count.is_none() {
+        return Err(WasmError::InvalidSection);
     }
 
     Ok(module)
+}
+
+/// Map section IDs to canonical ordering positions.
+/// DataCount (12) must appear after Element (9) but before Code (10).
+fn section_order(id: u8) -> u8 {
+    match id {
+        0 => 0, // Custom sections don't participate in ordering
+        SECTION_TYPE => 1,
+        SECTION_IMPORT => 2,
+        SECTION_FUNCTION => 3,
+        SECTION_TABLE => 4,
+        SECTION_MEMORY => 5,
+        SECTION_GLOBAL => 6,
+        SECTION_EXPORT => 7,
+        SECTION_START => 8,
+        SECTION_ELEMENT => 9,
+        SECTION_DATA_COUNT => 10,
+        SECTION_CODE => 11,
+        SECTION_DATA => 12,
+        _ => 255,
+    }
 }
 
 // ─── Section decoders ───────────────────────────────────────────────────────
@@ -381,6 +564,32 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7D => Ok(ValType::F32),
         0x7C => Ok(ValType::F64),
         0x7B => Ok(ValType::V128),
+        // Reference types: funcref (0x70), externref (0x6F)
+        // Map to I32 as placeholder since we don't fully support them
+        0x70 | 0x6F => Ok(ValType::I32),
+        _ => Err(WasmError::TypeMismatch),
+    }
+}
+
+/// Decode a valtype from the bytecode stream, handling multi-byte reference types.
+/// In the GC proposal, ref types can be encoded as:
+/// - 0x63 <heaptype> (ref null ht)
+/// - 0x64 <heaptype> (ref ht)
+/// Heap types are encoded as signed LEB128 indices or abstract type bytes.
+fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmError> {
+    let b = read_byte(bytes, pos)?;
+    match b {
+        0x7F => Ok(ValType::I32),
+        0x7E => Ok(ValType::I64),
+        0x7D => Ok(ValType::F32),
+        0x7C => Ok(ValType::F64),
+        0x7B => Ok(ValType::V128),
+        0x70 | 0x6F => Ok(ValType::I32), // funcref, externref
+        0x63 | 0x64 => {
+            // ref null/non-null heaptype: read and discard the heap type index
+            let _ = decode_leb128_i32(bytes, pos)?;
+            Ok(ValType::I32) // placeholder
+        }
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -388,7 +597,7 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
 fn decode_type_section(
     bytes: &[u8],
     pos: &mut usize,
-    _end: usize,
+    end: usize,
     module: &mut WasmModule,
 ) -> Result<(), WasmError> {
     let count = decode_leb128_u32(bytes, pos)? as usize;
@@ -397,11 +606,61 @@ fn decode_type_section(
     }
 
     for _i in 0..count {
-        // Each entry starts with 0x60 (func type marker)
-        if *pos >= bytes.len() || bytes[*pos] != 0x60 {
+        let marker = read_byte(bytes, pos)?;
+        // 0x60 = func type, 0x4E = rec type (GC proposal)
+        if marker == 0x4E {
+            // rec type: count of types, then each is a sub/func type
+            let rec_count = decode_leb128_u32(bytes, pos)? as usize;
+            for _ in 0..rec_count {
+                let sub_marker = read_byte(bytes, pos)?;
+                if sub_marker == 0x50 || sub_marker == 0x4F {
+                    // sub/sub_final: read supertype count + supertypes
+                    let super_count = decode_leb128_u32(bytes, pos)? as usize;
+                    for _ in 0..super_count {
+                        let _ = decode_leb128_u32(bytes, pos)?;
+                    }
+                    let inner = read_byte(bytes, pos)?;
+                    if inner != 0x60 {
+                        return Err(WasmError::InvalidSection);
+                    }
+                } else if sub_marker != 0x60 {
+                    return Err(WasmError::InvalidSection);
+                }
+                // Parse func type params and results
+                let mut ft = FuncTypeDef::empty();
+                let param_count = decode_leb128_u32(bytes, pos)? as u8;
+                if param_count as usize > MAX_PARAMS {
+                    return Err(WasmError::TooManyFunctions);
+                }
+                ft.param_count = param_count;
+                for p in 0..param_count as usize {
+                    ft.params[p] = decode_valtype_from_stream(bytes, pos)?;
+                }
+                let result_count = decode_leb128_u32(bytes, pos)? as u8;
+                if result_count as usize > MAX_RESULTS {
+                    return Err(WasmError::TooManyFunctions);
+                }
+                ft.result_count = result_count;
+                for r in 0..result_count as usize {
+                    ft.results[r] = decode_valtype_from_stream(bytes, pos)?;
+                }
+                module.func_types.push(ft);
+            }
+            continue;
+        }
+        if marker == 0x50 || marker == 0x4F {
+            // sub/sub_final type (non-rec)
+            let super_count = decode_leb128_u32(bytes, pos)? as usize;
+            for _ in 0..super_count {
+                let _ = decode_leb128_u32(bytes, pos)?;
+            }
+            let inner = read_byte(bytes, pos)?;
+            if inner != 0x60 {
+                return Err(WasmError::InvalidSection);
+            }
+        } else if marker != 0x60 {
             return Err(WasmError::InvalidSection);
         }
-        *pos += 1;
 
         let mut ft = FuncTypeDef::empty();
 
@@ -412,8 +671,7 @@ fn decode_type_section(
         }
         ft.param_count = param_count;
         for p in 0..param_count as usize {
-            ft.params[p] = decode_valtype(bytes[*pos])?;
-            *pos += 1;
+            ft.params[p] = decode_valtype_from_stream(bytes, pos)?;
         }
 
         // Results
@@ -423,8 +681,7 @@ fn decode_type_section(
         }
         ft.result_count = result_count;
         for r in 0..result_count as usize {
-            ft.results[r] = decode_valtype(bytes[*pos])?;
-            *pos += 1;
+            ft.results[r] = decode_valtype_from_stream(bytes, pos)?;
         }
 
         module.func_types.push(ft);
@@ -448,22 +705,19 @@ fn decode_import_section(
         let mut imp = ImportDef::empty();
 
         // Module name
-        let mod_name_len = decode_leb128_u32(bytes, pos)? as usize;
+        let mod_name = read_name(bytes, pos)?;
         imp.module_name_offset = module.names.len();
-        imp.module_name_len = mod_name_len;
-        module.names.extend_from_slice(&bytes[*pos..*pos + mod_name_len]);
-        *pos += mod_name_len;
+        imp.module_name_len = mod_name.len();
+        module.names.extend_from_slice(mod_name);
 
         // Field name
-        let field_name_len = decode_leb128_u32(bytes, pos)? as usize;
+        let field_name = read_name(bytes, pos)?;
         imp.field_name_offset = module.names.len();
-        imp.field_name_len = field_name_len;
-        module.names.extend_from_slice(&bytes[*pos..*pos + field_name_len]);
-        *pos += field_name_len;
+        imp.field_name_len = field_name.len();
+        module.names.extend_from_slice(field_name);
 
         // Import kind
-        let kind_byte = bytes[*pos];
-        *pos += 1;
+        let kind_byte = read_byte(bytes, pos)?;
         match kind_byte {
             0x00 => {
                 // Function import
@@ -472,23 +726,33 @@ fn decode_import_section(
             }
             0x01 => {
                 // Table import: elemtype + limits
-                let _elemtype = bytes[*pos]; *pos += 1;
-                let flags = decode_leb128_u32(bytes, pos)?;
+                let elemtype = read_byte(bytes, pos)?;
+                if elemtype == 0x63 || elemtype == 0x64 {
+                    let _ = decode_leb128_i32(bytes, pos)?;
+                }
+                let flags = read_byte(bytes, pos)?;
+                if flags > 1 {
+                    return Err(WasmError::InvalidSection);
+                }
                 let _min = decode_leb128_u32(bytes, pos)?;
                 if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
-                imp.kind = ImportKind::Func(0); // placeholder
+                imp.kind = ImportKind::Table;
             }
             0x02 => {
                 // Memory import: limits
-                let flags = decode_leb128_u32(bytes, pos)?;
+                module.has_memory = true;
+                let flags = read_byte(bytes, pos)?;
+                if flags > 3 || flags == 2 {
+                    return Err(WasmError::InvalidSection);
+                }
                 let _min = decode_leb128_u32(bytes, pos)?;
                 if flags & 1 != 0 { let _ = decode_leb128_u32(bytes, pos)?; }
-                imp.kind = ImportKind::Func(0); // placeholder
+                imp.kind = ImportKind::Memory;
             }
             0x03 => {
                 // Global import: valtype + mutability
-                let vt = bytes[*pos]; *pos += 1;
-                let mt = bytes[*pos]; *pos += 1;
+                let vt = read_byte(bytes, pos)?;
+                let mt = read_byte(bytes, pos)?;
                 imp.kind = ImportKind::Global(vt, mt != 0);
             }
             _ => {
@@ -535,17 +799,26 @@ fn decode_memory_section(
         return Ok(());
     }
     // We only support one memory
-    let flags = decode_leb128_u32(bytes, pos)?;
+    module.has_memory = true;
+    let flags = read_byte(bytes, pos)?;
+    // Valid limit flags for memory: 0 (min only), 1 (min+max), 3 (shared min+max)
+    if flags > 3 || flags == 2 {
+        return Err(WasmError::InvalidSection);
+    }
     module.memory_min_pages = decode_leb128_u32(bytes, pos)?;
     if flags & 1 != 0 {
         module.memory_max_pages = decode_leb128_u32(bytes, pos)?;
     } else {
-        module.memory_max_pages = module.memory_min_pages;
+        // No max specified: use u32::MAX as sentinel for "unlimited" (up to MAX_MEMORY_PAGES)
+        module.memory_max_pages = u32::MAX;
     }
 
     // Skip any additional memories
     for _ in 1..count {
-        let f = decode_leb128_u32(bytes, pos)?;
+        let f = read_byte(bytes, pos)?;
+        if f > 3 || f == 2 {
+            return Err(WasmError::InvalidSection);
+        }
         let _ = decode_leb128_u32(bytes, pos)?;
         if f & 1 != 0 {
             let _ = decode_leb128_u32(bytes, pos)?;
@@ -570,15 +843,13 @@ fn decode_export_section(
         let mut exp = ExportDef::empty();
 
         // Name
-        let name_len = decode_leb128_u32(bytes, pos)? as usize;
+        let name = read_name(bytes, pos)?;
         exp.name_offset = module.names.len();
-        exp.name_len = name_len;
-        module.names.extend_from_slice(&bytes[*pos..*pos + name_len]);
-        *pos += name_len;
+        exp.name_len = name.len();
+        module.names.extend_from_slice(name);
 
         // Kind
-        let kind_byte = bytes[*pos];
-        *pos += 1;
+        let kind_byte = read_byte(bytes, pos)?;
         let idx = decode_leb128_u32(bytes, pos)?;
         match kind_byte {
             0x00 => exp.kind = ExportKind::Func(idx),
@@ -597,7 +868,7 @@ fn decode_export_section(
 fn decode_code_section(
     bytes: &[u8],
     pos: &mut usize,
-    _end: usize,
+    end: usize,
     module: &mut WasmModule,
 ) -> Result<(), WasmError> {
     let count = decode_leb128_u32(bytes, pos)? as usize;
@@ -612,7 +883,8 @@ fn decode_code_section(
 
         // Decode locals
         let local_decl_count = decode_leb128_u32(bytes, pos)? as usize;
-        let mut total_locals: u16 = 0;
+        // Use u64 to detect overflow beyond u32::MAX
+        let mut total_locals: u64 = 0;
 
         if i >= module.functions.len() {
             return Err(WasmError::FunctionNotFound(i as u32));
@@ -620,17 +892,47 @@ fn decode_code_section(
         let func = &mut module.functions[i];
 
         for _ in 0..local_decl_count {
-            let n = decode_leb128_u32(bytes, pos)? as u16;
-            let ty = decode_valtype(bytes[*pos])?;
-            *pos += 1;
-            for _ in 0..n {
-                if (total_locals as usize) < MAX_LOCALS {
-                    func.locals[total_locals as usize] = ty;
-                }
-                total_locals += 1;
+            let n = decode_leb128_u32(bytes, pos)? as u64;
+            let ty = decode_valtype_from_stream(bytes, pos)?;
+            total_locals = total_locals.saturating_add(n);
+            // WASM spec: no more than 2^32 - 1 locals total (including params)
+            if total_locals > u32::MAX as u64 {
+                return Err(WasmError::InvalidSection);
+            }
+            let start = (total_locals - n) as usize;
+            for j in start..((total_locals as usize).min(MAX_LOCALS)) {
+                func.locals[j] = ty;
             }
         }
-        func.local_count = total_locals;
+
+        // Also check including params from the function type
+        let type_idx = func.type_idx as usize;
+        func.local_count = total_locals.min(u16::MAX as u64) as u16;
+
+        if type_idx < module.func_types.len() {
+            let param_count = module.func_types[type_idx].param_count as u64;
+            if total_locals.saturating_add(param_count) > u32::MAX as u64 {
+                return Err(WasmError::InvalidSection);
+            }
+        }
+
+        // Validate END opcode at end of function body
+        if body_end > 0 && bytes[body_end - 1] != 0x0B {
+            return Err(WasmError::InvalidSection);
+        }
+
+        // Scan for bulk-memory instructions (memory.init=0xFC 0x08, data.drop=0xFC 0x09)
+        // that require a data count section.
+        if !module.code_uses_data_count {
+            let code_start = *pos;
+            let code_end_pos = body_end;
+            for j in code_start..code_end_pos.saturating_sub(1) {
+                if bytes[j] == 0xFC && (bytes[j + 1] == 0x08 || bytes[j + 1] == 0x09) {
+                    module.code_uses_data_count = true;
+                    break;
+                }
+            }
+        }
 
         // Copy the remaining bytecode (instructions) into module.code
         let code_bytes = body_end - *pos;
@@ -642,6 +944,11 @@ fn decode_code_section(
         module.code.extend_from_slice(&bytes[*pos..*pos + code_bytes]);
 
         *pos = body_end;
+    }
+
+    // Section size mismatch: ensure we consumed exactly to section end
+    if *pos != end {
+        return Err(WasmError::InvalidSection);
     }
 
     Ok(())
@@ -657,12 +964,19 @@ fn decode_table_section(
 ) -> Result<(), WasmError> {
     let count = decode_leb128_u32(bytes, pos)? as usize;
     for _ in 0..count {
-        // elemtype: 0x70 = funcref (only valid in MVP)
-        let elemtype = bytes[*pos]; *pos += 1;
-        if elemtype != 0x70 {
+        // elemtype: 0x70 = funcref, 0x6F = externref, 0x63/0x64 = ref types
+        let elemtype = read_byte(bytes, pos)?;
+        if elemtype == 0x63 || elemtype == 0x64 {
+            // Nullable/non-nullable ref type: read and discard heap type
+            let _ = decode_leb128_i32(bytes, pos)?;
+        } else if elemtype != 0x70 && elemtype != 0x6F {
             return Err(WasmError::InvalidSection);
         }
-        let flags = decode_leb128_u32(bytes, pos)?;
+        let flags = read_byte(bytes, pos)?;
+        // Valid limit flags for tables: 0 (min only), 1 (min+max)
+        if flags > 1 {
+            return Err(WasmError::InvalidSection);
+        }
         let min = decode_leb128_u32(bytes, pos)?;
         let max = if flags & 1 != 0 {
             Some(decode_leb128_u32(bytes, pos)?)
@@ -685,9 +999,9 @@ fn decode_global_section(
         return Err(WasmError::TooManyFunctions);
     }
     for _ in 0..count {
-        let vt_byte = bytes[*pos]; *pos += 1;
-        let val_type = decode_valtype(vt_byte)?;
-        let mutable = bytes[*pos] != 0; *pos += 1;
+        // Use stream decoder to handle multi-byte ref types
+        let val_type = decode_valtype_from_stream(bytes, pos)?;
+        let mutable = read_byte(bytes, pos)? != 0;
         let init_value = eval_init_expr(bytes, pos)?;
         module.globals.push(GlobalDef { val_type, mutable, init_value });
     }
@@ -741,7 +1055,7 @@ fn decode_element_section(
             }
             1 => {
                 // Passive segment: kind byte + func indices (no table, no offset)
-                let _kind = bytes[*pos]; *pos += 1; // elemkind (0x00 = funcref)
+                let _kind = read_byte(bytes, pos)?; // elemkind (0x00 = funcref)
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 for _ in 0..num_elems {
                     let _ = decode_leb128_u32(bytes, pos)?; // skip func index
@@ -757,7 +1071,7 @@ fn decode_element_section(
                     Value::I64(v) => v as u32,
                     _ => 0,
                 };
-                let _kind = bytes[*pos]; *pos += 1;
+                let _kind = read_byte(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
@@ -771,14 +1085,56 @@ fn decode_element_section(
             }
             3 => {
                 // Declarative segment: kind + func indices (dropped immediately)
-                let _kind = bytes[*pos]; *pos += 1;
+                let _kind = read_byte(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 for _ in 0..num_elems {
                     let _ = decode_leb128_u32(bytes, pos)?;
                 }
             }
+            4 => {
+                // Active, table 0 implicit, offset expr, expression elements
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                for _ in 0..num_elems {
+                    let val = eval_init_expr(bytes, pos)?;
+                    func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                }
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices });
+            }
+            5 => {
+                // Passive, reftype, expression elements
+                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                for _ in 0..num_elems {
+                    let _ = eval_init_expr(bytes, pos)?;
+                }
+                // Passive — not applied at init
+            }
+            6 => {
+                // Active, explicit table_idx, offset expr, reftype, expression elements
+                let table_idx = decode_leb128_u32(bytes, pos)?;
+                let offset_val = eval_init_expr(bytes, pos)?;
+                let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
+                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
+                for _ in 0..num_elems {
+                    let val = eval_init_expr(bytes, pos)?;
+                    func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
+                }
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices });
+            }
+            7 => {
+                // Declarative, reftype, expression elements (dropped immediately)
+                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let num_elems = decode_leb128_u32(bytes, pos)? as usize;
+                for _ in 0..num_elems {
+                    let _ = eval_init_expr(bytes, pos)?;
+                }
+            }
             _ => {
-                // flags 4-7: expression-based variants (skip for now)
                 return Err(WasmError::InvalidSection);
             }
         }
@@ -874,12 +1230,11 @@ fn decode_data_count_section(
     bytes: &[u8],
     pos: &mut usize,
     _end: usize,
-    _module: &mut WasmModule,
+    module: &mut WasmModule,
 ) -> Result<(), WasmError> {
     // DataCount section contains a single u32: the number of data segments.
-    // This is used by bulk-memory proposal for validation; we read and discard
-    // it since our data section decoder handles counting independently.
-    let _count = decode_leb128_u32(bytes, pos)?;
+    let count = decode_leb128_u32(bytes, pos)?;
+    module.data_count = Some(count);
     Ok(())
 }
 
@@ -889,7 +1244,7 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
     if *pos >= bytes.len() {
         return Err(WasmError::UnexpectedEnd);
     }
-    let opcode = bytes[*pos]; *pos += 1;
+    let opcode = read_byte(bytes, pos)?;
     let value = match opcode {
         0x41 => {
             // i32.const
@@ -904,8 +1259,11 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
         0x43 => {
             // f32.const
             if *pos + 4 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
-            let v = f32::from_le_bytes([bytes[*pos], bytes[*pos+1], bytes[*pos+2], bytes[*pos+3]]);
-            *pos += 4;
+            let b0 = read_byte(bytes, pos)?;
+            let b1 = read_byte(bytes, pos)?;
+            let b2 = read_byte(bytes, pos)?;
+            let b3 = read_byte(bytes, pos)?;
+            let v = f32::from_le_bytes([b0, b1, b2, b3]);
             Value::F32(v)
         }
         0x44 => {
@@ -921,12 +1279,35 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
             let _idx = decode_leb128_u32(bytes, pos)?;
             Value::I32(0)
         }
+        0xD0 => {
+            // ref.null heaptype
+            let _ = decode_leb128_i32(bytes, pos)?;
+            Value::I32(-1) // null ref sentinel
+        }
+        0xD2 => {
+            // ref.func funcidx
+            let idx = decode_leb128_u32(bytes, pos)?;
+            Value::I32(idx as i32)
+        }
+        0xFD => {
+            // SIMD prefix in init expr: only v128.const (sub-opcode 12) is valid
+            let sub = decode_leb128_u32(bytes, pos)?;
+            if sub == 12 {
+                // v128.const: 16 bytes immediate
+                if *pos + 16 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
+                let mut v = [0u8; 16];
+                v.copy_from_slice(&bytes[*pos..*pos + 16]);
+                *pos += 16;
+                Value::V128(crate::wasm::types::V128(v))
+            } else {
+                return Err(WasmError::InvalidSection);
+            }
+        }
         _ => return Err(WasmError::InvalidSection),
     };
     // Expect 0x0B (end)
-    if *pos >= bytes.len() || bytes[*pos] != 0x0B {
+    if read_byte(bytes, pos)? != 0x0B {
         return Err(WasmError::InvalidSection);
     }
-    *pos += 1;
     Ok(value)
 }

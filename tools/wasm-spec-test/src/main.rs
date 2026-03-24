@@ -55,11 +55,11 @@ fn print_report(report: &FileReport) {
                 report.passed_assertions,
                 report.total_assertions
             );
-            for failure in report.failures.iter().take(10) {
+            for failure in report.failures.iter().take(100) {
                 println!("  line {} [{}] {}", failure.line, failure.kind, failure.message);
             }
-            if report.failures.len() > 10 {
-                println!("  ... {} more failures", report.failures.len() - 10);
+            if report.failures.len() > 100 {
+                println!("  ... {} more failures", report.failures.len() - 100);
             }
         }
     }
@@ -112,8 +112,12 @@ fn main() -> ExitCode {
     let mut skipped_assertions = 0usize;
 
     for file in files {
-        match WastRunner::run_file(&file, verbose) {
-            Ok(report) => {
+        let file_clone = file.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            WastRunner::run_file(&file_clone, verbose)
+        }));
+        match result {
+            Ok(Ok(report)) => {
                 total_assertions += report.total_assertions;
                 passed_assertions += report.passed_assertions;
                 skipped_assertions += report.skipped_assertions;
@@ -124,9 +128,13 @@ fn main() -> ExitCode {
                 }
                 print_report(&report);
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 fail_files += 1;
                 eprintln!("[FAIL] {} ({error:#})", display_path(&file));
+            }
+            Err(_panic) => {
+                fail_files += 1;
+                eprintln!("[PANIC] {} (internal panic)", display_path(&file));
             }
         }
     }
