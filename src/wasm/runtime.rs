@@ -1211,7 +1211,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_i32(addr));
                 try_exec!(self.push(Value::I32(val)));
             }
@@ -1220,7 +1220,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_i64(addr));
                 try_exec!(self.push(Value::I64(val)));
             }
@@ -1230,7 +1230,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_i32(addr, val));
             }
             0x37 => {
@@ -1239,7 +1239,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_i64(addr, val));
             }
 
@@ -1250,7 +1250,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_f32(addr));
                 try_exec!(self.push(Value::F32(val)));
             }
@@ -1260,7 +1260,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_f64(addr));
                 try_exec!(self.push(Value::F64(val)));
             }
@@ -1271,7 +1271,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u8(addr)) as i8;
                 try_exec!(self.push(Value::I32(val as i32)));
             }
@@ -1280,7 +1280,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u8(addr));
                 try_exec!(self.push(Value::I32(val as i32)));
             }
@@ -1289,7 +1289,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u16(addr)) as i16;
                 try_exec!(self.push(Value::I32(val as i32)));
             }
@@ -1298,7 +1298,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u16(addr));
                 try_exec!(self.push(Value::I32(val as i32)));
             }
@@ -1307,7 +1307,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u8(addr)) as i8;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1316,7 +1316,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u8(addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1325,7 +1325,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u16(addr)) as i16;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1334,7 +1334,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u16(addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1343,7 +1343,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u32(addr)) as i32;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1352,7 +1352,7 @@ impl WasmInstance {
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 let val = try_exec!(self.mem_load_u32(addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
@@ -1364,7 +1364,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_u8(addr, val as u8));
             }
             0x3B => {
@@ -1373,7 +1373,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_u16(addr, val as u16));
             }
             0x3C => {
@@ -1382,7 +1382,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_u8(addr, val as u8));
             }
             0x3D => {
@@ -1391,7 +1391,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_u16(addr, val as u16));
             }
             0x3E => {
@@ -1400,7 +1400,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_u32(addr, val as u32));
             }
 
@@ -1411,7 +1411,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_f32());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_f32(addr, val));
             }
             0x39 => {
@@ -1421,7 +1421,7 @@ impl WasmInstance {
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_f64());
                 let base = try_exec!(self.pop_i32()) as u32;
-                let addr = (base + offset) as usize;
+                let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
                 try_exec!(self.mem_store_f64(addr, val));
             }
 
