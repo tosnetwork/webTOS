@@ -1,7 +1,7 @@
 # ATOS eBPF-lite Specification
 
-**Version:** 1.0 (Stage-2)
-**Status:** Implementation Reference
+**Version:** 2.0 (Stage-3)
+**Status:** Implementation Complete
 **Companion to:** Yellow Paper §24.3.2
 
 > This document is the normative specification for the ATOS eBPF-lite policy runtime. The yellow paper provides architectural context and roadmap; this document provides the complete ABI, instruction set, and implementation contract.
@@ -45,7 +45,7 @@ eBPF-lite is **not** an `AgentRuntime` (§24.3.0). It is kernel-resident and att
 - Deterministic for a given verified bytecode image, input context, and helper results
 - Bytecode encoding compatible with standard Linux eBPF (subset)
 
-`[IMPL: ✅ 1,010 lines across 5 kernel modules + SDK toolchain]`
+`[IMPL: ✅ ~1,750 lines across 6 kernel modules + integration files + SDK toolchain]`
 
 ---
 
@@ -328,8 +328,15 @@ Helper functions provide eBPF programs with access to kernel services. They are 
 | 3 | `map_delete` | `r1=map_id, r2=key_ptr, r3=key_len` | `r0` = 0 (success) or 1 (not found) | ✅ |
 | 4 | `get_agent_id` | (none) | `r0` = current agent ID | ✅ |
 | 5 | `get_energy` | (none) | `r0` = agent's remaining energy budget | ✅ |
-| 6 | `emit_event` | `r1=event_code` | `r0` = 0 | ⚠️ No-op stub |
+| 6 | `emit_event` | `r1=event_code` | `r0` = 0 | ✅ |
 | 7 | `get_tick` | (none) | `r0` = system timer tick count | ✅ |
+| 8 | `get_mailbox_pressure` | `r1=mailbox_id` | `r0` = fill count (0–16) | ✅ |
+| 9 | `get_agent_parent` | `r1=agent_id` | `r0` = parent ID (0xFFFF if none) | ✅ |
+| 10 | `get_capability_count` | `r1=agent_id` | `r0` = capability count | ✅ |
+| 11 | `increment_counter` | `r1=map_id, r2=key_ptr, r3=key_len` | `r0` = 0 (success) or 1 (error) | ✅ |
+| 12 | `read_gauge` | `r1=map_id, r2=key_ptr, r3=key_len` | `r0` = u64 value (0 if not found) | ✅ |
+| 13 | `map_persist` | `r1=map_id` | `r0` = 0 (success) or 1 (error) | ✅ |
+| 14 | `map_restore` | `r1=map_id` | `r0` = 0 (success) or 1 (error) | ✅ |
 
 ### 6.1 Helper details
 
@@ -343,13 +350,27 @@ Helper functions provide eBPF programs with access to kernel services. They are 
 
 **`get_energy` (ID 5):** Returns the triggering agent's remaining energy budget. Returns 0 if the agent is not found.
 
-**`emit_event` (ID 6):** Intended to emit an audit event with the given event code. Currently a fire-and-forget stub that always returns 0 without actually writing to the event subsystem.
+**`emit_event` (ID 6):** Emits a `Custom` audit event with the given event code via the kernel event subsystem (`event::emit`). The event is recorded in both the serial log and the in-kernel ring buffer. Always returns 0.
 
 **`get_tick` (ID 7):** Returns the current PIT timer tick count (100 Hz resolution in Stage-1/2).
 
+**`get_mailbox_pressure` (ID 8):** Returns the current fill count of the specified mailbox (0 to `MAX_MAILBOX_CAPACITY`=16). Returns 0 if the mailbox does not exist.
+
+**`get_agent_parent` (ID 9):** Returns the parent agent ID for the given agent. Returns `0xFFFF` if the agent has no parent or does not exist.
+
+**`get_capability_count` (ID 10):** Returns the number of capabilities held by the given agent. Returns 0 if the agent does not exist.
+
+**`increment_counter` (ID 11):** Reads a `u64` value from the map at the given key, increments by 1, writes back. If not found, inserts with value 1. Returns 0 on success, 1 on error.
+
+**`read_gauge` (ID 12):** Reads a `u64` value from the map at the given key. Returns 0 if not found.
+
+**`map_persist` (ID 13):** Serializes all entries of the specified map to the calling agent's keyspace via the state subsystem. Returns 0 on success, 1 on failure.
+
+**`map_restore` (ID 14):** Deserializes map entries from the calling agent's keyspace, overwriting current map contents. Returns 0 on success, 1 on failure.
+
 **Invalid helper IDs** return `EbpfError::InvalidHelper`.
 
-`[IMPL: ✅ runtime.rs call_helper() — 7 helpers; ⚠️ emit_event is a no-op stub]`
+`[IMPL: ✅ runtime.rs call_helper() — all 14 helpers fully wired]`
 
 ---
 
@@ -378,25 +399,41 @@ MapEntry {
 }
 ```
 
-### 7.3 Map type
+### 7.3 Map types
 
-Only one map type is supported: **flat associative array** with linear scan. There is no hash function — all operations perform a linear scan over all entries comparing keys by exact byte match.
+Two map types are supported:
 
-- `lookup(key)` — linear scan of all entries, exact key match; O(n)
-- `update(key, value)` — scan for existing key (update in place) or first empty slot (insert); O(n)
-- `delete(key)` — scan for key, mark entry as unoccupied; O(n)
+| Type | Enum | Lookup | Key semantics |
+|------|------|--------|---------------|
+| **Hash** | `MapType::Hash` | Linear scan, O(n) | Exact byte match |
+| **Array** | `MapType::Array` | Direct index, O(1) | Key is little-endian `u32` index (must be ≥ 4 bytes) |
+
+**Hash map operations:**
+- `lookup(key)` — linear scan, exact key match; O(n)
+- `update(key, value)` — scan for existing key or first empty slot; O(n)
+- `delete(key)` — scan for key, mark unoccupied; O(n)
+
+**Array map operations:**
+- `lookup(key)` — interpret key as `u32` index, direct access; O(1)
+- `update(key, value)` — direct write at index; O(1)
+- `delete(key)` — clear entry at index; O(1)
 
 ### 7.4 Kernel API
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `create_map` | `(id: u32) -> Result<(), EbpfError>` | Allocate a new map in the global table |
+| `create_map` | `(id: u32) -> Result<(), EbpfError>` | Allocate a new hash map |
+| `create_map_typed` | `(id: u32, map_type: MapType) -> Result<(), EbpfError>` | Allocate a map with specified type |
 | `get_map` | `(id: u32) -> Option<&EbpfMap>` | Immutable reference by ID |
 | `get_map_mut` | `(id: u32) -> Option<&mut EbpfMap>` | Mutable reference by ID |
+| `persist_map` | `(map_id: u32, keyspace: u16) -> u32` | Serialize map to agent's keyspace |
+| `restore_map` | `(map_id: u32, keyspace: u16) -> u32` | Deserialize map from agent's keyspace |
 
-Maps are stored in a global static array. They are **not persistent** — all data is lost on reboot.
+**SMP safety:** Slot creation/deletion is protected by `MAPS_SLOT_LOCK: SpinLock<()>`. Map data access (`get_map`/`get_map_mut`) uses direct `static mut` access, safe because eBPF execution is serialized by the `PROGRAMS` SpinLock in `attach.rs`.
 
-`[IMPL: ✅ maps.rs — EbpfMap struct, global MAPS array, create/get/get_mut API]`
+**Persistence:** Maps can be persisted to the state subsystem via `map_persist` (helper 13) and restored via `map_restore` (helper 14). Entries are serialized to the calling agent's keyspace. Maps are **not** auto-persistent — persistence is explicit.
+
+`[IMPL: ✅ maps.rs — Hash + Array map types, SMP-safe slot lock, persist/restore via state.rs]`
 
 ---
 
@@ -415,7 +452,7 @@ eBPF programs are attached to kernel event hooks. When the event occurs, all pro
 | `AgentSpawn` | — | Before agent creation | ❌ Defined only |
 | `TimerTick` | — | On timer interrupt | ❌ Defined only |
 
-`[IMPL: ✅ attach.rs AttachPoint enum; ⚠️ only MailboxSend is wired into the syscall handler]`
+`[IMPL: ✅ attach.rs AttachPoint enum; ✅ all 6 points wired; SpinLock-protected with priority-sorted execution]`
 
 ### 8.2 Context structures
 
@@ -470,7 +507,7 @@ Total size: 24 bytes (aligned to largest member `u64`, 8-byte boundary).
 
 #### TimerTick
 
-No context structure is defined for `TimerTick`. The `ctx` argument passed to `run_at()` is determined by the caller. Since `TimerTick` is not yet wired into the timer interrupt handler, the context format is undefined.
+No typed context structure is defined for `TimerTick`. The `ctx` argument is the raw tick count (`u64`) from `arch::x86_64::timer::get_ticks()`, passed directly to `run_at()`. Programs access it via `r1`. The hook runs in `sched::timer_tick()` after energy charging and before preemptive rescheduling; its action code is ignored (observational only).
 
 > **Note:** Padding depends on Rust's `#[repr(C)]` layout rules. Programs should use field offsets from this table, not assume packed layout.
 
@@ -616,13 +653,14 @@ Byte   Field                  Type
                                         2=MailboxSend, 3=MailboxRecv,
                                         4=AgentSpawn, 5=TimerTick)
 2-3    attach_target          u16 LE   (syscall num or mailbox ID)
-4-5    prog_len               u16 LE   (total bytecode size in bytes)
-6..    bytecode               [u8]     (8-byte aligned instructions)
+4      priority               u8       (lower = higher priority, default 128)
+5-6    prog_len               u16 LE   (total bytecode size in bytes)
+7..    bytecode               [u8]     (8-byte aligned instructions)
 ```
 
 Instruction count is derived: `insn_count = prog_len / 8`.
 
-Maximum: 256 instructions = 2,048 bytes of bytecode. Total message size must fit within the 256-byte mailbox payload limit, which restricts practical program size to **31 instructions** via a single message (6 header bytes + 31 × 8 = 254 bytes).
+Maximum: 1024 instructions = 8,192 bytes of bytecode. A single message can carry up to **31 instructions** (7 header bytes + 31 × 8 = 255 bytes). For larger programs, use OP_ATTACH_CHUNK (0x04).
 
 #### OP_DETACH (0x02) — Remove a program
 
@@ -641,13 +679,38 @@ Byte   Field                  Type
 0      opcode = 0x03          u8
 ```
 
-Response format is not yet defined.
+Response: policyd iterates attached programs via `for_each_attached()` and outputs each entry's slot index, attach point, priority, and instruction count to the serial log.
+
+#### OP_ATTACH_CHUNK (0x04) — Multi-message program loading
+
+For programs larger than a single mailbox message (> 31 instructions).
+
+```text
+First chunk:  [op=0x04, flags=0x01, attach_type, attach_target:u16, priority, total_len:u16, bytecode...]
+Continuation: [op=0x04, flags=0x00, bytecode...]
+Last chunk:   [op=0x04, flags=0x02, bytecode...]  (triggers attach)
+```
+
+Flags: bit 0 = first chunk (has header), bit 1 = last chunk (triggers attach). Chunks are accumulated in a static 8192-byte buffer.
+
+#### OP_REPLACE (0x05) — Hot-replace program bytecode
+
+```text
+Byte   Field                  Type
+────────────────────────────────────────
+0      opcode = 0x05          u8
+1-2    program_index          u16 LE   (index of program to replace)
+3-4    prog_len               u16 LE   (new bytecode size in bytes)
+5..    bytecode               [u8]
+```
+
+Replaces the bytecode of an existing program. The attach point and priority are preserved. The new program is verified before replacement.
 
 ### 12.2 Capability requirement
 
-The yellow paper specifies that loading eBPF programs should require `CAP_POLICY_LOAD`. However, policyd **does not currently perform any capability check** — any agent that can send a message to policyd's mailbox can load programs. Capability gating is a planned addition.
+Loading, unloading, and replacing eBPF programs requires the `CAP_POLICY_LOAD` capability (`CapType::PolicyLoad = 7`). Policyd checks `agent_has_cap(msg.sender_id, CapType::PolicyLoad, 0)` before processing OP_ATTACH, OP_ATTACH_CHUNK, OP_DETACH, and OP_REPLACE. OP_LIST does not require the capability.
 
-`[IMPL: ✅ agents/policyd.rs — ATTACH/DETACH/LIST handlers; ⚠️ CAP_POLICY_LOAD check not yet implemented]`
+`[IMPL: ✅ agents/policyd.rs — ATTACH/DETACH/LIST/ATTACH_CHUNK/REPLACE with CAP_POLICY_LOAD; ✅ capability.rs PolicyLoad=7]`
 
 ---
 
@@ -897,7 +960,7 @@ exit                     ; 27:
 | Constant | Value | Location | Description |
 |----------|-------|----------|-------------|
 | `NUM_REGS` | 11 | `types.rs` | Register count (r0–r10) |
-| `MAX_INSNS` | 256 | `types.rs` | Maximum program size (instructions) |
+| `MAX_INSNS` | 1024 | `types.rs` | Maximum program size (instructions) |
 | `STACK_SIZE` | 512 | `types.rs` | Per-execution stack (bytes) |
 | `DEFAULT_MAX_INSNS` | 10,000 | `attach.rs` | Runtime instruction budget |
 | `MAX_ATTACHED` | 16 | `attach.rs` | Maximum attached programs |
@@ -913,7 +976,7 @@ exit                     ; 27:
 | Error | Trigger |
 |-------|---------|
 | `InvalidProgram` | Bytecode parsing failed |
-| `ProgramTooLarge` | Program empty or exceeds 256 instructions |
+| `ProgramTooLarge` | Program empty or exceeds 1024 instructions |
 | `InvalidOpcode(u8)` | Unknown opcode encountered during verification or execution |
 | `InvalidRegister(u8)` | Register index >= 11 |
 | `DivisionByZero` | DIV or MOD with src = 0 |
@@ -936,10 +999,10 @@ exit                     ; 27:
 
 | Feature | Linux eBPF | ATOS eBPF-lite | Impact |
 |---------|-----------|----------------|--------|
-| `ARSH` (arithmetic right shift) | ✅ | ❌ | Cannot do signed division by power-of-2 |
-| `JSGT/JSGE/JSLT/JSLE` (signed jumps) | ✅ | ❌ | Cannot compare signed values |
+| `ARSH` (arithmetic right shift) | ✅ | ✅ | — |
+| `JSGT/JSGE/JSLT/JSLE` (signed jumps) | ✅ | ✅ | — |
 | `JMP32` class (0x06) | ✅ | ❌ | No 32-bit branch optimization |
-| `BPF_LD_IMM64` (64-bit immediate load) | ✅ | ❌ | Cannot load constants > i32 range |
+| `BPF_LD_IMM64` (64-bit immediate load) | ✅ | ✅ | — |
 | `BPF_LD_ABS / BPF_LD_IND` | ✅ | ❌ | Packet direct access (N/A for ATOS) |
 | `BPF_ATOMIC` (XADD, XCHG, CMPXCHG) | ✅ | ❌ | No atomic operations (single-core) |
 | `BPF_END` (byte swap LE/BE) | ✅ | ❌ | No endian conversion |
@@ -949,7 +1012,7 @@ exit                     ; 27:
 | Aspect | Linux eBPF | ATOS eBPF-lite |
 |--------|-----------|----------------|
 | Loop support | Bounded loops (5.3+) via path simulation | **No loops at all** (no backward jumps) |
-| Max instructions | 1,000,000 | **256** |
+| Max instructions | 1,000,000 | **1024** |
 | Verification method | Path-based symbolic execution | Single-pass linear scan |
 | Register tracking | Full type + range tracking per path | Index bounds check only |
 | BTF/CO-RE | ✅ | ❌ |
@@ -960,8 +1023,8 @@ exit                     ; 27:
 
 | Aspect | Linux eBPF | ATOS eBPF-lite |
 |--------|-----------|----------------|
-| Helper functions | 200+ | 7 |
-| Map types | 30+ | 1 (flat associative array) |
+| Helper functions | 200+ | 14 |
+| Map types | 30+ | 2 (hash + array) |
 | Program types | 30+ (XDP, tc, kprobe, etc.) | 6 attachment points |
 | JIT compilation | ✅ | ❌ (interpreter only) |
 | Ring buffer output | ✅ (`bpf_ringbuf_*`) | ❌ |
@@ -988,46 +1051,51 @@ ATOS eBPF-lite intentionally does not aim for Linux eBPF compatibility. It borro
 
 ---
 
-## 18. Future Extensions
+## 18. Extensions (all implemented)
 
-Planned enhancements per Yellow Paper §25.2.7 and analysis of current gaps:
+All enhancements from Yellow Paper §25.2.7 and gap analysis have been implemented.
 
 ### 18.1 Stage-3 (Yellow Paper §25.2.7)
 
 | Enhancement | Description | Status |
 |-------------|-------------|--------|
-| New attachment points | Wire SyscallEntry/Exit, MailboxRecv, AgentSpawn, TimerTick into kernel handlers | Planned |
-| Program chaining with priority | Explicit priority ordering + short-circuit on Deny | Planned |
-| Persistent maps | eBPF maps backed by stated (survive reboot) | Planned |
-| Metrics helpers | `increment_counter()`, `read_gauge()` | Planned |
-| Hot-reload | Atomic `replace(index, new_program)` | Planned |
+| All attachment points wired | SyscallEntry/Exit, MailboxSend/Recv, AgentSpawn, TimerTick | ✅ Done |
+| Program chaining with priority | `AttachedProgram.priority: u8`, insertion sort in `run_at()` | ✅ Done |
+| Persistent maps | `map_persist` (ID 13) / `map_restore` (ID 14) via state subsystem | ✅ Done |
+| Metrics helpers | `increment_counter` (ID 11), `read_gauge` (ID 12) | ✅ Done |
+| Hot-reload | `replace(index, new_program)` + OP_REPLACE (0x05) protocol | ✅ Done |
 
-### 18.2 Opcode extensions (recommended)
+### 18.2 Opcode extensions
 
-| Extension | Reason | Priority |
-|-----------|--------|----------|
-| `BPF_LD_IMM64` | Load 64-bit constants (agent IDs, addresses, large thresholds) | High |
-| `JSGT/JSGE/JSLT/JSLE` | Signed comparisons for energy deltas, signed arithmetic | High |
-| `ARSH` | Arithmetic right shift, companion to signed operations | Medium |
+| Extension | Description | Status |
+|-----------|-------------|--------|
+| `BPF_LD_IMM64` | Two-instruction 64-bit immediate load (opcode 0x18) | ✅ Done |
+| `JSGT/JSGE/JSLT/JSLE` | Signed comparison jumps (opcodes 0x65/0x6D/0x75/0x7D/0xC5/0xCD/0xD5/0xDD) | ✅ Done |
+| `ARSH` | Arithmetic right shift, ALU64 (0xC7) and ALU32 (0xC4) | ✅ Done |
 
-### 18.3 Helper extensions (recommended)
+### 18.3 Helper extensions
 
-| Helper | Purpose | Priority |
-|--------|---------|----------|
-| `emit_event` (fix) | Wire to actual event subsystem | High |
-| `get_mailbox_pressure` | Read mailbox fill level for backpressure policy | Medium |
-| `get_agent_parent` | Read parent agent ID for delegation policy | Medium |
-| `get_capability_count` | Check agent's capability count | Medium |
-| `drop_message` | Silently drop a message at MailboxRecv | Medium |
+| Helper | ID | Purpose | Status |
+|--------|----|---------|--------|
+| `emit_event` | 6 | Emit audit event to kernel event subsystem | ✅ Done |
+| `get_mailbox_pressure` | 8 | Read mailbox fill level (0–16) | ✅ Done |
+| `get_agent_parent` | 9 | Read parent agent ID | ✅ Done |
+| `get_capability_count` | 10 | Read agent's capability count | ✅ Done |
+| `increment_counter` | 11 | Atomic u64 counter increment in map | ✅ Done |
+| `read_gauge` | 12 | Read u64 gauge value from map | ✅ Done |
+| `map_persist` | 13 | Serialize map to agent keyspace | ✅ Done |
+| `map_restore` | 14 | Restore map from agent keyspace | ✅ Done |
+| `drop_message` | — | Silently drop at MailboxRecv | ✅ Covered by `Action::Deny` |
 
 ### 18.4 Infrastructure extensions
 
-| Extension | Description | Priority |
-|-----------|-------------|----------|
-| SMP safety | Spinlocks on program table and maps (required before Stage-3 SMP) | High |
-| Array map type | O(1) indexed access for counters and lookup tables | Medium |
-| Larger programs via multi-message | Load programs larger than 256-byte mailbox payload | Medium |
-| Instruction limit increase | 256 → 1024 for complex policies | Low |
+| Extension | Description | Status |
+|-----------|-------------|--------|
+| SMP safety (PROGRAMS) | `SpinLock<[Option<AttachedProgram>; 16]>` in attach.rs | ✅ Done |
+| SMP safety (MAPS) | `MAPS_SLOT_LOCK: SpinLock<()>` for slot creation; data access serialized by PROGRAMS lock | ✅ Done |
+| Array map type | `MapType::Array` with O(1) indexed access via u32 key | ✅ Done |
+| Multi-message loading | OP_ATTACH_CHUNK (0x04) with chunked accumulation buffer | ✅ Done |
+| Instruction limit increase | MAX_INSNS: 256 → 1024 | ✅ Done |
 
 ---
 
@@ -1036,13 +1104,16 @@ Planned enhancements per Yellow Paper §25.2.7 and analysis of current gaps:
 | File | Lines | Description |
 |------|-------|-------------|
 | `src/ebpf/mod.rs` | ~10 | Module declaration |
-| `src/ebpf/types.rs` | ~126 | Instruction encoding, opcodes, constants, enums |
-| `src/ebpf/runtime.rs` | ~417 | VM interpreter, ALU/JMP/MEM execution, helper dispatch |
-| `src/ebpf/verifier.rs` | ~137 | Static verification (8 rules, single-pass) |
-| `src/ebpf/attach.rs` | ~155 | Attachment points, program table, `run_at()` execution |
-| `src/ebpf/maps.rs` | ~166 | Flat associative array storage, global map table |
-| `src/agents/policyd.rs` | ~110 | policyd agent: ATTACH/DETACH/LIST protocol |
-| `src/syscall.rs` | (lines 122–136) | eBPF policy check at sys_send |
+| `src/ebpf/types.rs` | ~138 | Instruction encoding, opcodes (incl. ARSH, signed jumps), 14 helper IDs, constants |
+| `src/ebpf/runtime.rs` | ~548 | VM interpreter, ALU/JMP/MEM/LD_IMM64 execution, 14 helper dispatchers |
+| `src/ebpf/verifier.rs` | ~164 | Static verification (8 rules + LD_IMM64 skip_next, signed jumps) |
+| `src/ebpf/attach.rs` | ~205 | SpinLock-protected program table, priority sort, `run_at()`, `replace()`, `for_each_attached()` |
+| `src/ebpf/maps.rs` | ~383 | Hash + Array map types, SMP-safe slot lock, persist/restore via state.rs |
+| `src/agents/policyd.rs` | ~303 | policyd: ATTACH/DETACH/LIST/ATTACH_CHUNK/REPLACE with CAP_POLICY_LOAD |
+| `src/syscall.rs` | ~857 | Syscall dispatcher with eBPF hooks at all 6 attachment points |
+| `src/sched.rs` | (line 413) | TimerTick eBPF hook in `timer_tick()` |
+| `src/capability.rs` | ~350 | Capability model including `PolicyLoad = 7` |
+| `src/event.rs` | ~240 | Audit subsystem including `EbpfPolicy = 22` event type |
 | `src/init.rs` | (lines 502–566) | Boot-time eBPF test programs |
 | `sdk/atos-ebpf-sdk/src/assembler.rs` | ~300 | Text-to-bytecode assembler |
 | `sdk/atos-ebpf-sdk/src/verifier.rs` | ~130 | Offline verifier (mirrors kernel) |
