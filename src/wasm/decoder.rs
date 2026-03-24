@@ -606,6 +606,21 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
     }
 }
 
+/// Decode a reference type from the bytecode stream.
+/// Only accepts reference types: 0x70 (funcref), 0x6F (externref), 0x63 (ref null ht), 0x64 (ref ht).
+/// Returns an error for non-reference types (i32, i64, f32, f64, v128).
+fn decode_reftype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmError> {
+    let b = read_byte(bytes, pos)?;
+    match b {
+        0x70 | 0x6F => Ok(ValType::I32), // funcref, externref -> I32 placeholder
+        0x63 | 0x64 => {
+            let _ = decode_leb128_i32(bytes, pos)?;
+            Ok(ValType::I32) // placeholder for typed ref types
+        }
+        _ => Err(WasmError::TypeMismatch),
+    }
+}
+
 /// Skip a storage type (used in struct/array field types).
 /// Storage types: 0x78 = i8, 0x77 = i16, or a full valtype.
 fn skip_storage_type(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
@@ -1019,8 +1034,9 @@ fn decode_table_section(
             return Err(WasmError::InvalidSection);
         }
         let flags = read_byte(bytes, pos)?;
-        // Valid limit flags for tables: bit 0 = has_max, bit 1 = shared, bit 2 = table64
-        if (flags & !0b111) != 0 {
+        // Valid limit flags for tables: 0x00 (no max) or 0x01 (has max).
+        // Flags >= 2 are invalid (shared/table64 not supported for tables).
+        if flags > 1 {
             return Err(WasmError::InvalidSection);
         }
         let has_max = (flags & 0b001) != 0;
@@ -1174,7 +1190,7 @@ fn decode_element_section(
             }
             5 => {
                 // Passive, reftype, expression elements
-                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let _reftype = decode_reftype_from_stream(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 for _ in 0..num_elems {
                     let _ = eval_init_expr(bytes, pos)?;
@@ -1186,7 +1202,7 @@ fn decode_element_section(
                 let table_idx = decode_leb128_u32(bytes, pos)?;
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
-                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let _reftype = decode_reftype_from_stream(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
@@ -1197,7 +1213,7 @@ fn decode_element_section(
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
-                let _reftype = decode_valtype_from_stream(bytes, pos)?;
+                let _reftype = decode_reftype_from_stream(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 for _ in 0..num_elems {
                     let _ = eval_init_expr(bytes, pos)?;
