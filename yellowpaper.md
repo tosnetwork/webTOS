@@ -2944,6 +2944,7 @@ Priority closure items:
 * eBPF-lite SDK and toolchain so policy is not limited to hand-assembled bytecode
 * MSI-X wiring for real hardware interrupt delivery
 * complete brokered HTTP/TCP path in `netd`, rather than UDP-only transport and HTTP-like stubs
+* **wasmi WASM engine integration**: replace the self-built WASM interpreter (~2,000 lines, partial spec) with [wasmi](https://github.com/wasmi-labs/wasmi) v2.0 — a production-ready, twice-audited, `#![no_std]` WebAssembly interpreter with 100% spec compliance, built-in fuel metering, and type-safe host bindings. wasmi runs as a native ATOS agent; existing `.wasm` binaries and the `atos-wasm-sdk` require zero changes. See [Wasmi.md](Wasmi.md) for the full integration plan. `[IMPL: ⏳ Planned]`
 * **Ristretto JVM integration** (Phase 1–2): port [Ristretto](https://github.com/theseus-rs/ristretto) as a native ATOS agent to provide Java execution capability. Java's standard APIs (file I/O, networking, threading) are virtualized through ATOS primitives — files map to keyspaces, sockets map to netd mailbox proxy, threads map to child agents. Java programs run unmodified, gaining ATOS capability isolation, eBPF policy filtering, energy metering, and verifiable execution for free. See [Ristretto.md](Ristretto.md) for the full porting plan. `[IMPL: ⏳ Planned]`
 
 ### 27.2 Stage-5: Trusted Authority Plane `[IMPL: ⏳ Planned]`
