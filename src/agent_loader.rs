@@ -34,6 +34,10 @@ const USER_STACK_VADDR: u64 = 0x4000_1000;
 static mut WASM_MODULES: [Option<wasm::decoder::WasmModule>; MAX_WASM_MODULES] =
     [const { None }; MAX_WASM_MODULES];
 
+/// Per-agent runtime class for dynamically loaded WASM agents.
+static mut WASM_RUNTIME_CLASSES: [wasm::types::RuntimeClass; MAX_WASM_MODULES] =
+    [wasm::types::RuntimeClass::ProofGrade; MAX_WASM_MODULES];
+
 /// Spawn a new agent from an in-memory binary image.
 ///
 /// # Arguments
@@ -52,6 +56,18 @@ pub fn spawn_from_image(
     energy: u64,
     mem_quota: u32,
 ) -> Result<AgentId, i64> {
+    spawn_from_image_with_class(caller_id, image, kind, energy, mem_quota, wasm::types::DEFAULT_RUNTIME_CLASS)
+}
+
+/// Spawn a new agent with a specific RuntimeClass.
+pub fn spawn_from_image_with_class(
+    caller_id: AgentId,
+    image: &[u8],
+    kind: RuntimeKind,
+    energy: u64,
+    mem_quota: u32,
+    runtime_class: wasm::types::RuntimeClass,
+) -> Result<AgentId, i64> {
     // ── Input validation ────────────────────────────────────────────────
     if image.is_empty() {
         return Err(E_INVALID_ARG);
@@ -68,7 +84,7 @@ pub fn spawn_from_image(
 
     match kind {
         RuntimeKind::Native => spawn_native_elf(caller_id, image, energy, mem_quota),
-        RuntimeKind::Wasm => spawn_wasm(caller_id, image, energy, mem_quota),
+        RuntimeKind::Wasm => spawn_wasm_with_class(caller_id, image, energy, mem_quota, runtime_class),
     }
 }
 
@@ -185,11 +201,12 @@ fn spawn_native_elf(
 
 // ─── WASM loading path ──────────────────────────────────────────────────────
 
-fn spawn_wasm(
+fn spawn_wasm_with_class(
     caller_id: AgentId,
     image: &[u8],
     energy: u64,
     mem_quota: u32,
+    runtime_class: wasm::types::RuntimeClass,
 ) -> Result<AgentId, i64> {
     // 1. Decode and validate the WASM module
     let module = wasm::decoder::decode(image).map_err(|_| E_BAD_IMAGE)?;
@@ -222,6 +239,7 @@ fn spawn_wasm(
     }
     unsafe {
         WASM_MODULES[slot] = Some(module);
+        WASM_RUNTIME_CLASSES[slot] = runtime_class;
     }
 
     // 6. Set cr3 to current kernel page table (WASM agents run in kernel mode)
@@ -283,7 +301,8 @@ pub extern "C" fn wasm_runner_entry() -> ! {
         Some(a) => a.energy_budget.min(1_000_000) as u64,
         None => 50_000,
     };
-    let mut instance = wasm::runtime::WasmInstance::new(module, fuel);
+    let rc = unsafe { WASM_RUNTIME_CLASSES[agent_id as usize] };
+    let mut instance = wasm::runtime::WasmInstance::with_class(module, fuel, rc);
 
     // Run start function if present (WASM spec requirement)
     match instance.run_start() {

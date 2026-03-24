@@ -112,11 +112,19 @@ pub struct WasmInstance {
     block_depth: usize,
     /// Set when execution is finished.
     pub finished: bool,
+    /// Per-instance runtime class controlling which features are allowed.
+    pub runtime_class: RuntimeClass,
 }
 
 impl WasmInstance {
     /// Create a new instance from a decoded module with the given fuel budget.
+    /// Create a new instance with the default runtime class (ProofGrade).
     pub fn new(module: WasmModule, fuel: u64) -> Self {
+        Self::with_class(module, fuel, DEFAULT_RUNTIME_CLASS)
+    }
+
+    /// Create a new instance with a specific runtime class.
+    pub fn with_class(module: WasmModule, fuel: u64, runtime_class: RuntimeClass) -> Self {
         let mem_pages = module.memory_min_pages as usize;
         let mem_size = mem_pages.saturating_mul(WASM_PAGE_SIZE);
 
@@ -157,6 +165,7 @@ impl WasmInstance {
             block_stack: vec![BlockFrame::zero(); MAX_BLOCK_DEPTH],
             block_depth: 0,
             finished: false,
+            runtime_class,
         };
 
         // Apply active data segments to memory (skip passive segments marked with offset=u32::MAX)
@@ -1262,7 +1271,7 @@ impl WasmInstance {
             // ── Float memory ─────────────────────────────────────────
             0x2A => {
                 // f32.load
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
@@ -1272,7 +1281,7 @@ impl WasmInstance {
             }
             0x2B => {
                 // f64.load
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let base = try_exec!(self.pop_i32()) as u32;
@@ -1422,7 +1431,7 @@ impl WasmInstance {
 
             0x38 => {
                 // f32.store
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_f32());
@@ -1432,7 +1441,7 @@ impl WasmInstance {
             }
             0x39 => {
                 // f64.store
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let _align = try_exec!(self.read_leb128_u32());
                 let offset = try_exec!(self.read_leb128_u32());
                 let val = try_exec!(self.pop_f64());
@@ -1485,13 +1494,13 @@ impl WasmInstance {
 
             0x43 => {
                 // f32.const
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let val = try_exec!(self.read_f32());
                 try_exec!(self.push(Value::F32(val)));
             }
             0x44 => {
                 // f64.const
-                if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); }
+                if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
                 let val = try_exec!(self.read_f64());
                 try_exec!(self.push(Value::F64(val)));
             }
@@ -1927,96 +1936,96 @@ impl WasmInstance {
             }
 
             // ── Float comparison ─────────────────────────────────────
-            0x5B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a == b { 1 } else { 0 }))); }
-            0x5C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a != b { 1 } else { 0 }))); }
-            0x5D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a < b { 1 } else { 0 }))); }
-            0x5E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a > b { 1 } else { 0 }))); }
-            0x5F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a <= b { 1 } else { 0 }))); }
-            0x60 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a >= b { 1 } else { 0 }))); }
-            0x61 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a == b { 1 } else { 0 }))); }
-            0x62 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a != b { 1 } else { 0 }))); }
-            0x63 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a < b { 1 } else { 0 }))); }
-            0x64 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a > b { 1 } else { 0 }))); }
-            0x65 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a <= b { 1 } else { 0 }))); }
-            0x66 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a >= b { 1 } else { 0 }))); }
+            0x5B => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a == b { 1 } else { 0 }))); }
+            0x5C => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a != b { 1 } else { 0 }))); }
+            0x5D => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a < b { 1 } else { 0 }))); }
+            0x5E => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a > b { 1 } else { 0 }))); }
+            0x5F => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a <= b { 1 } else { 0 }))); }
+            0x60 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(if a >= b { 1 } else { 0 }))); }
+            0x61 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a == b { 1 } else { 0 }))); }
+            0x62 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a != b { 1 } else { 0 }))); }
+            0x63 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a < b { 1 } else { 0 }))); }
+            0x64 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a > b { 1 } else { 0 }))); }
+            0x65 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a <= b { 1 } else { 0 }))); }
+            0x66 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(if a >= b { 1 } else { 0 }))); }
 
             // ── f32 unary ───────────────────────────────────────────
-            0x8B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::fabsf(a)))); }
-            0x8C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(-a))); }
-            0x8D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_ceil_f32(a)))); }
-            0x8E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_floor_f32(a)))); }
-            0x8F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_trunc_f32(a)))); }
-            0x90 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_nearest_f32(a)))); }
-            0x91 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_sqrt_f32(a)))); }
+            0x8B => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::fabsf(a)))); }
+            0x8C => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(-a))); }
+            0x8D => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_ceil_f32(a)))); }
+            0x8E => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_floor_f32(a)))); }
+            0x8F => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_trunc_f32(a)))); }
+            0x90 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_nearest_f32(a)))); }
+            0x91 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_sqrt_f32(a)))); }
 
             // ── f32 binary ──────────────────────────────────────────
-            0x92 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a + b))); }
-            0x93 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a - b))); }
-            0x94 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a * b))); }
-            0x95 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a / b))); }
-            0x96 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_min_f32(a, b)))); }
-            0x97 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_max_f32(a, b)))); }
-            0x98 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::copysignf(a, b)))); }
+            0x92 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a + b))); }
+            0x93 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a - b))); }
+            0x94 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a * b))); }
+            0x95 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(a / b))); }
+            0x96 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_min_f32(a, b)))); }
+            0x97 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(Self::wasm_max_f32(a, b)))); }
+            0x98 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f32()); let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F32(libm::copysignf(a, b)))); }
 
             // ── f64 unary ───────────────────────────────────────────
-            0x99 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::fabs(a)))); }
-            0x9A => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(-a))); }
-            0x9B => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_ceil_f64(a)))); }
-            0x9C => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_floor_f64(a)))); }
-            0x9D => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_trunc_f64(a)))); }
-            0x9E => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_nearest_f64(a)))); }
-            0x9F => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_sqrt_f64(a)))); }
+            0x99 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::fabs(a)))); }
+            0x9A => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(-a))); }
+            0x9B => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_ceil_f64(a)))); }
+            0x9C => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_floor_f64(a)))); }
+            0x9D => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_trunc_f64(a)))); }
+            0x9E => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_nearest_f64(a)))); }
+            0x9F => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_sqrt_f64(a)))); }
 
             // ── f64 binary ──────────────────────────────────────────
-            0xA0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a + b))); }
-            0xA1 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a - b))); }
-            0xA2 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a * b))); }
-            0xA3 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a / b))); }
-            0xA4 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_min_f64(a, b)))); }
-            0xA5 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_max_f64(a, b)))); }
-            0xA6 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::copysign(a, b)))); }
+            0xA0 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a + b))); }
+            0xA1 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a - b))); }
+            0xA2 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a * b))); }
+            0xA3 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(a / b))); }
+            0xA4 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_min_f64(a, b)))); }
+            0xA5 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(Self::wasm_max_f64(a, b)))); }
+            0xA6 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(self.pop_f64()); let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F64(libm::copysign(a, b)))); }
 
             // ── Float-integer conversion ─────────────────────────────
             // Trunc boundaries use exact float constants matching wasmi/WASM spec.
             // i32::MAX (2147483647) rounds up to 2147483648.0 in f32, so >= traps.
-            0xA8 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xA9 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAA => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -2147483649.0_f64 || a >= 2147483648.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
-            0xAB => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 4294967296.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
-            0xAE => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -9223373136366403584.0_f32 || a >= 9223372036854775808.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xAF => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 18446744073709551616.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
-            0xB0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -9223372036854777856.0_f64 || a >= 9223372036854775808.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
-            0xB1 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 18446744073709551616.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            0xA8 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xA9 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAA => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -2147483649.0_f64 || a >= 2147483648.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as i32))); }
+            0xAB => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 4294967296.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I32(a as u32 as i32))); }
+            0xAE => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -9223373136366403584.0_f32 || a >= 9223372036854775808.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xAF => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); if a.is_nan() || a <= -1.0_f32 || a >= 18446744073709551616.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
+            0xB0 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -9223372036854777856.0_f64 || a >= 9223372036854775808.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as i64))); }
+            0xB1 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); if a.is_nan() || a <= -1.0_f64 || a >= 18446744073709551616.0_f64 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(self.push(Value::I64(a as u64 as i64))); }
             // int → float
-            0xB2 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(a as f32))); }
-            0xB3 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32((a as u32) as f32))); }
-            0xB4 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F32(a as f32))); }
-            0xB5 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F32((a as u64) as f32))); }
-            0xB6 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F32(a as f32))); }
-            0xB7 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F64(a as f64))); }
-            0xB8 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F64((a as u32) as f64))); }
-            0xB9 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64(a as f64))); }
-            0xBA => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64((a as u64) as f64))); }
-            0xBB => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F64(a as f64))); }
+            0xB2 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(a as f32))); }
+            0xB3 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32((a as u32) as f32))); }
+            0xB4 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F32(a as f32))); }
+            0xB5 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F32((a as u64) as f32))); }
+            0xB6 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::F32(a as f32))); }
+            0xB7 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F64(a as f64))); }
+            0xB8 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F64((a as u32) as f64))); }
+            0xB9 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64(a as f64))); }
+            0xBA => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64((a as u64) as f64))); }
+            0xBB => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::F64(a as f64))); }
             // reinterpret
-            0xBC => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(a.to_bits() as i32))); }
-            0xBD => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(a.to_bits() as i64))); }
-            0xBE => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(f32::from_bits(a as u32)))); }
-            0xBF => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64(f64::from_bits(a as u64)))); }
+            0xBC => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(a.to_bits() as i32))); }
+            0xBD => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(a.to_bits() as i64))); }
+            0xBE => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i32()); try_exec!(self.push(Value::F32(f32::from_bits(a as u32)))); }
+            0xBF => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_i64()); try_exec!(self.push(Value::F64(f64::from_bits(a as u64)))); }
 
             // ── 0xFC prefix: saturating trunc + bulk memory + table ops ─
             0xFC => {
                 let sub_opcode = try_exec!(self.read_leb128_u32());
                 match sub_opcode {
                     // Saturating float-to-int conversions (no trap on NaN/overflow)
-                    0 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(sat_trunc_f32_i32(a)))); }
-                    1 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(sat_trunc_f32_u32(a) as i32))); }
-                    2 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(sat_trunc_f64_i32(a)))); }
-                    3 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(sat_trunc_f64_u32(a) as i32))); }
-                    4 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I64(sat_trunc_f32_i64(a)))); }
-                    5 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I64(sat_trunc_f32_u64(a) as i64))); }
-                    6 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_i64(a)))); }
-                    7 => { if STRICT_DETERMINISM { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_u64(a) as i64))); }
+                    0 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(sat_trunc_f32_i32(a)))); }
+                    1 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I32(sat_trunc_f32_u32(a) as i32))); }
+                    2 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(sat_trunc_f64_i32(a)))); }
+                    3 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I32(sat_trunc_f64_u32(a) as i32))); }
+                    4 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I64(sat_trunc_f32_i64(a)))); }
+                    5 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f32()); try_exec!(self.push(Value::I64(sat_trunc_f32_u64(a) as i64))); }
+                    6 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_i64(a)))); }
+                    7 => { if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(self.pop_f64()); try_exec!(self.push(Value::I64(sat_trunc_f64_u64(a) as i64))); }
 
                     // memory.init (8), data.drop (9)
                     8 => { let _seg = try_exec!(self.read_leb128_u32()); let _mem = try_exec!(self.read_leb128_u32()); let n = try_exec!(self.pop_i32()) as usize; let s = try_exec!(self.pop_i32()) as usize; let d = try_exec!(self.pop_i32()) as usize; let seg_idx = _seg as usize; if seg_idx < self.module.data_segments.len() { let seg = &self.module.data_segments[seg_idx]; let src_start = seg.data_offset.saturating_add(s); let src_end = src_start.saturating_add(n); let dst_end = d.saturating_add(n); if src_end <= self.module.code.len() && dst_end <= self.memory_size { for i in 0..n { self.memory[d + i] = self.module.code[src_start + i]; } } else { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } } }

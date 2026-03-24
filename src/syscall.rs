@@ -603,7 +603,10 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         }
 
         // ── 22: sys_spawn_image ─────────────────────────────────────────
-        // a1 = image_ptr, a2 = image_len, a3 = runtime_kind (0=Native, 1=WASM)
+        // a1 = image_ptr, a2 = image_len
+        // a3 = runtime_kind[7:0] | runtime_class[15:8]
+        //      runtime_kind: 0=Native, 1=WASM
+        //      runtime_class: 0=ProofGrade, 1=ReplayGrade, 2=BestEffort
         // a4 = energy_budget, a5 = mem_quota (pages)
         SYS_SPAWN_IMAGE => {
             // Check spawn capability
@@ -614,7 +617,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 
             let image_ptr = a1;
             let image_len = a2 as usize;
-            let runtime_kind_raw = a3;
+            let runtime_kind_raw = a3 & 0xFF;
+            let runtime_class_raw = (a3 >> 8) & 0xFF;
             let energy_budget = _a4;
             let mem_quota = _a5 as u32;
 
@@ -630,6 +634,14 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 _ => return E_INVALID_ARG,
             };
 
+            // Parse runtime class
+            let runtime_class = match runtime_class_raw {
+                0 => crate::wasm::types::RuntimeClass::ProofGrade,
+                1 => crate::wasm::types::RuntimeClass::ReplayGrade,
+                2 => crate::wasm::types::RuntimeClass::BestEffort,
+                _ => return E_INVALID_ARG,
+            };
+
             // Read image bytes from caller's address space
             let image = unsafe {
                 security::stac();
@@ -638,8 +650,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 s
             };
 
-            match crate::agent_loader::spawn_from_image(
-                caller_id, image, kind, energy_budget, mem_quota,
+            match crate::agent_loader::spawn_from_image_with_class(
+                caller_id, image, kind, energy_budget, mem_quota, runtime_class,
             ) {
                 Ok(new_id) => new_id as i64,
                 Err(e) => e,

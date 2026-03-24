@@ -69,11 +69,33 @@ impl Value {
     }
 }
 
-/// Strict determinism mode: when true, float opcodes (F32/F64) are rejected.
-/// This ensures deterministic execution for consensus-critical workloads.
+/// Per-agent execution class controlling which WASM features are allowed.
+///
+/// - **ProofGrade**: strict determinism — no floats, no SIMD, no threads.
+///   Execution can be replayed and independently verified. Produces
+///   cryptographically meaningful ExecutionReceipts.
+/// - **ReplayGrade**: relaxed — floats and SIMD allowed, no threads.
+///   Execution is reproducible on the same hardware but not formally provable.
+///   Suitable for AI inference, data processing, and general computation.
+/// - **BestEffort**: full features — floats, SIMD, threads (future).
+///   No replay or proof guarantees. Suitable for tool agents and I/O helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RuntimeClass {
+    ProofGrade = 0,
+    ReplayGrade = 1,
+    BestEffort = 2,
+}
+
+/// Default runtime class for new agents.
+pub const DEFAULT_RUNTIME_CLASS: RuntimeClass = RuntimeClass::ProofGrade;
+
+/// Legacy constant — kept for backward compatibility during transition.
+/// New code should use `RuntimeClass` per-instance instead.
 pub const STRICT_DETERMINISM: bool = true;
 
-/// WASM instruction opcodes — full MVP integer set + float (gated by STRICT_DETERMINISM).
+/// WASM instruction opcodes — full MVP set (float opcodes always defined,
+/// enforcement is per-instance via RuntimeClass).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Opcode {
@@ -328,8 +350,8 @@ impl Opcode {
             // Memory
             0x28 => Some(Opcode::I32Load),
             0x29 => Some(Opcode::I64Load),
-            0x2A => if !STRICT_DETERMINISM { Some(Opcode::F32Load) } else { None },
-            0x2B => if !STRICT_DETERMINISM { Some(Opcode::F64Load) } else { None },
+            0x2A => Some(Opcode::F32Load),
+            0x2B => Some(Opcode::F64Load),
             0x2C => Some(Opcode::I32Load8S),
             0x2D => Some(Opcode::I32Load8U),
             0x2E => Some(Opcode::I32Load16S),
@@ -342,8 +364,8 @@ impl Opcode {
             0x35 => Some(Opcode::I64Load32U),
             0x36 => Some(Opcode::I32Store),
             0x37 => Some(Opcode::I64Store),
-            0x38 => if !STRICT_DETERMINISM { Some(Opcode::F32Store) } else { None },
-            0x39 => if !STRICT_DETERMINISM { Some(Opcode::F64Store) } else { None },
+            0x38 => Some(Opcode::F32Store),
+            0x39 => Some(Opcode::F64Store),
             0x3A => Some(Opcode::I32Store8),
             0x3B => Some(Opcode::I32Store16),
             0x3C => Some(Opcode::I64Store8),
@@ -354,8 +376,8 @@ impl Opcode {
             // Constants
             0x41 => Some(Opcode::I32Const),
             0x42 => Some(Opcode::I64Const),
-            0x43 => if !STRICT_DETERMINISM { Some(Opcode::F32Const) } else { None },
-            0x44 => if !STRICT_DETERMINISM { Some(Opcode::F64Const) } else { None },
+            0x43 => Some(Opcode::F32Const),
+            0x44 => Some(Opcode::F64Const),
             // i32 comparison
             0x45 => Some(Opcode::I32Eqz),
             0x46 => Some(Opcode::I32Eq),
@@ -381,19 +403,19 @@ impl Opcode {
             0x59 => Some(Opcode::I64GeS),
             0x5A => Some(Opcode::I64GeU),
             // f32 comparison
-            0x5B => if !STRICT_DETERMINISM { Some(Opcode::F32Eq) } else { None },
-            0x5C => if !STRICT_DETERMINISM { Some(Opcode::F32Ne) } else { None },
-            0x5D => if !STRICT_DETERMINISM { Some(Opcode::F32Lt) } else { None },
-            0x5E => if !STRICT_DETERMINISM { Some(Opcode::F32Gt) } else { None },
-            0x5F => if !STRICT_DETERMINISM { Some(Opcode::F32Le) } else { None },
-            0x60 => if !STRICT_DETERMINISM { Some(Opcode::F32Ge) } else { None },
+            0x5B => Some(Opcode::F32Eq),
+            0x5C => Some(Opcode::F32Ne),
+            0x5D => Some(Opcode::F32Lt),
+            0x5E => Some(Opcode::F32Gt),
+            0x5F => Some(Opcode::F32Le),
+            0x60 => Some(Opcode::F32Ge),
             // f64 comparison
-            0x61 => if !STRICT_DETERMINISM { Some(Opcode::F64Eq) } else { None },
-            0x62 => if !STRICT_DETERMINISM { Some(Opcode::F64Ne) } else { None },
-            0x63 => if !STRICT_DETERMINISM { Some(Opcode::F64Lt) } else { None },
-            0x64 => if !STRICT_DETERMINISM { Some(Opcode::F64Gt) } else { None },
-            0x65 => if !STRICT_DETERMINISM { Some(Opcode::F64Le) } else { None },
-            0x66 => if !STRICT_DETERMINISM { Some(Opcode::F64Ge) } else { None },
+            0x61 => Some(Opcode::F64Eq),
+            0x62 => Some(Opcode::F64Ne),
+            0x63 => Some(Opcode::F64Lt),
+            0x64 => Some(Opcode::F64Gt),
+            0x65 => Some(Opcode::F64Le),
+            0x66 => Some(Opcode::F64Ge),
             // i32 arithmetic
             0x67 => Some(Opcode::I32Clz),
             0x68 => Some(Opcode::I32Ctz),
@@ -433,63 +455,63 @@ impl Opcode {
             0x89 => Some(Opcode::I64Rotl),
             0x8A => Some(Opcode::I64Rotr),
             // f32 unary
-            0x8B => if !STRICT_DETERMINISM { Some(Opcode::F32Abs) } else { None },
-            0x8C => if !STRICT_DETERMINISM { Some(Opcode::F32Neg) } else { None },
-            0x8D => if !STRICT_DETERMINISM { Some(Opcode::F32Ceil) } else { None },
-            0x8E => if !STRICT_DETERMINISM { Some(Opcode::F32Floor) } else { None },
-            0x8F => if !STRICT_DETERMINISM { Some(Opcode::F32Trunc) } else { None },
-            0x90 => if !STRICT_DETERMINISM { Some(Opcode::F32Nearest) } else { None },
-            0x91 => if !STRICT_DETERMINISM { Some(Opcode::F32Sqrt) } else { None },
+            0x8B => Some(Opcode::F32Abs),
+            0x8C => Some(Opcode::F32Neg),
+            0x8D => Some(Opcode::F32Ceil),
+            0x8E => Some(Opcode::F32Floor),
+            0x8F => Some(Opcode::F32Trunc),
+            0x90 => Some(Opcode::F32Nearest),
+            0x91 => Some(Opcode::F32Sqrt),
             // f32 binary
-            0x92 => if !STRICT_DETERMINISM { Some(Opcode::F32Add) } else { None },
-            0x93 => if !STRICT_DETERMINISM { Some(Opcode::F32Sub) } else { None },
-            0x94 => if !STRICT_DETERMINISM { Some(Opcode::F32Mul) } else { None },
-            0x95 => if !STRICT_DETERMINISM { Some(Opcode::F32Div) } else { None },
-            0x96 => if !STRICT_DETERMINISM { Some(Opcode::F32Min) } else { None },
-            0x97 => if !STRICT_DETERMINISM { Some(Opcode::F32Max) } else { None },
-            0x98 => if !STRICT_DETERMINISM { Some(Opcode::F32Copysign) } else { None },
+            0x92 => Some(Opcode::F32Add),
+            0x93 => Some(Opcode::F32Sub),
+            0x94 => Some(Opcode::F32Mul),
+            0x95 => Some(Opcode::F32Div),
+            0x96 => Some(Opcode::F32Min),
+            0x97 => Some(Opcode::F32Max),
+            0x98 => Some(Opcode::F32Copysign),
             // f64 unary
-            0x99 => if !STRICT_DETERMINISM { Some(Opcode::F64Abs) } else { None },
-            0x9A => if !STRICT_DETERMINISM { Some(Opcode::F64Neg) } else { None },
-            0x9B => if !STRICT_DETERMINISM { Some(Opcode::F64Ceil) } else { None },
-            0x9C => if !STRICT_DETERMINISM { Some(Opcode::F64Floor) } else { None },
-            0x9D => if !STRICT_DETERMINISM { Some(Opcode::F64Trunc) } else { None },
-            0x9E => if !STRICT_DETERMINISM { Some(Opcode::F64Nearest) } else { None },
-            0x9F => if !STRICT_DETERMINISM { Some(Opcode::F64Sqrt) } else { None },
+            0x99 => Some(Opcode::F64Abs),
+            0x9A => Some(Opcode::F64Neg),
+            0x9B => Some(Opcode::F64Ceil),
+            0x9C => Some(Opcode::F64Floor),
+            0x9D => Some(Opcode::F64Trunc),
+            0x9E => Some(Opcode::F64Nearest),
+            0x9F => Some(Opcode::F64Sqrt),
             // f64 binary
-            0xA0 => if !STRICT_DETERMINISM { Some(Opcode::F64Add) } else { None },
-            0xA1 => if !STRICT_DETERMINISM { Some(Opcode::F64Sub) } else { None },
-            0xA2 => if !STRICT_DETERMINISM { Some(Opcode::F64Mul) } else { None },
-            0xA3 => if !STRICT_DETERMINISM { Some(Opcode::F64Div) } else { None },
-            0xA4 => if !STRICT_DETERMINISM { Some(Opcode::F64Min) } else { None },
-            0xA5 => if !STRICT_DETERMINISM { Some(Opcode::F64Max) } else { None },
-            0xA6 => if !STRICT_DETERMINISM { Some(Opcode::F64Copysign) } else { None },
+            0xA0 => Some(Opcode::F64Add),
+            0xA1 => Some(Opcode::F64Sub),
+            0xA2 => Some(Opcode::F64Mul),
+            0xA3 => Some(Opcode::F64Div),
+            0xA4 => Some(Opcode::F64Min),
+            0xA5 => Some(Opcode::F64Max),
+            0xA6 => Some(Opcode::F64Copysign),
             // Conversion
             0xA7 => Some(Opcode::I32WrapI64),
-            0xA8 => if !STRICT_DETERMINISM { Some(Opcode::I32TruncF32S) } else { None },
-            0xA9 => if !STRICT_DETERMINISM { Some(Opcode::I32TruncF32U) } else { None },
-            0xAA => if !STRICT_DETERMINISM { Some(Opcode::I32TruncF64S) } else { None },
-            0xAB => if !STRICT_DETERMINISM { Some(Opcode::I32TruncF64U) } else { None },
+            0xA8 => Some(Opcode::I32TruncF32S),
+            0xA9 => Some(Opcode::I32TruncF32U),
+            0xAA => Some(Opcode::I32TruncF64S),
+            0xAB => Some(Opcode::I32TruncF64U),
             0xAC => Some(Opcode::I64ExtendI32S),
             0xAD => Some(Opcode::I64ExtendI32U),
-            0xAE => if !STRICT_DETERMINISM { Some(Opcode::I64TruncF32S) } else { None },
-            0xAF => if !STRICT_DETERMINISM { Some(Opcode::I64TruncF32U) } else { None },
-            0xB0 => if !STRICT_DETERMINISM { Some(Opcode::I64TruncF64S) } else { None },
-            0xB1 => if !STRICT_DETERMINISM { Some(Opcode::I64TruncF64U) } else { None },
-            0xB2 => if !STRICT_DETERMINISM { Some(Opcode::F32ConvertI32S) } else { None },
-            0xB3 => if !STRICT_DETERMINISM { Some(Opcode::F32ConvertI32U) } else { None },
-            0xB4 => if !STRICT_DETERMINISM { Some(Opcode::F32ConvertI64S) } else { None },
-            0xB5 => if !STRICT_DETERMINISM { Some(Opcode::F32ConvertI64U) } else { None },
-            0xB6 => if !STRICT_DETERMINISM { Some(Opcode::F32DemoteF64) } else { None },
-            0xB7 => if !STRICT_DETERMINISM { Some(Opcode::F64ConvertI32S) } else { None },
-            0xB8 => if !STRICT_DETERMINISM { Some(Opcode::F64ConvertI32U) } else { None },
-            0xB9 => if !STRICT_DETERMINISM { Some(Opcode::F64ConvertI64S) } else { None },
-            0xBA => if !STRICT_DETERMINISM { Some(Opcode::F64ConvertI64U) } else { None },
-            0xBB => if !STRICT_DETERMINISM { Some(Opcode::F64PromoteF32) } else { None },
-            0xBC => if !STRICT_DETERMINISM { Some(Opcode::I32ReinterpretF32) } else { None },
-            0xBD => if !STRICT_DETERMINISM { Some(Opcode::I64ReinterpretF64) } else { None },
-            0xBE => if !STRICT_DETERMINISM { Some(Opcode::F32ReinterpretI32) } else { None },
-            0xBF => if !STRICT_DETERMINISM { Some(Opcode::F64ReinterpretI64) } else { None },
+            0xAE => Some(Opcode::I64TruncF32S),
+            0xAF => Some(Opcode::I64TruncF32U),
+            0xB0 => Some(Opcode::I64TruncF64S),
+            0xB1 => Some(Opcode::I64TruncF64U),
+            0xB2 => Some(Opcode::F32ConvertI32S),
+            0xB3 => Some(Opcode::F32ConvertI32U),
+            0xB4 => Some(Opcode::F32ConvertI64S),
+            0xB5 => Some(Opcode::F32ConvertI64U),
+            0xB6 => Some(Opcode::F32DemoteF64),
+            0xB7 => Some(Opcode::F64ConvertI32S),
+            0xB8 => Some(Opcode::F64ConvertI32U),
+            0xB9 => Some(Opcode::F64ConvertI64S),
+            0xBA => Some(Opcode::F64ConvertI64U),
+            0xBB => Some(Opcode::F64PromoteF32),
+            0xBC => Some(Opcode::I32ReinterpretF32),
+            0xBD => Some(Opcode::I64ReinterpretF64),
+            0xBE => Some(Opcode::F32ReinterpretI32),
+            0xBF => Some(Opcode::F64ReinterpretI64),
             // Sign extension
             0xC0 => Some(Opcode::I32Extend8S),
             0xC1 => Some(Opcode::I32Extend16S),

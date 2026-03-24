@@ -74,6 +74,9 @@ pub enum RuntimeKind {
     Wasm = 1,
 }
 
+/// Re-export RuntimeClass from wasm types for agent-level use.
+pub use crate::wasm::types::RuntimeClass;
+
 // ─── Agent priority ─────────────────────────────────────────────────────────
 
 /// Agent scheduling priority (lower number = higher priority).

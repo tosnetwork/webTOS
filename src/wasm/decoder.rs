@@ -378,8 +378,8 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
     match b {
         0x7F => Ok(ValType::I32),
         0x7E => Ok(ValType::I64),
-        0x7D => if !STRICT_DETERMINISM { Ok(ValType::F32) } else { Err(WasmError::FloatsDisabled) },
-        0x7C => if !STRICT_DETERMINISM { Ok(ValType::F64) } else { Err(WasmError::FloatsDisabled) },
+        0x7D => Ok(ValType::F32),
+        0x7C => Ok(ValType::F64),
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -902,9 +902,6 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
         }
         0x43 => {
             // f32.const
-            if STRICT_DETERMINISM {
-                return Err(WasmError::FloatsDisabled);
-            }
             if *pos + 4 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
             let v = f32::from_le_bytes([bytes[*pos], bytes[*pos+1], bytes[*pos+2], bytes[*pos+3]]);
             *pos += 4;
@@ -912,9 +909,6 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
         }
         0x44 => {
             // f64.const
-            if STRICT_DETERMINISM {
-                return Err(WasmError::FloatsDisabled);
-            }
             if *pos + 8 > bytes.len() { return Err(WasmError::UnexpectedEnd); }
             let mut b8 = [0u8; 8];
             b8.copy_from_slice(&bytes[*pos..*pos+8]);
