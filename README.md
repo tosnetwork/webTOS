@@ -22,6 +22,17 @@ ATOS is a minimal operating system designed from first principles for AI agent e
 
 Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. ATOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
 
+### A New Paradigm
+
+| Traditional OS | ATOS |
+|----------------|------|
+| Processes and threads | **Agents** — autonomous units with energy budgets and parent-child hierarchy |
+| Files and filesystems | **Keyspaces** — per-agent key-value stores with Merkle proofs |
+| Root / sudo / ACL | **Capabilities** — explicit tokens of authority, delegated parent→child, never created from nothing |
+| System calls are open | **eBPF-lite policy filters** — every syscall can be intercepted by kernel-resident policy programs |
+| Logging as afterthought | **Structured event stream** — every operation produces a sequenced, replayable audit event |
+| "Trust the administrator" | **Cryptographic proofs** — execution results are independently verifiable by any third party |
+
 ### Design Principles
 
 - **Architecture from zero.** Not inherited from legacy human-centric systems.
@@ -30,36 +41,79 @@ Modern operating systems were designed for human-operated computing. Their core 
 - **Determinism over convenience.** Predictable, replayable behavior by default.
 - **Explicit authority.** Nothing is accessible without a capability. No ambient root.
 
-### Core Concepts
-
-| Concept | Replaces | Purpose |
-|---------|----------|---------|
-| **Agent** | Process | Primary execution unit, uniquely identifiable, budget-limited |
-| **Mailbox** | Socket/pipe | Bounded message queue for inter-agent communication |
-| **Capability** | UID/permissions | Explicit token of authority, no ambient access |
-| **State Object** | File | In-memory key-value keyspace, capability-scoped |
-| **Energy Budget** | (none) | Per-agent execution metering, enforced by the kernel |
-| **Event Log** | (afterthought) | Built-in structured audit from day one |
-
 ### Who Uses ATOS
 
 ATOS is not a general-purpose operating system. Its users are autonomous systems that need deterministic execution, minimal privilege, and verifiable behavior.
 
-**AI Agent Platforms** — Run AI agents in isolated, auditable sandboxes. Agents are written in WASM or native Rust, communicate via mailboxes, and operate under capability-scoped authority. Every action is logged. Agents can be checkpointed, migrated, and replayed. If an agent crashes, it cannot affect other agents.
+**AI Agent Platforms** — Run AI agents in isolated, auditable sandboxes. Agents are written in WASM or native Rust, communicate via mailboxes, and operate under capability-scoped authority. Every action is logged. Agents can be checkpointed, migrated, and replayed.
 
 **Verifiable Computation** — Execute workloads where results must be provably correct. WASM agents run deterministically (fuel-counted). State transitions produce Merkle proofs. Checkpoints enable independent replay verification. The energy model maps directly to metered execution (gas, tokens, billing units).
 
-**Secure Edge Devices** — Deploy on embedded hardware where the attack surface must be minimal. No shell, no root, no filesystem, no ambient authority. Each agent holds only the capabilities it was explicitly granted. Agent crashes are isolated by hardware-enforced memory boundaries. Energy budgets prevent runaway execution.
+**Secure Edge Devices** — Deploy on embedded hardware where the attack surface must be minimal. No shell, no root, no filesystem, no ambient authority. Each agent holds only the capabilities it was explicitly granted.
 
-**ATOS is not for:** desktop users, server administration, running existing Linux/POSIX programs, or any workload that requires a traditional OS interface.
+## Architecture
 
 ### Layering
 
-- **ATOS** = the full system architecture
-- **ATOS-0** = the privileged kernel substrate
-- **ATOS-1** = the runtime host for native, WASM, and future managed runtimes
-- **ATOS-2** = the agent and system-service layer
-- **ATOS-NET** = the brokered / distributed execution layer
+```
++---------------------------------------------------+
+|           Applications / External Systems         |
++---------------------------------------------------+
+| ATOS-NET                                           |
+| brokered network | distributed execution | replay |
++---------------------------------------------------+
+| ATOS-2 Agent / Service Layer                       |
+| root | stated | policyd | netd | accountd | user  |
++---------------------------------------------------+
+| ATOS-1 Runtime Host                                |
+| native | WASM | future managed runtimes           |
++---------------------------------------------------+
+| ATOS-0 Kernel                                      |
+| sched | mailbox | capability | state | audit      |
+| energy | syscall | checkpoint                     |
++---------------------------------------------------+
+| x86_64 Architecture + Boot                        |
+| gdt | idt | paging | timer | trap | multiboot     |
++---------------------------------------------------+
+|                    QEMU / Hardware                |
++---------------------------------------------------+
+```
+
+### Three Runtimes
+
+Every piece of running code is an **Agent**. ATOS supports three execution runtimes, each optimized for a different role:
+
+| Runtime | Use Case | Determinism | Location |
+|---------|----------|-------------|----------|
+| **Native x86_64** | High-performance system services (stated, policyd, netd) | Scheduling-level | Ring-3 user mode |
+| **WASM** | Portable, sandboxed user agents with fuel metering | Full (instruction-counted) | Kernel-hosted interpreter |
+| **eBPF-lite** | Kernel-resident policy enforcement and event filtering | Full (verified, bounded) | Kernel Ring-0 |
+
+### Capability-Based Security
+
+There is no superuser. Authority is expressed as **Capability tokens**:
+
+- `SendMailbox(3)` — permission to send messages to mailbox 3
+- `AgentSpawn` — permission to create child agents
+- `PolicyLoad` — permission to load eBPF policy programs
+- `Network` — permission to make network requests via netd
+
+Capabilities can only be **delegated from parent to child, and only as a subset**. They are never created from nothing. Each capability carries a cryptographic signature, verifiable even across nodes.
+
+### Verifiable Execution
+
+This is what makes ATOS unique — **ProofGrade execution**:
+
+1. Start from a checkpoint
+2. Replay under a deterministic scheduler
+3. Every step produces a hash-chained event log
+4. Generate an **execution proof** that any third party can independently verify
+
+This means you can outsource computation to an untrusted node, then verify the result is correct — without re-executing. The energy model turns CPU time into a metered, billable, auditable resource.
+
+### Distributed by Design
+
+Agents don't know which physical node their peers are on. Mailbox messages are automatically routed across nodes by the `routerd` system agent (over kernel UDP with signed capability verification). Agents can be **migrated** between nodes — checkpoint, serialize, transfer, resume.
 
 ## Quickstart
 
@@ -130,169 +184,7 @@ sudo apt install ovmf
 make uefi-run
 ```
 
-The UEFI loader (`uefi/`) is a standalone PE/COFF application that embeds the kernel ELF, sets up higher-half page tables, exits UEFI boot services, and jumps to `kernel_main`. This is the same approach Linux uses with its EFI stub.
-
-## Architecture
-
-ATOS is the umbrella system. The early kernel is ATOS-0, not the whole stack.
-
-```
-+---------------------------------------------------+
-|           Applications / External Systems         |
-+---------------------------------------------------+
-| ATOS-NET                                           |
-| brokered network | distributed execution | replay |
-+---------------------------------------------------+
-| ATOS-2 Agent / Service Layer                       |
-| root | stated | policyd | netd | accountd | user  |
-+---------------------------------------------------+
-| ATOS-1 Runtime Host                                |
-| native | WASM | future managed runtimes           |
-+---------------------------------------------------+
-| ATOS-0 Kernel                                      |
-| sched | mailbox | capability | state | audit      |
-| energy | syscall | checkpoint                     |
-+---------------------------------------------------+
-| x86_64 Architecture + Boot                        |
-| gdt | idt | paging | timer | trap | multiboot     |
-+---------------------------------------------------+
-|                    QEMU / Hardware                |
-+---------------------------------------------------+
-```
-
-Stage-1 is intentionally concentrated in ATOS-0. ATOS-1 is a thin native execution layer at first, ATOS-2 starts as built-in bootstrap/test agents, and ATOS-NET arrives later in the roadmap.
-
-### Syscall ABI
-
-22 syscalls, following the [Yellow Paper](yellowpaper.md):
-
-| # | Name | Description |
-|---|------|-------------|
-| 0 | `sys_yield` | Yield execution voluntarily |
-| 1 | `sys_spawn` | Create a child agent |
-| 2 | `sys_exit` | Terminate the calling agent |
-| 3 | `sys_send` | Send a message to a mailbox (non-blocking) |
-| 4 | `sys_recv` | Receive a message from a mailbox (blocking) |
-| 5 | `sys_cap_query` | Query capability possession |
-| 6 | `sys_cap_grant` | Grant a capability to a child agent |
-| 7 | `sys_event_emit` | Emit a custom audit event |
-| 8 | `sys_energy_get` | Query remaining energy budget |
-| 9 | `sys_state_get` | Read from agent's private keyspace |
-| 10 | `sys_state_put` | Write to agent's private keyspace |
-| 11 | `sys_cap_revoke` | Revoke a capability from an agent |
-| 12 | `sys_recv_nonblocking` | Non-blocking receive |
-| 13 | `sys_send_blocking` | Blocking send (waits if mailbox full) |
-| 14 | `sys_energy_grant` | Grant energy to a child agent |
-| 15 | `sys_checkpoint` | Save system state to disk |
-| 16 | `sys_mmap` | Allocate memory pages |
-| 17 | `sys_munmap` | Deallocate memory pages |
-| 18 | `sys_mailbox_create` | Create additional mailbox |
-| 19 | `sys_mailbox_destroy` | Destroy a mailbox |
-| 20 | `sys_replay` | Enter deterministic replay mode |
-| 21 | `sys_recv_timeout` | Receive with tick-based timeout |
-
-### Project Structure
-
-```
-atos/
-  asm/                        # x86_64 assembly (NASM)
-    boot.asm                  #   32→64 bit boot, 512MB identity map
-    multiboot_header.asm      #   Multiboot v1 header
-    switch.asm                #   Context switch + ring-3 entry
-    trap_entry.asm            #   Interrupt/exception stubs
-    syscall_entry.asm         #   SYSCALL/SYSRET handler
-    ap_trampoline.asm         #   SMP AP bootstrap (16→64 bit)
-    user_agents.asm           #   Ring-3 test agents (ping/pong)
-  src/
-    main.rs                   # Kernel entry point
-    agent.rs                  # Agent model (context, status, priority)
-    sched.rs                  # SMP-safe priority scheduler
-    mailbox.rs                # Bounded ring-buffer IPC
-    capability.rs             # Capability authority + signing
-    energy.rs                 # Execution budgeting + cost table
-    event.rs                  # Structured audit events
-    state.rs                  # Per-agent key-value state
-    syscall.rs                # Syscall dispatcher (22 handlers)
-    trap.rs                   # Fault handler + guard page detection
-    init.rs                   # System bootstrap (12 agents)
-    sync.rs                   # SpinLock with RFLAGS save/restore
-    wasm/                     # WASM interpreter (40+ opcodes)
-    ebpf/                     # eBPF-lite policy engine + verifier
-    checkpoint.rs             # Checkpoint save/load + agent migration
-    replay.rs                 # Deterministic replay + diff report
-    proof.rs                  # Execution proof (hash chain)
-    attestation.rs            # Kernel measurement + attestation report
-    merkle.rs                 # Binary Merkle tree (FNV-1a 128-bit)
-    persist.rs                # Append-only state log (ATA disk)
-    net.rs                    # Kernel UDP (virtio-net + e1000)
-    node.rs                   # Node identity for distributed execution
-    smp.rs                    # SMP bootstrap (INIT/SIPI)
-    arch/x86_64/              # Architecture layer
-      acpi.rs                 #   RSDP/RSDT/MADT parser
-      lapic.rs                #   Local APIC + timer driver
-      pci.rs                  #   PCI bus enumeration + BAR decode
-      virtio_net.rs           #   Virtio-net legacy PCI driver
-      e1000.rs                #   Intel e1000 NIC driver
-      nvme.rs                 #   NVMe DMA I/O (admin + IO queues)
-      security.rs             #   SMEP/SMAP/NX enforcement
-      paging.rs  gdt.rs  idt.rs  serial.rs  timer.rs  context.rs
-    agents/                   # 12 built-in agents
-      root.rs                 #   Checkpoint, proof, attestation
-      ping.rs  pong.rs        #   Ring-3 IPC test agents
-      stated.rs               #   State persistence manager
-      policyd.rs              #   eBPF policy loader
-      wasm_agent.rs           #   WASM interpreter demo
-      accountd.rs             #   Energy accounting
-      netd.rs                 #   Network broker (auto-detect NIC)
-      routerd.rs              #   Cross-node mailbox routing
-      skilld.rs               #   WASM skill installer
-      idle.rs  bad.rs         #   Idle loop / unauthorized test
-  sdk/
-    atos-sdk/                  # Native agent SDK (#![no_std])
-    atos-wasm-sdk/             # WASM agent SDK (wasm32 target)
-    atos-cli/                  # CLI tools (build/deploy/inspect/replay/verify)
-  linker.ld                   # Linker script (kernel at 1MB)
-  build.rs                    # NASM build integration
-  yellowpaper.md              # Full engineering specification
-```
-
-## What Works Today
-
-### Stage 1 — Kernel Foundation
-- Boots in QEMU from Multiboot v1, 32→64 bit long mode
-- GDT with TSS, IDT with PIC remapping, PIT timer at 100 Hz
-- Round-robin scheduler with assembly context switching
-- Mailbox IPC, capability enforcement, energy budgeting
-- Structured audit log over serial
-
-### Stage 2 — Isolation & Runtimes
-- Ring 3 user-mode agents with per-agent page tables (SYSCALL/SYSRET)
-- WASM interpreter (40+ opcodes, fuel metering, host function bridge)
-- eBPF-lite policy engine (verifier, interpreter, attachment points)
-- Persistent state on ATA disk with CRC32 crash recovery
-
-### Stage 3 — Production Hardening
-- SMP: ACPI parsing, LAPIC driver, AP bootstrap via INIT/SIPI
-- Priority-aware scheduling (4 levels) with SpinLock protection
-- Checkpoint/replay with Merkle state tree and deterministic scheduling
-- Stack guard canaries, orphan reparenting, 64KB aligned stacks
-- 12 system agents running concurrently on 2 cores
-
-### Stage 4 — Ecosystem
-- NVMe DMA I/O (admin + IO queue setup, PRP-based read/write)
-- e1000 + virtio-net NIC drivers with auto-detection
-- Distributed execution: cross-node mailbox routing, node discovery
-- Execution proofs: hash-chain verification, standalone verifier
-- Remote attestation: kernel measurement + signed reports
-- CPU security: SMEP/SMAP/NX detection and enforcement
-- Developer SDK: native + WASM agent crates + CLI tools
-
-### By the Numbers
-
-- **80+ source files** across Rust + x86_64 Assembly
-- **16,000+ lines of code**, written from scratch
-- **22 syscalls**, **12 agents**, **2 CPU cores**
-- **0 external runtime dependencies** (no libc, no POSIX, no Linux)
+The UEFI loader (`uefi/`) is a standalone PE/COFF application that embeds the kernel ELF, sets up higher-half page tables, exits UEFI boot services, and jumps to `kernel_main`.
 
 ## Developer SDK
 
@@ -323,7 +215,37 @@ atos replay <disk-image.img>              # Parse checkpoint
 atos verify <proof.bin>                   # Verify execution proof
 ```
 
-See the [Yellow Paper](yellowpaper.md) for the full specification and roadmap.
+## Roadmap
+
+ATOS is developed across 10 stages, from bare-metal boot to a production-grade agent execution appliance.
+
+| Stage | Focus | Status |
+|-------|-------|--------|
+| **1** | Kernel foundation — boot, scheduler, mailbox, capabilities, energy | ✅ Complete |
+| **2** | Isolation & runtimes — ring-3, WASM interpreter, eBPF-lite, persistent state | ✅ Complete |
+| **3** | Production hardening — SMP, checkpoint/replay, deterministic scheduling | ✅ Complete |
+| **4** | Ecosystem — NVMe, NIC drivers, distributed execution, SDK, attestation | ⚠️ Near-complete |
+| **5** | Trusted authority plane — signed capability leases, revocation, admission control | Planned |
+| **6** | Durable state plane — versioned storage, snapshots, encrypted keyspaces | Planned |
+| **7** | Agent package ecosystem — signed packages, registry, skilld, lifecycle management | Planned |
+| **8** | Distributed execution fabric — placement, cross-node pipelines, migration | Planned |
+| **9** | Verifiable execution economy — billing, settlement, proof-backed accounting | Planned |
+| **10** | Appliance-grade ATOS — multi-tenant, signed upgrades, remote operations | Planned |
+
+### The Vision: All 10 Stages Complete
+
+When all stages are delivered, ATOS becomes a **provable, metered, migratable agent execution platform**:
+
+- **Every computation is an Agent** with an energy budget, a capability set, and an audit trail
+- **Every permission is a Capability** that flows from parent to child, never from thin air, verifiable with cryptographic signatures
+- **Every execution is provable** — a third party can verify "this code, on this input, produced this output" without re-running it
+- **Every resource is metered** — CPU time is energy, energy is transferable, billing is built into the protocol
+- **Every agent is portable** — checkpoint on node A, migrate to node B, resume execution with full state
+- **Skills are deployable artifacts** — developers build WASM agents, sign them, publish to a registry, users install them via a standard protocol with automatic capability scoping
+
+Think of it this way: if Linux is a shared factory where anyone can walk in and use any machine, ATOS is a factory where **every worker operates in their own sealed chamber**, communicating only through message slots, powered by a metered energy supply, watched by tamper-proof cameras, and any outsider can replay the footage to verify the work.
+
+See the [Yellow Paper](yellowpaper.md) for the full engineering specification and detailed roadmap.
 
 ## License
 
