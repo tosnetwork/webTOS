@@ -3367,10 +3367,10 @@ fn decode_valtype_byte(byte: u8) -> Option<ValType> {
 #[allow(dead_code)]
 fn ref_types_compatible(a: ValType, b: ValType) -> bool {
     fn is_funcref_ish(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
     }
     fn is_ref(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
     }
     // Both funcref-ish types are compatible
     if is_funcref_ish(a) && is_funcref_ish(b) {
@@ -3397,7 +3397,7 @@ fn global_types_compatible(
     mutable: bool,
 ) -> bool {
     fn is_funcref_family(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
     }
     fn is_externref_family(t: ValType) -> bool {
         matches!(t, ValType::ExternRef)
@@ -3409,7 +3409,7 @@ fn global_types_compatible(
     let imp_is_abstract_extern = is_externref_family(import_val_type)
         || (matches!(import_byte, 0x63 | 0x64) && import_heap_type == Some(-17));
     let imp_is_concrete = matches!(import_byte, 0x63 | 0x64) && matches!(import_heap_type, Some(ht) if ht >= 0);
-    let imp_nullable = import_byte != 0x64 && import_val_type != ValType::TypedFuncRef;
+    let imp_nullable = import_byte != 0x64 && import_val_type != ValType::TypedFuncRef && import_val_type != ValType::NonNullableFuncRef;
 
     // Classify export
     let exp_is_concrete = matches!(export_heap_type, Some(ht) if ht >= 0);
@@ -3478,11 +3478,13 @@ fn value_matches_type(value: Value, val_type: ValType) -> bool {
             | (Value::I32(_), ValType::FuncRef)
             | (Value::I32(_), ValType::ExternRef)
             | (Value::I32(_), ValType::TypedFuncRef)
+            | (Value::I32(_), ValType::NonNullableFuncRef)
             | (Value::I32(_), ValType::NullableTypedFuncRef)
             | (Value::NullRef, ValType::I32)
             | (Value::NullRef, ValType::FuncRef)
             | (Value::NullRef, ValType::ExternRef)
             | (Value::NullRef, ValType::TypedFuncRef)
+            | (Value::NullRef, ValType::NonNullableFuncRef)
             | (Value::NullRef, ValType::NullableTypedFuncRef)
             | (Value::GcRef(_), ValType::I32)
             | (Value::GcRef(_), ValType::FuncRef)

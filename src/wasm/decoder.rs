@@ -829,7 +829,7 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
                 // -13=nofunc, -14=noextern, -15=none, -23=exn, -12=noexn
                 -17 => Ok(ValType::ExternRef),  // extern
                 -16 => { // func
-                    if nullable { Ok(ValType::FuncRef) } else { Ok(ValType::TypedFuncRef) }
+                    if nullable { Ok(ValType::FuncRef) } else { Ok(ValType::NonNullableFuncRef) }
                 }
                 -18 => Ok(ValType::AnyRef),     // any
                 -19 => Ok(ValType::EqRef),      // eq
@@ -1787,6 +1787,17 @@ fn decode_element_section(
     _end: usize,
     module: &mut WasmModule,
 ) -> Result<(), WasmError> {
+    // Collect global init values so element item expressions using global.get
+    // can resolve local globals (e.g., funcref globals initialized with ref.func).
+    // Global indices include imports first, then defined globals.
+    let num_global_imports = module.imports.iter()
+        .filter(|i| matches!(i.kind, ImportKind::Global(_, _, _)))
+        .count();
+    let mut global_init_values: Vec<Value> = vec![Value::I32(0); num_global_imports];
+    for g in &module.globals {
+        global_init_values.push(g.init_value);
+    }
+
     let count = decode_leb128_u32(bytes, pos)? as usize;
     if count > MAX_ELEMENT_SEGMENTS {
         return Err(WasmError::InvalidSection);
@@ -1917,7 +1928,7 @@ fn decode_element_section(
                 for _ in 0..num_elems {
                     let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
-                    let val = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr_with_globals(bytes, pos, &global_init_values)?;
                     let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
@@ -1935,7 +1946,7 @@ fn decode_element_section(
                 for _ in 0..num_elems {
                     let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
-                    let val = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr_with_globals(bytes, pos, &global_init_values)?;
                     let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
@@ -1969,7 +1980,7 @@ fn decode_element_section(
                 for _ in 0..num_elems {
                     let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
-                    let val = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr_with_globals(bytes, pos, &global_init_values)?;
                     let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
@@ -1987,7 +1998,7 @@ fn decode_element_section(
                 for _ in 0..num_elems {
                     let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
-                    let val = eval_init_expr(bytes, pos)?;
+                    let val = eval_init_expr_with_globals(bytes, pos, &global_init_values)?;
                     let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);

@@ -284,9 +284,24 @@ impl WasmInstance {
         }
 
         // Initialize tables from module definitions (support multiple tables)
+        // If a table has an init expression (GC proposal), evaluate it for default values.
         let mut tables: Vec<Vec<Option<u32>>> = Vec::with_capacity(module.tables.len());
         for t in &module.tables {
-            tables.push(vec![None; t.min as usize]);
+            let default_entry = if let Some(ref expr_bytes) = t.init_expr_bytes {
+                let mut expr_pos = 0;
+                let init_val = crate::wasm::decoder::eval_init_expr_with_globals(
+                    expr_bytes, &mut expr_pos, &globals,
+                );
+                match init_val {
+                    Ok(Value::NullRef) => None,
+                    Ok(Value::I32(v)) if v >= 0 => Some(v as u32),
+                    Ok(Value::GcRef(heap_idx)) => Some(heap_idx | 0x8000_0000),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            tables.push(vec![default_entry; t.min as usize]);
         }
         // Ensure at least one table exists if element segments reference table 0
         // (some modules have implicit table 0 via imports)
@@ -320,9 +335,9 @@ impl WasmInstance {
             // Trap if any function index is out of bounds (only for funcref tables)
             let is_func_table = tbl_idx < module.tables.len() && matches!(
                 module.tables[tbl_idx].elem_type,
-                ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
+                ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef
             );
-            let is_func_seg = matches!(seg.elem_type, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+            let is_func_seg = matches!(seg.elem_type, ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef);
             if is_func_table && is_func_seg {
                 for &func_idx in &seg.func_indices {
                     if func_idx != u32::MAX && func_idx >= total_funcs {
@@ -403,28 +418,8 @@ impl WasmInstance {
         // Re-evaluate expression-based element segment items (GC proposal)
         inst.eval_gc_elem_exprs();
 
-        // Apply table init expressions (GC proposal: tables with init values)
-        for (tbl_idx, tdef) in inst.module.tables.iter().enumerate() {
-            if let Some(ref expr_bytes) = tdef.init_expr_bytes {
-                if tbl_idx < inst.tables.len() {
-                    let mut expr_pos = 0;
-                    let init_val = crate::wasm::decoder::eval_init_expr_with_globals(
-                        expr_bytes, &mut expr_pos, &inst.globals,
-                    );
-                    if let Ok(val) = init_val {
-                        let entry = match val {
-                            Value::NullRef => None,
-                            Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
-                            Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
-                            _ => None,
-                        };
-                        for slot in inst.tables[tbl_idx].iter_mut() {
-                            *slot = entry;
-                        }
-                    }
-                }
-            }
-        }
+        // Table init expressions are already applied during table construction above,
+        // before elem segments, so no need to re-apply here.
 
         Ok(inst)
     }
@@ -517,7 +512,7 @@ impl WasmInstance {
                 ValType::AnyRef | ValType::EqRef | ValType::I31Ref |
                 ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef |
                 ValType::NoneRef | ValType::NullFuncRef | ValType::NullExternRef |
-                ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+                ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef);
             if !needs_gc { continue; }
             if let Some(val) = self.eval_gc_const_expr(expr_bytes, 0) {
                 self.globals[gi] = val;

@@ -39,6 +39,15 @@ pub enum ValType {
     NullExternRef,
     /// Exception handling proposal: exnref (exception reference)
     ExnRef,
+    /// Non-nullable abstract func reference: (ref func).
+    /// Distinguished from TypedFuncRef which is (ref $t) for a concrete type.
+    NonNullableFuncRef,
+    /// GC proposal: (ref null any) — nullable
+    NullableAnyRef,
+    /// GC proposal: (ref null eq) — nullable
+    NullableEqRef,
+    /// GC proposal: (ref null array) — nullable
+    NullableArrayRef,
 }
 
 /// A 128-bit SIMD value (v128), stored as little-endian byte array.
@@ -146,8 +155,13 @@ impl Value {
             ValType::V128 => Value::V128(V128::ZERO),
             ValType::FuncRef | ValType::ExternRef
             | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
-            | ValType::AnyRef | ValType::EqRef | ValType::I31Ref
-            | ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
+            | ValType::NonNullableFuncRef
+            | ValType::AnyRef | ValType::NullableAnyRef
+            | ValType::EqRef | ValType::NullableEqRef
+            | ValType::I31Ref
+            | ValType::StructRef | ValType::NullableStructRef
+            | ValType::ArrayRef | ValType::NullableArrayRef
+            | ValType::NoneRef
             | ValType::NullFuncRef | ValType::NullExternRef
             | ValType::ExnRef => Value::NullRef,
         }
