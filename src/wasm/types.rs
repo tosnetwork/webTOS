@@ -31,8 +31,12 @@ pub enum ValType {
     NullableStructRef,
     /// GC proposal: (ref array) / (ref null array) — abstract array type
     ArrayRef,
-    /// GC proposal: (ref null none) — bottom type
+    /// GC proposal: (ref null none) — bottom type for any hierarchy
     NoneRef,
+    /// GC proposal: (ref null nofunc) — bottom type for func hierarchy
+    NullFuncRef,
+    /// GC proposal: (ref null noextern) — bottom type for extern hierarchy
+    NullExternRef,
     /// Exception handling proposal: exnref (exception reference)
     ExnRef,
 }
@@ -144,6 +148,7 @@ impl Value {
             | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
             | ValType::AnyRef | ValType::EqRef | ValType::I31Ref
             | ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
+            | ValType::NullFuncRef | ValType::NullExternRef
             | ValType::ExnRef => Value::NullRef,
         }
     }

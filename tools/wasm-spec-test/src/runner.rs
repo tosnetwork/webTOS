@@ -762,6 +762,8 @@ impl WastRunner {
         let path_str = path.to_string_lossy();
         if path_str.contains("proposals/gc/") || path_str.contains("proposals/wasm-3.0/") {
             runner.gc_enabled = true;
+        }
+        if path_str.contains("proposals/wasm-3.0/") {
             runner.multi_memory_enabled = true;
         }
         if path_str.contains("proposals/multi-memory/") || path_str.contains("proposals/custom-page-sizes/") {
@@ -2206,7 +2208,8 @@ impl WastRunner {
 
         if module_name == SPECTEST_MODULE {
             // spectest table: min=10, max=20, funcref
-            if field_name != "table" {
+            // spectest table64: min=10, max=20, funcref (table64)
+            if field_name != "table" && field_name != "table64" {
                 return Err(RunnerError::new(
                     "link",
                     format!("unknown import: spectest does not export table `{field_name}`"),

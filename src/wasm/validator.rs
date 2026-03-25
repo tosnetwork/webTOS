@@ -130,9 +130,33 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             }
         }
         // Non-nullable ref types require an init expression
-        let is_non_nullable = matches!(table.elem_type, ValType::TypedFuncRef | ValType::StructRef);
-        if is_non_nullable && table.init_expr_bytes.is_none() {
+        if table.is_non_nullable && table.init_expr_bytes.is_none() {
             return Err(WasmError::TypeMismatch);
+        }
+        // Validate table init expression type compatibility
+        if let Some(ref expr_bytes) = table.init_expr_bytes {
+            let info = crate::wasm::decoder::scan_init_expr_info(expr_bytes, 0);
+            if info.stack_depth != 1 {
+                return Err(WasmError::TypeMismatch);
+            }
+            // Check init expr doesn't reference module-defined globals (only imports allowed)
+            if let Some(ref_idx) = info.global_ref {
+                let global_import_count_local = count_global_imports(module);
+                if ref_idx as usize >= global_import_count_local {
+                    return Err(WasmError::GlobalIndexOutOfBounds);
+                }
+            }
+            // Validate init expr result type matches table element type
+            if let Some(init_type) = info.result_type {
+                if !is_ref_type(init_type) && is_ref_type(table.elem_type) {
+                    // Non-ref init for ref table
+                    return Err(WasmError::TypeMismatch);
+                }
+                // Check type compatibility: init must be subtype of table elem type
+                if init_type != table.elem_type && !val_is_subtype(init_type, table.elem_type) {
+                    return Err(WasmError::TypeMismatch);
+                }
+            }
         }
     }
 
@@ -385,9 +409,15 @@ fn count_global_imports(module: &WasmModule) -> usize {
 fn is_ref_compatible(a: ValType, b: ValType) -> bool {
     if a == b { return true; }
     // Typed func refs are subtypes of FuncRef
-    let a_funcref_family = matches!(a, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
-    let b_funcref_family = matches!(b, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+    let a_funcref_family = matches!(a, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef | ValType::NullFuncRef);
+    let b_funcref_family = matches!(b, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef | ValType::NullFuncRef);
     if a_funcref_family && b_funcref_family { return true; }
+    // externref family
+    let a_externref_family = matches!(a, ValType::ExternRef | ValType::NullExternRef);
+    let b_externref_family = matches!(b, ValType::ExternRef | ValType::NullExternRef);
+    if a_externref_family && b_externref_family { return true; }
+    // any hierarchy: NoneRef is compatible with any ref in the any hierarchy
+    if (a == ValType::NoneRef || b == ValType::NoneRef) && (is_ref_type(a) && is_ref_type(b)) { return true; }
     false
 }
 
@@ -495,6 +525,8 @@ fn storage_type_eq(a: &crate::wasm::decoder::StorageType, b: &crate::wasm::decod
         (StorageType::I8, StorageType::I8) => true,
         (StorageType::I16, StorageType::I16) => true,
         (StorageType::Val(va), StorageType::Val(vb)) => va == vb,
+        (StorageType::RefType(va, ai), StorageType::RefType(vb, bi)) => va == vb && ai == bi,
+        (StorageType::Val(va), StorageType::RefType(vb, _)) | (StorageType::RefType(va, _), StorageType::Val(vb)) => va == vb,
         _ => false,
     }
 }
@@ -506,6 +538,10 @@ fn storage_type_subtype(a: &crate::wasm::decoder::StorageType, b: &crate::wasm::
         (StorageType::I8, StorageType::I8) => true,
         (StorageType::I16, StorageType::I16) => true,
         (StorageType::Val(va), StorageType::Val(vb)) => val_is_subtype(*va, *vb),
+        (StorageType::RefType(va, ai), StorageType::RefType(vb, bi)) => {
+            if ai == bi { true } else { val_is_subtype(*va, *vb) }
+        }
+        (StorageType::Val(va), StorageType::RefType(vb, _)) | (StorageType::RefType(va, _), StorageType::Val(vb)) => val_is_subtype(*va, *vb),
         _ => false,
     }
 }
@@ -622,11 +658,16 @@ fn is_non_nullable_ref(t: ValType) -> bool {
 fn val_is_subtype(src: ValType, dst: ValType) -> bool {
     if src == dst { return true; }
     match (src, dst) {
-        // FuncRef family: direction is typed <: nullable <: funcref
+        // FuncRef family: typed <: nullable <: funcref
         (ValType::TypedFuncRef, ValType::NullableTypedFuncRef | ValType::FuncRef) => true,
         (ValType::NullableTypedFuncRef, ValType::FuncRef) => true,
-        // GC ref hierarchy: none <: i31/struct/array <: eq <: any
-        (ValType::NoneRef, d) if is_ref_type(d) || d == ValType::ExnRef => true,
+        // NullFuncRef (nofunc) is bottom of func hierarchy
+        (ValType::NullFuncRef, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef) => true,
+        // NullExternRef (noextern) is bottom of extern hierarchy
+        (ValType::NullExternRef, ValType::ExternRef) => true,
+        // NoneRef (none) is bottom of any hierarchy — subtype of all any-related ref types
+        (ValType::NoneRef, d) if is_any_hierarchy(d) => true,
+        // GC ref hierarchy: i31/struct/array <: eq <: any
         (ValType::I31Ref, ValType::EqRef | ValType::AnyRef) => true,
         (ValType::StructRef | ValType::NullableStructRef, ValType::EqRef | ValType::AnyRef) => true,
         (ValType::StructRef, ValType::NullableStructRef) => true,
@@ -641,17 +682,46 @@ fn val_is_subtype(src: ValType, dst: ValType) -> bool {
     }
 }
 
+/// Check if a type is in the "any" hierarchy (subtypes of anyref).
+fn is_any_hierarchy(t: ValType) -> bool {
+    matches!(t, ValType::AnyRef | ValType::EqRef | ValType::I31Ref | ValType::StructRef
+        | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
+        | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+}
+
 /// Check if `src` is a subtype of `dst` (src <: dst).
 /// Used for validating try_table catch clause label types.
 fn is_subtype(src: ValType, dst: ValType) -> bool {
     val_is_subtype(src, dst)
 }
 
+/// Check if type index `src` is a declared subtype of type index `dst`
+/// by walking the subtype chain in the module's subtype_info.
+fn is_type_index_subtype(src: u32, dst: u32, module: &WasmModule) -> bool {
+    if src == dst { return true; }
+    // Walk the subtype chain from src towards its parent
+    let mut current = src;
+    for _ in 0..100 { // bounded loop to avoid infinite loops
+        if let Some(info) = module.sub_types.get(current as usize) {
+            if let Some(parent) = info.supertype {
+                if parent == dst { return true; }
+                current = parent;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    false
+}
+
 /// Check if a ValType is a reference type.
 fn is_ref_type(t: ValType) -> bool {
     matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
         | ValType::AnyRef | ValType::EqRef | ValType::I31Ref | ValType::StructRef
-        | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef | ValType::ExnRef)
+        | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
+        | ValType::NullFuncRef | ValType::NullExternRef | ValType::ExnRef)
 }
 
 // ─── Type checking structures ────────────────────────────────────────────────
@@ -928,8 +998,8 @@ impl<'a> Validator<'a> {
                         -0x16 => ValType::ArrayRef,    // array
                         -0x17 => ValType::ExnRef,      // exn
                         -0x0F => ValType::NoneRef,     // none
-                        -0x0E => ValType::ExternRef,   // noextern
-                        -0x0D => ValType::FuncRef,     // nofunc
+                        -0x0E => ValType::NullExternRef,   // noextern
+                        -0x0D => ValType::NullFuncRef,     // nofunc
                         _ => {
                             // Concrete type index — validate it exists
                             if heap_type >= 0 && (heap_type as u32) >= self.module.func_types.len() as u32 {
@@ -976,6 +1046,73 @@ impl<'a> Validator<'a> {
             let params: Vec<ValType> = ft.params[..ft.param_count as usize].to_vec();
             let results: Vec<ValType> = ft.results[..ft.result_count as usize].to_vec();
             Ok((params, results))
+        }
+    }
+
+    /// Read a single value type from the code stream, handling multi-byte ref types.
+    /// This is used by typed select and anywhere a valtype is encoded inline.
+    fn read_valtype(&mut self) -> Result<ValType, WasmError> {
+        let b = self.read_u32()? as u8;
+        match b {
+            0x7F => Ok(ValType::I32),
+            0x7E => Ok(ValType::I64),
+            0x7D => Ok(ValType::F32),
+            0x7C => Ok(ValType::F64),
+            0x7B => Ok(ValType::V128),
+            0x70 => Ok(ValType::FuncRef),
+            0x6F => Ok(ValType::ExternRef),
+            0x6E => Ok(ValType::AnyRef),
+            0x6D => Ok(ValType::EqRef),
+            0x6C => Ok(ValType::I31Ref),
+            0x6B => Ok(ValType::NullableStructRef),
+            0x6A => Ok(ValType::ArrayRef),
+            0x69 => Ok(ValType::ExnRef),
+            0x74 => Ok(ValType::ExnRef),    // nullexnref
+            0x71 => Ok(ValType::NoneRef),
+            0x72 => Ok(ValType::NullExternRef),  // nullexternref
+            0x73 => Ok(ValType::NullFuncRef),    // nullfuncref
+            0x63 => {
+                // (ref null ht) — read heap type
+                let ht = self.read_i32()?;
+                self.resolve_heap_type(ht, true)
+            }
+            0x64 => {
+                // (ref ht) — read heap type
+                let ht = self.read_i32()?;
+                self.resolve_heap_type(ht, false)
+            }
+            _ => Err(WasmError::TypeMismatch),
+        }
+    }
+
+    /// Resolve a heap type code to a ValType, validating type indices.
+    fn resolve_heap_type(&self, heap_type: i32, nullable: bool) -> Result<ValType, WasmError> {
+        match heap_type {
+            -0x10 => Ok(if nullable { ValType::FuncRef } else { ValType::TypedFuncRef }),
+            -0x11 => Ok(ValType::ExternRef),
+            -0x12 => Ok(ValType::AnyRef),
+            -0x13 => Ok(ValType::EqRef),
+            -0x14 => Ok(ValType::I31Ref),
+            -0x15 => Ok(if nullable { ValType::NullableStructRef } else { ValType::StructRef }),
+            -0x16 => Ok(ValType::ArrayRef),
+            -0x17 => Ok(ValType::ExnRef),
+            -0x0F => Ok(ValType::NoneRef),
+            -0x0E => Ok(ValType::NullExternRef),  // noextern
+            -0x0D => Ok(ValType::NullFuncRef),    // nofunc
+            -0x0C => Ok(ValType::ExnRef),         // noexn
+            _ => {
+                // Concrete type index — validate it exists
+                if heap_type < 0 {
+                    return Err(WasmError::TypeMismatch);
+                }
+                let gc_len = self.module.gc_types.len();
+                let ft_len = self.module.func_types.len();
+                let max_types = if gc_len > 0 { gc_len } else { ft_len };
+                if (heap_type as usize) >= max_types {
+                    return Err(WasmError::TypeMismatch);
+                }
+                Ok(if nullable { ValType::NullableTypedFuncRef } else { ValType::TypedFuncRef })
+            }
         }
     }
 
@@ -1633,8 +1770,7 @@ impl<'a> Validator<'a> {
                     if count != 1 {
                         return Err(WasmError::TypeMismatch);
                     }
-                    let vt_raw = self.read_u32()?;
-                    let vt = byte_to_valtype(vt_raw as u8)?;
+                    let vt = self.read_valtype()?;
                     self.pop_expect(ValType::I32)?; // condition
                     self.pop_expect(vt)?;
                     self.pop_expect(vt)?;
@@ -2029,19 +2165,23 @@ impl<'a> Validator<'a> {
                 // ── ref.null ──
                 0xD0 => {
                     let heap_type = self.read_i32()?; // heaptype
-                    if heap_type == -0x10 {
-                        // (ref null func) = funcref
-                        self.push_val(ValType::FuncRef);
-                    } else if heap_type == -0x11 {
-                        // (ref null extern) = externref
-                        self.push_val(ValType::ExternRef);
-                    } else if heap_type >= 0 {
-                        // (ref null $t) = nullable typed func ref
-                        self.push_val(ValType::NullableTypedFuncRef);
-                    } else {
-                        // Other abstract heap types - push as unknown
-                        self.push_opd(StackType::Unknown);
-                    }
+                    let vt = match heap_type {
+                        -0x10 => ValType::FuncRef,          // func
+                        -0x11 => ValType::ExternRef,        // extern
+                        -0x12 => ValType::AnyRef,           // any
+                        -0x13 => ValType::EqRef,            // eq
+                        -0x14 => ValType::I31Ref,           // i31
+                        -0x15 => ValType::NullableStructRef, // struct
+                        -0x16 => ValType::ArrayRef,         // array
+                        -0x17 => ValType::ExnRef,           // exn
+                        -0x0F => ValType::NoneRef,          // none
+                        -0x0D => ValType::NullFuncRef,      // nofunc
+                        -0x0E => ValType::NullExternRef,    // noextern
+                        -0x0C => ValType::ExnRef,           // noexn
+                        _ if heap_type >= 0 => ValType::NullableTypedFuncRef, // concrete type
+                        _ => ValType::NoneRef,
+                    };
+                    self.push_val(vt);
                 }
                 // ── ref.is_null ──
                 0xD1 => {
@@ -2068,7 +2208,9 @@ impl<'a> Validator<'a> {
                     let ref2 = self.pop_opd()?;
                     // Reject types that are NOT subtypes of eqref
                     fn is_not_eq_subtype(t: ValType) -> bool {
-                        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::ExnRef)
+                        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::ExnRef
+                            | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
+                            | ValType::NullFuncRef | ValType::NullExternRef)
                     }
                     if let StackType::Known(t) = ref1 { if is_not_eq_subtype(t) { return Err(WasmError::TypeMismatch); } }
                     if let StackType::Known(t) = ref2 { if is_not_eq_subtype(t) { return Err(WasmError::TypeMismatch); } }
@@ -2591,9 +2733,23 @@ impl<'a> Validator<'a> {
                             self.push_opd(StackType::Unknown);
                         }
                         2 | 3 | 4 => { // struct.get/get_s/get_u: typeidx fieldidx — pop ref, push val
-                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let type_idx = self.read_u32()?; let field_idx = self.read_u32()? as usize;
                             let _ = self.pop_opd()?;
-                            self.push_opd(StackType::Unknown);
+                            // Determine the field type from the GC type definition
+                            let field_vt = if let Some(crate::wasm::decoder::GcTypeDef::Struct { ref field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                if let Some(st) = field_types.get(field_idx) {
+                                    // struct.get_s/get_u (3/4) are for packed types only
+                                    // struct.get (2) returns the unpacked type
+                                    st.unpack()
+                                } else {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                            } else {
+                                // Unknown type — push Unknown
+                                self.push_opd(StackType::Unknown);
+                                continue;
+                            };
+                            self.push_val(field_vt);
                         }
                         5 => { // struct.set: typeidx fieldidx — pop ref, pop val
                             let type_idx = self.read_u32()?;
@@ -2703,6 +2859,17 @@ impl<'a> Validator<'a> {
                                         (StorageType::I8, StorageType::I8) => true,
                                         (StorageType::I16, StorageType::I16) => true,
                                         (StorageType::Val(sv), StorageType::Val(dv)) => val_is_subtype(*sv, *dv),
+                                        // RefType with same type index is compatible
+                                        (StorageType::RefType(_, si), StorageType::RefType(_, di)) => {
+                                            if si == di { true }
+                                            else {
+                                                // Check subtype chain: src must be a declared subtype of dst
+                                                is_type_index_subtype(*si, *di, self.module)
+                                            }
+                                        }
+                                        // RefType vs Val: check abstract subtyping only
+                                        (StorageType::RefType(sv, _), StorageType::Val(dv)) => val_is_subtype(*sv, *dv),
+                                        (StorageType::Val(sv), StorageType::RefType(dv, _)) => val_is_subtype(*sv, *dv),
                                         _ => false,
                                     };
                                     if !compatible { return Err(WasmError::TypeMismatch); }
@@ -2783,6 +2950,8 @@ impl<'a> Validator<'a> {
                                     -16 => if nullable { Some(ValType::FuncRef) } else { Some(ValType::TypedFuncRef) },
                                     -17 => Some(ValType::ExternRef),   // extern
                                     -15 => Some(ValType::NoneRef),     // none
+                                    -13 => Some(ValType::NullFuncRef), // nofunc
+                                    -14 => Some(ValType::NullExternRef), // noextern
                                     -23 => Some(ValType::ExnRef),      // exn
                                     _ if ht >= 0 => if nullable { Some(ValType::NullableTypedFuncRef) } else { Some(ValType::TypedFuncRef) },
                                     _ => None,

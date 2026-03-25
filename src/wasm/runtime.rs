@@ -516,7 +516,8 @@ impl WasmInstance {
             let needs_gc = matches!(val_type,
                 ValType::AnyRef | ValType::EqRef | ValType::I31Ref |
                 ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef |
-                ValType::NoneRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+                ValType::NoneRef | ValType::NullFuncRef | ValType::NullExternRef |
+                ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
             if !needs_gc { continue; }
             if let Some(val) = self.eval_gc_const_expr(expr_bytes, 0) {
                 self.globals[gi] = val;
