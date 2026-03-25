@@ -235,8 +235,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             return Err(WasmError::TypeMismatch);
         }
         // Validate no non-constant instructions in init expression
-        // GC modules allow struct.new, array.new etc. in const expressions
-        if global.has_non_const && !module.gc_enabled {
+        if global.has_non_const {
             return Err(WasmError::ConstExprRequired);
         }
         // Validate global init expression type matches declared type
