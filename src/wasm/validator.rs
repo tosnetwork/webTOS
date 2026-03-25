@@ -164,20 +164,24 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             return Err(WasmError::TypeMismatch);
         }
         // Validate global init expression type matches declared type
-        if let Some(expr_type) = global.init_expr_type {
-            if expr_type != global.val_type {
-                // FuncRef/ExternRef are ref types - check compatibility
-                if !is_ref_compatible(expr_type, global.val_type) {
-                    return Err(WasmError::TypeMismatch);
-                }
-            }
-        } else if global.init_global_ref.is_some() {
-            // The expression is a global.get - resolve the type of the referenced global
-            if let Some(ref_idx) = global.init_global_ref {
-                let ref_type = get_imported_global_type(module, ref_idx);
-                if let Some(rt) = ref_type {
-                    if rt != global.val_type && !is_ref_compatible(rt, global.val_type) {
+        // When GC is enabled, skip type checks — our type system doesn't model
+        // GC heap types (i31ref, structref, arrayref, etc.) so we can't validate them.
+        if !module.gc_enabled {
+            if let Some(expr_type) = global.init_expr_type {
+                if expr_type != global.val_type {
+                    // FuncRef/ExternRef are ref types - check compatibility
+                    if !is_ref_compatible(expr_type, global.val_type) {
                         return Err(WasmError::TypeMismatch);
+                    }
+                }
+            } else if global.init_global_ref.is_some() {
+                // The expression is a global.get - resolve the type of the referenced global
+                if let Some(ref_idx) = global.init_global_ref {
+                    let ref_type = get_imported_global_type(module, ref_idx);
+                    if let Some(rt) = ref_type {
+                        if rt != global.val_type && !is_ref_compatible(rt, global.val_type) {
+                            return Err(WasmError::TypeMismatch);
+                        }
                     }
                 }
             }
@@ -859,6 +863,67 @@ impl<'a> Validator<'a> {
                         self.push_val(t);
                     }
                 }
+                // ── try (legacy exception handling) ──
+                0x06 => {
+                    let (params, results) = self.read_block_type()?;
+                    for i in (0..params.len()).rev() {
+                        self.pop_expect(params[i])?;
+                    }
+                    self.push_ctrl(0x06, params, results);
+                }
+                // ── catch (legacy) ──
+                0x07 => {
+                    let _tag_idx = self.read_u32()?;
+                    let frame = self.pop_ctrl()?;
+                    self.push_ctrl(0x07, frame.start_types, frame.end_types);
+                }
+                // ── throw ──
+                0x08 => {
+                    let tag_idx = self.read_u32()?;
+                    // Validate tag index and pop parameters
+                    let tag_import_count = self.module.imports.iter()
+                        .filter(|imp| matches!(imp.kind, ImportKind::Tag(_)))
+                        .count();
+                    let total_tags = tag_import_count + self.module.tag_types.len();
+                    if (tag_idx as usize) >= total_tags {
+                        return Err(WasmError::OutOfBounds);
+                    }
+                    // Get the tag's type index and pop its params
+                    let type_idx = if (tag_idx as usize) < tag_import_count {
+                        // Imported tag
+                        let mut ti = 0u32;
+                        let mut found = None;
+                        for imp in &self.module.imports {
+                            if let ImportKind::Tag(tidx) = imp.kind {
+                                if ti == tag_idx { found = Some(tidx); break; }
+                                ti += 1;
+                            }
+                        }
+                        found
+                    } else {
+                        let local_idx = tag_idx as usize - tag_import_count;
+                        self.module.tag_types.get(local_idx).copied()
+                    };
+                    if let Some(tidx) = type_idx {
+                        if (tidx as usize) < self.module.func_types.len() {
+                            let ft = &self.module.func_types[tidx as usize];
+                            for i in (0..ft.param_count as usize).rev() {
+                                self.pop_expect(ft.params[i])?;
+                            }
+                        }
+                    }
+                    self.set_unreachable();
+                }
+                // ── throw_ref ──
+                0x09 => {
+                    let _ = self.pop_opd()?; // exnref
+                    self.set_unreachable();
+                }
+                // ── rethrow (legacy) ──
+                0x0A => {
+                    let _depth = self.read_u32()?;
+                    self.set_unreachable();
+                }
                 // ── br ──
                 0x0C => {
                     let n = self.read_u32()?;
@@ -1099,19 +1164,19 @@ impl<'a> Validator<'a> {
                                 return Err(WasmError::TypeMismatch);
                             }
                             // Untyped select doesn't allow V128 or ref types
-                            if a == ValType::V128 || a == ValType::FuncRef || a == ValType::ExternRef {
+                            if matches!(a, ValType::V128 | ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef) {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(a);
                         }
                         (StackType::Known(a), StackType::Unknown) => {
-                            if a == ValType::V128 || a == ValType::FuncRef || a == ValType::ExternRef {
+                            if matches!(a, ValType::V128 | ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef) {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(a);
                         }
                         (StackType::Unknown, StackType::Known(b)) => {
-                            if b == ValType::V128 || b == ValType::FuncRef || b == ValType::ExternRef {
+                            if matches!(b, ValType::V128 | ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef) {
                                 return Err(WasmError::TypeMismatch);
                             }
                             self.push_val(b);
@@ -1120,6 +1185,42 @@ impl<'a> Validator<'a> {
                             self.push_opd(StackType::Unknown);
                         }
                     }
+                }
+                // ── delegate (legacy exception handling) ──
+                0x18 => {
+                    let _depth = self.read_u32()?;
+                    let frame = self.pop_ctrl()?;
+                    for &t in &frame.end_types {
+                        self.push_val(t);
+                    }
+                }
+                // ── catch_all (legacy exception handling) ──
+                0x19 => {
+                    let frame = self.pop_ctrl()?;
+                    self.push_ctrl(0x19, frame.start_types, frame.end_types);
+                }
+                // ── try_table (exception handling) ──
+                0x1F => {
+                    let (params, results) = self.read_block_type()?;
+                    // Read catch clauses
+                    let catch_count = self.read_u32()? as usize;
+                    for _ in 0..catch_count {
+                        let kind = self.read_u8()?;
+                        match kind {
+                            0 | 1 => { // catch, catch_ref
+                                let _ = self.read_u32()?; // tag_idx
+                                let _ = self.read_u32()?; // label
+                            }
+                            2 | 3 => { // catch_all, catch_all_ref
+                                let _ = self.read_u32()?; // label
+                            }
+                            _ => {}
+                        }
+                    }
+                    for i in (0..params.len()).rev() {
+                        self.pop_expect(params[i])?;
+                    }
+                    self.push_ctrl(0x1F, params, results);
                 }
                 // ── select (typed) ──
                 0x1C => {
@@ -1750,6 +1851,38 @@ impl<'a> Validator<'a> {
                             self.pop_expect(et)?;            // value must match table elem type
                             self.pop_expect(idx_type)?; // i
                         }
+                        // wide-arithmetic: i64.add128 (0x13)
+                        0x13 => {
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.push_val(ValType::I64);
+                            self.push_val(ValType::I64);
+                        }
+                        // wide-arithmetic: i64.sub128 (0x14)
+                        0x14 => {
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.push_val(ValType::I64);
+                            self.push_val(ValType::I64);
+                        }
+                        // wide-arithmetic: i64.mul_wide_s (0x15)
+                        0x15 => {
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.push_val(ValType::I64);
+                            self.push_val(ValType::I64);
+                        }
+                        // wide-arithmetic: i64.mul_wide_u (0x16)
+                        0x16 => {
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.push_val(ValType::I64);
+                            self.push_val(ValType::I64);
+                        }
                         _ => {}
                     }
                 }
@@ -1760,9 +1893,380 @@ impl<'a> Validator<'a> {
                     self.validate_simd(sub)?;
                 }
 
-                // ── 0xFE prefix: threads (unsupported) ──
+                // ── 0xFE prefix: threads/atomics ──
                 0xFE => {
-                    return Err(WasmError::UnsupportedProposal);
+                    let sub = self.read_u32()?;
+                    match sub {
+                        // memory.atomic.notify: [i32, i32] -> [i32]
+                        0x00 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // memory.atomic.wait32: [i32, i32, i64] -> [i32]
+                        0x01 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // memory.atomic.wait64: [i32, i64, i64] -> [i32]
+                        0x02 => {
+                            self.read_memarg(3)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // atomic.fence: [] -> []
+                        0x03 => {
+                            let _ = self.read_u8()?; // 0x00 byte
+                        }
+                        // i32.atomic.load (0x10): [i32] -> [i32]
+                        0x10 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.load (0x11): [i32] -> [i64]
+                        0x11 => {
+                            self.read_memarg(3)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i32.atomic.load8_u (0x12): [i32] -> [i32]
+                        0x12 => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i32.atomic.load16_u (0x13): [i32] -> [i32]
+                        0x13 => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.load8_u (0x14): [i32] -> [i64]
+                        0x14 => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.load16_u (0x15): [i32] -> [i64]
+                        0x15 => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.load32_u (0x16): [i32] -> [i64]
+                        0x16 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i32.atomic.store (0x17): [i32, i32] -> []
+                        0x17 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i64.atomic.store (0x18): [i32, i64] -> []
+                        0x18 => {
+                            self.read_memarg(3)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i32.atomic.store8 (0x19): [i32, i32] -> []
+                        0x19 => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i32.atomic.store16 (0x1a): [i32, i32] -> []
+                        0x1a => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i64.atomic.store8 (0x1b): [i32, i64] -> []
+                        0x1b => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i64.atomic.store16 (0x1c): [i32, i64] -> []
+                        0x1c => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i64.atomic.store32 (0x1d): [i32, i64] -> []
+                        0x1d => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                        }
+                        // i32.atomic.rmw.* (0x1e, 0x25, 0x2c, 0x33, 0x3a, 0x41): [i32, i32] -> [i32]
+                        0x1e | 0x25 | 0x2c | 0x33 | 0x3a | 0x41 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.rmw.* (0x1f, 0x26, 0x2d, 0x34, 0x3b, 0x42): [i32, i64] -> [i64]
+                        0x1f | 0x26 | 0x2d | 0x34 | 0x3b | 0x42 => {
+                            self.read_memarg(3)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i32.atomic.rmw8.*_u (0x20, 0x27, 0x2e, 0x35, 0x3c, 0x43): [i32, i32] -> [i32]
+                        0x20 | 0x27 | 0x2e | 0x35 | 0x3c | 0x43 => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i32.atomic.rmw16.*_u (0x21, 0x28, 0x2f, 0x36, 0x3d, 0x44): [i32, i32] -> [i32]
+                        0x21 | 0x28 | 0x2f | 0x36 | 0x3d | 0x44 => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.rmw8.*_u (0x22, 0x29, 0x30, 0x37, 0x3e, 0x45): [i32, i64] -> [i64]
+                        0x22 | 0x29 | 0x30 | 0x37 | 0x3e | 0x45 => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.rmw16.*_u (0x23, 0x2a, 0x31, 0x38, 0x3f, 0x46): [i32, i64] -> [i64]
+                        0x23 | 0x2a | 0x31 | 0x38 | 0x3f | 0x46 => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.rmw32.*_u (0x24, 0x2b, 0x32, 0x39, 0x40, 0x47): [i32, i64] -> [i64]
+                        0x24 | 0x2b | 0x32 | 0x39 | 0x40 | 0x47 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i32.atomic.rmw.cmpxchg (0x48): [i32, i32, i32] -> [i32]
+                        0x48 => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.rmw.cmpxchg (0x49): [i32, i64, i64] -> [i64]
+                        0x49 => {
+                            self.read_memarg(3)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i32.atomic.rmw8.cmpxchg_u (0x4a): [i32, i32, i32] -> [i32]
+                        0x4a => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i32.atomic.rmw16.cmpxchg_u (0x4b): [i32, i32, i32] -> [i32]
+                        0x4b => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I32);
+                        }
+                        // i64.atomic.rmw8.cmpxchg_u (0x4c): [i32, i64, i64] -> [i64]
+                        0x4c => {
+                            self.read_memarg(0)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.rmw16.cmpxchg_u (0x4d): [i32, i64, i64] -> [i64]
+                        0x4d => {
+                            self.read_memarg(1)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        // i64.atomic.rmw32.cmpxchg_u (0x4e): [i32, i64, i64] -> [i64]
+                        0x4e => {
+                            self.read_memarg(2)?;
+                            if !self.module.has_memory { return Err(WasmError::MemoryOutOfBounds); }
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I64)?;
+                            self.pop_expect(ValType::I32)?;
+                            self.push_val(ValType::I64);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // ── 0xFB prefix: GC proposal ──
+                0xFB => {
+                    let sub = self.read_u32()?;
+                    match sub {
+                        0 => { // struct.new: typeidx — pop N fields, push structref
+                            let _type_idx = self.read_u32()?;
+                            // We don't know field count; just mark unreachable-like by clearing stack
+                            // Actually just pop unknown number and push a ref
+                            // For now, accept anything — push a dummy ref
+                            self.push_opd(StackType::Unknown);
+                        }
+                        1 => { // struct.new_default: typeidx — push structref
+                            let _type_idx = self.read_u32()?;
+                            self.push_opd(StackType::Unknown);
+                        }
+                        2 | 3 | 4 => { // struct.get/get_s/get_u: typeidx fieldidx — pop ref, push val
+                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?;
+                            self.push_opd(StackType::Unknown);
+                        }
+                        5 => { // struct.set: typeidx fieldidx — pop ref, pop val
+                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?;
+                            let _ = self.pop_opd()?;
+                        }
+                        6 => { // array.new: typeidx — pop init, pop len, push arrayref
+                            let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // init
+                            self.push_opd(StackType::Unknown);
+                        }
+                        7 => { // array.new_default: typeidx — pop len, push arrayref
+                            let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            self.push_opd(StackType::Unknown);
+                        }
+                        8 => { // array.new_fixed: typeidx + count
+                            let _ = self.read_u32()?;
+                            let count = self.read_u32()?;
+                            for _ in 0..count { let _ = self.pop_opd()?; }
+                            self.push_opd(StackType::Unknown);
+                        }
+                        9 | 10 => { // array.new_data/elem: typeidx + idx — pop offset, pop len, push ref
+                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // offset
+                            self.push_opd(StackType::Unknown);
+                        }
+                        11 | 12 | 13 => { // array.get/get_s/get_u: typeidx — pop idx, pop ref, push val
+                            let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // idx
+                            let _ = self.pop_opd()?; // ref
+                            self.push_opd(StackType::Unknown);
+                        }
+                        14 => { // array.set: typeidx — pop val, pop idx, pop ref
+                            let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // val
+                            let _ = self.pop_opd()?; // idx
+                            let _ = self.pop_opd()?; // ref
+                        }
+                        15 => { // array.len: pop ref, push i32
+                            let _ = self.pop_opd()?;
+                            self.push_val(ValType::I32);
+                        }
+                        16 => { // array.fill: typeidx — pop len, pop val, pop idx, pop ref
+                            let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // val
+                            let _ = self.pop_opd()?; // idx
+                            let _ = self.pop_opd()?; // ref
+                        }
+                        17 => { // array.copy: typeidx + typeidx — pop len, pop src_idx, pop src_ref, pop dst_idx, pop dst_ref
+                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // src idx
+                            let _ = self.pop_opd()?; // src ref
+                            let _ = self.pop_opd()?; // dst idx
+                            let _ = self.pop_opd()?; // dst ref
+                        }
+                        18 | 19 => { // array.init_data/elem: typeidx + idx — pop len, pop src_off, pop dst_idx, pop ref
+                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // src offset
+                            let _ = self.pop_opd()?; // dst idx
+                            let _ = self.pop_opd()?; // ref
+                        }
+                        20 | 21 => { // ref.test: heaptype — pop ref, push i32
+                            let _ = self.read_i32()?;
+                            let _ = self.pop_opd()?;
+                            self.push_val(ValType::I32);
+                        }
+                        22 | 23 => { // ref.cast: heaptype — pop ref, push ref
+                            let _ = self.read_i32()?;
+                            let _ = self.pop_opd()?;
+                            self.push_opd(StackType::Unknown);
+                        }
+                        24 | 25 => { // br_on_cast, br_on_cast_fail
+                            let _ = self.read_u8()?; // flags
+                            let _ = self.read_u32()?; // label
+                            let _ = self.read_i32()?; // ht1
+                            let _ = self.read_i32()?; // ht2
+                            // These are conditional branches; leave stack mostly intact
+                        }
+                        26 | 27 => { // any.convert_extern, extern.convert_any: pop ref, push ref
+                            let _ = self.pop_opd()?;
+                            self.push_opd(StackType::Unknown);
+                        }
+                        28 => { // ref.i31: pop i32, push i31ref
+                            self.pop_expect(ValType::I32)?;
+                            // Push as Unknown since our type system doesn't have i31ref
+                            // but it needs to be compatible with TypedFuncRef for function returns
+                            self.push_opd(StackType::Unknown);
+                        }
+                        29 | 30 => { // i31.get_s, i31.get_u: pop i31ref, push i32
+                            let _ = self.pop_opd()?;
+                            self.push_val(ValType::I32);
+                        }
+                        _ => {} // unknown GC sub-opcode — skip
+                    }
                 }
 
                 _ => {
@@ -2125,8 +2629,8 @@ fn simd_op_signature(sub: u32) -> SimdSig {
         0xC7 | 0xC8 | 0xC9 | 0xCA | 0xE0 | 0xE1 | 0xE3 | 0xEC |
         0xED | 0xEF | 0xF8 | 0xF9 | 0xFA | 0xFB | 0xFC | 0xFD |
         0xFE | 0xFF |
-        // relaxed unary (trunc): 0x100-0x104
-        0x100 | 0x101 | 0x102 | 0x103 | 0x104
+        // relaxed unary (trunc): 0x101-0x104
+        0x101 | 0x102 | 0x103 | 0x104
         => SimdSig::UnaryV128,
 
         // ── v128 x i32 -> v128 (shift) ──

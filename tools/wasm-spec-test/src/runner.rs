@@ -119,9 +119,9 @@ pub struct WastRunner {
     instances: HashMap<String, InstanceHandle>,
     current: Option<InstanceHandle>,
     anonymous_instances: usize,
-    /// Memory sharing pairs: (importer, exporter).
+    /// Memory sharing pairs: (importer, importer_mem_idx, exporter, exporter_mem_idx).
     /// When either side's memory changes, sync to the other.
-    memory_shares: Vec<(InstanceHandle, InstanceHandle)>,
+    memory_shares: Vec<(InstanceHandle, usize, InstanceHandle, usize)>,
     /// Whether GC-proposal features are enabled for this test file.
     gc_enabled: bool,
     /// Whether multi-memory proposal is enabled for this test file.
@@ -366,8 +366,8 @@ impl WastRunner {
     fn decode_module(&self, bytes: &[u8]) -> RunnerResult<WasmModule> {
         let mut module = crate::wasm::decoder::decode(bytes)
             .map_err(|err| RunnerError::new("decode", format!("{err:?}")))?;
-        module.gc_enabled = self.gc_enabled;
-        module.multi_memory_enabled = self.multi_memory_enabled;
+        module.gc_enabled = module.gc_enabled || self.gc_enabled;
+        module.multi_memory_enabled = module.multi_memory_enabled || self.multi_memory_enabled;
         crate::wasm::validator::validate(&module)
             .map_err(|err| RunnerError::new("validation", format!("{err:?}")))?;
         Ok(module)
@@ -377,12 +377,15 @@ impl WastRunner {
         let mut module = self.decode_module(bytes)?;
         self.inject_imported_globals(&mut module)?;
         self.fixup_funcref_globals(&mut module)?;
+        // Re-evaluate segment offsets that reference globals (extended-const)
+        self.fixup_segment_offsets(&mut module, bytes);
         self.inject_imported_memory(&mut module)?;
         self.inject_imported_tables(&mut module)?;
         self.ensure_linkable_imports(&module)?;
 
         // Collect info about memory/table imports before creating the instance
-        let memory_source = self.find_memory_source(&module);
+        let memory_sources = self.find_memory_sources(&module);
+        let memory_source = memory_sources.first().map(|(_, _, h)| h.clone());
         let table_sources = self.find_table_sources(&module);
 
         if name.is_none() {
@@ -395,8 +398,10 @@ impl WastRunner {
                 // requires that segments applied *before* the failure persist in shared
                 // memory/tables.  Apply partial segments to the exporter before returning.
                 // We need the module back; re-decode it cheaply just for segment info.
-                if let (Some(mem_src), Ok(failed_module)) = (&memory_source, self.decode_module(bytes)) {
-                    self.apply_partial_data_segments_to_shared(&failed_module, mem_src);
+                if !memory_sources.is_empty() {
+                    if let Ok(failed_module) = self.decode_module(bytes) {
+                        self.apply_partial_data_segments_to_shared(&failed_module, &memory_sources);
+                    }
                 }
                 if !table_sources.is_empty() {
                     if let Ok(failed_module) = self.decode_module(bytes) {
@@ -410,59 +415,66 @@ impl WastRunner {
             instance,
         }));
 
-        // Share memory: copy exporter's memory, then re-apply importer's data segments
-        if let Some(src_handle) = &memory_source {
+        // Share memory: copy exporter's memory per-index, then re-apply importer's data segments
+        for &(imp_mem_idx, exp_mem_idx, ref src_handle) in &memory_sources {
             let mut record = handle.borrow_mut();
             let src = src_handle.borrow();
-            // Copy the exporter's memory content (memory 0)
-            let src_mem_size = if src.instance.memory_sizes.is_empty() { 0 } else { src.instance.memory_sizes[0] };
-            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+            let src_mem_size = src.instance.memory_sizes.get(exp_mem_idx).copied().unwrap_or(0);
+            let rec_mem_size = record.instance.memory_sizes.get(imp_mem_idx).copied().unwrap_or(0);
             let copy_len = src_mem_size.min(rec_mem_size);
-            if copy_len > 0 && !record.instance.memories.is_empty() && !src.instance.memories.is_empty() {
-                record.instance.memories[0][..copy_len].copy_from_slice(&src.instance.memories[0][..copy_len]);
+            if copy_len > 0
+                && imp_mem_idx < record.instance.memories.len()
+                && exp_mem_idx < src.instance.memories.len()
+            {
+                record.instance.memories[imp_mem_idx][..copy_len]
+                    .copy_from_slice(&src.instance.memories[exp_mem_idx][..copy_len]);
             }
             // If exporter's memory is larger, grow the importer's memory to match
-            if src_mem_size > rec_mem_size && !record.instance.memories.is_empty() && !src.instance.memories.is_empty() {
-                record.instance.memories[0].resize(src_mem_size, 0);
-                let extra_start = rec_mem_size;
-                let extra_end = src_mem_size;
-                record.instance.memories[0][extra_start..extra_end]
-                    .copy_from_slice(&src.instance.memories[0][extra_start..extra_end]);
-                record.instance.memory_sizes[0] = src_mem_size;
+            if src_mem_size > rec_mem_size
+                && imp_mem_idx < record.instance.memories.len()
+                && exp_mem_idx < src.instance.memories.len()
+            {
+                record.instance.memories[imp_mem_idx].resize(src_mem_size, 0);
+                record.instance.memories[imp_mem_idx][rec_mem_size..src_mem_size]
+                    .copy_from_slice(&src.instance.memories[exp_mem_idx][rec_mem_size..src_mem_size]);
+                record.instance.memory_sizes[imp_mem_idx] = src_mem_size;
             }
             drop(src);
-            // Re-apply the importer's own active data segments on top
-            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+            // Re-apply the importer's own active data segments that target this memory
+            let rec_mem_size = record.instance.memory_sizes.get(imp_mem_idx).copied().unwrap_or(0);
             let segs: Vec<(usize, usize, usize)> = record.instance.module.data_segments.iter()
-                .filter(|seg| seg.is_active)
+                .filter(|seg| seg.is_active && seg.memory_idx as usize == imp_mem_idx)
                 .map(|seg| (seg.offset as usize, seg.data_offset, seg.data_len))
                 .collect();
             for (dst_start, src_start, len) in segs {
                 if dst_start.saturating_add(len) <= rec_mem_size
                     && src_start.saturating_add(len) <= record.instance.module.code.len()
-                    && !record.instance.memories.is_empty()
+                    && imp_mem_idx < record.instance.memories.len()
                 {
                     let code_bytes = record.instance.module.code[src_start..src_start + len].to_vec();
-                    record.instance.memories[0][dst_start..dst_start + len]
+                    record.instance.memories[imp_mem_idx][dst_start..dst_start + len]
                         .copy_from_slice(&code_bytes);
                 }
             }
             // Copy the result back to the exporter so both share the same state
-            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+            let rec_mem_size = record.instance.memory_sizes.get(imp_mem_idx).copied().unwrap_or(0);
             let mut src_mut = src_handle.borrow_mut();
-            let src_mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
-            if rec_mem_size > src_mem_size && !src_mut.instance.memories.is_empty() {
-                src_mut.instance.memories[0].resize(rec_mem_size, 0);
-                src_mut.instance.memory_sizes[0] = rec_mem_size;
+            let src_mem_size = src_mut.instance.memory_sizes.get(exp_mem_idx).copied().unwrap_or(0);
+            if rec_mem_size > src_mem_size && exp_mem_idx < src_mut.instance.memories.len() {
+                src_mut.instance.memories[exp_mem_idx].resize(rec_mem_size, 0);
+                src_mut.instance.memory_sizes[exp_mem_idx] = rec_mem_size;
             }
-            let src_mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
+            let src_mem_size = src_mut.instance.memory_sizes.get(exp_mem_idx).copied().unwrap_or(0);
             let copy_back = rec_mem_size.min(src_mem_size);
-            if copy_back > 0 && !src_mut.instance.memories.is_empty() && !record.instance.memories.is_empty() {
-                src_mut.instance.memories[0][..copy_back]
-                    .copy_from_slice(&record.instance.memories[0][..copy_back]);
+            if copy_back > 0
+                && exp_mem_idx < src_mut.instance.memories.len()
+                && imp_mem_idx < record.instance.memories.len()
+            {
+                src_mut.instance.memories[exp_mem_idx][..copy_back]
+                    .copy_from_slice(&record.instance.memories[imp_mem_idx][..copy_back]);
             }
             // Track memory sharing for later sync
-            self.memory_shares.push((handle.clone(), src_handle.clone()));
+            self.memory_shares.push((handle.clone(), imp_mem_idx, src_handle.clone(), exp_mem_idx));
         }
 
         // Share tables: copy exporter's table entries, then re-apply element segments
@@ -596,29 +608,33 @@ impl WastRunner {
         Ok(handle)
     }
 
-    fn find_memory_source(&self, module: &WasmModule) -> Option<InstanceHandle> {
+    /// Returns Vec of (importer_mem_idx, exporter_mem_idx, handle) for each imported memory.
+    fn find_memory_sources(&self, module: &WasmModule) -> Vec<(usize, usize, InstanceHandle)> {
+        let mut result = Vec::new();
+        let mut mem_idx = 0usize;
         for import in &module.imports {
             if !matches!(import.kind, ImportKind::Memory) {
                 continue;
             }
             let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
             let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
-            if module_name == SPECTEST_MODULE {
-                return None; // spectest memory is virtual, not shareable
-            }
-            if let Some(handle) = self.instances.get(&module_name) {
-                // Verify the export exists as a memory
-                let record = handle.borrow();
-                let has_mem = record.instance.module.exports.iter().any(|e| {
-                    record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
-                        && matches!(e.kind, ExportKind::Memory(_))
-                });
-                if has_mem {
-                    return Some(handle.clone());
+            if module_name != SPECTEST_MODULE {
+                if let Some(handle) = self.instances.get(&module_name) {
+                    let record = handle.borrow();
+                    if let Some(exp_mem_idx) = exported_memory_index(&record.instance.module, &field_name) {
+                        result.push((mem_idx, exp_mem_idx as usize, handle.clone()));
+                    }
                 }
             }
+            mem_idx += 1;
         }
-        None
+        result
+    }
+
+    /// Backward-compat: returns Some if there's at least one memory source (for memory 0).
+    #[allow(dead_code)]
+    fn find_memory_source(&self, module: &WasmModule) -> Option<InstanceHandle> {
+        self.find_memory_sources(module).into_iter().next().map(|(_, _, h)| h)
     }
 
     fn find_table_sources(&self, module: &WasmModule) -> Vec<(usize, InstanceHandle)> {
@@ -640,25 +656,46 @@ impl WastRunner {
         result
     }
 
-    /// Apply data segments from a failed module to the shared (exporter) memory.
+    /// Apply data segments from a failed module to the shared (exporter) memories.
     /// Stops at the first OOB segment, matching spec instantiation semantics.
-    fn apply_partial_data_segments_to_shared(&self, module: &WasmModule, mem_src: &InstanceHandle) {
-        let mut src_mut = mem_src.borrow_mut();
-        let mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
+    fn apply_partial_data_segments_to_shared(
+        &self,
+        module: &WasmModule,
+        memory_sources: &[(usize, usize, InstanceHandle)],
+    ) {
         for seg in &module.data_segments {
             if !seg.is_active {
                 continue;
             }
-            let dst_start = seg.offset as usize;
-            let len = seg.data_len;
-            // Stop at first OOB segment (the one that caused the trap)
-            if dst_start.saturating_add(len) > mem_size {
-                break;
-            }
-            let src_start = seg.data_offset;
-            if src_start.saturating_add(len) <= module.code.len() && !src_mut.instance.memories.is_empty() {
-                src_mut.instance.memories[0][dst_start..dst_start + len]
-                    .copy_from_slice(&module.code[src_start..src_start + len]);
+            let imp_mem_idx = seg.memory_idx as usize;
+            // Find the exporter for this memory index
+            let source = memory_sources.iter().find(|(imp_idx, _, _)| *imp_idx == imp_mem_idx);
+            if let Some((_, exp_mem_idx, src_handle)) = source {
+                let mut src_mut = src_handle.borrow_mut();
+                let mem_size = src_mut.instance.memory_sizes.get(*exp_mem_idx).copied().unwrap_or(0);
+                let dst_start = seg.offset as usize;
+                let len = seg.data_len;
+                // Stop at first OOB segment (the one that caused the trap)
+                if dst_start.saturating_add(len) > mem_size {
+                    break;
+                }
+                let src_start = seg.data_offset;
+                if src_start.saturating_add(len) <= module.code.len()
+                    && *exp_mem_idx < src_mut.instance.memories.len()
+                {
+                    src_mut.instance.memories[*exp_mem_idx][dst_start..dst_start + len]
+                        .copy_from_slice(&module.code[src_start..src_start + len]);
+                }
+            } else {
+                // Non-shared memory - check if OOB
+                let mem_size = if imp_mem_idx < module.memories.len() {
+                    module.memories[imp_mem_idx].min_pages as usize * 65536
+                } else { 0 };
+                let dst_start = seg.offset as usize;
+                let len = seg.data_len;
+                if dst_start.saturating_add(len) > mem_size {
+                    break;
+                }
             }
         }
     }
@@ -722,39 +759,41 @@ impl WastRunner {
     /// Sync shared memory between all instances that share it.
     /// After any call that might do memory.grow, both sides need to see the same memory.
     fn sync_shared_memory(&self) {
-        for (importer, exporter) in &self.memory_shares {
+        for (importer, imp_mem_idx, exporter, exp_mem_idx) in &self.memory_shares {
             if Rc::ptr_eq(importer, exporter) {
                 continue;
             }
+            let imp_mi = *imp_mem_idx;
+            let exp_mi = *exp_mem_idx;
             // Find the larger memory and sync to the smaller
             let (imp_size, exp_size) = {
                 let imp = importer.borrow();
                 let exp = exporter.borrow();
-                let is = if imp.instance.memory_sizes.is_empty() { 0 } else { imp.instance.memory_sizes[0] };
-                let es = if exp.instance.memory_sizes.is_empty() { 0 } else { exp.instance.memory_sizes[0] };
+                let is = imp.instance.memory_sizes.get(imp_mi).copied().unwrap_or(0);
+                let es = exp.instance.memory_sizes.get(exp_mi).copied().unwrap_or(0);
                 (is, es)
             };
             if imp_size > exp_size {
                 let imp = importer.borrow();
                 let mut exp = exporter.borrow_mut();
-                if !exp.instance.memories.is_empty() && !imp.instance.memories.is_empty() {
-                    exp.instance.memories[0].resize(imp_size, 0);
-                    exp.instance.memories[0][..imp_size].copy_from_slice(&imp.instance.memories[0][..imp_size]);
-                    exp.instance.memory_sizes[0] = imp_size;
+                if exp_mi < exp.instance.memories.len() && imp_mi < imp.instance.memories.len() {
+                    exp.instance.memories[exp_mi].resize(imp_size, 0);
+                    exp.instance.memories[exp_mi][..imp_size].copy_from_slice(&imp.instance.memories[imp_mi][..imp_size]);
+                    exp.instance.memory_sizes[exp_mi] = imp_size;
                 }
             } else if exp_size > imp_size {
                 let exp = exporter.borrow();
                 let mut imp = importer.borrow_mut();
-                if !imp.instance.memories.is_empty() && !exp.instance.memories.is_empty() {
-                    imp.instance.memories[0].resize(exp_size, 0);
-                    imp.instance.memories[0][..exp_size].copy_from_slice(&exp.instance.memories[0][..exp_size]);
-                    imp.instance.memory_sizes[0] = exp_size;
+                if imp_mi < imp.instance.memories.len() && exp_mi < exp.instance.memories.len() {
+                    imp.instance.memories[imp_mi].resize(exp_size, 0);
+                    imp.instance.memories[imp_mi][..exp_size].copy_from_slice(&exp.instance.memories[exp_mi][..exp_size]);
+                    imp.instance.memory_sizes[imp_mi] = exp_size;
                 }
             } else if imp_size == exp_size && imp_size > 0 {
                 let imp = importer.borrow();
                 let mut exp = exporter.borrow_mut();
-                if !exp.instance.memories.is_empty() && !imp.instance.memories.is_empty() {
-                    exp.instance.memories[0][..imp_size].copy_from_slice(&imp.instance.memories[0][..imp_size]);
+                if exp_mi < exp.instance.memories.len() && imp_mi < imp.instance.memories.len() {
+                    exp.instance.memories[exp_mi][..imp_size].copy_from_slice(&imp.instance.memories[imp_mi][..imp_size]);
                 }
             }
         }
@@ -1155,7 +1194,66 @@ impl WastRunner {
         Ok(())
     }
 
+    /// Re-evaluate element/data segment offsets that reference globals.
+    /// After inject_imported_globals, the globals have actual values, so we can
+    /// re-evaluate extended-const offset expressions that use global.get.
+    fn fixup_segment_offsets(&self, module: &mut WasmModule, original_bytes: &[u8]) {
+        // Build global init values for the evaluator
+        let global_values: Vec<Value> = module.globals.iter().map(|g| g.init_value).collect();
+
+        // Re-evaluate element segment offsets
+        use crate::wasm::decoder::ElemMode;
+        for seg in &mut module.element_segments {
+            if seg.mode != ElemMode::Active {
+                continue;
+            }
+            // Only re-evaluate if the offset expression references a global
+            if seg.offset_expr_info.global_ref.is_none() {
+                continue;
+            }
+            let (start, end) = seg.offset_expr_range;
+            if start == 0 && end == 0 {
+                continue; // no saved byte range
+            }
+            if end <= original_bytes.len() {
+                let mut pos = start;
+                if let Ok(val) = crate::wasm::decoder::eval_init_expr_with_globals(original_bytes, &mut pos, &global_values) {
+                    seg.offset = match val {
+                        Value::I32(v) => v as u32,
+                        Value::I64(v) => v as u32,
+                        _ => seg.offset,
+                    };
+                }
+            }
+        }
+
+        // Re-evaluate data segment offsets
+        for seg in &mut module.data_segments {
+            if !seg.is_active {
+                continue;
+            }
+            if seg.offset_expr_info.global_ref.is_none() {
+                continue;
+            }
+            let (start, end) = seg.offset_expr_range;
+            if start == 0 && end == 0 {
+                continue;
+            }
+            if end <= original_bytes.len() {
+                let mut pos = start;
+                if let Ok(val) = crate::wasm::decoder::eval_init_expr_with_globals(original_bytes, &mut pos, &global_values) {
+                    seg.offset = match val {
+                        Value::I32(v) => v as u32,
+                        Value::I64(v) => v as u32,
+                        _ => seg.offset,
+                    };
+                }
+            }
+        }
+    }
+
     fn inject_imported_memory(&self, module: &mut WasmModule) -> RunnerResult<()> {
+        let mut mem_idx = 0usize;
         for import in &module.imports {
             if !matches!(import.kind, ImportKind::Memory) {
                 continue;
@@ -1168,45 +1266,65 @@ impl WastRunner {
                 (1u32, Some(2u32))
             } else if let Some(handle) = self.instances.get(&module_name) {
                 let record = handle.borrow();
-                // Use the actual memory size of the exporting instance
-                let mem0_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
-                let actual_pages = (mem0_size / 65536) as u32;
-                let actual_max = if record.instance.module.has_memory_max {
+                // Find the exported memory index
+                let exp_mem_idx = exported_memory_index(&record.instance.module, &field_name)
+                    .unwrap_or(0) as usize;
+                let mem_size = record.instance.memory_sizes.get(exp_mem_idx).copied().unwrap_or(0);
+                let exp_page_size = if exp_mem_idx < record.instance.module.memories.len() {
+                    match record.instance.module.memories[exp_mem_idx].page_size_log2 {
+                        Some(log2) => 1usize << log2,
+                        None => 65536,
+                    }
+                } else { 65536 };
+                let actual_pages = if exp_page_size > 0 { (mem_size / exp_page_size) as u32 } else { 0 };
+                let actual_max = if exp_mem_idx < record.instance.module.memories.len() {
+                    let mdef = &record.instance.module.memories[exp_mem_idx];
+                    if mdef.has_max { Some(mdef.max_pages) } else { None }
+                } else if record.instance.module.has_memory_max {
                     Some(record.instance.module.memory_max_pages)
                 } else {
                     None
                 };
                 (actual_pages, actual_max)
             } else {
+                mem_idx += 1;
                 continue;
             };
 
-            // Upgrade memory_min_pages to the actual provider's size
-            if module.memory_min_pages < actual_min_pages {
-                module.memory_min_pages = actual_min_pages;
-            }
-            // Also update the MemoryDef if it exists
-            if !module.memories.is_empty() {
-                if module.memories[0].min_pages < actual_min_pages {
-                    module.memories[0].min_pages = actual_min_pages;
+            // Update module-wide fields for memory 0 (backward compat)
+            if mem_idx == 0 {
+                if module.memory_min_pages < actual_min_pages {
+                    module.memory_min_pages = actual_min_pages;
                 }
-            }
-            // Cap memory_max_pages to the actual provider's max
-            if let Some(actual_max) = actual_max_pages {
-                if module.has_memory_max {
-                    if module.memory_max_pages > actual_max {
+                if let Some(actual_max) = actual_max_pages {
+                    if module.has_memory_max {
+                        if module.memory_max_pages > actual_max {
+                            module.memory_max_pages = actual_max;
+                        }
+                    } else {
+                        module.has_memory_max = true;
                         module.memory_max_pages = actual_max;
                     }
-                } else {
-                    module.has_memory_max = true;
-                    module.memory_max_pages = actual_max;
-                }
-                if !module.memories.is_empty() {
-                    module.memories[0].has_max = true;
-                    module.memories[0].max_pages = actual_max;
                 }
             }
-            break; // only one memory in MVP
+
+            // Update the per-memory MemoryDef
+            if mem_idx < module.memories.len() {
+                if module.memories[mem_idx].min_pages < actual_min_pages {
+                    module.memories[mem_idx].min_pages = actual_min_pages;
+                }
+                if let Some(actual_max) = actual_max_pages {
+                    if module.memories[mem_idx].has_max {
+                        if module.memories[mem_idx].max_pages > actual_max {
+                            module.memories[mem_idx].max_pages = actual_max;
+                        }
+                    } else {
+                        module.memories[mem_idx].has_max = true;
+                        module.memories[mem_idx].max_pages = actual_max;
+                    }
+                }
+            }
+            mem_idx += 1;
         }
         Ok(())
     }
@@ -1246,6 +1364,7 @@ impl WastRunner {
 
     fn ensure_linkable_imports(&self, module: &WasmModule) -> RunnerResult<()> {
         let mut func_idx = 0u32;
+        let mut mem_import_idx = 0usize;
         for import in &module.imports {
             let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
             let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
@@ -1259,7 +1378,8 @@ impl WastRunner {
                     self.validate_table_import(module, &module_name, &field_name, import)?;
                 }
                 ImportKind::Memory => {
-                    self.validate_memory_import(module, &module_name, &field_name)?;
+                    self.validate_memory_import(module, &module_name, &field_name, mem_import_idx)?;
+                    mem_import_idx += 1;
                 }
                 ImportKind::Global(val_type_byte, mutable) => {
                     self.validate_global_import(&module_name, &field_name, val_type_byte, mutable)?;
@@ -1525,20 +1645,34 @@ impl WastRunner {
         _module: &WasmModule,
         module_name: &str,
         field_name: &str,
+        import_mem_idx: usize,
     ) -> RunnerResult<()> {
-        // The importing module's memory limits are in module.memory_min_pages / memory_max_pages
-        let import_min = _module.memory_min_pages;
-        let import_has_max = _module.has_memory_max;
-        let import_max = _module.memory_max_pages;
+        // Use the per-memory MemoryDef if available, else fall back to module-wide fields
+        let (import_min, import_has_max, import_max) = if import_mem_idx < _module.memories.len() {
+            let mdef = &_module.memories[import_mem_idx];
+            (mdef.min_pages, mdef.has_max, mdef.max_pages)
+        } else {
+            (_module.memory_min_pages, _module.has_memory_max, _module.memory_max_pages)
+        };
 
         if module_name == SPECTEST_MODULE {
-            if field_name != "memory" {
+            if field_name != "memory" && field_name != "shared_memory" {
                 return Err(RunnerError::new(
                     "link",
                     format!("unknown import: spectest does not export memory `{field_name}`"),
                 ));
             }
-            // spectest memory: min=1, max=2
+            // spectest memory: min=1, max=2, not shared
+            // spectest shared_memory: min=1, max=2, shared
+            let export_is_shared = field_name == "shared_memory";
+            let import_is_shared = import_mem_idx < _module.memories.len() && _module.memories[import_mem_idx].is_shared;
+            // shared mismatch: importing shared from non-shared or vice versa
+            if import_is_shared != export_is_shared {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for memory `{module_name}::{field_name}`: shared mismatch"),
+                ));
+            }
             if import_min > 1 {
                 return Err(RunnerError::new(
                     "link",
@@ -1556,12 +1690,9 @@ impl WastRunner {
 
         if let Some(handle) = self.instances.get(module_name) {
             let record = handle.borrow();
-            // Check if the export exists and is a memory
-            let has_memory_export = record.instance.module.exports.iter().any(|e| {
-                record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
-                    && matches!(e.kind, ExportKind::Memory(_))
-            });
-            if !has_memory_export {
+            // Find the exported memory index
+            let export_mem_idx = exported_memory_index(&record.instance.module, field_name);
+            if export_mem_idx.is_none() {
                 // Check if the name exists as a different kind
                 let has_any = record.instance.module.exports.iter().any(|e| {
                     record.instance.module.get_name(e.name_offset, e.name_len) == field_name.as_bytes()
@@ -1577,12 +1708,33 @@ impl WastRunner {
                     format!("unknown import: module `{module_name}` does not export memory `{field_name}`"),
                 ));
             }
-            // Validate limits
-            let export_min = record.instance.module.memory_min_pages;
-            let export_has_max = record.instance.module.has_memory_max;
-            let export_max = record.instance.module.memory_max_pages;
-            let mem0_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
-            let actual_pages = (mem0_size / 65536) as u32;
+            let exp_idx = export_mem_idx.unwrap() as usize;
+            // Get export MemoryDef
+            let (export_min, export_has_max, export_max, export_page_size_log2) = if exp_idx < record.instance.module.memories.len() {
+                let mdef = &record.instance.module.memories[exp_idx];
+                (mdef.min_pages, mdef.has_max, mdef.max_pages, mdef.page_size_log2)
+            } else {
+                (record.instance.module.memory_min_pages, record.instance.module.has_memory_max, record.instance.module.memory_max_pages, record.instance.module.page_size_log2)
+            };
+            // Check page size compatibility
+            let import_page_size_log2 = if import_mem_idx < _module.memories.len() {
+                _module.memories[import_mem_idx].page_size_log2
+            } else {
+                _module.page_size_log2
+            };
+            if import_page_size_log2 != export_page_size_log2 {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("memory types incompatible for memory `{module_name}::{field_name}`"),
+                ));
+            }
+            // Get actual memory size in pages using the correct page size
+            let actual_mem_size = record.instance.memory_sizes.get(exp_idx).copied().unwrap_or(0);
+            let page_size = match export_page_size_log2 {
+                Some(log2) => 1usize << log2,
+                None => 65536,
+            };
+            let actual_pages = (actual_mem_size / page_size) as u32;
             let available_min = actual_pages.max(export_min);
 
             if import_min > available_min {
@@ -1856,10 +2008,11 @@ impl WastRunner {
                 )),
             },
             WastRetCore::RefNull(_) => {
-                // null ref: our sentinel is I32(-1)
+                // null ref: our sentinel is I32(-1) or NullRef
                 match actual {
                     Value::I32(-1) => Ok(()),
                     Value::I32(v) if *v < 0 => Ok(()), // any negative = null
+                    Value::NullRef => Ok(()),
                     _ => Err(DirectiveError::assertion(
                         "assert_return",
                         format!("expected ref.null, got {actual:?}"),
@@ -1878,7 +2031,7 @@ impl WastRunner {
             WastRetCore::RefExtern(None) => {
                 // ref.extern with no value = null
                 match actual {
-                    Value::I32(-1) => Ok(()),
+                    Value::I32(-1) | Value::NullRef => Ok(()),
                     _ => Err(DirectiveError::assertion(
                         "assert_return",
                         format!("expected ref.extern null, got {actual:?}"),
@@ -1905,13 +2058,29 @@ impl WastRunner {
                     )),
                 }
             }
+            WastRetCore::RefI31 | WastRetCore::RefI31Shared => {
+                // Any non-null i31 ref is accepted
+                match actual {
+                    Value::NullRef => Err(DirectiveError::assertion(
+                        "assert_return",
+                        "expected non-null i31 reference, got null",
+                    )),
+                    _ => Ok(()),
+                }
+            }
+            WastRetCore::RefAny | WastRetCore::RefEq => {
+                // Any non-null ref is accepted
+                match actual {
+                    Value::NullRef => Err(DirectiveError::assertion(
+                        "assert_return",
+                        "expected non-null reference, got null",
+                    )),
+                    _ => Ok(()),
+                }
+            }
             WastRetCore::RefHost(_)
-            | WastRetCore::RefAny
-            | WastRetCore::RefEq
             | WastRetCore::RefArray
-            | WastRetCore::RefStruct
-            | WastRetCore::RefI31
-            | WastRetCore::RefI31Shared => Err(DirectiveError::assertion(
+            | WastRetCore::RefStruct => Err(DirectiveError::assertion(
                 "assert_return",
                 "GC reference-type results are not supported by the ATOS engine",
             )),
@@ -2170,6 +2339,17 @@ fn exported_table_index(module: &WasmModule, name: &str) -> Option<u32> {
     None
 }
 
+fn exported_memory_index(module: &WasmModule, name: &str) -> Option<u32> {
+    for export in &module.exports {
+        if module.get_name(export.name_offset, export.name_len) == name.as_bytes() {
+            if let ExportKind::Memory(idx) = export.kind {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
 fn func_types_match(a: &FuncTypeDef, b: &FuncTypeDef) -> bool {
     if a.param_count != b.param_count || a.result_count != b.result_count {
         return false;
@@ -2337,6 +2517,27 @@ fn decode_valtype_byte(byte: u8) -> Option<ValType> {
     }
 }
 
+/// Check if two ref-like ValTypes are compatible for import linking.
+/// In our simplified model (no full subtyping), we consider all funcref-ish types compatible.
+#[allow(dead_code)]
+fn ref_types_compatible(a: ValType, b: ValType) -> bool {
+    fn is_funcref_ish(t: ValType) -> bool {
+        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+    }
+    fn is_ref(t: ValType) -> bool {
+        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+    }
+    // Both funcref-ish types are compatible
+    if is_funcref_ish(a) && is_funcref_ish(b) {
+        return true;
+    }
+    // ExternRef only with ExternRef
+    if a == ValType::ExternRef && b == ValType::ExternRef {
+        return true;
+    }
+    false
+}
+
 fn value_matches_type(value: Value, val_type: ValType) -> bool {
     matches!(
         (value, val_type),
@@ -2349,6 +2550,10 @@ fn value_matches_type(value: Value, val_type: ValType) -> bool {
             | (Value::I32(_), ValType::ExternRef)
             | (Value::I32(_), ValType::TypedFuncRef)
             | (Value::I32(_), ValType::NullableTypedFuncRef)
+            | (Value::NullRef, ValType::FuncRef)
+            | (Value::NullRef, ValType::ExternRef)
+            | (Value::NullRef, ValType::TypedFuncRef)
+            | (Value::NullRef, ValType::NullableTypedFuncRef)
     )
 }
 
@@ -2369,8 +2574,11 @@ fn trap_message(err: &WasmError) -> String {
         WasmError::TableIndexOutOfBounds => "out of bounds table access".to_string(),
         WasmError::FloatsDisabled => "floats disabled".to_string(),
         WasmError::UnsupportedProposal => "unsupported proposal".to_string(),
+        WasmError::UnalignedAtomic => "unaligned atomic".to_string(),
         WasmError::NullFunctionReference => "null function reference".to_string(),
         WasmError::NullReference => "null reference".to_string(),
+        WasmError::NullI31Reference => "null i31 reference".to_string(),
+        WasmError::UncaughtException => "unhandled exception".to_string(),
         other => format!("{other:?}"),
     }
 }

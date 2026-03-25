@@ -106,6 +106,8 @@ pub enum Value {
     F32(f32),
     F64(f64),
     V128(V128),
+    /// Null reference — used for ref.null of any heap type.
+    NullRef,
 }
 
 impl Value {
@@ -128,6 +130,7 @@ impl Value {
             Value::F32(v) => v as i32,
             Value::F64(v) => v as i32,
             Value::V128(_) => 0,
+            Value::NullRef => -1,
         }
     }
 
@@ -138,6 +141,7 @@ impl Value {
             Value::F32(v) => v as i64,
             Value::F64(v) => v as i64,
             Value::V128(_) => 0,
+            Value::NullRef => -1,
         }
     }
 
@@ -148,6 +152,7 @@ impl Value {
             Value::F32(v) => v,
             Value::F64(v) => v as f32,
             Value::V128(_) => 0.0,
+            Value::NullRef => 0.0,
         }
     }
 
@@ -158,6 +163,7 @@ impl Value {
             Value::F32(v) => v as f64,
             Value::F64(v) => v,
             Value::V128(_) => 0.0,
+            Value::NullRef => 0.0,
         }
     }
 
@@ -688,5 +694,8 @@ pub enum WasmError {
     UndeclaredFuncRef,
     NullFunctionReference,
     NullReference,
+    NullI31Reference,
     UninitializedLocal,
+    UnalignedAtomic,
+    UncaughtException,
 }

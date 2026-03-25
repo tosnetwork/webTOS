@@ -146,6 +146,7 @@ pub struct MemoryDef {
     pub max_pages: u32,
     pub has_max: bool,
     pub is_memory64: bool,
+    pub is_shared: bool,
     pub page_size_log2: Option<u32>,
 }
 
@@ -731,6 +732,32 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
     }
 }
 
+/// Returns true if the heap type (signed) indicates a GC-proposal type.
+fn is_gc_heap_type(ht: i32) -> bool {
+    // any=-0x12, eq=-0x16, i31=-0x19, struct=-0x17, array=-0x18,
+    // none=-0x13, noextern=-0x14, nofunc=-0x15, exn=-0x1A, noexn=-0x1B
+    matches!(ht, -0x12 | -0x13 | -0x14 | -0x15 | -0x16 | -0x17 | -0x18 | -0x19 | -0x1A | -0x1B)
+    || ht >= 0 // concrete type index reference is GC
+}
+
+/// Decode a valtype and set gc_enabled on the module if a GC heap type is seen.
+fn decode_valtype_gc_aware(bytes: &[u8], pos: &mut usize, module: &mut WasmModule) -> Result<ValType, WasmError> {
+    let saved = *pos;
+    let b = read_byte(bytes, pos)?;
+    if b == 0x63 || b == 0x64 {
+        let ht = decode_leb128_i32(bytes, pos)?;
+        if is_gc_heap_type(ht) {
+            module.gc_enabled = true;
+        }
+        // Reset and use the normal decoder
+        *pos = saved;
+        decode_valtype_from_stream(bytes, pos)
+    } else {
+        *pos = saved;
+        decode_valtype_from_stream(bytes, pos)
+    }
+}
+
 /// Decode a reference type from the bytecode stream.
 /// Only accepts reference types: 0x70 (funcref), 0x6F (externref), 0x63 (ref null ht), 0x64 (ref ht).
 /// Returns an error for non-reference types (i32, i64, f32, f64, v128).
@@ -804,6 +831,7 @@ fn decode_composite_type(
     let inner_marker;
     if sub_marker == 0x50 || sub_marker == 0x4F {
         // sub/sub_final: read supertype count + supertypes
+        module.gc_enabled = true;
         let super_count = decode_leb128_u32(bytes, pos)? as usize;
         for _ in 0..super_count {
             let _ = decode_leb128_u32(bytes, pos)?;
@@ -823,7 +851,7 @@ fn decode_composite_type(
             }
             ft.param_count = param_count;
             for p in 0..param_count as usize {
-                ft.params[p] = decode_valtype_from_stream(bytes, pos)?;
+                ft.params[p] = decode_valtype_gc_aware(bytes, pos, module)?;
             }
             let result_count = decode_leb128_u32(bytes, pos)? as u8;
             if result_count as usize > MAX_RESULTS {
@@ -831,12 +859,13 @@ fn decode_composite_type(
             }
             ft.result_count = result_count;
             for r in 0..result_count as usize {
-                ft.results[r] = decode_valtype_from_stream(bytes, pos)?;
+                ft.results[r] = decode_valtype_gc_aware(bytes, pos, module)?;
             }
             module.func_types.push(ft);
         }
         0x5E => {
             // array type (GC proposal): single field (storage_type + mutability)
+            module.gc_enabled = true;
             skip_storage_type(bytes, pos)?;
             let mt = read_byte(bytes, pos)?; // mutability
             if mt > 1 {
@@ -847,6 +876,7 @@ fn decode_composite_type(
         }
         0x5F => {
             // struct type (GC proposal): count of fields, each is storage_type + mutability
+            module.gc_enabled = true;
             let field_count = decode_leb128_u32(bytes, pos)? as usize;
             for _ in 0..field_count {
                 skip_storage_type(bytes, pos)?;
@@ -879,6 +909,7 @@ fn decode_type_section(
         // 0x60 = func type, 0x4E = rec type (GC proposal)
         if marker == 0x4E {
             // rec type: count of types, then each is a sub/func type
+            module.gc_enabled = true;
             let rec_count = decode_leb128_u32(bytes, pos)? as usize;
             for _ in 0..rec_count {
                 decode_composite_type(bytes, pos, module)?;
@@ -993,6 +1024,7 @@ fn decode_import_section(
                     max_pages: if has_max { max } else { u32::MAX },
                     has_max,
                     is_memory64,
+                    is_shared: (flags & 0b0010) != 0,
                     page_size_log2: mem_page_size_log2,
                 });
                 imp.kind = ImportKind::Memory;
@@ -1112,6 +1144,7 @@ fn decode_memory_section(
             max_pages: max,
             has_max,
             is_memory64,
+            is_shared: (flags & 0b0010) != 0,
             page_size_log2: mem_page_size_log2,
         });
         if mem_idx == 0 {
@@ -1350,7 +1383,7 @@ fn decode_global_section(
     }
     for _ in 0..count {
         // Use stream decoder to handle multi-byte ref types
-        let val_type = decode_valtype_from_stream(bytes, pos)?;
+        let val_type = decode_valtype_gc_aware(bytes, pos, module)?;
         let mt = read_byte(bytes, pos)?;
         if mt > 1 {
             return Err(WasmError::InvalidSection);
@@ -1396,8 +1429,10 @@ fn decode_element_section(
         match flags {
             0 => {
                 // Active segment: table_idx=0 (implicit), offset expr, func indices
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
                     Value::I64(v) => v as u32,
@@ -1416,7 +1451,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
-                    offset_expr_range: (0, 0),
+                    offset_expr_range: (expr_start, expr_end),
                 });
             }
             1 => {
@@ -1444,8 +1479,10 @@ fn decode_element_section(
             2 => {
                 // Active segment with explicit table_idx
                 let table_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
                     Value::I64(v) => v as u32,
@@ -1468,7 +1505,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
-                    offset_expr_range: (0, 0),
+                    offset_expr_range: (expr_start, expr_end),
                 });
             }
             3 => {
@@ -1495,8 +1532,10 @@ fn decode_element_section(
             }
             4 => {
                 // Active, table 0 implicit, offset expr, expression elements
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
@@ -1507,7 +1546,7 @@ fn decode_element_section(
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (0, 0) });
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end) });
             }
             5 => {
                 // Passive, reftype, expression elements
@@ -1535,8 +1574,10 @@ fn decode_element_section(
             6 => {
                 // Active, explicit table_idx, offset expr, reftype, expression elements
                 let table_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
                 let elem_type = decode_reftype_real(bytes, pos)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
@@ -1548,7 +1589,7 @@ fn decode_element_section(
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (0, 0) });
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end) });
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
@@ -1721,6 +1762,30 @@ fn skip_init_expr(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
                     *pos += 16;
                 }
             }
+            0xFB => { // GC prefix
+                let sub = decode_leb128_u32(bytes, pos)?;
+                match sub {
+                    0 | 1 | 6 | 7 => { decode_leb128_u32(bytes, pos)?; } // struct.new/default, array.new/default: typeidx
+                    8 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.new_fixed: typeidx + count
+                    9 | 10 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.new_data/elem: typeidx + idx
+                    2 | 3 | 4 | 5 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // struct.get/get_s/get_u/set
+                    11 | 12 | 13 | 14 => { decode_leb128_u32(bytes, pos)?; } // array.get/get_s/get_u/set
+                    15 => {} // array.len
+                    16 => { decode_leb128_u32(bytes, pos)?; } // array.fill
+                    17 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.copy
+                    18 | 19 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.init_data/elem
+                    20 | 21 => { decode_leb128_i32(bytes, pos)?; } // ref.test/test_nullable: heaptype
+                    22 | 23 => { decode_leb128_i32(bytes, pos)?; } // ref.cast/cast_nullable: heaptype
+                    24 | 25 => { // br_on_cast, br_on_cast_fail
+                        read_byte(bytes, pos)?; // flags
+                        decode_leb128_u32(bytes, pos)?; // label
+                        decode_leb128_i32(bytes, pos)?; // ht1
+                        decode_leb128_i32(bytes, pos)?; // ht2
+                    }
+                    26 | 27 | 28 | 29 | 30 => {} // any.convert_extern, extern.convert_any, ref.i31, i31.get_s/u
+                    _ => {} // unknown GC sub-opcode — assume no immediates
+                }
+            }
             // Extended-const ops (no immediates): i32.add/sub/mul, i64.add/sub/mul
             0x6A | 0x6B | 0x6C | 0x7C | 0x7D | 0x7E => {}
             _ => return Err(WasmError::InvalidSection),
@@ -1794,6 +1859,69 @@ pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
                 p += 16;
                 if sp < 16 { type_stack[sp] = Some(ValType::V128); sp += 1; }
             }
+            0xFB => {
+                // GC prefix in init expr
+                if let Ok(sub) = decode_leb128_u32(bytes, &mut p) {
+                    match sub {
+                        0 | 1 | 6 | 7 => { let _ = decode_leb128_u32(bytes, &mut p); /* type_idx */
+                            // These push a ref; we don't track GC types precisely
+                            // struct.new pops N fields; struct.new_default pops 0; array.new pops 2; array.new_default pops 1
+                            // For scanning purposes, just mark as pushing something
+                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        }
+                        8 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        }
+                        9 | 10 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        }
+                        2 | 3 | 4 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                            // struct.get: pop ref, push val
+                            if sp > 0 { type_stack[sp - 1] = None; }
+                        }
+                        5 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                            // struct.set: pop ref, pop val
+                            if sp >= 2 { sp -= 2; }
+                        }
+                        11 | 12 | 13 => { let _ = decode_leb128_u32(bytes, &mut p);
+                            // array.get: pop ref, pop idx, push val
+                            if sp >= 2 { sp -= 1; type_stack[sp - 1] = None; }
+                        }
+                        14 => { let _ = decode_leb128_u32(bytes, &mut p);
+                            // array.set: pop ref, pop idx, pop val
+                            if sp >= 3 { sp -= 3; }
+                        }
+                        15 => { // array.len: pop ref, push i32
+                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
+                        }
+                        16 => { let _ = decode_leb128_u32(bytes, &mut p); } // array.fill
+                        17 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.copy
+                        18 | 19 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.init_data/elem
+                        20 | 21 => { let _ = decode_leb128_i32(bytes, &mut p);
+                            // ref.test: pop ref, push i32
+                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
+                        }
+                        22 | 23 => { let _ = decode_leb128_i32(bytes, &mut p);
+                            // ref.cast: pop ref, push ref (same-ish)
+                        }
+                        24 | 25 => { // br_on_cast / br_on_cast_fail
+                            let _ = read_byte(bytes, &mut p);
+                            let _ = decode_leb128_u32(bytes, &mut p);
+                            let _ = decode_leb128_i32(bytes, &mut p);
+                            let _ = decode_leb128_i32(bytes, &mut p);
+                        }
+                        26 | 27 => {} // any.convert_extern, extern.convert_any: pop ref, push ref
+                        28 => { // ref.i31: pop i32, push i31ref
+                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
+                            else if sp < 16 { type_stack[sp] = Some(ValType::I32); sp += 1; }
+                        }
+                        29 | 30 => { // i31.get_s/u: pop i31ref, push i32
+                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
+                        }
+                        _ => {} // unknown
+                    }
+                }
+            }
             // i32 arithmetic (extended-const): pop 2, push 1
             0x6A | 0x6B | 0x6C => {
                 if sp >= 2 { sp -= 1; type_stack[sp - 1] = Some(ValType::I32); }
@@ -1820,9 +1948,19 @@ fn scan_init_expr_global_refs(bytes: &[u8], start: usize) -> Option<u32> {
     scan_init_expr_info(bytes, start).global_ref
 }
 
+/// Evaluate a constant init expression with known global values.
+/// Used by the runner to re-evaluate offset expressions after globals are injected.
+pub fn eval_init_expr_with_globals(bytes: &[u8], pos: &mut usize, globals: &[Value]) -> Result<Value, WasmError> {
+    eval_init_expr_inner(bytes, pos, Some(globals))
+}
+
 /// Evaluate a constant init expression (for globals and segment offsets).
 /// Supports MVP + extended-const proposal (multi-instruction expressions).
 fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
+    eval_init_expr_inner(bytes, pos, None)
+}
+
+fn eval_init_expr_inner(bytes: &[u8], pos: &mut usize, globals: Option<&[Value]>) -> Result<Value, WasmError> {
     if *pos >= bytes.len() {
         return Err(WasmError::UnexpectedEnd);
     }
@@ -1867,13 +2005,14 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
             }
             0x23 => {
                 // global.get (reference to imported or defined global — return placeholder)
-                let _idx = decode_leb128_u32(bytes, pos)?;
-                if sp < 16 { stack[sp] = Value::I32(0); sp += 1; }
+                let idx = decode_leb128_u32(bytes, pos)?;
+                let val = globals.and_then(|g| g.get(idx as usize).copied()).unwrap_or(Value::I32(0));
+                if sp < 16 { stack[sp] = val; sp += 1; }
             }
             0xD0 => {
                 // ref.null heaptype
                 let _ = decode_leb128_i32(bytes, pos)?;
-                if sp < 16 { stack[sp] = Value::I32(-1); sp += 1; } // null ref sentinel
+                if sp < 16 { stack[sp] = Value::NullRef; sp += 1; } // null ref sentinel
             }
             0xD2 => {
                 // ref.func funcidx
@@ -1891,6 +2030,78 @@ fn eval_init_expr(bytes: &[u8], pos: &mut usize) -> Result<Value, WasmError> {
                     if sp < 16 { stack[sp] = Value::V128(crate::wasm::types::V128(v)); sp += 1; }
                 } else {
                     return Err(WasmError::InvalidSection);
+                }
+            }
+            0xFB => {
+                // GC prefix in init expr
+                let sub = decode_leb128_u32(bytes, pos)?;
+                match sub {
+                    0 | 1 | 6 | 7 => { decode_leb128_u32(bytes, pos)?; // type_idx
+                        // struct.new: pop N params, push ref; struct.new_default: push ref
+                        // array.new: pop init+len, push ref; array.new_default: pop len, push ref
+                        // For now, produce a dummy ref (i32(0))
+                        if sp < 16 { stack[sp] = Value::I32(0); sp += 1; }
+                    }
+                    8 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; // type_idx + count
+                        if sp < 16 { stack[sp] = Value::I32(0); sp += 1; }
+                    }
+                    9 | 10 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; // type_idx + idx
+                        if sp < 16 { stack[sp] = Value::I32(0); sp += 1; }
+                    }
+                    2 | 3 | 4 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?;
+                        // struct.get: pop ref, push val -> just replace TOS
+                        if sp > 0 { stack[sp - 1] = Value::I32(0); }
+                    }
+                    5 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?;
+                        // struct.set: pop ref + val
+                        if sp >= 2 { sp -= 2; }
+                    }
+                    11 | 12 | 13 => { decode_leb128_u32(bytes, pos)?;
+                        // array.get: pop ref + idx, push val
+                        if sp >= 2 { sp -= 1; stack[sp - 1] = Value::I32(0); }
+                    }
+                    14 => { decode_leb128_u32(bytes, pos)?;
+                        // array.set: pop ref + idx + val
+                        if sp >= 3 { sp -= 3; }
+                    }
+                    15 => { // array.len: pop ref, push i32
+                        if sp > 0 { stack[sp - 1] = Value::I32(0); }
+                    }
+                    16 => { decode_leb128_u32(bytes, pos)?; } // array.fill
+                    17 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.copy
+                    18 | 19 => { decode_leb128_u32(bytes, pos)?; decode_leb128_u32(bytes, pos)?; } // array.init_data/elem
+                    20 | 21 => { decode_leb128_i32(bytes, pos)?;
+                        // ref.test: pop ref, push i32
+                        if sp > 0 { stack[sp - 1] = Value::I32(0); }
+                    }
+                    22 | 23 => { decode_leb128_i32(bytes, pos)?;
+                        // ref.cast: pop ref, push ref
+                    }
+                    24 | 25 => { // br_on_cast/fail
+                        read_byte(bytes, pos)?;
+                        decode_leb128_u32(bytes, pos)?;
+                        decode_leb128_i32(bytes, pos)?;
+                        decode_leb128_i32(bytes, pos)?;
+                    }
+                    26 | 27 => {} // any.convert_extern, extern.convert_any
+                    28 => { // ref.i31: pop i32, push i31ref (represented as i32)
+                        // don't change sp; the value stays as i32 on our eval stack
+                    }
+                    29 => { // i31.get_s: pop i31ref, sign-extend from 31 bits
+                        if sp > 0 {
+                            let v = match stack[sp-1] { Value::I32(v) => v, _ => 0 };
+                            let masked = v & 0x7FFF_FFFF;
+                            let sign_extended = if masked & 0x4000_0000 != 0 { masked | !0x7FFF_FFFFu32 as i32 } else { masked };
+                            stack[sp-1] = Value::I32(sign_extended);
+                        }
+                    }
+                    30 => { // i31.get_u: pop i31ref, mask to 31 bits
+                        if sp > 0 {
+                            let v = match stack[sp-1] { Value::I32(v) => v, _ => 0 };
+                            stack[sp-1] = Value::I32(v & 0x7FFF_FFFF);
+                        }
+                    }
+                    _ => {} // unknown GC sub-opcode
                 }
             }
             // Extended-const: i32.add (0x6A), i32.sub (0x6B), i32.mul (0x6C)
