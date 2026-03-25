@@ -746,11 +746,7 @@ impl WastRunner {
             .with_context(|| format!("failed to read {}", path.display()))?;
         // Preprocess legacy exception handling syntax if needed
         let text = if path.to_string_lossy().contains("legacy/") {
-            let processed = preprocess_legacy_eh(&raw_text);
-            if std::env::var("DEBUG_PREPROCESS").is_ok() {
-                eprintln!("=== PREPROCESSED ===\n{}\n=== END ===", processed);
-            }
-            processed
+            preprocess_legacy_eh(&raw_text)
         } else {
             raw_text
         };

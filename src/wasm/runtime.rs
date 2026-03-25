@@ -1592,7 +1592,7 @@ impl WasmInstance {
                 }
                 0x05 => {} // else
                 0x08 => { let _ = self.read_leb128_u32()?; } // throw
-                0x09 => {} // rethrow
+                0x09 => { let _ = self.read_leb128_u32()?; } // rethrow: label
                 0x0A => {} // throw_ref
                 0x1F => {
                     let bt = self.read_leb128_i32()?;
@@ -1718,7 +1718,7 @@ impl WasmInstance {
                     let _ = self.read_leb128_u32()?;
                 }
                 0x08 => { let _ = self.read_leb128_u32()?; } // throw: tag_idx
-                0x09 => {} // unused opcode: no immediates
+                0x09 => { let _ = self.read_leb128_u32()?; } // rethrow: label
                 0x0A => {} // throw_ref: no immediates
                 0x18 => { // delegate (legacy): label — ends the try block
                     let _ = self.read_leb128_u32()?;

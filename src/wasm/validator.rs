@@ -1182,8 +1182,17 @@ impl<'a> Validator<'a> {
                 }
                 // ── rethrow (legacy) ──
                 0x09 => {
-                    let _depth = self.read_u32()?;
-                    // rethrow is a control transfer — set unreachable
+                    let depth = self.read_u32()?;
+                    // Validate that the label targets a catch handler scope
+                    if (depth as usize) >= self.ctrl_stack.len() {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    let target_idx = self.ctrl_stack.len() - 1 - depth as usize;
+                    let target = &self.ctrl_stack[target_idx];
+                    // Must target a catch (0x07) or catch_all (0x19) scope
+                    if target.opcode != 0x07 && target.opcode != 0x19 {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     self.set_unreachable();
                 }
                 // ── throw ──
@@ -1515,8 +1524,13 @@ impl<'a> Validator<'a> {
                 }
                 // ── delegate (legacy exception handling) ──
                 0x18 => {
-                    let _depth = self.read_u32()?;
+                    let depth = self.read_u32()?;
                     let frame = self.pop_ctrl()?;
+                    // Validate the delegate label: it must refer to a valid block depth
+                    // (counting from the position AFTER popping the try frame)
+                    if (depth as usize) >= self.ctrl_stack.len() {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     for &t in &frame.end_types {
                         self.push_val(t);
                     }
