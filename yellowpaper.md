@@ -3459,6 +3459,7 @@ Runtime porting priority, ranked by AI agent ecosystem value:
 | **P0** | WASM | [wasmi](https://github.com/wasmi-labs/wasmi) | Any → WASM | Universal sandbox; `#![no_std]` native, twice-audited, 100% spec compliant, built-in fuel metering. Replaces self-built interpreter. Languages without a dedicated ATOS port (Go, C#, Swift, Zig, Rust) compile to WASM and run via wasmi. | [Wasmi.md](Wasmi.md) |
 | **P1** | Python | [RustPython](https://github.com/RustPython/RustPython) | Python | 99% of AI/ML agent code is Python (LangChain, AutoGPT, CrewAI, HuggingFace). Without Python support, ATOS cannot serve the AI agent ecosystem. Pure Rust, actively developed. | Planned |
 | **P2** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | Enterprise AI ecosystem (Spring AI, LangChain4j), Android agent frameworks, Kotlin coroutine agents. Pure Rust, actively developed, already has `#[cfg(target_family = "wasm")]` platform gating. | [Ristretto.md](Ristretto.md) |
+| **P3** | EVM | [revm](https://github.com/bluealloy/revm) | Solidity / Vyper | Smart contract agents, DeFi protocols, L2 execution. Gas maps 1:1 to ATOS energy. `#![no_std]` native, production-grade (Reth, Foundry, Optimism). Reentrancy impossible (mailbox-based calls), storage isolation via keyspace. | [Revm.md](Revm.md) |
 
 Each ported runtime follows the same pattern:
 
@@ -3492,6 +3493,7 @@ Objectives:
 * port wasmi as the production WASM engine (P0, replaces self-built ~2,000 lines with audited, spec-compliant engine)
 * port RustPython to enable Python AI agent workloads on ATOS (P1)
 * port Ristretto to enable Java/Kotlin enterprise agent workloads (P2)
+* port revm to enable EVM smart contract execution on ATOS (P3) — gas→energy, storage→keyspace, calls→mailbox
 * define the standard ATOS virtualization layer API so all runtimes share the same file/network/thread mapping
 * ensure all ported runtimes benefit from ATOS energy metering via timer-tick preemption (no per-opcode instrumentation needed)
 * publish `x86_64-unknown-atos` target spec upstream to Rust compiler (like Redox OS did with `x86_64-unknown-redox`)
@@ -3500,6 +3502,7 @@ Success criteria:
 
 * a Python AI agent (LangChain) runs on ATOS, communicates via mailbox, energy-metered, checkpointable
 * a Java JAR file executes on ATOS with standard library classes (ArrayList, HashMap, String) functional
+* a Solidity smart contract deploys and executes on ATOS with gas metered as ATOS energy, storage in keyspace
 * any language that compiles to WASM runs on ATOS via wasmi with full spec compliance
 * all ported runtimes pass their respective language test suites on ATOS
 * the ATOS virtualization layer is documented and reusable across all runtime ports
