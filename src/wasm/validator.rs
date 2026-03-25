@@ -981,7 +981,8 @@ impl<'a> Validator<'a> {
             }
             return Err(WasmError::TypeMismatch);
         }
-        Ok(self.opd_stack.pop().unwrap())
+        // Safe: we verified len > height above, so pop cannot fail
+        Ok(self.opd_stack.pop().ok_or(WasmError::StackUnderflow)?)
     }
 
     fn pop_expect(&mut self, expected: ValType) -> Result<(), WasmError> {
@@ -1029,7 +1030,8 @@ impl<'a> Validator<'a> {
         if self.opd_stack.len() != frame.height {
             return Err(WasmError::TypeMismatch);
         }
-        let frame = self.ctrl_stack.pop().unwrap();
+        // Safe: we accessed ctrl_stack.last() above, so pop cannot fail
+        let frame = self.ctrl_stack.pop().ok_or(WasmError::InvalidBlockType)?;
         Ok(frame)
     }
 
@@ -1595,7 +1597,8 @@ impl<'a> Validator<'a> {
                     }
                     self.pop_expect(ValType::I32)?; // index
                     // Get the default label's arity
-                    let default_label = *labels.last().unwrap();
+                    // Safe: we pushed count+1 labels above, so last() cannot be None
+                    let default_label = *labels.last().ok_or(WasmError::InvalidSection)?;
                     let default_types = self.label_types(default_label as usize)?;
                     let arity = default_types.len();
                     // Check if we're in unreachable/polymorphic context

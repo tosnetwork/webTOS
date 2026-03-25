@@ -2,7 +2,7 @@
 //! and returns proper errors for malformed modules.
 
 extern crate wasm_spec_test;
-use wasm_spec_test::wasm::decode::decode;
+use wasm_spec_test::wasm::decoder::decode;
 use wasm_spec_test::wasm::runtime::WasmInstance;
 use wasm_spec_test::wasm::types::RuntimeClass;
 use wasm_spec_test::wasm::validator::validate;

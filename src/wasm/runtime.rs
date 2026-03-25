@@ -724,9 +724,9 @@ impl WasmInstance {
                         }
                     }
                 }
-                0x6A => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_add(b))); } }
-                0x6B => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_sub(b))); } }
-                0x6C => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_mul(b))); } }
+                0x6A => { if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) { stack.push(Value::I32(a.as_i32().wrapping_add(b.as_i32()))); } }
+                0x6B => { if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) { stack.push(Value::I32(a.as_i32().wrapping_sub(b.as_i32()))); } }
+                0x6C => { if let (Some(b), Some(a)) = (stack.pop(), stack.pop()) { stack.push(Value::I32(a.as_i32().wrapping_mul(b.as_i32()))); } }
                 _ => return None,
             }
         }

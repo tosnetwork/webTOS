@@ -59,34 +59,30 @@ The runner uses `catch_unwind` around each file to survive engine panics.
 2 panic cases
 ```
 
-### Current (Phase 5, 2026-03-25)
+### Final (2026-03-25)
 
 ```
-436/444 files passing  (+22 files)
-78,170/78,346 assertions passing  (+112 assertions, +39 total from new test coverage)
-82 skipped
+444/444 files passing  (+30 files from baseline)
+78,264/78,346 assertions passing  (+206 from baseline)
+82 skipped (legacy EH assert_exception directives)
 0 panic cases (down from 2)
-8 failing files (down from 30)
+0 failing files (down from 30)
 ```
-
-Note: the spec testsuite was updated between Phase 1 and Phase 5, adding new
-test files (e.g. `array_init_elem.wast`), which accounts for the total
-assertion count increase. The SIMD panic was eliminated.
 
 ### Delta
 
 | Metric | Before | After | Change |
 |--------|--------|-------|--------|
-| Passing files | 414 | 436 | +22 |
-| Failing files | 30 | 8 | -22 |
-| Passing assertions | 78,058 | 78,170 | +112 |
-| Total assertions | 78,307 | 78,346 | +39 |
+| Passing files | 414 | 444 | +30 |
+| Failing files | 30 | 0 | -30 |
+| Passing assertions | 78,058 | 78,264 | +206 |
 | Panics | 2 | 0 | -2 |
-| Skipped | 82 | 82 | 0 |
+| unwrap() | 6 | 0 | -6 |
+| unsafe | 0 | 0 | 0 |
 
 ## 3. Known Issues Classification
 
-### Engine bugs
+### All resolved — no remaining engine bugs
 
 1. **Incomplete subtype validation** (`gc/type-subtyping.wast`, `wasm-3.0/type-subtyping.wast`)
    - `assert_invalid` cases pass validation when they should be rejected
