@@ -3446,9 +3446,71 @@ Success criteria:
 * operators can inspect health, replay incidents, and collect forensic artifacts through explicit system services
 * production deployment guidance remains aligned with the ATOS principle of explicit authority rather than ambient administrative access
 
-### 27.8 Through-Line
+### 27.8 Stage-11: Language Runtime Ecosystem `[IMPL: ⏳ Planned]`
 
-The intended sequence of Stage-5 through Stage-10 is:
+Stage-11 should answer the ecosystem question: **what languages can agents be written in, and how do existing language ecosystems run on ATOS without modification?**
+
+ATOS defines a custom Rust compilation target (`x86_64-unknown-atos`) that enables `#[cfg(target_os = "atos")]` conditional compilation in all Rust crates. Third-party language runtimes are ported as native ATOS agents with a **virtualization layer** that maps standard OS APIs (files, sockets, threads) to ATOS primitives (keyspaces, netd mailbox, child agents). Programs written in these languages run unmodified and automatically gain capability isolation, eBPF policy filtering, energy metering, and verifiable execution.
+
+Runtime porting priority, ranked by AI agent ecosystem value:
+
+| Priority | Runtime | Engine | Language | Rationale | Design Doc |
+|----------|---------|--------|----------|-----------|------------|
+| **P0** | WASM | [wasmi](https://github.com/wasmi-labs/wasmi) | Any → WASM | Universal sandbox; `#![no_std]` native, audited, 100% spec, built-in fuel. Replaces self-built interpreter. | [Wasmi.md](Wasmi.md) |
+| **P1** | Python | [RustPython](https://github.com/RustPython/RustPython) | Python | 99% of AI/ML code is Python (LangChain, AutoGPT, CrewAI, HuggingFace). Without Python, ATOS cannot serve the AI agent ecosystem. | Planned |
+| **P2** | JavaScript | [Boa](https://github.com/nickel-org/nickel.rs) | JS / TypeScript | Second-largest AI agent ecosystem (LangChain.js, Vercel AI SDK). Web-native agents. | Planned |
+| **P3** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | Enterprise ecosystem, Android agents, Kotlin AI frameworks. | [Ristretto.md](Ristretto.md) |
+| **P4** | Lua | Pure Rust impl | Lua | Lightweight scripting for agent behavior trees, game AI, embedded policy. Smallest runtime, easiest port. | Planned |
+| **P5** | Ruby | [Artichoke](https://github.com/artichoke/artichoke) | Ruby | Niche but has scripting agent community. Pure Rust, designed for embedding. | Planned |
+
+Each ported runtime follows the same pattern:
+
+```
+Language program (unmodified source code)
+  ↓
+Language runtime (ported as native ATOS agent)
+  ↓ #[cfg(target_os = "atos")] virtualization layer
+ATOS syscall interface
+  ↓
+ATOS kernel (mailbox, capability, keyspace, energy, eBPF)
+```
+
+The virtualization layer maps standard OS abstractions to ATOS primitives:
+
+| Language expects | ATOS provides |
+|-----------------|---------------|
+| File I/O | Keyspace `sys_state_get` / `sys_state_put` |
+| Network sockets | netd mailbox proxy |
+| Threads | Child agents via `sys_spawn` |
+| stdout / stderr | `log` → serial + event log |
+| Random | Kernel RDRAND / RDTSC |
+| Time | `get_ticks` (100 Hz PIT) |
+| Process spawn | `sys_spawn_image` |
+| Environment vars | Keyspace with `env/` prefix |
+
+Languages not listed above (Go, C#, Swift, Zig) can already target WASM and run via wasmi. The priority list covers runtimes where **native execution** provides meaningful advantages over the WASM path (performance, ecosystem compatibility, or runtime features that WASM cannot express).
+
+Objectives:
+
+* port wasmi as the production WASM engine (P0, replaces self-built ~2,000 lines)
+* port RustPython to enable Python AI agent workloads on ATOS (P1)
+* port Boa to enable JavaScript/TypeScript agent workloads (P2)
+* port Ristretto to enable Java/Kotlin enterprise agent workloads (P3)
+* define the standard ATOS virtualization layer API so all runtimes share the same file/network/thread mapping
+* ensure all ported runtimes benefit from ATOS energy metering via timer-tick preemption (no per-opcode instrumentation needed)
+* publish `x86_64-unknown-atos` target spec upstream to Rust compiler (like Redox OS did with `x86_64-unknown-redox`)
+
+Success criteria:
+
+* a Python AI agent (LangChain) runs on ATOS, communicates via mailbox, energy-metered, checkpointable
+* a JavaScript agent (TypeScript) runs on ATOS with full V8-equivalent execution semantics
+* a Java JAR file executes on ATOS with standard library classes (ArrayList, HashMap, String) functional
+* all ported runtimes pass their respective language test suites on ATOS
+* the ATOS virtualization layer is documented and reusable across all runtime ports
+
+### 27.9 Through-Line
+
+The intended sequence of Stage-5 through Stage-11 is:
 
 * Stage-5: make authority durable and attestable
 * Stage-6: make state durable and provable
@@ -3456,8 +3518,9 @@ The intended sequence of Stage-5 through Stage-10 is:
 * Stage-8: make multi-node execution explicit and survivable
 * Stage-9: make execution receipts economically and cryptographically meaningful
 * Stage-10: make the whole system deployable as a trusted appliance
+* Stage-11: make every major language ecosystem run natively on ATOS
 
-If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems.
+If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems — with the full breadth of the AI agent ecosystem running on top.
 
 ---
 
