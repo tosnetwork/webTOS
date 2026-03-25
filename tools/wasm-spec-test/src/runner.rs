@@ -18,6 +18,587 @@ use wast::{
 const DEFAULT_FUEL: u64 = 1_000_000_000;
 const SPECTEST_MODULE: &str = "spectest";
 
+/// Preprocess legacy exception handling syntax that the `wast` crate can't parse.
+/// Transforms folded `(try (do ...) (catch ...) ...)` into flat form:
+///   `try ... catch $tag ... catch_all ... end`
+/// Also handles `(delegate ...)` which ends a try without `end`.
+fn preprocess_legacy_eh(input: &str) -> String {
+    // Quick check: if no `(do ` pattern exists, nothing to transform.
+    if !input.contains("(do ") && !input.contains("(do)") {
+        return input.to_string();
+    }
+
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 256);
+    let mut i = 0;
+
+    // Track try-block nesting to know when to emit `end`
+    // Each entry: true = needs `end`, false = ended by `delegate`
+    let mut try_stack: Vec<bool> = Vec::new();
+
+    while i < len {
+        // Skip ;; line comments
+        if i + 1 < len && bytes[i] == b';' && bytes[i + 1] == b';' {
+            while i < len && bytes[i] != b'\n' {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        // Skip (; block comments ;)
+        if i + 1 < len && bytes[i] == b'(' && bytes[i + 1] == b';' {
+            out.push('(');
+            out.push(';');
+            i += 2;
+            let mut depth = 1;
+            while i < len && depth > 0 {
+                if i + 1 < len && bytes[i] == b'(' && bytes[i + 1] == b';' {
+                    depth += 1;
+                    out.push('(');
+                    out.push(';');
+                    i += 2;
+                } else if i + 1 < len && bytes[i] == b';' && bytes[i + 1] == b')' {
+                    depth -= 1;
+                    out.push(';');
+                    out.push(')');
+                    i += 2;
+                } else {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Match `(try` at a word boundary
+        if bytes[i] == b'(' && matches_keyword(bytes, i + 1, b"try") {
+            let after = i + 1 + 3;
+            if after >= len || !is_ident_char(bytes[after]) {
+                // Found `(try` — emit `try` (without the opening paren)
+                out.push_str("try");
+                i = after;
+                try_stack.push(true); // assume needs `end` until we see `delegate`
+                continue;
+            }
+        }
+
+        // Match `(do` at word boundary — remove `(do` and later its closing `)`
+        if bytes[i] == b'(' && matches_keyword(bytes, i + 1, b"do") {
+            let after = i + 1 + 2;
+            if after >= len || !is_ident_char(bytes[after]) {
+                // Skip `(do`
+                i = after;
+                // If followed by `)` immediately (empty do), skip that too
+                let mut j = i;
+                while j < len && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b')' {
+                    // `(do)` — skip the closing paren
+                    i = j + 1;
+                } else {
+                    // `(do <body>)` — need to find and skip matching closing paren
+                    // We consume the body normally and track parens
+                    // The closing `)` of `(do ...)` will be consumed by skip_matching_close
+                    let body_end = find_matching_close(bytes, i);
+                    // Output everything inside, but not the final `)`
+                    while i < body_end {
+                        // Recursively handle nested try/do/catch within the do body
+                        // Just output character by character — nested patterns will be
+                        // caught by the main loop
+                        out.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    // Skip the closing `)` of `(do ...)`
+                    if i < len && bytes[i] == b')' {
+                        i += 1;
+                    }
+                }
+                // Emit newline for readability
+                out.push('\n');
+                continue;
+            }
+        }
+
+        // Match `(catch` at word boundary (but not `(catch_all`)
+        if bytes[i] == b'(' && matches_keyword(bytes, i + 1, b"catch") {
+            let after = i + 1 + 5;
+            if after < len && bytes[after] == b'_' {
+                // This is `(catch_all` — handle below
+            } else if after >= len || !is_ident_char(bytes[after]) {
+                // `(catch $tag ...)`  — emit `catch` + tag, unwrap parens
+                out.push_str("catch");
+                i = after;
+                // Read the tag name
+                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                // Copy tag name (e.g., $e0 or a number)
+                while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b')' {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                // Now we need to output the body and skip the closing `)`
+                let close = find_matching_close_from(bytes, i, 0);
+                while i < close {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len && bytes[i] == b')' {
+                    i += 1; // skip closing paren
+                }
+                out.push('\n');
+                continue;
+            }
+        }
+
+        // Match `(catch_all`
+        if bytes[i] == b'(' && matches_keyword(bytes, i + 1, b"catch_all") {
+            let after = i + 1 + 9;
+            if after >= len || !is_ident_char(bytes[after]) {
+                out.push_str("catch_all");
+                i = after;
+                // Output body and skip closing `)`
+                let close = find_matching_close_from(bytes, i, 0);
+                while i < close {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len && bytes[i] == b')' {
+                    i += 1;
+                }
+                out.push('\n');
+                continue;
+            }
+        }
+
+        // Match `(delegate`
+        if bytes[i] == b'(' && matches_keyword(bytes, i + 1, b"delegate") {
+            let after = i + 1 + 8;
+            if after >= len || !is_ident_char(bytes[after]) {
+                out.push_str("delegate");
+                i = after;
+                // Copy label and skip closing `)`
+                while i < len && bytes[i] != b')' {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len && bytes[i] == b')' {
+                    i += 1; // skip `)` of `(delegate ...)`
+                }
+                // Mark current try as not needing `end`
+                if let Some(last) = try_stack.last_mut() {
+                    *last = false;
+                }
+                out.push('\n');
+                continue;
+            }
+        }
+
+        // Match `)` that closes a `(try` — emit `end` if needed
+        if bytes[i] == b')' && !try_stack.is_empty() {
+            // Check if this `)` is the one closing the try block.
+            // We need to check the paren depth: the try's closing `)` is at depth 0
+            // relative to the try block. But since we removed the opening `(` of `(try`,
+            // we need a different approach: we check if this `)` would be unmatched
+            // in the current context (i.e., it's not closing any sub-expression).
+
+            // Count open parens from the position after the last try started
+            // Actually, let's just look ahead: if the next non-whitespace after this `)` is
+            // another `)` or a top-level directive, then this might be our try-closer.
+            // A simpler approach: just track paren depth since the try started.
+
+            // For simplicity, check if this `)` is "extra" (would be unbalanced)
+            // by scanning forward from this point. If removing it still leaves valid
+            // syntax, it was the try closer.
+
+            // Actually the simplest reliable way: this `)` was originally matching
+            // the `(try` we removed. We can detect it by checking if there's an
+            // unmatched `)` — but that's complex. Let me use a different approach:
+            // just output it and let the paren balancing work out.
+            // The `(try` open paren was removed, so one `)` will be extra.
+            // We rely on the fact that the `)` immediately after the last
+            // catch/catch_all/delegate block is the try closer.
+
+            // Better approach: don't try to detect — just output `)` normally.
+            // The unbalanced `)` will cause issues. Instead, we need to track this
+            // properly.
+            out.push(')');
+            i += 1;
+            continue;
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    // The approach above has a flaw: we removed `(` from `(try` but not the matching `)`.
+    // And we removed both `(` and `)` from `(do ...)`, `(catch ...)`, etc.
+    // So the try's `)` is still there and unmatched. We need to remove it.
+    // Let's use a second pass to fix paren balance, or better yet, redo the approach.
+
+    // Actually, let me just do a second pass: re-run the preprocessor on the output
+    // to handle any nested cases, then fix paren balance.
+
+    // Simpler: let me rewrite using a proper recursive approach.
+    drop(out);
+    drop(try_stack);
+    preprocess_legacy_eh_proper(input)
+}
+
+/// Find the position of the matching closing `)` starting from `start`,
+/// where `start` points to the first char AFTER `(keyword`.
+/// Counts nested `(...)` pairs and returns the position of the closing `)`.
+fn find_matching_close(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1; // we're already inside one `(`
+    let mut i = start;
+    let len = bytes.len();
+    while i < len {
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return i;
+            }
+        } else if bytes[i] == b';' && i + 1 < len && bytes[i + 1] == b';' {
+            // line comment
+            while i < len && bytes[i] != b'\n' { i += 1; }
+            continue;
+        } else if bytes[i] == b'"' {
+            // string literal
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' { i += 1; }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    start // fallback
+}
+
+/// Like find_matching_close but starts with a given depth.
+fn find_matching_close_from(bytes: &[u8], start: usize, extra_depth: usize) -> usize {
+    let mut depth: i32 = extra_depth as i32;
+    let mut i = start;
+    let len = bytes.len();
+    while i < len {
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            if depth == 0 {
+                return i;
+            }
+            depth -= 1;
+        } else if bytes[i] == b';' && i + 1 < len && bytes[i + 1] == b';' {
+            while i < len && bytes[i] != b'\n' { i += 1; }
+            continue;
+        } else if bytes[i] == b'"' {
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' { i += 1; }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    start
+}
+
+fn matches_keyword(bytes: &[u8], start: usize, keyword: &[u8]) -> bool {
+    let end = start + keyword.len();
+    if end > bytes.len() { return false; }
+    // Skip leading whitespace
+    &bytes[start..end] == keyword
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' || b == b'$'
+}
+
+/// Proper recursive preprocessor for legacy EH syntax.
+/// Processes the input as an S-expression stream, transforming legacy try blocks.
+fn preprocess_legacy_eh_proper(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len() + 256);
+    let mut pos = 0;
+    process_sexp_stream(bytes, &mut pos, &mut out, false);
+    out
+}
+
+/// Process a stream of S-expressions or atoms.
+/// If `inside_paren` is true, we stop when we hit the unmatched `)`.
+fn process_sexp_stream(bytes: &[u8], pos: &mut usize, out: &mut String, inside_paren: bool) {
+    let len = bytes.len();
+    while *pos < len {
+        // Skip whitespace
+        if bytes[*pos].is_ascii_whitespace() {
+            out.push(bytes[*pos] as char);
+            *pos += 1;
+            continue;
+        }
+
+        // Line comment
+        if *pos + 1 < len && bytes[*pos] == b';' && bytes[*pos + 1] == b';' {
+            while *pos < len && bytes[*pos] != b'\n' {
+                out.push(bytes[*pos] as char);
+                *pos += 1;
+            }
+            continue;
+        }
+
+        // Block comment
+        if *pos + 1 < len && bytes[*pos] == b'(' && bytes[*pos + 1] == b';' {
+            let start = *pos;
+            *pos += 2;
+            let mut depth = 1;
+            while *pos < len && depth > 0 {
+                if *pos + 1 < len && bytes[*pos] == b'(' && bytes[*pos + 1] == b';' {
+                    depth += 1; *pos += 2;
+                } else if *pos + 1 < len && bytes[*pos] == b';' && bytes[*pos + 1] == b')' {
+                    depth -= 1; *pos += 2;
+                } else {
+                    *pos += 1;
+                }
+            }
+            out.push_str(&String::from_utf8_lossy(&bytes[start..*pos]));
+            continue;
+        }
+
+        // Closing paren
+        if bytes[*pos] == b')' {
+            if inside_paren {
+                return; // don't consume the `)`, caller handles it
+            }
+            out.push(')');
+            *pos += 1;
+            continue;
+        }
+
+        // Opening paren — check what follows
+        if bytes[*pos] == b'(' {
+            let paren_start = *pos;
+            *pos += 1;
+            skip_whitespace(bytes, pos);
+
+            if peek_keyword(bytes, *pos, b"try") {
+                process_try_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"do") {
+                process_do_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"catch_all") {
+                process_catch_all_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"catch") && !peek_keyword(bytes, *pos, b"catch_all") {
+                process_catch_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"delegate") {
+                process_delegate(bytes, pos, out);
+            } else {
+                // Normal S-expression — output `(`, process contents, output `)`
+                out.push('(');
+                process_sexp_stream(bytes, pos, out, true);
+                if *pos < bytes.len() && bytes[*pos] == b')' {
+                    out.push(')');
+                    *pos += 1;
+                }
+            }
+            continue;
+        }
+
+        // String literal
+        if bytes[*pos] == b'"' {
+            out.push('"');
+            *pos += 1;
+            while *pos < len && bytes[*pos] != b'"' {
+                if bytes[*pos] == b'\\' {
+                    out.push(bytes[*pos] as char);
+                    *pos += 1;
+                    if *pos < len {
+                        out.push(bytes[*pos] as char);
+                        *pos += 1;
+                    }
+                } else {
+                    out.push(bytes[*pos] as char);
+                    *pos += 1;
+                }
+            }
+            if *pos < len {
+                out.push('"');
+                *pos += 1;
+            }
+            continue;
+        }
+
+        // Atom (identifier, number, keyword, etc.)
+        while *pos < len && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b'(' && bytes[*pos] != b')' && bytes[*pos] != b'"' {
+            // Handle line comments within atom scanning
+            if bytes[*pos] == b';' && *pos + 1 < len && bytes[*pos + 1] == b';' {
+                break;
+            }
+            out.push(bytes[*pos] as char);
+            *pos += 1;
+        }
+    }
+}
+
+fn skip_whitespace(bytes: &[u8], pos: &mut usize) {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+}
+
+fn peek_keyword(bytes: &[u8], pos: usize, kw: &[u8]) -> bool {
+    let end = pos + kw.len();
+    if end > bytes.len() { return false; }
+    if &bytes[pos..end] != kw { return false; }
+    // Must be followed by non-ident char or EOF
+    end >= bytes.len() || !is_ident_char(bytes[end])
+}
+
+/// Process `(try ...)` — already consumed `(`, pos points at `try`
+fn process_try_block(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    // Emit `try` without surrounding parens
+    out.push_str("try");
+    *pos += 3; // skip "try"
+
+    // Copy block type annotations (e.g., `$label`, `(result i32)`)
+    // and then process the body which should contain (do ...) (catch ...) etc.
+    let mut has_delegate = false;
+
+    // Process the contents of the try block
+    while *pos < bytes.len() {
+        skip_whitespace_emit(bytes, pos, out);
+
+        if *pos >= bytes.len() { break; }
+
+        // Closing `)` of the `(try ...)`
+        if bytes[*pos] == b')' {
+            *pos += 1; // consume it (don't output — we removed the `(`)
+            break;
+        }
+
+        // Opening `(` of a sub-expression
+        if bytes[*pos] == b'(' {
+            let save = *pos;
+            *pos += 1;
+            skip_whitespace(bytes, pos);
+
+            if peek_keyword(bytes, *pos, b"do") {
+                process_do_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"catch_all") {
+                process_catch_all_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"catch") && !peek_keyword(bytes, *pos, b"catch_all") {
+                process_catch_block(bytes, pos, out);
+            } else if peek_keyword(bytes, *pos, b"delegate") {
+                process_delegate(bytes, pos, out);
+                has_delegate = true;
+            } else if peek_keyword(bytes, *pos, b"result") {
+                // `(result ...)` — part of block type, output normally
+                out.push('(');
+                process_sexp_stream(bytes, pos, out, true);
+                if *pos < bytes.len() && bytes[*pos] == b')' {
+                    out.push(')');
+                    *pos += 1;
+                }
+            } else {
+                // Something else — output normally
+                out.push('(');
+                process_sexp_stream(bytes, pos, out, true);
+                if *pos < bytes.len() && bytes[*pos] == b')' {
+                    out.push(')');
+                    *pos += 1;
+                }
+            }
+            continue;
+        }
+
+        // Label like `$t` or `$label`
+        if bytes[*pos] == b'$' {
+            while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b'(' && bytes[*pos] != b')' {
+                out.push(bytes[*pos] as char);
+                *pos += 1;
+            }
+            continue;
+        }
+
+        // Other atom
+        while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b'(' && bytes[*pos] != b')' {
+            out.push(bytes[*pos] as char);
+            *pos += 1;
+        }
+    }
+
+    if !has_delegate {
+        out.push_str(" end");
+    }
+}
+
+/// Process `(do ...)` — already consumed `(`, pos points at `do`.
+/// Removes the `do` wrapper and outputs just the body.
+fn process_do_block(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    *pos += 2; // skip "do"
+    // Process body contents
+    process_sexp_stream(bytes, pos, out, true);
+    // Skip closing `)`
+    if *pos < bytes.len() && bytes[*pos] == b')' {
+        *pos += 1;
+    }
+    out.push('\n');
+}
+
+/// Process `(catch $tag ...)` — already consumed `(`, pos points at `catch`.
+fn process_catch_block(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    out.push_str(" catch");
+    *pos += 5; // skip "catch"
+    // Copy tag
+    skip_whitespace_emit(bytes, pos, out);
+    while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() && bytes[*pos] != b')' && bytes[*pos] != b'(' {
+        out.push(bytes[*pos] as char);
+        *pos += 1;
+    }
+    // Process handler body
+    process_sexp_stream(bytes, pos, out, true);
+    if *pos < bytes.len() && bytes[*pos] == b')' {
+        *pos += 1;
+    }
+    out.push('\n');
+}
+
+/// Process `(catch_all ...)` — already consumed `(`, pos points at `catch_all`.
+fn process_catch_all_block(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    out.push_str(" catch_all");
+    *pos += 9; // skip "catch_all"
+    // Process handler body
+    process_sexp_stream(bytes, pos, out, true);
+    if *pos < bytes.len() && bytes[*pos] == b')' {
+        *pos += 1;
+    }
+    out.push('\n');
+}
+
+/// Process `(delegate $label)` — already consumed `(`, pos points at `delegate`.
+fn process_delegate(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    out.push_str(" delegate");
+    *pos += 8; // skip "delegate"
+    // Copy label/index
+    while *pos < bytes.len() && bytes[*pos] != b')' {
+        out.push(bytes[*pos] as char);
+        *pos += 1;
+    }
+    if *pos < bytes.len() && bytes[*pos] == b')' {
+        *pos += 1;
+    }
+    out.push('\n');
+}
+
+fn skip_whitespace_emit(bytes: &[u8], pos: &mut usize, out: &mut String) {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        out.push(bytes[*pos] as char);
+        *pos += 1;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Pass,
@@ -140,6 +721,8 @@ pub struct WastRunner {
     multi_memory_enabled: bool,
     /// Whether multiple tables should be rejected (threads-only tests).
     reject_multi_table: bool,
+    /// The handle used in the last invoke/execute, for unwrapping externrefs.
+    last_invoke_handle: Option<InstanceHandle>,
 }
 
 impl WastRunner {
@@ -154,12 +737,23 @@ impl WastRunner {
             gc_enabled: false,
             multi_memory_enabled: false,
             reject_multi_table: false,
+            last_invoke_handle: None,
         }
     }
 
     pub fn run_file(path: &Path, verbose: bool) -> Result<FileReport> {
-        let text = fs::read_to_string(path)
+        let raw_text = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
+        // Preprocess legacy exception handling syntax if needed
+        let text = if path.to_string_lossy().contains("legacy/") {
+            let processed = preprocess_legacy_eh(&raw_text);
+            if std::env::var("DEBUG_PREPROCESS").is_ok() {
+                eprintln!("=== PREPROCESSED ===\n{}\n=== END ===", processed);
+            }
+            processed
+        } else {
+            raw_text
+        };
         let mut lexer = Lexer::new(&text);
         lexer.allow_confusing_unicode(true);
         let buffer = ParseBuffer::new_with_lexer(lexer)
@@ -888,6 +1482,7 @@ impl WastRunner {
 
     fn invoke(&mut self, invoke: wast::WastInvoke<'_>) -> RunnerResult<Vec<Value>> {
         let handle = self.get_instance_handle(invoke.module)?;
+        self.last_invoke_handle = Some(handle.clone());
         let args = self.values_from_args(&invoke.args)?;
         // Allocate externref args on the GC heap so they're properly typed
         let args = {
@@ -1184,6 +1779,7 @@ impl WastRunner {
                 init_expr_stack_depth: 1,
                 init_expr_bytes: Vec::new(),
                 heap_type: None,
+                has_non_const: false,
             });
         }
 
@@ -2139,7 +2735,9 @@ impl WastRunner {
     fn unwrap_externref(&self, val: &Value) -> Value {
         use crate::wasm::runtime::GcObject;
         if let Value::GcRef(idx) = val {
-            if let Some(handle) = &self.current {
+            // Use the handle from the last invoke (where the GcRef was created),
+            // falling back to the current instance
+            if let Some(handle) = self.last_invoke_handle.as_ref().or(self.current.as_ref()) {
                 let record = handle.borrow();
                 let mut current_idx = *idx as usize;
                 // Unwrap chains of Externalized/Internalized

@@ -119,12 +119,20 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
-    // Validate table limits
+    // Validate subtype declarations
+    validate_subtypes(module)?;
+
+    // Validate table limits and non-nullable ref types
     for table in &module.tables {
         if let Some(max) = table.max {
             if table.min > max {
                 return Err(WasmError::TableIndexOutOfBounds);
             }
+        }
+        // Non-nullable ref types require an init expression
+        let is_non_nullable = matches!(table.elem_type, ValType::TypedFuncRef | ValType::StructRef);
+        if is_non_nullable && table.init_expr_bytes.is_none() {
+            return Err(WasmError::TypeMismatch);
         }
     }
 
@@ -178,21 +186,26 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         if global.init_expr_stack_depth != 1 {
             return Err(WasmError::TypeMismatch);
         }
+        // Validate no non-constant instructions in init expression
+        if global.has_non_const {
+            return Err(WasmError::ConstExprRequired);
+        }
         // Validate global init expression type matches declared type
-        // When GC is enabled, skip type checks — our type system doesn't model
-        // GC heap types (i31ref, structref, arrayref, etc.) precisely in init exprs.
-        if !module.gc_enabled {
-            if let Some(expr_type) = global.init_expr_type {
-                if expr_type != global.val_type {
-                    if !is_ref_compatible(expr_type, global.val_type) {
+        if let Some(expr_type) = global.init_expr_type {
+            if expr_type != global.val_type {
+                if !is_ref_compatible(expr_type, global.val_type) {
+                    // For GC modules, also allow GC ref subtypes
+                    if !module.gc_enabled || !val_is_subtype(expr_type, global.val_type) {
                         return Err(WasmError::TypeMismatch);
                     }
                 }
-            } else if global.init_global_ref.is_some() {
-                if let Some(ref_idx) = global.init_global_ref {
-                    let ref_type = get_imported_global_type(module, ref_idx);
-                    if let Some(rt) = ref_type {
-                        if rt != global.val_type && !is_ref_compatible(rt, global.val_type) {
+            }
+        } else if global.init_global_ref.is_some() {
+            if let Some(ref_idx) = global.init_global_ref {
+                let ref_type = get_imported_global_type(module, ref_idx);
+                if let Some(rt) = ref_type {
+                    if rt != global.val_type && !is_ref_compatible(rt, global.val_type) {
+                        if !module.gc_enabled || !val_is_subtype(rt, global.val_type) {
                             return Err(WasmError::TypeMismatch);
                         }
                     }
@@ -376,6 +389,125 @@ fn is_ref_compatible(a: ValType, b: ValType) -> bool {
     let b_funcref_family = matches!(b, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
     if a_funcref_family && b_funcref_family { return true; }
     false
+}
+
+/// Validate subtype declarations: each sub type must be structurally compatible
+/// with its declared supertype.
+fn validate_subtypes(module: &WasmModule) -> Result<(), WasmError> {
+    use crate::wasm::decoder::{GcTypeDef, StorageType};
+
+    for (idx, sub_info) in module.sub_types.iter().enumerate() {
+        if let Some(super_idx) = sub_info.supertype {
+            let super_idx = super_idx as usize;
+            if super_idx >= module.gc_types.len() {
+                return Err(WasmError::TypeMismatch);
+            }
+            // Supertype must not be final
+            if super_idx < module.sub_types.len() && module.sub_types[super_idx].is_final {
+                return Err(WasmError::TypeMismatch);
+            }
+            let sub_gc = &module.gc_types[idx];
+            let super_gc = &module.gc_types[super_idx];
+            match (sub_gc, super_gc) {
+                (GcTypeDef::Struct { field_types: sub_ft, field_muts: sub_fm },
+                 GcTypeDef::Struct { field_types: super_ft, field_muts: super_fm }) => {
+                    // Subtype must have at least as many fields
+                    if sub_ft.len() < super_ft.len() {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    // Each supertype field must match
+                    for i in 0..super_ft.len() {
+                        let sub_mut = sub_fm.get(i).copied().unwrap_or(false);
+                        let super_mut = super_fm.get(i).copied().unwrap_or(false);
+                        // Mutability must match
+                        if sub_mut != super_mut {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        // For mutable fields: types must match exactly (invariant)
+                        // For immutable fields: sub field must be subtype of super field (covariant)
+                        if sub_mut {
+                            // Invariant: must be exact match
+                            if !storage_type_eq(&sub_ft[i], &super_ft[i]) {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                        } else {
+                            // Covariant: sub field type must be subtype of super field type
+                            if !storage_type_subtype(&sub_ft[i], &super_ft[i]) {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                        }
+                    }
+                }
+                (GcTypeDef::Array { elem_type: sub_et, elem_mutable: sub_em },
+                 GcTypeDef::Array { elem_type: super_et, elem_mutable: super_em }) => {
+                    // Mutability must match
+                    if sub_em != super_em {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    if *sub_em {
+                        // Invariant
+                        if !storage_type_eq(sub_et, super_et) {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                    } else {
+                        // Covariant
+                        if !storage_type_subtype(sub_et, super_et) {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                    }
+                }
+                (GcTypeDef::Func, GcTypeDef::Func) => {
+                    // Func subtyping: check param/result types
+                    if idx < module.func_types.len() && super_idx < module.func_types.len() {
+                        let sub_ft = &module.func_types[idx];
+                        let super_ft = &module.func_types[super_idx];
+                        // Param/result counts must match (for nominal subtyping in GC)
+                        if sub_ft.param_count != super_ft.param_count || sub_ft.result_count != super_ft.result_count {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        // Params are contravariant, results are covariant
+                        for i in 0..sub_ft.param_count as usize {
+                            if !val_is_subtype(super_ft.params[i], sub_ft.params[i]) {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                        }
+                        for i in 0..sub_ft.result_count as usize {
+                            if !val_is_subtype(sub_ft.results[i], super_ft.results[i]) {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Mismatched kinds (e.g., struct sub of array)
+                    return Err(WasmError::TypeMismatch);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if two storage types are equal.
+fn storage_type_eq(a: &crate::wasm::decoder::StorageType, b: &crate::wasm::decoder::StorageType) -> bool {
+    use crate::wasm::decoder::StorageType;
+    match (a, b) {
+        (StorageType::I8, StorageType::I8) => true,
+        (StorageType::I16, StorageType::I16) => true,
+        (StorageType::Val(va), StorageType::Val(vb)) => va == vb,
+        _ => false,
+    }
+}
+
+/// Check if storage type `a` is a subtype of storage type `b`.
+fn storage_type_subtype(a: &crate::wasm::decoder::StorageType, b: &crate::wasm::decoder::StorageType) -> bool {
+    use crate::wasm::decoder::StorageType;
+    match (a, b) {
+        (StorageType::I8, StorageType::I8) => true,
+        (StorageType::I16, StorageType::I16) => true,
+        (StorageType::Val(va), StorageType::Val(vb)) => val_is_subtype(*va, *vb),
+        _ => false,
+    }
 }
 
 /// Validate an init expression used in a data or element segment offset.
@@ -798,7 +930,13 @@ impl<'a> Validator<'a> {
                         -0x0F => ValType::NoneRef,     // none
                         -0x0E => ValType::ExternRef,   // noextern
                         -0x0D => ValType::FuncRef,     // nofunc
-                        _ => ValType::NullableTypedFuncRef,
+                        _ => {
+                            // Concrete type index — validate it exists
+                            if heap_type >= 0 && (heap_type as u32) >= self.module.func_types.len() as u32 {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                            ValType::NullableTypedFuncRef
+                        }
                     }
                 }
                 -0x1C => {
@@ -816,7 +954,13 @@ impl<'a> Validator<'a> {
                         -0x0F => ValType::NoneRef,      // none
                         -0x0E => ValType::ExternRef,    // noextern
                         -0x0D => ValType::FuncRef,      // nofunc
-                        _ => ValType::TypedFuncRef,
+                        _ => {
+                            // Concrete type index — validate it exists
+                            if heap_type >= 0 && (heap_type as u32) >= self.module.func_types.len() as u32 {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                            ValType::TypedFuncRef
+                        }
                     }
                 }
                 _ => return Err(WasmError::InvalidBlockType),
@@ -1002,9 +1146,45 @@ impl<'a> Validator<'a> {
                 }
                 // ── catch (legacy) ──
                 0x07 => {
-                    let _tag_idx = self.read_u32()?;
+                    let tag_idx = self.read_u32()?;
                     let frame = self.pop_ctrl()?;
-                    self.push_ctrl(0x07, frame.start_types, frame.end_types);
+                    let end_types = frame.end_types.clone();
+                    self.push_ctrl(0x07, Vec::new(), end_types);
+                    // Push tag parameter types onto the stack for the handler
+                    let tag_import_count = self.module.imports.iter()
+                        .filter(|imp| matches!(imp.kind, ImportKind::Tag(_)))
+                        .count();
+                    let total_tags = tag_import_count + self.module.tag_types.len();
+                    if (tag_idx as usize) < total_tags {
+                        let type_idx = if (tag_idx as usize) < tag_import_count {
+                            let mut ti = 0u32;
+                            let mut found = None;
+                            for imp in &self.module.imports {
+                                if let ImportKind::Tag(tidx) = imp.kind {
+                                    if ti == tag_idx { found = Some(tidx); break; }
+                                    ti += 1;
+                                }
+                            }
+                            found
+                        } else {
+                            let local_idx = tag_idx as usize - tag_import_count;
+                            self.module.tag_types.get(local_idx).copied()
+                        };
+                        if let Some(tidx) = type_idx {
+                            if (tidx as usize) < self.module.func_types.len() {
+                                let ft = &self.module.func_types[tidx as usize];
+                                for i in 0..ft.param_count as usize {
+                                    self.push_val(ft.params[i]);
+                                }
+                            }
+                        }
+                    }
+                }
+                // ── rethrow (legacy) ──
+                0x09 => {
+                    let _depth = self.read_u32()?;
+                    // rethrow is a control transfer — set unreachable
+                    self.set_unreachable();
                 }
                 // ── throw ──
                 0x08 => {
@@ -1869,8 +2049,15 @@ impl<'a> Validator<'a> {
                 }
                 // ── ref.eq (opcode 0xD3) ──
                 0xD3 => {
-                    let _ = self.pop_opd()?; // ref1
-                    let _ = self.pop_opd()?; // ref2
+                    // ref.eq requires both operands to be subtypes of eqref
+                    let ref1 = self.pop_opd()?;
+                    let ref2 = self.pop_opd()?;
+                    // Reject types that are NOT subtypes of eqref
+                    fn is_not_eq_subtype(t: ValType) -> bool {
+                        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::AnyRef | ValType::ExnRef)
+                    }
+                    if let StackType::Known(t) = ref1 { if is_not_eq_subtype(t) { return Err(WasmError::TypeMismatch); } }
+                    if let StackType::Known(t) = ref2 { if is_not_eq_subtype(t) { return Err(WasmError::TypeMismatch); } }
                     self.push_val(ValType::I32);
                 }
                 // ── ref.as_non_null (opcode 0xD4) ──
@@ -2451,20 +2638,61 @@ impl<'a> Validator<'a> {
                         }
                         16 => { // array.fill: typeidx — pop len, pop val, pop idx, pop ref
                             let type_idx = self.read_u32()?;
-                            // Check array is mutable
-                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(type_idx as usize) {
+                            // Check array is mutable and validate fill value type
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, ref elem_type }) = self.module.gc_types.get(type_idx as usize) {
                                 if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                                let unpacked = elem_type.unpack();
+                                let _ = self.pop_opd()?; // len
+                                // Check fill value type matches array element type
+                                let val = self.pop_opd()?;
+                                if let StackType::Known(vt) = val {
+                                    if is_ref_type(unpacked) {
+                                        // For reference element types, fill value must be a ref type
+                                        if !is_ref_type(vt) && vt != ValType::NoneRef {
+                                            return Err(WasmError::TypeMismatch);
+                                        }
+                                    } else {
+                                        // For numeric/vector element types, fill value must match
+                                        if is_ref_type(vt) {
+                                            return Err(WasmError::TypeMismatch);
+                                        }
+                                    }
+                                }
+                                let _ = self.pop_opd()?; // idx
+                                let _ = self.pop_opd()?; // ref
+                            } else {
+                                let _ = self.pop_opd()?; // len
+                                let _ = self.pop_opd()?; // val
+                                let _ = self.pop_opd()?; // idx
+                                let _ = self.pop_opd()?; // ref
                             }
-                            let _ = self.pop_opd()?; // len
-                            let _ = self.pop_opd()?; // val
-                            let _ = self.pop_opd()?; // idx
-                            let _ = self.pop_opd()?; // ref
                         }
                         17 => { // array.copy: dst_typeidx + src_typeidx — pop len, pop src_idx, pop src_ref, pop dst_idx, pop dst_ref
-                            let dst_type = self.read_u32()?; let _ = self.read_u32()?;
+                            let dst_type = self.read_u32()?; let src_type = self.read_u32()?;
                             // Check destination array is mutable
                             if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(dst_type as usize) {
                                 if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                            }
+                            // Check src and dst array element types are compatible
+                            {
+                                use crate::wasm::decoder::GcTypeDef;
+                                let dst_elem = if let Some(GcTypeDef::Array { ref elem_type, .. }) = self.module.gc_types.get(dst_type as usize) {
+                                    Some(elem_type.clone())
+                                } else { None };
+                                let src_elem = if let Some(GcTypeDef::Array { ref elem_type, .. }) = self.module.gc_types.get(src_type as usize) {
+                                    Some(elem_type.clone())
+                                } else { None };
+                                if let (Some(dst_st), Some(src_st)) = (dst_elem, src_elem) {
+                                    use crate::wasm::decoder::StorageType;
+                                    // Packed types must match exactly; val types must be subtypes
+                                    let compatible = match (&src_st, &dst_st) {
+                                        (StorageType::I8, StorageType::I8) => true,
+                                        (StorageType::I16, StorageType::I16) => true,
+                                        (StorageType::Val(sv), StorageType::Val(dv)) => val_is_subtype(*sv, *dv),
+                                        _ => false,
+                                    };
+                                    if !compatible { return Err(WasmError::TypeMismatch); }
+                                }
                             }
                             let _ = self.pop_opd()?; // len
                             let _ = self.pop_opd()?; // src idx
@@ -2472,11 +2700,42 @@ impl<'a> Validator<'a> {
                             let _ = self.pop_opd()?; // dst idx
                             let _ = self.pop_opd()?; // dst ref
                         }
-                        18 | 19 => { // array.init_data/elem: typeidx + idx — pop len, pop src_off, pop dst_idx, pop ref
+                        18 => { // array.init_data: typeidx + dataidx — pop len, pop src_off, pop dst_idx, pop ref
                             let type_idx = self.read_u32()?; let _ = self.read_u32()?;
-                            // Check array is mutable
-                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(type_idx as usize) {
+                            // Check array is mutable and element type is numeric or vector
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, ref elem_type }) = self.module.gc_types.get(type_idx as usize) {
                                 if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                                // array.init_data requires numeric or vector element type
+                                let unpacked = elem_type.unpack();
+                                if is_ref_type(unpacked) {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                            }
+                            let _ = self.pop_opd()?; // len
+                            let _ = self.pop_opd()?; // src offset
+                            let _ = self.pop_opd()?; // dst idx
+                            let _ = self.pop_opd()?; // ref
+                        }
+                        19 => { // array.init_elem: typeidx + elemidx — pop len, pop src_off, pop dst_idx, pop ref
+                            let type_idx = self.read_u32()?; let elem_idx = self.read_u32()?;
+                            // Check array is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, ref elem_type }) = self.module.gc_types.get(type_idx as usize) {
+                                if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                                // Check element segment type is compatible with array element type
+                                let arr_unpacked = elem_type.unpack();
+                                if let Some(seg) = self.module.element_segments.get(elem_idx as usize) {
+                                    let seg_type = seg.elem_type;
+                                    // For numeric array types, elem segment must also be numeric
+                                    if !is_ref_type(arr_unpacked) && is_ref_type(seg_type) {
+                                        return Err(WasmError::TypeMismatch);
+                                    }
+                                    // For ref array types, elem segment type must be subtype
+                                    if is_ref_type(arr_unpacked) && is_ref_type(seg_type) {
+                                        if !val_is_subtype(seg_type, arr_unpacked) {
+                                            return Err(WasmError::TypeMismatch);
+                                        }
+                                    }
+                                }
                             }
                             let _ = self.pop_opd()?; // len
                             let _ = self.pop_opd()?; // src offset
@@ -2494,10 +2753,35 @@ impl<'a> Validator<'a> {
                             self.push_opd(StackType::Unknown);
                         }
                         24 | 25 => { // br_on_cast, br_on_cast_fail
-                            let _ = self.read_u8()?; // flags
+                            let flags = self.read_u8()?;
                             let _ = self.read_u32()?; // label
-                            let _ = self.read_i32()?; // ht1
-                            let _ = self.read_i32()?; // ht2
+                            let ht1 = self.read_i32()?; // source heap type
+                            let ht2 = self.read_i32()?; // target heap type
+                            // Validate: target heap type (ht2) must be a subtype of source heap type (ht1)
+                            // Map heap type to abstract ValType for subtype checking
+                            fn heap_type_to_val(ht: i32, nullable: bool) -> Option<ValType> {
+                                match ht {
+                                    -18 => Some(ValType::AnyRef),      // any
+                                    -19 => Some(ValType::EqRef),       // eq
+                                    -20 => Some(ValType::I31Ref),      // i31
+                                    -21 => if nullable { Some(ValType::NullableStructRef) } else { Some(ValType::StructRef) },
+                                    -22 => Some(ValType::ArrayRef),    // array
+                                    -16 => if nullable { Some(ValType::FuncRef) } else { Some(ValType::TypedFuncRef) },
+                                    -17 => Some(ValType::ExternRef),   // extern
+                                    -15 => Some(ValType::NoneRef),     // none
+                                    -23 => Some(ValType::ExnRef),      // exn
+                                    _ if ht >= 0 => if nullable { Some(ValType::NullableTypedFuncRef) } else { Some(ValType::TypedFuncRef) },
+                                    _ => None,
+                                }
+                            }
+                            let ht1_null = (flags & 1) != 0;
+                            let ht2_null = (flags & 2) != 0;
+                            if let (Some(t1), Some(t2)) = (heap_type_to_val(ht1, ht1_null), heap_type_to_val(ht2, ht2_null)) {
+                                // ht2 must be a subtype of ht1
+                                if !val_is_subtype(t2, t1) {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                            }
                             // Pop the input ref, push Unknown (type is narrowed on fall-through)
                             let _ = self.pop_opd()?;
                             self.push_opd(StackType::Unknown);

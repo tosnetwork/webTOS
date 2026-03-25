@@ -135,6 +135,8 @@ pub struct GlobalDef {
     /// Heap type for GC ref types. Negative = abstract (-16=func, -17=extern, etc).
     /// Non-negative = concrete type index. None for non-ref types.
     pub heap_type: Option<i32>,
+    /// Whether the init expression contains non-constant instructions.
+    pub has_non_const: bool,
 }
 
 /// A table definition.
@@ -929,6 +931,10 @@ fn reftype_to_valtype(_rt: ValType) -> ValType {
 
 /// Decode a reftype from the byte stream, returning the real ValType.
 fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmError> {
+    decode_reftype_real_with_limit(bytes, pos, u32::MAX)
+}
+
+fn decode_reftype_real_with_limit(bytes: &[u8], pos: &mut usize, max_type_idx: u32) -> Result<ValType, WasmError> {
     let b = read_byte(bytes, pos)?;
     match b {
         0x70 => Ok(ValType::FuncRef),
@@ -951,6 +957,10 @@ fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmErr
             } else if heap_type == -17 { // extern
                 Ok(ValType::ExternRef)
             } else {
+                // Validate concrete type index
+                if heap_type >= 0 && (heap_type as u32) >= max_type_idx {
+                    return Err(WasmError::TypeMismatch);
+                }
                 Ok(if b == 0x63 { ValType::NullableTypedFuncRef } else { ValType::TypedFuncRef })
             }
         }
@@ -966,6 +976,15 @@ fn decode_storage_type(bytes: &[u8], pos: &mut usize) -> Result<StorageType, Was
         0x78 => { *pos += 1; Ok(StorageType::I8) }
         0x77 => { *pos += 1; Ok(StorageType::I16) }
         _ => { let vt = decode_valtype_from_stream(bytes, pos)?; Ok(StorageType::Val(vt)) }
+    }
+}
+
+fn decode_storage_type_with_limit(bytes: &[u8], pos: &mut usize, module: &mut WasmModule, max_type_idx: u32) -> Result<StorageType, WasmError> {
+    let b = peek_byte(bytes, *pos)?;
+    match b {
+        0x78 => { *pos += 1; Ok(StorageType::I8) }
+        0x77 => { *pos += 1; Ok(StorageType::I16) }
+        _ => { let vt = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?; Ok(StorageType::Val(vt)) }
     }
 }
 
@@ -1040,7 +1059,7 @@ fn decode_composite_type_with_limit(
         0x5E => {
             // array type (GC proposal): single field (storage_type + mutability)
             module.gc_enabled = true;
-            let st = decode_storage_type(bytes, pos)?;
+            let st = decode_storage_type_with_limit(bytes, pos, module, max_type_idx)?;
             let mt = read_byte(bytes, pos)?; // mutability
             if mt > 1 {
                 return Err(WasmError::InvalidSection);
@@ -1060,7 +1079,7 @@ fn decode_composite_type_with_limit(
             let mut field_types = Vec::with_capacity(field_count);
             let mut field_muts = Vec::with_capacity(field_count);
             for _ in 0..field_count {
-                field_types.push(decode_storage_type(bytes, pos)?);
+                field_types.push(decode_storage_type_with_limit(bytes, pos, module, max_type_idx)?);
                 let mt = read_byte(bytes, pos)?; // mutability
                 if mt > 1 {
                     return Err(WasmError::InvalidSection);
@@ -1458,27 +1477,34 @@ fn decode_code_section(
         if i >= module.functions.len() {
             return Err(WasmError::FunctionNotFound(i as u32));
         }
-        let func = &mut module.functions[i];
+        let max_type_idx = module.func_types.len() as u32;
 
         let mut nn_locals = Vec::new();
+        let mut local_types = Vec::new();
         for _ in 0..local_decl_count {
             let n = decode_leb128_u32(bytes, pos)? as u64;
             // Peek at the type byte to detect non-nullable refs (0x64 prefix)
             let type_byte = if *pos < bytes.len() { bytes[*pos] } else { 0 };
             let is_non_nullable = type_byte == 0x64;
-            let ty = decode_valtype_from_stream(bytes, pos)?;
+            let ty = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?;
             total_locals = total_locals.saturating_add(n);
             // WASM spec: no more than 2^32 - 1 locals total (including params)
             if total_locals > u32::MAX as u64 {
                 return Err(WasmError::InvalidSection);
             }
-            let start = (total_locals - n) as usize;
-            for j in start..((total_locals as usize).min(MAX_LOCALS)) {
-                func.locals[j] = ty;
+            local_types.push((n, ty, is_non_nullable));
+        }
+
+        let func = &mut module.functions[i];
+        for (n, ty, is_non_nullable) in &local_types {
+            let start = nn_locals.len();
+            let end = (start + *n as usize).min(MAX_LOCALS);
+            for j in start..end {
+                func.locals[j] = *ty;
                 if nn_locals.len() <= j {
                     nn_locals.resize(j + 1, false);
                 }
-                nn_locals[j] = is_non_nullable;
+                nn_locals[j] = *is_non_nullable;
             }
         }
         func.non_nullable_locals = nn_locals;
@@ -1560,6 +1586,10 @@ fn decode_table_section(
         if elemtype == 0x63 || elemtype == 0x64 {
             // Nullable/non-nullable ref type: read heap type
             elem_heap_type = decode_leb128_i32(bytes, pos)?;
+            // Validate concrete type references
+            if elem_heap_type >= 0 && (elem_heap_type as u32) >= module.func_types.len() as u32 {
+                return Err(WasmError::TypeMismatch);
+            }
         } else if matches!(elemtype, 0x6E | 0x6D | 0x6C | 0x6B | 0x6A | 0x73 | 0x72 | 0x71 | 0x69 | 0x68) {
             // GC shorthand reference types — single byte, no additional data
             // Map to corresponding heap type for later processing
@@ -1672,8 +1702,8 @@ fn decode_global_section(
         } else {
             None
         };
-        // Use stream decoder to handle multi-byte ref types
-        let val_type = decode_valtype_gc_aware(bytes, pos, module)?;
+        // Use stream decoder to handle multi-byte ref types, validating type refs
+        let val_type = decode_valtype_gc_aware_with_limit(bytes, pos, module, module.func_types.len() as u32)?;
         let mt = read_byte(bytes, pos)?;
         if mt > 1 {
             return Err(WasmError::InvalidSection);
@@ -1688,7 +1718,8 @@ fn decode_global_section(
         let init_func_ref = expr_info.func_ref;
         let init_value = eval_init_expr(bytes, pos)?;
         let init_expr_bytes = bytes[expr_start..*pos].to_vec();
-        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref, init_expr_bytes, heap_type: global_heap_type });
+        let has_non_const = expr_info.has_non_const;
+        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref, init_expr_bytes, heap_type: global_heap_type, has_non_const });
     }
     Ok(())
 }
@@ -1850,7 +1881,7 @@ fn decode_element_section(
             }
             5 => {
                 // Passive, reftype, expression elements
-                let elem_type = decode_reftype_real(bytes, pos)?;
+                let elem_type = decode_reftype_real_with_limit(bytes, pos, module.func_types.len() as u32)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
@@ -1884,7 +1915,7 @@ fn decode_element_section(
                 let offset_val = eval_init_expr(bytes, pos)?;
                 let expr_end = *pos;
                 let offset = match offset_val { Value::I32(v) => v as u32, _ => 0 };
-                let elem_type = decode_reftype_real(bytes, pos)?;
+                let elem_type = decode_reftype_real_with_limit(bytes, pos, module.func_types.len() as u32)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
@@ -1902,7 +1933,7 @@ fn decode_element_section(
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
-                let elem_type = decode_reftype_real(bytes, pos)?;
+                let elem_type = decode_reftype_real_with_limit(bytes, pos, module.func_types.len() as u32)?;
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
@@ -2220,55 +2251,57 @@ pub fn scan_init_expr_info_gc(bytes: &[u8], start: usize, gc_types: &[GcTypeDef]
                             }
                             if sp < 16 { type_stack[sp] = None; sp += 1; }
                         }
-                        9 | 10 => { // array.new_data/elem: pop offset + length, push ref
+                        9 | 10 => { // array.new_data/elem: pop offset + length, push ref (NOT const-valid)
+                            info.has_non_const = true;
                             let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
                             sp = sp.saturating_sub(2);
                             if sp < 16 { type_stack[sp] = None; sp += 1; }
                         }
-                        2 | 3 | 4 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                        2 | 3 | 4 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
                             // struct.get: pop ref, push val
                             if sp > 0 { type_stack[sp - 1] = None; }
                         }
-                        5 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                        5 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
                             // struct.set: pop ref, pop val
                             if sp >= 2 { sp -= 2; }
                         }
-                        11 | 12 | 13 => { let _ = decode_leb128_u32(bytes, &mut p);
+                        11 | 12 | 13 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p);
                             // array.get: pop ref, pop idx, push val
                             if sp >= 2 { sp -= 1; type_stack[sp - 1] = None; }
                         }
-                        14 => { let _ = decode_leb128_u32(bytes, &mut p);
+                        14 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p);
                             // array.set: pop ref, pop idx, pop val
                             if sp >= 3 { sp -= 3; }
                         }
-                        15 => { // array.len: pop ref, push i32
+                        15 => { info.has_non_const = true; // array.len: pop ref, push i32
                             if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
                         }
-                        16 => { let _ = decode_leb128_u32(bytes, &mut p); } // array.fill
-                        17 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.copy
-                        18 | 19 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.init_data/elem
-                        20 | 21 => { let _ = decode_leb128_i32(bytes, &mut p);
+                        16 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p); } // array.fill
+                        17 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.copy
+                        18 | 19 => { info.has_non_const = true; let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p); } // array.init_data/elem
+                        20 | 21 => { info.has_non_const = true; let _ = decode_leb128_i32(bytes, &mut p);
                             // ref.test: pop ref, push i32
                             if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
                         }
-                        22 | 23 => { let _ = decode_leb128_i32(bytes, &mut p);
+                        22 | 23 => { info.has_non_const = true; let _ = decode_leb128_i32(bytes, &mut p);
                             // ref.cast: pop ref, push ref (same-ish)
                         }
-                        24 | 25 => { // br_on_cast / br_on_cast_fail
+                        24 | 25 => { info.has_non_const = true; // br_on_cast / br_on_cast_fail
                             let _ = read_byte(bytes, &mut p);
                             let _ = decode_leb128_u32(bytes, &mut p);
                             let _ = decode_leb128_i32(bytes, &mut p);
                             let _ = decode_leb128_i32(bytes, &mut p);
                         }
-                        26 | 27 => {} // any.convert_extern, extern.convert_any: pop ref, push ref
-                        28 => { // ref.i31: pop i32, push i31ref
+                        26 | 27 => {} // any.convert_extern, extern.convert_any: pop ref, push ref (const-valid)
+                        28 => { // ref.i31: pop i32, push i31ref (const-valid)
                             if sp > 0 { type_stack[sp - 1] = Some(ValType::I31Ref); }
                             else if sp < 16 { type_stack[sp] = Some(ValType::I31Ref); sp += 1; }
                         }
-                        29 | 30 => { // i31.get_s/u: pop i31ref, push i32
+                        29 | 30 => { // i31.get_s/u: pop i31ref, push i32 (NOT const-valid)
+                            info.has_non_const = true;
                             if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
                         }
-                        _ => {} // unknown
+                        _ => { info.has_non_const = true; } // non-const sub-opcode
                     }
                 }
             }
