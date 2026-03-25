@@ -385,6 +385,7 @@ impl WastRunner {
         let mut module = crate::wasm::decoder::decode(bytes)
             .map_err(|err| RunnerError::new("decode", format!("{err:?}")))?;
         module.gc_enabled = module.gc_enabled || self.gc_enabled;
+        module.implicit_rec_enabled = self.gc_enabled; // GC proposal enables implicit rec groups
         module.multi_memory_enabled = module.multi_memory_enabled || self.multi_memory_enabled;
         module.reject_multi_table = self.reject_multi_table;
         crate::wasm::validator::validate(&module)
@@ -1889,7 +1890,7 @@ impl WastRunner {
             let idx = global_idx.unwrap() as usize;
             // Check type
             if let Some(gdef) = record.instance.module.globals.get(idx) {
-                if gdef.val_type != val_type && !global_types_compatible(val_type, val_type_byte, gdef.val_type, mutable) {
+                if gdef.val_type != val_type && !global_types_compatible(val_type, val_type_byte, heap_type, gdef.val_type, gdef.heap_type, mutable) {
                     return Err(RunnerError::new(
                         "link",
                         format!("incompatible import type for global `{module_name}::{field_name}`: type mismatch"),
@@ -2167,13 +2168,13 @@ impl WastRunner {
                 }
             }
             WastRetCore::RefExtern(None) => {
-                // ref.extern with no value = null
+                // ref.extern with no value = any non-null externref
                 match actual {
-                    Value::I32(-1) | Value::NullRef => Ok(()),
-                    _ => Err(DirectiveError::assertion(
+                    Value::NullRef | Value::I32(-1) => Err(DirectiveError::assertion(
                         "assert_return",
-                        format!("expected ref.extern null, got {actual:?}"),
+                        format!("expected ref.extern (non-null), got {actual:?}"),
                     )),
+                    _ => Ok(()),
                 }
             }
             WastRetCore::RefFunc(None) => {
@@ -2329,6 +2330,7 @@ fn copy_function_from_module(
                 code_len,
                 local_count: src_func.local_count,
                 locals: src_func.locals,
+                non_nullable_locals: Vec::new(),
             });
             return host_module.func_import_count() as u32
                 + (host_module.functions.len() as u32 - 1);
@@ -2431,6 +2433,7 @@ fn resolve_cross_module_function(
             code_len,
             local_count: src_func.local_count,
             locals: src_func.locals,
+            non_nullable_locals: Vec::new(),
         };
         host_module.functions.push(new_func);
 
@@ -2717,14 +2720,13 @@ fn ref_types_compatible(a: ValType, b: ValType) -> bool {
 /// For immutable globals, subtyping is allowed (import can be supertype of export).
 /// For mutable globals, types must match exactly (invariance).
 ///
-/// heap_type: decoded heap type for 0x63/0x64 imports.
-///   Negative values = abstract heap types: -16=func, -17=extern, -14=any, -13=eq, etc.
-///   Non-negative values = concrete type indices.
+/// Heap type values: negative = abstract (-16=func, -17=extern, etc), non-negative = concrete type index.
 fn global_types_compatible(
     import_val_type: ValType,
     import_byte: u8,
-    heap_type: Option<i32>,
+    import_heap_type: Option<i32>,
     export_val_type: ValType,
+    export_heap_type: Option<i32>,
     mutable: bool,
 ) -> bool {
     fn is_funcref_family(t: ValType) -> bool {
@@ -2734,74 +2736,63 @@ fn global_types_compatible(
         matches!(t, ValType::ExternRef)
     }
 
-    // Determine which "family" the import belongs to based on heap type
-    let import_is_abstract_func = is_funcref_family(import_val_type)
-        || (matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(-16)));
-    let import_is_abstract_extern = is_externref_family(import_val_type)
-        || (matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(-17)));
-    let import_is_concrete = matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(ht) if ht >= 0);
+    // Classify import
+    let imp_is_abstract_func = is_funcref_family(import_val_type)
+        || (matches!(import_byte, 0x63 | 0x64) && import_heap_type == Some(-16));
+    let imp_is_abstract_extern = is_externref_family(import_val_type)
+        || (matches!(import_byte, 0x63 | 0x64) && import_heap_type == Some(-17));
+    let imp_is_concrete = matches!(import_byte, 0x63 | 0x64) && matches!(import_heap_type, Some(ht) if ht >= 0);
+    let imp_nullable = import_byte != 0x64 && import_val_type != ValType::TypedFuncRef;
+
+    // Classify export
+    let exp_is_concrete = matches!(export_heap_type, Some(ht) if ht >= 0);
+    let exp_nullable = matches!(export_val_type, ValType::FuncRef | ValType::NullableTypedFuncRef | ValType::ExternRef);
 
     if mutable {
         // Mutable globals require exact type match (invariance).
-        // Same well-known ref types are OK
-        if is_funcref_family(import_val_type) && import_val_type == export_val_type {
+        // Both abstract func with same nullability
+        if imp_is_abstract_func && is_funcref_family(export_val_type) && !exp_is_concrete {
+            return imp_nullable == exp_nullable;
+        }
+        // Both abstract extern
+        if imp_is_abstract_extern && is_externref_family(export_val_type) {
             return true;
         }
-        if is_externref_family(import_val_type) && is_externref_family(export_val_type) {
-            return true;
+        // Both concrete with same type index and nullability
+        if imp_is_concrete && exp_is_concrete && import_heap_type == export_heap_type {
+            return imp_nullable == exp_nullable;
         }
-        // 0x63/0x64 with abstract heap type -16 (func):
-        //   0x63 + -16 = (ref null func) = FuncRef
-        //   0x64 + -16 = (ref func) = TypedFuncRef
-        if matches!(import_byte, 0x63 | 0x64) && heap_type == Some(-16) {
-            let effective_import = if import_byte == 0x63 { ValType::FuncRef } else { ValType::TypedFuncRef };
-            if effective_import == export_val_type {
-                return true;
-            }
-        }
-        // 0x63/0x64 with abstract heap type -17 (extern):
-        if matches!(import_byte, 0x63 | 0x64) && heap_type == Some(-17) {
-            if is_externref_family(export_val_type) {
-                return true;
-            }
-        }
-        // For concrete typed refs (0x63/0x64 + type index >= 0), both sides must have
-        // the exact same type. We can't verify type index equality through GlobalDef, so reject.
         return false;
     }
 
-    // Immutable globals: import is supertype of export.
+    // Immutable globals: import must be supertype of export.
 
-    // (ref null func) / funcref is supertype of any funcref-family type
-    if import_is_abstract_func && import_byte != 0x64 && is_funcref_family(export_val_type) {
-        return true;
-    }
-    // (ref func) is supertype of non-nullable funcref types
-    if import_is_abstract_func && import_byte == 0x64 {
-        // Accept TypedFuncRef (non-nullable) but not FuncRef/NullableTypedFuncRef (nullable)
-        if export_val_type == ValType::TypedFuncRef {
-            return true;
+    // Abstract func import
+    if imp_is_abstract_func {
+        if !is_funcref_family(export_val_type) {
+            return false;
+        }
+        if imp_nullable {
+            return true; // (ref null func) is supertype of all funcref-family
+        } else {
+            return !exp_nullable; // (ref func) is supertype of non-nullable funcref
         }
     }
 
-    // (ref null extern) / externref is supertype of externref
-    if import_is_abstract_extern && is_externref_family(export_val_type) {
-        return true;
+    // Abstract extern import
+    if imp_is_abstract_extern {
+        return is_externref_family(export_val_type);
     }
 
-    // Concrete type imports (ref null $t) / (ref $t).
-    // A concrete type (ref null $t) can match another concrete type (ref null $t) or (ref $t).
-    // It cannot match abstract types like (ref null func) or externref.
-    // In our model: NullableTypedFuncRef = (ref null $t), TypedFuncRef = (ref $t).
-    // FuncRef = (ref null func) is abstract and should NOT match concrete imports.
-    if import_is_concrete {
-        if import_byte == 0x63 {
-            // (ref null $t): accept (ref null $t) or (ref $t), reject (ref null func)/(ref func)/externref
-            return matches!(export_val_type, ValType::NullableTypedFuncRef | ValType::TypedFuncRef);
-        }
-        if import_byte == 0x64 {
-            // (ref $t): accept (ref $t) only, reject nullable and abstract
-            return export_val_type == ValType::TypedFuncRef;
+    // Concrete import (ref null $t) / (ref $t)
+    if imp_is_concrete {
+        // Can only match concrete exports with same type index
+        if exp_is_concrete && import_heap_type == export_heap_type {
+            if imp_nullable {
+                return true; // (ref null $t) accepts both (ref null $t) and (ref $t)
+            } else {
+                return !exp_nullable; // (ref $t) only accepts (ref $t)
+            }
         }
         return false;
     }

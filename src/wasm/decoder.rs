@@ -38,6 +38,9 @@ pub struct FuncDef {
     pub code_len: usize,
     pub local_count: u16,
     pub locals: [ValType; MAX_LOCALS],
+    /// Bitset: which locals are non-nullable ref types (need initialization tracking).
+    /// Indexed by local index (not including params).
+    pub non_nullable_locals: Vec<bool>,
 }
 
 impl FuncDef {
@@ -48,6 +51,7 @@ impl FuncDef {
             code_len: 0,
             local_count: 0,
             locals: [ValType::I32; MAX_LOCALS],
+            non_nullable_locals: Vec::new(),
         }
     }
 }
@@ -285,6 +289,9 @@ pub struct WasmModule {
 
     /// Whether GC-proposal features are enabled (allows module-defined globals in const exprs).
     pub gc_enabled: bool,
+    /// Whether implicit rec groups are enabled (GC proposal).
+    /// When true, non-rec types are treated as being in a singleton rec group.
+    pub implicit_rec_enabled: bool,
     /// Whether multi-memory proposal is enabled.
     pub multi_memory_enabled: bool,
     /// Whether multiple tables should be rejected (pre-reference-types, e.g. threads-only).
@@ -304,6 +311,8 @@ pub struct WasmModule {
     pub gc_types: Vec<GcTypeDef>,
     /// Subtype hierarchy — parallel to func_types; stores supertype info.
     pub sub_types: Vec<SubTypeInfo>,
+    /// Whether any type has a self-referential type index (outside rec groups).
+    pub has_self_ref_types: bool,
 
     /// Raw bytecode + data segment bytes storage.
     pub code: Vec<u8>,
@@ -333,6 +342,7 @@ impl WasmModule {
             is_memory64: false,
             page_size_log2: None,
             gc_enabled: false,
+            implicit_rec_enabled: false,
             multi_memory_enabled: false,
             reject_multi_table: false,
             data_count: None,
@@ -340,6 +350,7 @@ impl WasmModule {
             tag_types: Vec::new(),
             gc_types: Vec::new(),
             sub_types: Vec::new(),
+            has_self_ref_types: false,
             code: Vec::new(),
             names: Vec::new(),
         }
@@ -840,12 +851,29 @@ fn is_gc_heap_type(ht: i32) -> bool {
 
 /// Decode a valtype and set gc_enabled on the module if a GC heap type is seen.
 fn decode_valtype_gc_aware(bytes: &[u8], pos: &mut usize, module: &mut WasmModule) -> Result<ValType, WasmError> {
+    decode_valtype_gc_aware_with_limit(bytes, pos, module, u32::MAX)
+}
+
+/// Like decode_valtype_gc_aware but also validates that concrete type refs are < max_type_idx.
+fn decode_valtype_gc_aware_with_limit(bytes: &[u8], pos: &mut usize, module: &mut WasmModule, max_type_idx: u32) -> Result<ValType, WasmError> {
     let saved = *pos;
     let b = read_byte(bytes, pos)?;
     if b == 0x63 || b == 0x64 {
         let ht = decode_leb128_i32(bytes, pos)?;
         if is_gc_heap_type(ht) {
             module.gc_enabled = true;
+        }
+        // Validate type reference is in range
+        if ht >= 0 && (ht as u32) >= max_type_idx {
+            return Err(WasmError::TypeMismatch);
+        }
+        // Track self-references (type idx == max_type_idx - 1 when max includes self)
+        if ht >= 0 {
+            let type_idx = ht as u32;
+            let current_idx = module.func_types.len() as u32;
+            if type_idx == current_idx {
+                module.has_self_ref_types = true;
+            }
         }
         // Reset and use the normal decoder
         *pos = saved;
@@ -941,10 +969,20 @@ fn skip_storage_type(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
 
 /// Decode a composite type (possibly wrapped in sub/sub_final) and push to module.func_types.
 /// Handles: func (0x60), struct (0x5F), array (0x5E).
+/// max_type_idx: concrete type references in this type must be < max_type_idx.
 fn decode_composite_type(
     bytes: &[u8],
     pos: &mut usize,
     module: &mut WasmModule,
+) -> Result<(), WasmError> {
+    decode_composite_type_with_limit(bytes, pos, module, u32::MAX)
+}
+
+fn decode_composite_type_with_limit(
+    bytes: &[u8],
+    pos: &mut usize,
+    module: &mut WasmModule,
+    max_type_idx: u32,
 ) -> Result<(), WasmError> {
     let sub_marker = read_byte(bytes, pos)?;
     let inner_marker;
@@ -976,7 +1014,7 @@ fn decode_composite_type(
             }
             ft.param_count = param_count;
             for p in 0..param_count as usize {
-                ft.params[p] = decode_valtype_gc_aware(bytes, pos, module)?;
+                ft.params[p] = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?;
             }
             let result_count = decode_leb128_u32(bytes, pos)? as u8;
             if result_count as usize > MAX_RESULTS {
@@ -984,7 +1022,7 @@ fn decode_composite_type(
             }
             ft.result_count = result_count;
             for r in 0..result_count as usize {
-                ft.results[r] = decode_valtype_gc_aware(bytes, pos, module)?;
+                ft.results[r] = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?;
             }
             module.func_types.push(ft);
             module.gc_types.push(GcTypeDef::Func);
@@ -1050,15 +1088,19 @@ fn decode_type_section(
         if marker == 0x4E {
             // rec type: count of types, then each is a sub/func type
             module.gc_enabled = true;
+            let rec_start = module.func_types.len() as u32;
             let rec_count = decode_leb128_u32(bytes, pos)? as usize;
+            let rec_end = rec_start + rec_count as u32;
             for _ in 0..rec_count {
-                decode_composite_type(bytes, pos, module)?;
+                decode_composite_type_with_limit(bytes, pos, module, rec_end)?;
             }
             continue;
         }
         // For non-rec types, "unread" the marker by backing up
         *pos -= 1;
-        decode_composite_type(bytes, pos, module)?;
+        let current_type_idx = module.func_types.len() as u32;
+        // Allow self-ref (current_type_idx + 1) so validator can later reject for non-GC.
+        decode_composite_type_with_limit(bytes, pos, module, current_type_idx + 1)?;
     }
 
     Ok(())
@@ -1409,8 +1451,12 @@ fn decode_code_section(
         }
         let func = &mut module.functions[i];
 
+        let mut nn_locals = Vec::new();
         for _ in 0..local_decl_count {
             let n = decode_leb128_u32(bytes, pos)? as u64;
+            // Peek at the type byte to detect non-nullable refs (0x64 prefix)
+            let type_byte = if *pos < bytes.len() { bytes[*pos] } else { 0 };
+            let is_non_nullable = type_byte == 0x64;
             let ty = decode_valtype_from_stream(bytes, pos)?;
             total_locals = total_locals.saturating_add(n);
             // WASM spec: no more than 2^32 - 1 locals total (including params)
@@ -1420,8 +1466,13 @@ fn decode_code_section(
             let start = (total_locals - n) as usize;
             for j in start..((total_locals as usize).min(MAX_LOCALS)) {
                 func.locals[j] = ty;
+                if nn_locals.len() <= j {
+                    nn_locals.resize(j + 1, false);
+                }
+                nn_locals[j] = is_non_nullable;
             }
         }
+        func.non_nullable_locals = nn_locals;
 
         // Also check including params from the function type
         let type_idx = func.type_idx as usize;
@@ -2076,6 +2127,15 @@ pub fn scan_init_expr_info_gc(bytes: &[u8], start: usize, gc_types: &[GcTypeDef]
                 let vt = match ht {
                     Ok(-0x10) => Some(ValType::FuncRef),     // (ref null func) = funcref
                     Ok(-0x11) => Some(ValType::ExternRef),   // (ref null extern) = externref
+                    Ok(-0x12) => Some(ValType::AnyRef),      // (ref null any) = anyref
+                    Ok(-0x13) => Some(ValType::EqRef),       // (ref null eq) = eqref
+                    Ok(-0x14) => Some(ValType::I31Ref),      // (ref null i31) = i31ref
+                    Ok(-0x15) => Some(ValType::NullableStructRef), // (ref null struct) = structref
+                    Ok(-0x16) => Some(ValType::ArrayRef),    // (ref null array) = arrayref
+                    Ok(-0x0F) => Some(ValType::NoneRef),     // (ref null none) = nullref
+                    Ok(-0x0D) => Some(ValType::FuncRef),     // (ref null nofunc) = nullfuncref
+                    Ok(-0x0E) => Some(ValType::ExternRef),   // (ref null noextern) = nullexternref
+                    Ok(-0x17) => Some(ValType::ExnRef),      // (ref null exn) = exnref
                     Ok(ht_idx) if ht_idx >= 0 => Some(ValType::NullableTypedFuncRef), // (ref null $t)
                     _ => None,
                 };

@@ -34,6 +34,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
+    // Validate: self-referential types require GC proposal (implicit rec groups).
+    // gc_enabled alone is not sufficient - the function-references proposal allows
+    // typed refs but not implicit recursion. Use the separate implicit_rec flag.
+    if module.has_self_ref_types && !module.implicit_rec_enabled {
+        return Err(WasmError::TypeMismatch);
+    }
+
     // Validate: no multi-memory unless the multi-memory proposal is enabled
     if module.memory_count > 1 && !module.multi_memory_enabled {
         return Err(WasmError::InvalidSection);
@@ -321,11 +328,8 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 
     // Validate instruction sequences for each function
     for (i, func) in module.functions.iter().enumerate() {
-        if let Err(e) = validate_function_body(module, i, func, total_functions, has_memory,
-            total_tables, total_globals, table_import_count, &declared_funcs) {
-            eprintln!("[DEBUG] validation failed at function {} (type_idx={}, code_offset={}): {:?}", i, func.type_idx, func.code_offset, e);
-            return Err(e);
-        }
+        validate_function_body(module, i, func, total_functions, has_memory,
+            total_tables, total_globals, table_import_count, &declared_funcs)?;
     }
 
     Ok(())
@@ -477,6 +481,11 @@ fn ref_types_compatible(src: ValType, dst: ValType) -> bool {
 /// Covers GC type hierarchy: none <: i31/struct/array <: eq <: any
 /// func hierarchy: nofunc <: typed <: nullable typed <: func
 /// extern hierarchy: noextern <: extern
+/// Check if a type is a non-nullable reference type (requires initialization).
+fn is_non_nullable_ref(t: ValType) -> bool {
+    matches!(t, ValType::TypedFuncRef | ValType::StructRef | ValType::ArrayRef)
+}
+
 fn val_is_subtype(src: ValType, dst: ValType) -> bool {
     if src == dst { return true; }
     match (src, dst) {
@@ -535,6 +544,10 @@ struct CtrlFrame {
     height: usize,
     /// Whether we are in unreachable code
     unreachable: bool,
+    /// Local initialization state at block entry (for merging at end)
+    local_inits_at_entry: Vec<bool>,
+    /// For else frames: stores the if-entry init state for proper merging.
+    if_entry_inits: Option<Vec<bool>>,
 }
 
 /// The validation context for a single function.
@@ -561,6 +574,9 @@ struct Validator<'a> {
     table_import_count: usize,
     /// Set of function indices declared in element segments (for ref.func validation)
     declared_funcs: &'a BTreeSet<u32>,
+    /// Local initialization tracking: true if the local has been set.
+    /// Params are always initialized; non-nullable ref locals start uninitialized.
+    local_inits: Vec<bool>,
 }
 
 impl<'a> Validator<'a> {
@@ -612,6 +628,8 @@ impl<'a> Validator<'a> {
             end_types,
             height,
             unreachable: false,
+            local_inits_at_entry: self.local_inits.clone(),
+            if_entry_inits: None,
         });
     }
 
@@ -914,7 +932,19 @@ impl<'a> Validator<'a> {
                     if frame.opcode != 0x04 {
                         return Err(WasmError::TypeMismatch);
                     }
-                    self.push_ctrl(0x05, frame.start_types, frame.end_types);
+                    // Save the then-branch init state; restore entry state for else-branch
+                    let then_inits = self.local_inits.clone();
+                    let if_entry_inits = frame.local_inits_at_entry.clone();
+                    self.local_inits = if_entry_inits.clone();
+                    let else_frame_start = frame.start_types.clone();
+                    let else_frame_end = frame.end_types.clone();
+                    // Store then-branch inits in the new frame for merging at end
+                    self.push_ctrl(0x05, else_frame_start, else_frame_end);
+                    // Stash then_inits and if-entry inits in the ctrl frame
+                    if let Some(f) = self.ctrl_stack.last_mut() {
+                        f.local_inits_at_entry = then_inits;
+                        f.if_entry_inits = Some(if_entry_inits);
+                    }
                 }
                 // ── end ──
                 0x0B => {
@@ -922,7 +952,6 @@ impl<'a> Validator<'a> {
                     // If this was an if without else, check that start_types == end_types
                     if frame.opcode == 0x04 {
                         // An if without else must have matching start/end types
-                        // (i.e., the block must produce no extra values, or be void)
                         if frame.start_types.len() != frame.end_types.len() {
                             return Err(WasmError::TypeMismatch);
                         }
@@ -930,6 +959,31 @@ impl<'a> Validator<'a> {
                             if frame.start_types[i] != frame.end_types[i] {
                                 return Err(WasmError::TypeMismatch);
                             }
+                        }
+                        // For if-without-else, merge: local is init only if init at entry
+                        // (else branch is implicitly the entry state)
+                        let entry_inits = &frame.local_inits_at_entry;
+                        for i in 0..self.local_inits.len().min(entry_inits.len()) {
+                            self.local_inits[i] = self.local_inits[i] && entry_inits[i];
+                        }
+                    } else if frame.opcode == 0x05 {
+                        // else-end: merge entry, then-end, and else-end.
+                        // Result = entry_init INTERSECT then_end INTERSECT else_end
+                        let then_inits = &frame.local_inits_at_entry;
+                        for i in 0..self.local_inits.len().min(then_inits.len()) {
+                            self.local_inits[i] = self.local_inits[i] && then_inits[i];
+                        }
+                        // Also intersect with the if-entry state
+                        if let Some(ref entry_inits) = frame.if_entry_inits {
+                            for i in 0..self.local_inits.len().min(entry_inits.len()) {
+                                self.local_inits[i] = self.local_inits[i] && entry_inits[i];
+                            }
+                        }
+                    } else if frame.opcode == 0x02 || frame.opcode == 0x03 {
+                        // block/loop end: intersection of entry and current
+                        let entry_inits = &frame.local_inits_at_entry;
+                        for i in 0..self.local_inits.len().min(entry_inits.len()) {
+                            self.local_inits[i] = self.local_inits[i] && entry_inits[i];
                         }
                     }
                     // Push end types onto the stack
@@ -1131,11 +1185,16 @@ impl<'a> Validator<'a> {
                         return Err(WasmError::FunctionNotFound(func_idx));
                     }
                     let ft = self.func_type(func_idx)?;
-                    // return_call: callee return types must match current function's return types
+                    // return_call: callee return types must be subtypes of current function's return types
                     let result_count = ft.result_count as usize;
                     let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
-                    if callee_results != self.return_types {
+                    if callee_results.len() != self.return_types.len() {
                         return Err(WasmError::TypeMismatch);
+                    }
+                    for i in 0..callee_results.len() {
+                        if !val_is_subtype(callee_results[i], self.return_types[i]) {
+                            return Err(WasmError::TypeMismatch);
+                        }
                     }
                     let param_count = ft.param_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
@@ -1162,11 +1221,16 @@ impl<'a> Validator<'a> {
                     let idx_type = table_index_type(self.module, table_idx);
                     self.pop_expect(idx_type)?;
                     let ft = &self.module.func_types[type_idx as usize];
-                    // return_call_indirect: callee return types must match current function's
+                    // return_call_indirect: callee return types must be subtypes of current function's
                     let result_count = ft.result_count as usize;
                     let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
-                    if callee_results != self.return_types {
+                    if callee_results.len() != self.return_types.len() {
                         return Err(WasmError::TypeMismatch);
+                    }
+                    for i in 0..callee_results.len() {
+                        if !val_is_subtype(callee_results[i], self.return_types[i]) {
+                            return Err(WasmError::TypeMismatch);
+                        }
                     }
                     let param_count = ft.param_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
@@ -1210,9 +1274,14 @@ impl<'a> Validator<'a> {
                     let result_count = ft.result_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
                     let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
-                    // return_call_ref: callee return types must match current function's
-                    if callee_results != self.return_types {
+                    // return_call_ref: callee return types must be subtypes of current function's
+                    if callee_results.len() != self.return_types.len() {
                         return Err(WasmError::TypeMismatch);
+                    }
+                    for i in 0..callee_results.len() {
+                        if !val_is_subtype(callee_results[i], self.return_types[i]) {
+                            return Err(WasmError::TypeMismatch);
+                        }
                     }
                     // call_ref requires (ref null $type_idx); reject ExternRef and general FuncRef
                     let ref_val = self.pop_opd()?;
@@ -1380,6 +1449,10 @@ impl<'a> Validator<'a> {
                 0x20 => {
                     let idx = self.read_u32()?;
                     let t = self.local_type(idx)?;
+                    // Check local initialization for non-nullable ref types
+                    if (idx as usize) < self.local_inits.len() && !self.local_inits[idx as usize] {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     self.push_val(t);
                 }
                 // ── local.set ──
@@ -1387,12 +1460,19 @@ impl<'a> Validator<'a> {
                     let idx = self.read_u32()?;
                     let t = self.local_type(idx)?;
                     self.pop_expect(t)?;
+                    // Mark local as initialized
+                    if (idx as usize) < self.local_inits.len() {
+                        self.local_inits[idx as usize] = true;
+                    }
                 }
                 // ── local.tee ──
                 0x22 => {
                     let idx = self.read_u32()?;
                     let t = self.local_type(idx)?;
                     self.pop_expect(t)?;
+                    if (idx as usize) < self.local_inits.len() {
+                        self.local_inits[idx as usize] = true;
+                    }
                     self.push_val(t);
                 }
                 // ── global.get ──
@@ -2854,6 +2934,18 @@ fn validate_function_body(
 
     let return_types: Vec<ValType> = ft.results[..ft.result_count as usize].to_vec();
 
+    // Build local initialization tracking.
+    // Params are always initialized. Non-nullable ref locals start uninitialized.
+    let param_count = ft.param_count as usize;
+    let mut local_inits = vec![true; local_types.len()];
+    for i in param_count..local_types.len() {
+        let local_idx = i - param_count;
+        let is_nn = func.non_nullable_locals.get(local_idx).copied().unwrap_or(false);
+        if is_nn || is_non_nullable_ref(local_types[i]) {
+            local_inits[i] = false;
+        }
+    }
+
     let mut validator = Validator {
         module,
         code,
@@ -2862,7 +2954,7 @@ fn validate_function_body(
         opd_stack: Vec::new(),
         ctrl_stack: Vec::new(),
         local_types,
-        param_count: ft.param_count as usize,
+        param_count,
         return_types,
         total_functions,
         has_memory,
@@ -2871,6 +2963,7 @@ fn validate_function_body(
         func_import_count,
         table_import_count,
         declared_funcs,
+        local_inits,
     };
 
     // Temporary debug: dump function body bytes

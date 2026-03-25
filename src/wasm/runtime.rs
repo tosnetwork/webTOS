@@ -4572,7 +4572,7 @@ impl WasmInstance {
                     26 => { // any.convert_extern: pop externref, push anyref
                         let val = try_exec!(self.pop());
                         match val {
-                            Value::NullRef => { try_exec!(self.push(Value::NullRef)); }
+                            Value::NullRef | Value::I32(-1) => { try_exec!(self.push(Value::NullRef)); }
                             _ => {
                                 // Wrap externref in a GC object so it's distinguishable from i31ref
                                 let heap_idx = self.gc_heap.len() as u32;
@@ -4584,7 +4584,7 @@ impl WasmInstance {
                     27 => { // extern.convert_any: pop anyref, push externref
                         let val = try_exec!(self.pop());
                         match val {
-                            Value::NullRef => { try_exec!(self.push(Value::NullRef)); }
+                            Value::NullRef | Value::I32(-1) => { try_exec!(self.push(Value::NullRef)); }
                             Value::GcRef(idx) => {
                                 // Unwrap GcObject::Extern back to externref
                                 if (idx as usize) < self.gc_heap.len() {
