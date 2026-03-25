@@ -235,7 +235,8 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             return Err(WasmError::TypeMismatch);
         }
         // Validate no non-constant instructions in init expression
-        if global.has_non_const {
+        // GC modules allow struct.new, array.new etc. in const expressions
+        if global.has_non_const && !module.gc_enabled {
             return Err(WasmError::ConstExprRequired);
         }
         // Validate global init expression type matches declared type
@@ -260,10 +261,15 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                 }
             }
         }
-        // GC: when global is (ref $t) and init is ref.func $f, check type compatibility
+        // GC: when global is (ref $t) and init result is a funcref (ref.func $f),
+        // check that func type is a subtype of global type.
+        // Only when init_expr_type indicates funcref (ref.func is the result, not an argument to array.new).
         if module.gc_enabled {
             if let (Some(global_ht), Some(func_idx)) = (global.heap_type, global.init_func_ref) {
-                if global_ht >= 0 {
+                let init_is_funcref = matches!(global.init_expr_type,
+                    Some(ValType::FuncRef) | Some(ValType::TypedFuncRef) |
+                    Some(ValType::NullableTypedFuncRef) | Some(ValType::NonNullableFuncRef));
+                if global_ht >= 0 && init_is_funcref {
                     let global_type_idx = global_ht as u32;
                     let fti = if (func_idx as usize) < func_import_count {
                         module.func_import_type(func_idx)
