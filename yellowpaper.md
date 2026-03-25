@@ -3460,6 +3460,7 @@ Runtime porting priority, ranked by AI agent ecosystem value:
 | **P1** | Python | [RustPython](https://github.com/RustPython/RustPython) | Python | 99% of AI/ML agent code is Python (LangChain, AutoGPT, CrewAI, HuggingFace). Without Python support, ATOS cannot serve the AI agent ecosystem. Pure Rust, actively developed. | Planned |
 | **P2** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | Enterprise AI ecosystem (Spring AI, LangChain4j), Android agent frameworks, Kotlin coroutine agents. Pure Rust, actively developed, already has `#[cfg(target_family = "wasm")]` platform gating. | [Ristretto.md](Ristretto.md) |
 | **P3** | EVM | [revm](https://github.com/bluealloy/revm) | Solidity / Vyper | Smart contract agents, DeFi protocols, L2 execution. Gas maps 1:1 to ATOS energy. `#![no_std]` native, production-grade (Reth, Foundry, Optimism). Reentrancy impossible (mailbox-based calls), storage isolation via keyspace. | [Revm.md](Revm.md) |
+| **P4** | RISC-V zkVM | [SP1](https://github.com/succinctlabs/sp1) | Any → RISC-V | Zero-knowledge provable execution. Upgrades ATOS from replay-based proofs (O(n) verification) to ZK proofs (O(1) verification). Any program compiled to RISC-V can be proven. Aligned with Ethereum 2029 RISC-V zkEVM roadmap. Enables trustless computation, zkRollup execution, and verifiable AI agents. | [ZkVM.md](ZkVM.md) |
 
 Each ported runtime follows the same pattern:
 
@@ -3494,6 +3495,7 @@ Objectives:
 * port RustPython to enable Python AI agent workloads on ATOS (P1)
 * port Ristretto to enable Java/Kotlin enterprise agent workloads (P2)
 * port revm to enable EVM smart contract execution on ATOS (P3) — gas→energy, storage→keyspace, calls→mailbox
+* integrate SP1 RISC-V zkVM for zero-knowledge provable execution (P4) — upgrades ProofGrade from replay-based O(n) to ZK-based O(1) verification
 * define the standard ATOS virtualization layer API so all runtimes share the same file/network/thread mapping
 * ensure all ported runtimes benefit from ATOS energy metering via timer-tick preemption (no per-opcode instrumentation needed)
 * publish `x86_64-unknown-atos` target spec upstream to Rust compiler (like Redox OS did with `x86_64-unknown-redox`)
@@ -3503,6 +3505,8 @@ Success criteria:
 * a Python AI agent (LangChain) runs on ATOS, communicates via mailbox, energy-metered, checkpointable
 * a Java JAR file executes on ATOS with standard library classes (ArrayList, HashMap, String) functional
 * a Solidity smart contract deploys and executes on ATOS with gas metered as ATOS energy, storage in keyspace
+* a RISC-V program executes inside SP1 zkVM on ATOS and produces a ZK proof verifiable in O(1) time
+* revm compiled to RISC-V runs inside zkVM, enabling ATOS as a zkRollup execution engine
 * any language that compiles to WASM runs on ATOS via wasmi with full spec compliance
 * all ported runtimes pass their respective language test suites on ATOS
 * the ATOS virtualization layer is documented and reusable across all runtime ports
