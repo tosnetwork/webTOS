@@ -376,6 +376,11 @@ pub extern "C" fn wasm_runner_entry() -> ! {
                 serial_println!("[WASM_RUNNER] Agent {} trap: {:?}", agent_id, e);
                 break;
             }
+
+            wasm::runtime::ExecResult::Exception(tag, _) => {
+                serial_println!("[WASM_RUNNER] Agent {} uncaught exception (tag {})", agent_id, tag);
+                break;
+            }
         }
     }
 
