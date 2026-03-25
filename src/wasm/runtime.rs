@@ -139,6 +139,8 @@ const MAX_TOTAL_LOCALS: usize = 65_536;
 pub enum GcObject {
     Struct { type_idx: u32, fields: Vec<Value> },
     Array { type_idx: u32, elements: Vec<Value> },
+    /// Externalized value (from any.convert_extern): wraps an externref
+    Extern { value: Value },
 }
 
 impl GcObject {
@@ -146,6 +148,7 @@ impl GcObject {
         match self {
             GcObject::Struct { type_idx, .. } => *type_idx,
             GcObject::Array { type_idx, .. } => *type_idx,
+            GcObject::Extern { .. } => u32::MAX,
         }
     }
 }
@@ -273,10 +276,17 @@ impl WasmInstance {
                 return Err(WasmError::TableIndexOutOfBounds);
             }
 
-            // Trap if any function index is out of bounds
-            for &func_idx in &seg.func_indices {
-                if func_idx != u32::MAX && func_idx >= total_funcs {
-                    return Err(WasmError::UndefinedElement);
+            // Trap if any function index is out of bounds (only for funcref tables)
+            let is_func_table = tbl_idx < module.tables.len() && matches!(
+                module.tables[tbl_idx].elem_type,
+                ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
+            );
+            let is_func_seg = matches!(seg.elem_type, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+            if is_func_table && is_func_seg {
+                for &func_idx in &seg.func_indices {
+                    if func_idx != u32::MAX && func_idx >= total_funcs {
+                        return Err(WasmError::UndefinedElement);
+                    }
                 }
             }
 
@@ -347,6 +357,29 @@ impl WasmInstance {
 
         // Evaluate GC const expressions for globals that need deferred evaluation
         inst.eval_gc_globals();
+
+        // Apply table init expressions (GC proposal: tables with init values)
+        for (tbl_idx, tdef) in inst.module.tables.iter().enumerate() {
+            if let Some(ref expr_bytes) = tdef.init_expr_bytes {
+                if tbl_idx < inst.tables.len() {
+                    let mut expr_pos = 0;
+                    let init_val = crate::wasm::decoder::eval_init_expr_with_globals(
+                        expr_bytes, &mut expr_pos, &inst.globals,
+                    );
+                    if let Ok(val) = init_val {
+                        let entry = match val {
+                            Value::NullRef => None,
+                            Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
+                            Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
+                            _ => None,
+                        };
+                        for slot in inst.tables[tbl_idx].iter_mut() {
+                            *slot = entry;
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(inst)
     }
@@ -2360,13 +2393,48 @@ impl WasmInstance {
             }
             0x15 => {
                 // return_call_ref (typed function references proposal)
-                let _type_idx = try_exec!(self.read_leb128_u32());
-                let func_ref = try_exec!(self.pop_i32());
+                let type_idx = try_exec!(self.read_leb128_u32());
+                let func_ref_val = try_exec!(self.pop());
+                let func_ref = match func_ref_val {
+                    Value::NullRef => -1,
+                    Value::I32(v) => v,
+                    Value::GcRef(idx) => idx as i32,
+                    _ => -1,
+                };
                 if func_ref < 0 {
                     return ExecResult::Trap(WasmError::NullFunctionReference);
                 }
                 let func_idx = func_ref as u32;
-                // Pop current frame first (tail call optimization)
+
+                // Get the number of parameters the target function expects
+                let param_count = if (type_idx as usize) < self.module.func_types.len() {
+                    self.module.func_types[type_idx as usize].param_count as usize
+                } else if (func_idx as usize) < self.module.func_import_count() {
+                    match self.module.func_import_type(func_idx) {
+                        Some(ti) => {
+                            if (ti as usize) < self.module.func_types.len() {
+                                self.module.func_types[ti as usize].param_count as usize
+                            } else { 0 }
+                        }
+                        None => 0,
+                    }
+                } else {
+                    let li = (func_idx as usize) - self.module.func_import_count();
+                    if li < self.module.functions.len() {
+                        let ti = self.module.functions[li].type_idx as usize;
+                        if ti < self.module.func_types.len() {
+                            self.module.func_types[ti].param_count as usize
+                        } else { 0 }
+                    } else { 0 }
+                };
+
+                // Save the arguments from the stack
+                let mut args = [Value::I32(0); MAX_PARAMS];
+                for i in (0..param_count).rev() {
+                    args[i] = try_exec!(self.pop());
+                }
+
+                // Pop current frame (tail call: reuse the caller's slot)
                 if self.call_depth > 0 {
                     let frame = self.call_stack[self.call_depth - 1];
                     self.call_depth -= 1;
@@ -2374,6 +2442,12 @@ impl WasmInstance {
                     self.pc = frame.return_pc;
                     self.block_depth = frame.saved_block_depth;
                 }
+
+                // Push arguments back for the new function
+                for i in 0..param_count {
+                    try_exec!(self.push(args[i]));
+                }
+
                 if (func_idx as usize) < self.module.func_import_count() {
                     return match self.handle_import_call(func_idx) {
                         Ok(result) => result,
@@ -4492,10 +4566,36 @@ impl WasmInstance {
                         }
                     }
                     26 => { // any.convert_extern: pop externref, push anyref
-                        // Pass through — our representation is compatible
+                        let val = try_exec!(self.pop());
+                        match val {
+                            Value::NullRef => { try_exec!(self.push(Value::NullRef)); }
+                            _ => {
+                                // Wrap externref in a GC object so it's distinguishable from i31ref
+                                let heap_idx = self.gc_heap.len() as u32;
+                                self.gc_heap.push(GcObject::Extern { value: val });
+                                try_exec!(self.push(Value::GcRef(heap_idx)));
+                            }
+                        }
                     }
                     27 => { // extern.convert_any: pop anyref, push externref
-                        // Pass through — our representation is compatible
+                        let val = try_exec!(self.pop());
+                        match val {
+                            Value::NullRef => { try_exec!(self.push(Value::NullRef)); }
+                            Value::GcRef(idx) => {
+                                // Unwrap GcObject::Extern back to externref
+                                if (idx as usize) < self.gc_heap.len() {
+                                    if let GcObject::Extern { value } = &self.gc_heap[idx as usize] {
+                                        try_exec!(self.push(*value));
+                                    } else {
+                                        // Non-extern GC object: wrap as I32(idx)
+                                        try_exec!(self.push(Value::I32(idx as i32)));
+                                    }
+                                } else {
+                                    try_exec!(self.push(val));
+                                }
+                            }
+                            _ => { try_exec!(self.push(val)); }
+                        }
                     }
                     _ => {
                         return ExecResult::Trap(WasmError::UnsupportedProposal);

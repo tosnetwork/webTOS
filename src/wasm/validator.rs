@@ -148,7 +148,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             if (ref_idx as usize) < global_import_count {
                 let mut gi: usize = 0;
                 for imp in &module.imports {
-                    if let ImportKind::Global(_, mutable) = imp.kind {
+                    if let ImportKind::Global(_, mutable, _) = imp.kind {
                         if gi == ref_idx as usize {
                             if mutable {
                                 return Err(WasmError::TypeMismatch);
@@ -223,9 +223,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     // 3. An export
     let mut declared_funcs: BTreeSet<u32> = BTreeSet::new();
     for seg in &module.element_segments {
-        for &fi in &seg.func_indices {
-            if fi != u32::MAX {
-                declared_funcs.insert(fi);
+        // Only collect function indices from funcref-typed element segments
+        let is_func_elem = matches!(seg.elem_type, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+        if is_func_elem {
+            for &fi in &seg.func_indices {
+                if fi != u32::MAX {
+                    declared_funcs.insert(fi);
+                }
             }
         }
     }
@@ -248,9 +252,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 
     // Validate element segments
     for seg in &module.element_segments {
-        for &fi in &seg.func_indices {
-            if fi != u32::MAX && fi as usize >= total_functions {
-                return Err(WasmError::FunctionNotFound(fi));
+        // Only validate function index bounds for funcref-typed segments
+        let is_func_elem = matches!(seg.elem_type, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+        if is_func_elem {
+            for &fi in &seg.func_indices {
+                if fi != u32::MAX && fi as usize >= total_functions {
+                    return Err(WasmError::FunctionNotFound(fi));
+                }
             }
         }
         if seg.mode == ElemMode::Active {
@@ -324,7 +332,7 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 fn get_imported_global_type(module: &WasmModule, global_idx: u32) -> Option<ValType> {
     let mut gi = 0u32;
     for imp in &module.imports {
-        if let ImportKind::Global(vt_byte, _) = imp.kind {
+        if let ImportKind::Global(vt_byte, _, _) = imp.kind {
             if gi == global_idx {
                 return match vt_byte {
                     0x7F => Some(ValType::I32),
@@ -348,7 +356,7 @@ fn count_table_imports(module: &WasmModule) -> usize {
 }
 
 fn count_global_imports(module: &WasmModule) -> usize {
-    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Global(_, _))).count()
+    module.imports.iter().filter(|imp| matches!(imp.kind, ImportKind::Global(_, _, _))).count()
 }
 
 /// Check if two types are ref-compatible (both ref types are interchangeable
@@ -388,7 +396,7 @@ fn validate_init_expr_for_segment(
         if (ref_idx as usize) < global_import_count {
             let mut gi: usize = 0;
             for imp in &module.imports {
-                if let ImportKind::Global(_, mutable) = imp.kind {
+                if let ImportKind::Global(_, mutable, _) = imp.kind {
                     if gi == ref_idx as usize {
                         if mutable {
                             return Err(WasmError::ConstExprRequired);
@@ -458,22 +466,8 @@ fn table_index_type(module: &WasmModule, table_idx: u32) -> ValType {
 /// Check if source ref type is compatible with destination ref type.
 /// Subtyping: non-nullable is subtype of nullable, typed is subtype of abstract.
 fn ref_types_compatible(src: ValType, dst: ValType) -> bool {
-    if src == dst { return true; }
-    // FuncRef family subtyping:
-    //   TypedFuncRef (ref $t or ref func) <: NullableTypedFuncRef (ref null $t)
-    //   TypedFuncRef <: FuncRef (ref null func / funcref)
-    //   NullableTypedFuncRef <: FuncRef
-    let src_func = matches!(src, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
-    let dst_func = matches!(dst, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
-    if src_func && dst_func {
-        // FuncRef (nullable abstract) is the top of the func ref hierarchy
-        if dst == ValType::FuncRef { return true; }
-        // NullableTypedFuncRef accepts TypedFuncRef
-        if dst == ValType::NullableTypedFuncRef && src == ValType::TypedFuncRef { return true; }
-        // TypedFuncRef only accepts TypedFuncRef (already handled by src == dst)
-        return false;
-    }
-    false
+    // Use the comprehensive subtype check
+    val_is_subtype(src, dst)
 }
 
 /// Comprehensive subtype check for validator pop_expect.
@@ -758,7 +752,15 @@ impl<'a> Validator<'a> {
                 -0x05 => ValType::V128,  // 0x7B
                 -0x10 => ValType::FuncRef,   // 0x70 = funcref
                 -0x11 => ValType::ExternRef, // 0x6F = externref
+                -0x12 => ValType::AnyRef,    // 0x6E = anyref
+                -0x13 => ValType::EqRef,     // 0x6D = eqref
+                -0x14 => ValType::I31Ref,    // 0x6C = i31ref
+                -0x15 => ValType::NullableStructRef, // 0x6B = structref
+                -0x16 => ValType::ArrayRef,  // 0x6A = arrayref
                 -0x17 => ValType::ExnRef,    // 0x69 = exnref
+                -0x0F => ValType::NoneRef,   // 0x71 = nullref
+                -0x0E => ValType::ExternRef, // 0x72 = nullexternref
+                -0x0D => ValType::FuncRef,   // 0x73 = nullfuncref
                 -0x1D => {
                     // 0x63 = (ref null ht) — read the heap type
                     let heap_type = self.read_i32()?;
@@ -824,7 +826,7 @@ impl<'a> Validator<'a> {
     fn global_type(&self, idx: u32) -> Result<(ValType, bool), WasmError> {
         let mut global_import_idx: u32 = 0;
         for imp in &self.module.imports {
-            if let ImportKind::Global(vt_byte, mutable) = imp.kind {
+            if let ImportKind::Global(vt_byte, mutable, _) = imp.kind {
                 if global_import_idx == idx {
                     let vt = byte_to_valtype(vt_byte)?;
                     return Ok((vt, mutable));
@@ -2290,10 +2292,13 @@ impl<'a> Validator<'a> {
                     let sub = self.read_u32()?;
                     match sub {
                         0 => { // struct.new: typeidx — pop N fields, push structref
-                            let _type_idx = self.read_u32()?;
-                            // We don't know field count; just mark unreachable-like by clearing stack
-                            // Actually just pop unknown number and push a ref
-                            // For now, accept anything — push a dummy ref
+                            let type_idx = self.read_u32()?;
+                            // Pop field values in reverse order
+                            if let Some(crate::wasm::decoder::GcTypeDef::Struct { field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                for _ in 0..field_types.len() {
+                                    let _ = self.pop_opd()?;
+                                }
+                            }
                             self.push_opd(StackType::Unknown);
                         }
                         1 => { // struct.new_default: typeidx — push structref
@@ -2386,7 +2391,9 @@ impl<'a> Validator<'a> {
                             let _ = self.read_u32()?; // label
                             let _ = self.read_i32()?; // ht1
                             let _ = self.read_i32()?; // ht2
-                            // These are conditional branches; leave stack mostly intact
+                            // Pop the input ref, push back (conditional branch)
+                            let val = self.pop_opd()?;
+                            self.push_opd(val);
                         }
                         26 | 27 => { // any.convert_extern, extern.convert_any: pop ref, push ref
                             let _ = self.pop_opd()?;
@@ -2394,9 +2401,7 @@ impl<'a> Validator<'a> {
                         }
                         28 => { // ref.i31: pop i32, push i31ref
                             self.pop_expect(ValType::I32)?;
-                            // Push as Unknown since our type system doesn't have i31ref
-                            // but it needs to be compatible with TypedFuncRef for function returns
-                            self.push_opd(StackType::Unknown);
+                            self.push_val(ValType::I31Ref);
                         }
                         29 | 30 => { // i31.get_s, i31.get_u: pop i31ref, push i32
                             let _ = self.pop_opd()?;

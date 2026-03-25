@@ -949,7 +949,7 @@ impl WastRunner {
     fn sync_imported_globals(&self, handle: &InstanceHandle) {
         let mut record = handle.borrow_mut();
         let num_global_imports = record.instance.module.imports.iter()
-            .filter(|i| matches!(i.kind, ImportKind::Global(_, _)))
+            .filter(|i| matches!(i.kind, ImportKind::Global(_, _, _)))
             .count();
 
         // Collect import info first to avoid borrow conflict
@@ -957,7 +957,7 @@ impl WastRunner {
             let mut global_idx = 0usize;
             let mut result = Vec::new();
             for import in &record.instance.module.imports {
-                let ImportKind::Global(_, mutable) = import.kind else {
+                let ImportKind::Global(_, mutable, _) = import.kind else {
                     continue;
                 };
                 let module_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
@@ -995,7 +995,7 @@ impl WastRunner {
         let record = handle.borrow();
         let mut global_idx = 0usize;
         for import in &record.instance.module.imports {
-            let ImportKind::Global(_, mutable) = import.kind else {
+            let ImportKind::Global(_, mutable, _) = import.kind else {
                 continue;
             };
             if !mutable {
@@ -1088,7 +1088,7 @@ impl WastRunner {
     fn inject_imported_globals(&self, module: &mut WasmModule) -> RunnerResult<()> {
         let mut imported = Vec::new();
         for import in &module.imports {
-            let ImportKind::Global(val_type_byte, mutable) = import.kind else {
+            let ImportKind::Global(val_type_byte, mutable, _) = import.kind else {
                 continue;
             };
             let module_name = bytes_to_string(module.get_name(import.module_name_offset, import.module_name_len));
@@ -1186,7 +1186,7 @@ impl WastRunner {
         let mut funcref_fixups: Vec<(usize, String, u32)> = Vec::new();
         let mut global_idx = 0usize;
         for import in &module.imports {
-            if let ImportKind::Global(vt_byte, _) = import.kind {
+            if let ImportKind::Global(vt_byte, _, _) = import.kind {
                 // funcref = 0x70, externref = 0x6F
                 if vt_byte == 0x70 {
                     let module_name = bytes_to_string(module.get_name(
@@ -1422,8 +1422,8 @@ impl WastRunner {
                     self.validate_memory_import(module, &module_name, &field_name, mem_import_idx)?;
                     mem_import_idx += 1;
                 }
-                ImportKind::Global(val_type_byte, mutable) => {
-                    self.validate_global_import(&module_name, &field_name, val_type_byte, mutable)?;
+                ImportKind::Global(val_type_byte, mutable, heap_type) => {
+                    self.validate_global_import(&module_name, &field_name, val_type_byte, mutable, heap_type)?;
                 }
                 ImportKind::Tag(type_idx) => {
                     // Tag imports: validate that the source module exports a compatible tag
@@ -1837,6 +1837,7 @@ impl WastRunner {
         field_name: &str,
         val_type_byte: u8,
         mutable: bool,
+        heap_type: Option<i32>,
     ) -> RunnerResult<()> {
         let val_type = decode_valtype_byte(val_type_byte).ok_or_else(|| {
             RunnerError::new("link", format!("unsupported imported global type 0x{val_type_byte:02x}"))
@@ -1887,7 +1888,7 @@ impl WastRunner {
             let idx = global_idx.unwrap() as usize;
             // Check type
             if let Some(gdef) = record.instance.module.globals.get(idx) {
-                if gdef.val_type != val_type {
+                if gdef.val_type != val_type && !global_types_compatible(val_type, val_type_byte, heap_type, gdef.val_type, mutable) {
                     return Err(RunnerError::new(
                         "link",
                         format!("incompatible import type for global `{module_name}::{field_name}`: type mismatch"),
@@ -2708,6 +2709,77 @@ fn ref_types_compatible(a: ValType, b: ValType) -> bool {
     if a == ValType::ExternRef && b == ValType::ExternRef {
         return true;
     }
+    false
+}
+
+/// Check if a global import type is compatible with an export type for linking.
+/// For immutable globals, subtyping is allowed (import can be supertype of export).
+/// For mutable globals, types must match exactly (invariance).
+///
+/// heap_type: decoded heap type for 0x63/0x64 imports.
+///   Negative values = abstract heap types: -16=func, -17=extern, -14=any, -13=eq, etc.
+///   Non-negative values = concrete type indices.
+fn global_types_compatible(
+    import_val_type: ValType,
+    import_byte: u8,
+    heap_type: Option<i32>,
+    export_val_type: ValType,
+    mutable: bool,
+) -> bool {
+    fn is_funcref_family(t: ValType) -> bool {
+        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+    }
+    fn is_externref_family(t: ValType) -> bool {
+        matches!(t, ValType::ExternRef)
+    }
+
+    // Determine which "family" the import belongs to based on heap type
+    let import_is_abstract_func = is_funcref_family(import_val_type)
+        || (matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(-16)));
+    let import_is_abstract_extern = is_externref_family(import_val_type)
+        || (matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(-17)));
+    let import_is_concrete = matches!(import_byte, 0x63 | 0x64) && matches!(heap_type, Some(ht) if ht >= 0);
+
+    if mutable {
+        // Mutable globals require exact type match (invariance).
+        // Same well-known ref types are OK
+        if is_funcref_family(import_val_type) && import_val_type == export_val_type {
+            return true;
+        }
+        if is_externref_family(import_val_type) && is_externref_family(export_val_type) {
+            return true;
+        }
+        // For concrete typed refs (0x63/0x64 + type index), both sides must have matching
+        // types. But we can't verify type index equality through our GlobalDef, so reject.
+        return false;
+    }
+
+    // Immutable globals: import is supertype of export.
+
+    // (ref null func) / funcref is supertype of any funcref-family type
+    if import_is_abstract_func && import_byte != 0x64 && is_funcref_family(export_val_type) {
+        return true;
+    }
+    // (ref func) is supertype of non-nullable funcref types
+    if import_is_abstract_func && import_byte == 0x64 {
+        // Accept TypedFuncRef (non-nullable) but not FuncRef/NullableTypedFuncRef (nullable)
+        if export_val_type == ValType::TypedFuncRef {
+            return true;
+        }
+    }
+
+    // (ref null extern) / externref is supertype of externref
+    if import_is_abstract_extern && is_externref_family(export_val_type) {
+        return true;
+    }
+
+    // Concrete type imports (ref null $t) / (ref $t) - we can't match type indices
+    // precisely through our GlobalDef model, so reject mismatches.
+    // This correctly rejects e.g. importing (ref null $t) for an export of (ref null func).
+    if import_is_concrete {
+        return false;
+    }
+
     false
 }
 

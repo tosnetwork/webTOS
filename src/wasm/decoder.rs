@@ -80,7 +80,7 @@ pub enum ImportKind {
     Func(u32),           // type index
     Table(ValType),      // table import with element type
     Memory,              // memory import
-    Global(u8, bool),    // valtype byte, mutable
+    Global(u8, bool, Option<i32>),    // valtype byte, mutable, heap type (for 0x63/0x64)
     Tag(u32),            // tag import: type index (exception handling proposal)
 }
 
@@ -139,6 +139,8 @@ pub struct TableDef {
     pub elem_type: ValType,
     /// Whether this table uses 64-bit indices (table64 proposal).
     pub is_table64: bool,
+    /// Optional init expression bytes for all table slots (GC proposal).
+    pub init_expr_bytes: Option<Vec<u8>>,
 }
 
 /// A memory definition (imported or locally defined).
@@ -1133,7 +1135,7 @@ fn decode_import_section(
                     if is_table64 { Some(decode_leb128_u64(bytes, pos)? as u32) } else { Some(decode_leb128_u32(bytes, pos)?) }
                 } else { None };
                 // Add imported table to module tables so runtime can create it
-                module.tables.push(TableDef { min, max, elem_type: et, is_table64 });
+                module.tables.push(TableDef { min, max, elem_type: et, is_table64, init_expr_bytes: None });
                 imp.kind = ImportKind::Table(et);
             }
             0x02 => {
@@ -1206,14 +1208,16 @@ fn decode_import_section(
                 // Global import: valtype + mutability
                 let vt = read_byte(bytes, pos)?;
                 // Handle multi-byte ref types (0x63, 0x64)
-                if vt == 0x63 || vt == 0x64 {
-                    let _ = decode_leb128_i32(bytes, pos)?;
-                }
+                let heap_type = if vt == 0x63 || vt == 0x64 {
+                    Some(decode_leb128_i32(bytes, pos)?)
+                } else {
+                    None
+                };
                 let mt = read_byte(bytes, pos)?;
                 if mt > 1 {
                     return Err(WasmError::InvalidSection);
                 }
-                imp.kind = ImportKind::Global(vt, mt != 0);
+                imp.kind = ImportKind::Global(vt, mt != 0, heap_type);
             }
             0x04 => {
                 // Tag import (exception handling proposal): attribute byte + type index
@@ -1536,10 +1540,15 @@ fn decode_table_section(
             None
         };
 
-        // If has_init_expr, skip the init expression
-        if has_init_expr {
+        // If has_init_expr, store init expression bytes
+        let init_expr_bytes = if has_init_expr {
+            let start = *pos;
             let _ = eval_init_expr(bytes, pos)?;
-        }
+            let end = *pos;
+            Some(bytes[start..end].to_vec())
+        } else {
+            None
+        };
 
         let et = match elemtype {
             0x70 => ValType::FuncRef,
@@ -1575,7 +1584,7 @@ fn decode_table_section(
                 else { ValType::NullableTypedFuncRef }
             }
         };
-        module.tables.push(TableDef { min, max, elem_type: et, is_table64 });
+        module.tables.push(TableDef { min, max, elem_type: et, is_table64, init_expr_bytes });
     }
     Ok(())
 }
@@ -2150,8 +2159,8 @@ pub fn scan_init_expr_info_gc(bytes: &[u8], start: usize, gc_types: &[GcTypeDef]
                         }
                         26 | 27 => {} // any.convert_extern, extern.convert_any: pop ref, push ref
                         28 => { // ref.i31: pop i32, push i31ref
-                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
-                            else if sp < 16 { type_stack[sp] = Some(ValType::I32); sp += 1; }
+                            if sp > 0 { type_stack[sp - 1] = Some(ValType::I31Ref); }
+                            else if sp < 16 { type_stack[sp] = Some(ValType::I31Ref); sp += 1; }
                         }
                         29 | 30 => { // i31.get_s/u: pop i31ref, push i32
                             if sp > 0 { type_stack[sp - 1] = Some(ValType::I32); }
