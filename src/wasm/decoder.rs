@@ -5,6 +5,7 @@
 //! Supports sections: Type (1), Import (2), Function (3), Memory (5),
 //! Export (7), Code (10).
 
+use alloc::vec;
 use alloc::vec::Vec;
 use crate::wasm::types::*;
 
@@ -271,6 +272,10 @@ pub enum GcTypeDef {
 pub struct SubTypeInfo {
     pub supertype: Option<u32>,
     pub is_final: bool,
+    /// The starting type index of the rec group this type belongs to.
+    pub rec_group_start: u32,
+    /// The number of types in the rec group this type belongs to.
+    pub rec_group_size: u32,
 }
 
 /// A fully decoded WASM module.
@@ -778,11 +783,11 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7B => Ok(ValType::V128),
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
-        0x6E => Ok(ValType::AnyRef),
-        0x6D => Ok(ValType::EqRef),
+        0x6E => Ok(ValType::NullableAnyRef),
+        0x6D => Ok(ValType::NullableEqRef),
         0x6C => Ok(ValType::I31Ref),
         0x6B => Ok(ValType::NullableStructRef),
-        0x6A => Ok(ValType::ArrayRef),
+        0x6A => Ok(ValType::NullableArrayRef),
         0x73 => Ok(ValType::NullFuncRef),    // nullfuncref = (ref null nofunc)
         0x72 => Ok(ValType::NullExternRef),  // nullexternref = (ref null noextern)
         0x71 => Ok(ValType::NoneRef),
@@ -809,11 +814,11 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
         // GC proposal shorthand encodings (single-byte, implicitly nullable):
-        0x6E => Ok(ValType::AnyRef),              // anyref = (ref null any)
-        0x6D => Ok(ValType::EqRef),               // eqref = (ref null eq)
+        0x6E => Ok(ValType::NullableAnyRef),      // anyref = (ref null any)
+        0x6D => Ok(ValType::NullableEqRef),       // eqref = (ref null eq)
         0x6C => Ok(ValType::I31Ref),              // i31ref = (ref null i31)
         0x6B => Ok(ValType::NullableStructRef),   // structref = (ref null struct)
-        0x6A => Ok(ValType::ArrayRef),            // arrayref = (ref null array)
+        0x6A => Ok(ValType::NullableArrayRef),    // arrayref = (ref null array)
         0x73 => Ok(ValType::NullFuncRef),         // nullfuncref = (ref null nofunc)
         0x72 => Ok(ValType::NullExternRef),      // nullexternref = (ref null noextern)
         0x71 => Ok(ValType::NoneRef),             // nullref = (ref null none)
@@ -831,13 +836,11 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
                 -16 => { // func
                     if nullable { Ok(ValType::FuncRef) } else { Ok(ValType::NonNullableFuncRef) }
                 }
-                -18 => Ok(ValType::AnyRef),     // any
-                -19 => Ok(ValType::EqRef),      // eq
+                -18 => if nullable { Ok(ValType::NullableAnyRef) } else { Ok(ValType::AnyRef) },
+                -19 => if nullable { Ok(ValType::NullableEqRef) } else { Ok(ValType::EqRef) },
                 -20 => Ok(ValType::I31Ref),     // i31
-                -21 => { // struct
-                    if nullable { Ok(ValType::NullableStructRef) } else { Ok(ValType::StructRef) }
-                }
-                -22 => Ok(ValType::ArrayRef),   // array
+                -21 => if nullable { Ok(ValType::NullableStructRef) } else { Ok(ValType::StructRef) },
+                -22 => if nullable { Ok(ValType::NullableArrayRef) } else { Ok(ValType::ArrayRef) },
                 -15 => Ok(ValType::NoneRef),    // none
                 -14 => Ok(ValType::NullExternRef),  // noextern
                 -13 => Ok(ValType::NullFuncRef),    // nofunc
@@ -948,11 +951,11 @@ fn decode_reftype_real_with_limit(bytes: &[u8], pos: &mut usize, max_type_idx: u
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
         // GC proposal shorthand encodings (single-byte, implicitly nullable):
-        0x6E => Ok(ValType::AnyRef),       // anyref = (ref null any)
-        0x6D => Ok(ValType::EqRef),        // eqref = (ref null eq)
+        0x6E => Ok(ValType::NullableAnyRef), // anyref = (ref null any)
+        0x6D => Ok(ValType::NullableEqRef), // eqref = (ref null eq)
         0x6C => Ok(ValType::I31Ref),       // i31ref = (ref null i31)
         0x6B => Ok(ValType::NullableStructRef), // structref = (ref null struct)
-        0x6A => Ok(ValType::ArrayRef),     // arrayref = (ref null array)
+        0x6A => Ok(ValType::NullableArrayRef), // arrayref = (ref null array)
         0x73 => Ok(ValType::NullFuncRef),    // nullfuncref = (ref null nofunc)
         0x72 => Ok(ValType::NullExternRef), // nullexternref = (ref null noextern)
         0x71 => Ok(ValType::NoneRef),      // nullref = (ref null none)
@@ -1037,7 +1040,7 @@ fn decode_composite_type_with_limit(
 ) -> Result<(), WasmError> {
     let sub_marker = read_byte(bytes, pos)?;
     let inner_marker;
-    let mut sub_info = SubTypeInfo { supertype: None, is_final: true };
+    let mut sub_info = SubTypeInfo { supertype: None, is_final: true, rec_group_start: 0, rec_group_size: 1 };
     if sub_marker == 0x50 || sub_marker == 0x4F {
         // sub/sub_final: read supertype count + supertypes
         module.gc_enabled = true;
@@ -1145,6 +1148,13 @@ fn decode_type_section(
             for _ in 0..rec_count {
                 decode_composite_type_with_limit(bytes, pos, module, rec_end)?;
             }
+            // Set rec group info on all types in this group
+            for idx in rec_start..rec_end {
+                if let Some(si) = module.sub_types.get_mut(idx as usize) {
+                    si.rec_group_start = rec_start;
+                    si.rec_group_size = rec_count as u32;
+                }
+            }
             continue;
         }
         // For non-rec types, "unread" the marker by backing up
@@ -1152,6 +1162,11 @@ fn decode_type_section(
         let current_type_idx = module.func_types.len() as u32;
         // Allow self-ref (current_type_idx + 1) so validator can later reject for non-GC.
         decode_composite_type_with_limit(bytes, pos, module, current_type_idx + 1)?;
+        // Set rec group info for this singleton type
+        if let Some(si) = module.sub_types.get_mut(current_type_idx as usize) {
+            si.rec_group_start = current_type_idx;
+            si.rec_group_size = 1;
+        }
     }
 
     Ok(())
@@ -1197,28 +1212,28 @@ fn decode_import_section(
                 let et = match elemtype {
                     0x70 => ValType::FuncRef,
                     0x6F => ValType::ExternRef,
-                    0x6E => ValType::AnyRef,
-                    0x6D => ValType::EqRef,
+                    0x6E => ValType::NullableAnyRef,
+                    0x6D => ValType::NullableEqRef,
                     0x6C => ValType::I31Ref,
                     0x6B => ValType::NullableStructRef,
-                    0x6A => ValType::ArrayRef,
+                    0x6A => ValType::NullableArrayRef,
                     0x73 => ValType::NullFuncRef,
                     0x72 => ValType::NullExternRef,
                     0x71 => ValType::NoneRef,
                     0x69 => ValType::ExnRef,
                     0x74 => ValType::ExnRef,    // nullexnref
-                    0x68 => ValType::AnyRef,
+                    0x68 => ValType::NullableAnyRef,
                     0x63 | 0x64 => {
                         let ht = decode_leb128_i32(bytes, pos)?;
                         let nullable = elemtype == 0x63;
                         match ht {
                             -16 => if nullable { ValType::FuncRef } else { ValType::TypedFuncRef },
                             -17 => ValType::ExternRef,
-                            -18 => ValType::AnyRef,
-                            -19 => ValType::EqRef,
+                            -18 => if nullable { ValType::NullableAnyRef } else { ValType::AnyRef },
+                            -19 => if nullable { ValType::NullableEqRef } else { ValType::EqRef },
                             -20 => ValType::I31Ref,
                             -21 => if nullable { ValType::NullableStructRef } else { ValType::StructRef },
-                            -22 => ValType::ArrayRef,
+                            -22 => if nullable { ValType::NullableArrayRef } else { ValType::ArrayRef },
                             -23 => ValType::ExnRef,
                             -15 => ValType::NoneRef,
                             -13 => ValType::NullFuncRef,
@@ -1678,17 +1693,17 @@ fn decode_table_section(
         let et = match elemtype {
             0x70 => ValType::FuncRef,
             0x6F => ValType::ExternRef,
-            0x6E => ValType::AnyRef,
-            0x6D => ValType::EqRef,
+            0x6E => ValType::NullableAnyRef,
+            0x6D => ValType::NullableEqRef,
             0x6C => ValType::I31Ref,
             0x6B => ValType::NullableStructRef,
-            0x6A => ValType::ArrayRef,
+            0x6A => ValType::NullableArrayRef,
             0x73 => ValType::NullFuncRef,    // nullfuncref
             0x72 => ValType::NullExternRef,  // nullexternref
             0x71 => ValType::NoneRef,      // nullref
             0x69 => ValType::ExnRef,       // exnref
             0x74 => ValType::ExnRef,       // nullexnref
-            0x68 => ValType::AnyRef,       // contref
+            0x68 => ValType::NullableAnyRef, // contref
             0x64 => {
                 // (ref ht) = non-nullable
                 if elem_heap_type == -16 { ValType::TypedFuncRef }
@@ -1709,11 +1724,11 @@ fn decode_table_section(
                 // 0x63 = (ref null ht) = nullable
                 if elem_heap_type == -16 { ValType::FuncRef }
                 else if elem_heap_type == -17 { ValType::ExternRef }
-                else if elem_heap_type == -18 { ValType::AnyRef }
-                else if elem_heap_type == -19 { ValType::EqRef }
+                else if elem_heap_type == -18 { ValType::NullableAnyRef }
+                else if elem_heap_type == -19 { ValType::NullableEqRef }
                 else if elem_heap_type == -20 { ValType::I31Ref }
                 else if elem_heap_type == -21 { ValType::NullableStructRef }
-                else if elem_heap_type == -22 { ValType::ArrayRef }
+                else if elem_heap_type == -22 { ValType::NullableArrayRef }
                 else if elem_heap_type == -23 { ValType::ExnRef }
                 else if elem_heap_type == -15 { ValType::NoneRef }
                 else if elem_heap_type == -13 { ValType::NullFuncRef }
@@ -2246,11 +2261,11 @@ pub fn scan_init_expr_info_gc(bytes: &[u8], start: usize, gc_types: &[GcTypeDef]
                 let vt = match ht {
                     Ok(-0x10) => Some(ValType::FuncRef),     // (ref null func) = funcref
                     Ok(-0x11) => Some(ValType::ExternRef),   // (ref null extern) = externref
-                    Ok(-0x12) => Some(ValType::AnyRef),      // (ref null any) = anyref
-                    Ok(-0x13) => Some(ValType::EqRef),       // (ref null eq) = eqref
+                    Ok(-0x12) => Some(ValType::NullableAnyRef), // (ref null any) = anyref
+                    Ok(-0x13) => Some(ValType::NullableEqRef), // (ref null eq) = eqref
                     Ok(-0x14) => Some(ValType::I31Ref),      // (ref null i31) = i31ref
                     Ok(-0x15) => Some(ValType::NullableStructRef), // (ref null struct) = structref
-                    Ok(-0x16) => Some(ValType::ArrayRef),    // (ref null array) = arrayref
+                    Ok(-0x16) => Some(ValType::NullableArrayRef), // (ref null array) = arrayref
                     Ok(-0x0F) => Some(ValType::NoneRef),     // (ref null none) = nullref
                     Ok(-0x0D) => Some(ValType::NullFuncRef),   // (ref null nofunc) = nullfuncref
                     Ok(-0x0E) => Some(ValType::NullExternRef), // (ref null noextern) = nullexternref

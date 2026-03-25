@@ -2108,11 +2108,9 @@ impl WastRunner {
                         let exp_type_idx = record.instance.module.tag_types
                             .get(exp_tag_idx as usize)
                             .copied();
-                        if let (Some(import_ft), Some(exp_ti)) = (
-                            module.func_types.get(type_idx as usize),
-                            exp_type_idx.and_then(|ti| record.instance.module.func_types.get(ti as usize)),
-                        ) {
-                            if !func_types_match(import_ft, exp_ti) {
+                        if let Some(exp_ti) = exp_type_idx {
+                            // Use rec-group-aware type equivalence check
+                            if !type_indices_equivalent(module, type_idx, &record.instance.module, exp_ti) {
                                 return Err(RunnerError::new(
                                     "link",
                                     format!("incompatible import type for tag `{module_name}::{field_name}`"),
@@ -2171,13 +2169,41 @@ impl WastRunner {
                         format!("module `{module_name}` does not export function `{field_name}`"),
                     )
                 })?;
+            // Check type compatibility using rec-group-aware type comparison.
+            // For function imports, the exported function's type must be a subtype of
+            // or equivalent to the imported type. As a simplification, we check:
+            // 1. Rec-group equivalence (strict, handles rec group tests)
+            // 2. If either type is in a non-trivial rec group (size > 1), require strict equivalence
+            // 3. Otherwise, allow structural matching (handles subtyping cases)
+            let import_type_idx = function_type_idx(module, func_idx);
+            let target_type_idx = function_type_idx(&record.instance.module, target_idx);
             let target_ty = function_type(&record.instance.module, target_idx).ok_or_else(|| {
                 RunnerError::new(
                     "link",
                     format!("missing function type for `{module_name}::{field_name}`"),
                 )
             })?;
-            if !func_types_match(signature, target_ty) {
+            let compatible = if let (Some(it), Some(tt)) = (import_type_idx, target_type_idx) {
+                if type_indices_equivalent(module, it, &record.instance.module, tt) {
+                    true
+                } else {
+                    // Check if either type is in a non-trivial rec group
+                    let import_rec_size = module.sub_types.get(it as usize)
+                        .map(|s| s.rec_group_size).unwrap_or(1);
+                    let target_rec_size = record.instance.module.sub_types.get(tt as usize)
+                        .map(|s| s.rec_group_size).unwrap_or(1);
+                    if import_rec_size > 1 || target_rec_size > 1 {
+                        // Require rec group equivalence for non-trivial rec groups
+                        false
+                    } else {
+                        // Singleton rec groups: fall back to structural match
+                        func_types_match(signature, target_ty)
+                    }
+                }
+            } else {
+                func_types_match(signature, target_ty)
+            };
+            if !compatible {
                 return Err(RunnerError::new(
                     "link",
                     format!(
@@ -3148,13 +3174,17 @@ fn nth_function_import(module: &WasmModule, func_idx: u32) -> Option<&crate::was
 }
 
 fn function_type(module: &WasmModule, func_idx: u32) -> Option<&FuncTypeDef> {
+    let type_idx = function_type_idx(module, func_idx)?;
+    module.func_types.get(type_idx as usize)
+}
+
+fn function_type_idx(module: &WasmModule, func_idx: u32) -> Option<u32> {
     if (func_idx as usize) < module.func_import_count() {
-        let type_idx = module.func_import_type(func_idx)? as usize;
-        return module.func_types.get(type_idx);
+        return module.func_import_type(func_idx);
     }
     let local_idx = (func_idx as usize).checked_sub(module.func_import_count())?;
     let func = module.functions.get(local_idx)?;
-    module.func_types.get(func.type_idx as usize)
+    Some(func.type_idx)
 }
 
 fn exported_global_index(module: &WasmModule, name: &str) -> Option<u32> {
@@ -3205,6 +3235,89 @@ fn func_types_match(a: &FuncTypeDef, b: &FuncTypeDef) -> bool {
         }
     }
     true
+}
+
+/// Check if two type indices (from potentially different modules) refer to
+/// equivalent types, taking rec group structure into account.
+/// Two types are equivalent iff:
+/// 1. They are at the same position within their respective rec groups
+/// 2. Their rec groups have the same size
+/// 3. All corresponding types in the rec groups are structurally equivalent
+fn type_indices_equivalent(
+    mod_a: &WasmModule, type_idx_a: u32,
+    mod_b: &WasmModule, type_idx_b: u32,
+) -> bool {
+    let si_a = mod_a.sub_types.get(type_idx_a as usize);
+    let si_b = mod_b.sub_types.get(type_idx_b as usize);
+    match (si_a, si_b) {
+        (Some(a), Some(b)) => {
+            // Must be in rec groups of the same size
+            if a.rec_group_size != b.rec_group_size {
+                return false;
+            }
+            // Must be at the same position within the rec group
+            let pos_a = type_idx_a - a.rec_group_start;
+            let pos_b = type_idx_b - b.rec_group_start;
+            if pos_a != pos_b {
+                return false;
+            }
+            // All types in the rec group must be structurally equivalent
+            for i in 0..a.rec_group_size {
+                let idx_a = a.rec_group_start + i;
+                let idx_b = b.rec_group_start + i;
+                let ft_a = mod_a.func_types.get(idx_a as usize);
+                let ft_b = mod_b.func_types.get(idx_b as usize);
+                match (ft_a, ft_b) {
+                    (Some(fa), Some(fb)) => {
+                        if !func_types_match(fa, fb) {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+                // Also check gc_types match
+                let gc_a = mod_a.gc_types.get(idx_a as usize);
+                let gc_b = mod_b.gc_types.get(idx_b as usize);
+                match (gc_a, gc_b) {
+                    (Some(a), Some(b)) => {
+                        if std::mem::discriminant(a) != std::mem::discriminant(b) {
+                            return false;
+                        }
+                    }
+                    (None, None) => {}
+                    _ => return false,
+                }
+                // Check subtype info matches
+                let si_a_i = mod_a.sub_types.get(idx_a as usize);
+                let si_b_i = mod_b.sub_types.get(idx_b as usize);
+                match (si_a_i, si_b_i) {
+                    (Some(sa), Some(sb)) => {
+                        if sa.is_final != sb.is_final { return false; }
+                        // Supertypes should be at the same relative position within the rec group
+                        match (sa.supertype, sb.supertype) {
+                            (None, None) => {}
+                            (Some(sp_a), Some(sp_b)) => {
+                                // If supertype is within the rec group, compare relative positions
+                                let rel_a = sp_a.wrapping_sub(a.rec_group_start);
+                                let rel_b = sp_b.wrapping_sub(b.rec_group_start);
+                                if rel_a != rel_b { return false; }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            true
+        }
+        // If no subtype info, fall back to structural comparison
+        _ => {
+            match (mod_a.func_types.get(type_idx_a as usize), mod_b.func_types.get(type_idx_b as usize)) {
+                (Some(fa), Some(fb)) => func_types_match(fa, fb),
+                _ => false,
+            }
+        }
+    }
 }
 
 fn validate_spectest_func_signature(name: &str, sig: &FuncTypeDef) -> RunnerResult<()> {

@@ -120,6 +120,8 @@ struct BlockFrame {
     legacy_exception_values: [Value; 4],
     /// Number of exception values stored.
     legacy_exception_value_count: u8,
+    /// Delegate label for legacy try-delegate blocks. u32::MAX = no delegate.
+    legacy_delegate_label: u32,
 }
 
 impl BlockFrame {
@@ -140,6 +142,7 @@ impl BlockFrame {
             legacy_exception_tag: u32::MAX,
             legacy_exception_values: [Value::I32(0); 4],
             legacy_exception_value_count: 0,
+            legacy_delegate_label: u32::MAX,
         }
     }
 }
@@ -509,8 +512,8 @@ impl WasmInstance {
         for (gi, (ref expr_bytes, val_type)) in global_info.iter().enumerate() {
             if expr_bytes.is_empty() { continue; }
             let needs_gc = matches!(val_type,
-                ValType::AnyRef | ValType::EqRef | ValType::I31Ref |
-                ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef |
+                ValType::AnyRef | ValType::NullableAnyRef | ValType::EqRef | ValType::NullableEqRef | ValType::I31Ref |
+                ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef | ValType::NullableArrayRef |
                 ValType::NoneRef | ValType::NullFuncRef | ValType::NullExternRef |
                 ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef);
             if !needs_gc { continue; }
@@ -1533,13 +1536,14 @@ impl WasmInstance {
 
     /// Scan a legacy try block to find catch/catch_all handler positions and the end PC.
     /// Called right after reading the block type of a `try` instruction.
-    /// Returns (legacy_catches, legacy_catch_count, end_pc).
-    fn scan_legacy_try(&mut self) -> Result<([LegacyCatch; MAX_LEGACY_CATCHES], u8, usize), WasmError> {
+    /// Returns (legacy_catches, legacy_catch_count, end_pc, delegate_label).
+    fn scan_legacy_try(&mut self) -> Result<([LegacyCatch; MAX_LEGACY_CATCHES], u8, usize, u32), WasmError> {
         let save_pc = self.pc;
         let mut catches = [LegacyCatch::zero(); MAX_LEGACY_CATCHES];
         let mut catch_count: u8 = 0;
         let mut depth: usize = 1;
         let mut end_pc = 0usize;
+        let mut delegate_label: u32 = u32::MAX;
 
         while depth > 0 {
             let b = self.read_byte()?;
@@ -1574,10 +1578,11 @@ impl WasmInstance {
                     }
                 }
                 0x18 => { // delegate
-                    let _ = self.read_leb128_u32()?;
+                    let label = self.read_leb128_u32()?;
                     depth -= 1;
                     if depth == 0 {
                         end_pc = self.pc;
+                        delegate_label = label;
                     }
                 }
                 0x0B => {
@@ -1671,7 +1676,7 @@ impl WasmInstance {
             }
         }
         self.pc = save_pc;
-        Ok((catches, catch_count, end_pc))
+        Ok((catches, catch_count, end_pc, delegate_label))
     }
 
     /// Skip forward in the bytecode to find the matching End for a block.
@@ -2174,6 +2179,18 @@ impl WasmInstance {
 
                 // Check legacy try blocks
                 if bf.is_legacy_try {
+                    // If this is a delegate block (no catches, has delegate label),
+                    // skip ahead by delegate_label levels
+                    if bf.legacy_delegate_label != u32::MAX {
+                        // Pop this block and skip delegate_label more blocks
+                        let skip = bf.legacy_delegate_label as usize;
+                        if try_block_idx >= skip {
+                            try_block_idx -= skip;
+                        } else {
+                            try_block_idx = base;
+                        }
+                        continue;
+                    }
                     for ci in 0..bf.legacy_catch_count as usize {
                         let lc = bf.legacy_catches[ci];
                         if lc.tag_idx == u32::MAX {
@@ -2595,7 +2612,7 @@ impl WasmInstance {
                 // Legacy try: opens a block with catch handlers
                 let block_type = try_exec!(self.read_block_type());
                 let (param_count, result_count) = self.decode_block_type(block_type);
-                let (legacy_catches, legacy_catch_count, end_pc) = try_exec!(self.scan_legacy_try());
+                let (legacy_catches, legacy_catch_count, end_pc, delegate_label) = try_exec!(self.scan_legacy_try());
                 let stack_base = self.stack_ptr - param_count as usize;
                 let mut frame = BlockFrame::zero();
                 frame.start_pc = self.pc;
@@ -2606,6 +2623,7 @@ impl WasmInstance {
                 frame.is_legacy_try = true;
                 frame.legacy_catch_count = legacy_catch_count;
                 frame.legacy_catches = legacy_catches;
+                frame.legacy_delegate_label = delegate_label;
                 try_exec!(self.push_block(frame));
             }
             0x07 => {
