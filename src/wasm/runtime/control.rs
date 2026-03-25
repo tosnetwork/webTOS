@@ -458,12 +458,11 @@ impl WasmInstance {
                 catch_frame.result_count = try_frame.result_count;
                 catch_frame.end_result_count = try_frame.end_result_count;
                 catch_frame.is_legacy_try = true;
-                // Store exception info for rethrow
+                // Store exception info for rethrow (no truncation)
                 catch_frame.legacy_exception_tag = tag_idx;
-                catch_frame.legacy_exception_value_count = values.len().min(4) as u8;
-                for (i, v) in values.iter().enumerate().take(4) {
-                    catch_frame.legacy_exception_values[i] = *v;
-                }
+                let store_idx = self.legacy_exception_store.len() as u32;
+                self.legacy_exception_store.push(values.to_vec());
+                catch_frame.legacy_exception_store_idx = store_idx;
                 let _ = self.push_block(catch_frame);
 
                 // Push exception values for catch (not catch_all)

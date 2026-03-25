@@ -856,18 +856,20 @@ fn decode_composite_type_with_limit(
         0x60 => {
             // func type: parse params and results
             let mut ft = FuncTypeDef::empty();
-            let param_count = decode_leb128_u32(bytes, pos)? as u8;
-            if param_count as usize > MAX_PARAMS {
+            let param_count_u32 = decode_leb128_u32(bytes, pos)?;
+            if param_count_u32 as usize > MAX_PARAMS {
                 return Err(WasmError::TooManyFunctions);
             }
+            let param_count = param_count_u32 as u8;
             ft.param_count = param_count;
             for p in 0..param_count as usize {
                 ft.params[p] = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?;
             }
-            let result_count = decode_leb128_u32(bytes, pos)? as u8;
-            if result_count as usize > MAX_RESULTS {
+            let result_count_u32 = decode_leb128_u32(bytes, pos)?;
+            if result_count_u32 as usize > MAX_RESULTS {
                 return Err(WasmError::TooManyFunctions);
             }
+            let result_count = result_count_u32 as u8;
             ft.result_count = result_count;
             for r in 0..result_count as usize {
                 ft.results[r] = decode_valtype_gc_aware_with_limit(bytes, pos, module, max_type_idx)?;
@@ -1350,9 +1352,16 @@ fn decode_code_section(
         }
         func.non_nullable_locals = nn_locals;
 
-        // Also check including params from the function type
+        // Reject functions with more locals than our fixed-size array can hold.
+        // This prevents runtime indexing past locals[MAX_LOCALS].
         let type_idx = func.type_idx as usize;
-        func.local_count = total_locals.min(u16::MAX as u64) as u16;
+        let param_count_for_limit = if type_idx < module.func_types.len() {
+            module.func_types[type_idx].param_count as u64
+        } else { 0 };
+        if total_locals.saturating_add(param_count_for_limit) > MAX_LOCALS as u64 {
+            return Err(WasmError::TooManyFunctions); // too many locals
+        }
+        func.local_count = total_locals as u16;
 
         if type_idx < module.func_types.len() {
             let param_count = module.func_types[type_idx].param_count as u64;

@@ -141,10 +141,8 @@ struct BlockFrame {
     legacy_catches: [LegacyCatch; MAX_LEGACY_CATCHES],
     /// The tag_idx of the exception currently being handled (for rethrow). u32::MAX = none.
     legacy_exception_tag: u32,
-    /// Exception values for the currently handled exception (for rethrow).
-    legacy_exception_values: [Value; 4],
-    /// Number of exception values stored.
-    legacy_exception_value_count: u8,
+    /// Index into WasmInstance.legacy_exception_store for rethrow values. u32::MAX = none.
+    legacy_exception_store_idx: u32,
     /// Delegate label for legacy try-delegate blocks. u32::MAX = no delegate.
     legacy_delegate_label: u32,
 }
@@ -165,8 +163,7 @@ impl BlockFrame {
             legacy_catch_count: 0,
             legacy_catches: [LegacyCatch::zero(); MAX_LEGACY_CATCHES],
             legacy_exception_tag: u32::MAX,
-            legacy_exception_values: [Value::I32(0); 4],
-            legacy_exception_value_count: 0,
+            legacy_exception_store_idx: u32::MAX,
             legacy_delegate_label: u32::MAX,
         }
     }
@@ -256,8 +253,9 @@ pub struct WasmInstance {
     /// GC heap: heap-allocated structs and arrays.
     pub gc_heap: Vec<GcObject>,
     /// Re-evaluated element segment values (for GC proposal expression-based elements).
-    /// Indexed by segment index, contains re-evaluated Values for each item.
     pub elem_gc_values: Vec<Vec<Value>>,
+    /// Storage for legacy EH exception values (for rethrow). Each entry is one caught exception's values.
+    pub legacy_exception_store: Vec<Vec<Value>>,
 }
 
 impl WasmInstance {
@@ -416,6 +414,7 @@ impl WasmInstance {
             runtime_class,
             gc_heap: Vec::new(),
             elem_gc_values: Vec::new(),
+            legacy_exception_store: Vec::new(),
         };
 
         // Apply active data segments to memory (skip passive segments)
@@ -1453,8 +1452,9 @@ impl WasmInstance {
                 let bf = &self.block_stack[target_idx];
                 if bf.is_legacy_try && bf.legacy_exception_tag != u32::MAX {
                     found_tag = bf.legacy_exception_tag;
-                    for vi in 0..bf.legacy_exception_value_count as usize {
-                        found_values.push(bf.legacy_exception_values[vi]);
+                    let store_idx = bf.legacy_exception_store_idx as usize;
+                    if store_idx < self.legacy_exception_store.len() {
+                        found_values = self.legacy_exception_store[store_idx].clone();
                     }
                 }
                 if found_tag == u32::MAX {
