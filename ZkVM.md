@@ -199,9 +199,147 @@ Node A:
   → no need to re-execute or trust Node B
 ```
 
-## 7. Implementation Phases
+## 7. ProofGrade Upgrade Paths
 
-### Phase 1: SP1 Integration
+ATOS currently uses replay-based verification (`src/proof.rs`): a hash-chain is recorded during execution, and verifiers must re-execute the entire program to check the chain matches. There are two paths to upgrade this to ZK verification.
+
+### 7.1 Path A: ZK-Wrapped Replay (Minimal Change)
+
+Keep the existing ProofGrade flow unchanged. Add a one-time ZK proof generation step after the hash-chain is produced:
+
+```
+Execution (unchanged):
+  Agent runs natively (x86_64, fast)
+  → proof.rs records hash-chain over checkpoint + events
+  → produces replay proof (same as today)
+
+ZK wrapping (new step):
+  Compile proof.rs verify() function to RISC-V
+  → SP1 replays execution inside zkVM (one time)
+  → SP1 checks: "hash-chain is consistent with this checkpoint + these events"
+  → SP1 outputs ZK proof: "the replay was verified correctly"
+
+Verification (upgraded):
+  Any verifier receives the ZK proof
+  → SP1::verify(proof) → true/false
+  → O(1) time, no re-execution needed
+```
+
+**Advantages:**
+- Existing `proof.rs` and `replay.rs` unchanged
+- Existing ProofGrade agents unchanged
+- Only the verification step changes (from "replay" to "check ZK proof")
+- ZK proof generation is a one-time cost paid by the prover, not the verifier
+
+**Implementation:**
+```rust
+// New function in proof.rs
+pub fn generate_zk_proof(checkpoint: &Checkpoint, events: &[Event]) -> ZkProof {
+    // 1. Compile the replay verifier to RISC-V
+    let verifier_elf = include_bytes!("../target/riscv32im-succinct-zkvm-elf/release/atos-replay-verifier");
+
+    // 2. Run replay verification inside SP1
+    let stdin = SP1Stdin::new();
+    stdin.write(&checkpoint);
+    stdin.write(&events);
+
+    // 3. SP1 executes the verifier and generates proof
+    let client = ProverClient::new();
+    let (proof, public_values) = client.prove(verifier_elf, stdin).expect("proving failed");
+
+    ZkProof { proof, public_values }
+}
+
+// Verification is now O(1)
+pub fn verify_zk_proof(proof: &ZkProof) -> bool {
+    let client = ProverClient::new();
+    client.verify(&proof.proof, &proof.public_values).is_ok()
+}
+```
+
+**RuntimeClass mapping:**
+```
+ReplayGrade  → hash-chain + replay verification (O(n), current behavior)
+ProofGrade   → hash-chain + ZK-wrapped replay (O(1) verification)  ← upgraded
+```
+
+### 7.2 Path B: Native zkVM Execution (Zero Trust)
+
+Run the agent itself inside the zkVM from the start. No hash-chain, no replay — the ZK proof IS the execution:
+
+```
+Execution (inside zkVM):
+  Agent compiled to RISC-V
+  → SP1 interprets every instruction
+  → simultaneously generates ZK proof
+  → proof covers: "this program, with this input, produced this output"
+
+Verification:
+  Any verifier receives the ZK proof
+  → SP1::verify(proof) → true/false
+  → O(1) time, zero trust required
+```
+
+**Advantages:**
+- No hash-chain overhead during execution
+- Proof is mathematically guaranteed (not just "replay matches")
+- Optional privacy: prove the output without revealing the input
+- Strongest possible guarantee — nothing to trust except mathematics
+
+**Disadvantages:**
+- ~1000x slower than native execution (proof generation overhead)
+- Higher energy cost per instruction
+- Only suitable for high-value computations where proof is essential
+
+**RuntimeClass mapping:**
+```
+ZkProofGrade → full zkVM execution (O(1) verification, zero trust)  ← new
+```
+
+### 7.3 Four-Tier Verification Model
+
+After both paths are implemented, ATOS offers four verification tiers:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Tier        │ Mode           │ Verification │ Speed  │ Trust    │
+├─────────────┼────────────────┼──────────────┼────────┼──────────┤
+│ None        │ BestEffort     │ No proof     │ 1x     │ Full     │
+│ Replay      │ ReplayGrade    │ O(n) replay  │ 1x     │ Replay   │
+│ ZK-Wrapped  │ ProofGrade     │ O(1) ZK      │ ~2x *  │ Math     │
+│ Pure ZK     │ ZkProofGrade   │ O(1) ZK      │ ~1000x │ Math     │
+└─────────────────────────────────────────────────────────────────┘
+
+* ProofGrade execution is native speed (1x). The ~2x accounts for the
+  one-time ZK proof generation step after execution completes. Subsequent
+  verifications are O(1).
+```
+
+**Selection guidance:**
+
+| Scenario | Recommended Tier |
+|----------|-----------------|
+| Development, testing | BestEffort |
+| Internal audit, incident replay | ReplayGrade |
+| Publish verifiable results to third parties | **ProofGrade** (Path A) |
+| Trustless computation marketplace, L2 rollups | **ZkProofGrade** (Path B) |
+| Verifiable AI agent output | ProofGrade or ZkProofGrade |
+
+### 7.4 Migration Path
+
+The four tiers are **additive, not replacement**:
+
+```
+Stage 1-3 (done):   BestEffort + ReplayGrade
+Stage 11 P4 step 1: ProofGrade upgraded to ZK-Wrapped (Path A)
+Stage 11 P4 step 2: ZkProofGrade added (Path B)
+```
+
+Existing agents and proofs remain valid. The upgrade is backward-compatible — ReplayGrade proofs can still be verified by replay. ProofGrade proofs gain an additional ZK proof that makes O(1) verification possible.
+
+## 8. Implementation Phases
+
+### Phase 1: SP1 Integration (Path B foundation)
 
 **Goal:** Execute a RISC-V program on ATOS and generate a ZK proof.
 
@@ -214,7 +352,20 @@ Node A:
 
 **Test:** Prove `fibonacci(100)` on ATOS, verify proof on a separate machine.
 
-### Phase 2: Proof Verification Agent
+### Phase 2: ZK-Wrapped ProofGrade (Path A)
+
+**Goal:** Upgrade existing ProofGrade from O(n) replay verification to O(1) ZK verification.
+
+**Changes:**
+1. Compile `proof.rs` verify function to RISC-V target
+2. Create SP1 program that replays a checkpoint + event chain and asserts consistency
+3. `generate_zk_proof(checkpoint, events)` → calls SP1 prover → returns ZK proof
+4. `verify_zk_proof(proof)` → calls SP1 verifier → returns bool (O(1))
+5. Existing ReplayGrade unchanged; ProofGrade gains ZK proof output
+
+**Test:** Generate a ProofGrade hash-chain from an agent run, wrap in ZK proof, verify on a separate machine without replay.
+
+### Phase 3: Proof Verification Agent
 
 **Goal:** Any agent can verify proofs without running the zkVM.
 
@@ -222,10 +373,11 @@ Node A:
 1. Create `verifyd` system agent that accepts proof verification requests
 2. Lightweight SP1 verifier (no prover needed — verification is fast)
 3. Proof stored in keyspace with content hash
+4. Support both ZK-Wrapped ProofGrade proofs and pure zkVM proofs
 
 **Test:** Agent A generates proof, Agent B sends proof to verifyd, verifyd confirms validity.
 
-### Phase 3: EVM-in-zkVM
+### Phase 4: EVM-in-zkVM
 
 **Goal:** Run Ethereum transactions inside the zkVM to generate validity proofs (zkRollup capability).
 
@@ -236,7 +388,7 @@ Node A:
 
 **Test:** Execute a batch of 10 ERC-20 transfers, generate proof, verify on Ethereum testnet.
 
-### Phase 4: Recursive Proofs and Aggregation
+### Phase 5: Recursive Proofs and Aggregation
 
 **Goal:** Aggregate multiple proofs into a single proof for scalability.
 
@@ -247,7 +399,7 @@ Node A:
 
 **Test:** 100 independent computations → 100 proofs → 1 aggregate proof → single verification.
 
-## 8. Relationship to Other Runtimes
+## 9. Relationship to Other Runtimes
 
 | Runtime | Bytecode | Proving | Use Case |
 |---------|----------|---------|----------|
@@ -266,14 +418,14 @@ Want replay verification? → Use ProofGrade mode (hash-chain proof)
 Want ZK verification?     → Compile to RISC-V → run in zkVM (ZK proof)
 ```
 
-## 9. Non-Goals
+## 10. Non-Goals
 
-- **Replace ProofGrade mode** — zkVM is complementary, not a replacement. ProofGrade (replay) is cheaper for cases where the verifier is trusted.
+- **Replace ReplayGrade mode** — ZK verification is complementary. ReplayGrade (O(n) replay) remains available for internal auditing where O(1) verification is not needed.
 - **Hardware RISC-V support** — This is about RISC-V as a software VM for proof generation, not running ATOS on RISC-V hardware.
 - **Custom ZK circuit language** — We use SP1's general-purpose approach (compile any Rust to RISC-V), not a DSL like Circom.
 - **Consensus mechanism** — ATOS generates proofs. How they are submitted to a blockchain (if at all) is an application-level concern.
 
-## 10. Strategic Alignment
+## 11. Strategic Alignment
 
 ```
 Ethereum 2029 roadmap:  EVM → RISC-V zkVM
