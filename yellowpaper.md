@@ -3504,9 +3504,53 @@ Success criteria:
 * all ported runtimes pass their respective language test suites on ATOS
 * the ATOS virtualization layer is documented and reusable across all runtime ports
 
-### 27.9 Through-Line
+### 27.9 Stage-12: Linux Syscall Compatibility Layer `[IMPL: ⏳ Planned]`
 
-The intended sequence of Stage-5 through Stage-11 is:
+Stage-12 should answer the adoption question: **how do existing Linux programs run on ATOS without modification?**
+
+Stage-11 ports specific language runtimes natively, giving the best ATOS integration. Stage-12 takes a different approach: implement a **Linux syscall translation layer** that intercepts standard Linux syscalls and maps them to ATOS primitives. Any statically-linked Linux x86_64 ELF binary runs on ATOS unmodified — Node.js, Go binaries, curl, git, npm, pip, and the entire Linux CLI ecosystem.
+
+The full design is specified in [LinuxCompat.md](LinuxCompat.md).
+
+The translation maps Linux OS abstractions to ATOS primitives:
+
+| Linux syscall | ATOS translation |
+|--------------|-----------------|
+| `open/read/write/close` | Keyspace `sys_state_get` / `sys_state_put` via virtual fd table |
+| `socket/connect/send/recv` | netd mailbox proxy sessions |
+| `clone` (threads) | `sys_spawn` child agents with shared keyspace |
+| `fork + execve` | `sys_spawn_image` |
+| `epoll_create/ctl/wait` | Mailbox multiplexing (round-robin watch set) |
+| `mmap/brk` | `sys_mmap` with virtual address tracking |
+| `pipe` | Mailbox pair mapped to two fds |
+
+Implementation phases:
+
+| Phase | Syscalls | Enables |
+|-------|----------|---------|
+| **1: Boot** | ~20 | Static hello world, busybox, simple CLI tools |
+| **2: File I/O** | ~40 | CPython (static), file-processing tools |
+| **3: Network + epoll** | ~60 | Node.js, curl, HTTP clients/servers |
+| **4: Threads + dynamic linking** | ~80 | Multi-threaded Java, Go, full npm/pip ecosystem |
+
+Objectives:
+
+* implement Linux syscall dispatch (separate from ATOS-native dispatch) with per-agent compat flag
+* translate ~80 core Linux syscalls covering file I/O, networking, process management, and memory
+* implement virtual fd table, epoll state machine, and virtual `/proc/self` filesystem
+* run unmodified statically-linked Node.js, Python, Go, and Java binaries on ATOS
+* ensure all translated syscalls pass through ATOS eBPF policy filters and produce audit events
+
+Success criteria:
+
+* a statically-linked Node.js binary runs OpenClaw on ATOS, serving AI agent requests via netd
+* `curl https://example.com` works on ATOS through the netd proxy
+* a Go multi-threaded HTTP server handles concurrent requests via child agent threads
+* Linux compat agents are energy-metered, capability-scoped, and checkpointable like native agents
+
+### 27.10 Through-Line
+
+The intended sequence of Stage-5 through Stage-12 is:
 
 * Stage-5: make authority durable and attestable
 * Stage-6: make state durable and provable
@@ -3514,9 +3558,10 @@ The intended sequence of Stage-5 through Stage-11 is:
 * Stage-8: make multi-node execution explicit and survivable
 * Stage-9: make execution receipts economically and cryptographically meaningful
 * Stage-10: make the whole system deployable as a trusted appliance
-* Stage-11: bring WASM, Python, and Java ecosystems to ATOS
+* Stage-11: bring WASM, Python, and Java ecosystems to ATOS via native runtime ports
+* Stage-12: run any Linux program on ATOS via syscall translation
 
-If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems — with the full breadth of the AI agent ecosystem running on top.
+If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems — with the full breadth of both the AI agent ecosystem and the Linux software ecosystem running on top.
 
 ---
 
