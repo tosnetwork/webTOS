@@ -2184,22 +2184,11 @@ impl WastRunner {
                 )
             })?;
             let compatible = if let (Some(it), Some(tt)) = (import_type_idx, target_type_idx) {
-                if type_indices_equivalent(module, it, &record.instance.module, tt) {
-                    true
-                } else {
-                    // Check if either type is in a non-trivial rec group
-                    let import_rec_size = module.sub_types.get(it as usize)
-                        .map(|s| s.rec_group_size).unwrap_or(1);
-                    let target_rec_size = record.instance.module.sub_types.get(tt as usize)
-                        .map(|s| s.rec_group_size).unwrap_or(1);
-                    if import_rec_size > 1 || target_rec_size > 1 {
-                        // Require rec group equivalence for non-trivial rec groups
-                        false
-                    } else {
-                        // Singleton rec groups: fall back to structural match
-                        func_types_match(signature, target_ty)
-                    }
-                }
+                // Check equivalence or subtype: export type must be a subtype of import type
+                cross_module_type_subtype(
+                    &record.instance.module, tt, // export (actual) type
+                    module, it,                   // import (expected) type
+                )
             } else {
                 func_types_match(signature, target_ty)
             };
@@ -3275,14 +3264,29 @@ fn type_indices_equivalent(
                     }
                     _ => return false,
                 }
-                // Also check gc_types match
+                // Check gc_types match (with rec-group-relative type references)
+                use crate::wasm::decoder::{GcTypeDef, StorageType};
                 let gc_a = mod_a.gc_types.get(idx_a as usize);
                 let gc_b = mod_b.gc_types.get(idx_b as usize);
                 match (gc_a, gc_b) {
-                    (Some(a), Some(b)) => {
-                        if std::mem::discriminant(a) != std::mem::discriminant(b) {
-                            return false;
+                    (Some(GcTypeDef::Struct { field_types: ft_a, field_muts: fm_a }),
+                     Some(GcTypeDef::Struct { field_types: ft_b, field_muts: fm_b })) => {
+                        if ft_a.len() != ft_b.len() || fm_a != fm_b { return false; }
+                        for fi in 0..ft_a.len() {
+                            if !cross_module_storage_eq(&ft_a[fi], a.rec_group_start, mod_a,
+                                                        &ft_b[fi], b.rec_group_start, mod_b,
+                                                        a.rec_group_size) { return false; }
                         }
+                    }
+                    (Some(GcTypeDef::Array { elem_type: et_a, elem_mutable: em_a }),
+                     Some(GcTypeDef::Array { elem_type: et_b, elem_mutable: em_b })) => {
+                        if em_a != em_b { return false; }
+                        if !cross_module_storage_eq(et_a, a.rec_group_start, mod_a,
+                                                    et_b, b.rec_group_start, mod_b,
+                                                    a.rec_group_size) { return false; }
+                    }
+                    (Some(ga), Some(gb)) => {
+                        if std::mem::discriminant(ga) != std::mem::discriminant(gb) { return false; }
                     }
                     (None, None) => {}
                     _ => return false,
@@ -3293,14 +3297,20 @@ fn type_indices_equivalent(
                 match (si_a_i, si_b_i) {
                     (Some(sa), Some(sb)) => {
                         if sa.is_final != sb.is_final { return false; }
-                        // Supertypes should be at the same relative position within the rec group
                         match (sa.supertype, sb.supertype) {
                             (None, None) => {}
                             (Some(sp_a), Some(sp_b)) => {
-                                // If supertype is within the rec group, compare relative positions
-                                let rel_a = sp_a.wrapping_sub(a.rec_group_start);
-                                let rel_b = sp_b.wrapping_sub(b.rec_group_start);
-                                if rel_a != rel_b { return false; }
+                                let in_rg_a = sp_a >= a.rec_group_start && sp_a < a.rec_group_start + a.rec_group_size;
+                                let in_rg_b = sp_b >= b.rec_group_start && sp_b < b.rec_group_start + b.rec_group_size;
+                                if in_rg_a && in_rg_b {
+                                    // Both inside: compare relative positions
+                                    if (sp_a - a.rec_group_start) != (sp_b - b.rec_group_start) { return false; }
+                                } else if !in_rg_a && !in_rg_b {
+                                    // Both outside: recursively check equivalence
+                                    if !type_indices_equivalent(mod_a, sp_a, mod_b, sp_b) { return false; }
+                                } else {
+                                    return false;
+                                }
                             }
                             _ => return false,
                         }
@@ -3318,6 +3328,57 @@ fn type_indices_equivalent(
             }
         }
     }
+}
+
+/// Check if two storage types are equivalent across modules with rec-group awareness.
+fn cross_module_storage_eq(
+    a: &crate::wasm::decoder::StorageType, rg_a: u32, mod_a: &WasmModule,
+    b: &crate::wasm::decoder::StorageType, rg_b: u32, mod_b: &WasmModule,
+    rg_size: u32,
+) -> bool {
+    use crate::wasm::decoder::StorageType;
+    match (a, b) {
+        (StorageType::I8, StorageType::I8) | (StorageType::I16, StorageType::I16) => true,
+        (StorageType::Val(va), StorageType::Val(vb)) => va == vb,
+        (StorageType::RefType(va, ai), StorageType::RefType(vb, bi)) => {
+            if va != vb { return false; }
+            let in_a = *ai >= rg_a && *ai < rg_a + rg_size;
+            let in_b = *bi >= rg_b && *bi < rg_b + rg_size;
+            if in_a && in_b { (ai - rg_a) == (bi - rg_b) }
+            else if !in_a && !in_b { type_indices_equivalent(mod_a, *ai, mod_b, *bi) }
+            else { false }
+        }
+        _ => false,
+    }
+}
+
+/// Check if type `src` in `mod_src` is a subtype of type `dst` in `mod_dst`.
+/// Handles cross-module rec-group-aware type equivalence and subtype chains.
+fn cross_module_type_subtype(
+    mod_src: &WasmModule, src: u32,
+    mod_dst: &WasmModule, dst: u32,
+) -> bool {
+    // Check equivalence first
+    if type_indices_equivalent(mod_src, src, mod_dst, dst) {
+        return true;
+    }
+    // Walk the subtype chain in the source module
+    let mut current = src;
+    for _ in 0..100 {
+        if let Some(info) = mod_src.sub_types.get(current as usize) {
+            if let Some(parent) = info.supertype {
+                if type_indices_equivalent(mod_src, parent, mod_dst, dst) {
+                    return true;
+                }
+                current = parent;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    false
 }
 
 fn validate_spectest_func_signature(name: &str, sig: &FuncTypeDef) -> RunnerResult<()> {
