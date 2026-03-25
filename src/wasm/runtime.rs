@@ -204,6 +204,9 @@ pub struct WasmInstance {
     pub locals: Vec<Value>,
     pub globals: Vec<Value>,
     pub tables: Vec<Vec<Option<u32>>>,
+    /// Table index aliasing: if table_aliases[i] = Some(j), table i is an alias of table j.
+    /// All table ops on index i redirect to index j.
+    pub table_aliases: Vec<Option<usize>>,
     /// Tracks which element segments have been dropped (by elem.drop or after active init).
     pub dropped_elems: Vec<bool>,
     /// Tracks which data segments have been dropped (by data.drop).
@@ -367,6 +370,7 @@ impl WasmInstance {
             stack_ptr: 0,
             locals: vec![Value::I32(0); MAX_TOTAL_LOCALS],
             globals,
+            table_aliases: vec![None; tables.len()],
             tables,
             dropped_elems,
             dropped_data,

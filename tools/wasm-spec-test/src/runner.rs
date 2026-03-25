@@ -1517,6 +1517,8 @@ impl WastRunner {
         // This ensures aliased imports (same source global under different names) stay in sync
         self.sync_globals_back(&handle);
         self.sync_imported_globals(&handle);
+        // Note: table aliasing (wasm-3.0/instance.wast) requires runtime-level
+        // shared table backing which is not yet implemented.
         result
     }
 
@@ -1716,6 +1718,50 @@ impl WastRunner {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Sync tables that are aliased (two imports map to same source export).
+    /// After a function call, writes to one alias must be visible in the other.
+    fn sync_aliased_tables(&self, handle: &InstanceHandle) {
+        let record = handle.borrow();
+        // Collect table import source info: (local_tbl_idx, source_instance, source_export_name)
+        let mut tbl_imports: Vec<(usize, String, String)> = Vec::new();
+        let mut tbl_idx = 0usize;
+        for import in &record.instance.module.imports {
+            if !matches!(import.kind, ImportKind::Table(_)) { continue; }
+            let mod_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+            let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+            tbl_imports.push((tbl_idx, mod_name, fld_name));
+            tbl_idx += 1;
+        }
+        drop(record);
+        // Find aliases: two imports from same source module+field → same physical table
+        // Group by (source_module, source_export_index)
+        let mut groups: std::collections::HashMap<(String, u32), Vec<usize>> = std::collections::HashMap::new();
+        for (idx, mod_name, fld_name) in &tbl_imports {
+            if let Some(src_handle) = self.instances.get(mod_name.as_str()) {
+                if let Ok(src) = src_handle.try_borrow() {
+                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, fld_name) {
+                        groups.entry((mod_name.clone(), src_tbl_idx)).or_default().push(*idx);
+                    }
+                }
+            }
+        }
+        // For each group with >1 alias, sync all to match the first (most recently written)
+        let mut record = handle.borrow_mut();
+        for (_key, indices) in &groups {
+            if indices.len() <= 1 { continue; }
+            // Use the first alias as canonical; copy its content to all others
+            let src_idx = indices[0];
+            if src_idx >= record.instance.tables.len() { continue; }
+            for &dst_idx in &indices[1..] {
+                if dst_idx >= record.instance.tables.len() { continue; }
+                let len = record.instance.tables[src_idx].len().min(record.instance.tables[dst_idx].len());
+                // Can't borrow two mutable slices from same Vec, so clone
+                let src_copy: Vec<_> = record.instance.tables[src_idx][..len].to_vec();
+                record.instance.tables[dst_idx][..len].copy_from_slice(&src_copy);
             }
         }
     }
