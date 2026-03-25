@@ -1,7 +1,7 @@
 //! Unit tests for the WASM decoder: LEB128, minimal module, section parsing, UTF-8.
 
 extern crate wasm_spec_test;
-use wasm_spec_test::wasm::decode::*;
+use wasm_spec_test::wasm::decoder::*;
 
 // ─── LEB128 unsigned 32-bit ─────────────────────────────────────────────────
 
