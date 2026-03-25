@@ -200,6 +200,9 @@ pub struct ElementSegment {
     pub item_expr_infos: alloc::vec::Vec<InitExprInfo>,
     /// Byte range [start, end) of the offset init expression in the original binary.
     pub offset_expr_range: (usize, usize),
+    /// Per-item expression bytes for expression-based segments.
+    /// Used for re-evaluation at instantiation time (GC proposal).
+    pub item_expr_bytes: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 }
 
 /// Information extracted from scanning an init expression for validation.
@@ -879,6 +882,12 @@ fn decode_valtype_gc_aware_with_limit(bytes: &[u8], pos: &mut usize, module: &mu
         *pos = saved;
         decode_valtype_from_stream(bytes, pos)
     } else {
+        // GC shorthand reference types (single-byte) also enable GC:
+        // 0x6E=anyref, 0x6D=eqref, 0x6C=i31ref, 0x6B=structref, 0x6A=arrayref,
+        // 0x71=nullref, 0x73=nullfuncref, 0x72=nullexternref, 0x69=exnref, 0x68=contref
+        if matches!(b, 0x6E | 0x6D | 0x6C | 0x6B | 0x6A | 0x71 | 0x69 | 0x68) {
+            module.gc_enabled = true;
+        }
         *pos = saved;
         decode_valtype_from_stream(bytes, pos)
     }
@@ -1735,6 +1744,7 @@ fn decode_element_section(
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
                     offset_expr_range: (expr_start, expr_end),
+                    item_expr_bytes: alloc::vec::Vec::new(),
                 });
             }
             1 => {
@@ -1757,6 +1767,7 @@ fn decode_element_section(
                     offset_expr_info: Default::default(),
                     item_expr_infos: alloc::vec::Vec::new(),
                     offset_expr_range: (0, 0),
+                    item_expr_bytes: alloc::vec::Vec::new(),
                 });
             }
             2 => {
@@ -1789,6 +1800,7 @@ fn decode_element_section(
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
                     offset_expr_range: (expr_start, expr_end),
+                    item_expr_bytes: alloc::vec::Vec::new(),
                 });
             }
             3 => {
@@ -1811,6 +1823,7 @@ fn decode_element_section(
                     offset_expr_info: Default::default(),
                     item_expr_infos: alloc::vec::Vec::new(),
                     offset_expr_range: (0, 0),
+                    item_expr_bytes: alloc::vec::Vec::new(),
                 });
             }
             4 => {
@@ -1823,13 +1836,17 @@ fn decode_element_section(
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_bytes_vec = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
+                    let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
+                    item_expr_bytes_vec.push(bytes[item_start..item_end].to_vec());
                 }
-                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end) });
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end), item_expr_bytes: item_expr_bytes_vec });
             }
             5 => {
                 // Passive, reftype, expression elements
@@ -1837,11 +1854,15 @@ fn decode_element_section(
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_bytes_vec = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
+                    let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
+                    item_expr_bytes_vec.push(bytes[item_start..item_end].to_vec());
                 }
                 module.element_segments.push(ElementSegment {
                     table_idx: 0,
@@ -1852,6 +1873,7 @@ fn decode_element_section(
                     offset_expr_info: Default::default(),
                     item_expr_infos,
                     offset_expr_range: (0, 0),
+                    item_expr_bytes: item_expr_bytes_vec,
                 });
             }
             6 => {
@@ -1866,13 +1888,17 @@ fn decode_element_section(
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_bytes_vec = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
+                    let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
+                    item_expr_bytes_vec.push(bytes[item_start..item_end].to_vec());
                 }
-                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end) });
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (expr_start, expr_end), item_expr_bytes: item_expr_bytes_vec });
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
@@ -1880,11 +1906,15 @@ fn decode_element_section(
                 let num_elems = decode_leb128_u32(bytes, pos)? as usize;
                 let mut func_indices = alloc::vec::Vec::with_capacity(num_elems);
                 let mut item_expr_infos = alloc::vec::Vec::with_capacity(num_elems);
+                let mut item_expr_bytes_vec = alloc::vec::Vec::with_capacity(num_elems);
                 for _ in 0..num_elems {
+                    let item_start = *pos;
                     let item_info = scan_init_expr_info(bytes, *pos);
                     let val = eval_init_expr(bytes, pos)?;
+                    let item_end = *pos;
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
+                    item_expr_bytes_vec.push(bytes[item_start..item_end].to_vec());
                 }
                 module.element_segments.push(ElementSegment {
                     table_idx: 0,
@@ -1895,6 +1925,7 @@ fn decode_element_section(
                     offset_expr_info: Default::default(),
                     item_expr_infos,
                     offset_expr_range: (0, 0),
+                    item_expr_bytes: item_expr_bytes_vec,
                 });
             }
             _ => {

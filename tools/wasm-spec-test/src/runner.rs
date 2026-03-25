@@ -889,6 +889,22 @@ impl WastRunner {
     fn invoke(&mut self, invoke: wast::WastInvoke<'_>) -> RunnerResult<Vec<Value>> {
         let handle = self.get_instance_handle(invoke.module)?;
         let args = self.values_from_args(&invoke.args)?;
+        // Allocate externref args on the GC heap so they're properly typed
+        let args = {
+            let mut record = handle.borrow_mut();
+            args.into_iter().enumerate().map(|(_i, v)| {
+                match v {
+                    Value::I32(n) if n >= 0 && self.gc_enabled => {
+                        // Check if this corresponds to a RefExtern/RefHost arg
+                        // by seeing if the original arg was RefExtern/RefHost
+                        v // Can't distinguish here, handle below
+                    }
+                    _ => v,
+                }
+            }).collect::<Vec<_>>()
+        };
+        // Allocate externref values on GC heap for properly-typed arguments
+        let args = self.allocate_extern_args(&handle, &invoke.args, args)?;
         let func_idx = {
             let record = handle.borrow();
             record
@@ -905,6 +921,30 @@ impl WastRunner {
         let result = self.execute_call(&handle, func_idx, &args);
         self.sync_shared_memory();
         result
+    }
+
+    /// Allocate externref arguments on the GC heap as Externalized objects
+    fn allocate_extern_args(&self, handle: &InstanceHandle, wast_args: &[wast::WastArg<'_>], mut args: Vec<Value>) -> RunnerResult<Vec<Value>> {
+        use crate::wasm::runtime::GcObject;
+        if !self.gc_enabled {
+            return Ok(args);
+        }
+        let mut record = handle.borrow_mut();
+        for (i, wast_arg) in wast_args.iter().enumerate() {
+            if let wast::WastArg::Core(core_arg) = wast_arg {
+                match core_arg {
+                    WastArgCore::RefExtern(_) | WastArgCore::RefHost(_) => {
+                        if i < args.len() && !matches!(args[i], Value::NullRef) {
+                            let heap_idx = record.instance.gc_heap.len() as u32;
+                            record.instance.gc_heap.push(GcObject::Externalized { value: args[i] });
+                            args[i] = Value::GcRef(heap_idx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(args)
     }
 
     fn execute_call(&mut self, handle: &InstanceHandle, func_idx: u32, args: &[Value]) -> RunnerResult<Vec<Value>> {
@@ -1080,7 +1120,7 @@ impl WastRunner {
             WastArgCore::F32(v) => Ok(Value::F32(f32::from_bits(v.bits))),
             WastArgCore::F64(v) => Ok(Value::F64(f64::from_bits(v.bits))),
             WastArgCore::V128(v) => Ok(Value::V128(V128(v.to_le_bytes()))),
-            WastArgCore::RefNull(_) => Ok(Value::I32(-1)), // null ref sentinel
+            WastArgCore::RefNull(_) => Ok(Value::NullRef),
             WastArgCore::RefExtern(v) => Ok(Value::I32(*v as i32)),
             WastArgCore::RefHost(v) => Ok(Value::I32(*v as i32)),
         }
@@ -2094,6 +2134,34 @@ impl WastRunner {
         }
     }
 
+    /// Unwrap a GcRef pointing to an Externalized object to its inner value.
+    /// This handles the round-trip: ref.extern N -> Externalized { I32(N) } -> I32(N).
+    fn unwrap_externref(&self, val: &Value) -> Value {
+        use crate::wasm::runtime::GcObject;
+        if let Value::GcRef(idx) = val {
+            if let Some(handle) = &self.current {
+                let record = handle.borrow();
+                let mut current_idx = *idx as usize;
+                // Unwrap chains of Externalized/Internalized
+                for _ in 0..10 {
+                    if current_idx < record.instance.gc_heap.len() {
+                        match &record.instance.gc_heap[current_idx] {
+                            GcObject::Externalized { value } | GcObject::Internalized { value } => {
+                                match value {
+                                    Value::GcRef(inner) => { current_idx = *inner as usize; continue; }
+                                    other => return *other,
+                                }
+                            }
+                            _ => return *val,
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        *val
+    }
+
     fn assert_result_core(
         &self,
         actual: &Value,
@@ -2159,8 +2227,10 @@ impl WastRunner {
                 }
             }
             WastRetCore::RefExtern(Some(v)) => {
-                match actual {
-                    Value::I32(a) if *a as u32 == *v => Ok(()),
+                // Unwrap GcRef -> Externalized to compare inner value
+                let unwrapped = self.unwrap_externref(actual);
+                match unwrapped {
+                    Value::I32(a) if a as u32 == *v => Ok(()),
                     _ => Err(DirectiveError::assertion(
                         "assert_return",
                         format!("expected ref.extern {v}, got {actual:?}"),
@@ -2850,6 +2920,7 @@ fn trap_message(err: &WasmError) -> String {
         WasmError::CastFailure => "cast failure".to_string(),
         WasmError::UncaughtException => "unhandled exception".to_string(),
         WasmError::MultipleTables => "multiple tables".to_string(),
+        WasmError::OutOfBounds => "out of bounds".to_string(),
         other => format!("{other:?}"),
     }
 }

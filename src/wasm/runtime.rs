@@ -139,8 +139,10 @@ const MAX_TOTAL_LOCALS: usize = 65_536;
 pub enum GcObject {
     Struct { type_idx: u32, fields: Vec<Value> },
     Array { type_idx: u32, elements: Vec<Value> },
-    /// Externalized value (from any.convert_extern): wraps an externref
-    Extern { value: Value },
+    /// Internalized extern (from any.convert_extern): wraps an externref into the any hierarchy
+    Internalized { value: Value },
+    /// Externalized any (from extern.convert_any): wraps an anyref into the extern hierarchy
+    Externalized { value: Value },
 }
 
 impl GcObject {
@@ -148,7 +150,7 @@ impl GcObject {
         match self {
             GcObject::Struct { type_idx, .. } => *type_idx,
             GcObject::Array { type_idx, .. } => *type_idx,
-            GcObject::Extern { .. } => u32::MAX,
+            GcObject::Internalized { .. } | GcObject::Externalized { .. } => u32::MAX,
         }
     }
 }
@@ -183,6 +185,9 @@ pub struct WasmInstance {
     pub runtime_class: RuntimeClass,
     /// GC heap: heap-allocated structs and arrays.
     pub gc_heap: Vec<GcObject>,
+    /// Re-evaluated element segment values (for GC proposal expression-based elements).
+    /// Indexed by segment index, contains re-evaluated Values for each item.
+    pub elem_gc_values: Vec<Vec<Value>>,
 }
 
 impl WasmInstance {
@@ -322,6 +327,7 @@ impl WasmInstance {
             finished: false,
             runtime_class,
             gc_heap: Vec::new(),
+            elem_gc_values: Vec::new(),
         };
 
         // Apply active data segments to memory (skip passive segments)
@@ -357,6 +363,9 @@ impl WasmInstance {
 
         // Evaluate GC const expressions for globals that need deferred evaluation
         inst.eval_gc_globals();
+
+        // Re-evaluate expression-based element segment items (GC proposal)
+        inst.eval_gc_elem_exprs();
 
         // Apply table init expressions (GC proposal: tables with init values)
         for (tbl_idx, tdef) in inst.module.tables.iter().enumerate() {
@@ -475,6 +484,52 @@ impl WasmInstance {
             if !needs_gc { continue; }
             if let Some(val) = self.eval_gc_const_expr(expr_bytes, 0) {
                 self.globals[gi] = val;
+            }
+        }
+    }
+
+    /// Re-evaluate expression-based element segment items using the GC const expr evaluator.
+    /// This is needed because at decode time, GC allocations (struct.new, array.new) can't
+    /// be performed since the GC heap doesn't exist yet. We re-evaluate these expressions
+    /// now that the instance is set up, and update both func_indices and tables.
+    fn eval_gc_elem_exprs(&mut self) {
+        use crate::wasm::decoder::ElemMode;
+        let seg_count = self.module.element_segments.len();
+        for seg_idx in 0..seg_count {
+            let seg = &self.module.element_segments[seg_idx];
+            if seg.item_expr_bytes.is_empty() { continue; }
+            let expr_bytes_list = seg.item_expr_bytes.clone();
+            let mode = seg.mode;
+            let tbl_idx = seg.table_idx as usize;
+            let offset = seg.offset as usize;
+            // Re-evaluate each item expression
+            let mut new_values: Vec<Value> = Vec::with_capacity(expr_bytes_list.len());
+            for expr_bytes in &expr_bytes_list {
+                if let Some(val) = self.eval_gc_const_expr(expr_bytes, 0) {
+                    new_values.push(val);
+                } else {
+                    new_values.push(Value::NullRef);
+                }
+            }
+            // Store re-evaluated GcRef values in elem_gc_values for use by gc_array_from_elem
+            if self.elem_gc_values.len() <= seg_idx {
+                self.elem_gc_values.resize(seg_count, Vec::new());
+            }
+            self.elem_gc_values[seg_idx] = new_values.clone();
+            // Update tables for active segments
+            if mode == ElemMode::Active && tbl_idx < self.tables.len() {
+                for (i, val) in new_values.iter().enumerate() {
+                    let idx = offset + i;
+                    if idx < self.tables[tbl_idx].len() {
+                        let entry = match val {
+                            Value::NullRef => None,
+                            Value::I32(v) => if *v < 0 { None } else { Some(*v as u32) },
+                            Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
+                            _ => None,
+                        };
+                        self.tables[tbl_idx][idx] = entry;
+                    }
+                }
             }
         }
     }
@@ -710,18 +765,18 @@ impl WasmInstance {
     }
 
     /// Create array elements from a data segment.
+    /// For dropped segments, the effective data length is 0 (offset 0 + length 0 succeeds).
     fn gc_array_from_data(&self, type_idx: u32, data_idx: usize, offset: u32, length: u32) -> Result<Vec<Value>, WasmError> {
         if data_idx >= self.module.data_segments.len() {
-            return Err(WasmError::OutOfBounds);
+            return Err(WasmError::MemoryOutOfBounds);
         }
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-        if data_idx < self.dropped_data.len() && self.dropped_data[data_idx] {
-            return Err(WasmError::OutOfBounds);
-        }
-        let seg = &self.module.data_segments[data_idx];
-        let data = &self.module.code[seg.data_offset..seg.data_offset + seg.data_len];
+        // Dropped segments are treated as having length 0
+        let is_dropped = data_idx < self.dropped_data.len() && self.dropped_data[data_idx];
+        let data_len = if is_dropped {
+            0usize
+        } else {
+            self.module.data_segments[data_idx].data_len
+        };
 
         let elem_size = if let Some(GcTypeDef::Array { elem_type, .. }) = self.module.gc_types.get(type_idx as usize) {
             match elem_type {
@@ -735,9 +790,14 @@ impl WasmInstance {
 
         let total_bytes = length as usize * elem_size;
         let start = offset as usize;
-        if start + total_bytes > data.len() {
-            return Err(WasmError::OutOfBounds);
+        if start + total_bytes > data_len {
+            return Err(WasmError::MemoryOutOfBounds);
         }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let seg = &self.module.data_segments[data_idx];
+        let data = &self.module.code[seg.data_offset..seg.data_offset + seg.data_len];
 
         let mut elements = Vec::with_capacity(length as usize);
         for i in 0..length as usize {
@@ -770,21 +830,39 @@ impl WasmInstance {
     }
 
     /// Create array elements from an element segment.
+    /// For dropped segments, the effective element count is 0 (offset 0 + length 0 succeeds).
     fn gc_array_from_elem(&self, elem_idx: usize, offset: u32, length: u32) -> Result<Vec<Value>, WasmError> {
         if elem_idx >= self.module.element_segments.len() {
-            return Err(WasmError::OutOfBounds);
+            return Err(WasmError::TableIndexOutOfBounds);
+        }
+        // Dropped segments are treated as having length 0
+        let is_dropped = elem_idx < self.dropped_elems.len() && self.dropped_elems[elem_idx];
+        let seg_len = if is_dropped {
+            0usize
+        } else {
+            self.module.element_segments[elem_idx].func_indices.len()
+        };
+        let end = offset as usize + length as usize;
+        if end > seg_len {
+            return Err(WasmError::TableIndexOutOfBounds);
         }
         if length == 0 {
             return Ok(Vec::new());
         }
-        if elem_idx < self.dropped_elems.len() && self.dropped_elems[elem_idx] {
-            return Err(WasmError::OutOfBounds);
+        // Use re-evaluated GC values if available (expression-based segments)
+        if elem_idx < self.elem_gc_values.len() && !self.elem_gc_values[elem_idx].is_empty() {
+            let gc_vals = &self.elem_gc_values[elem_idx];
+            let mut elements = Vec::with_capacity(length as usize);
+            for i in offset as usize..end {
+                if i < gc_vals.len() {
+                    elements.push(gc_vals[i]);
+                } else {
+                    elements.push(Value::NullRef);
+                }
+            }
+            return Ok(elements);
         }
         let seg = &self.module.element_segments[elem_idx];
-        let end = offset as usize + length as usize;
-        if end > seg.func_indices.len() {
-            return Err(WasmError::OutOfBounds);
-        }
         let mut elements = Vec::with_capacity(length as usize);
         for i in offset as usize..end {
             let func_idx = seg.func_indices[i];
@@ -839,9 +917,13 @@ impl WasmInstance {
                     return false;
                 }
                 let obj = &self.gc_heap[heap_idx as usize];
-                // Externalized values only match anyref (not eq, i31, struct, etc.)
-                if matches!(obj, GcObject::Extern { .. }) {
+                // Internalized extern values (from any.convert_extern) only match HT_ANY
+                if matches!(obj, GcObject::Internalized { .. }) {
                     return ht == Self::HT_ANY;
+                }
+                // Externalized any values (from extern.convert_any) match HT_EXTERN
+                if matches!(obj, GcObject::Externalized { .. }) {
+                    return ht == Self::HT_EXTERN;
                 }
                 let obj_type_idx = obj.type_idx();
                 match ht {
@@ -863,16 +945,65 @@ impl WasmInstance {
         }
     }
 
+    /// Check if two types are structurally equivalent (type canonicalization).
+    fn gc_types_equivalent(&self, type_a: u32, type_b: u32) -> bool {
+        if type_a == type_b {
+            return true;
+        }
+        // Check if both types have the same GC type definition
+        let gc_a = self.module.gc_types.get(type_a as usize);
+        let gc_b = self.module.gc_types.get(type_b as usize);
+        let structurally_equal = match (gc_a, gc_b) {
+            (Some(GcTypeDef::Func), Some(GcTypeDef::Func)) => {
+                // Compare function signatures
+                self.types_structurally_equal(type_a, type_b)
+            }
+            (Some(GcTypeDef::Struct { field_types: ft_a, field_muts: fm_a }),
+             Some(GcTypeDef::Struct { field_types: ft_b, field_muts: fm_b })) => {
+                ft_a == ft_b && fm_a == fm_b
+            }
+            (Some(GcTypeDef::Array { elem_type: et_a, elem_mutable: em_a }),
+             Some(GcTypeDef::Array { elem_type: et_b, elem_mutable: em_b })) => {
+                et_a == et_b && em_a == em_b
+            }
+            _ => false,
+        };
+        if !structurally_equal {
+            return false;
+        }
+        // Check if supertypes are also equivalent
+        let sub_a = self.module.sub_types.get(type_a as usize);
+        let sub_b = self.module.sub_types.get(type_b as usize);
+        match (sub_a, sub_b) {
+            (Some(a), Some(b)) => {
+                if a.is_final != b.is_final {
+                    return false;
+                }
+                match (a.supertype, b.supertype) {
+                    (None, None) => true,
+                    (Some(sa), Some(sb)) => self.gc_types_equivalent(sa, sb),
+                    _ => false,
+                }
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Check if type_a is a subtype of type_b (or equal).
     fn gc_is_subtype(&self, type_a: u32, type_b: u32) -> bool {
         if type_a == type_b {
+            return true;
+        }
+        // Check canonical type equivalence
+        if self.gc_types_equivalent(type_a, type_b) {
             return true;
         }
         let mut current = type_a;
         for _ in 0..100 {
             if let Some(info) = self.module.sub_types.get(current as usize) {
                 if let Some(parent) = info.supertype {
-                    if parent == type_b {
+                    if parent == type_b || self.gc_types_equivalent(parent, type_b) {
                         return true;
                     }
                     current = parent;
@@ -3676,7 +3807,9 @@ impl WasmInstance {
                                 if is_t64 { try_exec!(self.push(Value::I64(-1))); } else { try_exec!(self.push(Value::I32(-1))); }
                             } else {
                                 let fill_val = match init {
+                                    Value::NullRef => None,
                                     Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
+                                    Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
                                     _ => None,
                                 };
                                 self.tables[tbl_idx].resize(new_size as usize, fill_val);
@@ -3699,13 +3832,18 @@ impl WasmInstance {
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
                         let is_t64 = tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64;
                         let n = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
-                        let val = try_exec!(self.pop_i32());
+                        let raw_val = try_exec!(self.pop());
                         let d = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let nu = n as usize; let du = d as usize;
                         if tbl_idx >= self.tables.len() || du.saturating_add(nu) > self.tables[tbl_idx].len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
-                        let entry = if val < 0 { None } else { Some(val as u32) };
+                        let entry = match raw_val {
+                            Value::NullRef => None,
+                            Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
+                            Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
+                            _ => None,
+                        };
                         for i in 0..nu { self.tables[tbl_idx][du + i] = entry; }
                     }
 
@@ -4442,17 +4580,33 @@ impl WasmInstance {
                             Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
                             _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
                         };
-                        if length == 0 { /* nop */ } else {
-                            // Copy elements, handling overlap
+                        {
+                            // Check bounds even for zero-length copies per spec
                             let src_end = src_offset as usize + length as usize;
                             let dst_end = dst_offset as usize + length as usize;
-                            // First, extract source elements
+                            // Check destination bounds first
+                            match &self.gc_heap[dst_idx] {
+                                GcObject::Array { elements, .. } => {
+                                    if dst_end > elements.len() {
+                                        return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                    }
+                                }
+                                _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                            }
+                            // Check source bounds
+                            match &self.gc_heap[src_idx] {
+                                GcObject::Array { elements, .. } => {
+                                    if src_end > elements.len() {
+                                        return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                    }
+                                }
+                                _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                            }
+                            if length > 0 {
+                            // Copy elements, handling overlap
                             let src_elems = {
                                 match &self.gc_heap[src_idx] {
                                     GcObject::Array { elements, .. } => {
-                                        if src_end > elements.len() {
-                                            return ExecResult::Trap(WasmError::ArrayOutOfBounds);
-                                        }
                                         elements[src_offset as usize..src_end].to_vec()
                                     }
                                     _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
@@ -4461,15 +4615,13 @@ impl WasmInstance {
                             // Then write to destination
                             match &mut self.gc_heap[dst_idx] {
                                 GcObject::Array { elements, .. } => {
-                                    if dst_end > elements.len() {
-                                        return ExecResult::Trap(WasmError::ArrayOutOfBounds);
-                                    }
                                     for i in 0..length as usize {
                                         elements[dst_offset as usize + i] = src_elems[i];
                                     }
                                 }
                                 _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
                             }
+                            } // end if length > 0
                         }
                     }
                     18 => { // array.init_data: typeidx + data_idx
@@ -4484,13 +4636,20 @@ impl WasmInstance {
                             Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
                             _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
                         };
-                        let src_elems = try_exec!(self.gc_array_from_data(type_idx, data_idx, src_offset, length));
-                        match &mut self.gc_heap[heap_idx] {
+                        // Check array (destination) bounds first per spec
+                        match &self.gc_heap[heap_idx] {
                             GcObject::Array { elements, .. } => {
                                 let dst_end = dst_offset as usize + length as usize;
                                 if dst_end > elements.len() {
                                     return ExecResult::Trap(WasmError::ArrayOutOfBounds);
                                 }
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                        // Then check data source bounds
+                        let src_elems = try_exec!(self.gc_array_from_data(type_idx, data_idx, src_offset, length));
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
                                 for i in 0..length as usize {
                                     elements[dst_offset as usize + i] = src_elems[i];
                                 }
@@ -4510,13 +4669,20 @@ impl WasmInstance {
                             Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
                             _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
                         };
-                        let src_elems = try_exec!(self.gc_array_from_elem(elem_idx, src_offset, length));
-                        match &mut self.gc_heap[heap_idx] {
+                        // Check array (destination) bounds first per spec
+                        match &self.gc_heap[heap_idx] {
                             GcObject::Array { elements, .. } => {
                                 let dst_end = dst_offset as usize + length as usize;
                                 if dst_end > elements.len() {
                                     return ExecResult::Trap(WasmError::ArrayOutOfBounds);
                                 }
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                        // Then check element source bounds
+                        let src_elems = try_exec!(self.gc_array_from_elem(elem_idx, src_offset, length));
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
                                 for i in 0..length as usize {
                                     elements[dst_offset as usize + i] = src_elems[i];
                                 }
@@ -4574,9 +4740,9 @@ impl WasmInstance {
                         match val {
                             Value::NullRef | Value::I32(-1) => { try_exec!(self.push(Value::NullRef)); }
                             _ => {
-                                // Wrap externref in a GC object so it's distinguishable from i31ref
+                                // Wrap externref into the any hierarchy as Internalized
                                 let heap_idx = self.gc_heap.len() as u32;
-                                self.gc_heap.push(GcObject::Extern { value: val });
+                                self.gc_heap.push(GcObject::Internalized { value: val });
                                 try_exec!(self.push(Value::GcRef(heap_idx)));
                             }
                         }
@@ -4585,20 +4751,12 @@ impl WasmInstance {
                         let val = try_exec!(self.pop());
                         match val {
                             Value::NullRef | Value::I32(-1) => { try_exec!(self.push(Value::NullRef)); }
-                            Value::GcRef(idx) => {
-                                // Unwrap GcObject::Extern back to externref
-                                if (idx as usize) < self.gc_heap.len() {
-                                    if let GcObject::Extern { value } = &self.gc_heap[idx as usize] {
-                                        try_exec!(self.push(*value));
-                                    } else {
-                                        // Non-extern GC object: wrap as I32(idx)
-                                        try_exec!(self.push(Value::I32(idx as i32)));
-                                    }
-                                } else {
-                                    try_exec!(self.push(val));
-                                }
+                            _ => {
+                                // Wrap anyref into the extern hierarchy as Externalized
+                                let heap_idx = self.gc_heap.len() as u32;
+                                self.gc_heap.push(GcObject::Externalized { value: val });
+                                try_exec!(self.push(Value::GcRef(heap_idx)));
                             }
-                            _ => { try_exec!(self.push(val)); }
                         }
                     }
                     _ => {

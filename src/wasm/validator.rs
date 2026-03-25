@@ -2395,7 +2395,14 @@ impl<'a> Validator<'a> {
                             self.push_opd(StackType::Unknown);
                         }
                         5 => { // struct.set: typeidx fieldidx — pop ref, pop val
-                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let type_idx = self.read_u32()?;
+                            let field_idx = self.read_u32()? as usize;
+                            // Check field is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Struct { field_muts, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                if let Some(&is_mut) = field_muts.get(field_idx) {
+                                    if !is_mut { return Err(WasmError::TypeMismatch); }
+                                }
+                            }
                             let _ = self.pop_opd()?;
                             let _ = self.pop_opd()?;
                         }
@@ -2429,7 +2436,11 @@ impl<'a> Validator<'a> {
                             self.push_opd(StackType::Unknown);
                         }
                         14 => { // array.set: typeidx — pop val, pop idx, pop ref
-                            let _ = self.read_u32()?;
+                            let type_idx = self.read_u32()?;
+                            // Check array is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                            }
                             let _ = self.pop_opd()?; // val
                             let _ = self.pop_opd()?; // idx
                             let _ = self.pop_opd()?; // ref
@@ -2439,14 +2450,22 @@ impl<'a> Validator<'a> {
                             self.push_val(ValType::I32);
                         }
                         16 => { // array.fill: typeidx — pop len, pop val, pop idx, pop ref
-                            let _ = self.read_u32()?;
+                            let type_idx = self.read_u32()?;
+                            // Check array is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                            }
                             let _ = self.pop_opd()?; // len
                             let _ = self.pop_opd()?; // val
                             let _ = self.pop_opd()?; // idx
                             let _ = self.pop_opd()?; // ref
                         }
-                        17 => { // array.copy: typeidx + typeidx — pop len, pop src_idx, pop src_ref, pop dst_idx, pop dst_ref
-                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                        17 => { // array.copy: dst_typeidx + src_typeidx — pop len, pop src_idx, pop src_ref, pop dst_idx, pop dst_ref
+                            let dst_type = self.read_u32()?; let _ = self.read_u32()?;
+                            // Check destination array is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(dst_type as usize) {
+                                if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                            }
                             let _ = self.pop_opd()?; // len
                             let _ = self.pop_opd()?; // src idx
                             let _ = self.pop_opd()?; // src ref
@@ -2454,7 +2473,11 @@ impl<'a> Validator<'a> {
                             let _ = self.pop_opd()?; // dst ref
                         }
                         18 | 19 => { // array.init_data/elem: typeidx + idx — pop len, pop src_off, pop dst_idx, pop ref
-                            let _ = self.read_u32()?; let _ = self.read_u32()?;
+                            let type_idx = self.read_u32()?; let _ = self.read_u32()?;
+                            // Check array is mutable
+                            if let Some(crate::wasm::decoder::GcTypeDef::Array { elem_mutable, .. }) = self.module.gc_types.get(type_idx as usize) {
+                                if !elem_mutable { return Err(WasmError::TypeMismatch); }
+                            }
                             let _ = self.pop_opd()?; // len
                             let _ = self.pop_opd()?; // src offset
                             let _ = self.pop_opd()?; // dst idx

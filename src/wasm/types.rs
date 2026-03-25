@@ -135,13 +135,14 @@ impl Value {
     /// Return zero/null for the given type.
     pub const fn default_for(ty: ValType) -> Self {
         match ty {
-            ValType::I32 | ValType::FuncRef | ValType::ExternRef
-            | ValType::TypedFuncRef | ValType::NullableTypedFuncRef => Value::I32(0),
+            ValType::I32 => Value::I32(0),
             ValType::I64 => Value::I64(0),
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
             ValType::V128 => Value::V128(V128::ZERO),
-            ValType::AnyRef | ValType::EqRef | ValType::I31Ref
+            ValType::FuncRef | ValType::ExternRef
+            | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
+            | ValType::AnyRef | ValType::EqRef | ValType::I31Ref
             | ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
             | ValType::ExnRef => Value::NullRef,
         }
