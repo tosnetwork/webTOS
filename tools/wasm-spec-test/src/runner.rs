@@ -1513,6 +1513,10 @@ impl WastRunner {
         };
         let result = self.execute_call(&handle, func_idx, &args);
         self.sync_shared_memory();
+        // Sync mutable globals back to source instances, then re-read
+        // This ensures aliased imports (same source global under different names) stay in sync
+        self.sync_globals_back(&handle);
+        self.sync_imported_globals(&handle);
         result
     }
 
@@ -1658,6 +1662,61 @@ impl WastRunner {
                 }
             }
             global_idx += 1;
+        }
+    }
+
+    fn sync_tables_back_and_forward(&self, handle: &InstanceHandle) {
+        // Collect table import info
+        let table_imports: Vec<(usize, String, String)> = {
+            let record = handle.borrow();
+            let mut tbl_idx = 0usize;
+            let mut result = Vec::new();
+            for import in &record.instance.module.imports {
+                if !matches!(import.kind, ImportKind::Table(_)) {
+                    continue;
+                }
+                let module_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+                let field_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+                result.push((tbl_idx, module_name, field_name));
+                tbl_idx += 1;
+            }
+            result
+        };
+        // Sync back: write local table to source, then re-read
+        for (tbl_idx, module_name, field_name) in &table_imports {
+            if *module_name == SPECTEST_MODULE { continue; }
+            let Some(src_handle) = self.instances.get(module_name.as_str()) else { continue };
+            if Rc::ptr_eq(src_handle, handle) { continue; }
+            // Write back
+            {
+                let record = handle.borrow();
+                if let Ok(mut src) = src_handle.try_borrow_mut() {
+                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, field_name) {
+                        let si = src_tbl_idx as usize;
+                        if *tbl_idx < record.instance.tables.len() && si < src.instance.tables.len() {
+                            let len = record.instance.tables[*tbl_idx].len().min(src.instance.tables[si].len());
+                            for i in 0..len {
+                                src.instance.tables[si][i] = record.instance.tables[*tbl_idx][i];
+                            }
+                        }
+                    }
+                }
+            }
+            // Read forward
+            {
+                if let Ok(src) = src_handle.try_borrow() {
+                    let mut record = handle.borrow_mut();
+                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, field_name) {
+                        let si = src_tbl_idx as usize;
+                        if *tbl_idx < record.instance.tables.len() && si < src.instance.tables.len() {
+                            let len = record.instance.tables[*tbl_idx].len().min(src.instance.tables[si].len());
+                            for i in 0..len {
+                                record.instance.tables[*tbl_idx][i] = src.instance.tables[si][i];
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
