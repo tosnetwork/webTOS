@@ -321,8 +321,11 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
 
     // Validate instruction sequences for each function
     for (i, func) in module.functions.iter().enumerate() {
-        validate_function_body(module, i, func, total_functions, has_memory,
-            total_tables, total_globals, table_import_count, &declared_funcs)?;
+        if let Err(e) = validate_function_body(module, i, func, total_functions, has_memory,
+            total_tables, total_globals, table_import_count, &declared_funcs) {
+            eprintln!("[DEBUG] validation failed at function {} (type_idx={}, code_offset={}): {:?}", i, func.type_idx, func.code_offset, e);
+            return Err(e);
+        }
     }
 
     Ok(())
@@ -2391,9 +2394,9 @@ impl<'a> Validator<'a> {
                             let _ = self.read_u32()?; // label
                             let _ = self.read_i32()?; // ht1
                             let _ = self.read_i32()?; // ht2
-                            // Pop the input ref, push back (conditional branch)
-                            let val = self.pop_opd()?;
-                            self.push_opd(val);
+                            // Pop the input ref, push Unknown (type is narrowed on fall-through)
+                            let _ = self.pop_opd()?;
+                            self.push_opd(StackType::Unknown);
                         }
                         26 | 27 => { // any.convert_extern, extern.convert_any: pop ref, push ref
                             let _ = self.pop_opd()?;

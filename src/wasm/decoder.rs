@@ -128,6 +128,9 @@ pub struct GlobalDef {
     pub init_func_ref: Option<u32>,
     /// Raw init expression bytes for deferred GC evaluation.
     pub init_expr_bytes: Vec<u8>,
+    /// Heap type for GC ref types. Negative = abstract (-16=func, -17=extern, etc).
+    /// Non-negative = concrete type index. None for non-ref types.
+    pub heap_type: Option<i32>,
 }
 
 /// A table definition.
@@ -1600,6 +1603,15 @@ fn decode_global_section(
         return Err(WasmError::TooManyFunctions);
     }
     for _ in 0..count {
+        // Peek at bytes to extract heap type for ref types
+        let saved_pos = *pos;
+        let first_byte = if saved_pos < bytes.len() { bytes[saved_pos] } else { 0 };
+        let global_heap_type = if first_byte == 0x63 || first_byte == 0x64 {
+            let mut peek_pos = saved_pos + 1;
+            decode_leb128_i32(bytes, &mut peek_pos).ok()
+        } else {
+            None
+        };
         // Use stream decoder to handle multi-byte ref types
         let val_type = decode_valtype_gc_aware(bytes, pos, module)?;
         let mt = read_byte(bytes, pos)?;
@@ -1616,7 +1628,7 @@ fn decode_global_section(
         let init_func_ref = expr_info.func_ref;
         let init_value = eval_init_expr(bytes, pos)?;
         let init_expr_bytes = bytes[expr_start..*pos].to_vec();
-        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref, init_expr_bytes });
+        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref, init_expr_bytes, heap_type: global_heap_type });
     }
     Ok(())
 }

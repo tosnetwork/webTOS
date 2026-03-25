@@ -839,6 +839,10 @@ impl WasmInstance {
                     return false;
                 }
                 let obj = &self.gc_heap[heap_idx as usize];
+                // Externalized values only match anyref (not eq, i31, struct, etc.)
+                if matches!(obj, GcObject::Extern { .. }) {
+                    return ht == Self::HT_ANY;
+                }
                 let obj_type_idx = obj.type_idx();
                 match ht {
                     Self::HT_ANY => true,      // all GC objects <: any

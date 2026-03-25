@@ -1142,6 +1142,7 @@ impl WastRunner {
                 init_expr_type: Some(val_type),
                 init_expr_stack_depth: 1,
                 init_expr_bytes: Vec::new(),
+                heap_type: None,
             });
         }
 
@@ -1888,7 +1889,7 @@ impl WastRunner {
             let idx = global_idx.unwrap() as usize;
             // Check type
             if let Some(gdef) = record.instance.module.globals.get(idx) {
-                if gdef.val_type != val_type && !global_types_compatible(val_type, val_type_byte, heap_type, gdef.val_type, mutable) {
+                if gdef.val_type != val_type && !global_types_compatible(val_type, val_type_byte, gdef.val_type, mutable) {
                     return Err(RunnerError::new(
                         "link",
                         format!("incompatible import type for global `{module_name}::{field_name}`: type mismatch"),
@@ -2749,8 +2750,23 @@ fn global_types_compatible(
         if is_externref_family(import_val_type) && is_externref_family(export_val_type) {
             return true;
         }
-        // For concrete typed refs (0x63/0x64 + type index), both sides must have matching
-        // types. But we can't verify type index equality through our GlobalDef, so reject.
+        // 0x63/0x64 with abstract heap type -16 (func):
+        //   0x63 + -16 = (ref null func) = FuncRef
+        //   0x64 + -16 = (ref func) = TypedFuncRef
+        if matches!(import_byte, 0x63 | 0x64) && heap_type == Some(-16) {
+            let effective_import = if import_byte == 0x63 { ValType::FuncRef } else { ValType::TypedFuncRef };
+            if effective_import == export_val_type {
+                return true;
+            }
+        }
+        // 0x63/0x64 with abstract heap type -17 (extern):
+        if matches!(import_byte, 0x63 | 0x64) && heap_type == Some(-17) {
+            if is_externref_family(export_val_type) {
+                return true;
+            }
+        }
+        // For concrete typed refs (0x63/0x64 + type index >= 0), both sides must have
+        // the exact same type. We can't verify type index equality through GlobalDef, so reject.
         return false;
     }
 
@@ -2773,10 +2789,20 @@ fn global_types_compatible(
         return true;
     }
 
-    // Concrete type imports (ref null $t) / (ref $t) - we can't match type indices
-    // precisely through our GlobalDef model, so reject mismatches.
-    // This correctly rejects e.g. importing (ref null $t) for an export of (ref null func).
+    // Concrete type imports (ref null $t) / (ref $t).
+    // A concrete type (ref null $t) can match another concrete type (ref null $t) or (ref $t).
+    // It cannot match abstract types like (ref null func) or externref.
+    // In our model: NullableTypedFuncRef = (ref null $t), TypedFuncRef = (ref $t).
+    // FuncRef = (ref null func) is abstract and should NOT match concrete imports.
     if import_is_concrete {
+        if import_byte == 0x63 {
+            // (ref null $t): accept (ref null $t) or (ref $t), reject (ref null func)/(ref func)/externref
+            return matches!(export_val_type, ValType::NullableTypedFuncRef | ValType::TypedFuncRef);
+        }
+        if import_byte == 0x64 {
+            // (ref $t): accept (ref $t) only, reject nullable and abstract
+            return export_val_type == ValType::TypedFuncRef;
+        }
         return false;
     }
 
