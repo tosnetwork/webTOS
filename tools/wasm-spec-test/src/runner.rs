@@ -1212,6 +1212,29 @@ impl WastRunner {
             self.instances.insert(name.clone(), handle.clone());
         }
 
+        // Detect aliased table imports: if two imports resolve to the same source table,
+        // set table_aliases so runtime redirects one to the other.
+        {
+            let mut record = handle.borrow_mut();
+            let mut tbl_source_map: Vec<(String, String)> = Vec::new(); // (module, field) per import table idx
+            for import in &record.instance.module.imports {
+                if !matches!(import.kind, ImportKind::Table(_)) { continue; }
+                let mod_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+                let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+                tbl_source_map.push((mod_name, fld_name));
+            }
+            // For each pair of table imports from the same module+field, alias the second to the first
+            for i in 0..tbl_source_map.len() {
+                for j in (i+1)..tbl_source_map.len() {
+                    if tbl_source_map[i] == tbl_source_map[j] {
+                        if j < record.instance.table_aliases.len() {
+                            record.instance.table_aliases[j] = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Err(err) = self.run_start(&handle) {
             if let Some(name) = &inserted_name {
                 self.instances.remove(name);

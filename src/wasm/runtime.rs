@@ -9,6 +9,12 @@ use alloc::vec::Vec;
 use crate::wasm::decoder::{WasmModule, ImportKind, GcTypeDef, StorageType};
 use crate::wasm::types::*;
 
+/// Resolve table alias without borrowing self.
+#[inline]
+fn resolve_table_alias(aliases: &[Option<usize>], idx: usize) -> usize {
+    if idx < aliases.len() { aliases[idx].unwrap_or(idx) } else { idx }
+}
+
 // ─── Call frame ─────────────────────────────────────────────────────────────
 
 /// A call frame on the call stack.
@@ -435,12 +441,13 @@ impl WasmInstance {
 
     /// Get a reference to a table by index (defaults to table 0).
     fn table(&self, tbl_idx: usize) -> &Vec<Option<u32>> {
-        &self.tables[tbl_idx]
+        &self.tables[self.tbl(tbl_idx)]
     }
 
     /// Get a mutable reference to a table by index (defaults to table 0).
     fn table_mut(&mut self, tbl_idx: usize) -> &mut Vec<Option<u32>> {
-        &mut self.tables[tbl_idx]
+        let resolved = resolve_table_alias(&self.table_aliases, tbl_idx);
+        &mut self.tables[resolved]
     }
 
     // ─── Tag helpers (exception handling) ──────────────────────────────
@@ -559,14 +566,15 @@ impl WasmInstance {
             if mode == ElemMode::Active && tbl_idx < self.tables.len() {
                 for (i, val) in new_values.iter().enumerate() {
                     let idx = offset + i;
-                    if idx < self.tables[tbl_idx].len() {
+                    if idx < self.tables[self.tbl(tbl_idx)].len() {
                         let entry = match val {
                             Value::NullRef => None,
                             Value::I32(v) => if *v < 0 { None } else { Some(*v as u32) },
                             Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
                             _ => None,
                         };
-                        self.tables[tbl_idx][idx] = entry;
+                        let rt = resolve_table_alias(&self.table_aliases, tbl_idx);
+                        self.tables[rt][idx] = entry;
                     }
                 }
             }
@@ -1113,6 +1121,12 @@ impl WasmInstance {
     }
 
     // ─── Memory access ──────────────────────────────────────────────────
+
+    /// Resolve table alias: if table_aliases[idx] is set, redirect to the alias target.
+    #[inline]
+    fn tbl(&self, idx: usize) -> usize {
+        resolve_table_alias(&self.table_aliases, idx)
+    }
 
     /// Get memory slice reference by index, defaulting to memory 0.
     #[inline]
@@ -2781,7 +2795,7 @@ impl WasmInstance {
                 let type_idx = try_exec!(self.read_leb128_u32());
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
                 let elem_idx = try_exec!(self.pop_i32()) as usize;
-                let tbl = if table_idx < self.tables.len() { &self.tables[table_idx] } else { return ExecResult::Trap(WasmError::TableIndexOutOfBounds); };
+                let tbl = if table_idx < self.tables.len() { &self.tables[self.tbl(table_idx)] } else { return ExecResult::Trap(WasmError::TableIndexOutOfBounds); };
                 if elem_idx >= tbl.len() {
                     return ExecResult::Trap(WasmError::UndefinedElement);
                 }
@@ -2941,10 +2955,10 @@ impl WasmInstance {
                 let elem_idx = try_exec!(self.pop_i32()) as usize;
                 // Look up function in table
                 let tbl = if table_idx < self.tables.len() { table_idx } else { 0 };
-                if tbl >= self.tables.len() || elem_idx >= self.tables[tbl].len() {
+                if tbl >= self.tables.len() || elem_idx >= self.tables[self.tbl(tbl)].len() {
                     return ExecResult::Trap(WasmError::UndefinedElement);
                 }
-                let func_idx = match self.tables[tbl][elem_idx] {
+                let func_idx = match self.tables[self.tbl(tbl)][elem_idx] {
                     Some(idx) => idx,
                     None => return ExecResult::Trap(WasmError::UninitializedElement(elem_idx as u32)),
                 };
@@ -3131,10 +3145,10 @@ impl WasmInstance {
                 if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                if idx >= self.tables[table_idx].len() {
+                if idx >= self.tables[self.tbl(table_idx)].len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                let val = match self.tables[table_idx][idx] {
+                let val = match self.tables[self.tbl(table_idx)][idx] {
                     None => Value::NullRef,
                     Some(f) if f & 0x8000_0000 != 0 => Value::GcRef(f & 0x7FFF_FFFF),
                     Some(f) => Value::I32(f as i32),
@@ -3150,7 +3164,7 @@ impl WasmInstance {
                 if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                if idx >= self.tables[table_idx].len() {
+                if idx >= self.tables[self.tbl(table_idx)].len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
                 let entry = match raw_val {
@@ -3159,7 +3173,8 @@ impl WasmInstance {
                     Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000), // encode gc refs with high bit
                     _ => None,
                 };
-                self.tables[table_idx][idx] = entry;
+                let rt = resolve_table_alias(&self.table_aliases, table_idx);
+                self.tables[rt][idx] = entry;
             }
 
             // ── Memory ──────────────────────────────────────────────
@@ -4064,7 +4079,7 @@ impl WasmInstance {
                             if n != 0 || s != 0 {
                                 return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                             }
-                            if tbl_idx >= self.tables.len() || (d as usize) > self.tables[tbl_idx].len() {
+                            if tbl_idx >= self.tables.len() || (d as usize) > self.tables[self.tbl(tbl_idx)].len() {
                                 return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                             }
                         } else if seg_idx < self.module.element_segments.len() {
@@ -4072,18 +4087,19 @@ impl WasmInstance {
                             if tbl_idx >= self.tables.len() {
                                 return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                             }
-                            let tbl_len = self.tables[tbl_idx].len();
+                            let tbl_len = self.tables[self.tbl(tbl_idx)].len();
                             let src_end = (s as u64) + (n as u64);
                             let dst_end = (d as u64) + (n as u64);
                             if src_end > seg_len as u64 || dst_end > tbl_len as u64 {
                                 return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                             }
+                            let rt = resolve_table_alias(&self.table_aliases, tbl_idx);
                             for i in 0..(n as usize) {
                                 let func_idx = self.module.element_segments[seg_idx].func_indices[(s as usize) + i];
                                 if func_idx == u32::MAX {
-                                    self.tables[tbl_idx][(d as usize) + i] = None;
+                                    self.tables[rt][(d as usize) + i] = None;
                                 } else {
-                                    self.tables[tbl_idx][(d as usize) + i] = Some(func_idx);
+                                    self.tables[rt][(d as usize) + i] = Some(func_idx);
                                 }
                             }
                         } else {
@@ -4112,21 +4128,23 @@ impl WasmInstance {
                         if dst_tbl >= self.tables.len() || src_tbl >= self.tables.len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
-                        if su.saturating_add(nu) > self.tables[src_tbl].len()
-                            || du.saturating_add(nu) > self.tables[dst_tbl].len()
+                        if su.saturating_add(nu) > self.tables[self.tbl(src_tbl)].len()
+                            || du.saturating_add(nu) > self.tables[self.tbl(dst_tbl)].len()
                         {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
-                        if dst_tbl == src_tbl {
+                        let rd = resolve_table_alias(&self.table_aliases, dst_tbl);
+                        let rs = resolve_table_alias(&self.table_aliases, src_tbl);
+                        if rd == rs {
                             if du <= su {
-                                for i in 0..nu { self.tables[dst_tbl][du + i] = self.tables[src_tbl][su + i]; }
+                                for i in 0..nu { self.tables[rd][du + i] = self.tables[rd][su + i]; }
                             } else {
-                                for i in (0..nu).rev() { self.tables[dst_tbl][du + i] = self.tables[src_tbl][su + i]; }
+                                for i in (0..nu).rev() { self.tables[rd][du + i] = self.tables[rd][su + i]; }
                             }
                         } else {
                             for i in 0..nu {
-                                let val = self.tables[src_tbl][su + i];
-                                self.tables[dst_tbl][du + i] = val;
+                                let val = self.tables[rs][su + i];
+                                self.tables[rd][du + i] = val;
                             }
                         }
                     }
@@ -4139,7 +4157,7 @@ impl WasmInstance {
                         if tbl_idx >= self.tables.len() {
                             if is_t64 { try_exec!(self.push(Value::I64(-1))); } else { try_exec!(self.push(Value::I32(-1))); }
                         } else {
-                            let old_size = self.tables[tbl_idx].len() as u64;
+                            let old_size = self.tables[self.tbl(tbl_idx)].len() as u64;
                             let new_size = old_size + n;
                             let max = self.module.tables.get(tbl_idx).and_then(|t| t.max);
                             let limit = max.map_or(MAX_TABLE_SIZE as u64, |m| m as u64);
@@ -4152,7 +4170,8 @@ impl WasmInstance {
                                     Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
                                     _ => None,
                                 };
-                                self.tables[tbl_idx].resize(new_size as usize, fill_val);
+                                let rt = resolve_table_alias(&self.table_aliases, tbl_idx);
+                                self.tables[rt].resize(new_size as usize, fill_val);
                                 if is_t64 { try_exec!(self.push(Value::I64(old_size as i64))); } else { try_exec!(self.push(Value::I32(old_size as i32))); }
                             }
                         }
@@ -4160,7 +4179,7 @@ impl WasmInstance {
                     // table.size (16)
                     16 => {
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
-                        let size = if tbl_idx < self.tables.len() { self.tables[tbl_idx].len() } else { 0 };
+                        let size = if tbl_idx < self.tables.len() { self.tables[self.tbl(tbl_idx)].len() } else { 0 };
                         if tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64 {
                             try_exec!(self.push(Value::I64(size as i64)));
                         } else {
@@ -4175,7 +4194,7 @@ impl WasmInstance {
                         let raw_val = try_exec!(self.pop());
                         let d = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let nu = n as usize; let du = d as usize;
-                        if tbl_idx >= self.tables.len() || du.saturating_add(nu) > self.tables[tbl_idx].len() {
+                        if tbl_idx >= self.tables.len() || du.saturating_add(nu) > self.tables[self.tbl(tbl_idx)].len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                         }
                         let entry = match raw_val {
@@ -4184,7 +4203,8 @@ impl WasmInstance {
                             Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000),
                             _ => None,
                         };
-                        for i in 0..nu { self.tables[tbl_idx][du + i] = entry; }
+                        let rt = resolve_table_alias(&self.table_aliases, tbl_idx);
+                        for i in 0..nu { self.tables[rt][du + i] = entry; }
                     }
 
                     // ── Wide-arithmetic (0x13-0x16) ──
