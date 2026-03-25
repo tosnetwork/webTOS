@@ -126,6 +126,8 @@ pub struct GlobalDef {
     pub init_expr_stack_depth: u32,
     /// If the init expression uses ref.func, this is the function index.
     pub init_func_ref: Option<u32>,
+    /// Raw init expression bytes for deferred GC evaluation.
+    pub init_expr_bytes: Vec<u8>,
 }
 
 /// A table definition.
@@ -1146,11 +1148,11 @@ fn decode_import_section(
                     return Err(WasmError::InvalidSection);
                 }
                 let is_memory64 = (flags & 0b100) != 0;
-                let min = if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? };
+                let min_raw = if is_memory64 { decode_leb128_u64(bytes, pos)? } else { decode_leb128_u32(bytes, pos)? as u64 };
                 let has_max = flags & 1 != 0;
-                let max = if has_max {
-                    if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? }
-                } else { u32::MAX };
+                let max_raw = if has_max {
+                    if is_memory64 { decode_leb128_u64(bytes, pos)? } else { decode_leb128_u32(bytes, pos)? as u64 }
+                } else { u32::MAX as u64 };
                 // If custom-page-sizes flag (bit 3), read and discard the page size
                 let mem_page_size_log2 = if flags & 0b1000 != 0 {
                     let page_size_log2 = decode_leb128_u32(bytes, pos)?;
@@ -1161,6 +1163,26 @@ fn decode_import_section(
                 } else {
                     None
                 };
+                // Validate memory64 limits against maximum before truncating
+                if is_memory64 {
+                    let page_size_log2 = mem_page_size_log2.unwrap_or(16);
+                    // Max pages for memory64 = 2^64 / page_size = 2^(64 - page_size_log2)
+                    let max_pages_for_mem64: u64 = if page_size_log2 == 0 {
+                        u64::MAX
+                    } else if page_size_log2 >= 64 {
+                        1
+                    } else {
+                        1u64 << (64u32 - page_size_log2)
+                    };
+                    if min_raw > max_pages_for_mem64 {
+                        return Err(WasmError::MemoryOutOfBounds);
+                    }
+                    if has_max && max_raw > max_pages_for_mem64 {
+                        return Err(WasmError::MemoryOutOfBounds);
+                    }
+                }
+                let min = min_raw as u32;
+                let max = if has_max { max_raw as u32 } else { u32::MAX };
                 module.memory_min_pages = min;
                 module.is_memory64 = is_memory64;
                 module.page_size_log2 = mem_page_size_log2;
@@ -1274,12 +1296,13 @@ fn decode_memory_section(
         // Validate memory64 limits against maximum before truncating
         if is_memory64 {
             let page_size_log2 = mem_page_size_log2.unwrap_or(16);
+            // Max pages for memory64 = 2^64 / page_size = 2^(64 - page_size_log2)
             let max_pages_for_mem64: u64 = if page_size_log2 == 0 {
-                // pagesize 1: max is 2^48 bytes = 2^48
-                1u64 << 48
+                u64::MAX
+            } else if page_size_log2 >= 64 {
+                1
             } else {
-                // pagesize 2^n: max is 2^48 / 2^n = 2^(48-n)
-                1u64 << (48u32.saturating_sub(page_size_log2))
+                1u64 << (64u32 - page_size_log2)
             };
             if min_raw > max_pages_for_mem64 {
                 return Err(WasmError::MemoryOutOfBounds);
@@ -1576,13 +1599,15 @@ fn decode_global_section(
         }
         let mutable = mt != 0;
         // Scan init expr bytes to find global.get references and type info before consuming them.
-        let expr_info = scan_init_expr_info(bytes, *pos);
+        let expr_start = *pos;
+        let expr_info = scan_init_expr_info_gc(bytes, *pos, &module.gc_types);
         let init_global_ref = expr_info.global_ref;
         let init_expr_type = expr_info.result_type;
         let init_expr_stack_depth = expr_info.stack_depth;
         let init_func_ref = expr_info.func_ref;
         let init_value = eval_init_expr(bytes, pos)?;
-        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref });
+        let init_expr_bytes = bytes[expr_start..*pos].to_vec();
+        module.globals.push(GlobalDef { val_type, mutable, init_value, init_global_ref, init_expr_type, init_expr_stack_depth, init_func_ref, init_expr_bytes });
     }
     Ok(())
 }
@@ -1982,6 +2007,10 @@ fn skip_init_expr(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
 /// Scan init expression bytes to extract validation info.
 /// Returns InitExprInfo with global refs, result type, stack depth, etc.
 pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
+    scan_init_expr_info_gc(bytes, start, &[])
+}
+
+pub fn scan_init_expr_info_gc(bytes: &[u8], start: usize, gc_types: &[GcTypeDef]) -> InitExprInfo {
     let mut p = start;
     let mut info = InitExprInfo::default();
     // Track a small type stack
@@ -2049,17 +2078,40 @@ pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
                 // GC prefix in init expr
                 if let Ok(sub) = decode_leb128_u32(bytes, &mut p) {
                     match sub {
-                        0 | 1 | 6 | 7 => { let _ = decode_leb128_u32(bytes, &mut p); /* type_idx */
-                            // These push a ref; we don't track GC types precisely
-                            // struct.new pops N fields; struct.new_default pops 0; array.new pops 2; array.new_default pops 1
-                            // For scanning purposes, just mark as pushing something
-                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        0 => { // struct.new: pop N fields, push ref
+                            if let Ok(type_idx) = decode_leb128_u32(bytes, &mut p) {
+                                let field_count = if let Some(GcTypeDef::Struct { field_types, .. }) = gc_types.get(type_idx as usize) {
+                                    field_types.len()
+                                } else { 0 };
+                                sp = sp.saturating_sub(field_count);
+                            }
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
                         }
-                        8 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
-                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        1 => { // struct.new_default: pop 0, push ref
+                            let _ = decode_leb128_u32(bytes, &mut p);
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
                         }
-                        9 | 10 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
-                            if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                        6 => { // array.new: pop init_val + length, push ref
+                            let _ = decode_leb128_u32(bytes, &mut p);
+                            sp = sp.saturating_sub(2);
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
+                        }
+                        7 => { // array.new_default: pop length, push ref
+                            let _ = decode_leb128_u32(bytes, &mut p);
+                            sp = sp.saturating_sub(1);
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
+                        }
+                        8 => { // array.new_fixed: pop N values, push ref
+                            let _ = decode_leb128_u32(bytes, &mut p);
+                            if let Ok(count) = decode_leb128_u32(bytes, &mut p) {
+                                sp = sp.saturating_sub(count as usize);
+                            }
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
+                        }
+                        9 | 10 => { // array.new_data/elem: pop offset + length, push ref
+                            let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
+                            sp = sp.saturating_sub(2);
+                            if sp < 16 { type_stack[sp] = None; sp += 1; }
                         }
                         2 | 3 | 4 => { let _ = decode_leb128_u32(bytes, &mut p); let _ = decode_leb128_u32(bytes, &mut p);
                             // struct.get: pop ref, push val

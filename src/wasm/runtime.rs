@@ -345,6 +345,9 @@ impl WasmInstance {
             }
         }
 
+        // Evaluate GC const expressions for globals that need deferred evaluation
+        inst.eval_gc_globals();
+
         Ok(inst)
     }
 
@@ -421,6 +424,164 @@ impl WasmInstance {
     }
 
     // ─── GC helpers ──────────────────────────────────────────────────────
+
+    /// Evaluate GC const expressions for globals that need deferred evaluation.
+    /// Called after instance creation when gc_heap is available.
+    fn eval_gc_globals(&mut self) {
+        // Collect init expression bytes to avoid borrow issues
+        let global_info: Vec<(Vec<u8>, ValType)> = self.module.globals.iter()
+            .map(|g| (g.init_expr_bytes.clone(), g.val_type))
+            .collect();
+
+        for (gi, (ref expr_bytes, val_type)) in global_info.iter().enumerate() {
+            if expr_bytes.is_empty() { continue; }
+            let needs_gc = matches!(val_type,
+                ValType::AnyRef | ValType::EqRef | ValType::I31Ref |
+                ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef |
+                ValType::NoneRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+            if !needs_gc { continue; }
+            if let Some(val) = self.eval_gc_const_expr(expr_bytes, 0) {
+                self.globals[gi] = val;
+            }
+        }
+    }
+
+    /// Evaluate a GC-aware const expression, returning the resulting value.
+    fn eval_gc_const_expr(&mut self, bytes: &[u8], start: usize) -> Option<Value> {
+        use crate::wasm::decoder::{decode_leb128_u32, decode_leb128_i32, decode_leb128_i64};
+
+        let mut pos = start;
+        let mut stack: Vec<Value> = Vec::new();
+
+        loop {
+            if pos >= bytes.len() { return None; }
+            let opcode = bytes[pos];
+            pos += 1;
+            match opcode {
+                0x0B => return stack.pop(),
+                0x41 => {
+                    if let Ok(v) = decode_leb128_i32(bytes, &mut pos) { stack.push(Value::I32(v)); }
+                }
+                0x42 => {
+                    if let Ok(v) = decode_leb128_i64(bytes, &mut pos) { stack.push(Value::I64(v)); }
+                }
+                0x43 => {
+                    if pos + 4 > bytes.len() { return None; }
+                    let v = f32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]);
+                    pos += 4;
+                    stack.push(Value::F32(v));
+                }
+                0x44 => {
+                    if pos + 8 > bytes.len() { return None; }
+                    let mut b8 = [0u8; 8];
+                    b8.copy_from_slice(&bytes[pos..pos+8]);
+                    pos += 8;
+                    stack.push(Value::F64(f64::from_le_bytes(b8)));
+                }
+                0x23 => {
+                    if let Ok(idx) = decode_leb128_u32(bytes, &mut pos) {
+                        let val = self.globals.get(idx as usize).copied().unwrap_or(Value::I32(0));
+                        stack.push(val);
+                    }
+                }
+                0xD0 => {
+                    let _ = decode_leb128_i32(bytes, &mut pos);
+                    stack.push(Value::NullRef);
+                }
+                0xD2 => {
+                    if let Ok(idx) = decode_leb128_u32(bytes, &mut pos) {
+                        stack.push(Value::I32(idx as i32));
+                    }
+                }
+                0xFB => {
+                    if let Ok(sub) = decode_leb128_u32(bytes, &mut pos) {
+                        match sub {
+                            0 => { // struct.new
+                                if let Ok(type_idx) = decode_leb128_u32(bytes, &mut pos) {
+                                    let field_count = self.gc_struct_field_count(type_idx);
+                                    let start_idx = stack.len().saturating_sub(field_count);
+                                    let mut fields: Vec<Value> = stack.drain(start_idx..).collect();
+                                    while fields.len() < field_count { fields.push(Value::I32(0)); }
+                                    for i in 0..field_count {
+                                        fields[i] = self.gc_wrap_field_value(type_idx, i, fields[i]);
+                                    }
+                                    let heap_idx = self.gc_heap.len() as u32;
+                                    self.gc_heap.push(GcObject::Struct { type_idx, fields });
+                                    stack.push(Value::GcRef(heap_idx));
+                                }
+                            }
+                            1 => { // struct.new_default
+                                if let Ok(type_idx) = decode_leb128_u32(bytes, &mut pos) {
+                                    let field_count = self.gc_struct_field_count(type_idx);
+                                    let mut fields = Vec::with_capacity(field_count);
+                                    for i in 0..field_count {
+                                        fields.push(self.gc_struct_field_default(type_idx, i));
+                                    }
+                                    let heap_idx = self.gc_heap.len() as u32;
+                                    self.gc_heap.push(GcObject::Struct { type_idx, fields });
+                                    stack.push(Value::GcRef(heap_idx));
+                                }
+                            }
+                            6 => { // array.new
+                                if let Ok(type_idx) = decode_leb128_u32(bytes, &mut pos) {
+                                    let length = stack.pop().map(|v| v.as_i32() as u32).unwrap_or(0);
+                                    let init_val = stack.pop().unwrap_or(Value::I32(0));
+                                    let wrapped = self.gc_wrap_array_value(type_idx, init_val);
+                                    let elements = vec![wrapped; length as usize];
+                                    let heap_idx = self.gc_heap.len() as u32;
+                                    self.gc_heap.push(GcObject::Array { type_idx, elements });
+                                    stack.push(Value::GcRef(heap_idx));
+                                }
+                            }
+                            7 => { // array.new_default
+                                if let Ok(type_idx) = decode_leb128_u32(bytes, &mut pos) {
+                                    let length = stack.pop().map(|v| v.as_i32() as u32).unwrap_or(0);
+                                    let default_val = self.gc_array_elem_default(type_idx);
+                                    let elements = vec![default_val; length as usize];
+                                    let heap_idx = self.gc_heap.len() as u32;
+                                    self.gc_heap.push(GcObject::Array { type_idx, elements });
+                                    stack.push(Value::GcRef(heap_idx));
+                                }
+                            }
+                            8 => { // array.new_fixed
+                                if let Ok(type_idx) = decode_leb128_u32(bytes, &mut pos) {
+                                    if let Ok(count) = decode_leb128_u32(bytes, &mut pos) {
+                                        let count = count as usize;
+                                        let start_idx = stack.len().saturating_sub(count);
+                                        let mut elements: Vec<Value> = stack.drain(start_idx..).collect();
+                                        for e in &mut elements {
+                                            *e = self.gc_wrap_array_value(type_idx, *e);
+                                        }
+                                        let heap_idx = self.gc_heap.len() as u32;
+                                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                                        stack.push(Value::GcRef(heap_idx));
+                                    }
+                                }
+                            }
+                            28 => {} // ref.i31: value stays as I32
+                            29 => { // i31.get_s
+                                if let Some(val) = stack.last_mut() {
+                                    let v = val.as_i32() & 0x7FFF_FFFF;
+                                    *val = Value::I32(if v & 0x4000_0000 != 0 { v | !0x7FFF_FFFFu32 as i32 } else { v });
+                                }
+                            }
+                            30 => { // i31.get_u
+                                if let Some(val) = stack.last_mut() {
+                                    *val = Value::I32(val.as_i32() & 0x7FFF_FFFF);
+                                }
+                            }
+                            26 | 27 => {} // any.convert_extern, extern.convert_any
+                            _ => return None,
+                        }
+                    }
+                }
+                0x6A => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_add(b))); } }
+                0x6B => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_sub(b))); } }
+                0x6C => { if stack.len() >= 2 { let b = stack.pop().unwrap().as_i32(); let a = stack.pop().unwrap().as_i32(); stack.push(Value::I32(a.wrapping_mul(b))); } }
+                _ => return None,
+            }
+        }
+    }
 
     /// Get the number of fields in a struct type.
     fn gc_struct_field_count(&self, type_idx: u32) -> usize {
@@ -2317,19 +2478,23 @@ impl WasmInstance {
                 try_exec!(self.push(Value::I32(idx as i32)));
             }
             0xD3 => {
-                // ref.as_non_null
-                let val = try_exec!(self.pop());
-                match val {
-                    Value::NullRef | Value::I32(-1) => {
-                        return ExecResult::Trap(WasmError::NullReference);
-                    }
-                    _ => {
-                        try_exec!(self.push(val));
-                    }
-                }
+                // ref.eq: pop two eqrefs, compare identity, push i32
+                let val2 = try_exec!(self.pop());
+                let val1 = try_exec!(self.pop());
+                let eq = match (val1, val2) {
+                    (Value::NullRef, Value::NullRef) => true,
+                    (Value::I32(-1), Value::NullRef) | (Value::NullRef, Value::I32(-1)) => true,
+                    (Value::I32(-1), Value::I32(-1)) => true,
+                    (Value::NullRef, _) | (_, Value::NullRef) => false,
+                    (Value::I32(-1), _) | (_, Value::I32(-1)) => false,
+                    (Value::I32(a), Value::I32(b)) => a == b,
+                    (Value::GcRef(a), Value::GcRef(b)) => a == b,
+                    _ => false,
+                };
+                try_exec!(self.push(Value::I32(if eq { 1 } else { 0 })));
             }
             0xD4 => {
-                // ref.as_non_null (alternate encoding)
+                // ref.as_non_null
                 let val = try_exec!(self.pop());
                 match val {
                     Value::NullRef | Value::I32(-1) => {

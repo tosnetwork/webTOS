@@ -172,17 +172,15 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
         // Validate global init expression type matches declared type
         // When GC is enabled, skip type checks — our type system doesn't model
-        // GC heap types (i31ref, structref, arrayref, etc.) so we can't validate them.
+        // GC heap types (i31ref, structref, arrayref, etc.) precisely in init exprs.
         if !module.gc_enabled {
             if let Some(expr_type) = global.init_expr_type {
                 if expr_type != global.val_type {
-                    // FuncRef/ExternRef are ref types - check compatibility
                     if !is_ref_compatible(expr_type, global.val_type) {
                         return Err(WasmError::TypeMismatch);
                     }
                 }
             } else if global.init_global_ref.is_some() {
-                // The expression is a global.get - resolve the type of the referenced global
                 if let Some(ref_idx) = global.init_global_ref {
                     let ref_type = get_imported_global_type(module, ref_idx);
                     if let Some(rt) = ref_type {
@@ -303,7 +301,9 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                 if seg.memory_idx > 0 { return Err(WasmError::MemoryOutOfBounds); }
             }
             // Validate offset expression (memory64 uses I64 offset)
-            let offset_type = if module.is_memory64 && seg.memory_idx == 0 { ValType::I64 } else { ValType::I32 };
+            let offset_type = if (seg.memory_idx as usize) < module.memories.len() {
+                if module.memories[seg.memory_idx as usize].is_memory64 { ValType::I64 } else { ValType::I32 }
+            } else if module.is_memory64 { ValType::I64 } else { ValType::I32 };
             validate_init_expr_for_segment(
                 &seg.offset_expr_info, global_import_count, total_globals,
                 module, offset_type,
@@ -476,9 +476,43 @@ fn ref_types_compatible(src: ValType, dst: ValType) -> bool {
     false
 }
 
+/// Comprehensive subtype check for validator pop_expect.
+/// Covers GC type hierarchy: none <: i31/struct/array <: eq <: any
+/// func hierarchy: nofunc <: typed <: nullable typed <: func
+/// extern hierarchy: noextern <: extern
+fn val_is_subtype(src: ValType, dst: ValType) -> bool {
+    if src == dst { return true; }
+    match (src, dst) {
+        // FuncRef family: direction is typed <: nullable <: funcref
+        (ValType::TypedFuncRef, ValType::NullableTypedFuncRef | ValType::FuncRef) => true,
+        (ValType::NullableTypedFuncRef, ValType::FuncRef) => true,
+        // GC ref hierarchy: none <: i31/struct/array <: eq <: any
+        (ValType::NoneRef, d) if is_ref_type(d) || d == ValType::ExnRef => true,
+        (ValType::I31Ref, ValType::EqRef | ValType::AnyRef) => true,
+        (ValType::StructRef | ValType::NullableStructRef, ValType::EqRef | ValType::AnyRef) => true,
+        (ValType::StructRef, ValType::NullableStructRef) => true,
+        (ValType::ArrayRef, ValType::EqRef | ValType::AnyRef) => true,
+        (ValType::EqRef, ValType::AnyRef) => true,
+        // Concrete GC refs (encoded as TypedFuncRef/NullableTypedFuncRef for non-func types)
+        // are subtypes of abstract GC types
+        (ValType::TypedFuncRef | ValType::NullableTypedFuncRef,
+         ValType::AnyRef | ValType::EqRef | ValType::StructRef |
+         ValType::NullableStructRef | ValType::ArrayRef | ValType::I31Ref) => true,
+        _ => false,
+    }
+}
+
+/// Check if `src` is a subtype of `dst` (src <: dst).
+/// Used for validating try_table catch clause label types.
+fn is_subtype(src: ValType, dst: ValType) -> bool {
+    val_is_subtype(src, dst)
+}
+
 /// Check if a ValType is a reference type.
 fn is_ref_type(t: ValType) -> bool {
-    matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
+    matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef
+        | ValType::AnyRef | ValType::EqRef | ValType::I31Ref | ValType::StructRef
+        | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef | ValType::ExnRef)
 }
 
 // ─── Type checking structures ────────────────────────────────────────────────
@@ -557,12 +591,7 @@ impl<'a> Validator<'a> {
         match actual {
             StackType::Known(t) if t == expected => Ok(()),
             StackType::Unknown => Ok(()),
-            // Subtyping: typed func refs are subtypes of general funcref
-            StackType::Known(ValType::TypedFuncRef) | StackType::Known(ValType::NullableTypedFuncRef)
-                if expected == ValType::FuncRef => Ok(()),
-            // Non-nullable typed ref is subtype of nullable typed ref
-            StackType::Known(ValType::TypedFuncRef)
-                if expected == ValType::NullableTypedFuncRef => Ok(()),
+            StackType::Known(t) if val_is_subtype(t, expected) => Ok(()),
             _ => Err(WasmError::TypeMismatch),
         }
     }
@@ -657,6 +686,16 @@ impl<'a> Validator<'a> {
         if self.module.is_memory64 { ValType::I64 } else { ValType::I32 }
     }
 
+    /// Get the address type for a specific memory index.
+    fn mem_addr_type_for(&self, mem_idx: u32) -> ValType {
+        let is_mem64 = if (mem_idx as usize) < self.module.memories.len() {
+            self.module.memories[mem_idx as usize].is_memory64
+        } else {
+            self.module.is_memory64
+        };
+        if is_mem64 { ValType::I64 } else { ValType::I32 }
+    }
+
     /// Read a memarg (alignment + offset) and validate alignment against max_align.
     /// max_align is log2 of the natural alignment (0=1byte, 1=2byte, 2=4byte, 3=8byte, 4=16byte).
     fn read_memarg(&mut self, max_align: u32) -> Result<(), WasmError> {
@@ -723,16 +762,38 @@ impl<'a> Validator<'a> {
                 -0x1D => {
                     // 0x63 = (ref null ht) — read the heap type
                     let heap_type = self.read_i32()?;
-                    if heap_type == -0x10 { ValType::FuncRef }
-                    else if heap_type == -0x11 { ValType::ExternRef }
-                    else { ValType::NullableTypedFuncRef }
+                    match heap_type {
+                        -0x10 => ValType::FuncRef,     // func
+                        -0x11 => ValType::ExternRef,   // extern
+                        -0x12 => ValType::AnyRef,      // any
+                        -0x13 => ValType::EqRef,       // eq
+                        -0x14 => ValType::I31Ref,      // i31
+                        -0x15 => ValType::NullableStructRef, // struct
+                        -0x16 => ValType::ArrayRef,    // array
+                        -0x17 => ValType::ExnRef,      // exn
+                        -0x0F => ValType::NoneRef,     // none
+                        -0x0E => ValType::ExternRef,   // noextern
+                        -0x0D => ValType::FuncRef,     // nofunc
+                        _ => ValType::NullableTypedFuncRef,
+                    }
                 }
                 -0x1C => {
                     // 0x64 = (ref ht) — read the heap type
                     let heap_type = self.read_i32()?;
-                    if heap_type == -0x10 { ValType::FuncRef }
-                    else if heap_type == -0x11 { ValType::ExternRef }
-                    else { ValType::TypedFuncRef }
+                    match heap_type {
+                        -0x10 => ValType::TypedFuncRef, // func (non-nullable)
+                        -0x11 => ValType::ExternRef,    // extern (non-nullable)
+                        -0x12 => ValType::AnyRef,       // any
+                        -0x13 => ValType::EqRef,        // eq
+                        -0x14 => ValType::I31Ref,       // i31
+                        -0x15 => ValType::StructRef,    // struct
+                        -0x16 => ValType::ArrayRef,     // array
+                        -0x17 => ValType::ExnRef,       // exn
+                        -0x0F => ValType::NoneRef,      // none
+                        -0x0E => ValType::ExternRef,    // noextern
+                        -0x0D => ValType::FuncRef,      // nofunc
+                        _ => ValType::TypedFuncRef,
+                    }
                 }
                 _ => return Err(WasmError::InvalidBlockType),
             };
@@ -985,11 +1046,17 @@ impl<'a> Validator<'a> {
                         for i in (0..default_types.len()).rev() {
                             self.pop_expect(default_types[i])?;
                         }
-                        // Check consistency of types across labels
+                        // Check consistency: each label's types must be compatible
+                        // with the default's types (subtyping in either direction).
+                        // Per spec with GC: the operand types must be subtypes of ALL label types,
+                        // so labels can have different but related types.
                         for &l in &labels[..labels.len() - 1] {
                             let lt = self.label_types(l as usize)?;
                             for j in 0..arity {
-                                if lt[j] != default_types[j] {
+                                if lt[j] != default_types[j]
+                                    && !is_subtype(lt[j], default_types[j])
+                                    && !is_subtype(default_types[j], lt[j])
+                                {
                                     return Err(WasmError::TypeMismatch);
                                 }
                             }
@@ -1038,7 +1105,8 @@ impl<'a> Validator<'a> {
                     if tbl_et != ValType::FuncRef {
                         return Err(WasmError::TypeMismatch);
                     }
-                    self.pop_expect(ValType::I32)?; // table index operand
+                    let idx_type = table_index_type(self.module, table_idx);
+                    self.pop_expect(idx_type)?; // table index operand (i32 or i64 for table64)
                     let ft = &self.module.func_types[type_idx as usize];
                     let param_count = ft.param_count as usize;
                     let result_count = ft.result_count as usize;
@@ -1086,7 +1154,8 @@ impl<'a> Validator<'a> {
                     if tbl_et != ValType::FuncRef {
                         return Err(WasmError::TypeMismatch);
                     }
-                    self.pop_expect(ValType::I32)?;
+                    let idx_type = table_index_type(self.module, table_idx);
+                    self.pop_expect(idx_type)?;
                     let ft = &self.module.func_types[type_idx as usize];
                     // return_call_indirect: callee return types must match current function's
                     let result_count = ft.result_count as usize;
@@ -1205,17 +1274,81 @@ impl<'a> Validator<'a> {
                 // ── try_table (exception handling) ──
                 0x1F => {
                     let (params, results) = self.read_block_type()?;
-                    // Read catch clauses
+                    // Read and validate catch clauses
+                    // Labels are resolved relative to the current scope (before try_table is pushed)
                     let catch_count = self.read_u32()? as usize;
+                    let tag_import_count = self.module.imports.iter()
+                        .filter(|imp| matches!(imp.kind, ImportKind::Tag(_)))
+                        .count();
                     for _ in 0..catch_count {
                         let kind = self.read_u8()?;
                         match kind {
                             0 | 1 => { // catch, catch_ref
-                                let _ = self.read_u32()?; // tag_idx
-                                let _ = self.read_u32()?; // label
+                                let tag_idx = self.read_u32()?;
+                                let label = self.read_u32()?;
+                                // Get the tag's param types
+                                let type_idx = if (tag_idx as usize) < tag_import_count {
+                                    let mut ti = 0u32;
+                                    let mut found = None;
+                                    for imp in &self.module.imports {
+                                        if let ImportKind::Tag(tidx) = imp.kind {
+                                            if ti == tag_idx { found = Some(tidx); break; }
+                                            ti += 1;
+                                        }
+                                    }
+                                    found
+                                } else {
+                                    let local_idx = tag_idx as usize - tag_import_count;
+                                    self.module.tag_types.get(local_idx).copied()
+                                };
+                                // Build expected label types: tag params [+ exnref for catch_ref]
+                                let mut expected_types = Vec::new();
+                                if let Some(tidx) = type_idx {
+                                    if (tidx as usize) < self.module.func_types.len() {
+                                        let ft = &self.module.func_types[tidx as usize];
+                                        for i in 0..ft.param_count as usize {
+                                            expected_types.push(ft.params[i]);
+                                        }
+                                    }
+                                }
+                                if kind == 1 {
+                                    expected_types.push(ValType::ExnRef);
+                                }
+                                // Validate label types match expected
+                                let label_types = self.label_types(label as usize)?;
+                                if label_types.len() != expected_types.len() {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                                // Validate: catch pushes expected_types, label expects label_types.
+                                // The pushed types must be subtypes of the label types.
+                                let label_types = self.label_types(label as usize)?;
+                                if label_types.len() != expected_types.len() {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                                for (i, &et) in expected_types.iter().enumerate() {
+                                    if !is_subtype(et, label_types[i]) {
+                                        return Err(WasmError::TypeMismatch);
+                                    }
+                                }
                             }
                             2 | 3 => { // catch_all, catch_all_ref
-                                let _ = self.read_u32()?; // label
+                                let label = self.read_u32()?;
+                                // catch_all: label expects nothing
+                                // catch_all_ref: label expects [exnref]
+                                let expected_types: Vec<ValType> = if kind == 3 {
+                                    vec![ValType::ExnRef]
+                                } else {
+                                    vec![]
+                                };
+                                let label_types = self.label_types(label as usize)?;
+                                if label_types.len() != expected_types.len() {
+                                    return Err(WasmError::TypeMismatch);
+                                }
+                                for (i, &et) in expected_types.iter().enumerate() {
+                                    if !is_subtype(et, label_types[i]) {
+                                        return Err(WasmError::TypeMismatch);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -1242,10 +1375,6 @@ impl<'a> Validator<'a> {
                 0x20 => {
                     let idx = self.read_u32()?;
                     let t = self.local_type(idx)?;
-                    // Non-nullable ref locals (not params) must be initialized
-                    if t == ValType::TypedFuncRef && (idx as usize) >= self.param_count {
-                        return Err(WasmError::UninitializedLocal);
-                    }
                     self.push_val(t);
                 }
                 // ── local.set ──
@@ -1652,8 +1781,14 @@ impl<'a> Validator<'a> {
                     // ref.func produces (ref $t) - a typed, non-nullable func ref
                     self.push_val(ValType::TypedFuncRef);
                 }
-                // ── ref.as_non_null (opcode 0xD3 or 0xD4) ──
-                0xD3 | 0xD4 => {
+                // ── ref.eq (opcode 0xD3) ──
+                0xD3 => {
+                    let _ = self.pop_opd()?; // ref1
+                    let _ = self.pop_opd()?; // ref2
+                    self.push_val(ValType::I32);
+                }
+                // ── ref.as_non_null (opcode 0xD4) ──
+                0xD4 => {
                     // Pop a ref value; if it's a known non-ref type, reject
                     let ref_val = self.pop_opd()?;
                     match ref_val {
@@ -1714,13 +1849,6 @@ impl<'a> Validator<'a> {
                     }
                     // On fallthrough, the ref was null so nothing is pushed
                 }
-                // ── ref.eq (opcode 0xD7) ──
-                0xD7 => {
-                    let _ = self.pop_opd()?; // ref1
-                    let _ = self.pop_opd()?; // ref2
-                    self.push_val(ValType::I32);
-                }
-
                 // ── 0xFC prefix: saturating truncation + bulk memory ──
                 0xFC => {
                     let sub = self.read_u32()?;
@@ -1743,9 +1871,10 @@ impl<'a> Validator<'a> {
                             if data_idx as usize >= self.module.data_segments.len() {
                                 return Err(WasmError::OutOfBounds);
                             }
-                            self.pop_expect(ValType::I32)?; // size
-                            self.pop_expect(ValType::I32)?; // src offset
-                            self.pop_expect(ValType::I32)?; // dest offset
+                            let at = self.mem_addr_type_for(mem_idx);
+                            self.pop_expect(ValType::I32)?; // size (always i32)
+                            self.pop_expect(ValType::I32)?; // src offset (always i32)
+                            self.pop_expect(at)?;           // dest offset (memory address type)
                         }
                         // data.drop
                         9 => {
@@ -1761,9 +1890,13 @@ impl<'a> Validator<'a> {
                             if !self.module.has_memory || (if self.module.multi_memory_enabled { dst >= self.module.memory_count || src >= self.module.memory_count } else { dst > 0 || src > 0 }) {
                                 return Err(WasmError::MemoryOutOfBounds);
                             }
-                            self.pop_expect(ValType::I32)?; // size
-                            self.pop_expect(ValType::I32)?; // src
-                            self.pop_expect(ValType::I32)?; // dest
+                            let dst_at = self.mem_addr_type_for(dst);
+                            let src_at = self.mem_addr_type_for(src);
+                            // size type: if either memory is 64-bit, size is i64
+                            let size_type = if dst_at == ValType::I64 || src_at == ValType::I64 { ValType::I64 } else { ValType::I32 };
+                            self.pop_expect(size_type)?; // size
+                            self.pop_expect(src_at)?;    // src
+                            self.pop_expect(dst_at)?;    // dest
                         }
                         // memory.fill
                         11 => {
@@ -1771,9 +1904,10 @@ impl<'a> Validator<'a> {
                             if !self.module.has_memory || (if self.module.multi_memory_enabled { mem >= self.module.memory_count } else { mem > 0 }) {
                                 return Err(WasmError::MemoryOutOfBounds);
                             }
-                            self.pop_expect(ValType::I32)?; // size
-                            self.pop_expect(ValType::I32)?; // value
-                            self.pop_expect(ValType::I32)?; // dest
+                            let at = self.mem_addr_type_for(mem);
+                            self.pop_expect(at)?;           // size (memory address type)
+                            self.pop_expect(ValType::I32)?; // value (always i32)
+                            self.pop_expect(at)?;           // dest (memory address type)
                         }
                         // table.init
                         12 => {
@@ -1818,8 +1952,8 @@ impl<'a> Validator<'a> {
                             }
                             let src_it = table_index_type(self.module, src_idx);
                             let dst_it = table_index_type(self.module, dst_idx);
-                            // n: smaller of src/dst (i32 if either is i32)
-                            let n_type = if src_it == ValType::I32 { ValType::I32 } else { dst_it };
+                            // n: minimum of src/dst index types (i32 if either is i32)
+                            let n_type = if src_it == ValType::I32 || dst_it == ValType::I32 { ValType::I32 } else { ValType::I64 };
                             self.pop_expect(n_type)?;  // n
                             self.pop_expect(src_it)?;  // s
                             self.pop_expect(dst_it)?;  // d
@@ -2731,6 +2865,7 @@ fn validate_function_body(
         declared_funcs,
     };
 
+    // Temporary debug: dump function body bytes
     validator.validate()
 }
 

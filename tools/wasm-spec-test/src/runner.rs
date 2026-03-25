@@ -388,7 +388,10 @@ impl WastRunner {
         module.multi_memory_enabled = module.multi_memory_enabled || self.multi_memory_enabled;
         module.reject_multi_table = self.reject_multi_table;
         crate::wasm::validator::validate(&module)
-            .map_err(|err| RunnerError::new("validation", format!("{err:?}")))?;
+            .map_err(|err| {
+                eprintln!("[DEBUG] validation error: {err:?}");
+                RunnerError::new("validation", format!("{err:?}"))
+            })?;
         Ok(module)
     }
 
@@ -1138,6 +1141,7 @@ impl WastRunner {
                 init_func_ref: None,
                 init_expr_type: Some(val_type),
                 init_expr_stack_depth: 1,
+                init_expr_bytes: Vec::new(),
             });
         }
 
@@ -1627,6 +1631,13 @@ impl WastRunner {
                         format!("incompatible import type for table `{module_name}::{field_name}`: element type mismatch"),
                     ));
                 }
+                // Check table index type compatibility (table32 vs table64)
+                if imp_tbl.is_table64 != exp_tbl.is_table64 {
+                    return Err(RunnerError::new(
+                        "link",
+                        format!("incompatible import type for table `{module_name}::{field_name}`: index type mismatch"),
+                    ));
+                }
                 // Import min must be <= actual current size (or export min)
                 let available_min = actual_size.max(exp_tbl.min);
                 if imp_tbl.min > available_min {
@@ -1763,6 +1774,23 @@ impl WastRunner {
                 return Err(RunnerError::new(
                     "link",
                     format!("memory types incompatible for memory `{module_name}::{field_name}`"),
+                ));
+            }
+            // Check memory64 compatibility (memory32 vs memory64)
+            let import_is_64 = if import_mem_idx < _module.memories.len() {
+                _module.memories[import_mem_idx].is_memory64
+            } else {
+                _module.is_memory64
+            };
+            let export_is_64 = if exp_idx < record.instance.module.memories.len() {
+                record.instance.module.memories[exp_idx].is_memory64
+            } else {
+                record.instance.module.is_memory64
+            };
+            if import_is_64 != export_is_64 {
+                return Err(RunnerError::new(
+                    "link",
+                    format!("incompatible import type for memory `{module_name}::{field_name}`: index type mismatch"),
                 ));
             }
             // Get actual memory size in pages using the correct page size
@@ -2653,6 +2681,11 @@ fn decode_valtype_byte(byte: u8) -> Option<ValType> {
         0x7B => Some(ValType::V128),
         0x70 => Some(ValType::FuncRef),
         0x6F => Some(ValType::ExternRef),
+        // GC ref types: 0x63=nullable ref, 0x64=non-nullable ref
+        // These are multi-byte in binary (followed by heap type), but
+        // ImportKind::Global stores only the first byte. Accept as I32 (our ref sentinel).
+        0x63 | 0x64 => Some(ValType::I32),
+        0x69 => Some(ValType::ExnRef),
         _ => None,
     }
 }
@@ -2690,10 +2723,14 @@ fn value_matches_type(value: Value, val_type: ValType) -> bool {
             | (Value::I32(_), ValType::ExternRef)
             | (Value::I32(_), ValType::TypedFuncRef)
             | (Value::I32(_), ValType::NullableTypedFuncRef)
+            | (Value::NullRef, ValType::I32)
             | (Value::NullRef, ValType::FuncRef)
             | (Value::NullRef, ValType::ExternRef)
             | (Value::NullRef, ValType::TypedFuncRef)
             | (Value::NullRef, ValType::NullableTypedFuncRef)
+            | (Value::GcRef(_), ValType::I32)
+            | (Value::GcRef(_), ValType::FuncRef)
+            | (Value::GcRef(_), ValType::ExternRef)
     )
 }
 
