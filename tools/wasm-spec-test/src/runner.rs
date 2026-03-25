@@ -944,8 +944,25 @@ impl WastRunner {
                     }
                 }
             }
-            WastDirective::AssertException { .. }
-            | WastDirective::AssertSuspension { .. }
+            WastDirective::AssertException { exec, .. } => {
+                match self.execute(exec) {
+                    Ok(values) => Err(DirectiveError::assertion(
+                        "assert_exception",
+                        format!("expected exception, got {:?}", values),
+                    )),
+                    Err(err) => {
+                        if err.exception.is_some() {
+                            Ok(DirectiveOutcome::AssertionPassed)
+                        } else {
+                            Err(DirectiveError::assertion(
+                                "assert_exception",
+                                format!("expected exception, got trap: {}", err.message),
+                            ))
+                        }
+                    }
+                }
+            }
+            WastDirective::AssertSuspension { .. }
             | WastDirective::Thread(..)
             | WastDirective::Wait { .. } => Ok(DirectiveOutcome::AssertionSkipped(
                 "directive is not supported by the ATOS host-side runner".to_string(),

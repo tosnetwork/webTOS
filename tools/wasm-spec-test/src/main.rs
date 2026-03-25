@@ -7,6 +7,15 @@ use runner::{collect_wast_files, FileReport, FileStatus, WastRunner};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
+
+fn max_parallel() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
 
 fn print_usage(binary: &str) {
     println!("Usage: {binary} [--verbose] [PATH ...]");
@@ -65,6 +74,12 @@ fn print_report(report: &FileReport) {
     }
 }
 
+enum FileOutcome {
+    Report(FileReport),
+    Error(PathBuf, String),
+    Panic(PathBuf),
+}
+
 fn main() -> ExitCode {
     let mut verbose = false;
     let mut inputs: Vec<PathBuf> = Vec::new();
@@ -104,6 +119,39 @@ fn main() -> ExitCode {
     files.sort();
     files.dedup();
 
+    // Run files in parallel using a thread pool with bounded concurrency.
+    let (tx, rx) = mpsc::channel::<FileOutcome>();
+    let file_count = files.len();
+    let parallelism = max_parallel().min(file_count);
+
+    // Shared work queue: each thread grabs the next file atomically.
+    let work = std::sync::Arc::new(std::sync::Mutex::new(files.into_iter()));
+
+    for _ in 0..parallelism {
+        let tx = tx.clone();
+        let work = work.clone();
+        thread::spawn(move || {
+            loop {
+                let file = {
+                    let mut iter = work.lock().unwrap();
+                    iter.next()
+                };
+                let Some(file) = file else { break };
+                let file_clone = file.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    WastRunner::run_file(&file_clone, verbose)
+                }));
+                let outcome = match result {
+                    Ok(Ok(report)) => FileOutcome::Report(report),
+                    Ok(Err(error)) => FileOutcome::Error(file, format!("{error:#}")),
+                    Err(_panic) => FileOutcome::Panic(file),
+                };
+                let _ = tx.send(outcome);
+            }
+        });
+    }
+    drop(tx); // Close sender so rx iterator ends when all threads finish.
+
     let mut pass_files = 0usize;
     let mut fail_files = 0usize;
     let mut skip_files = 0usize;
@@ -111,13 +159,27 @@ fn main() -> ExitCode {
     let mut passed_assertions = 0usize;
     let mut skipped_assertions = 0usize;
 
-    for file in files {
-        let file_clone = file.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            WastRunner::run_file(&file_clone, verbose)
-        }));
-        match result {
-            Ok(Ok(report)) => {
+    // Collect results and buffer for sorted output.
+    let mut outcomes: Vec<FileOutcome> = rx.into_iter().collect();
+
+    // Sort by path for deterministic output.
+    outcomes.sort_by(|a, b| {
+        let path_a = match a {
+            FileOutcome::Report(r) => &r.path,
+            FileOutcome::Error(p, _) => p,
+            FileOutcome::Panic(p) => p,
+        };
+        let path_b = match b {
+            FileOutcome::Report(r) => &r.path,
+            FileOutcome::Error(p, _) => p,
+            FileOutcome::Panic(p) => p,
+        };
+        path_a.cmp(path_b)
+    });
+
+    for outcome in outcomes {
+        match outcome {
+            FileOutcome::Report(report) => {
                 total_assertions += report.total_assertions;
                 passed_assertions += report.passed_assertions;
                 skipped_assertions += report.skipped_assertions;
@@ -128,11 +190,11 @@ fn main() -> ExitCode {
                 }
                 print_report(&report);
             }
-            Ok(Err(error)) => {
+            FileOutcome::Error(file, error) => {
                 fail_files += 1;
-                eprintln!("[FAIL] {} ({error:#})", display_path(&file));
+                eprintln!("[FAIL] {} ({error})", display_path(&file));
             }
-            Err(_panic) => {
+            FileOutcome::Panic(file) => {
                 fail_files += 1;
                 eprintln!("[PANIC] {} (internal panic)", display_path(&file));
             }
