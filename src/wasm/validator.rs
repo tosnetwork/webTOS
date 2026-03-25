@@ -239,10 +239,10 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             return Err(WasmError::ConstExprRequired);
         }
         // Validate global init expression type matches declared type
+        // Skip for GC globals with complex init expressions (struct.new, array.new, etc.)
         if let Some(expr_type) = global.init_expr_type {
-            if expr_type != global.val_type {
+            if expr_type != global.val_type && !global.has_non_const {
                 if !is_ref_compatible(expr_type, global.val_type) {
-                    // For GC modules, also allow GC ref subtypes
                     if !module.gc_enabled || !val_is_subtype(expr_type, global.val_type) {
                         return Err(WasmError::TypeMismatch);
                     }
