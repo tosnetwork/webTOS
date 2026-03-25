@@ -7,6 +7,7 @@ use crate::wasm::decoder::{ElemMode, ExportKind, ImportKind, WasmModule};
 use crate::wasm::types::{ValType, WasmError, MAX_MEMORY_PAGES, MAX_TABLE_SIZE};
 use alloc::collections::BTreeSet;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Validate a decoded WASM module.
