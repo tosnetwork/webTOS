@@ -13,11 +13,9 @@ pub use subtype::types_equivalent_in_module;
 use subtype::*;
 use func::validate_function_body;
 use crate::wasm::decoder::{ElemMode, ExportKind, ImportKind, WasmModule};
-use crate::wasm::types::{ValType, WasmError, MAX_MEMORY_PAGES, MAX_TABLE_SIZE};
+use crate::wasm::types::{ValType, WasmError, MAX_MEMORY_PAGES};
 use alloc::collections::BTreeSet;
 use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
 
 /// Validate a decoded WASM module.
 pub fn validate(module: &WasmModule) -> Result<(), WasmError> {

@@ -287,8 +287,7 @@ pub fn val_is_subtype(src: ValType, dst: ValType) -> bool {
         // Nullable concrete refs are subtypes of only nullable abstract types
         (ValType::NullableTypedFuncRef,
          ValType::NullableAnyRef | ValType::NullableEqRef |
-         ValType::NullableStructRef | ValType::NullableArrayRef |
-         ValType::FuncRef) => true,
+         ValType::NullableStructRef | ValType::NullableArrayRef) => true,
         _ => false,
     }
 }

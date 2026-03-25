@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use wast::{
     QuoteWat, WastDirective, WastExecute, WastRet, Wat,
-    core::{AbstractHeapType, HeapType, NanPattern, V128Pattern, WastArgCore, WastRetCore},
+    core::{NanPattern, V128Pattern, WastArgCore, WastRetCore},
     lexer::Lexer,
     parser::ParseBuffer,
     token::{F32, F64, Id},
@@ -380,7 +380,6 @@ fn process_sexp_stream(bytes: &[u8], pos: &mut usize, out: &mut String, inside_p
 
         // Opening paren — check what follows
         if bytes[*pos] == b'(' {
-            let paren_start = *pos;
             *pos += 1;
             skip_whitespace(bytes, pos);
 
@@ -480,7 +479,6 @@ fn process_try_block(bytes: &[u8], pos: &mut usize, out: &mut String) {
 
         // Opening `(` of a sub-expression
         if bytes[*pos] == b'(' {
-            let save = *pos;
             *pos += 1;
             skip_whitespace(bytes, pos);
 
@@ -1017,7 +1015,6 @@ impl WastRunner {
 
         // Collect info about memory/table imports before creating the instance
         let memory_sources = self.find_memory_sources(&module);
-        let memory_source = memory_sources.first().map(|(_, _, h)| h.clone());
         let table_sources = self.find_table_sources(&module);
 
         if name.is_none() {
@@ -1596,19 +1593,18 @@ impl WastRunner {
         self.last_invoke_handle = Some(handle.clone());
         let args = self.values_from_args(&invoke.args)?;
         // Allocate externref args on the GC heap so they're properly typed
-        let args = {
-            let mut record = handle.borrow_mut();
-            args.into_iter().enumerate().map(|(_i, v)| {
-                match v {
-                    Value::I32(n) if n >= 0 && self.gc_enabled => {
-                        // Check if this corresponds to a RefExtern/RefHost arg
-                        // by seeing if the original arg was RefExtern/RefHost
-                        v // Can't distinguish here, handle below
-                    }
-                    _ => v,
+        let args = args
+            .into_iter()
+            .enumerate()
+            .map(|(_i, v)| match v {
+                Value::I32(n) if n >= 0 && self.gc_enabled => {
+                    // Keep placeholder ref values as-is here; precise externref handling
+                    // happens below once we still have access to the original wast args.
+                    v
                 }
-            }).collect::<Vec<_>>()
-        };
+                _ => v,
+            })
+            .collect::<Vec<_>>();
         // Allocate externref values on GC heap for properly-typed arguments
         let args = self.allocate_extern_args(&handle, &invoke.args, args)?;
         let func_idx = {
@@ -1780,105 +1776,6 @@ impl WastRunner {
         }
     }
 
-    fn sync_tables_back_and_forward(&self, handle: &InstanceHandle) {
-        // Collect table import info
-        let table_imports: Vec<(usize, String, String)> = {
-            let record = handle.borrow();
-            let mut tbl_idx = 0usize;
-            let mut result = Vec::new();
-            for import in &record.instance.module.imports {
-                if !matches!(import.kind, ImportKind::Table(_)) {
-                    continue;
-                }
-                let module_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
-                let field_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
-                result.push((tbl_idx, module_name, field_name));
-                tbl_idx += 1;
-            }
-            result
-        };
-        // Sync back: write local table to source, then re-read
-        for (tbl_idx, module_name, field_name) in &table_imports {
-            if *module_name == SPECTEST_MODULE { continue; }
-            let Some(src_handle) = self.instances.get(module_name.as_str()) else { continue };
-            if Rc::ptr_eq(src_handle, handle) { continue; }
-            // Write back
-            {
-                let record = handle.borrow();
-                if let Ok(mut src) = src_handle.try_borrow_mut() {
-                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, field_name) {
-                        let si = src_tbl_idx as usize;
-                        if *tbl_idx < record.instance.tables.len() && si < src.instance.tables.len() {
-                            let len = record.instance.tables[*tbl_idx].len().min(src.instance.tables[si].len());
-                            for i in 0..len {
-                                src.instance.tables[si][i] = record.instance.tables[*tbl_idx][i];
-                            }
-                        }
-                    }
-                }
-            }
-            // Read forward
-            {
-                if let Ok(src) = src_handle.try_borrow() {
-                    let mut record = handle.borrow_mut();
-                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, field_name) {
-                        let si = src_tbl_idx as usize;
-                        if *tbl_idx < record.instance.tables.len() && si < src.instance.tables.len() {
-                            let len = record.instance.tables[*tbl_idx].len().min(src.instance.tables[si].len());
-                            for i in 0..len {
-                                record.instance.tables[*tbl_idx][i] = src.instance.tables[si][i];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Sync tables that are aliased (two imports map to same source export).
-    /// After a function call, writes to one alias must be visible in the other.
-    fn sync_aliased_tables(&self, handle: &InstanceHandle) {
-        let record = handle.borrow();
-        // Collect table import source info: (local_tbl_idx, source_instance, source_export_name)
-        let mut tbl_imports: Vec<(usize, String, String)> = Vec::new();
-        let mut tbl_idx = 0usize;
-        for import in &record.instance.module.imports {
-            if !matches!(import.kind, ImportKind::Table(_)) { continue; }
-            let mod_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
-            let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
-            tbl_imports.push((tbl_idx, mod_name, fld_name));
-            tbl_idx += 1;
-        }
-        drop(record);
-        // Find aliases: two imports from same source module+field → same physical table
-        // Group by (source_module, source_export_index)
-        let mut groups: std::collections::HashMap<(String, u32), Vec<usize>> = std::collections::HashMap::new();
-        for (idx, mod_name, fld_name) in &tbl_imports {
-            if let Some(src_handle) = self.instances.get(mod_name.as_str()) {
-                if let Ok(src) = src_handle.try_borrow() {
-                    if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, fld_name) {
-                        groups.entry((mod_name.clone(), src_tbl_idx)).or_default().push(*idx);
-                    }
-                }
-            }
-        }
-        // For each group with >1 alias, sync all to match the first (most recently written)
-        let mut record = handle.borrow_mut();
-        for (_key, indices) in &groups {
-            if indices.len() <= 1 { continue; }
-            // Use the first alias as canonical; copy its content to all others
-            let src_idx = indices[0];
-            if src_idx >= record.instance.tables.len() { continue; }
-            for &dst_idx in &indices[1..] {
-                if dst_idx >= record.instance.tables.len() { continue; }
-                let len = record.instance.tables[src_idx].len().min(record.instance.tables[dst_idx].len());
-                // Can't borrow two mutable slices from same Vec, so clone
-                let src_copy: Vec<_> = record.instance.tables[src_idx][..len].to_vec();
-                record.instance.tables[dst_idx][..len].copy_from_slice(&src_copy);
-            }
-        }
-    }
-
     fn get_global(&self, module: Option<Id<'_>>, global_name: &str) -> RunnerResult<Value> {
         let handle = self.get_instance_handle(module)?;
         self.sync_imported_globals(&handle);
@@ -2034,8 +1931,6 @@ impl WastRunner {
     /// module and update both the global value and any element segments that
     /// reference it via global.get.
     fn fixup_funcref_globals(&self, module: &mut WasmModule) -> RunnerResult<()> {
-        use crate::wasm::decoder::ElemMode;
-
         // Collect funcref global imports: (global_idx, source_module_name, func_idx_in_source)
         let mut funcref_fixups: Vec<(usize, String, u32)> = Vec::new();
         let mut global_idx = 0usize;
@@ -3483,7 +3378,7 @@ fn type_indices_equivalent(
                     _ => return false,
                 }
                 // Check gc_types match (with rec-group-relative type references)
-                use crate::wasm::decoder::{GcTypeDef, StorageType};
+                use crate::wasm::decoder::GcTypeDef;
                 let gc_a = mod_a.gc_types.get(idx_a as usize);
                 let gc_b = mod_b.gc_types.get(idx_b as usize);
                 match (gc_a, gc_b) {

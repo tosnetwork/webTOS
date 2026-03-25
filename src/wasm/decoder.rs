@@ -427,7 +427,6 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
     // Track the last non-custom section id for ordering validation.
     // Custom sections (id 0) can appear anywhere and don't affect ordering.
     let mut last_non_custom_section_id: u8 = 0;
-    let mut has_code_section = false;
     let mut has_data_section = false;
 
     while pos < bytes.len() {
@@ -478,7 +477,6 @@ pub fn decode(bytes: &[u8]) -> Result<WasmModule, WasmError> {
             SECTION_START => decode_start_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_ELEMENT => decode_element_section(bytes, &mut pos, section_end, &mut module)?,
             SECTION_CODE => {
-                has_code_section = true;
                 decode_code_section(bytes, &mut pos, section_end, &mut module)?;
             }
             SECTION_DATA => {
@@ -924,7 +922,7 @@ fn decode_composite_type_with_limit(
 fn decode_type_section(
     bytes: &[u8],
     pos: &mut usize,
-    end: usize,
+    _end: usize,
     module: &mut WasmModule,
 ) -> Result<(), WasmError> {
     let count = decode_leb128_u32(bytes, pos)? as usize;

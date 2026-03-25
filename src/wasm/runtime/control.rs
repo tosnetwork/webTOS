@@ -2,12 +2,11 @@
 //! Includes scan_legacy_try, skip_to_end, and handle_exception.
 
 use super::*;
-use alloc::vec::Vec;
 
 impl WasmInstance {
     /// Called right after reading the block type of a `try` instruction.
     /// Returns (legacy_catches, legacy_catch_count, end_pc, delegate_label).
-    pub(crate) fn scan_legacy_try(&mut self) -> Result<([LegacyCatch; MAX_LEGACY_CATCHES], u8, usize, u32), WasmError> {
+    pub(super) fn scan_legacy_try(&mut self) -> Result<([LegacyCatch; MAX_LEGACY_CATCHES], u8, usize, u32), WasmError> {
         let save_pc = self.pc;
         let mut catches = [LegacyCatch::zero(); MAX_LEGACY_CATCHES];
         let mut catch_count: u8 = 0;
@@ -446,7 +445,7 @@ impl WasmInstance {
                 // Reset stack to the try block's stack base
                 self.stack_ptr = try_frame.stack_base;
                 // Pop all blocks above AND including the try block
-                self.block_depth = try_idx;
+                self.truncate_blocks(try_idx);
 
                 // Push a "catch" frame to replace the try frame.
                 // This frame represents the catch handler scope.
@@ -460,8 +459,7 @@ impl WasmInstance {
                 catch_frame.is_legacy_try = true;
                 // Store exception info for rethrow (no truncation)
                 catch_frame.legacy_exception_tag = tag_idx;
-                let store_idx = self.legacy_exception_store.len() as u32;
-                self.legacy_exception_store.push(values.to_vec());
+                let store_idx = self.alloc_legacy_exception_values(values);
                 catch_frame.legacy_exception_store_idx = store_idx;
                 let _ = self.push_block(catch_frame);
 
@@ -484,7 +482,7 @@ impl WasmInstance {
                 // Reset stack to the try_table's stack base
                 let try_frame = self.block_stack[try_idx];
                 self.stack_ptr = try_frame.stack_base;
-                self.block_depth = try_idx;
+                self.truncate_blocks(try_idx);
 
                 // Push the exception values onto the stack for catch/catch_ref
                 match cc.kind {
@@ -520,7 +518,7 @@ impl WasmInstance {
             self.call_depth -= 1;
             self.stack_ptr = frame.stack_base;
             self.pc = frame.return_pc;
-            self.block_depth = frame.saved_block_depth;
+            self.truncate_blocks(frame.saved_block_depth);
 
             if self.call_depth == 0 {
                 return Err(());

@@ -25,7 +25,7 @@ mod control;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::wasm::decoder::{WasmModule, ImportKind, GcTypeDef, StorageType};
+use crate::wasm::decoder::{WasmModule, ImportKind};
 use crate::wasm::types::*;
 
 /// Resolve an alias index without borrowing self.
@@ -255,7 +255,9 @@ pub struct WasmInstance {
     /// Re-evaluated element segment values (for GC proposal expression-based elements).
     pub elem_gc_values: Vec<Vec<Value>>,
     /// Storage for legacy EH exception values (for rethrow). Each entry is one caught exception's values.
-    pub legacy_exception_store: Vec<Vec<Value>>,
+    pub legacy_exception_store: Vec<Option<Vec<Value>>>,
+    /// Reusable indices into legacy_exception_store.
+    legacy_exception_free: Vec<u32>,
 }
 
 impl WasmInstance {
@@ -415,6 +417,7 @@ impl WasmInstance {
             gc_heap: Vec::new(),
             elem_gc_values: Vec::new(),
             legacy_exception_store: Vec::new(),
+            legacy_exception_free: Vec::new(),
         };
 
         // Apply active data segments to memory (skip passive segments)
@@ -830,7 +833,48 @@ impl WasmInstance {
             return Err(WasmError::InvalidBlockType);
         }
         self.block_depth -= 1;
-        Ok(self.block_stack[self.block_depth])
+        let bf = self.block_stack[self.block_depth];
+        self.release_block_resources(bf);
+        self.block_stack[self.block_depth] = BlockFrame::zero();
+        Ok(bf)
+    }
+
+    #[inline]
+    fn alloc_legacy_exception_values(&mut self, values: &[Value]) -> u32 {
+        if let Some(idx) = self.legacy_exception_free.pop() {
+            self.legacy_exception_store[idx as usize] = Some(values.to_vec());
+            idx
+        } else {
+            let idx = self.legacy_exception_store.len() as u32;
+            self.legacy_exception_store.push(Some(values.to_vec()));
+            idx
+        }
+    }
+
+    #[inline]
+    fn release_legacy_exception_values(&mut self, idx: u32) {
+        if idx == u32::MAX {
+            return;
+        }
+        if let Some(slot) = self.legacy_exception_store.get_mut(idx as usize) {
+            if slot.take().is_some() {
+                self.legacy_exception_free.push(idx);
+            }
+        }
+    }
+
+    #[inline]
+    fn release_block_resources(&mut self, bf: BlockFrame) {
+        self.release_legacy_exception_values(bf.legacy_exception_store_idx);
+    }
+
+    fn truncate_blocks(&mut self, new_depth: usize) {
+        while self.block_depth > new_depth {
+            self.block_depth -= 1;
+            let bf = self.block_stack[self.block_depth];
+            self.release_block_resources(bf);
+            self.block_stack[self.block_depth] = BlockFrame::zero();
+        }
     }
 
     /// Scan a legacy try block to find catch/catch_all handler positions and the end PC.
@@ -868,7 +912,7 @@ impl WasmInstance {
             }
             self.pc = target.start_pc;
             // Pop blocks above the loop, keeping the loop itself
-            self.block_depth = target_idx + 1;
+            self.truncate_blocks(target_idx + 1);
         } else {
             // Branch to block end — pop all blocks up to and including target
             // Save any result values
@@ -887,7 +931,7 @@ impl WasmInstance {
             }
 
             self.pc = target.end_pc;
-            self.block_depth = target_idx;
+            self.truncate_blocks(target_idx);
         }
         Ok(())
     }
@@ -1044,7 +1088,7 @@ impl WasmInstance {
         // Reset execution state for new call (important after traps)
         self.finished = false;
         self.call_depth = 0;
-        self.block_depth = 0;
+        self.truncate_blocks(0);
 
         // Push arguments onto the stack
         for arg in args {
@@ -1425,7 +1469,7 @@ impl WasmInstance {
                             let _ = self.push(results[i]);
                         }
                         self.pc = bf.end_pc;
-                        self.block_depth -= 1;
+                        let _ = self.pop_block();
                     }
                 }
             }
@@ -1453,8 +1497,8 @@ impl WasmInstance {
                 if bf.is_legacy_try && bf.legacy_exception_tag != u32::MAX {
                     found_tag = bf.legacy_exception_tag;
                     let store_idx = bf.legacy_exception_store_idx as usize;
-                    if store_idx < self.legacy_exception_store.len() {
-                        found_values = self.legacy_exception_store[store_idx].clone();
+                    if let Some(Some(values)) = self.legacy_exception_store.get(store_idx) {
+                        found_values = values.clone();
                     }
                 }
                 if found_tag == u32::MAX {
@@ -1473,8 +1517,7 @@ impl WasmInstance {
                 let _label = try_exec!(self.read_leb128_u32());
                 // Pop the try block frame (normal execution — no exception)
                 if self.block_depth > 0 {
-                    self.block_depth -= 1;
-                    let bf = self.block_stack[self.block_depth];
+                    let bf = try_exec!(self.pop_block());
                     let rc = bf.end_result_count as usize;
                     let mut results = [Value::I32(0); 8];
                     for i in (0..rc).rev() {
@@ -1502,7 +1545,7 @@ impl WasmInstance {
                             let _ = self.push(results[i]);
                         }
                         self.pc = bf.end_pc;
-                        self.block_depth -= 1;
+                        let _ = self.pop_block();
                     }
                 }
             }
@@ -1556,7 +1599,7 @@ impl WasmInstance {
                     self.call_depth -= 1;
                     self.stack_ptr = frame.stack_base;
                     self.pc = frame.return_pc;
-                    self.block_depth = frame.saved_block_depth;
+                    self.truncate_blocks(frame.saved_block_depth);
                 }
 
                 // Push arguments back for the new function
@@ -1627,7 +1670,7 @@ impl WasmInstance {
                     self.call_depth -= 1;
                     self.stack_ptr = frame.stack_base;
                     self.pc = frame.return_pc;
-                    self.block_depth = frame.saved_block_depth;
+                    self.truncate_blocks(frame.saved_block_depth);
                 }
 
                 // Push arguments back
@@ -1713,7 +1756,7 @@ impl WasmInstance {
                     self.call_depth -= 1;
                     self.stack_ptr = frame.stack_base;
                     self.pc = frame.return_pc;
-                    self.block_depth = frame.saved_block_depth;
+                    self.truncate_blocks(frame.saved_block_depth);
                 }
 
                 // Push arguments back for the new function
@@ -2051,7 +2094,7 @@ impl WasmInstance {
 
         // Restore PC and block depth
         self.pc = frame.return_pc;
-        self.block_depth = frame.saved_block_depth;
+        self.truncate_blocks(frame.saved_block_depth);
 
         if self.call_depth == 0 {
             self.finished = true;
@@ -2124,4 +2167,42 @@ fn sat_trunc_f64_u64(v: f64) -> u64 {
     if v >= 18446744073709551616.0_f64 { return u64::MAX; }
     if v <= -1.0_f64 { return 0; }
     v as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm::decoder::WasmModule;
+
+    #[test]
+    fn legacy_exception_slots_are_reused_after_block_unwind() {
+        let mut inst = WasmInstance::with_class(WasmModule::new(), 0, DEFAULT_RUNTIME_CLASS)
+            .expect("empty module should instantiate");
+
+        let first_idx = inst.alloc_legacy_exception_values(&[Value::I32(7)]);
+        let mut frame = BlockFrame::zero();
+        frame.is_legacy_try = true;
+        frame.legacy_exception_tag = 0;
+        frame.legacy_exception_store_idx = first_idx;
+        inst.push_block(frame).expect("push block");
+
+        inst.truncate_blocks(0);
+
+        let second_idx = inst.alloc_legacy_exception_values(&[Value::I32(9), Value::I32(11)]);
+        assert_eq!(second_idx, first_idx);
+        assert_eq!(inst.legacy_exception_store.len(), 1);
+
+        let reused = inst.legacy_exception_store[second_idx as usize]
+            .as_ref()
+            .expect("reused slot must be populated");
+        assert_eq!(reused.len(), 2);
+        match reused[0] {
+            Value::I32(v) => assert_eq!(v, 9),
+            _ => panic!("unexpected value kind"),
+        }
+        match reused[1] {
+            Value::I32(v) => assert_eq!(v, 11),
+            _ => panic!("unexpected value kind"),
+        }
+    }
 }

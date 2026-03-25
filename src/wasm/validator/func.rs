@@ -1,7 +1,7 @@
 //! Function body validation: stack-based type checking per the WebAssembly specification.
 
 use crate::wasm::decoder::{
-    ElemMode, ExportKind, FuncDef, FuncTypeDef, GcTypeDef, ImportKind,
+    FuncDef, FuncTypeDef, GcTypeDef, ImportKind,
     StorageType, WasmModule,
 };
 use crate::wasm::types::{ValType, WasmError, MAX_LOCALS};
