@@ -404,7 +404,7 @@ Existing agents and proofs remain valid. The upgrade is backward-compatible — 
 | Runtime | Bytecode | Proving | Use Case |
 |---------|----------|---------|----------|
 | Native x86_64 | ELF64 | No | System agents |
-| WASM (wasmi) | .wasm | No (replay only) | General sandbox |
+| WASM | .wasm | No (replay only) | General sandbox |
 | EVM (revm) | Solidity | No (replay only) | Smart contracts |
 | Python (RustPython) | .py | No | AI agents |
 | JVM (Ristretto) | .class | No | Enterprise |

@@ -2067,7 +2067,7 @@ impl WasmInstance {
 
 // ─── Saturating float-to-int conversions (0xFC 0x00-0x07) ────────────────
 
-/// Saturating float-to-int conversions matching wasmi semantics.
+/// Saturating float-to-int conversions per WASM spec.
 /// NaN → 0, +inf → MAX, -inf → MIN (or 0 for unsigned), out-of-range → saturate.
 fn sat_trunc_f32_i32(v: f32) -> i32 {
     if v.is_nan() { return 0; }

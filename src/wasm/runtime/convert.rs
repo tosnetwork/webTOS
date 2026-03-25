@@ -1,6 +1,6 @@
 //! Saturating float-to-int conversions (0xFC 0x00-0x07).
 //!
-//! Matching wasmi semantics: NaN -> 0, +inf -> MAX, -inf -> MIN (or 0 for unsigned),
+//! Per WASM spec: NaN -> 0, +inf -> MAX, -inf -> MIN (or 0 for unsigned),
 //! out-of-range -> saturate.
 
 pub fn sat_trunc_f32_i32(v: f32) -> i32 {

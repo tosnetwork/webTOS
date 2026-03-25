@@ -152,7 +152,7 @@ The runner uses `catch_unwind` around each file to survive engine panics.
    would fix `wasm-3.0/instance.wast`.
 
 6. **Add fuzz targets** for the decoder, validator, and runtime. Differential
-   fuzzing against `wasmparser` for decode, and against `wasmi` for execution,
+   fuzzing against `wasmparser` for decode, and against a reference interpreter for execution,
    would catch edge cases systematically.
 
 ### P3 (ongoing)

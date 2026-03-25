@@ -71,7 +71,7 @@ impl WasmInstance {
         Ok(())
     }
 
-    // ─── Float NaN helpers (matching wasmi semantics) ──────────────────
+    // ─── Float NaN helpers (per WASM spec) ──────────────────
 
     /// Convert signaling NaN to quiet NaN, preserving payload.
     /// WASM spec requires all NaN outputs to be quiet NaN.
@@ -133,7 +133,7 @@ impl WasmInstance {
     }
 
     /// WASM spec min/max: propagate NaN with quieting (using lhs+rhs),
-    /// handle -0.0/+0.0 sign correctly. Matches wasmi semantics.
+    /// handle -0.0/+0.0 sign correctly per WASM spec.
     pub(crate) fn wasm_min_f32(a: f32, b: f32) -> f32 {
         if a < b { a }
         else if b < a { b }

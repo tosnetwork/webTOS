@@ -496,7 +496,7 @@ pub(super) fn execute_numeric(inst: &mut WasmInstance, opcode: u8) -> ExecResult
     0xA6 => { if inst.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let b = try_exec!(inst.pop_f64()); let a = try_exec!(inst.pop_f64()); try_exec!(inst.push(Value::F64(libm::copysign(a, b)))); }
 
     // ── Float-integer conversion ─────────────────────────────
-    // Trunc boundaries use exact float constants matching wasmi/WASM spec.
+    // Trunc boundaries use exact float constants per WASM spec.
     // i32::MAX (2147483647) rounds up to 2147483648.0 in f32, so >= traps.
     0xA8 => { if inst.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(inst.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -2147483904.0_f32 || a >= 2147483648.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(inst.push(Value::I32(a as i32))); }
     0xA9 => { if inst.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); } let a = try_exec!(inst.pop_f32()); if a.is_nan() { return ExecResult::Trap(WasmError::InvalidConversionToInteger); } if a <= -1.0_f32 || a >= 4294967296.0_f32 { return ExecResult::Trap(WasmError::IntegerOverflow); } try_exec!(inst.push(Value::I32(a as u32 as i32))); }

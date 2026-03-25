@@ -441,7 +441,7 @@ All float opcodes (`0x5B`–`0x66`, `0x8B`–`0xA6`, `0xA8`–`0xBF`, `0xFC sub 
 
 - **Quiet NaN conversion**: ceil, floor, trunc, sqrt convert signaling NaN to quiet NaN
 - **NaN propagation**: min/max use `lhs + rhs` to propagate NaN with payload preservation
-- **Precise trunc boundaries**: use exact float constants matching wasmi spec (e.g., `-2147483904.0_f32` for f32→i32)
+- **Precise trunc boundaries**: use exact float constants matching the WASM spec (e.g., `-2147483904.0_f32` for f32→i32)
 - **IEEE 754 nearest-even**: uses `libm::rintf`/`libm::rint`
 
 In ProofGrade mode, all these opcodes trap with `FloatsDisabled`.
@@ -779,9 +779,9 @@ runtime_class: 0 = BestEffort (default), 1 = ReplayGrade, 2 = ProofGrade
 
 ## 12. Implementation Limits
 
-Limits are aligned with [wasmi](https://github.com/wasmi-labs/wasmi) defaults. Actual memory usage is gated by the agent's `mem_quota`.
+Limits are aligned with WASM spec defaults. Actual memory usage is gated by the agent's `mem_quota`.
 
-| Constant | Value | wasmi default | Description |
+| Constant | Value | Spec default | Description |
 |----------|-------|-------------|-------------|
 | `MAX_FUNCTIONS` | 10,000 | 10,000 | Total functions (imports + local) |
 | `MAX_IMPORTS` | 10,000 | — | Maximum imported functions/globals |
@@ -914,11 +914,11 @@ extern "C" {
 | Multi-memory | ✅ (proposal) | ❌ | ❌ | ❌ |
 | Reference types (externref) | ✅ (proposal) | ❌ | ❌ | ❌ |
 
-### 15.2 Limits (aligned with wasmi defaults)
+### 15.2 Limits (aligned with WASM spec defaults)
 
-ATOS limits are aligned with [wasmi](https://github.com/wasmi-labs/wasmi) to ensure compatibility with standard WASM toolchain output. Actual resource usage is controlled per-agent by `mem_quota` and `energy_budget`.
+ATOS limits are aligned with the WASM spec to ensure compatibility with standard WASM toolchain output. Actual resource usage is controlled per-agent by `mem_quota` and `energy_budget`.
 
-| Resource | Standard WASM | ATOS | wasmi |
+| Resource | Standard WASM | ATOS | Spec default |
 |----------|--------------|------|-------|
 | Max memory | 4 GiB (65,536 pages) | **4 GiB** (65,536 pages) | unlimited (by Store) |
 | Max functions | Unlimited | **10,000** | 10,000 |
@@ -1014,9 +1014,9 @@ All limits have been raised to support standard compiler output (see §12). No f
 | Milestone | Status | Date |
 |-----------|--------|------|
 | MVP opcodes (42 → 203) | ✅ Complete | 2026-03-24 |
-| wasmi comparison audit (12 rounds, 23 bugs fixed) | ✅ Complete | 2026-03-24 |
+| WASM spec comparison audit (12 rounds, 23 bugs fixed) | ✅ Complete | 2026-03-24 |
 | Per-agent RuntimeClass | ✅ Complete | 2026-03-24 |
-| Limits aligned with wasmi | ✅ Complete | 2026-03-24 |
+| Limits aligned with WASM spec | ✅ Complete | 2026-03-24 |
 | Default BestEffort (most permissive) | ✅ Complete | 2026-03-24 |
 | SIMD (256 sub-opcodes, wasmparser-aligned) | ✅ Complete | 2026-03-24 |
 | Relaxed SIMD (20 sub-opcodes) | ✅ Complete | 2026-03-24 |

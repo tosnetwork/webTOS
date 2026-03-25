@@ -9,7 +9,7 @@
 
 ## 1. Motivation
 
-Porting language runtimes one-by-one (wasmi, RustPython, Ristretto) gives the best ATOS integration but only covers a few languages. A Linux syscall compatibility layer covers **everything at once**:
+Porting language runtimes one-by-one (WASM, RustPython, Ristretto) gives the best ATOS integration but only covers a few languages. A Linux syscall compatibility layer covers **everything at once**:
 
 | Approach | Effort | Coverage |
 |----------|--------|----------|
@@ -293,7 +293,7 @@ Linux compat (Stage-12):     Broader coverage, run anything, less ATOS-native
 
 Recommended combination:
   System agents      → Native Rust (ATOS syscalls)
-  AI agent runtimes  → Stage-11 ports (wasmi, RustPython, Ristretto)
+  AI agent runtimes  → Stage-11 ports (WASM engine, RustPython, Ristretto)
   Long-tail tools    → Stage-12 Linux compat (curl, git, gcc, npm, pip, ...)
 ```
 

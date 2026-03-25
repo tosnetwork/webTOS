@@ -295,7 +295,7 @@ Running EVM on ATOS provides a strictly stronger security model than Ethereum ma
 | Runtime | Engine | Bytecode | Primary Use |
 |---------|--------|----------|-------------|
 | Native x86_64 | Direct | ELF64 | System agents |
-| WASM | wasmi | .wasm | General-purpose sandbox |
+| WASM | ATOS WASM engine | .wasm | General-purpose sandbox |
 | Python | RustPython | .py | AI/ML agents |
 | JVM | Ristretto | .class/.jar | Enterprise agents |
 | **EVM** | **revm** | **Solidity/Vyper bytecode** | **Smart contract agents, DeFi, L2 execution** |

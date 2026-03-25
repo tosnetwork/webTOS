@@ -1,21 +1,18 @@
 # WASM Library-Grade Refactor Prompt
 
-Use the following prompt with Claude Code to upgrade the ATOS self-built WASM implementation toward library-grade quality comparable to `wasmi`, while preserving the custom engine architecture.
+Use the following prompt with Claude Code to upgrade the ATOS self-built WASM implementation toward library-grade quality, while preserving the custom engine architecture.
 
 ```text
-You are a senior Rust and WebAssembly runtime engineer. Upgrade the ATOS custom wasm implementation from a "large prototype that works" to something much closer to wasmi in library-grade quality.
+You are a senior Rust and WebAssembly runtime engineer. Upgrade the ATOS custom wasm implementation from a "large prototype that works" to library-grade quality.
 
 Workspace:
 - Main project: /home/tomi/atos
 - WASM engine code: /home/tomi/atos/src/wasm
 - Spec runner: /home/tomi/atos/tools/wasm-spec-test
-- Reference implementation: /tmp/wasmi_compare_20260325d1
-  If /tmp/wasmi_compare_20260325d1 does not exist, then look at ~/wasmi. You may study its module boundaries, error model, and engineering discipline, but do not copy code directly and do not replace our engine with wasmi.
-
 Important constraints:
 - Keep our self-built decoder / validator / executor path.
-- Do not replace the production implementation with wasmi / wasmparser / wasmtime.
-- You may use wasmparser / wasmi / wasmtime only as test-only, fuzz-only, or oracle-only dependencies for validation and differential testing.
+- Do not replace the production implementation with wasmparser / wasmtime or other third-party WASM engines.
+- You may use wasmparser / wasmtime only as test-only, fuzz-only, or oracle-only dependencies for validation and differential testing.
 - Do not hide bugs with catch_unwind or similar panic-masking techniques. Fix the real invariant and bounds issues.
 - Preserve the current RuntimeClass semantics: BestEffort / ReplayGrade / ProofGrade.
 - Do not revert unrelated user changes. The worktree may be dirty.
@@ -59,7 +56,7 @@ Execute the work in the following order:
 
 Phase 1: Baseline and plan
 - Read /home/tomi/atos/src/wasm and /home/tomi/atos/tools/wasm-spec-test first.
-- Compare the current structure against /tmp/wasmi_compare_20260325d1, especially module boundaries, error handling, and testing strategy.
+- Analyze the current structure, especially module boundaries, error handling, and testing strategy.
 - Before changing code, produce a short but concrete plan that includes:
   - Current architecture problems
   - P0 / P1 / P2 priorities
@@ -87,7 +84,7 @@ Close the highest-impact spec gaps, especially:
 - Separate runner limitations from engine limitations so host-runner issues are not misclassified as engine bugs
 
 Phase 4: P2 architecture refactor
-Split the large monolithic files into cleaner modules. Follow wasmi's separation ideas, but keep our own implementation strategy.
+Split the large monolithic files into cleaner modules, but keep our own implementation strategy.
 
 Suggested direction:
 - src/wasm/module/*
@@ -132,7 +129,7 @@ Add the missing engineering layers expected from a library-grade runtime:
   - parser / decoder
   - validator
   - execution
-  - differential behavior against wasmi or wasmtime if practical
+  - differential behavior against wasmtime or another reference interpreter if practical
 - A before/after spec-runner comparison
 - If failures remain, classify them explicitly as:
   - engine bug

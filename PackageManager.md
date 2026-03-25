@@ -2,7 +2,7 @@
 
 **Status:** Design Document
 **Companion to:** Yellow Paper §27.4 (Stage-7)
-**Depends on:** skilld agent, wasmi integration, Ristretto integration
+**Depends on:** skilld agent, WASM engine integration, Ristretto integration
 
 > This document defines `atp` — the ATOS package manager. It plays the same role as `apt` on Debian or `cargo install` in Rust, but built on ATOS primitives: agents, capabilities, keyspaces, and cryptographic verification.
 
