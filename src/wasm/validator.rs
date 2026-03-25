@@ -34,8 +34,8 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         }
     }
 
-    // Validate: no multi-memory (total memories must be <= 1)
-    if module.memory_count > 1 {
+    // Validate: no multi-memory unless the multi-memory proposal is enabled
+    if module.memory_count > 1 && !module.multi_memory_enabled {
         return Err(WasmError::InvalidSection);
     }
 
@@ -62,8 +62,14 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                     }
                 }
                 ExportKind::Memory(idx) => {
-                    if idx > 0 || !has_memory {
-                        return Err(WasmError::MemoryOutOfBounds);
+                    if module.multi_memory_enabled {
+                        if idx >= module.memory_count || !has_memory {
+                            return Err(WasmError::MemoryOutOfBounds);
+                        }
+                    } else {
+                        if idx > 0 || !has_memory {
+                            return Err(WasmError::MemoryOutOfBounds);
+                        }
                     }
                 }
                 ExportKind::Global(idx) => {
@@ -75,6 +81,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
                     // Tag exports are not validated further (exception handling proposal)
                 }
             }
+        }
+    }
+
+    // Validate custom page sizes: only 0 (1 byte) and 16 (65536 bytes) are valid
+    if let Some(log2) = module.page_size_log2 {
+        if log2 != 0 && log2 != 16 {
+            return Err(WasmError::InvalidSection);
         }
     }
 
@@ -101,27 +114,48 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     }
 
     // Validate global init expressions:
-    // With extended-const, global.get can reference any previously defined global.
-    // The referenced global must have index < current global's absolute index AND be immutable.
+    // With extended-const/GC, global.get can reference any previously defined global
+    // (imported or module-defined) with index < current global's absolute index.
+    // The referenced global must be immutable.
     let global_import_count = count_global_imports(module);
     let table_import_count = count_table_imports(module);
-    for (_g_idx, global) in module.globals.iter().enumerate() {
+    for (g_idx, global) in module.globals.iter().enumerate() {
         if let Some(ref_idx) = global.init_global_ref {
-            // global.get in global init expressions can only reference imported globals
-            if ref_idx as usize >= global_import_count {
-                return Err(WasmError::GlobalIndexOutOfBounds);
+            let abs_idx = global_import_count + g_idx;
+            let total_globals = global_import_count + module.globals.len();
+            if module.gc_enabled {
+                // GC: global.get can reference any previously defined global
+                if (ref_idx as usize) >= total_globals {
+                    return Err(WasmError::GlobalIndexOutOfBounds);
+                }
+                if (ref_idx as usize) >= abs_idx {
+                    return Err(WasmError::GlobalIndexOutOfBounds);
+                }
+            } else {
+                // Non-GC: global.get can only reference imported globals
+                if ref_idx as usize >= global_import_count {
+                    return Err(WasmError::GlobalIndexOutOfBounds);
+                }
             }
-            // The referenced imported global must be immutable
-            let mut gi: usize = 0;
-            for imp in &module.imports {
-                if let ImportKind::Global(_, mutable) = imp.kind {
-                    if gi == ref_idx as usize {
-                        if mutable {
-                            return Err(WasmError::TypeMismatch);
+            // The referenced global must be immutable
+            if (ref_idx as usize) < global_import_count {
+                let mut gi: usize = 0;
+                for imp in &module.imports {
+                    if let ImportKind::Global(_, mutable) = imp.kind {
+                        if gi == ref_idx as usize {
+                            if mutable {
+                                return Err(WasmError::TypeMismatch);
+                            }
+                            break;
                         }
-                        break;
+                        gi += 1;
                     }
-                    gi += 1;
+                }
+            } else {
+                // Module-defined global
+                let local_idx = ref_idx as usize - global_import_count;
+                if module.globals[local_idx].mutable {
+                    return Err(WasmError::TypeMismatch);
                 }
             }
         }
@@ -219,10 +253,11 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             if !ref_types_compatible(seg.elem_type, tbl_et) {
                 return Err(WasmError::TypeMismatch);
             }
-            // Validate offset expression
+            // Validate offset expression (table64 uses I64 offset)
+            let offset_type = table_index_type(module, seg.table_idx);
             validate_init_expr_for_segment(
                 &seg.offset_expr_info, global_import_count, total_globals,
-                module, ValType::I32,
+                module, offset_type,
             )?;
         }
         // Validate per-item expression types for expression-based segments (flags 4-7)
@@ -244,11 +279,16 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
     for seg in &module.data_segments {
         if seg.is_active {
             if !has_memory { return Err(WasmError::MemoryOutOfBounds); }
-            if seg.memory_idx > 0 { return Err(WasmError::MemoryOutOfBounds); }
-            // Validate offset expression
+            if module.multi_memory_enabled {
+                if seg.memory_idx >= module.memory_count { return Err(WasmError::MemoryOutOfBounds); }
+            } else {
+                if seg.memory_idx > 0 { return Err(WasmError::MemoryOutOfBounds); }
+            }
+            // Validate offset expression (memory64 uses I64 offset)
+            let offset_type = if module.is_memory64 && seg.memory_idx == 0 { ValType::I64 } else { ValType::I32 };
             validate_init_expr_for_segment(
                 &seg.offset_expr_info, global_import_count, total_globals,
-                module, ValType::I32,
+                module, offset_type,
             )?;
         }
     }
@@ -313,22 +353,38 @@ fn validate_init_expr_for_segment(
     module: &WasmModule,
     expected_type: ValType,
 ) -> Result<(), WasmError> {
-    // Check global references: without extended-const, only imported globals allowed
+    // Check global references
     if let Some(ref_idx) = info.global_ref {
-        if ref_idx as usize >= global_import_count {
-            return Err(WasmError::GlobalIndexOutOfBounds);
+        let total_globals = global_import_count + module.globals.len();
+        if module.gc_enabled {
+            // GC: allow any global
+            if ref_idx as usize >= total_globals {
+                return Err(WasmError::GlobalIndexOutOfBounds);
+            }
+        } else {
+            // Non-GC: only imported globals allowed
+            if ref_idx as usize >= global_import_count {
+                return Err(WasmError::GlobalIndexOutOfBounds);
+            }
         }
-        // Referenced imported global must be immutable
-        let mut gi: usize = 0;
-        for imp in &module.imports {
-            if let ImportKind::Global(_, mutable) = imp.kind {
-                if gi == ref_idx as usize {
-                    if mutable {
-                        return Err(WasmError::ConstExprRequired);
+        // Referenced global must be immutable
+        if (ref_idx as usize) < global_import_count {
+            let mut gi: usize = 0;
+            for imp in &module.imports {
+                if let ImportKind::Global(_, mutable) = imp.kind {
+                    if gi == ref_idx as usize {
+                        if mutable {
+                            return Err(WasmError::ConstExprRequired);
+                        }
+                        break;
                     }
-                    break;
+                    gi += 1;
                 }
-                gi += 1;
+            }
+        } else if module.gc_enabled {
+            let local_idx = ref_idx as usize - global_import_count;
+            if local_idx < module.globals.len() && module.globals[local_idx].mutable {
+                return Err(WasmError::ConstExprRequired);
             }
         }
     }
@@ -370,6 +426,15 @@ fn table_elem_type(module: &WasmModule, table_idx: u32, table_import_count: usiz
         } else {
             ValType::FuncRef
         }
+    }
+}
+
+/// Get the index type of a table (I32 for normal, I64 for table64).
+fn table_index_type(module: &WasmModule, table_idx: u32) -> ValType {
+    if (table_idx as usize) < module.tables.len() && module.tables[table_idx as usize].is_table64 {
+        ValType::I64
+    } else {
+        ValType::I32
     }
 }
 
@@ -538,18 +603,39 @@ impl<'a> Validator<'a> {
         crate::wasm::decoder::decode_leb128_i64(self.code, &mut self.pc)
     }
 
+    fn read_u64(&mut self) -> Result<u64, WasmError> {
+        crate::wasm::decoder::decode_leb128_u64(self.code, &mut self.pc)
+    }
+
+    /// Get the address type for memory 0 (I32 for normal, I64 for memory64).
+    fn mem_addr_type(&self) -> ValType {
+        if self.module.is_memory64 { ValType::I64 } else { ValType::I32 }
+    }
+
     /// Read a memarg (alignment + offset) and validate alignment against max_align.
     /// max_align is log2 of the natural alignment (0=1byte, 1=2byte, 2=4byte, 3=8byte, 4=16byte).
     fn read_memarg(&mut self, max_align: u32) -> Result<(), WasmError> {
         let align = self.read_u32()?;
-        // In non-multi-memory mode, if bit 6 is set it's a multi-memory encoding
-        if align >= 64 {
+        // In multi-memory mode, bit 6 encodes the memory index
+        let mem_idx = if align >= 64 {
+            if !self.module.multi_memory_enabled {
+                return Err(WasmError::TypeMismatch);
+            }
+            // memory index follows in the remaining bits
+            0u32 // placeholder — we don't track per-memory types yet
+        } else {
+            0u32
+        };
+        let effective_align = align & 0x3F;
+        if effective_align > max_align {
             return Err(WasmError::TypeMismatch);
         }
-        if align > max_align {
-            return Err(WasmError::TypeMismatch);
+        // For memory64 memories, read 64-bit offset; otherwise 32-bit
+        if self.module.is_memory64 && mem_idx == 0 {
+            let _offset = self.read_u64()?;
+        } else {
+            let _offset = self.read_u32()?;
         }
-        let _offset = self.read_u32()?;
         Ok(())
     }
 
@@ -1018,7 +1104,8 @@ impl<'a> Validator<'a> {
                     if self.total_tables == 0 || tidx as usize >= self.total_tables {
                         return Err(WasmError::TableIndexOutOfBounds);
                     }
-                    self.pop_expect(ValType::I32)?;
+                    let idx_type = table_index_type(self.module, tidx);
+                    self.pop_expect(idx_type)?;
                     let et = table_elem_type(self.module, tidx, self.table_import_count);
                     self.push_val(et);
                 }
@@ -1029,148 +1116,183 @@ impl<'a> Validator<'a> {
                         return Err(WasmError::TableIndexOutOfBounds);
                     }
                     let et = table_elem_type(self.module, tidx, self.table_import_count);
+                    let idx_type = table_index_type(self.module, tidx);
                     self.pop_expect(et)?; // value must match table element type
-                    self.pop_expect(ValType::I32)?; // index
+                    self.pop_expect(idx_type)?; // index
                 }
                 // ── memory loads ──
                 // i32.load
                 0x28 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I32);
                 }
                 // i32.load8_s, i32.load8_u
                 0x2C | 0x2D => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(0)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I32);
                 }
                 // i32.load16_s, i32.load16_u
                 0x2E | 0x2F => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(1)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I32);
                 }
                 // i64.load
                 0x29 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(3)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I64);
                 }
                 // i64.load8_s, i64.load8_u
                 0x30 | 0x31 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(0)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I64);
                 }
                 // i64.load16_s, i64.load16_u
                 0x32 | 0x33 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(1)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I64);
                 }
                 // i64.load32_s, i64.load32_u
                 0x34 | 0x35 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::I64);
                 }
                 // f32.load
                 0x2A => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::F32);
                 }
                 // f64.load
                 0x2B => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(3)?;
-                    self.pop_expect(ValType::I32)?;
+                    let at = self.mem_addr_type();
+                    self.pop_expect(at)?;
                     self.push_val(ValType::F64);
                 }
                 // i32.store
                 0x36 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I32)?; // value
-                    self.pop_expect(ValType::I32)?; // address
+                    self.pop_expect(at)?; // address
                 }
                 // i32.store8
                 0x3A => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(0)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I32)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // i32.store16
                 0x3B => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(1)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I32)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // i64.store
                 0x37 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(3)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I64)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // i64.store8
                 0x3C => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(0)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I64)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // i64.store16
                 0x3D => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(1)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I64)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // i64.store32
                 0x3E => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::I64)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // f32.store
                 0x38 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(2)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::F32)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // f64.store
                 0x39 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
                     self.read_memarg(3)?;
+                    let at = self.mem_addr_type();
                     self.pop_expect(ValType::F64)?;
-                    self.pop_expect(ValType::I32)?;
+                    self.pop_expect(at)?;
                 }
                 // ── memory.size ──
                 0x3F => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    self.read_zero_byte()?;
-                    self.push_val(ValType::I32);
+                    let mem_idx = if self.module.multi_memory_enabled {
+                        let idx = self.read_u32()?;
+                        if idx >= self.module.memory_count { return Err(WasmError::MemoryOutOfBounds); }
+                        idx
+                    } else {
+                        self.read_zero_byte()?;
+                        0
+                    };
+                    let val_type = if self.module.is_memory64 && mem_idx == 0 { ValType::I64 } else { ValType::I32 };
+                    self.push_val(val_type);
                 }
                 // ── memory.grow ──
                 0x40 => {
                     if !self.has_memory { return Err(WasmError::MemoryOutOfBounds); }
-                    self.read_zero_byte()?;
-                    self.pop_expect(ValType::I32)?;
-                    self.push_val(ValType::I32);
+                    let mem_idx = if self.module.multi_memory_enabled {
+                        let idx = self.read_u32()?;
+                        if idx >= self.module.memory_count { return Err(WasmError::MemoryOutOfBounds); }
+                        idx
+                    } else {
+                        self.read_zero_byte()?;
+                        0
+                    };
+                    let val_type = if self.module.is_memory64 && mem_idx == 0 { ValType::I64 } else { ValType::I32 };
+                    self.pop_expect(val_type)?;
+                    self.push_val(val_type);
                 }
                 // ── i32.const ──
                 0x41 => {
@@ -1355,7 +1477,7 @@ impl<'a> Validator<'a> {
                         8 => {
                             let data_idx = self.read_u32()?;
                             let mem_idx = self.read_u32()?;
-                            if !self.module.has_memory || mem_idx > 0 {
+                            if !self.module.has_memory || (if self.module.multi_memory_enabled { mem_idx >= self.module.memory_count } else { mem_idx > 0 }) {
                                 return Err(WasmError::MemoryOutOfBounds);
                             }
                             if data_idx as usize >= self.module.data_segments.len() {
@@ -1376,7 +1498,7 @@ impl<'a> Validator<'a> {
                         10 => {
                             let dst = self.read_u32()?;
                             let src = self.read_u32()?;
-                            if !self.module.has_memory || dst > 0 || src > 0 {
+                            if !self.module.has_memory || (if self.module.multi_memory_enabled { dst >= self.module.memory_count || src >= self.module.memory_count } else { dst > 0 || src > 0 }) {
                                 return Err(WasmError::MemoryOutOfBounds);
                             }
                             self.pop_expect(ValType::I32)?; // size
@@ -1386,7 +1508,7 @@ impl<'a> Validator<'a> {
                         // memory.fill
                         11 => {
                             let mem = self.read_u32()?;
-                            if !self.module.has_memory || mem > 0 {
+                            if !self.module.has_memory || (if self.module.multi_memory_enabled { mem >= self.module.memory_count } else { mem > 0 }) {
                                 return Err(WasmError::MemoryOutOfBounds);
                             }
                             self.pop_expect(ValType::I32)?; // size
@@ -1409,9 +1531,10 @@ impl<'a> Validator<'a> {
                             if !ref_types_compatible(seg_et, tbl_et) {
                                 return Err(WasmError::TypeMismatch);
                             }
-                            self.pop_expect(ValType::I32)?; // n
-                            self.pop_expect(ValType::I32)?; // s
-                            self.pop_expect(ValType::I32)?; // d
+                            let idx_type = table_index_type(self.module, tbl_idx);
+                            self.pop_expect(ValType::I32)?; // n (always i32)
+                            self.pop_expect(ValType::I32)?; // s (always i32)
+                            self.pop_expect(idx_type)?;      // d (table index type)
                         }
                         // elem.drop
                         13 => {
@@ -1433,9 +1556,13 @@ impl<'a> Validator<'a> {
                             if !ref_types_compatible(src_et, dst_et) {
                                 return Err(WasmError::TypeMismatch);
                             }
-                            self.pop_expect(ValType::I32)?; // n
-                            self.pop_expect(ValType::I32)?; // s
-                            self.pop_expect(ValType::I32)?; // d
+                            let src_it = table_index_type(self.module, src_idx);
+                            let dst_it = table_index_type(self.module, dst_idx);
+                            // n: smaller of src/dst (i32 if either is i32)
+                            let n_type = if src_it == ValType::I32 { ValType::I32 } else { dst_it };
+                            self.pop_expect(n_type)?;  // n
+                            self.pop_expect(src_it)?;  // s
+                            self.pop_expect(dst_it)?;  // d
                         }
                         // table.grow
                         15 => {
@@ -1443,15 +1570,17 @@ impl<'a> Validator<'a> {
                             if tidx as usize >= self.total_tables {
                                 return Err(WasmError::TableIndexOutOfBounds);
                             }
-                            self.pop_expect(ValType::I32)?; // n
+                            let idx_type = table_index_type(self.module, tidx);
+                            self.pop_expect(idx_type)?; // n
                             let et = table_elem_type(self.module, tidx, self.table_import_count);
                             self.pop_expect(et)?;            // init value must match table elem type
-                            self.push_val(ValType::I32);
+                            self.push_val(idx_type);
                         }
                         // table.size
                         16 => {
-                            let _ = self.read_u32()?;
-                            self.push_val(ValType::I32);
+                            let tidx = self.read_u32()?;
+                            let idx_type = table_index_type(self.module, tidx);
+                            self.push_val(idx_type);
                         }
                         // table.fill
                         17 => {
@@ -1459,10 +1588,11 @@ impl<'a> Validator<'a> {
                             if tidx as usize >= self.total_tables {
                                 return Err(WasmError::TableIndexOutOfBounds);
                             }
-                            self.pop_expect(ValType::I32)?; // n
+                            let idx_type = table_index_type(self.module, tidx);
+                            self.pop_expect(idx_type)?; // n
                             let et = table_elem_type(self.module, tidx, self.table_import_count);
                             self.pop_expect(et)?;            // value must match table elem type
-                            self.pop_expect(ValType::I32)?; // i
+                            self.pop_expect(idx_type)?; // i
                         }
                         _ => {}
                     }

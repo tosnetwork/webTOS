@@ -122,6 +122,10 @@ pub struct WastRunner {
     /// Memory sharing pairs: (importer, exporter).
     /// When either side's memory changes, sync to the other.
     memory_shares: Vec<(InstanceHandle, InstanceHandle)>,
+    /// Whether GC-proposal features are enabled for this test file.
+    gc_enabled: bool,
+    /// Whether multi-memory proposal is enabled for this test file.
+    multi_memory_enabled: bool,
 }
 
 impl WastRunner {
@@ -133,6 +137,8 @@ impl WastRunner {
             current: None,
             anonymous_instances: 0,
             memory_shares: Vec::new(),
+            gc_enabled: false,
+            multi_memory_enabled: false,
         }
     }
 
@@ -147,6 +153,15 @@ impl WastRunner {
             .map_err(|err| annotate_wast_error(err, path, &text))?;
 
         let mut runner = Self::new(verbose);
+        // Enable proposal features based on file path
+        let path_str = path.to_string_lossy();
+        if path_str.contains("proposals/gc/") || path_str.contains("proposals/wasm-3.0/") {
+            runner.gc_enabled = true;
+            runner.multi_memory_enabled = true;
+        }
+        if path_str.contains("proposals/multi-memory/") || path_str.contains("proposals/custom-page-sizes/") {
+            runner.multi_memory_enabled = true;
+        }
         let mut report = FileReport {
             path: path.to_path_buf(),
             total_assertions: 0,
@@ -349,8 +364,10 @@ impl WastRunner {
     }
 
     fn decode_module(&self, bytes: &[u8]) -> RunnerResult<WasmModule> {
-        let module = crate::wasm::decoder::decode(bytes)
+        let mut module = crate::wasm::decoder::decode(bytes)
             .map_err(|err| RunnerError::new("decode", format!("{err:?}")))?;
+        module.gc_enabled = self.gc_enabled;
+        module.multi_memory_enabled = self.multi_memory_enabled;
         crate::wasm::validator::validate(&module)
             .map_err(|err| RunnerError::new("validation", format!("{err:?}")))?;
         Ok(module)

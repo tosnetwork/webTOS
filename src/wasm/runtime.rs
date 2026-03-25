@@ -247,6 +247,9 @@ impl WasmInstance {
             if !seg.is_active {
                 continue; // passive segment — applied later by memory.init
             }
+            if seg.memory_idx > 0 {
+                continue; // multi-memory: skip non-primary memory data segments
+            }
             let dst_start = seg.offset as usize;
             let src_start = seg.data_offset;
             let len = seg.data_len;
@@ -1664,7 +1667,8 @@ impl WasmInstance {
             0x25 => {
                 // table.get
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
-                let idx = try_exec!(self.pop_i32()) as usize;
+                let is_t64 = table_idx < self.module.tables.len() && self.module.tables[table_idx].is_table64;
+                let idx = if is_t64 { try_exec!(self.pop_i64()) as usize } else { try_exec!(self.pop_i32()) as usize };
                 if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
@@ -1678,7 +1682,8 @@ impl WasmInstance {
                 // table.set
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
                 let val = try_exec!(self.pop_i32());
-                let idx = try_exec!(self.pop_i32()) as usize;
+                let is_t64 = table_idx < self.module.tables.len() && self.module.tables[table_idx].is_table64;
+                let idx = if is_t64 { try_exec!(self.pop_i64()) as usize } else { try_exec!(self.pop_i32()) as usize };
                 if table_idx >= self.tables.len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
@@ -1912,13 +1917,21 @@ impl WasmInstance {
             0x3F => {
                 // memory.size
                 let _reserved = try_exec!(self.read_leb128_u32()); // must be 0x00
-                let pages = (self.memory_size / WASM_PAGE_SIZE) as i32;
-                try_exec!(self.push(Value::I32(pages)));
+                let pages = (self.memory_size / WASM_PAGE_SIZE) as i64;
+                if self.module.is_memory64 {
+                    try_exec!(self.push(Value::I64(pages)));
+                } else {
+                    try_exec!(self.push(Value::I32(pages as i32)));
+                }
             }
             0x40 => {
                 // memory.grow
                 let _reserved = try_exec!(self.read_leb128_u32()); // must be 0x00
-                let delta = try_exec!(self.pop_i32()) as u32;
+                let delta = if self.module.is_memory64 {
+                    try_exec!(self.pop_i64()) as u32
+                } else {
+                    try_exec!(self.pop_i32()) as u32
+                };
                 let old_pages = (self.memory_size / WASM_PAGE_SIZE) as u32;
                 let new_pages = old_pages.saturating_add(delta);
                 // Check both the module's declared max and the global hard limit
@@ -1929,12 +1942,20 @@ impl WasmInstance {
                 };
                 if new_pages as usize > module_max || new_pages as usize > MAX_MEMORY_PAGES {
                     // Failure: push -1
-                    try_exec!(self.push(Value::I32(-1)));
+                    if self.module.is_memory64 {
+                        try_exec!(self.push(Value::I64(-1)));
+                    } else {
+                        try_exec!(self.push(Value::I32(-1)));
+                    }
                 } else {
                     let new_size = (new_pages as usize).saturating_mul(WASM_PAGE_SIZE);
                     self.memory.resize(new_size, 0);
                     self.memory_size = new_size;
-                    try_exec!(self.push(Value::I32(old_pages as i32)));
+                    if self.module.is_memory64 {
+                        try_exec!(self.push(Value::I64(old_pages as i64)));
+                    } else {
+                        try_exec!(self.push(Value::I32(old_pages as i32)));
+                    }
                 }
             }
 
@@ -2558,9 +2579,10 @@ impl WasmInstance {
                     12 => {
                         let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
-                        let n = try_exec!(self.pop_i32()) as u32;
-                        let s = try_exec!(self.pop_i32()) as u32;
-                        let d = try_exec!(self.pop_i32()) as u32;
+                        let is_t64 = tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64;
+                        let n = try_exec!(self.pop_i32()) as u32; // n is always i32
+                        let s = try_exec!(self.pop_i32()) as u32; // s is always i32
+                        let d = if is_t64 { try_exec!(self.pop_i64()) as u32 } else { try_exec!(self.pop_i32()) as u32 };
                         let is_dropped = seg_idx < self.dropped_elems.len() && self.dropped_elems[seg_idx];
                         if is_dropped {
                             if n != 0 || s != 0 {
@@ -2603,9 +2625,13 @@ impl WasmInstance {
                     14 => {
                         let dst_tbl = try_exec!(self.read_leb128_u32()) as usize;
                         let src_tbl = try_exec!(self.read_leb128_u32()) as usize;
-                        let n = try_exec!(self.pop_i32()) as u32;
-                        let s = try_exec!(self.pop_i32()) as u32;
-                        let d = try_exec!(self.pop_i32()) as u32;
+                        let src_t64 = src_tbl < self.module.tables.len() && self.module.tables[src_tbl].is_table64;
+                        let dst_t64 = dst_tbl < self.module.tables.len() && self.module.tables[dst_tbl].is_table64;
+                        // n: smaller of src/dst (i32 if either is i32)
+                        let n_is_64 = src_t64 && dst_t64;
+                        let n = if n_is_64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
+                        let s = if src_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
+                        let d = if dst_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let nu = n as usize; let su = s as usize; let du = d as usize;
                         if dst_tbl >= self.tables.len() || src_tbl >= self.tables.len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
@@ -2631,24 +2657,25 @@ impl WasmInstance {
                     // table.grow (15)
                     15 => {
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
-                        let n = try_exec!(self.pop_i32()) as u32;
+                        let is_t64 = tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64;
+                        let n = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let init = try_exec!(self.pop());
                         if tbl_idx >= self.tables.len() {
-                            try_exec!(self.push(Value::I32(-1)));
+                            if is_t64 { try_exec!(self.push(Value::I64(-1))); } else { try_exec!(self.push(Value::I32(-1))); }
                         } else {
-                            let old_size = self.tables[tbl_idx].len() as u32;
-                            let new_size = old_size as u64 + n as u64;
+                            let old_size = self.tables[tbl_idx].len() as u64;
+                            let new_size = old_size + n;
                             let max = self.module.tables.get(tbl_idx).and_then(|t| t.max);
                             let limit = max.map_or(MAX_TABLE_SIZE as u64, |m| m as u64);
                             if new_size > limit || new_size > MAX_TABLE_SIZE as u64 {
-                                try_exec!(self.push(Value::I32(-1)));
+                                if is_t64 { try_exec!(self.push(Value::I64(-1))); } else { try_exec!(self.push(Value::I32(-1))); }
                             } else {
                                 let fill_val = match init {
                                     Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
                                     _ => None,
                                 };
                                 self.tables[tbl_idx].resize(new_size as usize, fill_val);
-                                try_exec!(self.push(Value::I32(old_size as i32)));
+                                if is_t64 { try_exec!(self.push(Value::I64(old_size as i64))); } else { try_exec!(self.push(Value::I32(old_size as i32))); }
                             }
                         }
                     }
@@ -2656,14 +2683,19 @@ impl WasmInstance {
                     16 => {
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
                         let size = if tbl_idx < self.tables.len() { self.tables[tbl_idx].len() } else { 0 };
-                        try_exec!(self.push(Value::I32(size as i32)));
+                        if tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64 {
+                            try_exec!(self.push(Value::I64(size as i64)));
+                        } else {
+                            try_exec!(self.push(Value::I32(size as i32)));
+                        }
                     }
                     // table.fill (17)
                     17 => {
                         let tbl_idx = try_exec!(self.read_leb128_u32()) as usize;
-                        let n = try_exec!(self.pop_i32()) as u32;
+                        let is_t64 = tbl_idx < self.module.tables.len() && self.module.tables[tbl_idx].is_table64;
+                        let n = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let val = try_exec!(self.pop_i32());
-                        let d = try_exec!(self.pop_i32()) as u32;
+                        let d = if is_t64 { try_exec!(self.pop_i64()) as u64 } else { try_exec!(self.pop_i32()) as u32 as u64 };
                         let nu = n as usize; let du = d as usize;
                         if tbl_idx >= self.tables.len() || du.saturating_add(nu) > self.tables[tbl_idx].len() {
                             return ExecResult::Trap(WasmError::TableIndexOutOfBounds);

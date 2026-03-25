@@ -135,6 +135,8 @@ pub struct TableDef {
     pub max: Option<u32>,
     /// Element type: FuncRef (0x70) or ExternRef (0x6F).
     pub elem_type: ValType,
+    /// Whether this table uses 64-bit indices (table64 proposal).
+    pub is_table64: bool,
 }
 
 /// A data segment for memory initialization.
@@ -148,6 +150,8 @@ pub struct DataSegment {
     pub data_len: usize,
     /// Info from scanning the offset init expression for validation.
     pub offset_expr_info: InitExprInfo,
+    /// Byte range [start, end) of the offset init expression in the original binary.
+    pub offset_expr_range: (usize, usize),
 }
 
 /// Element segment mode.
@@ -172,6 +176,8 @@ pub struct ElementSegment {
     /// Per-item expression info for expression-based segments (flags 4-7).
     /// Empty for index-based segments (flags 0-3).
     pub item_expr_infos: alloc::vec::Vec<InitExprInfo>,
+    /// Byte range [start, end) of the offset init expression in the original binary.
+    pub offset_expr_range: (usize, usize),
 }
 
 /// Information extracted from scanning an init expression for validation.
@@ -210,6 +216,15 @@ pub struct WasmModule {
     pub memory_count: u32,
     pub memory_min_pages: u32,
     pub memory_max_pages: u32,
+    /// Whether the first memory uses 64-bit addressing (memory64 proposal).
+    pub is_memory64: bool,
+    /// Custom page size log2 for the first memory (None if no custom page size).
+    pub page_size_log2: Option<u32>,
+
+    /// Whether GC-proposal features are enabled (allows module-defined globals in const exprs).
+    pub gc_enabled: bool,
+    /// Whether multi-memory proposal is enabled.
+    pub multi_memory_enabled: bool,
 
     /// DataCount section value (if present); None if no DataCount section.
     pub data_count: Option<u32>,
@@ -245,6 +260,10 @@ impl WasmModule {
             memory_count: 0,
             memory_min_pages: 0,
             memory_max_pages: 0,
+            is_memory64: false,
+            page_size_log2: None,
+            gc_enabled: false,
+            multi_memory_enabled: false,
             data_count: None,
             code_uses_data_count: false,
             tag_types: Vec::new(),
@@ -332,6 +351,29 @@ pub fn decode_leb128_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, WasmError
         }
         shift += 7;
         if shift >= 35 {
+            return Err(WasmError::InvalidLEB128);
+        }
+    }
+}
+
+pub fn decode_leb128_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, WasmError> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if *pos >= bytes.len() {
+            return Err(WasmError::UnexpectedEnd);
+        }
+        let byte = bytes[*pos];
+        *pos += 1;
+        if shift == 63 && byte > 0x01 {
+            return Err(WasmError::InvalidLEB128);
+        }
+        result |= ((byte & 0x7F) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 70 {
             return Err(WasmError::InvalidLEB128);
         }
     }
@@ -871,13 +913,16 @@ fn decode_import_section(
                     _ => ValType::FuncRef,
                 };
                 let flags = read_byte(bytes, pos)?;
-                if (flags & !0b111) != 0 {
+                if flags != 0 && flags != 1 && flags != 4 && flags != 5 {
                     return Err(WasmError::InvalidSection);
                 }
-                let min = decode_leb128_u32(bytes, pos)?;
-                let max = if flags & 1 != 0 { Some(decode_leb128_u32(bytes, pos)?) } else { None };
+                let is_table64 = (flags & 0b100) != 0;
+                let min = if is_table64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? };
+                let max = if flags & 1 != 0 {
+                    if is_table64 { Some(decode_leb128_u64(bytes, pos)? as u32) } else { Some(decode_leb128_u32(bytes, pos)?) }
+                } else { None };
                 // Add imported table to module tables so runtime can create it
-                module.tables.push(TableDef { min, max, elem_type: et });
+                module.tables.push(TableDef { min, max, elem_type: et, is_table64 });
                 imp.kind = ImportKind::Table(et);
             }
             0x02 => {
@@ -885,13 +930,31 @@ fn decode_import_section(
                 module.has_memory = true;
                 module.memory_count += 1;
                 let flags = read_byte(bytes, pos)?;
-                if flags > 3 || flags == 2 {
+                // Valid flags: 0 (min), 1 (min+max), 3 (shared min+max),
+                // 4 (memory64 min), 5 (memory64 min+max), 7 (memory64 shared min+max)
+                // Also allow custom-page-sizes flag (bit 3 = 0x08)
+                if (flags & !0b1111) != 0 || (flags & 0b0010 != 0 && flags & 0b0001 == 0) {
                     return Err(WasmError::InvalidSection);
                 }
-                let min = decode_leb128_u32(bytes, pos)?;
+                let is_memory64 = (flags & 0b100) != 0;
+                let min = if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? };
                 let has_max = flags & 1 != 0;
-                let max = if has_max { decode_leb128_u32(bytes, pos)? } else { u32::MAX };
+                let max = if has_max {
+                    if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? }
+                } else { u32::MAX };
+                // If custom-page-sizes flag (bit 3), read and discard the page size
+                let mem_page_size_log2 = if flags & 0b1000 != 0 {
+                    let page_size_log2 = decode_leb128_u32(bytes, pos)?;
+                    if page_size_log2 >= 64 {
+                        return Err(WasmError::InvalidSection);
+                    }
+                    Some(page_size_log2)
+                } else {
+                    None
+                };
                 module.memory_min_pages = min;
+                module.is_memory64 = is_memory64;
+                module.page_size_log2 = mem_page_size_log2;
                 if has_max {
                     module.has_memory_max = true;
                     module.memory_max_pages = max;
@@ -964,29 +1027,44 @@ fn decode_memory_section(
         return Ok(());
     }
     module.has_memory = true;
-    let flags = read_byte(bytes, pos)?;
-    // Valid limit flags for memory: 0 (min only), 1 (min+max), 3 (shared min+max)
-    if flags > 3 || flags == 2 {
-        return Err(WasmError::InvalidSection);
-    }
-    module.memory_min_pages = decode_leb128_u32(bytes, pos)?;
-    if flags & 1 != 0 {
-        module.has_memory_max = true;
-        module.memory_max_pages = decode_leb128_u32(bytes, pos)?;
-    } else {
-        module.has_memory_max = false;
-        module.memory_max_pages = u32::MAX;
-    }
-
-    // Skip any additional memories
-    for _ in 1..count {
-        let f = read_byte(bytes, pos)?;
-        if f > 3 || f == 2 {
+    for mem_idx in 0..count {
+        let flags = read_byte(bytes, pos)?;
+        // Valid flags: 0 (min), 1 (min+max), 3 (shared min+max),
+        // 4 (memory64 min), 5 (memory64 min+max), 7 (memory64 shared min+max)
+        // Also allow custom-page-sizes flag (bit 3 = 0x08)
+        if (flags & !0b1111) != 0 || (flags & 0b0010 != 0 && flags & 0b0001 == 0) {
             return Err(WasmError::InvalidSection);
         }
-        let _ = decode_leb128_u32(bytes, pos)?;
-        if f & 1 != 0 {
-            let _ = decode_leb128_u32(bytes, pos)?;
+        let is_memory64 = (flags & 0b100) != 0;
+        let min = if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? };
+        let has_max = flags & 1 != 0;
+        let max = if has_max {
+            if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? }
+        } else {
+            u32::MAX
+        };
+        // If custom-page-sizes flag (bit 3), read and validate page_size_log2
+        let mem_page_size_log2 = if flags & 0b1000 != 0 {
+            let page_size_log2 = decode_leb128_u32(bytes, pos)?;
+            // Decode-time check: must be < 64
+            if page_size_log2 >= 64 {
+                return Err(WasmError::InvalidSection);
+            }
+            Some(page_size_log2)
+        } else {
+            None
+        };
+        if mem_idx == 0 {
+            module.memory_min_pages = min;
+            module.is_memory64 = is_memory64;
+            module.page_size_log2 = mem_page_size_log2;
+            if has_max {
+                module.has_memory_max = true;
+                module.memory_max_pages = max;
+            } else {
+                module.has_memory_max = false;
+                module.memory_max_pages = u32::MAX;
+            }
         }
     }
 
@@ -1150,15 +1228,25 @@ fn decode_table_section(
             return Err(WasmError::InvalidSection);
         }
         let flags = read_byte(bytes, pos)?;
-        // Valid limit flags for tables: 0x00 (no max) or 0x01 (has max).
-        // Flags >= 2 are invalid (shared/table64 not supported for tables).
-        if flags > 1 {
+        // Valid limit flags for tables: 0x00 (no max), 0x01 (has max),
+        // 0x04 (table64, no max), 0x05 (table64, has max).
+        // Flags with shared bit (0x02) are invalid for tables.
+        if flags != 0 && flags != 1 && flags != 4 && flags != 5 {
             return Err(WasmError::InvalidSection);
         }
         let has_max = (flags & 0b001) != 0;
-        let min = decode_leb128_u32(bytes, pos)?;
+        let is_table64 = (flags & 0b100) != 0;
+        let min = if is_table64 {
+            decode_leb128_u64(bytes, pos)? as u32
+        } else {
+            decode_leb128_u32(bytes, pos)?
+        };
         let max = if has_max {
-            Some(decode_leb128_u32(bytes, pos)?)
+            if is_table64 {
+                Some(decode_leb128_u64(bytes, pos)? as u32)
+            } else {
+                Some(decode_leb128_u32(bytes, pos)?)
+            }
         } else {
             None
         };
@@ -1173,7 +1261,7 @@ fn decode_table_section(
             0x6F => ValType::ExternRef,
             _ => ValType::FuncRef, // 0x63/0x64 ref types default to funcref
         };
-        module.tables.push(TableDef { min, max, elem_type: et });
+        module.tables.push(TableDef { min, max, elem_type: et, is_table64 });
     }
     Ok(())
 }
@@ -1256,6 +1344,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
+                    offset_expr_range: (0, 0),
                 });
             }
             1 => {
@@ -1277,6 +1366,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: Default::default(),
                     item_expr_infos: alloc::vec::Vec::new(),
+                    offset_expr_range: (0, 0),
                 });
             }
             2 => {
@@ -1306,6 +1396,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: expr_info,
                     item_expr_infos: alloc::vec::Vec::new(),
+                    offset_expr_range: (0, 0),
                 });
             }
             3 => {
@@ -1327,6 +1418,7 @@ fn decode_element_section(
                     elem_type: ValType::FuncRef,
                     offset_expr_info: Default::default(),
                     item_expr_infos: alloc::vec::Vec::new(),
+                    offset_expr_range: (0, 0),
                 });
             }
             4 => {
@@ -1343,7 +1435,7 @@ fn decode_element_section(
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos });
+                module.element_segments.push(ElementSegment { table_idx: 0, offset, func_indices, mode: ElemMode::Active, elem_type: ValType::FuncRef, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (0, 0) });
             }
             5 => {
                 // Passive, reftype, expression elements
@@ -1365,6 +1457,7 @@ fn decode_element_section(
                     elem_type,
                     offset_expr_info: Default::default(),
                     item_expr_infos,
+                    offset_expr_range: (0, 0),
                 });
             }
             6 => {
@@ -1383,7 +1476,7 @@ fn decode_element_section(
                     func_indices.push(match val { Value::I32(v) => v as u32, _ => u32::MAX });
                     item_expr_infos.push(item_info);
                 }
-                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos });
+                module.element_segments.push(ElementSegment { table_idx, offset, func_indices, mode: ElemMode::Active, elem_type, offset_expr_info: expr_info, item_expr_infos, offset_expr_range: (0, 0) });
             }
             7 => {
                 // Declarative, reftype, expression elements (dropped immediately)
@@ -1405,6 +1498,7 @@ fn decode_element_section(
                     elem_type,
                     offset_expr_info: Default::default(),
                     item_expr_infos,
+                    offset_expr_range: (0, 0),
                 });
             }
             _ => {
@@ -1432,8 +1526,10 @@ fn decode_data_section(
         match flags {
             0 => {
                 // Active segment: memory_idx=0 (implicit), offset expr, data bytes
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
                     Value::I64(v) => v as u32,
@@ -1453,6 +1549,7 @@ fn decode_data_section(
                     data_offset,
                     data_len,
                     offset_expr_info: expr_info,
+                    offset_expr_range: (expr_start, expr_end),
                 });
             }
             1 => {
@@ -1472,13 +1569,16 @@ fn decode_data_section(
                     data_offset,
                     data_len,
                     offset_expr_info: Default::default(),
+                    offset_expr_range: (0, 0),
                 });
             }
             2 => {
                 // Active segment with explicit memory_idx
                 let memory_idx = decode_leb128_u32(bytes, pos)?;
+                let expr_start = *pos;
                 let expr_info = scan_init_expr_info(bytes, *pos);
                 let offset_val = eval_init_expr(bytes, pos)?;
+                let expr_end = *pos;
                 let offset = match offset_val {
                     Value::I32(v) => v as u32,
                     Value::I64(v) => v as u32,
@@ -1498,6 +1598,7 @@ fn decode_data_section(
                     data_offset,
                     data_len,
                     offset_expr_info: expr_info,
+                    offset_expr_range: (expr_start, expr_end),
                 });
             }
             _ => return Err(WasmError::InvalidSection),
