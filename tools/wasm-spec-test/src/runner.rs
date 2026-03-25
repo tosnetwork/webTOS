@@ -1254,6 +1254,60 @@ impl WastRunner {
             }
         }
 
+        // Detect aliased global imports: same source global → alias
+        {
+            let mut record = handle.borrow_mut();
+            let mut glob_sources: Vec<Option<(String, u32)>> = Vec::new();
+            for import in &record.instance.module.imports {
+                let ImportKind::Global(_, _, _) = import.kind else { continue };
+                let mod_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+                let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+                if let Some(src_handle) = self.instances.get(&mod_name) {
+                    if let Ok(src) = src_handle.try_borrow() {
+                        if let Some(src_idx) = exported_global_index(&src.instance.module, &fld_name) {
+                            glob_sources.push(Some((mod_name, src_idx)));
+                        } else { glob_sources.push(None); }
+                    } else { glob_sources.push(None); }
+                } else { glob_sources.push(None); }
+            }
+            for i in 0..glob_sources.len() {
+                for j in (i+1)..glob_sources.len() {
+                    if let (Some(a), Some(b)) = (&glob_sources[i], &glob_sources[j]) {
+                        if a == b && j < record.instance.global_aliases.len() {
+                            record.instance.global_aliases[j] = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Detect aliased memory imports: same source memory → alias
+        {
+            let mut record = handle.borrow_mut();
+            let mut mem_sources: Vec<Option<(String, u32)>> = Vec::new();
+            for import in &record.instance.module.imports {
+                if !matches!(import.kind, ImportKind::Memory) { continue; }
+                let mod_name = bytes_to_string(record.instance.module.get_name(import.module_name_offset, import.module_name_len));
+                let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
+                if let Some(src_handle) = self.instances.get(&mod_name) {
+                    if let Ok(src) = src_handle.try_borrow() {
+                        if let Some(src_idx) = exported_memory_index(&src.instance.module, &fld_name) {
+                            mem_sources.push(Some((mod_name, src_idx)));
+                        } else { mem_sources.push(None); }
+                    } else { mem_sources.push(None); }
+                } else { mem_sources.push(None); }
+            }
+            for i in 0..mem_sources.len() {
+                for j in (i+1)..mem_sources.len() {
+                    if let (Some(a), Some(b)) = (&mem_sources[i], &mem_sources[j]) {
+                        if a == b && j < record.instance.memory_aliases.len() {
+                            record.instance.memory_aliases[j] = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Err(err) = self.run_start(&handle) {
             if let Some(name) = &inserted_name {
                 self.instances.remove(name);
