@@ -90,6 +90,9 @@ enum DirectiveOutcome {
 struct RunnerError {
     kind: &'static str,
     message: String,
+    /// If this error is an uncaught exception, carry the exception info
+    /// so it can be propagated to a caller's try_table.
+    exception: Option<(u32, Vec<Value>)>,
 }
 
 impl RunnerError {
@@ -97,6 +100,15 @@ impl RunnerError {
         Self {
             kind,
             message: message.into(),
+            exception: None,
+        }
+    }
+
+    fn exception(tag_idx: u32, values: Vec<Value>) -> Self {
+        Self {
+            kind: "trap",
+            message: "unhandled exception".to_string(),
+            exception: Some((tag_idx, values)),
         }
     }
 
@@ -126,6 +138,8 @@ pub struct WastRunner {
     gc_enabled: bool,
     /// Whether multi-memory proposal is enabled for this test file.
     multi_memory_enabled: bool,
+    /// Whether multiple tables should be rejected (threads-only tests).
+    reject_multi_table: bool,
 }
 
 impl WastRunner {
@@ -139,6 +153,7 @@ impl WastRunner {
             memory_shares: Vec::new(),
             gc_enabled: false,
             multi_memory_enabled: false,
+            reject_multi_table: false,
         }
     }
 
@@ -161,6 +176,9 @@ impl WastRunner {
         }
         if path_str.contains("proposals/multi-memory/") || path_str.contains("proposals/custom-page-sizes/") {
             runner.multi_memory_enabled = true;
+        }
+        if path_str.contains("proposals/threads/") {
+            runner.reject_multi_table = true;
         }
         let mut report = FileReport {
             path: path.to_path_buf(),
@@ -368,6 +386,7 @@ impl WastRunner {
             .map_err(|err| RunnerError::new("decode", format!("{err:?}")))?;
         module.gc_enabled = module.gc_enabled || self.gc_enabled;
         module.multi_memory_enabled = module.multi_memory_enabled || self.multi_memory_enabled;
+        module.reject_multi_table = self.reject_multi_table;
         crate::wasm::validator::validate(&module)
             .map_err(|err| RunnerError::new("validation", format!("{err:?}")))?;
         Ok(module)
@@ -828,6 +847,9 @@ impl WastRunner {
                     return Err(RunnerError::new("trap", "out of fuel while running start"));
                 }
                 ExecResult::Trap(err) => return Err(RunnerError::trap(err)),
+                ExecResult::Exception(_tag_idx, _values) => {
+                    return Err(RunnerError::new("trap", "uncaught exception in start function"));
+                }
                 ExecResult::HostCall(import_idx, args, arg_count) => {
                     let ret = self.dispatch_host_call(
                         &mut record.instance,
@@ -894,13 +916,28 @@ impl WastRunner {
                 }
                 ExecResult::OutOfFuel => return Err(RunnerError::new("trap", "out of fuel")),
                 ExecResult::Trap(err) => return Err(RunnerError::trap(err)),
+                ExecResult::Exception(tag_idx, values) => {
+                    return Err(RunnerError::exception(tag_idx, values));
+                }
                 ExecResult::HostCall(import_idx, values, arg_count) => {
-                    let ret = self.dispatch_host_call(
+                    match self.dispatch_host_call_ex(
                         &mut record.instance,
                         import_idx,
                         &values[..arg_count as usize],
-                    )?;
-                    result = record.instance.resume(ret);
+                    ) {
+                        Ok(ret) => {
+                            result = record.instance.resume(ret);
+                        }
+                        Err(err) => {
+                            if let Some((tag_idx, exc_values)) = err.exception {
+                                // Cross-module exception: propagate to caller's try_table
+                                // tag_idx is already mapped to caller's tag space
+                                result = record.instance.resume_with_exception(tag_idx, exc_values);
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1903,6 +1940,77 @@ impl WastRunner {
         }
     }
 
+    /// Like dispatch_host_call, but maps exception tag indices from the callee's
+    /// module space to the caller's module space when an exception is thrown.
+    fn dispatch_host_call_ex(
+        &mut self,
+        caller: &mut WasmInstance,
+        import_idx: u32,
+        args: &[Value],
+    ) -> RunnerResult<Option<Value>> {
+        // Get the import info before calling
+        let import = nth_function_import(&caller.module, import_idx).ok_or_else(|| {
+            RunnerError::new("link", format!("unknown function import index {import_idx}"))
+        })?;
+        let module_name = bytes_to_string(caller.module.get_name(
+            import.module_name_offset,
+            import.module_name_len,
+        ));
+
+        match self.dispatch_host_call(caller, import_idx, args) {
+            Ok(val) => Ok(val),
+            Err(mut err) => {
+                if let Some((callee_tag_idx, ref _values)) = err.exception {
+                    // Map the tag from the callee's space to the caller's space.
+                    // Look up the exported tag name in the callee module.
+                    if let Some(callee_handle) = self.instances.get(&module_name).cloned() {
+                        let callee_record = callee_handle.borrow();
+                        // Find the exported name for this tag in the callee module
+                        let mut exported_tag_name = None;
+                        for exp in &callee_record.instance.module.exports {
+                            if let ExportKind::Tag(idx) = exp.kind {
+                                if idx == callee_tag_idx {
+                                    exported_tag_name = Some(bytes_to_string(
+                                        callee_record.instance.module.get_name(exp.name_offset, exp.name_len)
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(tag_name) = exported_tag_name {
+                            // Find the caller's imported tag with the same (module, name)
+                            let mut caller_tag_idx = 0u32;
+                            let mut mapped = false;
+                            for imp in &caller.module.imports {
+                                if let ImportKind::Tag(_) = imp.kind {
+                                    let imp_mod = bytes_to_string(
+                                        caller.module.get_name(imp.module_name_offset, imp.module_name_len));
+                                    let imp_field = bytes_to_string(
+                                        caller.module.get_name(imp.field_name_offset, imp.field_name_len));
+                                    if imp_mod == module_name && imp_field == tag_name {
+                                        err.exception = Some((caller_tag_idx, err.exception.take().unwrap().1));
+                                        mapped = true;
+                                        break;
+                                    }
+                                    caller_tag_idx += 1;
+                                }
+                            }
+                            if !mapped {
+                                // Tag not imported by caller — use u32::MAX so only catch_all matches
+                                err.exception = Some((u32::MAX, err.exception.take().unwrap().1));
+                            }
+                        } else {
+                            // Tag not exported by callee — use u32::MAX
+                            err.exception = Some((u32::MAX, err.exception.take().unwrap().1));
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
     fn assert_message(
         &self,
         kind: &'static str,
@@ -2078,12 +2186,44 @@ impl WastRunner {
                     _ => Ok(()),
                 }
             }
-            WastRetCore::RefHost(_)
-            | WastRetCore::RefArray
-            | WastRetCore::RefStruct => Err(DirectiveError::assertion(
-                "assert_return",
-                "GC reference-type results are not supported by the ATOS engine",
-            )),
+            WastRetCore::RefArray => {
+                // Any non-null array ref is accepted
+                match actual {
+                    Value::GcRef(_) | Value::I32(_) => Ok(()),
+                    Value::NullRef => Err(DirectiveError::assertion(
+                        "assert_return",
+                        "expected non-null array reference, got null",
+                    )),
+                    _ => Err(DirectiveError::assertion(
+                        "assert_return",
+                        format!("expected array reference, got {actual:?}"),
+                    )),
+                }
+            }
+            WastRetCore::RefStruct => {
+                // Any non-null struct ref is accepted
+                match actual {
+                    Value::GcRef(_) | Value::I32(_) => Ok(()),
+                    Value::NullRef => Err(DirectiveError::assertion(
+                        "assert_return",
+                        "expected non-null struct reference, got null",
+                    )),
+                    _ => Err(DirectiveError::assertion(
+                        "assert_return",
+                        format!("expected struct reference, got {actual:?}"),
+                    )),
+                }
+            }
+            WastRetCore::RefHost(_) => {
+                // Host references are not directly supported
+                match actual {
+                    Value::NullRef | Value::I32(-1) => Err(DirectiveError::assertion(
+                        "assert_return",
+                        "expected non-null host reference, got null",
+                    )),
+                    _ => Ok(()),
+                }
+            }
         }
     }
 }
@@ -2578,7 +2718,12 @@ fn trap_message(err: &WasmError) -> String {
         WasmError::NullFunctionReference => "null function reference".to_string(),
         WasmError::NullReference => "null reference".to_string(),
         WasmError::NullI31Reference => "null i31 reference".to_string(),
+        WasmError::NullStructReference => "null structure reference".to_string(),
+        WasmError::NullArrayReference => "null array reference".to_string(),
+        WasmError::ArrayOutOfBounds => "out of bounds array access".to_string(),
+        WasmError::CastFailure => "cast failure".to_string(),
         WasmError::UncaughtException => "unhandled exception".to_string(),
+        WasmError::MultipleTables => "multiple tables".to_string(),
         other => format!("{other:?}"),
     }
 }

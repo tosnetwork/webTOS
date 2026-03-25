@@ -19,6 +19,22 @@ pub enum ValType {
     /// A typed, nullable function reference: (ref null $t).
     /// This is distinct from FuncRef (which is funcref / (ref null func)).
     NullableTypedFuncRef,
+    /// GC proposal: (ref any) / (ref null any) — abstract any type
+    AnyRef,
+    /// GC proposal: (ref eq) / (ref null eq) — abstract eq type
+    EqRef,
+    /// GC proposal: (ref i31) / (ref null i31) — i31 reference
+    I31Ref,
+    /// GC proposal: (ref struct) / (ref null struct) — abstract struct type
+    StructRef,
+    /// GC proposal: (ref null struct) — abstract nullable struct type
+    NullableStructRef,
+    /// GC proposal: (ref array) / (ref null array) — abstract array type
+    ArrayRef,
+    /// GC proposal: (ref null none) — bottom type
+    NoneRef,
+    /// Exception handling proposal: exnref (exception reference)
+    ExnRef,
 }
 
 /// A 128-bit SIMD value (v128), stored as little-endian byte array.
@@ -108,10 +124,15 @@ pub enum Value {
     V128(V128),
     /// Null reference — used for ref.null of any heap type.
     NullRef,
+    /// GC heap reference: index into WasmInstance::gc_heap.
+    /// The heap_type field stores the abstract heap type code for type checking:
+    /// -0x12=any, -0x16=eq, -0x19=i31, -0x17=struct, -0x18=array, -0x10=func, -0x11=extern
+    /// or >= 0 for a concrete type index.
+    GcRef(u32),
 }
 
 impl Value {
-    /// Return zero for the given type.
+    /// Return zero/null for the given type.
     pub const fn default_for(ty: ValType) -> Self {
         match ty {
             ValType::I32 | ValType::FuncRef | ValType::ExternRef
@@ -120,6 +141,9 @@ impl Value {
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
             ValType::V128 => Value::V128(V128::ZERO),
+            ValType::AnyRef | ValType::EqRef | ValType::I31Ref
+            | ValType::StructRef | ValType::NullableStructRef | ValType::ArrayRef | ValType::NoneRef
+            | ValType::ExnRef => Value::NullRef,
         }
     }
 
@@ -131,6 +155,7 @@ impl Value {
             Value::F64(v) => v as i32,
             Value::V128(_) => 0,
             Value::NullRef => -1,
+            Value::GcRef(idx) => idx as i32,
         }
     }
 
@@ -142,6 +167,7 @@ impl Value {
             Value::F64(v) => v as i64,
             Value::V128(_) => 0,
             Value::NullRef => -1,
+            Value::GcRef(idx) => idx as i64,
         }
     }
 
@@ -153,6 +179,7 @@ impl Value {
             Value::F64(v) => v as f32,
             Value::V128(_) => 0.0,
             Value::NullRef => 0.0,
+            Value::GcRef(_) => 0.0,
         }
     }
 
@@ -164,6 +191,7 @@ impl Value {
             Value::F64(v) => v,
             Value::V128(_) => 0.0,
             Value::NullRef => 0.0,
+            Value::GcRef(_) => 0.0,
         }
     }
 
@@ -695,7 +723,12 @@ pub enum WasmError {
     NullFunctionReference,
     NullReference,
     NullI31Reference,
+    NullStructReference,
+    NullArrayReference,
+    ArrayOutOfBounds,
     UninitializedLocal,
     UnalignedAtomic,
     UncaughtException,
+    CastFailure,
+    MultipleTables,
 }

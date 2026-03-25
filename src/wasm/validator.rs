@@ -39,6 +39,13 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
         return Err(WasmError::InvalidSection);
     }
 
+    // Multiple tables: the reference-types proposal allows them.
+    // Only the threads proposal (which is pre-reference-types) needs to reject them.
+    // We gate this on a module flag `reject_multi_table` set by the runner for threads-only tests.
+    if total_tables > 1 && module.reject_multi_table {
+        return Err(WasmError::MultipleTables);
+    }
+
     // Validate export indices and check for duplicate export names
     {
         let mut export_names = BTreeSet::new();
@@ -712,6 +719,7 @@ impl<'a> Validator<'a> {
                 -0x05 => ValType::V128,  // 0x7B
                 -0x10 => ValType::FuncRef,   // 0x70 = funcref
                 -0x11 => ValType::ExternRef, // 0x6F = externref
+                -0x17 => ValType::ExnRef,    // 0x69 = exnref
                 -0x1D => {
                     // 0x63 = (ref null ht) — read the heap type
                     let heap_type = self.read_i32()?;
@@ -915,13 +923,8 @@ impl<'a> Validator<'a> {
                     self.set_unreachable();
                 }
                 // ── throw_ref ──
-                0x09 => {
-                    let _ = self.pop_opd()?; // exnref
-                    self.set_unreachable();
-                }
-                // ── rethrow (legacy) ──
                 0x0A => {
-                    let _depth = self.read_u32()?;
+                    let _ = self.pop_opd()?; // exnref
                     self.set_unreachable();
                 }
                 // ── br ──

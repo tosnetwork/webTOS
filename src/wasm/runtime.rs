@@ -6,7 +6,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use crate::wasm::decoder::{WasmModule, ImportKind};
+use crate::wasm::decoder::{WasmModule, ImportKind, GcTypeDef, StorageType};
 use crate::wasm::types::*;
 
 // ─── Call frame ─────────────────────────────────────────────────────────────
@@ -45,6 +45,26 @@ impl CallFrame {
 
 // ─── Block frame (for control flow) ─────────────────────────────────────────
 
+/// Maximum number of catch clauses per try_table block.
+const MAX_CATCH_CLAUSES: usize = 8;
+
+/// A single catch clause within a try_table block.
+#[derive(Clone, Copy)]
+struct CatchClause {
+    /// 0=catch(tag,label), 1=catch_ref(tag,label), 2=catch_all(label), 3=catch_all_ref(label)
+    kind: u8,
+    /// Tag index (only valid for kind 0 and 1).
+    tag_idx: u32,
+    /// Branch label depth (relative to the try_table's position in the block stack).
+    label: u32,
+}
+
+impl CatchClause {
+    const fn zero() -> Self {
+        CatchClause { kind: 0, tag_idx: 0, label: 0 }
+    }
+}
+
 /// Tracks Block/Loop/If control flow for branch targets.
 #[derive(Clone, Copy)]
 struct BlockFrame {
@@ -64,6 +84,12 @@ struct BlockFrame {
     end_result_count: u8,
     /// True if this is a Loop (branch goes to start), false for Block/If (branch goes to end).
     is_loop: bool,
+    /// True if this is a try_table block with catch clauses.
+    is_try_table: bool,
+    /// Number of catch clauses (0 for non-try_table blocks).
+    catch_count: u8,
+    /// Catch clauses for try_table blocks.
+    catches: [CatchClause; MAX_CATCH_CLAUSES],
 }
 
 impl BlockFrame {
@@ -75,6 +101,9 @@ impl BlockFrame {
             result_count: 0,
             end_result_count: 0,
             is_loop: false,
+            is_try_table: false,
+            catch_count: 0,
+            catches: [CatchClause::zero(); MAX_CATCH_CLAUSES],
         }
     }
 }
@@ -94,12 +123,32 @@ pub enum ExecResult {
     Trap(WasmError),
     /// A host function call is needed: (import_idx, args, arg_count).
     HostCall(u32, [Value; MAX_PARAMS], u8),
+    /// An exception was thrown: (tag_idx, exception values).
+    Exception(u32, Vec<Value>),
 }
 
 // ─── Locals storage ─────────────────────────────────────────────────────────
 
 /// Maximum total locals across all active call frames.
 const MAX_TOTAL_LOCALS: usize = 65_536;
+
+// ─── GC heap objects ─────────────────────────────────────────────────────────
+
+/// A GC heap-allocated object (struct or array).
+#[derive(Debug, Clone)]
+pub enum GcObject {
+    Struct { type_idx: u32, fields: Vec<Value> },
+    Array { type_idx: u32, elements: Vec<Value> },
+}
+
+impl GcObject {
+    pub fn type_idx(&self) -> u32 {
+        match self {
+            GcObject::Struct { type_idx, .. } => *type_idx,
+            GcObject::Array { type_idx, .. } => *type_idx,
+        }
+    }
+}
 
 // ─── WASM instance ─────────────────────────────────────────────────────────
 
@@ -129,6 +178,8 @@ pub struct WasmInstance {
     pub finished: bool,
     /// Per-instance runtime class controlling which features are allowed.
     pub runtime_class: RuntimeClass,
+    /// GC heap: heap-allocated structs and arrays.
+    pub gc_heap: Vec<GcObject>,
 }
 
 impl WasmInstance {
@@ -260,6 +311,7 @@ impl WasmInstance {
             block_depth: 0,
             finished: false,
             runtime_class,
+            gc_heap: Vec::new(),
         };
 
         // Apply active data segments to memory (skip passive segments)
@@ -306,6 +358,334 @@ impl WasmInstance {
     /// Get a mutable reference to a table by index (defaults to table 0).
     fn table_mut(&mut self, tbl_idx: usize) -> &mut Vec<Option<u32>> {
         &mut self.tables[tbl_idx]
+    }
+
+    // ─── Tag helpers (exception handling) ──────────────────────────────
+
+    /// Get the function type index for a tag (considering imports).
+    /// Tag index space: imported tags first, then local tags.
+    fn tag_type_idx(&self, tag_idx: u32) -> Option<u32> {
+        let mut import_tag_count = 0u32;
+        for imp in &self.module.imports {
+            if let ImportKind::Tag(type_idx) = imp.kind {
+                if import_tag_count == tag_idx {
+                    return Some(type_idx);
+                }
+                import_tag_count += 1;
+            }
+        }
+        let local_tag_idx = tag_idx.checked_sub(import_tag_count)?;
+        self.module.tag_types.get(local_tag_idx as usize).copied()
+    }
+
+    /// Get the parameter count for a tag's type signature.
+    fn tag_param_count(&self, tag_idx: u32) -> usize {
+        if let Some(type_idx) = self.tag_type_idx(tag_idx) {
+            if let Some(ft) = self.module.func_types.get(type_idx as usize) {
+                return ft.param_count as usize;
+            }
+        }
+        0
+    }
+
+    /// Check if two tag indices refer to the same tag.
+    /// Tags are the same if they have the same index, or if they are both imports
+    /// from the same (module, name) pair.
+    fn tags_match(&self, tag_a: u32, tag_b: u32) -> bool {
+        if tag_a == tag_b {
+            return true;
+        }
+        // Check if both are imports from the same (module, name)
+        let import_a = self.tag_import_identity(tag_a);
+        let import_b = self.tag_import_identity(tag_b);
+        if let (Some((ma, fa)), Some((mb, fb))) = (import_a, import_b) {
+            return ma == mb && fa == fb;
+        }
+        false
+    }
+
+    /// Get the (module_name, field_name) for an imported tag, or None for local tags.
+    fn tag_import_identity(&self, tag_idx: u32) -> Option<(&[u8], &[u8])> {
+        let mut import_tag_count = 0u32;
+        for imp in &self.module.imports {
+            if let ImportKind::Tag(_) = imp.kind {
+                if import_tag_count == tag_idx {
+                    let mod_name = self.module.get_name(imp.module_name_offset, imp.module_name_len);
+                    let field_name = self.module.get_name(imp.field_name_offset, imp.field_name_len);
+                    return Some((mod_name, field_name));
+                }
+                import_tag_count += 1;
+            }
+        }
+        None
+    }
+
+    // ─── GC helpers ──────────────────────────────────────────────────────
+
+    /// Get the number of fields in a struct type.
+    fn gc_struct_field_count(&self, type_idx: u32) -> usize {
+        if let Some(GcTypeDef::Struct { field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+            field_types.len()
+        } else {
+            0
+        }
+    }
+
+    /// Get default value for a struct field.
+    fn gc_struct_field_default(&self, type_idx: u32, field_idx: usize) -> Value {
+        if let Some(GcTypeDef::Struct { field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+            if let Some(st) = field_types.get(field_idx) {
+                return Value::default_for(st.unpack());
+            }
+        }
+        Value::I32(0)
+    }
+
+    /// Get default value for an array element.
+    fn gc_array_elem_default(&self, type_idx: u32) -> Value {
+        if let Some(GcTypeDef::Array { elem_type, .. }) = self.module.gc_types.get(type_idx as usize) {
+            return Value::default_for(elem_type.unpack());
+        }
+        Value::I32(0)
+    }
+
+    /// Apply sign/zero extension for struct field packed types.
+    fn gc_apply_field_extend(&self, type_idx: u32, field_idx: usize, val: Value, sub_opcode: u32) -> Value {
+        if let Some(GcTypeDef::Struct { field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+            if let Some(st) = field_types.get(field_idx) {
+                let v = val.as_i32();
+                return match st {
+                    StorageType::I8 => {
+                        if sub_opcode == 3 { Value::I32((v as i8) as i32) }
+                        else { Value::I32(v & 0xFF) }
+                    }
+                    StorageType::I16 => {
+                        if sub_opcode == 3 { Value::I32((v as i16) as i32) }
+                        else { Value::I32(v & 0xFFFF) }
+                    }
+                    _ => val,
+                };
+            }
+        }
+        val
+    }
+
+    /// Apply sign/zero extension for array element packed types.
+    fn gc_apply_array_extend(&self, type_idx: u32, val: Value, sub_opcode: u32) -> Value {
+        if let Some(GcTypeDef::Array { elem_type, .. }) = self.module.gc_types.get(type_idx as usize) {
+            let v = val.as_i32();
+            return match elem_type {
+                StorageType::I8 => {
+                    if sub_opcode == 12 { Value::I32((v as i8) as i32) }
+                    else { Value::I32(v & 0xFF) }
+                }
+                StorageType::I16 => {
+                    if sub_opcode == 12 { Value::I32((v as i16) as i32) }
+                    else { Value::I32(v & 0xFFFF) }
+                }
+                _ => val,
+            };
+        }
+        val
+    }
+
+    /// Wrap a value for storing into a packed struct field.
+    fn gc_wrap_field_value(&self, type_idx: u32, field_idx: usize, val: Value) -> Value {
+        if let Some(GcTypeDef::Struct { field_types, .. }) = self.module.gc_types.get(type_idx as usize) {
+            if let Some(st) = field_types.get(field_idx) {
+                return match st {
+                    StorageType::I8 => Value::I32(val.as_i32() & 0xFF),
+                    StorageType::I16 => Value::I32(val.as_i32() & 0xFFFF),
+                    _ => val,
+                };
+            }
+        }
+        val
+    }
+
+    /// Wrap a value for storing into a packed array element.
+    fn gc_wrap_array_value(&self, type_idx: u32, val: Value) -> Value {
+        if let Some(GcTypeDef::Array { elem_type, .. }) = self.module.gc_types.get(type_idx as usize) {
+            return match elem_type {
+                StorageType::I8 => Value::I32(val.as_i32() & 0xFF),
+                StorageType::I16 => Value::I32(val.as_i32() & 0xFFFF),
+                _ => val,
+            };
+        }
+        val
+    }
+
+    /// Create array elements from a data segment.
+    fn gc_array_from_data(&self, type_idx: u32, data_idx: usize, offset: u32, length: u32) -> Result<Vec<Value>, WasmError> {
+        if data_idx >= self.module.data_segments.len() {
+            return Err(WasmError::OutOfBounds);
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if data_idx < self.dropped_data.len() && self.dropped_data[data_idx] {
+            return Err(WasmError::OutOfBounds);
+        }
+        let seg = &self.module.data_segments[data_idx];
+        let data = &self.module.code[seg.data_offset..seg.data_offset + seg.data_len];
+
+        let elem_size = if let Some(GcTypeDef::Array { elem_type, .. }) = self.module.gc_types.get(type_idx as usize) {
+            match elem_type {
+                StorageType::I8 => 1usize,
+                StorageType::I16 => 2,
+                StorageType::Val(ValType::I32) | StorageType::Val(ValType::F32) => 4,
+                StorageType::Val(ValType::I64) | StorageType::Val(ValType::F64) => 8,
+                _ => 4,
+            }
+        } else { 4 };
+
+        let total_bytes = length as usize * elem_size;
+        let start = offset as usize;
+        if start + total_bytes > data.len() {
+            return Err(WasmError::OutOfBounds);
+        }
+
+        let mut elements = Vec::with_capacity(length as usize);
+        for i in 0..length as usize {
+            let pos = start + i * elem_size;
+            let val = match elem_size {
+                1 => Value::I32(data[pos] as i32),
+                2 => Value::I32(u16::from_le_bytes([data[pos], data[pos+1]]) as i32),
+                4 => {
+                    let bytes = [data[pos], data[pos+1], data[pos+2], data[pos+3]];
+                    if let Some(GcTypeDef::Array { elem_type: StorageType::Val(ValType::F32), .. }) = self.module.gc_types.get(type_idx as usize) {
+                        Value::F32(f32::from_le_bytes(bytes))
+                    } else {
+                        Value::I32(i32::from_le_bytes(bytes))
+                    }
+                }
+                8 => {
+                    let mut b8 = [0u8; 8];
+                    b8.copy_from_slice(&data[pos..pos+8]);
+                    if let Some(GcTypeDef::Array { elem_type: StorageType::Val(ValType::F64), .. }) = self.module.gc_types.get(type_idx as usize) {
+                        Value::F64(f64::from_le_bytes(b8))
+                    } else {
+                        Value::I64(i64::from_le_bytes(b8))
+                    }
+                }
+                _ => Value::I32(0),
+            };
+            elements.push(val);
+        }
+        Ok(elements)
+    }
+
+    /// Create array elements from an element segment.
+    fn gc_array_from_elem(&self, elem_idx: usize, offset: u32, length: u32) -> Result<Vec<Value>, WasmError> {
+        if elem_idx >= self.module.element_segments.len() {
+            return Err(WasmError::OutOfBounds);
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if elem_idx < self.dropped_elems.len() && self.dropped_elems[elem_idx] {
+            return Err(WasmError::OutOfBounds);
+        }
+        let seg = &self.module.element_segments[elem_idx];
+        let end = offset as usize + length as usize;
+        if end > seg.func_indices.len() {
+            return Err(WasmError::OutOfBounds);
+        }
+        let mut elements = Vec::with_capacity(length as usize);
+        for i in offset as usize..end {
+            let func_idx = seg.func_indices[i];
+            if func_idx == u32::MAX {
+                elements.push(Value::NullRef);
+            } else {
+                elements.push(Value::I32(func_idx as i32));
+            }
+        }
+        Ok(elements)
+    }
+
+    /// Test if a reference value matches a heap type.
+    // Heap type constants (signed LEB128 byte values):
+    // -16 (0x70) = func, -17 (0x6F) = extern, -18 (0x6E) = any,
+    // -19 (0x6D) = eq, -20 (0x6C) = i31, -21 (0x6B) = struct,
+    // -22 (0x6A) = array, -13 (0x73) = nofunc, -14 (0x72) = noextern,
+    // -15 (0x71) = none, -23 (0x69) = exn, -12 (0x74) = noexn
+    const HT_FUNC: i32 = -16;
+    const HT_EXTERN: i32 = -17;
+    const HT_ANY: i32 = -18;
+    const HT_EQ: i32 = -19;
+    const HT_I31: i32 = -20;
+    const HT_STRUCT: i32 = -21;
+    const HT_ARRAY: i32 = -22;
+    const HT_NOFUNC: i32 = -13;
+    const HT_NOEXTERN: i32 = -14;
+    const HT_NONE: i32 = -15;
+
+    fn gc_ref_test(&self, val: Value, ht: i32, nullable: bool) -> bool {
+        match val {
+            Value::NullRef | Value::I32(-1) => nullable,
+            Value::I32(_) => {
+                // I32 values represent i31ref (from ref.i31) or funcref
+                match ht {
+                    Self::HT_ANY => true,      // i31 <: any
+                    Self::HT_EQ => true,       // i31 <: eq
+                    Self::HT_I31 => true,      // i31 <: i31
+                    Self::HT_FUNC => true,     // i32 encoding for funcref
+                    Self::HT_EXTERN => false,
+                    Self::HT_STRUCT => false,
+                    Self::HT_ARRAY => false,
+                    Self::HT_NONE => false,
+                    Self::HT_NOFUNC => false,
+                    Self::HT_NOEXTERN => false,
+                    _ if ht >= 0 => false,     // concrete type — i32 can't match
+                    _ => false,
+                }
+            }
+            Value::GcRef(heap_idx) => {
+                if heap_idx as usize >= self.gc_heap.len() {
+                    return false;
+                }
+                let obj = &self.gc_heap[heap_idx as usize];
+                let obj_type_idx = obj.type_idx();
+                match ht {
+                    Self::HT_ANY => true,      // all GC objects <: any
+                    Self::HT_EQ => true,       // all GC objects <: eq
+                    Self::HT_I31 => false,     // GC objects are not i31
+                    Self::HT_STRUCT => matches!(obj, GcObject::Struct { .. }),
+                    Self::HT_ARRAY => matches!(obj, GcObject::Array { .. }),
+                    Self::HT_FUNC => false,
+                    Self::HT_EXTERN => false,
+                    Self::HT_NONE => false,
+                    Self::HT_NOFUNC => false,
+                    Self::HT_NOEXTERN => false,
+                    _ if ht >= 0 => self.gc_is_subtype(obj_type_idx, ht as u32),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Check if type_a is a subtype of type_b (or equal).
+    fn gc_is_subtype(&self, type_a: u32, type_b: u32) -> bool {
+        if type_a == type_b {
+            return true;
+        }
+        let mut current = type_a;
+        for _ in 0..100 {
+            if let Some(info) = self.module.sub_types.get(current as usize) {
+                if let Some(parent) = info.supertype {
+                    if parent == type_b {
+                        return true;
+                    }
+                    current = parent;
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+        false
     }
 
     // ─── Stack operations ───────────────────────────────────────────────
@@ -830,8 +1210,8 @@ impl WasmInstance {
                     let _ = self.read_leb128_u32()?;
                 }
                 0x08 => { let _ = self.read_leb128_u32()?; } // throw: tag_idx
-                0x09 => {} // throw_ref: no immediates
-                0x0A => { let _ = self.read_leb128_u32()?; } // rethrow (legacy): u32 label
+                0x09 => {} // unused opcode: no immediates
+                0x0A => {} // throw_ref: no immediates
                 0x18 => { // delegate (legacy): label — ends the try block
                     let _ = self.read_leb128_u32()?;
                     depth -= 1;
@@ -1134,6 +1514,7 @@ impl WasmInstance {
             result_count,
             end_result_count: result_count,
             is_loop: false,
+            ..BlockFrame::zero()
         })?;
 
         Ok(())
@@ -1223,6 +1604,16 @@ impl WasmInstance {
         self.run()
     }
 
+    /// Resume execution after a host call that threw an exception.
+    /// The exception will be propagated through the caller's try_table handlers.
+    pub fn resume_with_exception(&mut self, tag_idx: u32, values: Vec<Value>) -> ExecResult {
+        // Inject the exception into the running instance's exception handling
+        match self.handle_exception(tag_idx, &values) {
+            Ok(()) => self.run(), // Exception was caught, continue
+            Err(()) => ExecResult::Exception(tag_idx, values), // Propagate
+        }
+    }
+
     /// Resume execution after a host call, providing the return value (if any).
     pub fn resume(&mut self, return_value: Option<Value>) -> ExecResult {
         if let Some(val) = return_value {
@@ -1242,7 +1633,136 @@ impl WasmInstance {
                         return ExecResult::Ok;
                     }
                 }
+                ExecResult::Exception(tag_idx, values) => {
+                    match self.handle_exception(tag_idx, &values) {
+                        Ok(()) => {} // Exception was caught, execution continues
+                        Err(_) => {
+                            // No catch found in any frame — propagate as uncaught exception
+                            return ExecResult::Exception(tag_idx, values);
+                        }
+                    }
+                }
                 other => return other,
+            }
+        }
+    }
+
+    /// Try to handle an exception by scanning the block stack for matching try_table catch clauses.
+    /// If a match is found, sets up the branch and returns Ok(()).
+    /// If no match, returns Err(()) so the caller can propagate.
+    fn handle_exception(&mut self, tag_idx: u32, values: &[Value]) -> Result<(), ()> {
+        // Scan the block stack from top to bottom within the current function,
+        // then unwind through call frames if needed.
+        loop {
+            let base = if self.call_depth > 0 {
+                self.call_stack[self.call_depth - 1].block_stack_base
+            } else {
+                0
+            };
+
+            // Scan block stack from top to bottom for a try_table with matching catch
+            let mut found = None;
+            let mut try_block_idx = self.block_depth;
+            while try_block_idx > base {
+                try_block_idx -= 1;
+                let bf = self.block_stack[try_block_idx];
+                if !bf.is_try_table {
+                    continue;
+                }
+                // Check catch clauses
+                for ci in 0..bf.catch_count as usize {
+                    let cc = bf.catches[ci];
+                    match cc.kind {
+                        0 => {
+                            // catch(tag_idx, label): match specific tag
+                            if self.tags_match(cc.tag_idx, tag_idx) {
+                                found = Some((try_block_idx, ci, false));
+                                break;
+                            }
+                        }
+                        1 => {
+                            // catch_ref(tag_idx, label): match specific tag, push exnref
+                            if self.tags_match(cc.tag_idx, tag_idx) {
+                                found = Some((try_block_idx, ci, true));
+                                break;
+                            }
+                        }
+                        2 => {
+                            // catch_all(label): match any
+                            found = Some((try_block_idx, ci, false));
+                            break;
+                        }
+                        3 => {
+                            // catch_all_ref(label): match any, push exnref
+                            found = Some((try_block_idx, ci, true));
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+
+            if let Some((try_idx, clause_idx, push_exnref)) = found {
+                let cc = self.block_stack[try_idx].catches[clause_idx];
+                let label = cc.label;
+
+                // Reset stack to the try_table's stack base
+                let try_frame = self.block_stack[try_idx];
+                self.stack_ptr = try_frame.stack_base;
+                // The catch clause label is relative to the scope OUTSIDE the try_table
+                // (resolved before the try_table is pushed in the validator).
+                // So we pop the try_table itself and all blocks above it, then branch.
+                self.block_depth = try_idx;
+
+                // Push the exception values onto the stack for catch/catch_ref
+                match cc.kind {
+                    0 | 1 => {
+                        // catch / catch_ref: push tag values
+                        for v in values {
+                            let _ = self.push(*v);
+                        }
+                    }
+                    2 => {
+                        // catch_all: no values pushed
+                    }
+                    3 => {
+                        // catch_all_ref: no tag values pushed
+                    }
+                    _ => {}
+                }
+
+                // For catch_ref / catch_all_ref, push exnref (we encode as NullRef placeholder)
+                if push_exnref {
+                    // Store tag_idx and values as an exnref.
+                    // We encode the tag index in an I32 value as a simple representation.
+                    let _ = self.push(Value::I32(tag_idx as i32));
+                }
+
+                // Now branch using the label from the catch clause
+                if let Err(_e) = self.branch(label) {
+                    // Should not happen if module is valid
+                    return Err(());
+                }
+                return Ok(());
+            }
+
+            // No matching catch in this function's block stack.
+            // Unwind the call frame and propagate to the caller.
+            if self.call_depth == 0 {
+                return Err(());
+            }
+
+            let frame = self.call_stack[self.call_depth - 1];
+            self.call_depth -= 1;
+            self.stack_ptr = frame.stack_base;
+            self.pc = frame.return_pc;
+            self.block_depth = frame.saved_block_depth;
+
+            if self.call_depth == 0 {
+                return Err(());
             }
         }
     }
@@ -1310,6 +1830,7 @@ impl WasmInstance {
                     result_count,
                     end_result_count: result_count,
                     is_loop: false,
+                    ..BlockFrame::zero()
                 }));
             }
             0x03 => {
@@ -1330,6 +1851,7 @@ impl WasmInstance {
                     result_count: param_count,
                     end_result_count: result_count,
                     is_loop: true,
+                    ..BlockFrame::zero()
                 }));
             }
             0x04 => {
@@ -1363,6 +1885,7 @@ impl WasmInstance {
                         result_count,
                         end_result_count: result_count,
                         is_loop: false,
+                        ..BlockFrame::zero()
                     }));
                 } else if has_else {
                     // Condition false, has else: execute the else branch
@@ -1374,6 +1897,7 @@ impl WasmInstance {
                         result_count,
                         end_result_count: result_count,
                         is_loop: false,
+                        ..BlockFrame::zero()
                     }));
                 } else {
                     // Condition false, no else: skip past end entirely
@@ -1445,39 +1969,60 @@ impl WasmInstance {
                 try_exec!(self.branch(depth));
             }
             0x08 => {
-                // throw: read tag_idx, trap with uncaught exception
-                let _tag_idx = try_exec!(self.read_leb128_u32());
-                return ExecResult::Trap(WasmError::UncaughtException);
+                // throw: read tag_idx, pop params, raise exception
+                let tag_idx = try_exec!(self.read_leb128_u32());
+                let param_count = self.tag_param_count(tag_idx);
+                let mut values = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    values.push(try_exec!(self.pop()));
+                }
+                values.reverse(); // params were popped in reverse order
+                return ExecResult::Exception(tag_idx, values);
             }
-            0x09 => {
-                // throw_ref: pop exnref, trap
-                let _ = try_exec!(self.pop());
-                return ExecResult::Trap(WasmError::UncaughtException);
+            0x0A => {
+                // throw_ref: pop exnref, re-throw
+                let exnref = try_exec!(self.pop());
+                match exnref {
+                    Value::NullRef => return ExecResult::Trap(WasmError::NullReference),
+                    Value::I32(tag_idx) => {
+                        // Our exnref encodes only the tag_idx; values are lost on re-throw
+                        // For a complete implementation we'd store full exception objects
+                        return ExecResult::Exception(tag_idx as u32, Vec::new());
+                    }
+                    _ => return ExecResult::Trap(WasmError::NullReference),
+                }
             }
             0x0F => {
                 // return
                 return self.do_return();
             }
             0x1F => {
-                // try_table: treat as a block for now (exceptions will propagate as traps)
+                // try_table: block with catch clauses
                 let block_type = try_exec!(self.read_block_type());
                 let (param_count, result_count) = self.decode_block_type(block_type);
-                // Read and skip catch clauses
+                // Read catch clauses
                 let catch_count = try_exec!(self.read_leb128_u32()) as usize;
-                for _ in 0..catch_count {
+                let effective_count = catch_count.min(MAX_CATCH_CLAUSES);
+                let mut catches = [CatchClause::zero(); MAX_CATCH_CLAUSES];
+                for i in 0..catch_count {
                     let clause_kind = try_exec!(self.read_byte());
-                    match clause_kind {
+                    let (tag_idx, label) = match clause_kind {
                         0 | 1 => { // catch, catch_ref: tag_idx + label
-                            let _ = try_exec!(self.read_leb128_u32()); // tag_idx
-                            let _ = try_exec!(self.read_leb128_u32()); // label
+                            let t = try_exec!(self.read_leb128_u32());
+                            let l = try_exec!(self.read_leb128_u32());
+                            (t, l)
                         }
-                        2 | 3 => { // catch_all, catch_all_ref: label
-                            let _ = try_exec!(self.read_leb128_u32()); // label
+                        2 | 3 => { // catch_all, catch_all_ref: label only
+                            let l = try_exec!(self.read_leb128_u32());
+                            (0, l)
                         }
-                        _ => {}
+                        _ => (0, 0),
+                    };
+                    if i < effective_count {
+                        catches[i] = CatchClause { kind: clause_kind, tag_idx, label };
                     }
                 }
-                // Set up block frame like a normal block
+                // Set up block frame with catch clause info
                 let start_pc = self.pc;
                 let end_pc = try_exec!(self.skip_to_end());
                 self.pc = start_pc;
@@ -1489,6 +2034,9 @@ impl WasmInstance {
                     result_count,
                     end_result_count: result_count,
                     is_loop: false,
+                    is_try_table: true,
+                    catch_count: effective_count as u8,
+                    catches,
                 }));
             }
             0x10 => {
@@ -1872,13 +2420,17 @@ impl WasmInstance {
                 if idx >= self.tables[table_idx].len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                let val = self.tables[table_idx][idx].map_or(Value::I32(-1), |f| Value::I32(f as i32));
+                let val = match self.tables[table_idx][idx] {
+                    None => Value::NullRef,
+                    Some(f) if f & 0x8000_0000 != 0 => Value::GcRef(f & 0x7FFF_FFFF),
+                    Some(f) => Value::I32(f as i32),
+                };
                 try_exec!(self.push(val));
             }
             0x26 => {
                 // table.set
                 let table_idx = try_exec!(self.read_leb128_u32()) as usize;
-                let val = try_exec!(self.pop_i32());
+                let raw_val = try_exec!(self.pop());
                 let is_t64 = table_idx < self.module.tables.len() && self.module.tables[table_idx].is_table64;
                 let idx = if is_t64 { try_exec!(self.pop_i64()) as usize } else { try_exec!(self.pop_i32()) as usize };
                 if table_idx >= self.tables.len() {
@@ -1887,7 +2439,13 @@ impl WasmInstance {
                 if idx >= self.tables[table_idx].len() {
                     return ExecResult::Trap(WasmError::TableIndexOutOfBounds);
                 }
-                self.tables[table_idx][idx] = if val < 0 { None } else { Some(val as u32) };
+                let entry = match raw_val {
+                    Value::NullRef => None,
+                    Value::I32(v) => if v < 0 { None } else { Some(v as u32) },
+                    Value::GcRef(heap_idx) => Some(heap_idx | 0x8000_0000), // encode gc refs with high bit
+                    _ => None,
+                };
+                self.tables[table_idx][idx] = entry;
             }
 
             // ── Memory ──────────────────────────────────────────────
@@ -3409,83 +3967,370 @@ impl WasmInstance {
                             }
                         }
                     }
-                    0 => { // struct.new: typeidx — pop fields, push dummy ref
+                    0 => { // struct.new: typeidx — pop fields (in reverse), push ref
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let field_count = self.gc_struct_field_count(type_idx);
+                        let mut fields = vec![Value::I32(0); field_count];
+                        for i in (0..field_count).rev() {
+                            fields[i] = try_exec!(self.pop());
+                        }
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Struct { type_idx, fields });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    1 => { // struct.new_default: typeidx — push ref with default fields
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let field_count = self.gc_struct_field_count(type_idx);
+                        let mut fields = Vec::with_capacity(field_count);
+                        for i in 0..field_count {
+                            fields.push(self.gc_struct_field_default(type_idx, i));
+                        }
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Struct { type_idx, fields });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    2 | 3 | 4 => { // struct.get / struct.get_s / struct.get_u
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let field_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullStructReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullStructReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullStructReference);
+                        }
+                        let val = match &self.gc_heap[heap_idx] {
+                            GcObject::Struct { fields, .. } => {
+                                if field_idx >= fields.len() {
+                                    return ExecResult::Trap(WasmError::OutOfBounds);
+                                }
+                                fields[field_idx]
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        };
+                        // Apply sign/zero extension for packed types
+                        let result = self.gc_apply_field_extend(type_idx, field_idx, val, sub);
+                        try_exec!(self.push(result));
+                    }
+                    5 => { // struct.set: typeidx fieldidx — pop value + ref, set field
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let field_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let val = try_exec!(self.pop());
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullStructReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullStructReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullStructReference);
+                        }
+                        // Wrap value for packed field types
+                        let wrapped = self.gc_wrap_field_value(type_idx, field_idx, val);
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Struct { fields, .. } => {
+                                if field_idx >= fields.len() {
+                                    return ExecResult::Trap(WasmError::OutOfBounds);
+                                }
+                                fields[field_idx] = wrapped;
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                    }
+                    6 => { // array.new: typeidx — pop init_value + length, allocate, push ref
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let init_val = try_exec!(self.pop());
+                        let elements = vec![init_val; length as usize];
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    7 => { // array.new_default: typeidx — pop length, allocate with defaults
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let default_val = self.gc_array_elem_default(type_idx);
+                        let elements = vec![default_val; length as usize];
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    8 => { // array.new_fixed: typeidx + count — pop count values, allocate
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let count = try_exec!(self.read_leb128_u32()) as usize;
+                        let mut elements = vec![Value::I32(0); count];
+                        for i in (0..count).rev() {
+                            elements[i] = try_exec!(self.pop());
+                        }
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    9 => { // array.new_data: typeidx + data_idx — pop offset + length
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let data_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let offset = try_exec!(self.pop_i32()) as u32;
+                        let elements = try_exec!(self.gc_array_from_data(type_idx, data_idx, offset, length));
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    10 => { // array.new_elem: typeidx + elem_idx — pop offset + length
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let elem_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let offset = try_exec!(self.pop_i32()) as u32;
+                        let elements = try_exec!(self.gc_array_from_elem(elem_idx, offset, length));
+                        let heap_idx = self.gc_heap.len() as u32;
+                        self.gc_heap.push(GcObject::Array { type_idx, elements });
+                        try_exec!(self.push(Value::GcRef(heap_idx)));
+                    }
+                    11 | 12 | 13 => { // array.get / array.get_s / array.get_u
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let index = try_exec!(self.pop_i32()) as u32;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullArrayReference);
+                        }
+                        let val = match &self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
+                                if index as usize >= elements.len() {
+                                    return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                }
+                                elements[index as usize]
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        };
+                        // Apply sign/zero extension for packed array element types
+                        let result = self.gc_apply_array_extend(type_idx, val, sub);
+                        try_exec!(self.push(result));
+                    }
+                    14 => { // array.set: typeidx — pop value + index + ref, set element
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let val = try_exec!(self.pop());
+                        let index = try_exec!(self.pop_i32()) as u32;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullArrayReference);
+                        }
+                        let wrapped = self.gc_wrap_array_value(type_idx, val);
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
+                                if index as usize >= elements.len() {
+                                    return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                }
+                                elements[index as usize] = wrapped;
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                    }
+                    15 => { // array.len: pop ref, push length
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullArrayReference);
+                        }
+                        let len = match &self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => elements.len() as i32,
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        };
+                        try_exec!(self.push(Value::I32(len)));
+                    }
+                    16 => { // array.fill: typeidx — pop length + value + offset + ref
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let val = try_exec!(self.pop());
+                        let offset = try_exec!(self.pop_i32()) as u32;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        if heap_idx >= self.gc_heap.len() {
+                            return ExecResult::Trap(WasmError::NullArrayReference);
+                        }
+                        let wrapped = self.gc_wrap_array_value(type_idx, val);
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
+                                let end = offset as usize + length as usize;
+                                if end > elements.len() {
+                                    return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                }
+                                for i in offset as usize..end {
+                                    elements[i] = wrapped;
+                                }
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                    }
+                    17 => { // array.copy: dst_type + src_type
+                        let _dst_type = try_exec!(self.read_leb128_u32());
+                        let _src_type = try_exec!(self.read_leb128_u32());
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let src_offset = try_exec!(self.pop_i32()) as u32;
+                        let src_ref = try_exec!(self.pop());
+                        let dst_offset = try_exec!(self.pop_i32()) as u32;
+                        let dst_ref = try_exec!(self.pop());
+                        let src_idx = match src_ref {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        let dst_idx = match dst_ref {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        if length == 0 { /* nop */ } else {
+                            // Copy elements, handling overlap
+                            let src_end = src_offset as usize + length as usize;
+                            let dst_end = dst_offset as usize + length as usize;
+                            // First, extract source elements
+                            let src_elems = {
+                                match &self.gc_heap[src_idx] {
+                                    GcObject::Array { elements, .. } => {
+                                        if src_end > elements.len() {
+                                            return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                        }
+                                        elements[src_offset as usize..src_end].to_vec()
+                                    }
+                                    _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                                }
+                            };
+                            // Then write to destination
+                            match &mut self.gc_heap[dst_idx] {
+                                GcObject::Array { elements, .. } => {
+                                    if dst_end > elements.len() {
+                                        return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                    }
+                                    for i in 0..length as usize {
+                                        elements[dst_offset as usize + i] = src_elems[i];
+                                    }
+                                }
+                                _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                            }
+                        }
+                    }
+                    18 => { // array.init_data: typeidx + data_idx
+                        let type_idx = try_exec!(self.read_leb128_u32());
+                        let data_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let src_offset = try_exec!(self.pop_i32()) as u32;
+                        let dst_offset = try_exec!(self.pop_i32()) as u32;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        let src_elems = try_exec!(self.gc_array_from_data(type_idx, data_idx, src_offset, length));
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
+                                let dst_end = dst_offset as usize + length as usize;
+                                if dst_end > elements.len() {
+                                    return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                }
+                                for i in 0..length as usize {
+                                    elements[dst_offset as usize + i] = src_elems[i];
+                                }
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
+                    }
+                    19 => { // array.init_elem: typeidx + elem_idx
                         let _type_idx = try_exec!(self.read_leb128_u32());
-                        // We don't know the field count from just the type_idx without
-                        // looking up the type definition. For now, trap.
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
+                        let elem_idx = try_exec!(self.read_leb128_u32()) as usize;
+                        let length = try_exec!(self.pop_i32()) as u32;
+                        let src_offset = try_exec!(self.pop_i32()) as u32;
+                        let dst_offset = try_exec!(self.pop_i32()) as u32;
+                        let ref_val = try_exec!(self.pop());
+                        let heap_idx = match ref_val {
+                            Value::GcRef(idx) => idx as usize,
+                            Value::NullRef => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                            _ => { return ExecResult::Trap(WasmError::NullArrayReference); }
+                        };
+                        let src_elems = try_exec!(self.gc_array_from_elem(elem_idx, src_offset, length));
+                        match &mut self.gc_heap[heap_idx] {
+                            GcObject::Array { elements, .. } => {
+                                let dst_end = dst_offset as usize + length as usize;
+                                if dst_end > elements.len() {
+                                    return ExecResult::Trap(WasmError::ArrayOutOfBounds);
+                                }
+                                for i in 0..length as usize {
+                                    elements[dst_offset as usize + i] = src_elems[i];
+                                }
+                            }
+                            _ => { return ExecResult::Trap(WasmError::TypeMismatch); }
+                        }
                     }
-                    1 => { // struct.new_default: typeidx — push dummy ref
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
+                    20 | 21 => { // ref.test / ref.test null: heaptype
+                        let ht = try_exec!(self.read_leb128_i32());
+                        let nullable = sub == 21;
+                        let ref_val = try_exec!(self.pop());
+                        let result = self.gc_ref_test(ref_val, ht, nullable);
+                        try_exec!(self.push(Value::I32(if result { 1 } else { 0 })));
                     }
-                    2 | 3 | 4 => { // struct.get/get_s/get_u: typeidx fieldidx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _field_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
+                    22 | 23 => { // ref.cast / ref.cast null: heaptype
+                        let ht = try_exec!(self.read_leb128_i32());
+                        let nullable = sub == 23;
+                        let ref_val = try_exec!(self.pop());
+                        let ok = self.gc_ref_test(ref_val, ht, nullable);
+                        if !ok {
+                            return ExecResult::Trap(WasmError::CastFailure);
+                        }
+                        try_exec!(self.push(ref_val));
                     }
-                    5 => { // struct.set: typeidx fieldidx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _field_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    6 | 7 => { // array.new, array.new_default: typeidx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    8 => { // array.new_fixed: typeidx + count
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _count = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    9 | 10 => { // array.new_data/elem: typeidx + idx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    11 | 12 | 13 => { // array.get/get_s/get_u: typeidx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    14 => { // array.set: typeidx
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    15 => { // array.len: pop ref, push i32(0)
-                        let _ref = try_exec!(self.pop());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    16 => { // array.fill
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    17 => { // array.copy
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _type_idx2 = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    18 | 19 => { // array.init_data/elem
-                        let _type_idx = try_exec!(self.read_leb128_u32());
-                        let _idx = try_exec!(self.read_leb128_u32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    20 | 21 => { // ref.test, ref.test nullable: heaptype
-                        let _ht = try_exec!(self.read_leb128_i32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    22 | 23 => { // ref.cast, ref.cast nullable: heaptype
-                        let _ht = try_exec!(self.read_leb128_i32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
-                    }
-                    24 | 25 => { // br_on_cast, br_on_cast_fail
+                    24 => { // br_on_cast: flags + label + ht1 + ht2
                         let _flags = try_exec!(self.read_byte());
-                        let _label = try_exec!(self.read_leb128_u32());
+                        let label = try_exec!(self.read_leb128_u32());
                         let _ht1 = try_exec!(self.read_leb128_i32());
-                        let _ht2 = try_exec!(self.read_leb128_i32());
-                        return ExecResult::Trap(WasmError::UnsupportedProposal);
+                        let ht2 = try_exec!(self.read_leb128_i32());
+                        let ref_val = try_exec!(self.pop());
+                        let nullable = (_flags & 2) != 0; // bit 1 = output nullable
+                        if self.gc_ref_test(ref_val, ht2, nullable) {
+                            try_exec!(self.push(ref_val));
+                            try_exec!(self.branch(label));
+                        } else {
+                            try_exec!(self.push(ref_val));
+                        }
                     }
-                    26 | 27 => { // any.convert_extern, extern.convert_any
-                        // These just reinterpret the ref; for now pass through
+                    25 => { // br_on_cast_fail: flags + label + ht1 + ht2
+                        let _flags = try_exec!(self.read_byte());
+                        let label = try_exec!(self.read_leb128_u32());
+                        let _ht1 = try_exec!(self.read_leb128_i32());
+                        let ht2 = try_exec!(self.read_leb128_i32());
+                        let ref_val = try_exec!(self.pop());
+                        let nullable = (_flags & 2) != 0; // bit 1 = output nullable
+                        if !self.gc_ref_test(ref_val, ht2, nullable) {
+                            try_exec!(self.push(ref_val));
+                            try_exec!(self.branch(label));
+                        } else {
+                            try_exec!(self.push(ref_val));
+                        }
+                    }
+                    26 => { // any.convert_extern: pop externref, push anyref
+                        // Pass through — our representation is compatible
+                    }
+                    27 => { // extern.convert_any: pop anyref, push externref
+                        // Pass through — our representation is compatible
                     }
                     _ => {
                         return ExecResult::Trap(WasmError::UnsupportedProposal);

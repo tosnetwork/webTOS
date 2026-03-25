@@ -208,6 +208,49 @@ pub struct InitExprInfo {
     pub func_ref: Option<u32>,
 }
 
+/// Storage type for struct fields and array elements (GC proposal).
+/// Packed types i8/i16 are narrower than full value types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageType {
+    I8,
+    I16,
+    Val(ValType),
+}
+
+impl StorageType {
+    /// Get the full ValType for this storage type (packed -> I32).
+    pub fn unpack(self) -> ValType {
+        match self {
+            StorageType::I8 | StorageType::I16 => ValType::I32,
+            StorageType::Val(vt) => vt,
+        }
+    }
+}
+
+/// GC type definition — parallel to func_types, indexed by the same type index.
+#[derive(Debug, Clone)]
+pub enum GcTypeDef {
+    /// Regular function type (delegates to func_types entry).
+    Func,
+    /// Struct type with field types and mutabilities.
+    Struct {
+        field_types: Vec<StorageType>,
+        field_muts: Vec<bool>,
+    },
+    /// Array type with element type and mutability.
+    Array {
+        elem_type: StorageType,
+        elem_mutable: bool,
+    },
+}
+
+/// Subtype info: for each type index, which type index is its supertype (if any).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubTypeInfo {
+    pub supertype: Option<u32>,
+    pub is_final: bool,
+}
+
 /// A fully decoded WASM module.
 ///
 /// All buffers are heap-allocated via `Vec` to avoid large stack frames.
@@ -237,6 +280,8 @@ pub struct WasmModule {
     pub gc_enabled: bool,
     /// Whether multi-memory proposal is enabled.
     pub multi_memory_enabled: bool,
+    /// Whether multiple tables should be rejected (pre-reference-types, e.g. threads-only).
+    pub reject_multi_table: bool,
 
     /// DataCount section value (if present); None if no DataCount section.
     pub data_count: Option<u32>,
@@ -247,6 +292,11 @@ pub struct WasmModule {
     /// Tag type indices (exception handling proposal).
     /// Each entry is the function type index for that tag.
     pub tag_types: Vec<u32>,
+
+    /// GC type definitions — parallel to func_types, one entry per type index.
+    pub gc_types: Vec<GcTypeDef>,
+    /// Subtype hierarchy — parallel to func_types; stores supertype info.
+    pub sub_types: Vec<SubTypeInfo>,
 
     /// Raw bytecode + data segment bytes storage.
     pub code: Vec<u8>,
@@ -277,9 +327,12 @@ impl WasmModule {
             page_size_log2: None,
             gc_enabled: false,
             multi_memory_enabled: false,
+            reject_multi_table: false,
             data_count: None,
             code_uses_data_count: false,
             tag_types: Vec::new(),
+            gc_types: Vec::new(),
+            sub_types: Vec::new(),
             code: Vec::new(),
             names: Vec::new(),
         }
@@ -696,6 +749,16 @@ fn decode_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7B => Ok(ValType::V128),
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
+        0x6E => Ok(ValType::AnyRef),
+        0x6D => Ok(ValType::EqRef),
+        0x6C => Ok(ValType::I31Ref),
+        0x6B => Ok(ValType::NullableStructRef),
+        0x6A => Ok(ValType::ArrayRef),
+        0x73 => Ok(ValType::FuncRef),
+        0x72 => Ok(ValType::ExternRef),
+        0x71 => Ok(ValType::NoneRef),
+        0x69 => Ok(ValType::ExnRef),
+        0x68 => Ok(ValType::AnyRef),   // contref
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -715,28 +778,56 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
         0x7B => Ok(ValType::V128),
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
+        // GC proposal shorthand encodings (single-byte, implicitly nullable):
+        0x6E => Ok(ValType::AnyRef),              // anyref = (ref null any)
+        0x6D => Ok(ValType::EqRef),               // eqref = (ref null eq)
+        0x6C => Ok(ValType::I31Ref),              // i31ref = (ref null i31)
+        0x6B => Ok(ValType::NullableStructRef),   // structref = (ref null struct)
+        0x6A => Ok(ValType::ArrayRef),            // arrayref = (ref null array)
+        0x73 => Ok(ValType::FuncRef),             // nullfuncref = (ref null nofunc)
+        0x72 => Ok(ValType::ExternRef),           // nullexternref = (ref null noextern)
+        0x71 => Ok(ValType::NoneRef),             // nullref = (ref null none)
+        0x69 => Ok(ValType::ExnRef),              // exnref = (ref null exn)
+        0x68 => Ok(ValType::AnyRef),              // contref = (ref null cont)
         0x63 | 0x64 => {
             let heap_type = decode_leb128_i32(bytes, pos)?;
-            if heap_type == -0x11 {
-                Ok(ValType::ExternRef)
-            } else if heap_type == -0x10 {
-                // (ref null func) = funcref, (ref func) = non-nullable abstract func ref
-                if b == 0x63 { Ok(ValType::FuncRef) } else { Ok(ValType::TypedFuncRef) }
-            } else if b == 0x63 {
-                Ok(ValType::NullableTypedFuncRef) // (ref null $t)
-            } else {
-                Ok(ValType::TypedFuncRef) // (ref $t)
+            let nullable = b == 0x63;
+            match heap_type {
+                // Heap type constants (signed LEB128): -16=func, -17=extern,
+                // -18=any, -19=eq, -20=i31, -21=struct, -22=array,
+                // -13=nofunc, -14=noextern, -15=none, -23=exn, -12=noexn
+                -17 => Ok(ValType::ExternRef),  // extern
+                -16 => { // func
+                    if nullable { Ok(ValType::FuncRef) } else { Ok(ValType::TypedFuncRef) }
+                }
+                -18 => Ok(ValType::AnyRef),     // any
+                -19 => Ok(ValType::EqRef),      // eq
+                -20 => Ok(ValType::I31Ref),     // i31
+                -21 => { // struct
+                    if nullable { Ok(ValType::NullableStructRef) } else { Ok(ValType::StructRef) }
+                }
+                -22 => Ok(ValType::ArrayRef),   // array
+                -15 => Ok(ValType::NoneRef),    // none
+                -14 => Ok(ValType::ExternRef),  // noextern -> treat as externref
+                -13 => Ok(ValType::FuncRef),    // nofunc -> treat as funcref
+                -23 => Ok(ValType::ExnRef),     // exn
+                -12 => Ok(ValType::AnyRef),     // noexn
+                _ if heap_type >= 0 => {
+                    // Concrete type index reference
+                    if nullable { Ok(ValType::NullableTypedFuncRef) } else { Ok(ValType::TypedFuncRef) }
+                }
+                _ => Err(WasmError::TypeMismatch),
             }
         }
         _ => Err(WasmError::TypeMismatch),
     }
 }
 
-/// Returns true if the heap type (signed) indicates a GC-proposal type.
+/// Returns true if the heap type (signed LEB128 value) indicates a GC-proposal type.
 fn is_gc_heap_type(ht: i32) -> bool {
-    // any=-0x12, eq=-0x16, i31=-0x19, struct=-0x17, array=-0x18,
-    // none=-0x13, noextern=-0x14, nofunc=-0x15, exn=-0x1A, noexn=-0x1B
-    matches!(ht, -0x12 | -0x13 | -0x14 | -0x15 | -0x16 | -0x17 | -0x18 | -0x19 | -0x1A | -0x1B)
+    // any=-18, eq=-19, i31=-20, struct=-21, array=-22,
+    // none=-15, noextern=-14, nofunc=-13, exn=-23, noexn=-12
+    matches!(ht, -18 | -19 | -20 | -21 | -22 | -15 | -14 | -13 | -23 | -12)
     || ht >= 0 // concrete type index reference is GC
 }
 
@@ -765,6 +856,8 @@ fn decode_reftype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
     let b = read_byte(bytes, pos)?;
     match b {
         0x70 | 0x6F => Ok(ValType::I32), // funcref, externref -> I32 placeholder
+        // GC shorthand encodings — also reference types
+        0x6E | 0x6D | 0x6C | 0x6B | 0x6A | 0x73 | 0x72 | 0x71 | 0x69 | 0x68 => Ok(ValType::I32),
         0x63 | 0x64 => {
             let _ = decode_leb128_i32(bytes, pos)?;
             Ok(ValType::I32) // placeholder for typed ref types
@@ -796,11 +889,22 @@ fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmErr
     match b {
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
+        // GC proposal shorthand encodings (single-byte, implicitly nullable):
+        0x6E => Ok(ValType::AnyRef),       // anyref = (ref null any)
+        0x6D => Ok(ValType::EqRef),        // eqref = (ref null eq)
+        0x6C => Ok(ValType::I31Ref),       // i31ref = (ref null i31)
+        0x6B => Ok(ValType::NullableStructRef), // structref = (ref null struct)
+        0x6A => Ok(ValType::ArrayRef),     // arrayref = (ref null array)
+        0x73 => Ok(ValType::FuncRef),      // nullfuncref = (ref null nofunc)
+        0x72 => Ok(ValType::ExternRef),    // nullexternref = (ref null noextern)
+        0x71 => Ok(ValType::NoneRef),      // nullref = (ref null none)
+        0x69 => Ok(ValType::ExnRef),       // exnref = (ref null exn)
+        0x68 => Ok(ValType::AnyRef),       // contref = (ref null cont)
         0x63 | 0x64 => {
             let heap_type = decode_leb128_i32(bytes, pos)?;
-            if heap_type == -0x10 {
+            if heap_type == -16 { // func
                 Ok(if b == 0x63 { ValType::FuncRef } else { ValType::TypedFuncRef })
-            } else if heap_type == -0x11 {
+            } else if heap_type == -17 { // extern
                 Ok(ValType::ExternRef)
             } else {
                 Ok(if b == 0x63 { ValType::NullableTypedFuncRef } else { ValType::TypedFuncRef })
@@ -810,14 +914,22 @@ fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmErr
     }
 }
 
+/// Decode a storage type (used in struct/array field types).
+/// Storage types: 0x78 = i8, 0x77 = i16, or a full valtype.
+fn decode_storage_type(bytes: &[u8], pos: &mut usize) -> Result<StorageType, WasmError> {
+    let b = peek_byte(bytes, *pos)?;
+    match b {
+        0x78 => { *pos += 1; Ok(StorageType::I8) }
+        0x77 => { *pos += 1; Ok(StorageType::I16) }
+        _ => { let vt = decode_valtype_from_stream(bytes, pos)?; Ok(StorageType::Val(vt)) }
+    }
+}
+
 /// Skip a storage type (used in struct/array field types).
 /// Storage types: 0x78 = i8, 0x77 = i16, or a full valtype.
 fn skip_storage_type(bytes: &[u8], pos: &mut usize) -> Result<(), WasmError> {
-    let b = peek_byte(bytes, *pos)?;
-    match b {
-        0x78 | 0x77 => { *pos += 1; Ok(()) }
-        _ => { decode_valtype_from_stream(bytes, pos)?; Ok(()) }
-    }
+    decode_storage_type(bytes, pos)?;
+    Ok(())
 }
 
 /// Decode a composite type (possibly wrapped in sub/sub_final) and push to module.func_types.
@@ -829,12 +941,18 @@ fn decode_composite_type(
 ) -> Result<(), WasmError> {
     let sub_marker = read_byte(bytes, pos)?;
     let inner_marker;
+    let mut sub_info = SubTypeInfo { supertype: None, is_final: true };
     if sub_marker == 0x50 || sub_marker == 0x4F {
         // sub/sub_final: read supertype count + supertypes
         module.gc_enabled = true;
+        sub_info.is_final = sub_marker == 0x4F; // 0x4F = sub final
         let super_count = decode_leb128_u32(bytes, pos)? as usize;
-        for _ in 0..super_count {
-            let _ = decode_leb128_u32(bytes, pos)?;
+        if super_count > 0 {
+            sub_info.supertype = Some(decode_leb128_u32(bytes, pos)?);
+            // Skip remaining supertypes (we only track the first)
+            for _ in 1..super_count {
+                let _ = decode_leb128_u32(bytes, pos)?;
+            }
         }
         inner_marker = read_byte(bytes, pos)?;
     } else {
@@ -862,31 +980,46 @@ fn decode_composite_type(
                 ft.results[r] = decode_valtype_gc_aware(bytes, pos, module)?;
             }
             module.func_types.push(ft);
+            module.gc_types.push(GcTypeDef::Func);
+            module.sub_types.push(sub_info);
         }
         0x5E => {
             // array type (GC proposal): single field (storage_type + mutability)
             module.gc_enabled = true;
-            skip_storage_type(bytes, pos)?;
+            let st = decode_storage_type(bytes, pos)?;
             let mt = read_byte(bytes, pos)?; // mutability
             if mt > 1 {
                 return Err(WasmError::InvalidSection);
             }
             // Push a placeholder func type so type indices stay aligned
             module.func_types.push(FuncTypeDef::empty());
+            module.gc_types.push(GcTypeDef::Array {
+                elem_type: st,
+                elem_mutable: mt != 0,
+            });
+            module.sub_types.push(sub_info);
         }
         0x5F => {
             // struct type (GC proposal): count of fields, each is storage_type + mutability
             module.gc_enabled = true;
             let field_count = decode_leb128_u32(bytes, pos)? as usize;
+            let mut field_types = Vec::with_capacity(field_count);
+            let mut field_muts = Vec::with_capacity(field_count);
             for _ in 0..field_count {
-                skip_storage_type(bytes, pos)?;
+                field_types.push(decode_storage_type(bytes, pos)?);
                 let mt = read_byte(bytes, pos)?; // mutability
                 if mt > 1 {
                     return Err(WasmError::InvalidSection);
                 }
+                field_muts.push(mt != 0);
             }
             // Push a placeholder func type so type indices stay aligned
             module.func_types.push(FuncTypeDef::empty());
+            module.gc_types.push(GcTypeDef::Struct {
+                field_types,
+                field_muts,
+            });
+            module.sub_types.push(sub_info);
         }
         _ => return Err(WasmError::InvalidSection),
     }
@@ -964,9 +1097,27 @@ fn decode_import_section(
                 let et = match elemtype {
                     0x70 => ValType::FuncRef,
                     0x6F => ValType::ExternRef,
+                    0x6E => ValType::AnyRef,
+                    0x6D => ValType::EqRef,
+                    0x6C => ValType::I31Ref,
+                    0x6B => ValType::NullableStructRef,
+                    0x6A => ValType::ArrayRef,
+                    0x73 => ValType::FuncRef,
+                    0x72 => ValType::ExternRef,
+                    0x71 => ValType::NoneRef,
+                    0x69 => ValType::ExnRef,
+                    0x68 => ValType::AnyRef,
                     0x63 | 0x64 => {
-                        let _ = decode_leb128_i32(bytes, pos)?;
-                        if elemtype == 0x63 { ValType::FuncRef } else { ValType::FuncRef }
+                        let ht = decode_leb128_i32(bytes, pos)?;
+                        match ht {
+                            -16 => if elemtype == 0x63 { ValType::FuncRef } else { ValType::TypedFuncRef },
+                            -17 => ValType::ExternRef,
+                            -18 => ValType::AnyRef,
+                            -19 => ValType::EqRef,
+                            -21 => if elemtype == 0x63 { ValType::NullableStructRef } else { ValType::StructRef },
+                            -22 => ValType::ArrayRef,
+                            _ => if elemtype == 0x63 { ValType::NullableTypedFuncRef } else { ValType::TypedFuncRef },
+                        }
                     }
                     _ => ValType::FuncRef,
                 };
@@ -1312,12 +1463,29 @@ fn decode_table_section(
             false
         };
 
-        // elemtype: 0x70 = funcref, 0x6F = externref, 0x63/0x64 = ref types
+        // elemtype: 0x70 = funcref, 0x6F = externref, 0x63/0x64 = ref types,
+        // 0x6E-0x6A, 0x73-0x69 = GC shorthand ref types
         let elemtype = read_byte(bytes, pos)?;
         let mut elem_heap_type: i32 = 0;
         if elemtype == 0x63 || elemtype == 0x64 {
             // Nullable/non-nullable ref type: read heap type
             elem_heap_type = decode_leb128_i32(bytes, pos)?;
+        } else if matches!(elemtype, 0x6E | 0x6D | 0x6C | 0x6B | 0x6A | 0x73 | 0x72 | 0x71 | 0x69 | 0x68) {
+            // GC shorthand reference types — single byte, no additional data
+            // Map to corresponding heap type for later processing
+            elem_heap_type = match elemtype {
+                0x6E => -0x12, // any
+                0x6D => -0x16, // eq
+                0x6C => -0x19, // i31
+                0x6B => -0x17, // struct
+                0x6A => -0x18, // array
+                0x73 => -0x15, // nofunc
+                0x72 => -0x14, // noextern
+                0x71 => -0x13, // none
+                0x69 => -0x1A, // exn
+                0x68 => -0x12, // cont -> any
+                _ => 0,
+            };
         } else if elemtype != 0x70 && elemtype != 0x6F {
             return Err(WasmError::InvalidSection);
         }
@@ -1353,16 +1521,34 @@ fn decode_table_section(
         let et = match elemtype {
             0x70 => ValType::FuncRef,
             0x6F => ValType::ExternRef,
+            0x6E => ValType::AnyRef,
+            0x6D => ValType::EqRef,
+            0x6C => ValType::I31Ref,
+            0x6B => ValType::NullableStructRef,
+            0x6A => ValType::ArrayRef,
+            0x73 => ValType::FuncRef,      // nullfuncref
+            0x72 => ValType::ExternRef,    // nullexternref
+            0x71 => ValType::NoneRef,      // nullref
+            0x69 => ValType::ExnRef,       // exnref
+            0x68 => ValType::AnyRef,       // contref
             0x64 => {
                 // (ref ht) = non-nullable
-                if elem_heap_type == -0x10 { ValType::TypedFuncRef }
-                else if elem_heap_type == -0x11 { ValType::ExternRef }
+                if elem_heap_type == -16 { ValType::TypedFuncRef }
+                else if elem_heap_type == -17 { ValType::ExternRef }
+                else if elem_heap_type == -18 { ValType::AnyRef }
+                else if elem_heap_type == -19 { ValType::EqRef }
+                else if elem_heap_type == -21 { ValType::StructRef }
+                else if elem_heap_type == -22 { ValType::ArrayRef }
                 else { ValType::TypedFuncRef }
             }
             _ => {
                 // 0x63 = (ref null ht) = nullable
-                if elem_heap_type == -0x10 { ValType::FuncRef }
-                else if elem_heap_type == -0x11 { ValType::ExternRef }
+                if elem_heap_type == -16 { ValType::FuncRef }
+                else if elem_heap_type == -17 { ValType::ExternRef }
+                else if elem_heap_type == -18 { ValType::AnyRef }
+                else if elem_heap_type == -19 { ValType::EqRef }
+                else if elem_heap_type == -21 { ValType::NullableStructRef }
+                else if elem_heap_type == -22 { ValType::ArrayRef }
                 else { ValType::NullableTypedFuncRef }
             }
         };
