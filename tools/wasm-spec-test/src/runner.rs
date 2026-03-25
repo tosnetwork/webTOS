@@ -1223,12 +1223,31 @@ impl WastRunner {
                 let fld_name = bytes_to_string(record.instance.module.get_name(import.field_name_offset, import.field_name_len));
                 tbl_source_map.push((mod_name, fld_name));
             }
-            // For each pair of table imports from the same module+field, alias the second to the first
-            for i in 0..tbl_source_map.len() {
-                for j in (i+1)..tbl_source_map.len() {
-                    if tbl_source_map[i] == tbl_source_map[j] {
-                        if j < record.instance.table_aliases.len() {
-                            record.instance.table_aliases[j] = Some(i);
+            // For each pair of table imports, check if they resolve to the same source table index
+            // Two different export names (tab1, tab2) may point to the same table in the source
+            let mut resolved_sources: Vec<Option<(String, u32)>> = Vec::new(); // (module, source_table_idx)
+            for (mod_name, fld_name) in &tbl_source_map {
+                if let Some(src_handle) = self.instances.get(mod_name.as_str()) {
+                    if let Ok(src) = src_handle.try_borrow() {
+                        if let Some(src_tbl_idx) = exported_table_index(&src.instance.module, fld_name) {
+                            resolved_sources.push(Some((mod_name.clone(), src_tbl_idx)));
+                        } else {
+                            resolved_sources.push(None);
+                        }
+                    } else {
+                        resolved_sources.push(None);
+                    }
+                } else {
+                    resolved_sources.push(None);
+                }
+            }
+            for i in 0..resolved_sources.len() {
+                for j in (i+1)..resolved_sources.len() {
+                    if let (Some(a), Some(b)) = (&resolved_sources[i], &resolved_sources[j]) {
+                        if a == b {
+                            if j < record.instance.table_aliases.len() {
+                                record.instance.table_aliases[j] = Some(i);
+                            }
                         }
                     }
                 }
