@@ -13,6 +13,12 @@ pub enum ValType {
     V128,
     FuncRef,
     ExternRef,
+    /// A typed, non-nullable function reference: (ref $t).
+    /// This is distinct from FuncRef (which is (ref null func), i.e., general funcref).
+    TypedFuncRef,
+    /// A typed, nullable function reference: (ref null $t).
+    /// This is distinct from FuncRef (which is funcref / (ref null func)).
+    NullableTypedFuncRef,
 }
 
 /// A 128-bit SIMD value (v128), stored as little-endian byte array.
@@ -106,7 +112,8 @@ impl Value {
     /// Return zero for the given type.
     pub const fn default_for(ty: ValType) -> Self {
         match ty {
-            ValType::I32 | ValType::FuncRef | ValType::ExternRef => Value::I32(0),
+            ValType::I32 | ValType::FuncRef | ValType::ExternRef
+            | ValType::TypedFuncRef | ValType::NullableTypedFuncRef => Value::I32(0),
             ValType::I64 => Value::I64(0),
             ValType::F32 => Value::F32(0.0),
             ValType::F64 => Value::F64(0.0),
@@ -681,4 +688,5 @@ pub enum WasmError {
     UndeclaredFuncRef,
     NullFunctionReference,
     NullReference,
+    UninitializedLocal,
 }

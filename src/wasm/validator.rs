@@ -250,7 +250,14 @@ pub fn validate(module: &WasmModule) -> Result<(), WasmError> {
             }
             // Validate element type compatibility with table
             let tbl_et = table_elem_type(module, seg.table_idx, table_import_count);
-            if !ref_types_compatible(seg.elem_type, tbl_et) {
+            // For func-index segments (no item_expr_infos), the effective type is
+            // (ref func) = TypedFuncRef since func indices are inherently non-nullable.
+            let effective_elem_type = if seg.item_expr_infos.is_empty() && seg.elem_type == ValType::FuncRef {
+                ValType::TypedFuncRef
+            } else {
+                seg.elem_type
+            };
+            if !ref_types_compatible(effective_elem_type, tbl_et) {
                 return Err(WasmError::TypeMismatch);
             }
             // Validate offset expression (table64 uses I64 offset)
@@ -336,12 +343,11 @@ fn count_global_imports(module: &WasmModule) -> usize {
 /// Check if two types are ref-compatible (both ref types are interchangeable
 /// for the purpose of global init validation when the global type is a ref type).
 fn is_ref_compatible(a: ValType, b: ValType) -> bool {
-    let a_ref = matches!(a, ValType::FuncRef | ValType::ExternRef);
-    let b_ref = matches!(b, ValType::FuncRef | ValType::ExternRef);
-    // If both are the same ref type, they're compatible
     if a == b { return true; }
-    // FuncRef and ExternRef are NOT compatible with each other
-    if a_ref && b_ref { return false; }
+    // Typed func refs are subtypes of FuncRef
+    let a_funcref_family = matches!(a, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+    let b_funcref_family = matches!(b, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+    if a_funcref_family && b_funcref_family { return true; }
     false
 }
 
@@ -439,9 +445,29 @@ fn table_index_type(module: &WasmModule, table_idx: u32) -> ValType {
 }
 
 /// Check if source ref type is compatible with destination ref type.
-/// FuncRef is only compatible with FuncRef, ExternRef only with ExternRef.
+/// Subtyping: non-nullable is subtype of nullable, typed is subtype of abstract.
 fn ref_types_compatible(src: ValType, dst: ValType) -> bool {
-    src == dst
+    if src == dst { return true; }
+    // FuncRef family subtyping:
+    //   TypedFuncRef (ref $t or ref func) <: NullableTypedFuncRef (ref null $t)
+    //   TypedFuncRef <: FuncRef (ref null func / funcref)
+    //   NullableTypedFuncRef <: FuncRef
+    let src_func = matches!(src, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+    let dst_func = matches!(dst, ValType::FuncRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef);
+    if src_func && dst_func {
+        // FuncRef (nullable abstract) is the top of the func ref hierarchy
+        if dst == ValType::FuncRef { return true; }
+        // NullableTypedFuncRef accepts TypedFuncRef
+        if dst == ValType::NullableTypedFuncRef && src == ValType::TypedFuncRef { return true; }
+        // TypedFuncRef only accepts TypedFuncRef (already handled by src == dst)
+        return false;
+    }
+    false
+}
+
+/// Check if a ValType is a reference type.
+fn is_ref_type(t: ValType) -> bool {
+    matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NullableTypedFuncRef)
 }
 
 // ─── Type checking structures ────────────────────────────────────────────────
@@ -481,6 +507,8 @@ struct Validator<'a> {
     ctrl_stack: Vec<CtrlFrame>,
     /// Local types: params then locals
     local_types: Vec<ValType>,
+    /// Number of parameters (params are always initialized)
+    param_count: usize,
     /// Function return types
     return_types: Vec<ValType>,
     total_functions: usize,
@@ -518,6 +546,12 @@ impl<'a> Validator<'a> {
         match actual {
             StackType::Known(t) if t == expected => Ok(()),
             StackType::Unknown => Ok(()),
+            // Subtyping: typed func refs are subtypes of general funcref
+            StackType::Known(ValType::TypedFuncRef) | StackType::Known(ValType::NullableTypedFuncRef)
+                if expected == ValType::FuncRef => Ok(()),
+            // Non-nullable typed ref is subtype of nullable typed ref
+            StackType::Known(ValType::TypedFuncRef)
+                if expected == ValType::NullableTypedFuncRef => Ok(()),
             _ => Err(WasmError::TypeMismatch),
         }
     }
@@ -615,23 +649,33 @@ impl<'a> Validator<'a> {
     /// Read a memarg (alignment + offset) and validate alignment against max_align.
     /// max_align is log2 of the natural alignment (0=1byte, 1=2byte, 2=4byte, 3=8byte, 4=16byte).
     fn read_memarg(&mut self, max_align: u32) -> Result<(), WasmError> {
-        let align = self.read_u32()?;
-        // In multi-memory mode, bit 6 encodes the memory index
-        let mem_idx = if align >= 64 {
-            if !self.module.multi_memory_enabled {
-                return Err(WasmError::TypeMismatch);
-            }
-            // memory index follows in the remaining bits
-            0u32 // placeholder — we don't track per-memory types yet
+        let flags = self.read_u32()?;
+        // In multi-memory mode, bit 6 signals an explicit memory index follows
+        let mem_idx = if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 {
+            self.read_u32()?
+        } else if flags >= 64 {
+            // bit 6 set but multi-memory not enabled
+            return Err(WasmError::TypeMismatch);
         } else {
             0u32
         };
-        let effective_align = align & 0x3F;
+        let effective_align = flags & 0x3F;
         if effective_align > max_align {
             return Err(WasmError::TypeMismatch);
         }
+        // Validate memory index bounds
+        if self.module.multi_memory_enabled {
+            if mem_idx >= self.module.memory_count {
+                return Err(WasmError::MemoryOutOfBounds);
+            }
+        }
         // For memory64 memories, read 64-bit offset; otherwise 32-bit
-        if self.module.is_memory64 && mem_idx == 0 {
+        let is_mem64 = if (mem_idx as usize) < self.module.memories.len() {
+            self.module.memories[mem_idx as usize].is_memory64
+        } else {
+            self.module.is_memory64
+        };
+        if is_mem64 {
             let _offset = self.read_u64()?;
         } else {
             let _offset = self.read_u32()?;
@@ -664,6 +708,20 @@ impl<'a> Validator<'a> {
                 -0x05 => ValType::V128,  // 0x7B
                 -0x10 => ValType::FuncRef,   // 0x70 = funcref
                 -0x11 => ValType::ExternRef, // 0x6F = externref
+                -0x1D => {
+                    // 0x63 = (ref null ht) — read the heap type
+                    let heap_type = self.read_i32()?;
+                    if heap_type == -0x10 { ValType::FuncRef }
+                    else if heap_type == -0x11 { ValType::ExternRef }
+                    else { ValType::NullableTypedFuncRef }
+                }
+                -0x1C => {
+                    // 0x64 = (ref ht) — read the heap type
+                    let heap_type = self.read_i32()?;
+                    if heap_type == -0x10 { ValType::FuncRef }
+                    else if heap_type == -0x11 { ValType::ExternRef }
+                    else { ValType::TypedFuncRef }
+                }
                 _ => return Err(WasmError::InvalidBlockType),
             };
             Ok((Vec::new(), alloc::vec![vt]))
@@ -986,9 +1044,10 @@ impl<'a> Validator<'a> {
                     let result_count = ft.result_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
                     let results: Vec<ValType> = ft.results[..result_count].to_vec();
-                    // call_ref requires (ref null $type_idx); reject ExternRef
+                    // call_ref requires (ref null $type_idx); reject ExternRef and general FuncRef
                     let ref_val = self.pop_opd()?;
-                    if ref_val == StackType::Known(ValType::ExternRef) {
+                    if ref_val == StackType::Known(ValType::ExternRef)
+                        || ref_val == StackType::Known(ValType::FuncRef) {
                         return Err(WasmError::TypeMismatch);
                     }
                     for i in (0..params.len()).rev() {
@@ -1006,8 +1065,19 @@ impl<'a> Validator<'a> {
                     }
                     let ft = &self.module.func_types[type_idx as usize];
                     let param_count = ft.param_count as usize;
+                    let result_count = ft.result_count as usize;
                     let params: Vec<ValType> = ft.params[..param_count].to_vec();
-                    let _ = self.pop_opd()?; // function reference
+                    let callee_results: Vec<ValType> = ft.results[..result_count].to_vec();
+                    // return_call_ref: callee return types must match current function's
+                    if callee_results != self.return_types {
+                        return Err(WasmError::TypeMismatch);
+                    }
+                    // call_ref requires (ref null $type_idx); reject ExternRef and general FuncRef
+                    let ref_val = self.pop_opd()?;
+                    if ref_val == StackType::Known(ValType::ExternRef)
+                        || ref_val == StackType::Known(ValType::FuncRef) {
+                        return Err(WasmError::TypeMismatch);
+                    }
                     for i in (0..params.len()).rev() {
                         self.pop_expect(params[i])?;
                     }
@@ -1068,6 +1138,10 @@ impl<'a> Validator<'a> {
                 0x20 => {
                     let idx = self.read_u32()?;
                     let t = self.local_type(idx)?;
+                    // Non-nullable ref locals (not params) must be initialized
+                    if t == ValType::TypedFuncRef && (idx as usize) >= self.param_count {
+                        return Err(WasmError::UninitializedLocal);
+                    }
                     self.push_val(t);
                 }
                 // ── local.set ──
@@ -1276,7 +1350,8 @@ impl<'a> Validator<'a> {
                         self.read_zero_byte()?;
                         0
                     };
-                    let val_type = if self.module.is_memory64 && mem_idx == 0 { ValType::I64 } else { ValType::I32 };
+                    let is_mem64 = if (mem_idx as usize) < self.module.memories.len() { self.module.memories[mem_idx as usize].is_memory64 } else { self.module.is_memory64 };
+                    let val_type = if is_mem64 { ValType::I64 } else { ValType::I32 };
                     self.push_val(val_type);
                 }
                 // ── memory.grow ──
@@ -1290,7 +1365,8 @@ impl<'a> Validator<'a> {
                         self.read_zero_byte()?;
                         0
                     };
-                    let val_type = if self.module.is_memory64 && mem_idx == 0 { ValType::I64 } else { ValType::I32 };
+                    let is_mem64 = if (mem_idx as usize) < self.module.memories.len() { self.module.memories[mem_idx as usize].is_memory64 } else { self.module.is_memory64 };
+                    let val_type = if is_mem64 { ValType::I64 } else { ValType::I32 };
                     self.pop_expect(val_type)?;
                     self.push_val(val_type);
                 }
@@ -1439,9 +1515,20 @@ impl<'a> Validator<'a> {
 
                 // ── ref.null ──
                 0xD0 => {
-                    let _ = self.read_i32()?; // heaptype
-                    // Push unknown since we don't have ref types in ValType
-                    self.push_opd(StackType::Unknown);
+                    let heap_type = self.read_i32()?; // heaptype
+                    if heap_type == -0x10 {
+                        // (ref null func) = funcref
+                        self.push_val(ValType::FuncRef);
+                    } else if heap_type == -0x11 {
+                        // (ref null extern) = externref
+                        self.push_val(ValType::ExternRef);
+                    } else if heap_type >= 0 {
+                        // (ref null $t) = nullable typed func ref
+                        self.push_val(ValType::NullableTypedFuncRef);
+                    } else {
+                        // Other abstract heap types - push as unknown
+                        self.push_opd(StackType::Unknown);
+                    }
                 }
                 // ── ref.is_null ──
                 0xD1 => {
@@ -1458,7 +1545,76 @@ impl<'a> Validator<'a> {
                     if !self.declared_funcs.contains(&idx) {
                         return Err(WasmError::UndeclaredFuncRef);
                     }
-                    self.push_opd(StackType::Unknown);
+                    // ref.func produces (ref $t) - a typed, non-nullable func ref
+                    self.push_val(ValType::TypedFuncRef);
+                }
+                // ── ref.as_non_null (opcode 0xD3 or 0xD4) ──
+                0xD3 | 0xD4 => {
+                    // Pop a ref value; if it's a known non-ref type, reject
+                    let ref_val = self.pop_opd()?;
+                    match ref_val {
+                        StackType::Known(t) if !is_ref_type(t) => {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        _ => {}
+                    }
+                    // Push the non-null version: same type
+                    self.push_opd(ref_val);
+                }
+                // ── br_on_null (opcode 0xD5) ──
+                0xD5 => {
+                    let n = self.read_u32()?;
+                    // Pop the ref operand
+                    let ref_val = self.pop_opd()?;
+                    match ref_val {
+                        StackType::Known(t) if !is_ref_type(t) => {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        _ => {}
+                    }
+                    // Check branch target types
+                    let label_types = self.label_types(n as usize)?;
+                    for i in (0..label_types.len()).rev() {
+                        self.pop_expect(label_types[i])?;
+                    }
+                    // Push label types back + the non-null ref
+                    for &t in &label_types {
+                        self.push_val(t);
+                    }
+                    // The ref is non-null on fallthrough
+                    self.push_opd(ref_val);
+                }
+                // ── br_on_non_null (opcode 0xD6) ──
+                0xD6 => {
+                    let n = self.read_u32()?;
+                    // Pop the ref operand
+                    let ref_val = self.pop_opd()?;
+                    match ref_val {
+                        StackType::Known(t) if !is_ref_type(t) => {
+                            return Err(WasmError::TypeMismatch);
+                        }
+                        _ => {}
+                    }
+                    // Branch target gets label_types + the non-null ref
+                    let label_types = self.label_types(n as usize)?;
+                    // Pop and check label types (minus the ref which goes on branch)
+                    if label_types.is_empty() {
+                        // label must accept at least the ref value
+                    } else {
+                        for i in (0..label_types.len() - 1).rev() {
+                            self.pop_expect(label_types[i])?;
+                        }
+                        for i in 0..label_types.len() - 1 {
+                            self.push_val(label_types[i]);
+                        }
+                    }
+                    // On fallthrough, the ref was null so nothing is pushed
+                }
+                // ── ref.eq (opcode 0xD7) ──
+                0xD7 => {
+                    let _ = self.pop_opd()?; // ref1
+                    let _ = self.pop_opd()?; // ref2
+                    self.push_val(ValType::I32);
                 }
 
                 // ── 0xFC prefix: saturating truncation + bulk memory ──
@@ -2000,9 +2156,12 @@ fn byte_to_valtype(b: u8) -> Result<ValType, WasmError> {
         0x7D => Ok(ValType::F32),
         0x7C => Ok(ValType::F64),
         0x7B => Ok(ValType::V128),
-        // funcref and externref — mapped to I32 like the decoder does
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
+        // Typed function reference types (should not normally appear as raw bytes here,
+        // but handle them in case the decoder passes them through)
+        0x63 => Ok(ValType::NullableTypedFuncRef),
+        0x64 => Ok(ValType::TypedFuncRef),
         _ => Err(WasmError::TypeMismatch),
     }
 }
@@ -2054,6 +2213,7 @@ fn validate_function_body(
         opd_stack: Vec::new(),
         ctrl_stack: Vec::new(),
         local_types,
+        param_count: ft.param_count as usize,
         return_types,
         total_functions,
         has_memory,

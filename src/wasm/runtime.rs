@@ -115,8 +115,8 @@ pub struct WasmInstance {
     pub dropped_elems: Vec<bool>,
     /// Tracks which data segments have been dropped (by data.drop).
     pub dropped_data: Vec<bool>,
-    pub memory: Vec<u8>,
-    pub memory_size: usize,
+    pub memories: Vec<Vec<u8>>,
+    pub memory_sizes: Vec<usize>,
     /// Program counter — byte offset within `module.code`.
     pub pc: usize,
     pub fuel: u64,
@@ -140,8 +140,23 @@ impl WasmInstance {
 
     /// Create a new instance with a specific runtime class.
     pub fn with_class(module: WasmModule, fuel: u64, runtime_class: RuntimeClass) -> Result<Self, WasmError> {
-        let mem_pages = module.memory_min_pages as usize;
-        let mem_size = mem_pages.saturating_mul(WASM_PAGE_SIZE);
+        // Initialize all memories from module.memories (includes imports + local defs)
+        let mut memories: Vec<Vec<u8>> = Vec::with_capacity(module.memories.len().max(1));
+        let mut memory_sizes: Vec<usize> = Vec::with_capacity(module.memories.len().max(1));
+        if module.memories.is_empty() && module.has_memory {
+            // Fallback for modules with memory but no MemoryDef entries (backward compat)
+            let mem_pages = module.memory_min_pages as usize;
+            let mem_size = mem_pages.saturating_mul(WASM_PAGE_SIZE);
+            memories.push(vec![0u8; mem_size]);
+            memory_sizes.push(mem_size);
+        } else {
+            for mdef in &module.memories {
+                let mem_pages = mdef.min_pages as usize;
+                let mem_size = mem_pages.saturating_mul(WASM_PAGE_SIZE);
+                memories.push(vec![0u8; mem_size]);
+                memory_sizes.push(mem_size);
+            }
+        }
 
         // Initialize globals from module definitions.
         // For globals with init_global_ref, resolve sequentially so that each global
@@ -230,8 +245,8 @@ impl WasmInstance {
             tables,
             dropped_elems,
             dropped_data,
-            memory: vec![0u8; mem_size],
-            memory_size: mem_size,
+            memories,
+            memory_sizes,
             pc: 0,
             fuel,
             call_stack: vec![CallFrame::zero(); MAX_CALL_DEPTH],
@@ -247,20 +262,21 @@ impl WasmInstance {
             if !seg.is_active {
                 continue; // passive segment — applied later by memory.init
             }
-            if seg.memory_idx > 0 {
-                continue; // multi-memory: skip non-primary memory data segments
+            let mem_idx = seg.memory_idx as usize;
+            if mem_idx >= inst.memories.len() {
+                return Err(WasmError::MemoryOutOfBounds);
             }
             let dst_start = seg.offset as usize;
             let src_start = seg.data_offset;
             let len = seg.data_len;
 
             // Trap if segment goes out of bounds of memory
-            if dst_start.saturating_add(len) > inst.memory_size {
+            if dst_start.saturating_add(len) > inst.memory_sizes[mem_idx] {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
             if src_start.saturating_add(len) <= inst.module.code.len() {
-                inst.memory[dst_start..dst_start + len]
+                inst.memories[mem_idx][dst_start..dst_start + len]
                     .copy_from_slice(&inst.module.code[src_start..src_start + len]);
             }
         }
@@ -366,91 +382,123 @@ impl WasmInstance {
 
     // ─── Memory access ──────────────────────────────────────────────────
 
-    fn mem_load_i32(&self, addr: usize) -> Result<i32, WasmError> {
-        if addr + 4 > self.memory_size {
+    /// Get memory slice reference by index, defaulting to memory 0.
+    #[inline]
+    fn mem(&self, idx: usize) -> &Vec<u8> {
+        if idx < self.memories.len() { &self.memories[idx] } else { &self.memories[0] }
+    }
+
+    /// Get mutable memory slice reference by index, defaulting to memory 0.
+    #[inline]
+    fn mem_mut(&mut self, idx: usize) -> &mut Vec<u8> {
+        if idx < self.memories.len() { &mut self.memories[idx] } else { &mut self.memories[0] }
+    }
+
+    /// Get memory size by index, defaulting to memory 0.
+    #[inline]
+    fn mem_size(&self, idx: usize) -> usize {
+        if idx < self.memory_sizes.len() { self.memory_sizes[idx] } else { 0 }
+    }
+
+    /// Read a memarg: alignment flags + optional memory index + offset.
+    /// Multi-memory: if bit 6 of flags is set, read an explicit memory index.
+    /// Returns (mem_idx, offset).
+    fn read_memarg(&mut self) -> Result<(usize, u32), WasmError> {
+        let flags = self.read_leb128_u32()?;
+        let mem_idx = if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 {
+            self.read_leb128_u32()? as usize
+        } else {
+            0
+        };
+        let offset = self.read_leb128_u32()?;
+        Ok((mem_idx, offset))
+    }
+
+    fn mem_load_i32(&self, mem_idx: usize, addr: usize) -> Result<i32, WasmError> {
+        let msz = self.mem_size(mem_idx);
+        if addr + 4 > msz {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        let bytes = [
-            self.memory[addr],
-            self.memory[addr + 1],
-            self.memory[addr + 2],
-            self.memory[addr + 3],
-        ];
+        let m = self.mem(mem_idx);
+        let bytes = [m[addr], m[addr + 1], m[addr + 2], m[addr + 3]];
         Ok(i32::from_le_bytes(bytes))
     }
 
-    fn mem_load_i64(&self, addr: usize) -> Result<i64, WasmError> {
-        if addr + 8 > self.memory_size {
+    fn mem_load_i64(&self, mem_idx: usize, addr: usize) -> Result<i64, WasmError> {
+        let msz = self.mem_size(mem_idx);
+        if addr + 8 > msz {
             return Err(WasmError::MemoryOutOfBounds);
         }
+        let m = self.mem(mem_idx);
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.memory[addr..addr + 8]);
+        bytes.copy_from_slice(&m[addr..addr + 8]);
         Ok(i64::from_le_bytes(bytes))
     }
 
-    fn mem_store_i32(&mut self, addr: usize, val: i32) -> Result<(), WasmError> {
-        if addr + 4 > self.memory_size {
+    fn mem_store_i32(&mut self, mem_idx: usize, addr: usize, val: i32) -> Result<(), WasmError> {
+        let msz = self.mem_size(mem_idx);
+        if addr + 4 > msz {
             return Err(WasmError::MemoryOutOfBounds);
         }
         let bytes = val.to_le_bytes();
-        self.memory[addr..addr + 4].copy_from_slice(&bytes);
+        self.mem_mut(mem_idx)[addr..addr + 4].copy_from_slice(&bytes);
         Ok(())
     }
 
-    fn mem_store_i64(&mut self, addr: usize, val: i64) -> Result<(), WasmError> {
-        if addr + 8 > self.memory_size {
+    fn mem_store_i64(&mut self, mem_idx: usize, addr: usize, val: i64) -> Result<(), WasmError> {
+        let msz = self.mem_size(mem_idx);
+        if addr + 8 > msz {
             return Err(WasmError::MemoryOutOfBounds);
         }
         let bytes = val.to_le_bytes();
-        self.memory[addr..addr + 8].copy_from_slice(&bytes);
+        self.mem_mut(mem_idx)[addr..addr + 8].copy_from_slice(&bytes);
         Ok(())
     }
 
     // ─── Sub-word memory helpers ─────────────────────────────────────────
 
-    fn mem_load_u8(&self, addr: usize) -> Result<u8, WasmError> {
-        if addr >= self.memory_size { return Err(WasmError::MemoryOutOfBounds); }
-        Ok(self.memory[addr])
+    fn mem_load_u8(&self, mem_idx: usize, addr: usize) -> Result<u8, WasmError> {
+        if addr >= self.mem_size(mem_idx) { return Err(WasmError::MemoryOutOfBounds); }
+        Ok(self.mem(mem_idx)[addr])
     }
 
-    fn mem_load_u16(&self, addr: usize) -> Result<u16, WasmError> {
-        if addr.checked_add(2).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_load_u16(&self, mem_idx: usize, addr: usize) -> Result<u16, WasmError> {
+        if addr.checked_add(2).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        Ok(u16::from_le_bytes([self.memory[addr], self.memory[addr + 1]]))
+        let m = self.mem(mem_idx);
+        Ok(u16::from_le_bytes([m[addr], m[addr + 1]]))
     }
 
-    fn mem_load_u32(&self, addr: usize) -> Result<u32, WasmError> {
-        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_load_u32(&self, mem_idx: usize, addr: usize) -> Result<u32, WasmError> {
+        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        Ok(u32::from_le_bytes([
-            self.memory[addr], self.memory[addr + 1],
-            self.memory[addr + 2], self.memory[addr + 3],
-        ]))
+        let m = self.mem(mem_idx);
+        Ok(u32::from_le_bytes([m[addr], m[addr + 1], m[addr + 2], m[addr + 3]]))
     }
 
-    fn mem_store_u8(&mut self, addr: usize, val: u8) -> Result<(), WasmError> {
-        if addr >= self.memory_size { return Err(WasmError::MemoryOutOfBounds); }
-        self.memory[addr] = val;
+    fn mem_store_u8(&mut self, mem_idx: usize, addr: usize, val: u8) -> Result<(), WasmError> {
+        if addr >= self.mem_size(mem_idx) { return Err(WasmError::MemoryOutOfBounds); }
+        self.mem_mut(mem_idx)[addr] = val;
         Ok(())
     }
 
-    fn mem_store_u16(&mut self, addr: usize, val: u16) -> Result<(), WasmError> {
-        if addr.checked_add(2).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_store_u16(&mut self, mem_idx: usize, addr: usize, val: u16) -> Result<(), WasmError> {
+        if addr.checked_add(2).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
         let bytes = val.to_le_bytes();
-        self.memory[addr..addr + 2].copy_from_slice(&bytes);
+        self.mem_mut(mem_idx)[addr..addr + 2].copy_from_slice(&bytes);
         Ok(())
     }
 
-    fn mem_store_u32(&mut self, addr: usize, val: u32) -> Result<(), WasmError> {
-        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_store_u32(&mut self, mem_idx: usize, addr: usize, val: u32) -> Result<(), WasmError> {
+        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
         let bytes = val.to_le_bytes();
-        self.memory[addr..addr + 4].copy_from_slice(&bytes);
+        self.mem_mut(mem_idx)[addr..addr + 4].copy_from_slice(&bytes);
         Ok(())
     }
 
@@ -486,38 +534,37 @@ impl WasmInstance {
         Ok(f64::from_le_bytes(bytes))
     }
 
-    fn mem_load_f32(&self, addr: usize) -> Result<f32, WasmError> {
-        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_load_f32(&self, mem_idx: usize, addr: usize) -> Result<f32, WasmError> {
+        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        Ok(f32::from_le_bytes([
-            self.memory[addr], self.memory[addr + 1],
-            self.memory[addr + 2], self.memory[addr + 3],
-        ]))
+        let m = self.mem(mem_idx);
+        Ok(f32::from_le_bytes([m[addr], m[addr + 1], m[addr + 2], m[addr + 3]]))
     }
 
-    fn mem_load_f64(&self, addr: usize) -> Result<f64, WasmError> {
-        if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_load_f64(&self, mem_idx: usize, addr: usize) -> Result<f64, WasmError> {
+        if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
+        let m = self.mem(mem_idx);
         let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.memory[addr..addr + 8]);
+        bytes.copy_from_slice(&m[addr..addr + 8]);
         Ok(f64::from_le_bytes(bytes))
     }
 
-    fn mem_store_f32(&mut self, addr: usize, val: f32) -> Result<(), WasmError> {
-        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_store_f32(&mut self, mem_idx: usize, addr: usize, val: f32) -> Result<(), WasmError> {
+        if addr.checked_add(4).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        self.memory[addr..addr + 4].copy_from_slice(&val.to_le_bytes());
+        self.mem_mut(mem_idx)[addr..addr + 4].copy_from_slice(&val.to_le_bytes());
         Ok(())
     }
 
-    fn mem_store_f64(&mut self, addr: usize, val: f64) -> Result<(), WasmError> {
-        if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_store_f64(&mut self, mem_idx: usize, addr: usize, val: f64) -> Result<(), WasmError> {
+        if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        self.memory[addr..addr + 8].copy_from_slice(&val.to_le_bytes());
+        self.mem_mut(mem_idx)[addr..addr + 8].copy_from_slice(&val.to_le_bytes());
         Ok(())
     }
 
@@ -639,20 +686,21 @@ impl WasmInstance {
         Ok(V128(b))
     }
 
-    fn mem_load_v128(&self, addr: usize) -> Result<V128, WasmError> {
-        if addr.checked_add(16).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_load_v128(&self, mem_idx: usize, addr: usize) -> Result<V128, WasmError> {
+        if addr.checked_add(16).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
+        let m = self.mem(mem_idx);
         let mut b = [0u8; 16];
-        b.copy_from_slice(&self.memory[addr..addr + 16]);
+        b.copy_from_slice(&m[addr..addr + 16]);
         Ok(V128(b))
     }
 
-    fn mem_store_v128(&mut self, addr: usize, val: V128) -> Result<(), WasmError> {
-        if addr.checked_add(16).ok_or(WasmError::MemoryOutOfBounds)? > self.memory_size {
+    fn mem_store_v128(&mut self, mem_idx: usize, addr: usize, val: V128) -> Result<(), WasmError> {
+        if addr.checked_add(16).ok_or(WasmError::MemoryOutOfBounds)? > self.mem_size(mem_idx) {
             return Err(WasmError::MemoryOutOfBounds);
         }
-        self.memory[addr..addr + 16].copy_from_slice(&val.0);
+        self.mem_mut(mem_idx)[addr..addr + 16].copy_from_slice(&val.0);
         Ok(())
     }
 
@@ -692,6 +740,7 @@ impl WasmInstance {
             (0, 0)
         } else if block_type < 0 {
             // valtype: i32=-1, i64=-2, f32=-3, f64=-4, v128=-5
+            // Also: ref null ht (-0x1D), ref ht (-0x1C), funcref (-0x10), externref (-0x11)
             (0, 1)
         } else {
             // type index: look up function type
@@ -703,6 +752,18 @@ impl WasmInstance {
                 (0, 0)
             }
         }
+    }
+
+    /// Read a block type from the bytecode, handling multi-byte ref types.
+    /// Returns the block type as i32 (same as read_leb128_i32), but additionally
+    /// consumes any following heap type for ref type block types.
+    fn read_block_type(&mut self) -> Result<i32, WasmError> {
+        let block_type = self.read_leb128_i32()?;
+        // For ref types (0x63 = -0x1D, 0x64 = -0x1C), read the heap type
+        if block_type == -0x1D || block_type == -0x1C {
+            let _heap_type = self.read_leb128_i32()?;
+        }
+        Ok(block_type)
     }
 
     // ─── Block management ───────────────────────────────────────────────
@@ -733,8 +794,11 @@ impl WasmInstance {
             match b {
                 0x02 | 0x03 | 0x04 => {
                     // Block, Loop, If — nested
-                    // Read and discard the block type
-                    let _ = self.read_leb128_i32()?;
+                    // Read and discard the block type (may be multi-byte for ref types)
+                    let bt = self.read_leb128_i32()?;
+                    if bt == -0x1D || bt == -0x1C {
+                        let _ = self.read_leb128_i32()?; // consume heap type
+                    }
                     depth += 1;
                 }
                 0x05 => {
@@ -780,22 +844,37 @@ impl WasmInstance {
                     // SIMD prefix: read sub-opcode, then skip its immediates
                     let sub = self.read_leb128_u32()?;
                     match sub {
-                        0x00..=0x0b => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // v128 load/store: align + offset
+                        0x00..=0x0b => { // v128 load/store: memarg (flags [+ memidx] + offset)
+                            let flags = self.read_leb128_u32()?;
+                            if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 { let _ = self.read_leb128_u32()?; }
+                            let _ = self.read_leb128_u32()?;
+                        }
                         0x0c => { self.pc += 16; } // v128.const: 16 bytes immediate
                         0x0d => { self.pc += 16; } // i8x16.shuffle: 16 lane bytes
                         0x15..=0x22 => { self.pc += 1; } // extract/replace lane: 1 byte lane index
-                        0x54..=0x5b => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; self.pc += 1; } // load/store_lane: align+offset+lane
-                        0x5c..=0x5d => { let _ = self.read_leb128_u32()?; let _ = self.read_leb128_u32()?; } // load*_zero: align + offset
+                        0x54..=0x5b => { // load/store_lane: memarg + lane
+                            let flags = self.read_leb128_u32()?;
+                            if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 { let _ = self.read_leb128_u32()?; }
+                            let _ = self.read_leb128_u32()?; self.pc += 1;
+                        }
+                        0x5c..=0x5d => { // load*_zero: memarg
+                            let flags = self.read_leb128_u32()?;
+                            if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 { let _ = self.read_leb128_u32()?; }
+                            let _ = self.read_leb128_u32()?;
+                        }
                         _ => {} // most SIMD ops have no immediates
                     }
                 }
-                0x3F | 0x40 => { let _ = self.read_leb128_u32()?; } // memory.size/grow (reserved byte)
+                0x3F | 0x40 => { let _ = self.read_leb128_u32()?; } // memory.size/grow (memory index)
                 0x28 | 0x29 | 0x2A | 0x2B | 0x2C | 0x2D | 0x2E | 0x2F
                 | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35
                 | 0x36 | 0x37 | 0x38 | 0x39 | 0x3A | 0x3B | 0x3C | 0x3D | 0x3E => {
-                    // memory load/store (all variants): align + offset
-                    let _ = self.read_leb128_u32()?;
-                    let _ = self.read_leb128_u32()?;
+                    // memory load/store (all variants): memarg (flags [+ memidx] + offset)
+                    let flags = self.read_leb128_u32()?;
+                    if self.module.multi_memory_enabled && (flags & (1 << 6)) != 0 {
+                        let _ = self.read_leb128_u32()?; // memory index
+                    }
+                    let _ = self.read_leb128_u32()?; // offset
                 }
                 0x41 => { let _ = self.read_leb128_i32()?; } // i32.const
                 0x42 => { let _ = self.read_leb128_i64()?; } // i64.const
@@ -809,6 +888,7 @@ impl WasmInstance {
                 }
                 0xD0 => { let _ = self.read_leb128_i32()?; } // ref.null heaptype
                 0xD2 => { let _ = self.read_leb128_u32()?; } // ref.func funcidx
+                // 0xD3, 0xD4 = ref.as_non_null: no immediates
                 0xD5 | 0xD6 => { let _ = self.read_leb128_u32()?; } // br_on_null, br_on_non_null: label
                 0xFB => {
                     // GC prefix: read sub-opcode, then skip its immediates
@@ -1157,7 +1237,7 @@ impl WasmInstance {
             }
             0x02 => {
                 // block
-                let block_type = try_exec!(self.read_leb128_i32());
+                let block_type = try_exec!(self.read_block_type());
                 let (param_count, result_count) = self.decode_block_type(block_type);
                 // We need to find the matching End to know end_pc.
                 let start_pc = self.pc;
@@ -1176,7 +1256,7 @@ impl WasmInstance {
             }
             0x03 => {
                 // loop
-                let block_type = try_exec!(self.read_leb128_i32());
+                let block_type = try_exec!(self.read_block_type());
                 let (param_count, result_count) = self.decode_block_type(block_type);
                 let start_pc = self.pc;
                 let saved_pc = self.pc;
@@ -1196,7 +1276,7 @@ impl WasmInstance {
             }
             0x04 => {
                 // if — two-pass scan: first find else/end boundary, then find true end
-                let block_type = try_exec!(self.read_leb128_i32());
+                let block_type = try_exec!(self.read_block_type());
                 let (param_count, result_count) = self.decode_block_type(block_type);
                 let condition = try_exec!(self.pop_i32());
 
@@ -1586,8 +1666,16 @@ impl WasmInstance {
                 let idx = try_exec!(self.read_leb128_u32());
                 try_exec!(self.push(Value::I32(idx as i32)));
             }
+            0xD3 => {
+                // ref.as_non_null (may also be mapped at 0xD4 by some encoders)
+                let val = try_exec!(self.pop_i32());
+                if val < 0 {
+                    return ExecResult::Trap(WasmError::NullReference);
+                }
+                try_exec!(self.push(Value::I32(val)));
+            }
             0xD4 => {
-                // ref.as_non_null
+                // ref.as_non_null (alternate encoding used by wast crate)
                 let val = try_exec!(self.pop_i32());
                 if val < 0 {
                     return ExecResult::Trap(WasmError::NullReference);
@@ -1696,229 +1784,208 @@ impl WasmInstance {
             // ── Memory ──────────────────────────────────────────────
             0x28 => {
                 // i32.load
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_i32(addr));
+                let val = try_exec!(self.mem_load_i32(mi, addr));
                 try_exec!(self.push(Value::I32(val)));
             }
             0x29 => {
                 // i64.load
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_i64(addr));
+                let val = try_exec!(self.mem_load_i64(mi, addr));
                 try_exec!(self.push(Value::I64(val)));
             }
             0x36 => {
                 // i32.store
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_i32(addr, val));
+                try_exec!(self.mem_store_i32(mi, addr, val));
             }
             0x37 => {
                 // i64.store
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_i64(addr, val));
+                try_exec!(self.mem_store_i64(mi, addr, val));
             }
 
             // ── Float memory ─────────────────────────────────────────
             0x2A => {
                 // f32.load
                 if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_f32(addr));
+                let val = try_exec!(self.mem_load_f32(mi, addr));
                 try_exec!(self.push(Value::F32(val)));
             }
             0x2B => {
                 // f64.load
                 if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_f64(addr));
+                let val = try_exec!(self.mem_load_f64(mi, addr));
                 try_exec!(self.push(Value::F64(val)));
             }
 
             // ── Sub-word loads ──────────────────────────────────────
             0x2C => {
                 // i32.load8_s
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u8(addr)) as i8;
+                let val = try_exec!(self.mem_load_u8(mi, addr)) as i8;
                 try_exec!(self.push(Value::I32(val as i32)));
             }
             0x2D => {
                 // i32.load8_u
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u8(addr));
+                let val = try_exec!(self.mem_load_u8(mi, addr));
                 try_exec!(self.push(Value::I32(val as i32)));
             }
             0x2E => {
                 // i32.load16_s
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u16(addr)) as i16;
+                let val = try_exec!(self.mem_load_u16(mi, addr)) as i16;
                 try_exec!(self.push(Value::I32(val as i32)));
             }
             0x2F => {
                 // i32.load16_u
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u16(addr));
+                let val = try_exec!(self.mem_load_u16(mi, addr));
                 try_exec!(self.push(Value::I32(val as i32)));
             }
             0x30 => {
                 // i64.load8_s
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u8(addr)) as i8;
+                let val = try_exec!(self.mem_load_u8(mi, addr)) as i8;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
             0x31 => {
                 // i64.load8_u
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u8(addr));
+                let val = try_exec!(self.mem_load_u8(mi, addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
             0x32 => {
                 // i64.load16_s
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u16(addr)) as i16;
+                let val = try_exec!(self.mem_load_u16(mi, addr)) as i16;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
             0x33 => {
                 // i64.load16_u
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u16(addr));
+                let val = try_exec!(self.mem_load_u16(mi, addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
             0x34 => {
                 // i64.load32_s
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u32(addr)) as i32;
+                let val = try_exec!(self.mem_load_u32(mi, addr)) as i32;
                 try_exec!(self.push(Value::I64(val as i64)));
             }
             0x35 => {
                 // i64.load32_u
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                let val = try_exec!(self.mem_load_u32(addr));
+                let val = try_exec!(self.mem_load_u32(mi, addr));
                 try_exec!(self.push(Value::I64(val as i64)));
             }
 
             // ── Sub-word stores ─────────────────────────────────────
             0x3A => {
                 // i32.store8
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_u8(addr, val as u8));
+                try_exec!(self.mem_store_u8(mi, addr, val as u8));
             }
             0x3B => {
                 // i32.store16
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i32());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_u16(addr, val as u16));
+                try_exec!(self.mem_store_u16(mi, addr, val as u16));
             }
             0x3C => {
                 // i64.store8
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_u8(addr, val as u8));
+                try_exec!(self.mem_store_u8(mi, addr, val as u8));
             }
             0x3D => {
                 // i64.store16
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_u16(addr, val as u16));
+                try_exec!(self.mem_store_u16(mi, addr, val as u16));
             }
             0x3E => {
                 // i64.store32
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_i64());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_u32(addr, val as u32));
+                try_exec!(self.mem_store_u32(mi, addr, val as u32));
             }
 
             0x38 => {
                 // f32.store
                 if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_f32());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_f32(addr, val));
+                try_exec!(self.mem_store_f32(mi, addr, val));
             }
             0x39 => {
                 // f64.store
                 if self.runtime_class == RuntimeClass::ProofGrade { return ExecResult::Trap(WasmError::FloatsDisabled); }
-                let _align = try_exec!(self.read_leb128_u32());
-                let offset = try_exec!(self.read_leb128_u32());
+                let (mi, offset) = try_exec!(self.read_memarg());
                 let val = try_exec!(self.pop_f64());
                 let base = try_exec!(self.pop_i32()) as u32;
                 let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                try_exec!(self.mem_store_f64(addr, val));
+                try_exec!(self.mem_store_f64(mi, addr, val));
             }
 
             // ── Memory management ────────────────────────────────────
             0x3F => {
                 // memory.size
-                let _reserved = try_exec!(self.read_leb128_u32()); // must be 0x00
-                let pages = (self.memory_size / WASM_PAGE_SIZE) as i64;
-                if self.module.is_memory64 {
+                let mi = try_exec!(self.read_leb128_u32()) as usize;
+                let msz = self.mem_size(mi);
+                let pages = (msz / WASM_PAGE_SIZE) as i64;
+                let is_mem64 = mi < self.module.memories.len() && self.module.memories[mi].is_memory64;
+                if is_mem64 {
                     try_exec!(self.push(Value::I64(pages)));
                 } else {
                     try_exec!(self.push(Value::I32(pages as i32)));
@@ -1926,32 +1993,38 @@ impl WasmInstance {
             }
             0x40 => {
                 // memory.grow
-                let _reserved = try_exec!(self.read_leb128_u32()); // must be 0x00
-                let delta = if self.module.is_memory64 {
+                let mi = try_exec!(self.read_leb128_u32()) as usize;
+                let is_mem64 = mi < self.module.memories.len() && self.module.memories[mi].is_memory64;
+                let delta = if is_mem64 {
                     try_exec!(self.pop_i64()) as u32
                 } else {
                     try_exec!(self.pop_i32()) as u32
                 };
-                let old_pages = (self.memory_size / WASM_PAGE_SIZE) as u32;
+                let msz = self.mem_size(mi);
+                let old_pages = (msz / WASM_PAGE_SIZE) as u32;
                 let new_pages = old_pages.saturating_add(delta);
                 // Check both the module's declared max and the global hard limit
-                let module_max = if self.module.memory_max_pages != u32::MAX {
+                let module_max = if mi < self.module.memories.len() && self.module.memories[mi].max_pages != u32::MAX {
+                    self.module.memories[mi].max_pages as usize
+                } else if self.module.has_memory_max && mi == 0 && self.module.memory_max_pages != u32::MAX {
                     self.module.memory_max_pages as usize
                 } else {
                     MAX_MEMORY_PAGES
                 };
                 if new_pages as usize > module_max || new_pages as usize > MAX_MEMORY_PAGES {
                     // Failure: push -1
-                    if self.module.is_memory64 {
+                    if is_mem64 {
                         try_exec!(self.push(Value::I64(-1)));
                     } else {
                         try_exec!(self.push(Value::I32(-1)));
                     }
                 } else {
                     let new_size = (new_pages as usize).saturating_mul(WASM_PAGE_SIZE);
-                    self.memory.resize(new_size, 0);
-                    self.memory_size = new_size;
-                    if self.module.is_memory64 {
+                    if mi < self.memories.len() {
+                        self.memories[mi].resize(new_size, 0);
+                        self.memory_sizes[mi] = new_size;
+                    }
+                    if is_mem64 {
                         try_exec!(self.push(Value::I64(old_pages as i64)));
                     } else {
                         try_exec!(self.push(Value::I32(old_pages as i32)));
@@ -2509,17 +2582,18 @@ impl WasmInstance {
                     // memory.init (8)
                     8 => {
                         let seg_idx = try_exec!(self.read_leb128_u32()) as usize;
-                        let _mem = try_exec!(self.read_leb128_u32());
+                        let mi = try_exec!(self.read_leb128_u32()) as usize;
                         let n = try_exec!(self.pop_i32()) as u32;
                         let s = try_exec!(self.pop_i32()) as u32;
                         let d = try_exec!(self.pop_i32()) as u32;
+                        let msz = self.mem_size(mi);
                         let is_dropped = seg_idx < self.dropped_data.len() && self.dropped_data[seg_idx];
                         if is_dropped {
                             // Dropped segment: n=0 is OK, but still validate d
                             if n != 0 || s != 0 {
                                 return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                             }
-                            if (d as usize) > self.memory_size {
+                            if (d as usize) > msz {
                                 return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                             }
                         } else if seg_idx < self.module.data_segments.len() {
@@ -2527,11 +2601,11 @@ impl WasmInstance {
                             let seg_data_len = self.module.data_segments[seg_idx].data_len;
                             let src_end = (s as u64) + (n as u64);
                             let dst_end = (d as u64) + (n as u64);
-                            if src_end > seg_data_len as u64 || dst_end > self.memory_size as u64 {
+                            if src_end > seg_data_len as u64 || dst_end > msz as u64 {
                                 return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                             }
                             for i in 0..(n as usize) {
-                                self.memory[(d as usize) + i] = self.module.code[seg_data_offset + (s as usize) + i];
+                                self.memories[mi][(d as usize) + i] = self.module.code[seg_data_offset + (s as usize) + i];
                             }
                         } else {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
@@ -2547,32 +2621,41 @@ impl WasmInstance {
 
                     // memory.copy (10)
                     10 => {
-                        let _dst_mem = try_exec!(self.read_leb128_u32());
-                        let _src_mem = try_exec!(self.read_leb128_u32());
+                        let dst_mi = try_exec!(self.read_leb128_u32()) as usize;
+                        let src_mi = try_exec!(self.read_leb128_u32()) as usize;
                         let n = try_exec!(self.pop_i32()) as u32;
                         let s = try_exec!(self.pop_i32()) as u32;
                         let d = try_exec!(self.pop_i32()) as u32;
                         let nu = n as usize; let su = s as usize; let du = d as usize;
-                        if su.saturating_add(nu) > self.memory_size || du.saturating_add(nu) > self.memory_size {
+                        let src_msz = self.mem_size(src_mi);
+                        let dst_msz = self.mem_size(dst_mi);
+                        if su.saturating_add(nu) > src_msz || du.saturating_add(nu) > dst_msz {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                         }
-                        if du <= su {
-                            for i in 0..nu { self.memory[du + i] = self.memory[su + i]; }
+                        if dst_mi == src_mi {
+                            if du <= su {
+                                for i in 0..nu { self.memories[dst_mi][du + i] = self.memories[src_mi][su + i]; }
+                            } else {
+                                for i in (0..nu).rev() { self.memories[dst_mi][du + i] = self.memories[src_mi][su + i]; }
+                            }
                         } else {
-                            for i in (0..nu).rev() { self.memory[du + i] = self.memory[su + i]; }
+                            // Cross-memory copy: collect source bytes first to avoid borrow conflict
+                            let src_bytes: Vec<u8> = self.memories[src_mi][su..su + nu].to_vec();
+                            self.memories[dst_mi][du..du + nu].copy_from_slice(&src_bytes);
                         }
                     }
                     // memory.fill (11)
                     11 => {
-                        let _mem = try_exec!(self.read_leb128_u32());
+                        let mi = try_exec!(self.read_leb128_u32()) as usize;
                         let n = try_exec!(self.pop_i32()) as u32;
                         let val = try_exec!(self.pop_i32()) as u8;
                         let d = try_exec!(self.pop_i32()) as u32;
                         let nu = n as usize; let du = d as usize;
-                        if du.saturating_add(nu) > self.memory_size {
+                        let msz = self.mem_size(mi);
+                        if du.saturating_add(nu) > msz {
                             return ExecResult::Trap(WasmError::MemoryOutOfBounds);
                         }
-                        for i in 0..nu { self.memory[du + i] = val; }
+                        for i in 0..nu { self.memories[mi][du + i] = val; }
                     }
 
                     // table.init (12)
@@ -2715,40 +2798,39 @@ impl WasmInstance {
                 match simd_op {
                     // ── Memory (0x00-0x0b) ──────────────────────
                     0x00 => { // v128.load
-                        let _align = try_exec!(self.read_leb128_u32());
-                        let offset = try_exec!(self.read_leb128_u32());
+                        let (mi, offset) = try_exec!(self.read_memarg());
                         let base = try_exec!(self.pop_i32()) as u32;
                         let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                        let val = try_exec!(self.mem_load_v128(addr));
+                        let val = try_exec!(self.mem_load_v128(mi, addr));
                         try_exec!(self.push(Value::V128(val)));
                     }
                     0x01..=0x0a => { // v128.load*x*_s/u, load*_splat
-                        let _align = try_exec!(self.read_leb128_u32());
-                        let offset = try_exec!(self.read_leb128_u32());
+                        let (mi, offset) = try_exec!(self.read_memarg());
                         let base = try_exec!(self.pop_i32()) as u32;
                         let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
+                        let msz = self.mem_size(mi);
+                        let m = self.mem(mi);
                         let val = match simd_op {
-                            0x01 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i16; 8]; for i in 0..8 { r[i] = self.memory[addr+i] as i8 as i16; } V128::from_i16x8(r) }
-                            0x02 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i16; 8]; for i in 0..8 { r[i] = self.memory[addr+i] as i16; } V128::from_i16x8(r) }
-                            0x03 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i32; 4]; for i in 0..4 { r[i] = i16::from_le_bytes([self.memory[addr+i*2], self.memory[addr+i*2+1]]) as i32; } V128::from_i32x4(r) }
-                            0x04 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i32; 4]; for i in 0..4 { r[i] = u16::from_le_bytes([self.memory[addr+i*2], self.memory[addr+i*2+1]]) as i32; } V128::from_i32x4(r) }
-                            0x05 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i64; 2]; for i in 0..2 { r[i] = i32::from_le_bytes([self.memory[addr+i*4], self.memory[addr+i*4+1], self.memory[addr+i*4+2], self.memory[addr+i*4+3]]) as i64; } V128::from_i64x2(r) }
-                            0x06 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i64; 2]; for i in 0..2 { r[i] = u32::from_le_bytes([self.memory[addr+i*4], self.memory[addr+i*4+1], self.memory[addr+i*4+2], self.memory[addr+i*4+3]]) as i64; } V128::from_i64x2(r) }
-                            0x07 => { if addr >= self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } V128::from_u8x16([self.memory[addr]; 16]) }
-                            0x08 => { if addr + 2 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let v = [self.memory[addr], self.memory[addr+1]]; let mut b = [0u8; 16]; for i in 0..8 { b[i*2] = v[0]; b[i*2+1] = v[1]; } V128(b) }
-                            0x09 => { if addr + 4 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut b = [0u8; 16]; for i in 0..4 { b[i*4..i*4+4].copy_from_slice(&self.memory[addr..addr+4]); } V128(b) }
-                            0x0a => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut b = [0u8; 16]; b[0..8].copy_from_slice(&self.memory[addr..addr+8]); b[8..16].copy_from_slice(&self.memory[addr..addr+8]); V128(b) }
+                            0x01 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i16; 8]; for i in 0..8 { r[i] = m[addr+i] as i8 as i16; } V128::from_i16x8(r) }
+                            0x02 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i16; 8]; for i in 0..8 { r[i] = m[addr+i] as i16; } V128::from_i16x8(r) }
+                            0x03 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i32; 4]; for i in 0..4 { r[i] = i16::from_le_bytes([m[addr+i*2], m[addr+i*2+1]]) as i32; } V128::from_i32x4(r) }
+                            0x04 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i32; 4]; for i in 0..4 { r[i] = u16::from_le_bytes([m[addr+i*2], m[addr+i*2+1]]) as i32; } V128::from_i32x4(r) }
+                            0x05 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i64; 2]; for i in 0..2 { r[i] = i32::from_le_bytes([m[addr+i*4], m[addr+i*4+1], m[addr+i*4+2], m[addr+i*4+3]]) as i64; } V128::from_i64x2(r) }
+                            0x06 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0i64; 2]; for i in 0..2 { r[i] = u32::from_le_bytes([m[addr+i*4], m[addr+i*4+1], m[addr+i*4+2], m[addr+i*4+3]]) as i64; } V128::from_i64x2(r) }
+                            0x07 => { if addr >= msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } V128::from_u8x16([m[addr]; 16]) }
+                            0x08 => { if addr + 2 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let v = [m[addr], m[addr+1]]; let mut b = [0u8; 16]; for i in 0..8 { b[i*2] = v[0]; b[i*2+1] = v[1]; } V128(b) }
+                            0x09 => { if addr + 4 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut b = [0u8; 16]; for i in 0..4 { b[i*4..i*4+4].copy_from_slice(&m[addr..addr+4]); } V128(b) }
+                            0x0a => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut b = [0u8; 16]; b[0..8].copy_from_slice(&m[addr..addr+8]); b[8..16].copy_from_slice(&m[addr..addr+8]); V128(b) }
                             _ => V128::ZERO,
                         };
                         try_exec!(self.push(Value::V128(val)));
                     }
                     0x0b => { // v128.store
-                        let _align = try_exec!(self.read_leb128_u32());
-                        let offset = try_exec!(self.read_leb128_u32());
+                        let (mi, offset) = try_exec!(self.read_memarg());
                         let val = try_exec!(self.pop_v128());
                         let base = try_exec!(self.pop_i32()) as u32;
                         let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
-                        try_exec!(self.mem_store_v128(addr, val));
+                        try_exec!(self.mem_store_v128(mi, addr, val));
                     }
                     // ── Const/Shuffle/Swizzle (0x0c-0x0e) ────────
                     0x0c => { let val = try_exec!(self.read_v128()); try_exec!(self.push(Value::V128(val))); }
@@ -2843,33 +2925,35 @@ impl WasmInstance {
                     0x53 => { let a = try_exec!(self.pop_v128()); let any = a.0.iter().any(|&b| b != 0); try_exec!(self.push(Value::I32(if any { 1 } else { 0 }))); }
                     // ── Load/Store lane (0x54-0x5b) ──────────────
                     0x54..=0x57 => { // load8/16/32/64_lane
-                        let _align = try_exec!(self.read_leb128_u32()); let offset = try_exec!(self.read_leb128_u32()); let lane = try_exec!(self.read_byte()) as usize;
+                        let (mi, offset) = try_exec!(self.read_memarg()); let lane = try_exec!(self.read_byte()) as usize;
                         let mut v = try_exec!(self.pop_v128()); let base = try_exec!(self.pop_i32()) as u32;
                         let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
+                        let msz = self.mem_size(mi);
                         match simd_op {
-                            0x54 => { if addr >= self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } v.0[lane & 15] = self.memory[addr]; }
-                            0x55 => { if addr + 2 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 7) * 2; v.0[l] = self.memory[addr]; v.0[l+1] = self.memory[addr+1]; }
-                            0x56 => { if addr + 4 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 3) * 4; v.0[l..l+4].copy_from_slice(&self.memory[addr..addr+4]); }
-                            0x57 => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 1) * 8; v.0[l..l+8].copy_from_slice(&self.memory[addr..addr+8]); }
+                            0x54 => { if addr >= msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } v.0[lane & 15] = self.mem(mi)[addr]; }
+                            0x55 => { if addr + 2 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 7) * 2; let m = self.mem(mi); v.0[l] = m[addr]; v.0[l+1] = m[addr+1]; }
+                            0x56 => { if addr + 4 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 3) * 4; v.0[l..l+4].copy_from_slice(&self.mem(mi)[addr..addr+4]); }
+                            0x57 => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 1) * 8; v.0[l..l+8].copy_from_slice(&self.mem(mi)[addr..addr+8]); }
                             _ => {}
                         }
                         try_exec!(self.push(Value::V128(v)));
                     }
                     0x58..=0x5b => { // store8/16/32/64_lane
-                        let _align = try_exec!(self.read_leb128_u32()); let offset = try_exec!(self.read_leb128_u32()); let lane = try_exec!(self.read_byte()) as usize;
+                        let (mi, offset) = try_exec!(self.read_memarg()); let lane = try_exec!(self.read_byte()) as usize;
                         let v = try_exec!(self.pop_v128()); let base = try_exec!(self.pop_i32()) as u32;
                         let addr = try_exec!(base.checked_add(offset).ok_or(WasmError::MemoryOutOfBounds)) as usize;
+                        let msz = self.mem_size(mi);
                         match simd_op {
-                            0x58 => { if addr >= self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } self.memory[addr] = v.0[lane & 15]; }
-                            0x59 => { if addr + 2 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 7) * 2; self.memory[addr] = v.0[l]; self.memory[addr+1] = v.0[l+1]; }
-                            0x5a => { if addr + 4 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 3) * 4; self.memory[addr..addr+4].copy_from_slice(&v.0[l..l+4]); }
-                            0x5b => { if addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 1) * 8; self.memory[addr..addr+8].copy_from_slice(&v.0[l..l+8]); }
+                            0x58 => { if addr >= msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } self.mem_mut(mi)[addr] = v.0[lane & 15]; }
+                            0x59 => { if addr + 2 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 7) * 2; let m = self.mem_mut(mi); m[addr] = v.0[l]; m[addr+1] = v.0[l+1]; }
+                            0x5a => { if addr + 4 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 3) * 4; self.mem_mut(mi)[addr..addr+4].copy_from_slice(&v.0[l..l+4]); }
+                            0x5b => { if addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let l = (lane & 1) * 8; self.mem_mut(mi)[addr..addr+8].copy_from_slice(&v.0[l..l+8]); }
                             _ => {}
                         }
                     }
                     // ── Load zero (0x5c-0x5d) ────────────────────
-                    0x5c => { let _a = try_exec!(self.read_leb128_u32()); let o = try_exec!(self.read_leb128_u32()); let b = try_exec!(self.pop_i32()) as u32; let addr = try_exec!(b.checked_add(o).ok_or(WasmError::MemoryOutOfBounds)) as usize; let v = try_exec!(self.mem_load_u32(addr)); let mut r = [0u8; 16]; r[0..4].copy_from_slice(&v.to_le_bytes()); try_exec!(self.push(Value::V128(V128(r)))); }
-                    0x5d => { let _a = try_exec!(self.read_leb128_u32()); let o = try_exec!(self.read_leb128_u32()); let b = try_exec!(self.pop_i32()) as u32; let addr = try_exec!(b.checked_add(o).ok_or(WasmError::MemoryOutOfBounds)) as usize; if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds).is_err() || addr + 8 > self.memory_size { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0u8; 16]; r[0..8].copy_from_slice(&self.memory[addr..addr+8]); try_exec!(self.push(Value::V128(V128(r)))); }
+                    0x5c => { let (mi, o) = try_exec!(self.read_memarg()); let b = try_exec!(self.pop_i32()) as u32; let addr = try_exec!(b.checked_add(o).ok_or(WasmError::MemoryOutOfBounds)) as usize; let v = try_exec!(self.mem_load_u32(mi, addr)); let mut r = [0u8; 16]; r[0..4].copy_from_slice(&v.to_le_bytes()); try_exec!(self.push(Value::V128(V128(r)))); }
+                    0x5d => { let (mi, o) = try_exec!(self.read_memarg()); let b = try_exec!(self.pop_i32()) as u32; let addr = try_exec!(b.checked_add(o).ok_or(WasmError::MemoryOutOfBounds)) as usize; let msz = self.mem_size(mi); if addr.checked_add(8).ok_or(WasmError::MemoryOutOfBounds).is_err() || addr + 8 > msz { return ExecResult::Trap(WasmError::MemoryOutOfBounds); } let mut r = [0u8; 16]; r[0..8].copy_from_slice(&self.mem(mi)[addr..addr+8]); try_exec!(self.push(Value::V128(V128(r)))); }
                     // ── Conversion (0x5e-0x5f) ───────────────────
                     0x5e => { let a = try_exec!(self.pop_v128()); let aa = a.as_f64x2(); try_exec!(self.push(Value::V128(V128::from_f32x4([aa[0] as f32, aa[1] as f32, 0.0, 0.0])))); }
                     0x5f => { let a = try_exec!(self.pop_v128()); let aa = a.as_f32x4(); try_exec!(self.push(Value::V128(V128::from_f64x2([aa[0] as f64, aa[1] as f64])))); }

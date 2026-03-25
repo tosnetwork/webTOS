@@ -139,6 +139,16 @@ pub struct TableDef {
     pub is_table64: bool,
 }
 
+/// A memory definition (imported or locally defined).
+#[derive(Clone)]
+pub struct MemoryDef {
+    pub min_pages: u32,
+    pub max_pages: u32,
+    pub has_max: bool,
+    pub is_memory64: bool,
+    pub page_size_log2: Option<u32>,
+}
+
 /// A data segment for memory initialization.
 #[derive(Clone)]
 pub struct DataSegment {
@@ -207,6 +217,7 @@ pub struct WasmModule {
     pub exports: Vec<ExportDef>,
     pub globals: Vec<GlobalDef>,
     pub tables: Vec<TableDef>,
+    pub memories: Vec<MemoryDef>,
     pub data_segments: Vec<DataSegment>,
     pub element_segments: Vec<ElementSegment>,
     pub start_func: Option<u32>,
@@ -252,6 +263,7 @@ impl WasmModule {
             exports: Vec::new(),
             globals: Vec::new(),
             tables: Vec::new(),
+            memories: Vec::new(),
             data_segments: Vec::new(),
             element_segments: Vec::new(),
             start_func: None,
@@ -704,7 +716,16 @@ fn decode_valtype_from_stream(bytes: &[u8], pos: &mut usize) -> Result<ValType, 
         0x6F => Ok(ValType::ExternRef),
         0x63 | 0x64 => {
             let heap_type = decode_leb128_i32(bytes, pos)?;
-            if heap_type == -0x11 { Ok(ValType::ExternRef) } else { Ok(ValType::FuncRef) }
+            if heap_type == -0x11 {
+                Ok(ValType::ExternRef)
+            } else if heap_type == -0x10 {
+                // (ref null func) = funcref, (ref func) = non-nullable abstract func ref
+                if b == 0x63 { Ok(ValType::FuncRef) } else { Ok(ValType::TypedFuncRef) }
+            } else if b == 0x63 {
+                Ok(ValType::NullableTypedFuncRef) // (ref null $t)
+            } else {
+                Ok(ValType::TypedFuncRef) // (ref $t)
+            }
         }
         _ => Err(WasmError::TypeMismatch),
     }
@@ -749,8 +770,14 @@ fn decode_reftype_real(bytes: &[u8], pos: &mut usize) -> Result<ValType, WasmErr
         0x70 => Ok(ValType::FuncRef),
         0x6F => Ok(ValType::ExternRef),
         0x63 | 0x64 => {
-            let _ = decode_leb128_i32(bytes, pos)?;
-            Ok(if b == 0x63 { ValType::FuncRef } else { ValType::FuncRef })
+            let heap_type = decode_leb128_i32(bytes, pos)?;
+            if heap_type == -0x10 {
+                Ok(if b == 0x63 { ValType::FuncRef } else { ValType::TypedFuncRef })
+            } else if heap_type == -0x11 {
+                Ok(ValType::ExternRef)
+            } else {
+                Ok(if b == 0x63 { ValType::NullableTypedFuncRef } else { ValType::TypedFuncRef })
+            }
         }
         _ => Err(WasmError::TypeMismatch),
     }
@@ -961,6 +988,13 @@ fn decode_import_section(
                 } else {
                     module.memory_max_pages = u32::MAX;
                 }
+                module.memories.push(MemoryDef {
+                    min_pages: min,
+                    max_pages: if has_max { max } else { u32::MAX },
+                    has_max,
+                    is_memory64,
+                    page_size_log2: mem_page_size_log2,
+                });
                 imp.kind = ImportKind::Memory;
             }
             0x03 => {
@@ -1036,12 +1070,12 @@ fn decode_memory_section(
             return Err(WasmError::InvalidSection);
         }
         let is_memory64 = (flags & 0b100) != 0;
-        let min = if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? };
+        let min_raw = if is_memory64 { decode_leb128_u64(bytes, pos)? } else { decode_leb128_u32(bytes, pos)? as u64 };
         let has_max = flags & 1 != 0;
-        let max = if has_max {
-            if is_memory64 { decode_leb128_u64(bytes, pos)? as u32 } else { decode_leb128_u32(bytes, pos)? }
+        let max_raw = if has_max {
+            if is_memory64 { decode_leb128_u64(bytes, pos)? } else { decode_leb128_u32(bytes, pos)? as u64 }
         } else {
-            u32::MAX
+            u64::MAX
         };
         // If custom-page-sizes flag (bit 3), read and validate page_size_log2
         let mem_page_size_log2 = if flags & 0b1000 != 0 {
@@ -1054,6 +1088,32 @@ fn decode_memory_section(
         } else {
             None
         };
+        // Validate memory64 limits against maximum before truncating
+        if is_memory64 {
+            let page_size_log2 = mem_page_size_log2.unwrap_or(16);
+            let max_pages_for_mem64: u64 = if page_size_log2 == 0 {
+                // pagesize 1: max is 2^48 bytes = 2^48
+                1u64 << 48
+            } else {
+                // pagesize 2^n: max is 2^48 / 2^n = 2^(48-n)
+                1u64 << (48u32.saturating_sub(page_size_log2))
+            };
+            if min_raw > max_pages_for_mem64 {
+                return Err(WasmError::MemoryOutOfBounds);
+            }
+            if has_max && max_raw > max_pages_for_mem64 {
+                return Err(WasmError::MemoryOutOfBounds);
+            }
+        }
+        let min = min_raw as u32;
+        let max = if has_max { max_raw as u32 } else { u32::MAX };
+        module.memories.push(MemoryDef {
+            min_pages: min,
+            max_pages: max,
+            has_max,
+            is_memory64,
+            page_size_log2: mem_page_size_log2,
+        });
         if mem_idx == 0 {
             module.memory_min_pages = min;
             module.is_memory64 = is_memory64;
@@ -1221,9 +1281,10 @@ fn decode_table_section(
 
         // elemtype: 0x70 = funcref, 0x6F = externref, 0x63/0x64 = ref types
         let elemtype = read_byte(bytes, pos)?;
+        let mut elem_heap_type: i32 = 0;
         if elemtype == 0x63 || elemtype == 0x64 {
-            // Nullable/non-nullable ref type: read and discard heap type
-            let _ = decode_leb128_i32(bytes, pos)?;
+            // Nullable/non-nullable ref type: read heap type
+            elem_heap_type = decode_leb128_i32(bytes, pos)?;
         } else if elemtype != 0x70 && elemtype != 0x6F {
             return Err(WasmError::InvalidSection);
         }
@@ -1259,7 +1320,18 @@ fn decode_table_section(
         let et = match elemtype {
             0x70 => ValType::FuncRef,
             0x6F => ValType::ExternRef,
-            _ => ValType::FuncRef, // 0x63/0x64 ref types default to funcref
+            0x64 => {
+                // (ref ht) = non-nullable
+                if elem_heap_type == -0x10 { ValType::TypedFuncRef }
+                else if elem_heap_type == -0x11 { ValType::ExternRef }
+                else { ValType::TypedFuncRef }
+            }
+            _ => {
+                // 0x63 = (ref null ht) = nullable
+                if elem_heap_type == -0x10 { ValType::FuncRef }
+                else if elem_heap_type == -0x11 { ValType::ExternRef }
+                else { ValType::NullableTypedFuncRef }
+            }
         };
         module.tables.push(TableDef { min, max, elem_type: et, is_table64 });
     }
@@ -1701,8 +1773,9 @@ pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
             0xD0 => {
                 let ht = decode_leb128_i32(bytes, &mut p);
                 let vt = match ht {
-                    Ok(-0x10) => Some(ValType::FuncRef),
-                    Ok(-0x11) => Some(ValType::ExternRef),
+                    Ok(-0x10) => Some(ValType::FuncRef),     // (ref null func) = funcref
+                    Ok(-0x11) => Some(ValType::ExternRef),   // (ref null extern) = externref
+                    Ok(ht_idx) if ht_idx >= 0 => Some(ValType::NullableTypedFuncRef), // (ref null $t)
                     _ => None,
                 };
                 if sp < 16 { type_stack[sp] = vt; sp += 1; }
@@ -1713,7 +1786,8 @@ pub fn scan_init_expr_info(bytes: &[u8], start: usize) -> InitExprInfo {
                         info.func_ref = Some(idx);
                     }
                 }
-                if sp < 16 { type_stack[sp] = Some(ValType::FuncRef); sp += 1; }
+                // ref.func produces (ref $t) = TypedFuncRef (non-nullable)
+                if sp < 16 { type_stack[sp] = Some(ValType::TypedFuncRef); sp += 1; }
             }
             0xFD => {
                 let _ = decode_leb128_u32(bytes, &mut p);

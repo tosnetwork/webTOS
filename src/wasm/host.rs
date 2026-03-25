@@ -118,11 +118,11 @@ pub fn handle_host_call(
 
             // Validate memory bounds (checked_add to prevent overflow)
             let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > instance.memory_size {
+            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            let _ = &instance.memory[ptr..end];
+            let _ = &instance.memories[0][ptr..end];
             Ok(Some(Value::I32(0)))
         }
 
@@ -134,7 +134,7 @@ pub fn handle_host_call(
 
             // Validate memory bounds (checked_add to prevent overflow)
             let end = ptr.checked_add(capacity).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > instance.memory_size {
+            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
@@ -161,11 +161,11 @@ pub fn handle_host_call(
             let len = args[1].as_i32() as usize;
 
             let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > instance.memory_size {
+            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            let _msg_bytes = &instance.memory[ptr..end];
+            let _msg_bytes = &instance.memories[0][ptr..end];
 
             Ok(None) // log returns void
         }

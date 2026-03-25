@@ -414,46 +414,53 @@ impl WastRunner {
         if let Some(src_handle) = &memory_source {
             let mut record = handle.borrow_mut();
             let src = src_handle.borrow();
-            // Copy the exporter's memory content
-            let copy_len = src.instance.memory_size.min(record.instance.memory_size);
-            record.instance.memory[..copy_len].copy_from_slice(&src.instance.memory[..copy_len]);
+            // Copy the exporter's memory content (memory 0)
+            let src_mem_size = if src.instance.memory_sizes.is_empty() { 0 } else { src.instance.memory_sizes[0] };
+            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+            let copy_len = src_mem_size.min(rec_mem_size);
+            if copy_len > 0 && !record.instance.memories.is_empty() && !src.instance.memories.is_empty() {
+                record.instance.memories[0][..copy_len].copy_from_slice(&src.instance.memories[0][..copy_len]);
+            }
             // If exporter's memory is larger, grow the importer's memory to match
-            if src.instance.memory_size > record.instance.memory_size {
-                record.instance.memory.resize(src.instance.memory_size, 0);
-                let extra_start = record.instance.memory_size;
-                let extra_end = src.instance.memory_size;
-                record.instance.memory[extra_start..extra_end]
-                    .copy_from_slice(&src.instance.memory[extra_start..extra_end]);
-                record.instance.memory_size = src.instance.memory_size;
+            if src_mem_size > rec_mem_size && !record.instance.memories.is_empty() && !src.instance.memories.is_empty() {
+                record.instance.memories[0].resize(src_mem_size, 0);
+                let extra_start = rec_mem_size;
+                let extra_end = src_mem_size;
+                record.instance.memories[0][extra_start..extra_end]
+                    .copy_from_slice(&src.instance.memories[0][extra_start..extra_end]);
+                record.instance.memory_sizes[0] = src_mem_size;
             }
             drop(src);
             // Re-apply the importer's own active data segments on top
-            // Collect segment info first to avoid borrow conflict
+            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
             let segs: Vec<(usize, usize, usize)> = record.instance.module.data_segments.iter()
                 .filter(|seg| seg.is_active)
                 .map(|seg| (seg.offset as usize, seg.data_offset, seg.data_len))
                 .collect();
             for (dst_start, src_start, len) in segs {
-                if dst_start.saturating_add(len) <= record.instance.memory_size
+                if dst_start.saturating_add(len) <= rec_mem_size
                     && src_start.saturating_add(len) <= record.instance.module.code.len()
+                    && !record.instance.memories.is_empty()
                 {
                     let code_bytes = record.instance.module.code[src_start..src_start + len].to_vec();
-                    record.instance.memory[dst_start..dst_start + len]
+                    record.instance.memories[0][dst_start..dst_start + len]
                         .copy_from_slice(&code_bytes);
                 }
             }
             // Copy the result back to the exporter so both share the same state
-            let src = src_handle.borrow();
-            let copy_back = record.instance.memory_size.min(src.instance.memory.len());
-            drop(src);
+            let rec_mem_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
             let mut src_mut = src_handle.borrow_mut();
-            if record.instance.memory_size > src_mut.instance.memory_size {
-                src_mut.instance.memory.resize(record.instance.memory_size, 0);
-                src_mut.instance.memory_size = record.instance.memory_size;
+            let src_mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
+            if rec_mem_size > src_mem_size && !src_mut.instance.memories.is_empty() {
+                src_mut.instance.memories[0].resize(rec_mem_size, 0);
+                src_mut.instance.memory_sizes[0] = rec_mem_size;
             }
-            let copy_back = record.instance.memory_size.min(src_mut.instance.memory_size);
-            src_mut.instance.memory[..copy_back]
-                .copy_from_slice(&record.instance.memory[..copy_back]);
+            let src_mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
+            let copy_back = rec_mem_size.min(src_mem_size);
+            if copy_back > 0 && !src_mut.instance.memories.is_empty() && !record.instance.memories.is_empty() {
+                src_mut.instance.memories[0][..copy_back]
+                    .copy_from_slice(&record.instance.memories[0][..copy_back]);
+            }
             // Track memory sharing for later sync
             self.memory_shares.push((handle.clone(), src_handle.clone()));
         }
@@ -637,6 +644,7 @@ impl WastRunner {
     /// Stops at the first OOB segment, matching spec instantiation semantics.
     fn apply_partial_data_segments_to_shared(&self, module: &WasmModule, mem_src: &InstanceHandle) {
         let mut src_mut = mem_src.borrow_mut();
+        let mem_size = if src_mut.instance.memory_sizes.is_empty() { 0 } else { src_mut.instance.memory_sizes[0] };
         for seg in &module.data_segments {
             if !seg.is_active {
                 continue;
@@ -644,12 +652,12 @@ impl WastRunner {
             let dst_start = seg.offset as usize;
             let len = seg.data_len;
             // Stop at first OOB segment (the one that caused the trap)
-            if dst_start.saturating_add(len) > src_mut.instance.memory_size {
+            if dst_start.saturating_add(len) > mem_size {
                 break;
             }
             let src_start = seg.data_offset;
-            if src_start.saturating_add(len) <= module.code.len() {
-                src_mut.instance.memory[dst_start..dst_start + len]
+            if src_start.saturating_add(len) <= module.code.len() && !src_mut.instance.memories.is_empty() {
+                src_mut.instance.memories[0][dst_start..dst_start + len]
                     .copy_from_slice(&module.code[src_start..src_start + len]);
             }
         }
@@ -722,31 +730,32 @@ impl WastRunner {
             let (imp_size, exp_size) = {
                 let imp = importer.borrow();
                 let exp = exporter.borrow();
-                (imp.instance.memory_size, exp.instance.memory_size)
+                let is = if imp.instance.memory_sizes.is_empty() { 0 } else { imp.instance.memory_sizes[0] };
+                let es = if exp.instance.memory_sizes.is_empty() { 0 } else { exp.instance.memory_sizes[0] };
+                (is, es)
             };
             if imp_size > exp_size {
-                // Importer grew; sync to exporter
                 let imp = importer.borrow();
                 let mut exp = exporter.borrow_mut();
-                exp.instance.memory.resize(imp_size, 0);
-                exp.instance.memory[..imp_size].copy_from_slice(&imp.instance.memory[..imp_size]);
-                exp.instance.memory_size = imp_size;
+                if !exp.instance.memories.is_empty() && !imp.instance.memories.is_empty() {
+                    exp.instance.memories[0].resize(imp_size, 0);
+                    exp.instance.memories[0][..imp_size].copy_from_slice(&imp.instance.memories[0][..imp_size]);
+                    exp.instance.memory_sizes[0] = imp_size;
+                }
             } else if exp_size > imp_size {
-                // Exporter grew; sync to importer
                 let exp = exporter.borrow();
                 let mut imp = importer.borrow_mut();
-                imp.instance.memory.resize(exp_size, 0);
-                imp.instance.memory[..exp_size].copy_from_slice(&exp.instance.memory[..exp_size]);
-                imp.instance.memory_size = exp_size;
+                if !imp.instance.memories.is_empty() && !exp.instance.memories.is_empty() {
+                    imp.instance.memories[0].resize(exp_size, 0);
+                    imp.instance.memories[0][..exp_size].copy_from_slice(&exp.instance.memories[0][..exp_size]);
+                    imp.instance.memory_sizes[0] = exp_size;
+                }
             } else if imp_size == exp_size && imp_size > 0 {
-                // Same size, sync contents (bidirectional: use the most recently modified)
-                // Simple approach: copy from the instance that was just executed.
-                // Since we can't easily tell which was just executed, sync bidirectionally
-                // by preferring the one with different content.
-                // For simplicity, just sync from importer to exporter (most common case).
                 let imp = importer.borrow();
                 let mut exp = exporter.borrow_mut();
-                exp.instance.memory[..imp_size].copy_from_slice(&imp.instance.memory[..imp_size]);
+                if !exp.instance.memories.is_empty() && !imp.instance.memories.is_empty() {
+                    exp.instance.memories[0][..imp_size].copy_from_slice(&imp.instance.memories[0][..imp_size]);
+                }
             }
         }
     }
@@ -1160,7 +1169,8 @@ impl WastRunner {
             } else if let Some(handle) = self.instances.get(&module_name) {
                 let record = handle.borrow();
                 // Use the actual memory size of the exporting instance
-                let actual_pages = (record.instance.memory_size / 65536) as u32;
+                let mem0_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+                let actual_pages = (mem0_size / 65536) as u32;
                 let actual_max = if record.instance.module.has_memory_max {
                     Some(record.instance.module.memory_max_pages)
                 } else {
@@ -1175,6 +1185,12 @@ impl WastRunner {
             if module.memory_min_pages < actual_min_pages {
                 module.memory_min_pages = actual_min_pages;
             }
+            // Also update the MemoryDef if it exists
+            if !module.memories.is_empty() {
+                if module.memories[0].min_pages < actual_min_pages {
+                    module.memories[0].min_pages = actual_min_pages;
+                }
+            }
             // Cap memory_max_pages to the actual provider's max
             if let Some(actual_max) = actual_max_pages {
                 if module.has_memory_max {
@@ -1184,6 +1200,10 @@ impl WastRunner {
                 } else {
                     module.has_memory_max = true;
                     module.memory_max_pages = actual_max;
+                }
+                if !module.memories.is_empty() {
+                    module.memories[0].has_max = true;
+                    module.memories[0].max_pages = actual_max;
                 }
             }
             break; // only one memory in MVP
@@ -1561,7 +1581,8 @@ impl WastRunner {
             let export_min = record.instance.module.memory_min_pages;
             let export_has_max = record.instance.module.has_memory_max;
             let export_max = record.instance.module.memory_max_pages;
-            let actual_pages = (record.instance.memory_size / 65536) as u32;
+            let mem0_size = if record.instance.memory_sizes.is_empty() { 0 } else { record.instance.memory_sizes[0] };
+            let actual_pages = (mem0_size / 65536) as u32;
             let available_min = actual_pages.max(export_min);
 
             if import_min > available_min {
@@ -2326,6 +2347,8 @@ fn value_matches_type(value: Value, val_type: ValType) -> bool {
             | (Value::V128(_), ValType::V128)
             | (Value::I32(_), ValType::FuncRef)
             | (Value::I32(_), ValType::ExternRef)
+            | (Value::I32(_), ValType::TypedFuncRef)
+            | (Value::I32(_), ValType::NullableTypedFuncRef)
     )
 }
 
