@@ -92,7 +92,7 @@ fn handle_install(recv_buf: &[u8], msg_len: usize) {
     match crate::wasm::decoder::decode(wasm_bytes) {
         Ok(module) => {
             serial_println!("[SKILLD] WASM module validated: {} functions, {} exports",
-                module.functions.len(), module.exports.len());
+                module.get_functions().len(), module.get_exports().len());
 
             // Register the skill
             unsafe {

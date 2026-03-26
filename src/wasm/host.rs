@@ -35,10 +35,9 @@ pub enum HostFunc {
 
 /// Resolve an import index to a `HostFunc` by examining the import names.
 pub fn resolve_import(module: &WasmModule, func_idx: u32) -> HostFunc {
-    // Find the N-th function import (func_idx is a function index, not import array index)
     let mut func_count: u32 = 0;
     let mut found_imp = None;
-    for imp in &module.imports {
+    for imp in module.get_imports() {
         if let crate::wasm::decoder::ImportKind::Func(_) = imp.kind {
             if func_count == func_idx {
                 found_imp = Some(imp);
@@ -77,64 +76,42 @@ pub fn resolve_import(module: &WasmModule, func_idx: u32) -> HostFunc {
 }
 
 /// Handle a host function call.
-///
-/// This is called when the interpreter encounters a `HostCall` result.
-/// It resolves the import, executes the host logic, and returns an
-/// optional value to push back onto the WASM stack.
-///
-/// # Arguments
-///
-/// * `instance` — the running WASM instance (for memory access)
-/// * `import_idx` — the import index from the `HostCall`
-/// * `args` — the arguments popped from the WASM stack
-/// * `arg_count` — number of valid entries in `args`
-///
-/// # Returns
-///
-/// `Ok(Some(value))` — push this value onto the WASM stack and resume
-/// `Ok(None)` — resume with no return value
-/// `Err(e)` — trap the WASM instance
 pub fn handle_host_call(
     instance: &mut WasmInstance,
     import_idx: u32,
     args: &[Value],
     _arg_count: u8,
 ) -> Result<Option<Value>, WasmError> {
-    let func = resolve_import(&instance.module, import_idx);
+    let func = resolve_import(instance.module(), import_idx);
 
     match func {
         HostFunc::SysYield => {
-            // sys_yield() -> i32
-            // In a real kernel, this would yield the current agent's timeslice.
-            // For now, return 0 (success).
             Ok(Some(Value::I32(0)))
         }
 
         HostFunc::SysSend => {
-            // sys_send(mailbox_id: i32, ptr: i32, len: i32) -> i32
             let _mailbox_id = args[0].as_i32();
             let ptr = args[1].as_i32() as usize;
             let len = args[2].as_i32() as usize;
 
-            // Validate memory bounds (checked_add to prevent overflow)
             let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
+            let mem_size = instance.get_memory_size(0).unwrap_or(0);
+            if end > mem_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            let _ = &instance.memories[0][ptr..end];
+            let _ = &instance.get_memory(0).unwrap()[ptr..end];
             Ok(Some(Value::I32(0)))
         }
 
         HostFunc::SysRecv => {
-            // sys_recv(mailbox_id: i32, ptr: i32, capacity: i32) -> i32
             let _mailbox_id = args[0].as_i32();
             let ptr = args[1].as_i32() as usize;
             let capacity = args[2].as_i32() as usize;
 
-            // Validate memory bounds (checked_add to prevent overflow)
             let end = ptr.checked_add(capacity).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
+            let mem_size = instance.get_memory_size(0).unwrap_or(0);
+            if end > mem_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
@@ -142,32 +119,27 @@ pub fn handle_host_call(
         }
 
         HostFunc::SysExit => {
-            // sys_exit(code: i32)
-            // Mark the instance as finished. The exit code is on args[0].
-            instance.finished = true;
-            // Return the exit code — the caller will handle it.
+            instance.set_finished(true);
             Ok(Some(Value::I32(args[0].as_i32())))
         }
 
         HostFunc::SysEnergyGet => {
-            // sys_energy_get() -> i64
-            // Return remaining fuel as the energy value.
-            Ok(Some(Value::I64(instance.fuel as i64)))
+            Ok(Some(Value::I64(instance.get_fuel() as i64)))
         }
 
         HostFunc::Log => {
-            // log(ptr: i32, len: i32)
             let ptr = args[0].as_i32() as usize;
             let len = args[1].as_i32() as usize;
 
             let end = ptr.checked_add(len).ok_or(WasmError::MemoryOutOfBounds)?;
-            if end > if instance.memory_sizes.is_empty() { 0 } else { instance.memory_sizes[0] } {
+            let mem_size = instance.get_memory_size(0).unwrap_or(0);
+            if end > mem_size {
                 return Err(WasmError::MemoryOutOfBounds);
             }
 
-            let _msg_bytes = &instance.memories[0][ptr..end];
+            let _msg_bytes = &instance.get_memory(0).unwrap()[ptr..end];
 
-            Ok(None) // log returns void
+            Ok(None)
         }
 
         HostFunc::Unknown => {

@@ -102,9 +102,9 @@ pub extern "C" fn wasm_agent_entry() -> ! {
         Ok(m) => {
             serial_println!(
                 "[WASM_AGENT] Module decoded: {} functions, {} imports, {} exports",
-                m.functions.len(),
-                m.imports.len(),
-                m.exports.len()
+                m.get_functions().len(),
+                m.get_imports().len(),
+                m.get_exports().len()
             );
             m
         }

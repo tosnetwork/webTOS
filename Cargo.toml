@@ -7,6 +7,7 @@ description = "ATOS Stage-1: AI-native minimal operating system kernel"
 
 [dependencies]
 libm = "0.2"
+wasbi = { path = "../wasbi" }
 
 [profile.dev]
 panic = "abort"
