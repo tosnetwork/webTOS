@@ -11,3 +11,9 @@ pub mod validator;
 #[allow(dead_code)]
 pub mod runtime;
 pub mod host;
+#[allow(dead_code)]
+pub mod instance;
+#[allow(dead_code)]
+pub mod linker;
+#[allow(dead_code)]
+pub mod store;

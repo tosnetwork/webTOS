@@ -1,4 +1,16 @@
 use crate::wasm::decoder::{ExportKind, FuncTypeDef, GlobalDef, ImportKind, WasmModule};
+use crate::wasm::instance::{
+    bytes_to_string, copy_function_from_module, exported_global_index,
+    exported_memory_index, exported_table_index, find_or_add_func_type, function_type,
+    function_type_idx, nth_function_import,
+};
+use crate::wasm::linker::{
+    cross_module_type_subtype, decode_valtype_byte, func_types_match,
+    global_types_compatible, type_indices_equivalent, value_matches_type,
+};
+use crate::wasm::store::{
+    self, ResolvedGlobal, ResolvedMemory, ResolvedTable,
+};
 use crate::wasm::runtime::{ExecResult, WasmInstance};
 use crate::wasm::types::{RuntimeClass, ValType, Value, V128, WasmError};
 use anyhow::{Context, Result, anyhow, bail};
@@ -1835,7 +1847,8 @@ impl WastRunner {
     }
 
     fn inject_imported_globals(&self, module: &mut WasmModule) -> RunnerResult<()> {
-        let mut imported = Vec::new();
+        // Resolve global import values from the instance registry
+        let mut resolved = Vec::new();
         for import in &module.imports {
             let ImportKind::Global(val_type_byte, mutable, _) = import.kind else {
                 continue;
@@ -1882,47 +1895,12 @@ impl WastRunner {
                     ),
                 ));
             }
-            imported.push(GlobalDef {
-                val_type,
-                mutable,
-                init_value: value,
-                init_global_ref: None,
-                init_func_ref: None,
-                init_expr_type: Some(val_type),
-                init_expr_stack_depth: 1,
-                init_expr_bytes: Vec::new(),
-                heap_type: None,
-                has_non_const: false,
-            });
+            resolved.push(ResolvedGlobal { val_type, mutable, value });
         }
 
-        if !imported.is_empty() {
-            let num_imported = imported.len();
-            let mut globals = imported;
-            globals.extend(module.globals.iter().cloned());
-            module.globals = globals;
-
-            // Re-evaluate init expressions for module-defined globals that reference
-            // imported globals. At decode time, global.get returns 0 as a placeholder.
-            // Now that imported globals have their actual values, add the reference value.
-            for i in num_imported..module.globals.len() {
-                if let Some(ref_idx) = module.globals[i].init_global_ref {
-                    if (ref_idx as usize) < i {
-                        let ref_val = module.globals[ref_idx as usize].init_value;
-                        let init = &mut module.globals[i].init_value;
-                        match (ref_val, *init) {
-                            (Value::I32(r), Value::I32(v)) => *init = Value::I32(v.wrapping_add(r)),
-                            (Value::I64(r), Value::I64(v)) => *init = Value::I64(v.wrapping_add(r)),
-                            (Value::F32(r), Value::F32(v)) => *init = Value::F32(v + r),
-                            (Value::F64(r), Value::F64(v)) => *init = Value::F64(v + r),
-                            (val, _) => *init = val,
-                        }
-                        // Clear the ref so the runtime doesn't re-process
-                        module.globals[i].init_global_ref = None;
-                    }
-                }
-            }
-        }
+        // Apply resolved globals using the engine
+        store::apply_imported_globals(module, resolved)
+            .map_err(|msg| RunnerError::new("link", msg))?;
         Ok(())
     }
 
@@ -1988,61 +1966,12 @@ impl WastRunner {
     /// After inject_imported_globals, the globals have actual values, so we can
     /// re-evaluate extended-const offset expressions that use global.get.
     fn fixup_segment_offsets(&self, module: &mut WasmModule, original_bytes: &[u8]) {
-        // Build global init values for the evaluator
-        let global_values: Vec<Value> = module.globals.iter().map(|g| g.init_value).collect();
-
-        // Re-evaluate element segment offsets
-        use crate::wasm::decoder::ElemMode;
-        for seg in &mut module.element_segments {
-            if seg.mode != ElemMode::Active {
-                continue;
-            }
-            // Only re-evaluate if the offset expression references a global
-            if seg.offset_expr_info.global_ref.is_none() {
-                continue;
-            }
-            let (start, end) = seg.offset_expr_range;
-            if start == 0 && end == 0 {
-                continue; // no saved byte range
-            }
-            if end <= original_bytes.len() {
-                let mut pos = start;
-                if let Ok(val) = crate::wasm::decoder::eval_init_expr_with_globals(original_bytes, &mut pos, &global_values) {
-                    seg.offset = match val {
-                        Value::I32(v) => v as u32,
-                        Value::I64(v) => v as u32,
-                        _ => seg.offset,
-                    };
-                }
-            }
-        }
-
-        // Re-evaluate data segment offsets
-        for seg in &mut module.data_segments {
-            if !seg.is_active {
-                continue;
-            }
-            if seg.offset_expr_info.global_ref.is_none() {
-                continue;
-            }
-            let (start, end) = seg.offset_expr_range;
-            if start == 0 && end == 0 {
-                continue;
-            }
-            if end <= original_bytes.len() {
-                let mut pos = start;
-                if let Ok(val) = crate::wasm::decoder::eval_init_expr_with_globals(original_bytes, &mut pos, &global_values) {
-                    seg.offset = match val {
-                        Value::I32(v) => v as u32,
-                        Value::I64(v) => v as u32,
-                        _ => seg.offset,
-                    };
-                }
-            }
-        }
+        store::fixup_segment_offsets(module, original_bytes);
     }
 
     fn inject_imported_memory(&self, module: &mut WasmModule) -> RunnerResult<()> {
+        // Resolve memory sizes from the instance registry
+        let mut resolved = Vec::new();
         let mut mem_idx = 0usize;
         for import in &module.imports {
             if !matches!(import.kind, ImportKind::Memory) {
@@ -2056,7 +1985,6 @@ impl WastRunner {
                 (1u32, Some(2u32))
             } else if let Some(handle) = self.instances.get(&module_name) {
                 let record = handle.borrow();
-                // Find the exported memory index
                 let exp_mem_idx = exported_memory_index(&record.instance.module, &field_name)
                     .unwrap_or(0) as usize;
                 let mem_size = record.instance.memory_sizes.get(exp_mem_idx).copied().unwrap_or(0);
@@ -2081,45 +2009,21 @@ impl WastRunner {
                 continue;
             };
 
-            // Update module-wide fields for memory 0 (backward compat)
-            if mem_idx == 0 {
-                if module.memory_min_pages < actual_min_pages {
-                    module.memory_min_pages = actual_min_pages;
-                }
-                if let Some(actual_max) = actual_max_pages {
-                    if module.has_memory_max {
-                        if module.memory_max_pages > actual_max {
-                            module.memory_max_pages = actual_max;
-                        }
-                    } else {
-                        module.has_memory_max = true;
-                        module.memory_max_pages = actual_max;
-                    }
-                }
-            }
-
-            // Update the per-memory MemoryDef
-            if mem_idx < module.memories.len() {
-                if module.memories[mem_idx].min_pages < actual_min_pages {
-                    module.memories[mem_idx].min_pages = actual_min_pages;
-                }
-                if let Some(actual_max) = actual_max_pages {
-                    if module.memories[mem_idx].has_max {
-                        if module.memories[mem_idx].max_pages > actual_max {
-                            module.memories[mem_idx].max_pages = actual_max;
-                        }
-                    } else {
-                        module.memories[mem_idx].has_max = true;
-                        module.memories[mem_idx].max_pages = actual_max;
-                    }
-                }
-            }
+            resolved.push(ResolvedMemory {
+                mem_idx,
+                actual_min_pages,
+                actual_max_pages,
+            });
             mem_idx += 1;
         }
+
+        store::apply_imported_memories(module, &resolved);
         Ok(())
     }
 
     fn inject_imported_tables(&self, module: &mut WasmModule) -> RunnerResult<()> {
+        // Resolve table sizes from the instance registry
+        let mut resolved = Vec::new();
         let mut table_idx = 0usize;
         for import in &module.imports {
             if !matches!(import.kind, ImportKind::Table(_)) {
@@ -2129,7 +2033,6 @@ impl WastRunner {
             let field_name = bytes_to_string(module.get_name(import.field_name_offset, import.field_name_len));
 
             let actual_min = if module_name == SPECTEST_MODULE && field_name == "table" {
-                // spectest table: min=10, max=20
                 10u32
             } else if let Some(handle) = self.instances.get(&module_name) {
                 let record = handle.borrow();
@@ -2143,12 +2046,11 @@ impl WastRunner {
                 continue;
             };
 
-            // Upgrade the table's min to the actual provider's size
-            if table_idx < module.tables.len() && module.tables[table_idx].min < actual_min {
-                module.tables[table_idx].min = actual_min;
-            }
+            resolved.push(ResolvedTable { table_idx, actual_min });
             table_idx += 1;
         }
+
+        store::apply_imported_tables(module, &resolved);
         Ok(())
     }
 
@@ -3094,47 +2996,6 @@ fn is_core_module(module: &QuoteWat<'_>) -> bool {
     matches!(module, QuoteWat::Wat(Wat::Module(_)) | QuoteWat::QuoteModule(..))
 }
 
-/// Copy a local function from `src_module` at `func_idx` into `host_module`.
-/// For import functions, returns `func_idx` unchanged (best effort).
-/// Used when we only have a WasmModule (not an InstanceHandle).
-fn copy_function_from_module(
-    host_module: &mut WasmModule,
-    src_module: &WasmModule,
-    func_idx: u32,
-) -> u32 {
-    let src_import_count = src_module.func_import_count();
-    if (func_idx as usize) >= src_import_count {
-        let local_idx = (func_idx as usize) - src_import_count;
-        if local_idx < src_module.functions.len() {
-            let src_func = &src_module.functions[local_idx];
-            let source_ft = if (src_func.type_idx as usize) < src_module.func_types.len() {
-                src_module.func_types[src_func.type_idx as usize].clone()
-            } else {
-                crate::wasm::decoder::FuncTypeDef::empty()
-            };
-            let host_type_idx = find_or_add_func_type(host_module, &source_ft);
-            let host_code_offset = host_module.code.len();
-            let code_start = src_func.code_offset;
-            let code_len = src_func.code_len;
-            if code_start + code_len <= src_module.code.len() {
-                host_module.code.extend_from_slice(&src_module.code[code_start..code_start + code_len]);
-            }
-            host_module.functions.push(crate::wasm::decoder::FuncDef {
-                type_idx: host_type_idx,
-                code_offset: host_code_offset,
-                code_len,
-                local_count: src_func.local_count,
-                locals: src_func.locals,
-                non_nullable_locals: Vec::new(),
-            });
-            return host_module.func_import_count() as u32
-                + (host_module.functions.len() as u32 - 1);
-        }
-    }
-    // For imports, we can't reliably resolve without instance info
-    func_idx
-}
-
 /// Resolve a function reference from `source_handle` at `source_func_idx` into
 /// the `host_module`'s function index space.
 ///
@@ -3201,297 +3062,10 @@ fn resolve_cross_module_function(
         return source_func_idx;
     }
 
-    // Local function: copy it
-    let local_idx = (source_func_idx as usize) - src_import_count;
-    if local_idx < src_mod.functions.len() {
-        let src_func = &src_mod.functions[local_idx];
-        let src_type_idx = src_func.type_idx;
-
-        let source_ft = if (src_type_idx as usize) < src_mod.func_types.len() {
-            src_mod.func_types[src_type_idx as usize].clone()
-        } else {
-            crate::wasm::decoder::FuncTypeDef::empty()
-        };
-
-        let host_type_idx = find_or_add_func_type(host_module, &source_ft);
-
-        let code_start = src_func.code_offset;
-        let code_len = src_func.code_len;
-        let host_code_offset = host_module.code.len();
-        if code_start + code_len <= src_mod.code.len() {
-            host_module.code.extend_from_slice(&src_mod.code[code_start..code_start + code_len]);
-        }
-
-        let new_func = crate::wasm::decoder::FuncDef {
-            type_idx: host_type_idx,
-            code_offset: host_code_offset,
-            code_len,
-            local_count: src_func.local_count,
-            locals: src_func.locals,
-            non_nullable_locals: Vec::new(),
-        };
-        host_module.functions.push(new_func);
-
-        let new_idx = host_module.func_import_count() as u32
-            + (host_module.functions.len() as u32 - 1);
-        drop(source);
-        return new_idx;
-    }
-
+    // Local function: copy it using the engine utility
     drop(source);
-    source_func_idx
-}
-
-/// Find a matching FuncTypeDef in the module's type list, or add a new one.
-fn find_or_add_func_type(module: &mut WasmModule, ft: &crate::wasm::decoder::FuncTypeDef) -> u32 {
-    for (i, existing) in module.func_types.iter().enumerate() {
-        if existing.param_count == ft.param_count
-            && existing.result_count == ft.result_count
-            && existing.params[..existing.param_count as usize] == ft.params[..ft.param_count as usize]
-            && existing.results[..existing.result_count as usize] == ft.results[..ft.result_count as usize]
-        {
-            return i as u32;
-        }
-    }
-    let idx = module.func_types.len() as u32;
-    module.func_types.push(ft.clone());
-    idx
-}
-
-fn bytes_to_string(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn nth_function_import(module: &WasmModule, func_idx: u32) -> Option<&crate::wasm::decoder::ImportDef> {
-    let mut seen = 0u32;
-    for import in &module.imports {
-        if let ImportKind::Func(_) = import.kind {
-            if seen == func_idx {
-                return Some(import);
-            }
-            seen = seen.saturating_add(1);
-        }
-    }
-    None
-}
-
-fn function_type(module: &WasmModule, func_idx: u32) -> Option<&FuncTypeDef> {
-    let type_idx = function_type_idx(module, func_idx)?;
-    module.func_types.get(type_idx as usize)
-}
-
-fn function_type_idx(module: &WasmModule, func_idx: u32) -> Option<u32> {
-    if (func_idx as usize) < module.func_import_count() {
-        return module.func_import_type(func_idx);
-    }
-    let local_idx = (func_idx as usize).checked_sub(module.func_import_count())?;
-    let func = module.functions.get(local_idx)?;
-    Some(func.type_idx)
-}
-
-fn exported_global_index(module: &WasmModule, name: &str) -> Option<u32> {
-    for export in &module.exports {
-        if module.get_name(export.name_offset, export.name_len) == name.as_bytes() {
-            if let ExportKind::Global(idx) = export.kind {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn exported_table_index(module: &WasmModule, name: &str) -> Option<u32> {
-    for export in &module.exports {
-        if module.get_name(export.name_offset, export.name_len) == name.as_bytes() {
-            if let ExportKind::Table(idx) = export.kind {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn exported_memory_index(module: &WasmModule, name: &str) -> Option<u32> {
-    for export in &module.exports {
-        if module.get_name(export.name_offset, export.name_len) == name.as_bytes() {
-            if let ExportKind::Memory(idx) = export.kind {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn func_types_match(a: &FuncTypeDef, b: &FuncTypeDef) -> bool {
-    if a.param_count != b.param_count || a.result_count != b.result_count {
-        return false;
-    }
-    for i in 0..a.param_count as usize {
-        if a.params[i] != b.params[i] {
-            return false;
-        }
-    }
-    for i in 0..a.result_count as usize {
-        if a.results[i] != b.results[i] {
-            return false;
-        }
-    }
-    true
-}
-
-/// Check if two type indices (from potentially different modules) refer to
-/// equivalent types, taking rec group structure into account.
-/// Two types are equivalent iff:
-/// 1. They are at the same position within their respective rec groups
-/// 2. Their rec groups have the same size
-/// 3. All corresponding types in the rec groups are structurally equivalent
-fn type_indices_equivalent(
-    mod_a: &WasmModule, type_idx_a: u32,
-    mod_b: &WasmModule, type_idx_b: u32,
-) -> bool {
-    let si_a = mod_a.sub_types.get(type_idx_a as usize);
-    let si_b = mod_b.sub_types.get(type_idx_b as usize);
-    match (si_a, si_b) {
-        (Some(a), Some(b)) => {
-            // Must be in rec groups of the same size
-            if a.rec_group_size != b.rec_group_size {
-                return false;
-            }
-            // Must be at the same position within the rec group
-            let pos_a = type_idx_a - a.rec_group_start;
-            let pos_b = type_idx_b - b.rec_group_start;
-            if pos_a != pos_b {
-                return false;
-            }
-            // All types in the rec group must be structurally equivalent
-            for i in 0..a.rec_group_size {
-                let idx_a = a.rec_group_start + i;
-                let idx_b = b.rec_group_start + i;
-                let ft_a = mod_a.func_types.get(idx_a as usize);
-                let ft_b = mod_b.func_types.get(idx_b as usize);
-                match (ft_a, ft_b) {
-                    (Some(fa), Some(fb)) => {
-                        if !func_types_match(fa, fb) {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-                // Check gc_types match (with rec-group-relative type references)
-                use crate::wasm::decoder::GcTypeDef;
-                let gc_a = mod_a.gc_types.get(idx_a as usize);
-                let gc_b = mod_b.gc_types.get(idx_b as usize);
-                match (gc_a, gc_b) {
-                    (Some(GcTypeDef::Struct { field_types: ft_a, field_muts: fm_a }),
-                     Some(GcTypeDef::Struct { field_types: ft_b, field_muts: fm_b })) => {
-                        if ft_a.len() != ft_b.len() || fm_a != fm_b { return false; }
-                        for fi in 0..ft_a.len() {
-                            if !cross_module_storage_eq(&ft_a[fi], a.rec_group_start, mod_a,
-                                                        &ft_b[fi], b.rec_group_start, mod_b,
-                                                        a.rec_group_size) { return false; }
-                        }
-                    }
-                    (Some(GcTypeDef::Array { elem_type: et_a, elem_mutable: em_a }),
-                     Some(GcTypeDef::Array { elem_type: et_b, elem_mutable: em_b })) => {
-                        if em_a != em_b { return false; }
-                        if !cross_module_storage_eq(et_a, a.rec_group_start, mod_a,
-                                                    et_b, b.rec_group_start, mod_b,
-                                                    a.rec_group_size) { return false; }
-                    }
-                    (Some(ga), Some(gb)) => {
-                        if std::mem::discriminant(ga) != std::mem::discriminant(gb) { return false; }
-                    }
-                    (None, None) => {}
-                    _ => return false,
-                }
-                // Check subtype info matches
-                let si_a_i = mod_a.sub_types.get(idx_a as usize);
-                let si_b_i = mod_b.sub_types.get(idx_b as usize);
-                match (si_a_i, si_b_i) {
-                    (Some(sa), Some(sb)) => {
-                        if sa.is_final != sb.is_final { return false; }
-                        match (sa.supertype, sb.supertype) {
-                            (None, None) => {}
-                            (Some(sp_a), Some(sp_b)) => {
-                                let in_rg_a = sp_a >= a.rec_group_start && sp_a < a.rec_group_start + a.rec_group_size;
-                                let in_rg_b = sp_b >= b.rec_group_start && sp_b < b.rec_group_start + b.rec_group_size;
-                                if in_rg_a && in_rg_b {
-                                    // Both inside: compare relative positions
-                                    if (sp_a - a.rec_group_start) != (sp_b - b.rec_group_start) { return false; }
-                                } else if !in_rg_a && !in_rg_b {
-                                    // Both outside: recursively check equivalence
-                                    if !type_indices_equivalent(mod_a, sp_a, mod_b, sp_b) { return false; }
-                                } else {
-                                    return false;
-                                }
-                            }
-                            _ => return false,
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            true
-        }
-        // If no subtype info, fall back to structural comparison
-        _ => {
-            match (mod_a.func_types.get(type_idx_a as usize), mod_b.func_types.get(type_idx_b as usize)) {
-                (Some(fa), Some(fb)) => func_types_match(fa, fb),
-                _ => false,
-            }
-        }
-    }
-}
-
-/// Check if two storage types are equivalent across modules with rec-group awareness.
-fn cross_module_storage_eq(
-    a: &crate::wasm::decoder::StorageType, rg_a: u32, mod_a: &WasmModule,
-    b: &crate::wasm::decoder::StorageType, rg_b: u32, mod_b: &WasmModule,
-    rg_size: u32,
-) -> bool {
-    use crate::wasm::decoder::StorageType;
-    match (a, b) {
-        (StorageType::I8, StorageType::I8) | (StorageType::I16, StorageType::I16) => true,
-        (StorageType::Val(va), StorageType::Val(vb)) => va == vb,
-        (StorageType::RefType(va, ai), StorageType::RefType(vb, bi)) => {
-            if va != vb { return false; }
-            let in_a = *ai >= rg_a && *ai < rg_a + rg_size;
-            let in_b = *bi >= rg_b && *bi < rg_b + rg_size;
-            if in_a && in_b { (ai - rg_a) == (bi - rg_b) }
-            else if !in_a && !in_b { type_indices_equivalent(mod_a, *ai, mod_b, *bi) }
-            else { false }
-        }
-        _ => false,
-    }
-}
-
-/// Check if type `src` in `mod_src` is a subtype of type `dst` in `mod_dst`.
-/// Handles cross-module rec-group-aware type equivalence and subtype chains.
-fn cross_module_type_subtype(
-    mod_src: &WasmModule, src: u32,
-    mod_dst: &WasmModule, dst: u32,
-) -> bool {
-    // Check equivalence first
-    if type_indices_equivalent(mod_src, src, mod_dst, dst) {
-        return true;
-    }
-    // Walk the subtype chain in the source module
-    let mut current = src;
-    for _ in 0..100 {
-        if let Some(info) = mod_src.sub_types.get(current as usize) {
-            if let Some(parent) = info.supertype {
-                if type_indices_equivalent(mod_src, parent, mod_dst, dst) {
-                    return true;
-                }
-                current = parent;
-            } else {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    false
+    let source = source_handle.borrow();
+    copy_function_from_module(host_module, &source.instance.module, source_func_idx)
 }
 
 fn validate_spectest_func_signature(name: &str, sig: &FuncTypeDef) -> RunnerResult<()> {
@@ -3629,154 +3203,6 @@ fn spectest_global(name: &str) -> Option<Value> {
         "global_externref" => Some(Value::I32(-1)),   // null externref
         _ => None,
     }
-}
-
-fn decode_valtype_byte(byte: u8) -> Option<ValType> {
-    match byte {
-        0x7F => Some(ValType::I32),
-        0x7E => Some(ValType::I64),
-        0x7D => Some(ValType::F32),
-        0x7C => Some(ValType::F64),
-        0x7B => Some(ValType::V128),
-        0x70 => Some(ValType::FuncRef),
-        0x6F => Some(ValType::ExternRef),
-        // GC ref types: 0x63=nullable ref, 0x64=non-nullable ref
-        // These are multi-byte in binary (followed by heap type), but
-        // ImportKind::Global stores only the first byte. Accept as I32 (our ref sentinel).
-        0x63 | 0x64 => Some(ValType::I32),
-        0x69 => Some(ValType::ExnRef),
-        _ => None,
-    }
-}
-
-/// Check if two ref-like ValTypes are compatible for import linking.
-/// In our simplified model (no full subtyping), we consider all funcref-ish types compatible.
-#[allow(dead_code)]
-fn ref_types_compatible(a: ValType, b: ValType) -> bool {
-    fn is_funcref_ish(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
-    }
-    fn is_ref(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::ExternRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
-    }
-    // Both funcref-ish types are compatible
-    if is_funcref_ish(a) && is_funcref_ish(b) {
-        return true;
-    }
-    // ExternRef only with ExternRef
-    if a == ValType::ExternRef && b == ValType::ExternRef {
-        return true;
-    }
-    false
-}
-
-/// Check if a global import type is compatible with an export type for linking.
-/// For immutable globals, subtyping is allowed (import can be supertype of export).
-/// For mutable globals, types must match exactly (invariance).
-///
-/// Heap type values: negative = abstract (-16=func, -17=extern, etc), non-negative = concrete type index.
-fn global_types_compatible(
-    import_val_type: ValType,
-    import_byte: u8,
-    import_heap_type: Option<i32>,
-    export_val_type: ValType,
-    export_heap_type: Option<i32>,
-    mutable: bool,
-) -> bool {
-    fn is_funcref_family(t: ValType) -> bool {
-        matches!(t, ValType::FuncRef | ValType::TypedFuncRef | ValType::NonNullableFuncRef | ValType::NullableTypedFuncRef)
-    }
-    fn is_externref_family(t: ValType) -> bool {
-        matches!(t, ValType::ExternRef)
-    }
-
-    // Classify import
-    let imp_is_abstract_func = is_funcref_family(import_val_type)
-        || (matches!(import_byte, 0x63 | 0x64) && import_heap_type == Some(-16));
-    let imp_is_abstract_extern = is_externref_family(import_val_type)
-        || (matches!(import_byte, 0x63 | 0x64) && import_heap_type == Some(-17));
-    let imp_is_concrete = matches!(import_byte, 0x63 | 0x64) && matches!(import_heap_type, Some(ht) if ht >= 0);
-    let imp_nullable = import_byte != 0x64 && import_val_type != ValType::TypedFuncRef && import_val_type != ValType::NonNullableFuncRef;
-
-    // Classify export
-    let exp_is_concrete = matches!(export_heap_type, Some(ht) if ht >= 0);
-    let exp_nullable = matches!(export_val_type, ValType::FuncRef | ValType::NullableTypedFuncRef | ValType::ExternRef);
-
-    if mutable {
-        // Mutable globals require exact type match (invariance).
-        // Both abstract func with same nullability
-        if imp_is_abstract_func && is_funcref_family(export_val_type) && !exp_is_concrete {
-            return imp_nullable == exp_nullable;
-        }
-        // Both abstract extern
-        if imp_is_abstract_extern && is_externref_family(export_val_type) {
-            return true;
-        }
-        // Both concrete with same type index and nullability
-        if imp_is_concrete && exp_is_concrete && import_heap_type == export_heap_type {
-            return imp_nullable == exp_nullable;
-        }
-        return false;
-    }
-
-    // Immutable globals: import must be supertype of export.
-
-    // Abstract func import
-    if imp_is_abstract_func {
-        if !is_funcref_family(export_val_type) {
-            return false;
-        }
-        if imp_nullable {
-            return true; // (ref null func) is supertype of all funcref-family
-        } else {
-            return !exp_nullable; // (ref func) is supertype of non-nullable funcref
-        }
-    }
-
-    // Abstract extern import
-    if imp_is_abstract_extern {
-        return is_externref_family(export_val_type);
-    }
-
-    // Concrete import (ref null $t) / (ref $t)
-    if imp_is_concrete {
-        // Can only match concrete exports with same type index
-        if exp_is_concrete && import_heap_type == export_heap_type {
-            if imp_nullable {
-                return true; // (ref null $t) accepts both (ref null $t) and (ref $t)
-            } else {
-                return !exp_nullable; // (ref $t) only accepts (ref $t)
-            }
-        }
-        return false;
-    }
-
-    false
-}
-
-fn value_matches_type(value: Value, val_type: ValType) -> bool {
-    matches!(
-        (value, val_type),
-        (Value::I32(_), ValType::I32)
-            | (Value::I64(_), ValType::I64)
-            | (Value::F32(_), ValType::F32)
-            | (Value::F64(_), ValType::F64)
-            | (Value::V128(_), ValType::V128)
-            | (Value::I32(_), ValType::FuncRef)
-            | (Value::I32(_), ValType::ExternRef)
-            | (Value::I32(_), ValType::TypedFuncRef)
-            | (Value::I32(_), ValType::NonNullableFuncRef)
-            | (Value::I32(_), ValType::NullableTypedFuncRef)
-            | (Value::NullRef, ValType::I32)
-            | (Value::NullRef, ValType::FuncRef)
-            | (Value::NullRef, ValType::ExternRef)
-            | (Value::NullRef, ValType::TypedFuncRef)
-            | (Value::NullRef, ValType::NonNullableFuncRef)
-            | (Value::NullRef, ValType::NullableTypedFuncRef)
-            | (Value::GcRef(_), ValType::I32)
-            | (Value::GcRef(_), ValType::FuncRef)
-            | (Value::GcRef(_), ValType::ExternRef)
-    )
 }
 
 fn trap_message(err: &WasmError) -> String {

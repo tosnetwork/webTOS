@@ -10,3 +10,9 @@ pub mod validator;
 pub mod runtime;
 #[path = "../../../src/wasm/host.rs"]
 pub mod host;
+#[path = "../../../src/wasm/instance.rs"]
+pub mod instance;
+#[path = "../../../src/wasm/linker.rs"]
+pub mod linker;
+#[path = "../../../src/wasm/store.rs"]
+pub mod store;
