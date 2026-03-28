@@ -13,7 +13,7 @@ pub type Tick = u64;
 pub type EnergyUnit = u64;
 pub type KeyspaceId = u16;
 
-pub const MAX_AGENTS: usize = 16;
+pub const MAX_AGENTS: usize = 20;
 pub const IDLE_AGENT_ID: AgentId = 0;
 pub const ROOT_AGENT_ID: AgentId = 1;
 pub const MAX_MAILBOX_CAPACITY: usize = 16;
@@ -57,6 +57,15 @@ pub const SYS_STATE_TX_COMMIT: u64 = 27;
 pub const SYS_STATE_SNAPSHOT: u64 = 28;
 pub const SYS_STATE_PROOF_GET: u64 = 29;
 pub const SYS_RECEIPT_EMIT: u64 = 30;
+
+// Stage 7: Agent Package & Skill Ecosystem syscalls
+pub const SYS_PACKAGE_VERIFY: u64 = 31;
+pub const SYS_PACKAGE_INSTALL: u64 = 32;
+
+// Stage 8: Distributed Execution Fabric syscalls
+pub const SYS_NODE_ATTEST: u64 = 33;
+pub const SYS_AGENT_MIGRATE: u64 = 34;
+pub const SYS_PLACEMENT_HINT: u64 = 35;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -213,6 +222,9 @@ pub struct Agent {
     pub stack_bottom: u64,   // address of stack guard canary (lowest stack address)
     pub active: bool,       // whether this slot is in use
     pub priority: AgentPriority,
+    // Stage 8: placement hints for distributed scheduling
+    pub placement_hint_type: u64,
+    pub placement_hint_value: u64,
 }
 
 impl Agent {
@@ -244,6 +256,8 @@ impl Agent {
             stack_bottom: 0,
             active: true,
             priority: AgentPriority::Normal,
+            placement_hint_type: 0,
+            placement_hint_value: 0,
         }
     }
 }

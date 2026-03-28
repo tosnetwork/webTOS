@@ -39,3 +39,80 @@ pub fn set_node_id(id: u32) {
         unsafe { NODE_ID = id; }
     }
 }
+
+// ─── Extended node identity (Stage 8: Distributed Execution Fabric) ──────
+
+/// Full 32-byte node identifier for cluster-wide uniqueness.
+pub type NodeId = [u8; 32];
+
+/// Extended node identity with attestation and cluster membership info.
+pub struct NodeIdentity {
+    pub id: NodeId,
+    pub signing_key: [u8; 32],
+    pub attestation_hash: [u8; 32],
+    pub is_attested: bool,
+    pub cluster_id: u32,
+    pub last_heartbeat_tick: u64,
+}
+
+static mut LOCAL_NODE: Option<NodeIdentity> = None;
+
+/// Initialise the extended node identity.
+///
+/// Derives a 32-byte `NodeId` by combining the legacy 32-bit node ID with
+/// the TSC timestamp for additional uniqueness. Should be called once
+/// during early boot, after the NIC is available (so `node_id()` works).
+pub fn init_node_identity() {
+    let legacy = node_id();
+    let mut id = [0u8; 32];
+    // First 4 bytes: legacy 32-bit node ID for backward compat.
+    id[0..4].copy_from_slice(&legacy.to_le_bytes());
+    // Bytes 4..12: TSC for uniqueness across reboots.
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
+        let tsc = (hi as u64) << 32 | lo as u64;
+        id[4..12].copy_from_slice(&tsc.to_le_bytes());
+    }
+    unsafe {
+        LOCAL_NODE = Some(NodeIdentity {
+            id,
+            signing_key: [0; 32],
+            attestation_hash: [0; 32],
+            is_attested: false,
+            cluster_id: 0,
+            last_heartbeat_tick: 0,
+        });
+    }
+    crate::serial_println!("[NODE] Extended identity initialised (cluster_id=0)");
+}
+
+/// Return the full 32-byte `NodeId`, or all-zeros if not yet initialised.
+pub fn get_node_id() -> NodeId {
+    unsafe { LOCAL_NODE.as_ref().map(|n| n.id).unwrap_or([0; 32]) }
+}
+
+/// Return a reference to the local `NodeIdentity`, if initialised.
+pub fn get_node_identity() -> Option<&'static NodeIdentity> {
+    unsafe { LOCAL_NODE.as_ref() }
+}
+
+/// Return the attestation hash, or all-zeros if not attested.
+pub fn get_attestation_hash() -> [u8; 32] {
+    unsafe {
+        LOCAL_NODE
+            .as_ref()
+            .map(|n| n.attestation_hash)
+            .unwrap_or([0; 32])
+    }
+}
+
+/// Record a heartbeat at the given tick.
+pub fn record_heartbeat(tick: u64) {
+    unsafe {
+        if let Some(ref mut node) = LOCAL_NODE {
+            node.last_heartbeat_tick = tick;
+        }
+    }
+}

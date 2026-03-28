@@ -489,6 +489,120 @@ pub fn init() {
     serial_println!("[INIT] Authd agent created: id={}", authd_id);
     event::agent_created(authd_id, root_id);
 
+    // ── Upgraded agent (agent 13) ── upgrade manager ────────────────────
+    let upgraded_id = create_agent(
+        Some(root_id),
+        agents::upgraded::upgraded_main as *const () as u64,
+        stack_top(13),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create upgraded agent");
+    {
+        let agent = get_agent_mut(upgraded_id).expect("Upgraded agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[13].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(upgraded_id as MailboxId, upgraded_id).ok();
+    state::create_keyspace(upgraded_id as u16).ok();
+    serial_println!("[INIT] Upgraded agent created: id={}", upgraded_id);
+    event::agent_created(upgraded_id, root_id);
+
+    // ── Admind agent (agent 14) ── administration service ─────────────
+    let admind_id = create_agent(
+        Some(root_id),
+        agents::admind::admind_main as *const () as u64,
+        stack_top(14),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create admind agent");
+    {
+        let agent = get_agent_mut(admind_id).expect("Admind agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[14].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(admind_id as MailboxId, admind_id).ok();
+    state::create_keyspace(admind_id as u16).ok();
+    serial_println!("[INIT] Admind agent created: id={}", admind_id);
+    event::agent_created(admind_id, root_id);
+
+    // ── Observabilityd agent (agent 15) ── observability service ──────
+    let observabilityd_id = create_agent(
+        Some(root_id),
+        agents::observabilityd::observabilityd_main as *const () as u64,
+        stack_top(15),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create observabilityd agent");
+    {
+        let agent = get_agent_mut(observabilityd_id).expect("Observabilityd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[15].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(observabilityd_id as MailboxId, observabilityd_id).ok();
+    state::create_keyspace(observabilityd_id as u16).ok();
+    serial_println!("[INIT] Observabilityd agent created: id={}", observabilityd_id);
+    event::agent_created(observabilityd_id, root_id);
+
+    // ── Pkgd agent (agent 16) ── package manager ─────────────────────────
+    let pkgd_id = create_agent(
+        Some(root_id),
+        agents::pkgd::pkgd_entry as *const () as u64,
+        stack_top(16),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create pkgd agent");
+    {
+        let agent = get_agent_mut(pkgd_id).expect("Pkgd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[16].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::AgentSpawn, CAP_TARGET_WILDCARD));
+        agent.cap_count = 4;
+    }
+    mailbox::create_mailbox(pkgd_id as MailboxId, pkgd_id).ok();
+    state::create_keyspace(pkgd_id as u16).ok();
+    serial_println!("[INIT] Pkgd agent created: id={}", pkgd_id);
+    event::agent_created(pkgd_id, root_id);
+
+    // ── Membership_d agent (agent 17) ── cluster membership service ────
+    let membership_d_id = create_agent(
+        Some(root_id),
+        agents::membership_d::membership_d_entry as *const () as u64,
+        stack_top(17),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create membership_d agent");
+    {
+        let agent = get_agent_mut(membership_d_id).expect("Membership_d agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[17].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(membership_d_id as MailboxId, membership_d_id).ok();
+    state::create_keyspace(membership_d_id as u16).ok();
+    serial_println!("[INIT] Membership_d agent created: id={}", membership_d_id);
+    event::agent_created(membership_d_id, root_id);
+
+    // ── Initialise extended node identity (Stage 8) ─────────────────────
+    crate::node::init_node_identity();
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
@@ -496,7 +610,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id, authd_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id, authd_id, upgraded_id, admind_id, observabilityd_id, pkgd_id, membership_d_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -517,6 +631,11 @@ pub fn init() {
     sched::add_to_run_queue(routerd_id);
     sched::add_to_run_queue(skilld_id);
     sched::add_to_run_queue(authd_id);
+    sched::add_to_run_queue(upgraded_id);
+    sched::add_to_run_queue(admind_id);
+    sched::add_to_run_queue(observabilityd_id);
+    sched::add_to_run_queue(pkgd_id);
+    sched::add_to_run_queue(membership_d_id);
 
     // ── Write stack guard canaries at the bottom of every agent stack ──
     write_stack_guards();
