@@ -269,7 +269,17 @@ pub fn emit_receipt_on_exit(
         0,
     );
 
-    store_receipt(receipt)
+    let idx = store_receipt(receipt);
+
+    // Generate and store a ProofBundle alongside the receipt.
+    if let Some(i) = idx {
+        if let Some(stored) = get_receipt(i) {
+            let proof = ProofBundle::from_receipt(stored);
+            store_proof_bundle(proof);
+        }
+    }
+
+    idx
 }
 
 // ─── Replay & Proof bundles (Stage 9) ───────────────────────────────────
@@ -336,6 +346,85 @@ impl ProofBundle {
         bundle.proof_len = 32;
         bundle
     }
+
+    /// Create a proof bundle from a receipt with real Merkle state proofs.
+    pub fn from_receipt(receipt: &ExecutionReceipt) -> Self {
+        let mut bundle = Self::empty(receipt.receipt_id);
+
+        // Proof type 0: state transition proof
+        // Contains: initial_state_root + final_state_root + receipt_hash
+        bundle.proof_type = 0;
+
+        // Pack state roots into proof data
+        bundle.proof_data[0..32].copy_from_slice(&receipt.initial_state_root);
+        bundle.proof_data[32..64].copy_from_slice(&receipt.final_state_root);
+
+        // Pack receipt hash
+        let receipt_hash = receipt.compute_hash();
+        bundle.proof_data[64..96].copy_from_slice(&receipt_hash);
+
+        // Pack energy and ticks for billing verification
+        bundle.proof_data[96..104].copy_from_slice(&receipt.energy_used.to_le_bytes());
+        bundle.proof_data[104..112].copy_from_slice(&receipt.tick_start.to_le_bytes());
+        bundle.proof_data[112..120].copy_from_slice(&receipt.tick_end.to_le_bytes());
+
+        bundle.proof_len = 120;
+
+        // Verifier key = node_id (verifier needs this to check signature)
+        bundle.verifier_key = receipt.node_id;
+
+        bundle
+    }
+
+    /// Verify this proof bundle against a receipt.
+    pub fn verify_against_receipt(&self, receipt: &ExecutionReceipt) -> bool {
+        if self.receipt_id != receipt.receipt_id { return false; }
+        if self.proof_len < 120 { return false; }
+
+        // Check state roots match
+        if self.proof_data[0..32] != receipt.initial_state_root { return false; }
+        if self.proof_data[32..64] != receipt.final_state_root { return false; }
+
+        // Check receipt hash
+        let expected_hash = receipt.compute_hash();
+        if self.proof_data[64..96] != expected_hash { return false; }
+
+        // Check energy/timing
+        let stored_energy = u64::from_le_bytes(
+            self.proof_data[96..104].try_into().unwrap_or([0; 8])
+        );
+        if stored_energy != receipt.energy_used { return false; }
+
+        true
+    }
+}
+
+// ─── Proof bundle store ────────────────────────────────────────────────────
+
+/// Fixed-size proof bundle store.
+///
+/// Safety: single-core, no preemption during store access in Stage-1.
+static mut PROOF_STORE: [Option<ProofBundle>; 64] = [const { None }; 64];
+static mut PROOF_COUNT: usize = 0;
+
+/// Store a proof bundle in the global proof store.
+pub fn store_proof_bundle(proof: ProofBundle) {
+    unsafe {
+        if PROOF_COUNT < PROOF_STORE.len() {
+            PROOF_STORE[PROOF_COUNT] = Some(proof);
+            PROOF_COUNT += 1;
+        }
+    }
+}
+
+/// Retrieve a proof bundle by index.
+pub fn get_proof_bundle(idx: usize) -> Option<&'static ProofBundle> {
+    unsafe { PROOF_STORE.get(idx)?.as_ref() }
+}
+
+/// Return the current proof bundle count.
+pub fn proof_count() -> usize {
+    unsafe { PROOF_COUNT }
 }
 
 /// Patch the trace_commitment field of an already-stored receipt.

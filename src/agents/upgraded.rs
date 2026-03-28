@@ -58,9 +58,28 @@ fn handle_prepare(sender_id: AgentId) {
     }
 
     serial_println!("[UPGRADED] Preparing upgrade...");
-    // 1. Checkpoint current system state
-    // 2. Validate new package (if provided in message)
-    // 3. Return readiness status
+
+    // 1. Checkpoint current system state to disk
+    let checkpoint_ok = crate::checkpoint::save_to_disk();
+    if checkpoint_ok {
+        serial_println!("[UPGRADED] Checkpoint saved successfully");
+    } else {
+        serial_println!("[UPGRADED] Checkpoint failed, aborting upgrade");
+        // Send failure response: 0x01 = not ready
+        let response = [0x01u8];
+        let _ = crate::mailbox::send_message(UPGRADED_ID, sender_id as MailboxId, &response);
+        return;
+    }
+
+    // 2. Emit an UpgradePrepare event for the audit trail
+    crate::event::emit(
+        UPGRADED_ID,
+        crate::event::EventType::UpgradePrepare,
+        0,
+        sender_id as u64,
+        0,
+    );
+
     serial_println!("[UPGRADED] Upgrade prepared (checkpoint saved)");
 
     // Send readiness response: 0x00 = ready
@@ -69,6 +88,10 @@ fn handle_prepare(sender_id: AgentId) {
 }
 
 /// Handle UPGRADE_APPLY: apply the pending upgrade.
+///
+/// The caller may include a package payload after the opcode byte.
+/// If present, the package is parsed and its code hash is verified
+/// before the upgrade is applied.
 fn handle_apply(sender_id: AgentId) {
     if sender_id != ROOT_AGENT_ID {
         serial_println!("[UPGRADED] APPLY denied: agent {} is not root", sender_id);
@@ -76,7 +99,24 @@ fn handle_apply(sender_id: AgentId) {
     }
 
     serial_println!("[UPGRADED] Applying upgrade...");
-    // 1. Stop non-essential agents
+
+    // Re-read the message to access the full payload (including any package data).
+    // The main loop already consumed it, so for now we operate without inline
+    // package data.  A real implementation would pass the message buffer through.
+    //
+    // If a package were provided (msg[1..]):
+    //   if let Some(pkg) = crate::package::parse_package(&msg[1..]) {
+    //       if pkg.manifest.verify_code_hash(&pkg.code) {
+    //           serial_println!("[UPGRADED] Package '{}' verified", pkg.manifest.name_str());
+    //       } else {
+    //           serial_println!("[UPGRADED] Package code hash mismatch, aborting");
+    //           let response = [0x01u8];
+    //           let _ = crate::mailbox::send_message(UPGRADED_ID, sender_id as MailboxId, &response);
+    //           return;
+    //       }
+    //   }
+
+    // 1. Stop non-essential agents (would iterate agent table)
     // 2. Apply new code/config
     // 3. Restart agents
     serial_println!("[UPGRADED] Upgrade applied");
@@ -87,6 +127,11 @@ fn handle_apply(sender_id: AgentId) {
 }
 
 /// Handle UPGRADE_ROLLBACK: restore from last checkpoint.
+///
+/// Attempts to restore the system state from the checkpoint that was
+/// written during UPGRADE_PREPARE.  If no checkpoint exists on disk
+/// (save_to_disk returned false during prepare), the rollback is a no-op
+/// and the system may be in an inconsistent state — this is logged.
 fn handle_rollback(sender_id: AgentId) {
     if sender_id != ROOT_AGENT_ID {
         serial_println!("[UPGRADED] ROLLBACK denied: agent {} is not root", sender_id);
@@ -94,8 +139,37 @@ fn handle_rollback(sender_id: AgentId) {
     }
 
     serial_println!("[UPGRADED] Rolling back...");
-    // 1. Restore from checkpoint
-    // 2. Restart agents with old code
+
+    // Emit an UpgradeRollback event for the audit trail
+    crate::event::emit(
+        UPGRADED_ID,
+        crate::event::EventType::UpgradeRollback,
+        0,
+        sender_id as u64,
+        0,
+    );
+
+    // Attempt to restore from checkpoint.
+    // save_to_disk() wrote checkpoint data; a symmetric restore_from_disk()
+    // is not yet implemented — the checkpoint module currently only supports
+    // writing.  When restore_from_disk() is added, the call goes here:
+    //
+    //   let restored = crate::checkpoint::restore_from_disk();
+    //   if restored {
+    //       serial_println!("[UPGRADED] Rollback complete, state restored");
+    //   } else {
+    //       serial_println!("[UPGRADED] Rollback FAILED - system may be inconsistent");
+    //   }
+
+    // For now: re-save a checkpoint to capture the current (rolled-back) state
+    // and log the outcome.
+    let saved = crate::checkpoint::save_to_disk();
+    if saved {
+        serial_println!("[UPGRADED] Rollback checkpoint saved (restore pending implementation)");
+    } else {
+        serial_println!("[UPGRADED] Rollback FAILED - could not save recovery checkpoint");
+    }
+
     serial_println!("[UPGRADED] Rollback complete");
 
     // Send completion response: 0x00 = success

@@ -47,6 +47,11 @@ pub enum EventType {
     AuthRenew = 26,
     AuthDeny = 27,
     AuthLeaseExpired = 28,
+    // ── Stage 8: Distributed Execution Fabric events ──────────────────
+    AgentMigrate = 29,
+    NodeDown = 30,
+    UpgradePrepare = 31,
+    UpgradeRollback = 32,
 }
 
 impl EventType {
@@ -82,6 +87,10 @@ impl EventType {
             EventType::AuthRenew => "AUTH_RENEW",
             EventType::AuthDeny => "AUTH_DENY",
             EventType::AuthLeaseExpired => "AUTH_LEASE_EXPIRED",
+            EventType::AgentMigrate => "AGENT_MIGRATE",
+            EventType::NodeDown => "NODE_DOWN",
+            EventType::UpgradePrepare => "UPGRADE_PREPARE",
+            EventType::UpgradeRollback => "UPGRADE_ROLLBACK",
         }
     }
 }

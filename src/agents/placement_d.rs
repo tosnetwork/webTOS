@@ -34,6 +34,7 @@ struct NodeCapacity {
     cpu_available: u16,      // available CPU units
     memory_available: u32,   // available memory in pages
     energy_available: u64,   // available energy budget
+    hardware_class: u32,     // hardware class identifier (0 = generic)
     active: bool,
 }
 
@@ -42,6 +43,7 @@ static mut NODE_TABLE: [NodeCapacity; MAX_NODES] = [NodeCapacity {
     cpu_available: 0,
     memory_available: 0,
     energy_available: 0,
+    hardware_class: 0,
     active: false,
 }; MAX_NODES];
 static mut NODE_COUNT: usize = 0;
@@ -57,6 +59,7 @@ pub extern "C" fn placement_d_main() -> ! {
             cpu_available: 256,
             memory_available: 4096,
             energy_available: 1_000_000,
+            hardware_class: 0, // generic
             active: true,
         };
         NODE_COUNT = 1;
@@ -86,6 +89,57 @@ pub extern "C" fn placement_d_main() -> ! {
     }
 }
 
+/// Select the best node for an agent based on hints and capacity.
+///
+/// Hint types:
+///   0x00 = no preference (pick node with most available energy)
+///   0x01 = locality (prefer node whose id matches hint_value)
+///   0x02 = energy (pick node with most available energy — same as 0x00)
+///   0x03 = hardware class (prefer node matching hint_value class)
+fn select_best_node(hint_type: u8, hint_value: u64) -> u16 {
+    let mut best_node: u16 = 0; // default: local node
+    let mut best_score: u64 = 0;
+
+    unsafe {
+        for i in 0..NODE_COUNT {
+            let node = &NODE_TABLE[i];
+            if !node.active {
+                continue;
+            }
+
+            let score = match hint_type {
+                HINT_LOCALITY => {
+                    // Locality: strongly prefer the node whose id matches hint_value.
+                    // Fall back to energy-based ranking for other nodes.
+                    if node.node_id == hint_value as u16 {
+                        u64::MAX
+                    } else {
+                        node.energy_available
+                    }
+                }
+                HINT_HARDWARE => {
+                    // Hardware class: boost nodes that match the requested class.
+                    if node.hardware_class == hint_value as u32 {
+                        node.energy_available.saturating_add(1_000_000)
+                    } else {
+                        node.energy_available
+                    }
+                }
+                // HINT_ENERGY (0x02) or no preference (0x00) or unknown:
+                // rank purely by available energy.
+                _ => node.energy_available,
+            };
+
+            if score > best_score {
+                best_score = score;
+                best_node = node.node_id;
+            }
+        }
+    }
+
+    best_node
+}
+
 /// Handle QUERY_PLACEMENT: given hints, return recommended node_id.
 /// Format: [op=0x01, hint_type:u8, hint_value:u64]
 fn handle_query_placement(payload: &[u8], msg_len: usize, sender_id: AgentId) {
@@ -103,26 +157,7 @@ fn handle_query_placement(payload: &[u8], msg_len: usize, sender_id: AgentId) {
         payload[6], payload[7], payload[8], payload[9],
     ]);
 
-    let recommended = unsafe {
-        match hint_type {
-            HINT_ENERGY => {
-                // Find node with most available energy
-                let mut best_id: u16 = 0;
-                let mut best_energy: u64 = 0;
-                for i in 0..NODE_COUNT {
-                    if NODE_TABLE[i].active && NODE_TABLE[i].energy_available > best_energy {
-                        best_energy = NODE_TABLE[i].energy_available;
-                        best_id = NODE_TABLE[i].node_id;
-                    }
-                }
-                best_id
-            }
-            HINT_LOCALITY | HINT_HARDWARE | _ => {
-                // Single-node operation: always recommend local node
-                0u16
-            }
-        }
-    };
+    let recommended = select_best_node(hint_type, hint_value);
 
     serial_println!("[PLACEMENT_D] Placement query: hint_type={} hint_value={} -> node {}",
         hint_type, hint_value, recommended);
@@ -132,8 +167,8 @@ fn handle_query_placement(payload: &[u8], msg_len: usize, sender_id: AgentId) {
 }
 
 /// Handle REGISTER_CAPACITY: node reports its available resources.
-/// Format: [op=0x02, node_id:u16, cpu:u16, memory:u32, energy:u64]
-/// Total: 1 + 2 + 2 + 4 + 8 = 17 bytes
+/// Format: [op=0x02, node_id:u16, cpu:u16, memory:u32, energy:u64, hw_class:u32]
+/// Total: 1 + 2 + 2 + 4 + 8 + 4 = 21 bytes (17 bytes minimum for backward compat)
 fn handle_register_capacity(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     if msg_len < 17 {
         serial_println!("[PLACEMENT_D] REGISTER_CAPACITY: payload too short ({} < 17)", msg_len);
@@ -147,6 +182,12 @@ fn handle_register_capacity(payload: &[u8], msg_len: usize, sender_id: AgentId) 
         payload[9], payload[10], payload[11], payload[12],
         payload[13], payload[14], payload[15], payload[16],
     ]);
+    // Hardware class is optional (backward compatible): default to 0 (generic)
+    let hw_class = if msg_len >= 21 {
+        u32::from_le_bytes([payload[17], payload[18], payload[19], payload[20]])
+    } else {
+        0
+    };
 
     unsafe {
         // Update existing node or add new one
@@ -156,6 +197,7 @@ fn handle_register_capacity(payload: &[u8], msg_len: usize, sender_id: AgentId) 
                 NODE_TABLE[i].cpu_available = cpu;
                 NODE_TABLE[i].memory_available = memory;
                 NODE_TABLE[i].energy_available = energy;
+                NODE_TABLE[i].hardware_class = hw_class;
                 NODE_TABLE[i].active = true;
                 found = true;
                 break;
@@ -168,6 +210,7 @@ fn handle_register_capacity(payload: &[u8], msg_len: usize, sender_id: AgentId) 
                 cpu_available: cpu,
                 memory_available: memory,
                 energy_available: energy,
+                hardware_class: hw_class,
                 active: true,
             };
             NODE_COUNT += 1;
@@ -175,8 +218,8 @@ fn handle_register_capacity(payload: &[u8], msg_len: usize, sender_id: AgentId) 
     }
 
     serial_println!(
-        "[PLACEMENT_D] Registered capacity for node {}: cpu={} mem={} energy={} (from agent {})",
-        node_id, cpu, memory, energy, sender_id
+        "[PLACEMENT_D] Registered capacity for node {}: cpu={} mem={} energy={} hw_class={} (from agent {})",
+        node_id, cpu, memory, energy, hw_class, sender_id
     );
 }
 

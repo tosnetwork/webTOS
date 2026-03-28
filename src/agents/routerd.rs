@@ -634,6 +634,33 @@ fn handle_route_remote(my_node_id: u32, msg: &[u8]) {
     serial_println!("[ROUTERD] ROUTE_REMOTE: {} bytes from agent {} -> node {:#x} agent {}",
         payload.len(), src_agent, dest_node_32, dest_agent);
 
+    // ── StateAccessMode check (Stage 8) ──────────────────────────────────
+    //
+    // Before forwarding a message that may trigger agent migration, the
+    // source agent's StateAccessMode (defined in src/state.rs) determines
+    // how its persistent state is handled:
+    //
+    //   MoveWithAgent:
+    //     Include the agent's state in a PortableCheckpoint and send it
+    //     alongside the migration payload.  The destination node restores
+    //     the checkpoint and the source node discards its copy.
+    //
+    //   RemoteBroker:
+    //     Leave the state on the source node.  The migrated agent accesses
+    //     its state via cross-node mailbox messages back to a broker agent
+    //     on the original node.
+    //
+    //   SnapshotAndReconcile:
+    //     Take a snapshot of the state (PortableCheckpoint::from_agent),
+    //     send a copy to the destination, and keep the original.  A
+    //     reconciliation step merges divergent writes after the agent
+    //     returns.
+    //
+    // Full implementation requires multi-node testing; the plumbing point
+    // is here, immediately before we decide whether to deliver locally or
+    // build a remote packet.
+    // ────────────────────────────────────────────────────────────────────
+
     // Check if destination is actually local (same node).
     let local_node = crate::node::get_node_id();
     if dest_node_key == local_node {
