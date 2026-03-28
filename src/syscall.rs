@@ -211,8 +211,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                     state::create_keyspace(new_id as u16).ok();
                     // Snapshot initial state root and creation tick for receipts
                     if let Some(agent) = get_agent_mut(new_id) {
-                        let root16 = state::get_root(new_id as u16).unwrap_or([0u8; 16]);
-                        agent.initial_state_root[..16].copy_from_slice(&root16);
+                        let root32 = state::get_root(new_id as u16).unwrap_or([0u8; 32]);
+                        agent.initial_state_root = root32;
                         agent.tick_created = crate::arch::x86_64::timer::get_ticks();
                     }
                     // Add to run queue

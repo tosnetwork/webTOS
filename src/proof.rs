@@ -38,32 +38,28 @@ pub enum ProofResult {
     NoCheckpoint,
 }
 
-// ─── FNV hash helpers (reuse from merkle.rs pattern) ─────────────────────
+// ─── SHA-256 hash helpers ────────────────────────────────────────────────
+
+use sha2::{Sha256, Digest};
 
 fn hash_bytes(data: &[u8]) -> MerkleHash {
-    let h1 = fnv1a_64(data, 0xcbf29ce484222325);
-    let h2 = fnv1a_64(data, 0x84222325cbf29ce4);
-    let mut result = [0u8; 16];
-    result[0..8].copy_from_slice(&h1.to_le_bytes());
-    result[8..16].copy_from_slice(&h2.to_le_bytes());
-    result
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
-fn fnv1a_64(data: &[u8], offset_basis: u64) -> u64 {
-    let mut hash = offset_basis;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
-
-/// Chain two hashes together: H(left || right)
+/// Chain two hashes together: SHA-256(left || right)
 fn chain_hash(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
-    let mut data = [0u8; 32];
-    data[0..16].copy_from_slice(left);
-    data[16..32].copy_from_slice(right);
-    hash_bytes(&data)
+    let mut hasher = Sha256::new();
+    hasher.update(left);
+    hasher.update(right);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 /// Hash an event into a MerkleHash for chaining
@@ -90,7 +86,7 @@ pub fn generate_proof() -> ExecutionProof {
     let seq = crate::event::get_sequence();
 
     // Compute aggregate checkpoint root (hash of all keyspace roots)
-    let mut combined_root = [0u8; 16];
+    let mut combined_root = [0u8; 32];
     for i in 0..MAX_AGENTS {
         if let Some(root) = merkle::get_root(i as u16) {
             combined_root = chain_hash(&combined_root, &root);
@@ -126,7 +122,7 @@ pub fn generate_proof() -> ExecutionProof {
 /// sequence, then compares against the provided proof.
 pub fn verify_proof(proof: &ExecutionProof) -> ProofResult {
     // Recompute aggregate root
-    let mut combined_root = [0u8; 16];
+    let mut combined_root = [0u8; 32];
     for i in 0..MAX_AGENTS {
         if let Some(root) = merkle::get_root(i as u16) {
             combined_root = chain_hash(&combined_root, &root);
@@ -229,10 +225,10 @@ pub fn proof_from_bytes(data: &[u8]) -> Option<ExecutionProof> {
     let checkpoint_tick = u64::from_le_bytes(data[5..13].try_into().ok()?);
     let event_count = u32::from_le_bytes(data[13..17].try_into().ok()?) as u64;
 
-    let mut checkpoint_root = [0u8; 16];
+    let mut checkpoint_root = [0u8; 32];
     checkpoint_root.copy_from_slice(&data[17..33]);
 
-    let mut proof_hash = [0u8; 16];
+    let mut proof_hash = [0u8; 32];
     proof_hash.copy_from_slice(&data[33..49]);
 
     let start_seq = u64::from_le_bytes(data[49..57].try_into().ok()?);
@@ -291,12 +287,12 @@ pub fn generate_historical_proof(
     let value_hash = if let Some(data) = value_data {
         hash_bytes(data)
     } else {
-        [0u8; 16]
+        [0u8; 32]
     };
 
     // Build the Merkle path from the live tree.  We look up the entry index
     // for the key so we can call the tree's proof method.
-    let mut proof_path = [[0u8; 16]; 8];
+    let mut proof_path = [[0u8; 32]; 8];
     let mut proof_depth: u8 = 0;
 
     if let Some(merkle_proof) = find_entry_and_prove(keyspace, key as u64) {
