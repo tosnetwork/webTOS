@@ -45,6 +45,8 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
 fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
     let caller_id = sched::current();
 
+    crate::metrics::increment_syscall_count();
+
     // Charge energy for the syscall (except for idle agent)
     if caller_id != IDLE_AGENT_ID {
         let cost = crate::cost::COSTS.syscall;
@@ -133,6 +135,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                     state::create_keyspace(new_id as u16).ok();
                     // Add to run queue
                     sched::enqueue(new_id);
+                    crate::metrics::increment_agent_spawned();
                     crate::event::agent_created(new_id, caller_id);
                     new_id as i64
                 }
@@ -161,6 +164,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             );
 
             terminate_agent(caller_id, AgentStatus::Exited);
+            crate::metrics::increment_agent_exited();
             crate::event::agent_exited(caller_id, exit_code);
             sched::remove_from_run_queue(caller_id);
             sched::yield_current();
@@ -315,7 +319,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         }
 
         // ── 7: sys_event_emit ───────────────────────────────────────────
-        // a1 = event arg0, a2 = event arg1
+        // a1 = event arg0, a2 = event a1
         SYS_EVENT_EMIT => {
             if !capability::agent_try_cap(caller_id, CapType::EventEmit, 0) {
                 crate::event::cap_denied(caller_id, CapType::EventEmit as u64, 0);
@@ -971,6 +975,123 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             match crate::receipts::emit_receipt_for_agent(caller_id) {
                 Some(idx) => idx as i64,
                 None => E_QUOTA_EXCEEDED,
+            }
+        }
+
+        // ── 31: sys_package_verify ──────────────────────────────────────
+        // Verify package manifest signature and code hash.
+        // a1 = pointer to package data, a2 = length
+        // Returns 0 on success (valid), negative on failure.
+        SYS_PACKAGE_VERIFY => {
+            if a2 == 0 {
+                E_INVALID_ARG
+            } else {
+                match crate::package::parse_package(unsafe {
+                    core::slice::from_raw_parts(a1 as *const u8, a2 as usize)
+                }) {
+                    Some(pkg) => {
+                        if pkg.manifest.verify_code_hash(&pkg.code) {
+                            serial_println!("[SYSCALL] Package '{}' verified OK", pkg.manifest.name_str());
+                            0
+                        } else {
+                            serial_println!("[SYSCALL] Package '{}' code hash mismatch", pkg.manifest.name_str());
+                            E_INVALID_ARG
+                        }
+                    }
+                    None => {
+                        serial_println!("[SYSCALL] Package parse failed");
+                        E_INVALID_ARG
+                    }
+                }
+            }
+        }
+
+        // ── 32: sys_package_install ─────────────────────────────────────
+        // Install package from data in agent memory.
+        // a1 = pointer to package data, a2 = length
+        // Returns registry index on success, negative on failure.
+        SYS_PACKAGE_INSTALL => {
+            if a2 == 0 {
+                E_INVALID_ARG
+            } else {
+                match crate::package::parse_package(unsafe {
+                    core::slice::from_raw_parts(a1 as *const u8, a2 as usize)
+                }) {
+                    Some(pkg) => {
+                        if !pkg.manifest.verify_code_hash(&pkg.code) {
+                            serial_println!("[SYSCALL] Package install rejected: code hash mismatch");
+                            E_INVALID_ARG
+                        } else {
+                            let name = pkg.manifest.name_str();
+                            serial_println!("[SYSCALL] Installing package '{}'", name);
+                            match crate::package::install_package(pkg.manifest) {
+                                Some(idx) => idx as i64,
+                                None => E_QUOTA_EXCEEDED,
+                            }
+                        }
+                    }
+                    None => {
+                        serial_println!("[SYSCALL] Package install: parse failed");
+                        E_INVALID_ARG
+                    }
+                }
+            }
+        }
+
+        // ── 33: sys_node_attest ───────────────────────────────────────
+        // Return a summary of the node attestation hash (first 8 bytes as u64).
+        SYS_NODE_ATTEST => {
+            let hash = crate::node::get_attestation_hash();
+            i64::from_le_bytes([hash[0], hash[1], hash[2], hash[3],
+                                hash[4], hash[5], hash[6], hash[7]])
+        }
+
+        // ── 34: sys_agent_migrate ─────────────────────────────────────
+        // Initiate checkpoint-based migration. a1 = ptr to 32-byte target node ID.
+        SYS_AGENT_MIGRATE => {
+            let _target_ptr = a1;
+            serial_println!(
+                "[SYSCALL] AGENT_MIGRATE: agent {} requests migration (target_ptr={:#x})",
+                caller_id, _target_ptr
+            );
+
+            // Build a portable checkpoint for this agent
+            match crate::checkpoint::PortableCheckpoint::from_agent(caller_id) {
+                Some(pc) => {
+                    serial_println!(
+                        "[SYSCALL] AGENT_MIGRATE: checkpoint ready, data_len={} auth_len={}",
+                        pc.checkpoint_len, pc.authority_len
+                    );
+                    // In a full implementation the checkpoint would be sent via
+                    // routerd to the target node. For now we mark the agent as
+                    // suspended to indicate migration-in-progress.
+                    if let Some(agent) = crate::agent::get_agent_mut(caller_id) {
+                        agent.status = crate::agent::AgentStatus::Suspended;
+                    }
+                    E_OK
+                }
+                None => {
+                    serial_println!("[SYSCALL] AGENT_MIGRATE: checkpoint failed for agent {}", caller_id);
+                    E_INVALID_ARG
+                }
+            }
+        }
+
+        // ── 35: sys_placement_hint ────────────────────────────────────
+        // Declare placement preference. a1 = hint_type, a2 = hint_value.
+        SYS_PLACEMENT_HINT => {
+            let hint_type = a1;
+            let hint_value = a2;
+            if let Some(agent) = crate::agent::get_agent_mut(caller_id) {
+                agent.placement_hint_type = hint_type;
+                agent.placement_hint_value = hint_value;
+                serial_println!(
+                    "[SYSCALL] PLACEMENT_HINT: agent {} type={} value={}",
+                    caller_id, hint_type, hint_value
+                );
+                E_OK
+            } else {
+                E_INVALID_ARG
             }
         }
 

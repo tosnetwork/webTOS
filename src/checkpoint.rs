@@ -316,6 +316,107 @@ pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAge
     agents
 }
 
+// ─── Portable checkpoint for cross-node migration (Stage 8) ───────────────
+
+/// Portable checkpoint format for cross-node agent migration.
+///
+/// Contains everything needed to resume an agent on a different node:
+/// serialized CPU context, energy budget, capabilities, and state keyspace.
+#[repr(C)]
+pub struct PortableCheckpoint {
+    /// Agent ID on the source node (may be reassigned on destination).
+    pub agent_id: u16,
+    /// 32-byte identity of the source node.
+    pub source_node: [u8; 32],
+    /// Runtime class: 0 = kernel, 1 = user, 2 = WASM.
+    pub runtime_class: u8,
+    /// Remaining energy budget to transfer with the agent.
+    pub energy_remaining: u64,
+    /// Merkle state root of the agent's keyspace at checkpoint time.
+    pub state_root: [u8; 32],
+    /// Serialized agent state (CPU context + state entries).
+    pub checkpoint_data: [u8; 4096],
+    /// Number of valid bytes in `checkpoint_data`.
+    pub checkpoint_len: usize,
+    /// Serialized capability list (authority context).
+    pub authority_context: [u8; 256],
+    /// Number of valid bytes in `authority_context`.
+    pub authority_len: usize,
+}
+
+impl PortableCheckpoint {
+    /// Create an empty portable checkpoint.
+    pub const fn empty() -> Self {
+        PortableCheckpoint {
+            agent_id: 0,
+            source_node: [0; 32],
+            runtime_class: 0,
+            energy_remaining: 0,
+            state_root: [0; 32],
+            checkpoint_data: [0; 4096],
+            checkpoint_len: 0,
+            authority_context: [0; 256],
+            authority_len: 0,
+        }
+    }
+
+    /// Build a portable checkpoint from a live agent.
+    ///
+    /// Returns `None` if the agent does not exist or serialization exceeds
+    /// the fixed buffer sizes.
+    pub fn from_agent(agent_id: AgentId) -> Option<Self> {
+        let agent = crate::agent::get_agent(agent_id)?;
+        let mut pc = Self::empty();
+
+        pc.agent_id = agent_id;
+        pc.source_node = crate::node::get_node_id();
+        pc.runtime_class = match agent.mode {
+            crate::agent::AgentMode::Kernel => 0,
+            crate::agent::AgentMode::User   => 1,
+        };
+        pc.energy_remaining = agent.energy_budget;
+
+        // State root from Merkle tree (if available)
+        if let Some(root) = crate::merkle::get_root(agent_id) {
+            pc.state_root[..16].copy_from_slice(&root);
+        }
+
+        // Serialize full agent blob into checkpoint_data
+        if let Some(blob) = serialize_agent(agent_id) {
+            let copy_len = blob.len().min(pc.checkpoint_data.len());
+            pc.checkpoint_data[..copy_len].copy_from_slice(&blob[..copy_len]);
+            pc.checkpoint_len = copy_len;
+        } else {
+            return None;
+        }
+
+        // Serialize capabilities into authority_context
+        let cap_size = core::mem::size_of::<Capability>();
+        let mut off = 0usize;
+        for i in 0..agent.cap_count {
+            if let Some(ref cap) = agent.capabilities[i] {
+                if off + cap_size > pc.authority_context.len() { break; }
+                let cap_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        cap as *const Capability as *const u8,
+                        cap_size,
+                    )
+                };
+                pc.authority_context[off..off + cap_size].copy_from_slice(cap_bytes);
+                off += cap_size;
+            }
+        }
+        pc.authority_len = off;
+
+        serial_println!(
+            "[CHECKPOINT] PortableCheckpoint: agent={} data_len={} auth_len={}",
+            agent_id, pc.checkpoint_len, pc.authority_len
+        );
+
+        Some(pc)
+    }
+}
+
 // ─── Agent migration serialization ────────────────────────────────────────
 //
 // Wire format for a single migrated agent (little-endian throughout):

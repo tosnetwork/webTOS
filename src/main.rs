@@ -45,6 +45,8 @@ mod attestation;
 mod principal;
 mod policy;
 mod receipts;
+pub mod metrics;
+pub mod package;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

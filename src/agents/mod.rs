@@ -17,3 +17,8 @@ pub mod netd;
 pub mod routerd;
 pub mod skilld;
 pub mod authd;
+pub mod upgraded;
+pub mod admind;
+pub mod observabilityd;
+pub mod pkgd;
+pub mod membership_d;

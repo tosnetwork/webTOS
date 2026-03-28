@@ -104,6 +104,7 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
         32 => {
             // Increment the global tick counter
             crate::arch::x86_64::timer::tick();
+            crate::metrics::increment_uptime();
             // Send EOI: use LAPIC if active, otherwise PIC
             if crate::arch::x86_64::lapic::is_active() {
                 crate::arch::x86_64::lapic::eoi();
