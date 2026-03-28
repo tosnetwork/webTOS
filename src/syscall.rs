@@ -143,6 +143,23 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         // ── 2: sys_exit ─────────────────────────────────────────────────
         SYS_EXIT => {
             let exit_code = a1;
+
+            // Emit an execution receipt before terminating the agent
+            let tick_now = crate::arch::x86_64::timer::get_ticks();
+            let energy_remaining = match get_agent(caller_id) {
+                Some(a) => a.energy_budget,
+                None => 0,
+            };
+            crate::receipts::emit_receipt_on_exit(
+                caller_id,
+                crate::receipts::RuntimeClassTag::ProofGradeWasm,
+                energy_remaining,
+                [0; 32], // initial_state_root placeholder
+                [0; 32], // final_state_root placeholder
+                0,       // tick_start placeholder
+                tick_now,
+            );
+
             terminate_agent(caller_id, AgentStatus::Exited);
             crate::event::agent_exited(caller_id, exit_code);
             sched::remove_from_run_queue(caller_id);
@@ -805,6 +822,155 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             match crate::replay::enter_replay() {
                 Ok(()) => E_OK,
                 Err(e) => e,
+            }
+        }
+
+        // ── 23: sys_principal_query ─────────────────────────────────────
+        // Returns the principal_id associated with this agent (derived from agent_id).
+        SYS_PRINCIPAL_QUERY => {
+            // Derive a principal ID from the agent ID: zero-fill with agent_id in first 2 bytes
+            let mut principal_id = [0u8; 32];
+            let id_bytes = caller_id.to_le_bytes();
+            principal_id[0] = id_bytes[0];
+            principal_id[1] = id_bytes[1];
+
+            // If a2 is a valid buffer pointer, write the principal_id there
+            if a1 != 0 && a2 >= 32 {
+                unsafe {
+                    security::stac();
+                    core::ptr::copy_nonoverlapping(
+                        principal_id.as_ptr(),
+                        a1 as *mut u8,
+                        32,
+                    );
+                    security::clac();
+                }
+            }
+
+            E_OK
+        }
+
+        // ── 24: sys_lease_verify ────────────────────────────────────────
+        // a1 = cap_index -> checks if capability lease is still valid
+        // Returns 0 if valid, -1 if expired/revoked
+        SYS_LEASE_VERIFY => {
+            let cap_index = a1 as usize;
+            let current_tick = crate::arch::x86_64::timer::get_ticks();
+
+            let agent = match get_agent(caller_id) {
+                Some(a) => a,
+                None => return E_INVALID_ARG,
+            };
+
+            if cap_index >= agent.cap_count {
+                return E_INVALID_ARG;
+            }
+
+            match &agent.capabilities[cap_index] {
+                Some(cap) => {
+                    if cap.is_expired(current_tick) {
+                        crate::event::auth_lease_expired(caller_id, cap_index as u64, cap.expiry_ticks);
+                        -1
+                    } else {
+                        E_OK
+                    }
+                }
+                None => E_NOT_FOUND,
+            }
+        }
+
+        // ── 25: sys_revocation_check ────────────────────────────────────
+        // a1 = principal_id_ptr, a2 = principal_id_len (must be 32)
+        // Returns 0 if active, 1 if revoked
+        SYS_REVOCATION_CHECK => {
+            if a2 != 32 {
+                return E_INVALID_ARG;
+            }
+
+            let _principal_id = unsafe {
+                security::stac();
+                let s = core::slice::from_raw_parts(a1 as *const u8, 32);
+                security::clac();
+                s
+            };
+
+            // Stage 5 stub: all principals are active until a revocation
+            // registry is implemented. The authd agent handles revocations
+            // via mailbox protocol.
+            0 // Active
+        }
+
+        // ── 26: sys_state_tx_begin ────────────────────────────────────
+        // a1 = keyspace_id (0 = own keyspace)
+        // Creates a new transaction for atomic multi-key updates.
+        SYS_STATE_TX_BEGIN => {
+            let keyspace = if a1 == 0 { caller_id as KeyspaceId } else { a1 as KeyspaceId };
+
+            if !capability::agent_has_cap(caller_id, CapType::StateWrite, keyspace) {
+                crate::event::cap_denied(caller_id, CapType::StateWrite as u64, keyspace as u64);
+                return E_NO_CAP;
+            }
+
+            match state::tx_begin(caller_id as u16, keyspace) {
+                Ok(tx_id) => tx_id as i64,
+                Err(e) => e,
+            }
+        }
+
+        // ── 27: sys_state_tx_commit ──────────────────────────────────
+        // Commits all buffered mutations atomically and advances the
+        // keyspace version.
+        SYS_STATE_TX_COMMIT => {
+            match state::tx_commit(caller_id as u16) {
+                Ok(()) => E_OK,
+                Err(e) => e,
+            }
+        }
+
+        // ── 28: sys_state_snapshot ───────────────────────────────────
+        // a1 = keyspace_id (0 = own keyspace)
+        // Returns the current version number.
+        SYS_STATE_SNAPSHOT => {
+            let keyspace = if a1 == 0 { caller_id as KeyspaceId } else { a1 as KeyspaceId };
+
+            if !capability::agent_has_cap(caller_id, CapType::StateRead, keyspace) {
+                crate::event::cap_denied(caller_id, CapType::StateRead as u64, keyspace as u64);
+                return E_NO_CAP;
+            }
+
+            match state::get_version(keyspace) {
+                Some(v) => v as i64,
+                None => E_NOT_FOUND,
+            }
+        }
+
+        // ── 29: sys_state_proof_get ──────────────────────────────────
+        // a1 = keyspace_id (0 = own), a2 = key, a3 = version
+        // Generates a historical inclusion/exclusion proof.
+        // Returns 1 for inclusion, 0 for exclusion, negative on error.
+        SYS_STATE_PROOF_GET => {
+            let keyspace = if a1 == 0 { caller_id as KeyspaceId } else { a1 as KeyspaceId };
+
+            if !capability::agent_has_cap(caller_id, CapType::StateRead, keyspace) {
+                crate::event::cap_denied(caller_id, CapType::StateRead as u64, keyspace as u64);
+                return E_NO_CAP;
+            }
+
+            match crate::proof::generate_historical_proof(keyspace, a3 as u32, a2 as u16) {
+                Some(hp) => {
+                    if hp.inclusion { 1 } else { 0 }
+                }
+                None => E_NOT_FOUND,
+            }
+        }
+
+        // ── 30: sys_receipt_emit ────────────────────────────────────────
+        // Manually emit an execution receipt for the calling agent.
+        // Returns the receipt store index on success, or E_QUOTA_EXCEEDED if full.
+        SYS_RECEIPT_EMIT => {
+            match crate::receipts::emit_receipt_for_agent(caller_id) {
+                Some(idx) => idx as i64,
+                None => E_QUOTA_EXCEEDED,
             }
         }
 

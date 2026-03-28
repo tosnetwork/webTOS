@@ -467,6 +467,28 @@ pub fn init() {
     serial_println!("[INIT] Skilld agent created: id={}", skilld_id);
     event::agent_created(skilld_id, root_id);
 
+    // ── Authd agent (agent 12) ── authority service ─────────────────────
+    let authd_id = create_agent(
+        Some(root_id),
+        agents::authd::authd_entry as *const () as u64,
+        stack_top(12),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create authd agent");
+    {
+        let agent = get_agent_mut(authd_id).expect("Authd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[12].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(authd_id as MailboxId, authd_id).ok();
+    state::create_keyspace(authd_id as u16).ok();
+    serial_println!("[INIT] Authd agent created: id={}", authd_id);
+    event::agent_created(authd_id, root_id);
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
@@ -474,7 +496,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id, authd_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -494,6 +516,7 @@ pub fn init() {
     sched::add_to_run_queue(netd_id);
     sched::add_to_run_queue(routerd_id);
     sched::add_to_run_queue(skilld_id);
+    sched::add_to_run_queue(authd_id);
 
     // ── Write stack guard canaries at the bottom of every agent stack ──
     write_stack_guards();
