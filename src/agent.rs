@@ -49,6 +49,14 @@ pub const SYS_MAILBOX_DESTROY: u64 = 19;
 pub const SYS_REPLAY: u64 = 20;
 pub const SYS_RECV_TIMEOUT: u64 = 21;
 pub const SYS_SPAWN_IMAGE: u64 = 22;
+pub const SYS_PRINCIPAL_QUERY: u64 = 23;
+pub const SYS_LEASE_VERIFY: u64 = 24;
+pub const SYS_REVOCATION_CHECK: u64 = 25;
+pub const SYS_STATE_TX_BEGIN: u64 = 26;
+pub const SYS_STATE_TX_COMMIT: u64 = 27;
+pub const SYS_STATE_SNAPSHOT: u64 = 28;
+pub const SYS_STATE_PROOF_GET: u64 = 29;
+pub const SYS_RECEIPT_EMIT: u64 = 30;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 

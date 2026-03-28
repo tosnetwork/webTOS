@@ -42,6 +42,9 @@ mod ringbuf;
 mod block;
 mod proof;
 mod attestation;
+mod principal;
+mod policy;
+mod receipts;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

@@ -8,6 +8,7 @@ use crate::agent::{
     AgentId, CAP_TARGET_WILDCARD,
     MAX_CAPABILITIES_PER_AGENT, E_NO_CAP, E_QUOTA_EXCEEDED, E_INVALID_ARG, E_NOT_FOUND,
 };
+use crate::principal::PrincipalId;
 
 // ─── Capability types ───────────────────────────────────────────────────────
 
@@ -39,6 +40,17 @@ pub struct Capability {
     /// Placeholder signature — FNV-1a hash of cap fields concatenated with the
     /// shared secret. A real implementation would use ed25519 here.
     pub signature: [u8; 32],
+    // ── Stage 5: Trusted Authority Plane lease fields ────────────────────
+    /// Principal that issued this capability.
+    pub issuer_id: PrincipalId,
+    /// Principal this capability is granted to.
+    pub subject_id: PrincipalId,
+    /// Tick at which this capability expires (0 = no expiry).
+    pub expiry_ticks: u64,
+    /// Unique nonce for replay protection.
+    pub nonce: u64,
+    /// Maximum delegation chain length (0 = cannot delegate further).
+    pub delegation_depth: u8,
 }
 
 impl Capability {
@@ -52,6 +64,11 @@ impl Capability {
             use_count: 0,
             node_id: 0,
             signature: [0u8; 32],
+            issuer_id: [0u8; 32],
+            subject_id: [0u8; 32],
+            expiry_ticks: 0,
+            nonce: 0,
+            delegation_depth: 0,
         }
     }
 
@@ -65,6 +82,11 @@ impl Capability {
             use_count: 0,
             node_id: 0,
             signature: [0u8; 32],
+            issuer_id: [0u8; 32],
+            subject_id: [0u8; 32],
+            expiry_ticks: 0,
+            nonce: 0,
+            delegation_depth: 0,
         }
     }
 
@@ -100,6 +122,34 @@ impl Capability {
     pub fn is_subset_of(&self, parent_cap: &Capability) -> bool {
         self.cap_type == parent_cap.cap_type
             && (parent_cap.target == CAP_TARGET_WILDCARD || self.target == parent_cap.target)
+    }
+
+    // ── Stage 5: Lease / delegation methods ─────────────────────────────
+
+    /// Check if this capability's lease has expired.
+    ///
+    /// A capability with `expiry_ticks == 0` never expires.
+    pub fn is_expired(&self, current_tick: u64) -> bool {
+        self.expiry_ticks > 0 && current_tick > self.expiry_ticks
+    }
+
+    /// Check if this capability can be delegated further.
+    pub fn can_delegate(&self) -> bool {
+        self.delegation_depth > 0
+    }
+
+    /// Create a delegated copy of this capability for `new_subject`.
+    ///
+    /// Returns `None` if delegation depth is exhausted.
+    pub fn delegated(&self, new_subject: PrincipalId) -> Option<Capability> {
+        if self.delegation_depth == 0 {
+            return None;
+        }
+        let mut new = *self;
+        new.issuer_id = self.subject_id;
+        new.subject_id = new_subject;
+        new.delegation_depth -= 1;
+        Some(new)
     }
 }
 

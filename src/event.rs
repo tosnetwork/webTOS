@@ -40,6 +40,13 @@ pub enum EventType {
     MailboxPressure = 20,
     ChildAdopted = 21,
     EbpfPolicy = 22,
+    // ── Stage 5: Trusted Authority Plane events ─────────────────────────
+    AuthGrant = 23,
+    AuthDelegate = 24,
+    AuthRevoke = 25,
+    AuthRenew = 26,
+    AuthDeny = 27,
+    AuthLeaseExpired = 28,
 }
 
 impl EventType {
@@ -69,6 +76,12 @@ impl EventType {
             EventType::MailboxPressure => "MAILBOX_PRESSURE",
             EventType::ChildAdopted => "CHILD_ADOPTED",
             EventType::EbpfPolicy => "EBPF_POLICY",
+            EventType::AuthGrant => "AUTH_GRANT",
+            EventType::AuthDelegate => "AUTH_DELEGATE",
+            EventType::AuthRevoke => "AUTH_REVOKE",
+            EventType::AuthRenew => "AUTH_RENEW",
+            EventType::AuthDeny => "AUTH_DENY",
+            EventType::AuthLeaseExpired => "AUTH_LEASE_EXPIRED",
         }
     }
 }
@@ -237,4 +250,36 @@ pub fn mailbox_pressure(mailbox_id: u16, current_count: u64, capacity: u64) {
 /// Emit a child-adopted event when an orphan is reparented to a new parent.
 pub fn child_adopted(child_id: AgentId, new_parent: AgentId, old_parent: AgentId) {
     emit(child_id, EventType::ChildAdopted, new_parent as u64, old_parent as u64, 0);
+}
+
+// ─── Stage 5: Authority plane event helpers ─────────────────────────────
+
+/// Emit an authority grant event.
+pub fn auth_grant(agent_id: AgentId, target_agent: u64, cap_type: u64) {
+    emit(agent_id, EventType::AuthGrant, target_agent, cap_type, 0);
+}
+
+/// Emit an authority delegation event.
+pub fn auth_delegate(agent_id: AgentId, target_agent: u64, depth: u64) {
+    emit(agent_id, EventType::AuthDelegate, target_agent, depth, 0);
+}
+
+/// Emit an authority revocation event.
+pub fn auth_revoke(agent_id: AgentId, target_agent: u64, reason: u64) {
+    emit(agent_id, EventType::AuthRevoke, target_agent, reason, 0);
+}
+
+/// Emit an authority renewal event.
+pub fn auth_renew(agent_id: AgentId, target_agent: u64, new_expiry: u64) {
+    emit(agent_id, EventType::AuthRenew, target_agent, new_expiry, 0);
+}
+
+/// Emit an authority denial event.
+pub fn auth_deny(agent_id: AgentId, reason: u64, target: u64) {
+    emit(agent_id, EventType::AuthDeny, reason, target, -1);
+}
+
+/// Emit a lease-expired event.
+pub fn auth_lease_expired(agent_id: AgentId, cap_index: u64, expiry_tick: u64) {
+    emit(agent_id, EventType::AuthLeaseExpired, cap_index, expiry_tick, 0);
 }

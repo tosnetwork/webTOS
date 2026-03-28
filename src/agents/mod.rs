@@ -16,3 +16,4 @@ pub mod accountd;
 pub mod netd;
 pub mod routerd;
 pub mod skilld;
+pub mod authd;
