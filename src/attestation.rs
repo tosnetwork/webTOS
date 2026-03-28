@@ -25,22 +25,23 @@ fn fnv1a_64(data: &[u8], offset_basis: u64) -> u64 {
     hash
 }
 
-/// Produce a 16-byte (128-bit) FNV-1a hash over `data`.
-fn fnv_hash_128(data: &[u8]) -> [u8; 16] {
-    let h1 = fnv1a_64(data, 0xcbf29ce484222325);
-    let h2 = fnv1a_64(data, 0x84222325cbf29ce4);
-    let mut out = [0u8; 16];
-    out[0..8].copy_from_slice(&h1.to_le_bytes());
-    out[8..16].copy_from_slice(&h2.to_le_bytes());
+/// Produce a 32-byte SHA-256 hash over `data`.
+fn sha256_hash(data: &[u8]) -> [u8; 32] {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
     out
 }
 
-/// Chain two 16-byte hashes: H(left || right)
-fn chain_hash(left: &[u8; 16], right: &[u8; 16]) -> [u8; 16] {
-    let mut buf = [0u8; 32];
-    buf[0..16].copy_from_slice(left);
-    buf[16..32].copy_from_slice(right);
-    fnv_hash_128(&buf)
+/// Chain two 32-byte hashes: SHA-256(left || right)
+fn chain_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 64];
+    buf[0..32].copy_from_slice(left);
+    buf[32..64].copy_from_slice(right);
+    sha256_hash(&buf)
 }
 
 // ─── Structures ────────────────────────────────────────────────────────────
@@ -51,10 +52,10 @@ fn chain_hash(left: &[u8; 16], right: &[u8; 16]) -> [u8; 16] {
 /// `boot_config_hash` — FNV-1a over the boot-time configuration (tick, agent
 ///                      count, event sequence).
 pub struct KernelMeasurement {
-    /// FNV-1a of kernel .text section bounds (start + end addresses).
-    pub kernel_hash: [u8; 16],
-    /// FNV-1a of boot configuration (tick, agent_count, event_seq).
-    pub boot_config_hash: [u8; 16],
+    /// SHA-256 of kernel .text section bounds (start + end addresses).
+    pub kernel_hash: [u8; 32],
+    /// SHA-256 of boot configuration (tick, agent_count, event_seq).
+    pub boot_config_hash: [u8; 32],
     /// Number of active agents at measurement time.
     pub agent_count: u32,
     /// Scheduler tick at measurement time.
@@ -66,7 +67,7 @@ pub struct AttestationReport {
     /// The kernel measurement captured for this report.
     pub measurement: KernelMeasurement,
     /// Hash of the latest execution proof at report-generation time.
-    pub proof_hash: [u8; 16],
+    pub proof_hash: [u8; 32],
     /// Keyed-hash signature over (measurement || proof_hash).
     /// Placeholder for a TPM-backed signature in production.
     pub signature: [u8; 32],
@@ -95,7 +96,7 @@ pub fn measure_kernel() -> KernelMeasurement {
     let mut text_buf = [0u8; 16];
     text_buf[0..8].copy_from_slice(&text_start.to_le_bytes());
     text_buf[8..16].copy_from_slice(&text_end.to_le_bytes());
-    let kernel_hash = fnv_hash_128(&text_buf);
+    let kernel_hash = sha256_hash(&text_buf);
 
     // ── boot_config_hash: FNV-1a over tick + agent_count + event_seq ───────
     let mut agent_count: u32 = 0;
@@ -110,7 +111,7 @@ pub fn measure_kernel() -> KernelMeasurement {
     cfg_buf[0..8].copy_from_slice(&tick.to_le_bytes());
     cfg_buf[8..12].copy_from_slice(&agent_count.to_le_bytes());
     cfg_buf[12..20].copy_from_slice(&event_seq.to_le_bytes());
-    let boot_config_hash = fnv_hash_128(&cfg_buf);
+    let boot_config_hash = sha256_hash(&cfg_buf);
 
     KernelMeasurement {
         kernel_hash,

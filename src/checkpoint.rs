@@ -150,7 +150,7 @@ pub fn save_to_disk() -> bool {
     });
 
     // ── Collect Merkle roots ──
-    let mut merkle_roots: [merkle::MerkleHash; MAX_AGENTS] = [[0u8; 16]; MAX_AGENTS];
+    let mut merkle_roots: [merkle::MerkleHash; MAX_AGENTS] = [[0u8; 32]; MAX_AGENTS];
     let mut merkle_count = 0u16;
 
     for i in 0..MAX_AGENTS {
@@ -611,7 +611,7 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
 /// Load Merkle roots from a checkpoint on disk.
 /// Returns an array of MerkleHash values.
 pub fn load_merkle_from_disk(header: &CheckpointHeader) -> [crate::merkle::MerkleHash; MAX_AGENTS] {
-    let mut roots: [crate::merkle::MerkleHash; MAX_AGENTS] = [[0u8; 16]; MAX_AGENTS];
+    let mut roots: [crate::merkle::MerkleHash; MAX_AGENTS] = [[0u8; 32]; MAX_AGENTS];
     const SECTOR_SIZE: usize = 512;
     let mut sector_buf = [0u8; SECTOR_SIZE];
 

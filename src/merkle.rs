@@ -1,13 +1,16 @@
 //! ATOS Merkle State Tree
 //!
-//! Provides a Merkle root hash over key-value state entries.
+//! Provides a SHA-256 Merkle root hash over key-value state entries.
 //! Each keyspace maintains its own Merkle root. State transitions
 //! produce a new root hash for external verification.
+//!
+//! Tree structure: Binary Merkle Tree with 64 leaves and 7 levels.
+//! Hash function: SHA-256 (cryptographically secure, 128-bit collision resistance).
 
-/// Simple SHA-256-like hash (use a lightweight hash for bare metal).
-/// For Stage-3, we use a simple FNV-1a 64-bit hash doubled to 128-bit.
-/// Full SHA-256 can be added in Stage-4 for cryptographic security.
-pub type MerkleHash = [u8; 16]; // 128-bit hash
+use sha2::{Sha256, Digest};
+
+/// 256-bit Merkle hash (SHA-256).
+pub type MerkleHash = [u8; 32];
 
 const MAX_LEAVES: usize = 64;  // Max entries per keyspace
 const TREE_SIZE: usize = 128;  // Internal nodes (next power of 2 above MAX_LEAVES)
@@ -24,9 +27,9 @@ pub struct MerkleTree {
 impl MerkleTree {
     pub const fn new() -> Self {
         MerkleTree {
-            leaves: [[0u8; 16]; MAX_LEAVES],
+            leaves: [[0u8; 32]; MAX_LEAVES],
             leaf_count: 0,
-            root: [0u8; 16],
+            root: [0u8; 32],
         }
     }
 
@@ -43,7 +46,7 @@ impl MerkleTree {
     /// Remove a leaf (set to zero hash)
     pub fn remove_leaf(&mut self, index: usize) {
         if index >= MAX_LEAVES { return; }
-        self.leaves[index] = [0u8; 16];
+        self.leaves[index] = [0u8; 32];
         self.recompute_root();
     }
 
@@ -60,11 +63,11 @@ impl MerkleTree {
     /// Recompute root from leaves (simple binary tree hash)
     fn recompute_root(&mut self) {
         if self.leaf_count == 0 {
-            self.root = [0u8; 16];
+            self.root = [0u8; 32];
             return;
         }
         // Build tree bottom-up: hash pairs of nodes
-        let mut level: [MerkleHash; TREE_SIZE] = [[0u8; 16]; TREE_SIZE];
+        let mut level: [MerkleHash; TREE_SIZE] = [[0u8; 32]; TREE_SIZE];
         // Copy leaves to bottom level
         for i in 0..self.leaf_count {
             level[i] = self.leaves[i];
@@ -89,7 +92,7 @@ impl MerkleTree {
     /// Returns the sibling hashes along the path from leaf to root.
     pub fn proof(&self, index: usize) -> MerkleProof {
         let mut proof = MerkleProof {
-            siblings: [[0u8; 16]; 7], // log2(128) = 7 levels max
+            siblings: [[0u8; 32]; 7], // log2(128) = 7 levels max
             depth: 0,
             leaf_index: index,
         };
@@ -99,7 +102,7 @@ impl MerkleTree {
         }
 
         // Rebuild tree to extract siblings
-        let mut level: [MerkleHash; TREE_SIZE] = [[0u8; 16]; TREE_SIZE];
+        let mut level: [MerkleHash; TREE_SIZE] = [[0u8; 32]; TREE_SIZE];
         for i in 0..self.leaf_count {
             level[i] = self.leaves[i];
         }
@@ -155,41 +158,26 @@ impl MerkleProof {
     }
 }
 
-/// Hash a key-value pair into a leaf hash
+/// Hash a key-value pair into a leaf hash using SHA-256.
 fn hash_kv(key: u64, value: &[u8]) -> MerkleHash {
-    let mut data = [0u8; 264]; // 8 (key) + 256 (max value)
-    data[0..8].copy_from_slice(&key.to_le_bytes());
-    let len = value.len().min(256);
-    data[8..8 + len].copy_from_slice(&value[..len]);
-    fnv_hash_128(&data[..8 + len])
+    let mut hasher = Sha256::new();
+    hasher.update(&key.to_le_bytes());
+    hasher.update(value);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
-/// Hash two child hashes into a parent hash
+/// Hash two child hashes into a parent hash using SHA-256.
 fn hash_pair(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
-    let mut data = [0u8; 32];
-    data[0..16].copy_from_slice(left);
-    data[16..32].copy_from_slice(right);
-    fnv_hash_128(&data)
-}
-
-/// FNV-1a 128-bit hash (simple, non-cryptographic, suitable for Stage-3)
-fn fnv_hash_128(data: &[u8]) -> MerkleHash {
-    // FNV-1a with 64-bit, run twice with different offsets for 128-bit
-    let h1 = fnv1a_64(data, 0xcbf29ce484222325);
-    let h2 = fnv1a_64(data, 0x84222325cbf29ce4); // different seed
-    let mut result = [0u8; 16];
-    result[0..8].copy_from_slice(&h1.to_le_bytes());
-    result[8..16].copy_from_slice(&h2.to_le_bytes());
-    result
-}
-
-fn fnv1a_64(data: &[u8], offset_basis: u64) -> u64 {
-    let mut hash = offset_basis;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    let mut hasher = Sha256::new();
+    hasher.update(left);
+    hasher.update(right);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 // ─── Per-keyspace Merkle roots ─────────────────────────────────────────────

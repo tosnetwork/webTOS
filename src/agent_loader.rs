@@ -472,8 +472,8 @@ fn finish_agent_setup(agent_id: AgentId, parent_id: AgentId) -> Result<(), i64> 
         .map_err(|_| E_QUOTA_EXCEEDED)?;
     // Snapshot initial state root and creation tick for receipts
     if let Some(agent) = crate::agent::get_agent_mut(agent_id) {
-        let root16 = state::get_root(agent_id as u16).unwrap_or([0u8; 16]);
-        agent.initial_state_root[..16].copy_from_slice(&root16);
+        let root32 = state::get_root(agent_id as u16).unwrap_or([0u8; 32]);
+        agent.initial_state_root = root32;
         agent.tick_created = crate::arch::x86_64::timer::get_ticks();
     }
     sched::enqueue(agent_id);

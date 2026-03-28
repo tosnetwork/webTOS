@@ -12,7 +12,7 @@ use crate::deterministic;
 // ─── Replay state ────────────────────────────────────────────────────────
 
 static mut REPLAY_ACTIVE: bool = false;
-static mut SAVED_MERKLE_ROOTS: [MerkleHash; MAX_AGENTS] = [[0u8; 16]; MAX_AGENTS];
+static mut SAVED_MERKLE_ROOTS: [MerkleHash; MAX_AGENTS] = [[0u8; 32]; MAX_AGENTS];
 static mut SAVED_TICK: u64 = 0;
 static mut SAVED_EVENT_SEQ: u64 = 0;
 static mut SAVED_AGENT_COUNT: u16 = 0;

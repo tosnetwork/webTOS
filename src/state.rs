@@ -79,7 +79,7 @@ impl Keyspace {
             id,
             entries: [const { StateEntry::empty() }; MAX_ENTRIES_PER_KEYSPACE],
             version: 0,
-            root_history: [(0u32, [0u8; 16]); MAX_ROOT_HISTORY],
+            root_history: [(0u32, [0u8; 32]); MAX_ROOT_HISTORY],
             root_history_count: 0,
         }
     }
@@ -87,7 +87,7 @@ impl Keyspace {
     /// Compute the current Merkle root for this keyspace by delegating to the
     /// global Merkle tree table.
     fn compute_root(&self) -> MerkleHash {
-        merkle::get_root(self.id).unwrap_or([0u8; 16])
+        merkle::get_root(self.id).unwrap_or([0u8; 32])
     }
 
     /// Advance the version counter and snapshot the current Merkle root into
