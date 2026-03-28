@@ -7,7 +7,7 @@ description = "ATOS Stage-1: AI-native minimal operating system kernel"
 
 [dependencies]
 libm = "0.2"
-wasbi = { path = "../wasbi", features = ["spec-test-internals"] }
+wasbi = { git = "https://gitlab.com/atos-im/wasbi.git", branch = "main", features = ["spec-test-internals"] }
 
 [profile.dev]
 panic = "abort"
