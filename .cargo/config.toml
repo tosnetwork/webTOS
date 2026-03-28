@@ -8,4 +8,4 @@ json-target-spec = true
 
 [target.'cfg(target_os = "atos")']
 runner = "qemu-system-x86_64 -serial stdio -display none -no-reboot -no-shutdown -kernel"
-rustflags = []
+rustflags = ["--cfg", "curve25519_dalek_backend=\"fiat\""]

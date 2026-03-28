@@ -152,6 +152,7 @@ pub fn store_receipt(receipt: ExecutionReceipt) -> Option<usize> {
             let idx = RECEIPT_COUNT;
             RECEIPT_STORE[idx] = Some(receipt);
             RECEIPT_COUNT += 1;
+            crate::persist::save_receipts_to_disk();
             Some(idx)
         } else {
             None

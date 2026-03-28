@@ -178,6 +178,7 @@ pub fn install_package(manifest: PackageManifest) -> Option<usize> {
         let idx = PACKAGE_COUNT;
         PACKAGE_REGISTRY[idx] = Some(manifest);
         PACKAGE_COUNT += 1;
+        crate::persist::save_packages_to_disk();
         Some(idx)
     }
 }

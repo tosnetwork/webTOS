@@ -8,6 +8,9 @@ description = "ATOS Stage-1: AI-native minimal operating system kernel"
 [dependencies]
 libm = "0.2"
 wasbi = { git = "https://gitlab.com/atos-im/wasbi.git", branch = "main", features = ["spec-test-internals"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+rand_core = { version = "0.6", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 [profile.dev]
 panic = "abort"

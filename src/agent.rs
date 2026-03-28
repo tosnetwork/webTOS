@@ -71,6 +71,9 @@ pub const SYS_PLACEMENT_HINT: u64 = 35;
 pub const SYS_QUOTE_REQUEST: u64 = 36;
 pub const SYS_PROOF_GENERATE: u64 = 37;
 
+// Stage 10: Cross-node mailbox routing syscall
+pub const SYS_SEND_REMOTE: u64 = 38;
+
 // ─── Error codes ────────────────────────────────────────────────────────────
 
 pub const E_OK: i64 = 0;

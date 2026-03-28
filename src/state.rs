@@ -419,6 +419,7 @@ pub fn tx_commit(agent_id: u16) -> Result<(), i64> {
             Some(tx) => {
                 if tx.commit() {
                     TX_SLOTS[idx] = None;
+                    crate::persist::save_state_to_disk();
                     Ok(())
                 } else {
                     Err(E_INVALID_ARG)
