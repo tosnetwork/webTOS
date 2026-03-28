@@ -1095,6 +1095,30 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             }
         }
 
+        // ── 36: sys_quote_request ──────────────────────────────────────
+        // Return estimated energy cost for a workload.
+        // a1 = workload type (0=wasm, 1=native, 2=migrate)
+        // a2 = estimated size/duration
+        // Returns: estimated energy units
+        SYS_QUOTE_REQUEST => {
+            let workload_type = a1;
+            let size_hint = a2;
+            let estimate = match workload_type {
+                0 => size_hint * 10,  // WASM: 10 energy per estimated instruction
+                1 => size_hint * 5,   // Native: 5 energy per unit
+                2 => 1000 + size_hint, // Migration: 1000 base + size
+                _ => 0,
+            };
+            estimate as i64
+        }
+
+        // ── 37: sys_proof_generate ──────────────────────────────────────
+        // Generate a proof bundle for the most recent receipt.
+        // Returns: proof bundle index or -1 on failure
+        SYS_PROOF_GENERATE => {
+            0 // stub
+        }
+
         _ => {
             serial_println!(
                 "[SYSCALL] Unknown syscall {} from agent {}",

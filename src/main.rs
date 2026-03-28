@@ -44,6 +44,7 @@ mod proof;
 mod attestation;
 mod principal;
 mod policy;
+mod crypto;
 mod receipts;
 pub mod metrics;
 pub mod package;

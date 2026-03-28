@@ -600,6 +600,162 @@ pub fn init() {
     serial_println!("[INIT] Membership_d agent created: id={}", membership_d_id);
     event::agent_created(membership_d_id, root_id);
 
+    // ── Compactd agent (agent 18) ── state compaction service ──────────
+    let compactd_id = create_agent(
+        Some(root_id),
+        agents::compactd::compactd_main as *const () as u64,
+        stack_top(18),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create compactd agent");
+    {
+        let agent = get_agent_mut(compactd_id).expect("Compactd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[18].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.capabilities[3] = Some(Capability::new(CapType::StateRead, CAP_TARGET_WILDCARD));
+        agent.capabilities[4] = Some(Capability::new(CapType::StateWrite, CAP_TARGET_WILDCARD));
+        agent.cap_count = 5;
+    }
+    mailbox::create_mailbox(compactd_id as MailboxId, compactd_id).ok();
+    state::create_keyspace(compactd_id as u16).ok();
+    serial_println!("[INIT] Compactd agent created: id={}", compactd_id);
+    event::agent_created(compactd_id, root_id);
+
+    // ── Placement_d agent (agent 19) ── placement decision service ────
+    let placement_d_id = create_agent(
+        Some(root_id),
+        agents::placement_d::placement_d_main as *const () as u64,
+        stack_top(19),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create placement_d agent");
+    {
+        let agent = get_agent_mut(placement_d_id).expect("Placement_d agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[19].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(placement_d_id as MailboxId, placement_d_id).ok();
+    state::create_keyspace(placement_d_id as u16).ok();
+    serial_println!("[INIT] Placement_d agent created: id={}", placement_d_id);
+    event::agent_created(placement_d_id, root_id);
+
+    // ── Failover_d agent (agent 20) ── failure recovery service ───────
+    let failover_d_id = create_agent(
+        Some(root_id),
+        agents::failover_d::failover_d_main as *const () as u64,
+        stack_top(20),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create failover_d agent");
+    {
+        let agent = get_agent_mut(failover_d_id).expect("Failover_d agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[20].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(failover_d_id as MailboxId, failover_d_id).ok();
+    state::create_keyspace(failover_d_id as u16).ok();
+    serial_println!("[INIT] Failover_d agent created: id={}", failover_d_id);
+    event::agent_created(failover_d_id, root_id);
+
+    // ── Auditd agent (agent 21) ── authority audit service ──────────────
+    let auditd_id = create_agent(
+        Some(root_id),
+        agents::auditd::auditd_main as *const () as u64,
+        stack_top(21),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create auditd agent");
+    {
+        let agent = get_agent_mut(auditd_id).expect("Auditd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[21].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(auditd_id as MailboxId, auditd_id).ok();
+    state::create_keyspace(auditd_id as u16).ok();
+    serial_println!("[INIT] Auditd agent created: id={}", auditd_id);
+    event::agent_created(auditd_id, root_id);
+
+    // ── Quotad agent (agent 22) ── cost estimation service ────────────
+    let quotad_id = create_agent(
+        Some(root_id),
+        agents::quotad::quotad_main as *const () as u64,
+        stack_top(22),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create quotad agent");
+    {
+        let agent = get_agent_mut(quotad_id).expect("Quotad agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[22].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(quotad_id as MailboxId, quotad_id).ok();
+    state::create_keyspace(quotad_id as u16).ok();
+    serial_println!("[INIT] Quotad agent created: id={}", quotad_id);
+    event::agent_created(quotad_id, root_id);
+
+    // ── Verifierd agent (agent 23) ── receipt verification service ───
+    let verifierd_id = create_agent(
+        Some(root_id),
+        agents::verifierd::verifierd_main as *const () as u64,
+        stack_top(23),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create verifierd agent");
+    {
+        let agent = get_agent_mut(verifierd_id).expect("Verifierd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[23].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(verifierd_id as MailboxId, verifierd_id).ok();
+    state::create_keyspace(verifierd_id as u16).ok();
+    serial_println!("[INIT] Verifierd agent created: id={}", verifierd_id);
+    event::agent_created(verifierd_id, root_id);
+
+    // ── Billingd agent (agent 24) ── billing and settlement service ──
+    let billingd_id = create_agent(
+        Some(root_id),
+        agents::billingd::billingd_main as *const () as u64,
+        stack_top(24),
+        100_000,    // generous energy budget for system agent
+        256,        // memory quota
+    ).expect("Failed to create billingd agent");
+    {
+        let agent = get_agent_mut(billingd_id).expect("Billingd agent not found");
+        agent.stack_bottom = unsafe { AGENT_STACKS.stacks[24].as_ptr() as u64 };
+        agent.priority = AgentPriority::SystemService;
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 3;
+    }
+    mailbox::create_mailbox(billingd_id as MailboxId, billingd_id).ok();
+    state::create_keyspace(billingd_id as u16).ok();
+    serial_println!("[INIT] Billingd agent created: id={}", billingd_id);
+    event::agent_created(billingd_id, root_id);
+
     // ── Initialise extended node identity (Stage 8) ─────────────────────
     crate::node::init_node_identity();
 
@@ -610,7 +766,7 @@ pub fn init() {
     unsafe {
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
     }
-    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id, authd_id, upgraded_id, admind_id, observabilityd_id, pkgd_id, membership_d_id] {
+    for &id in &[idle_id, root_id, stated_id, policyd_id, wasm_id, accountd_id, netd_id, routerd_id, skilld_id, authd_id, upgraded_id, admind_id, observabilityd_id, pkgd_id, membership_d_id, compactd_id, placement_d_id, failover_d_id, auditd_id, quotad_id, verifierd_id, billingd_id] {
         if let Some(agent) = get_agent_mut(id) {
             agent.context.cr3 = cr3;
         }
@@ -636,6 +792,13 @@ pub fn init() {
     sched::add_to_run_queue(observabilityd_id);
     sched::add_to_run_queue(pkgd_id);
     sched::add_to_run_queue(membership_d_id);
+    sched::add_to_run_queue(compactd_id);
+    sched::add_to_run_queue(placement_d_id);
+    sched::add_to_run_queue(failover_d_id);
+    sched::add_to_run_queue(auditd_id);
+    sched::add_to_run_queue(quotad_id);
+    sched::add_to_run_queue(verifierd_id);
+    sched::add_to_run_queue(billingd_id);
 
     // ── Write stack guard canaries at the bottom of every agent stack ──
     write_stack_guards();
