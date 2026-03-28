@@ -96,7 +96,7 @@ pub fn measure_kernel() -> KernelMeasurement {
     let mut text_buf = [0u8; 16];
     text_buf[0..8].copy_from_slice(&text_start.to_le_bytes());
     text_buf[8..16].copy_from_slice(&text_end.to_le_bytes());
-    let kernel_hash = sha256_hash(&text_buf);
+    let mut kernel_hash = sha256_hash(&text_buf);
 
     // ── boot_config_hash: FNV-1a over tick + agent_count + event_seq ───────
     let mut agent_count: u32 = 0;
@@ -111,7 +111,17 @@ pub fn measure_kernel() -> KernelMeasurement {
     cfg_buf[0..8].copy_from_slice(&tick.to_le_bytes());
     cfg_buf[8..12].copy_from_slice(&agent_count.to_le_bytes());
     cfg_buf[12..20].copy_from_slice(&event_seq.to_le_bytes());
-    let boot_config_hash = sha256_hash(&cfg_buf);
+    let mut boot_config_hash = sha256_hash(&cfg_buf);
+
+    // If TPM is available, use hardware PCR values for measurements
+    if crate::arch::x86_64::tpm::is_available() {
+        if let Some(pcr0) = crate::arch::x86_64::tpm::pcr_read(0) {
+            kernel_hash = pcr0;
+        }
+        if let Some(pcr1) = crate::arch::x86_64::tpm::pcr_read(1) {
+            boot_config_hash = pcr1;
+        }
+    }
 
     KernelMeasurement {
         kernel_hash,
