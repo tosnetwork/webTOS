@@ -125,6 +125,15 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     arch::x86_64::pci::init();
     serial_println!("[OK] PCI bus enumerated");
 
+    // 4c. TPM 2.0 initialization (measured boot)
+    if arch::x86_64::tpm::init() {
+        serial_println!("[OK] TPM 2.0 initialized");
+        arch::x86_64::tpm::measured_boot();
+        serial_println!("[OK] Measured boot complete");
+    } else {
+        serial_println!("[WARN] No TPM 2.0 detected, measured boot skipped");
+    }
+
     // 5. Initialize kernel subsystems
     sched::init();
     serial_println!("[OK] Scheduler initialized");

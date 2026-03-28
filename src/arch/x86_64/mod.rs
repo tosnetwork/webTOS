@@ -20,6 +20,8 @@ pub mod nvme;
 pub mod security;
 pub mod kaslr;
 pub mod framebuffer;
+#[allow(dead_code)]
+pub mod tpm;
 
 pub use serial::{serial_print, serial_println};
 
