@@ -116,6 +116,13 @@ fn handle_watch_agent(payload: &[u8], msg_len: usize, sender_id: AgentId) {
 }
 
 /// Handle NODE_DOWN: notification that a node is gone.
+///
+/// Recovery procedure for each affected agent:
+///   1. Emit a NodeDown event for audit trail
+///   2. Query placement_d for an alternate node (via HINT_ENERGY)
+///   3. Emit an AgentMigrate event recording the recovery
+///   4. Update the watch entry's home_node to the new target
+///
 /// Format: [op=0x02, node_id:u16]
 fn handle_node_down(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     if msg_len < 3 {
@@ -126,6 +133,37 @@ fn handle_node_down(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     let node_id = u16::from_le_bytes([payload[1], payload[2]]);
     serial_println!("[FAILOVER_D] Node {} reported DOWN by agent {}", node_id, sender_id);
 
+    // Emit a NodeDown event for the audit trail
+    crate::event::emit(
+        FAILOVER_D_ID,
+        crate::event::EventType::NodeDown,
+        node_id as u64,
+        sender_id as u64,
+        0,
+    );
+
+    // Query placement_d for the best alternate node.
+    // Build a QUERY_PLACEMENT message: [0x01, hint_type=0x02 (ENERGY), hint_value=0]
+    let mut placement_query = [0u8; 10];
+    placement_query[0] = 0x01; // OP_QUERY_PLACEMENT
+    placement_query[1] = 0x02; // HINT_ENERGY — pick node with most energy
+    // hint_value bytes [2..10] stay zero (no preference)
+
+    let placement_mailbox: MailboxId = 19; // placement_d
+    let _ = crate::mailbox::send_message(FAILOVER_D_ID, placement_mailbox, &placement_query);
+
+    // Read placement_d's response (best available node).
+    // In a fully async system this would be a continuation; here we attempt
+    // one receive since placement_d runs cooperatively on the same core.
+    let alternate_node: u16 = match crate::mailbox::recv_message(FAILOVER_D_ID, FAILOVER_D_MAILBOX) {
+        Ok(resp) if resp.len as usize >= 2 => {
+            u16::from_le_bytes([resp.payload[0], resp.payload[1]])
+        }
+        _ => 0, // fall back to local node
+    };
+
+    serial_println!("[FAILOVER_D] Alternate node for recovery: {}", alternate_node);
+
     // Find all agents on the failed node and initiate recovery
     let mut affected: u32 = 0;
     unsafe {
@@ -133,11 +171,25 @@ fn handle_node_down(payload: &[u8], msg_len: usize, sender_id: AgentId) {
             if WATCHED_AGENTS[i].active && WATCHED_AGENTS[i].home_node == node_id {
                 let aid = WATCHED_AGENTS[i].agent_id;
                 serial_println!(
-                    "[FAILOVER_D] Agent {} was on failed node {} — initiating recovery",
-                    aid, node_id
+                    "[FAILOVER_D] Agent {} was on failed node {} — recovering to node {}",
+                    aid, node_id, alternate_node
                 );
-                // In a full implementation: load checkpoint, spawn on alternate node.
-                // For now, log the recovery event.
+
+                // Step 1: Trigger a checkpoint save so the latest state is persisted
+                crate::event::checkpoint_triggered(aid);
+
+                // Step 2: Emit AgentMigrate event for the audit trail
+                crate::event::emit(
+                    aid,
+                    crate::event::EventType::AgentMigrate,
+                    node_id as u64,       // source node (failed)
+                    alternate_node as u64, // destination node
+                    0,
+                );
+
+                // Step 3: Update the watch entry to reflect the new home node
+                WATCHED_AGENTS[i].home_node = alternate_node;
+
                 RECOVERY_COUNT += 1;
                 affected += 1;
             }

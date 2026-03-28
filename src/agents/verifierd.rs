@@ -107,42 +107,67 @@ fn handle_verify_receipt(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     let _ = crate::mailbox::send_message(VERIFIERD_ID, sender_id as MailboxId, &response);
 }
 
-/// Handle VERIFY_PROOF: validate a proof hash against a receipt.
-/// Format: [op=0x02, receipt_index:u32, proof_hash:[u8;32]]
+/// Handle VERIFY_PROOF: validate a proof bundle against its corresponding receipt.
+/// Format: [op=0x02, proof_index:u32 LE]
 ///
-/// Compares the provided proof_hash (bytes 5..37) against the receipt's
-/// compute_hash(). If they match, the proof is valid.
+/// Loads the proof bundle from PROOF_STORE at the given index, finds the
+/// corresponding receipt, and calls `verify_against_receipt` to perform full
+/// state-root, hash, and energy verification.
 ///
 /// Response: [status:u8] where 0=valid, 3=proof mismatch, 2=not found
 fn handle_verify_proof(payload: &[u8], msg_len: usize, sender_id: AgentId) {
-    if msg_len < 37 {
-        serial_println!("[VERIFIERD] VERIFY_PROOF: payload too short ({} < 37)", msg_len);
+    if msg_len < 5 {
+        serial_println!("[VERIFIERD] VERIFY_PROOF: payload too short ({} < 5)", msg_len);
         return;
     }
 
-    let index = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-
-    let mut proof_hash = [0u8; 32];
-    proof_hash.copy_from_slice(&payload[5..37]);
+    let proof_index = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
 
     unsafe { TOTAL_VERIFICATIONS += 1; }
 
-    let result = match crate::receipts::get_receipt(index) {
-        Some(receipt) => {
-            let receipt_hash = receipt.compute_hash();
+    let result = match crate::receipts::get_proof_bundle(proof_index) {
+        Some(proof) => {
+            // Find the corresponding receipt by scanning the receipt store
+            let receipt_count = crate::receipts::receipt_count();
+            let mut found_receipt = None;
+            for i in 0..receipt_count {
+                if let Some(r) = crate::receipts::get_receipt(i) {
+                    if r.receipt_id == proof.receipt_id {
+                        found_receipt = Some(r);
+                        break;
+                    }
+                }
+            }
 
-            // Compare proof_hash against receipt's compute_hash
-            if proof_hash == receipt_hash {
-                serial_println!("[VERIFIERD] Proof for receipt {} VALID", index);
-                RESULT_VALID
-            } else {
-                serial_println!("[VERIFIERD] Proof for receipt {} MISMATCH", index);
-                unsafe { TOTAL_FAILURES += 1; }
-                RESULT_PROOF_MISMATCH
+            match found_receipt {
+                Some(receipt) => {
+                    if proof.verify_against_receipt(receipt) {
+                        serial_println!(
+                            "[VERIFIERD] Proof {} for receipt VALID (energy={}, roots checked)",
+                            proof_index, receipt.energy_used
+                        );
+                        RESULT_VALID
+                    } else {
+                        serial_println!(
+                            "[VERIFIERD] Proof {} MISMATCH: state roots or hash diverged",
+                            proof_index
+                        );
+                        unsafe { TOTAL_FAILURES += 1; }
+                        RESULT_PROOF_MISMATCH
+                    }
+                }
+                None => {
+                    serial_println!(
+                        "[VERIFIERD] Proof {}: corresponding receipt NOT FOUND",
+                        proof_index
+                    );
+                    unsafe { TOTAL_FAILURES += 1; }
+                    RESULT_NOT_FOUND
+                }
             }
         }
         None => {
-            serial_println!("[VERIFIERD] Proof verification: receipt {} NOT FOUND", index);
+            serial_println!("[VERIFIERD] Proof bundle {} NOT FOUND", proof_index);
             unsafe { TOTAL_FAILURES += 1; }
             RESULT_NOT_FOUND
         }

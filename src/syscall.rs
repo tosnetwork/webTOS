@@ -1212,7 +1212,18 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         // Generate a proof bundle for the most recent receipt.
         // Returns: proof bundle index or -1 on failure
         SYS_PROOF_GENERATE => {
-            0 // stub
+            // Generate a proof bundle for the most recent receipt
+            let count = crate::receipts::receipt_count();
+            if count == 0 { -1 } else {
+                let idx = count - 1;
+                if let Some(receipt) = crate::receipts::get_receipt(idx) {
+                    let proof = crate::receipts::ProofBundle::from_receipt(receipt);
+                    crate::receipts::store_proof_bundle(proof);
+                    (crate::receipts::proof_count() - 1) as i64
+                } else {
+                    -1
+                }
+            }
         }
 
         // ── 38: sys_send_remote ─────────────────────────────────────────
