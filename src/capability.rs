@@ -24,6 +24,7 @@ pub enum CapType {
     StateWrite = 5,
     Network = 6,
     PolicyLoad = 7,
+    SendRemote = 8,
 }
 
 // ─── Capability struct ──────────────────────────────────────────────────────
@@ -155,6 +156,14 @@ impl Capability {
 }
 
 // ─── Agent capability queries ───────────────────────────────────────────────
+
+/// Return a copy of the agent's capability array for hashing / inspection.
+pub fn agent_capabilities(agent_id: AgentId) -> [Option<Capability>; MAX_CAPABILITIES_PER_AGENT] {
+    match crate::agent::get_agent(agent_id) {
+        Some(a) => a.capabilities,
+        None => [const { None }; MAX_CAPABILITIES_PER_AGENT],
+    }
+}
 
 /// Check if an agent holds a capability matching the given type and target.
 ///
@@ -436,15 +445,20 @@ fn lease_signable_bytes(cap: &Capability, buf: &mut [u8; 128]) -> usize {
 /// Sign a capability lease using the crypto module's keyed-hash signing.
 ///
 /// Produces a 64-byte signature over the capability's lease fields.
-pub fn sign_lease(cap: &Capability, key: &crypto::SigningKey) -> crypto::Signature {
+pub fn sign_lease(cap: &Capability, key: &crypto::SigningKey) -> [u8; 64] {
     let mut buf = [0u8; 128];
     let len = lease_signable_bytes(cap, &mut buf);
-    crypto::sign(key, &buf[..len])
+    let sig = crypto::sign(key, &buf[..len]);
+    sig.to_bytes()
 }
 
 /// Verify a capability lease signature using the crypto module.
-pub fn verify_lease(cap: &Capability, sig: &crypto::Signature, key: &crypto::VerifyKey) -> bool {
+pub fn verify_lease(cap: &Capability, sig_bytes: &[u8; 64], key: &crypto::VerifyingKey) -> bool {
     let mut buf = [0u8; 128];
     let len = lease_signable_bytes(cap, &mut buf);
-    crypto::verify(key, &buf[..len], sig)
+    if let Ok(sig) = crypto::Signature::from_slice(sig_bytes) {
+        crypto::verify(key, &buf[..len], &sig)
+    } else {
+        false
+    }
 }

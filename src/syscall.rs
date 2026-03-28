@@ -1119,6 +1119,82 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             0 // stub
         }
 
+        // ── 38: sys_send_remote ─────────────────────────────────────────
+        // Send a message to a remote agent via cross-node routing.
+        // a1 = dest_agent_id (remote), a2 = payload ptr, a3 = payload len
+        // The kernel looks up the remote agent's home node, wraps the message
+        // with a routing header (including authority hash + signature), and
+        // forwards it to routerd (mailbox 10) for network delivery.
+        SYS_SEND_REMOTE => {
+            use crate::capability::CapType;
+            use crate::agents::routerd;
+
+            let dest_agent = a1 as u16;
+            let payload_len = a3 as usize;
+
+            if payload_len > MAX_MESSAGE_PAYLOAD {
+                return E_PAYLOAD_TOO_LARGE;
+            }
+
+            // Check that the sender has the SendRemote capability.
+            if !crate::capability::agent_try_cap(caller_id, CapType::SendRemote, dest_agent) {
+                crate::event::cap_denied(caller_id, CapType::SendRemote as u64, dest_agent as u64);
+                return E_NO_CAP;
+            }
+
+            // Look up the remote agent's home node.
+            let dest_node = match routerd::lookup_remote_agent(dest_agent) {
+                Some(node) => node,
+                None => {
+                    serial_println!(
+                        "[SYSCALL] SYS_SEND_REMOTE: agent {} not found in remote registry",
+                        dest_agent
+                    );
+                    return E_NOT_FOUND;
+                }
+            };
+
+            // Read the payload from user space.
+            let payload = unsafe {
+                security::stac();
+                let s = core::slice::from_raw_parts(a2 as *const u8, payload_len);
+                security::clac();
+                s
+            };
+
+            // Compute authority hash over the sender's capabilities.
+            let authority_hash = routerd::compute_authority_hash(caller_id);
+
+            // Sign the routing header fields with the node's signing key.
+            let source_node = crate::node::get_node_id();
+            let signature = routerd::sign_routing_header(
+                &source_node, &dest_node, caller_id, dest_agent, &authority_hash,
+            );
+
+            // Build the forwarding message for routerd:
+            //   [0x10] [dest_node:32] [src_agent:2] [dest_agent:2]
+            //   [authority_hash:32] [signature:64] [payload...]
+            let mut fwd_buf = [0u8; MAX_MESSAGE_PAYLOAD];
+            let hdr_len = 1 + 32 + 2 + 2 + 32 + 64; // = 133
+            if hdr_len + payload_len > MAX_MESSAGE_PAYLOAD {
+                return E_PAYLOAD_TOO_LARGE;
+            }
+            fwd_buf[0] = 0x10; // ROUTE_REMOTE
+            fwd_buf[1..33].copy_from_slice(&dest_node);
+            fwd_buf[33..35].copy_from_slice(&caller_id.to_le_bytes());
+            fwd_buf[35..37].copy_from_slice(&dest_agent.to_le_bytes());
+            fwd_buf[37..69].copy_from_slice(&authority_hash);
+            fwd_buf[69..133].copy_from_slice(&signature);
+            fwd_buf[133..133 + payload_len].copy_from_slice(payload);
+
+            let total_len = hdr_len + payload_len;
+            // Deliver to routerd's mailbox (10) as kernel (sender 0).
+            match mailbox::send_message(0, 10, &fwd_buf[..total_len]) {
+                Ok(()) => E_OK,
+                Err(e) => e,
+            }
+        }
+
         _ => {
             serial_println!(
                 "[SYSCALL] Unknown syscall {} from agent {}",

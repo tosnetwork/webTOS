@@ -47,7 +47,7 @@ pub struct PolicyBundle {
     pub rule_count: u8,
     pub manifest_hash: Hash256,
     /// Cryptographic signature over (version || manifest_hash || rules).
-    pub signature: crypto::Signature,
+    pub signature: [u8; 64],
 }
 
 impl PolicyBundle {
@@ -115,13 +115,18 @@ impl PolicyBundle {
     pub fn sign_bundle(&mut self, key: &crypto::SigningKey) {
         let mut buf = [0u8; 256];
         let len = self.signable_bytes(&mut buf);
-        self.signature = crypto::sign(key, &buf[..len]);
+        let sig = crypto::sign(key, &buf[..len]);
+        self.signature = sig.to_bytes();
     }
 
     /// Verify the bundle signature against a verify key.
-    pub fn verify_bundle(&self, key: &crypto::VerifyKey) -> bool {
+    pub fn verify_bundle(&self, key: &crypto::VerifyingKey) -> bool {
         let mut buf = [0u8; 256];
         let len = self.signable_bytes(&mut buf);
-        crypto::verify(key, &buf[..len], &self.signature)
+        if let Ok(sig) = crypto::Signature::from_slice(&self.signature) {
+            crypto::verify(key, &buf[..len], &sig)
+        } else {
+            false
+        }
     }
 }
