@@ -1,0 +1,11 @@
+[package]
+name = "atos-verifier"
+version = "0.1.0"
+edition = "2021"
+description = "ATOS Execution Receipt verifier library"
+
+[workspace]
+
+[lib]
+name = "atos_verifier"
+path = "src/lib.rs"
