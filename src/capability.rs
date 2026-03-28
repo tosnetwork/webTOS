@@ -9,6 +9,7 @@ use crate::agent::{
     MAX_CAPABILITIES_PER_AGENT, E_NO_CAP, E_QUOTA_EXCEEDED, E_INVALID_ARG, E_NOT_FOUND,
 };
 use crate::principal::PrincipalId;
+use crate::crypto;
 
 // ─── Capability types ───────────────────────────────────────────────────────
 
@@ -397,4 +398,53 @@ impl SignedCapability {
     pub fn verify(&self, secret: &[u8; 32]) -> bool {
         cap_verify(&self.cap, &self.signature, secret)
     }
+}
+
+// ─── Lease signing with crypto module ────────────────────────────────────────
+
+/// Serialise a capability's lease-relevant fields into a byte buffer for signing.
+///
+/// Includes: cap_type, target, flags, use_limit, node_id, issuer_id,
+/// subject_id, expiry_ticks, nonce, delegation_depth.
+///
+/// Returns the number of bytes written.
+fn lease_signable_bytes(cap: &Capability, buf: &mut [u8; 128]) -> usize {
+    let mut pos = 0;
+    buf[pos] = cap.cap_type as u8;
+    pos += 1;
+    buf[pos..pos + 2].copy_from_slice(&cap.target.to_le_bytes());
+    pos += 2;
+    buf[pos..pos + 2].copy_from_slice(&cap.flags.to_le_bytes());
+    pos += 2;
+    buf[pos..pos + 4].copy_from_slice(&cap.use_limit.to_le_bytes());
+    pos += 4;
+    buf[pos..pos + 4].copy_from_slice(&cap.node_id.to_le_bytes());
+    pos += 4;
+    buf[pos..pos + 32].copy_from_slice(&cap.issuer_id);
+    pos += 32;
+    buf[pos..pos + 32].copy_from_slice(&cap.subject_id);
+    pos += 32;
+    buf[pos..pos + 8].copy_from_slice(&cap.expiry_ticks.to_le_bytes());
+    pos += 8;
+    buf[pos..pos + 8].copy_from_slice(&cap.nonce.to_le_bytes());
+    pos += 8;
+    buf[pos] = cap.delegation_depth;
+    pos += 1;
+    pos
+}
+
+/// Sign a capability lease using the crypto module's keyed-hash signing.
+///
+/// Produces a 64-byte signature over the capability's lease fields.
+pub fn sign_lease(cap: &Capability, key: &crypto::SigningKey) -> crypto::Signature {
+    let mut buf = [0u8; 128];
+    let len = lease_signable_bytes(cap, &mut buf);
+    crypto::sign(key, &buf[..len])
+}
+
+/// Verify a capability lease signature using the crypto module.
+pub fn verify_lease(cap: &Capability, sig: &crypto::Signature, key: &crypto::VerifyKey) -> bool {
+    let mut buf = [0u8; 128];
+    let len = lease_signable_bytes(cap, &mut buf);
+    crypto::verify(key, &buf[..len], sig)
 }

@@ -210,6 +210,72 @@ pub fn emit_receipt_on_exit(
     store_receipt(receipt)
 }
 
+// ─── Replay & Proof bundles (Stage 9) ───────────────────────────────────
+
+/// A replay bundle containing everything needed for independent replay verification.
+pub struct ReplayBundle {
+    /// The execution receipt this bundle verifies
+    pub receipt_id: Hash256,
+    /// Checkpoint image (compressed agent state at start)
+    pub checkpoint_data: [u8; 4096],
+    pub checkpoint_len: usize,
+    /// I/O transcript (all syscalls and their results)
+    pub transcript: [u8; 4096],
+    pub transcript_len: usize,
+    /// Initial state snapshot
+    pub initial_state: [u8; 2048],
+    pub initial_state_len: usize,
+}
+
+impl ReplayBundle {
+    pub fn empty(receipt_id: Hash256) -> Self {
+        Self {
+            receipt_id,
+            checkpoint_data: [0; 4096],
+            checkpoint_len: 0,
+            transcript: [0; 4096],
+            transcript_len: 0,
+            initial_state: [0; 2048],
+            initial_state_len: 0,
+        }
+    }
+}
+
+/// Compact proof artifacts for fast external verification without full replay.
+pub struct ProofBundle {
+    /// The execution receipt this proof covers
+    pub receipt_id: Hash256,
+    /// Proof type (0 = replay-hash, 1 = Merkle-state, 2 = zk-snark placeholder)
+    pub proof_type: u8,
+    /// Compact proof data
+    pub proof_data: [u8; 1024],
+    pub proof_len: usize,
+    /// Verification key or reference
+    pub verifier_key: Hash256,
+}
+
+impl ProofBundle {
+    pub fn empty(receipt_id: Hash256) -> Self {
+        Self {
+            receipt_id,
+            proof_type: 0,
+            proof_data: [0; 1024],
+            proof_len: 0,
+            verifier_key: [0; 32],
+        }
+    }
+
+    /// Create a simple replay-hash proof from a receipt
+    pub fn from_receipt_hash(receipt: &ExecutionReceipt) -> Self {
+        let hash = receipt.compute_hash();
+        let mut bundle = Self::empty(receipt.receipt_id);
+        bundle.proof_type = 0; // replay-hash
+        bundle.proof_data[0..32].copy_from_slice(&hash);
+        bundle.proof_len = 32;
+        bundle
+    }
+}
+
 /// Emit a receipt for the current state of a running agent (via syscall).
 /// Returns the store index on success.
 pub fn emit_receipt_for_agent(agent_id: u16) -> Option<usize> {

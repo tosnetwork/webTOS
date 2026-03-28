@@ -13,7 +13,7 @@ pub type Tick = u64;
 pub type EnergyUnit = u64;
 pub type KeyspaceId = u16;
 
-pub const MAX_AGENTS: usize = 20;
+pub const MAX_AGENTS: usize = 28;
 pub const IDLE_AGENT_ID: AgentId = 0;
 pub const ROOT_AGENT_ID: AgentId = 1;
 pub const MAX_MAILBOX_CAPACITY: usize = 16;
@@ -66,6 +66,10 @@ pub const SYS_PACKAGE_INSTALL: u64 = 32;
 pub const SYS_NODE_ATTEST: u64 = 33;
 pub const SYS_AGENT_MIGRATE: u64 = 34;
 pub const SYS_PLACEMENT_HINT: u64 = 35;
+
+// Stage 9: Verification & Billing syscalls
+pub const SYS_QUOTE_REQUEST: u64 = 36;
+pub const SYS_PROOF_GENERATE: u64 = 37;
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 

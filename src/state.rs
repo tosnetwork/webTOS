@@ -33,6 +33,30 @@ impl StateEntry {
     }
 }
 
+// ─── Encryption context ─────────────────────────────────────────────────────
+
+/// Encryption context for sealed keyspaces.
+///
+/// Uses simple XOR-based encryption as a placeholder.  Real crypto would use
+/// AES or similar, but the API surface is identical.
+pub struct KeyspaceEncryption {
+    pub enabled: bool,
+    pub key: [u8; 32],
+}
+
+// ─── State access mode ─────────────────────────────────────────────────────
+
+/// How state is handled during cross-node agent migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateAccessMode {
+    /// State moves with the agent to the new node.
+    MoveWithAgent,
+    /// State stays on the original node, accessed via remote broker.
+    RemoteBroker,
+    /// State is snapshot'd, agent gets a copy, reconcile later.
+    SnapshotAndReconcile,
+}
+
 // ─── Keyspace ───────────────────────────────────────────────────────────────
 
 /// Maximum number of version roots retained in history.
@@ -96,6 +120,20 @@ impl Keyspace {
             }
         }
         None
+    }
+
+    /// Encrypt a value before storing (XOR placeholder).
+    pub fn encrypt_value(&self, value: &mut [u8], enc: &KeyspaceEncryption) {
+        if !enc.enabled { return; }
+        for (i, b) in value.iter_mut().enumerate() {
+            *b ^= enc.key[i % 32];
+        }
+    }
+
+    /// Decrypt a value after loading (XOR is symmetric).
+    pub fn decrypt_value(&self, value: &mut [u8], enc: &KeyspaceEncryption) {
+        // XOR is symmetric
+        self.encrypt_value(value, enc);
     }
 
     fn get(&self, key: u64) -> Option<&[u8]> {
