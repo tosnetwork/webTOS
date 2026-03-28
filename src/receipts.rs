@@ -6,7 +6,38 @@
 
 extern crate alloc;
 
+use crate::crypto;
 use crate::principal::PrincipalId;
+
+// ─── Node-level receipt signing key ──────────────────────────────────────────
+
+/// Node-level Ed25519 signing key for receipts (initialized at boot).
+///
+/// Safety: written once during single-threaded boot via `init_receipt_signing()`,
+/// then read-only during normal operation (single-core Stage-1).
+static mut NODE_SIGNING_KEY: Option<crypto::SigningKey> = None;
+
+/// Initialise the node-level receipt signing key.
+///
+/// Must be called once during early boot (before any receipt is emitted).
+/// Generates a fresh Ed25519 keypair using hardware RNG.
+pub fn init_receipt_signing() {
+    let (sk, vk) = crypto::generate_keypair();
+    unsafe { NODE_SIGNING_KEY = Some(sk); }
+    crate::serial_println!("[RECEIPTS] Receipt signing key initialised (vk={:02x}{:02x}..)",
+        vk.as_bytes()[0], vk.as_bytes()[1]);
+}
+
+/// Sign a receipt in-place with the node's Ed25519 signing key.
+fn sign_receipt(receipt: &mut ExecutionReceipt) {
+    let hash = receipt.compute_hash();
+    unsafe {
+        if let Some(ref sk) = NODE_SIGNING_KEY {
+            let sig = crypto::sign(sk, &hash);
+            receipt.signature = sig.to_bytes();
+        }
+    }
+}
 
 pub type Hash256 = [u8; 32];
 
@@ -113,21 +144,48 @@ impl ExecutionReceipt {
     }
 
     /// Compute the hash of this receipt (for signing).
+    ///
+    /// Uses a keyed-hash construction via Ed25519 pre-hash: we serialise all
+    /// critical receipt fields into a buffer and sign it with a deterministic
+    /// "hash key" derived from the receipt_id. The first 32 bytes of the
+    /// resulting signature are used as the hash. This provides collision
+    /// resistance far beyond the previous FNV-1a placeholder.
     pub fn compute_hash(&self) -> Hash256 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        // Hash all critical fields
-        for b in &self.receipt_id { h = h.wrapping_mul(0x100000001b3) ^ (*b as u64); }
-        for b in &self.workload_id { h = h.wrapping_mul(0x100000001b3) ^ (*b as u64); }
-        for b in &self.initial_state_root { h = h.wrapping_mul(0x100000001b3) ^ (*b as u64); }
-        for b in &self.final_state_root { h = h.wrapping_mul(0x100000001b3) ^ (*b as u64); }
-        h = h.wrapping_mul(0x100000001b3) ^ self.energy_used;
-        h = h.wrapping_mul(0x100000001b3) ^ self.tick_start;
-        h = h.wrapping_mul(0x100000001b3) ^ self.tick_end;
+        // Serialise all critical fields into a flat buffer for hashing.
+        let mut buf = [0u8; 256];
+        let mut pos = 0;
+
+        buf[pos..pos + 32].copy_from_slice(&self.receipt_id);
+        pos += 32;
+        buf[pos..pos + 32].copy_from_slice(&self.workload_id);
+        pos += 32;
+        buf[pos..pos + 32].copy_from_slice(&self.execution_id);
+        pos += 32;
+        buf[pos..pos + 32].copy_from_slice(&self.initial_state_root);
+        pos += 32;
+        buf[pos..pos + 32].copy_from_slice(&self.final_state_root);
+        pos += 32;
+        buf[pos..pos + 8].copy_from_slice(&self.energy_used.to_le_bytes());
+        pos += 8;
+        buf[pos..pos + 8].copy_from_slice(&self.tick_start.to_le_bytes());
+        pos += 8;
+        buf[pos..pos + 8].copy_from_slice(&self.tick_end.to_le_bytes());
+        pos += 8;
+        buf[pos] = self.runtime_class as u8;
+        pos += 1;
+        buf[pos..pos + 4].copy_from_slice(&self.pricing_class.to_le_bytes());
+        pos += 4;
+        buf[pos..pos + 32].copy_from_slice(&self.node_id);
+        pos += 32;
+
+        // Use a deterministic signing key derived from the receipt_id as a
+        // keyed hash function. This gives us a 64-byte "hash" from which
+        // we take the first 32 bytes.
+        let hash_key = crypto::SigningKey::from_bytes(&self.receipt_id);
+        let sig = crypto::sign(&hash_key, &buf[..pos]);
+        let sig_bytes = sig.to_bytes();
         let mut result = [0u8; 32];
-        result[0..8].copy_from_slice(&h.to_le_bytes());
-        // Second round
-        h = h.wrapping_mul(0x100000001b3) ^ (self.runtime_class as u64);
-        result[8..16].copy_from_slice(&h.to_le_bytes());
+        result.copy_from_slice(&sig_bytes[..32]);
         result
     }
 }
@@ -189,7 +247,7 @@ pub fn emit_receipt_on_exit(
     tick_start: u64,
     tick_end: u64,
 ) -> Option<usize> {
-    let receipt = ExecutionReceipt::from_agent_exit(
+    let mut receipt = ExecutionReceipt::from_agent_exit(
         agent_id,
         runtime_class,
         energy_used,
@@ -198,6 +256,9 @@ pub fn emit_receipt_on_exit(
         tick_start,
         tick_end,
     );
+
+    // Sign the receipt with the node's Ed25519 key before storing.
+    sign_receipt(&mut receipt);
 
     // Log receipt emission via the event system
     crate::event::emit(
@@ -277,24 +338,51 @@ impl ProofBundle {
     }
 }
 
+/// Patch the trace_commitment field of an already-stored receipt.
+pub fn patch_trace_commitment(index: usize, commitment: Hash256) {
+    unsafe {
+        if index < MAX_RECEIPTS {
+            if let Some(ref mut receipt) = RECEIPT_STORE[index] {
+                receipt.trace_commitment = commitment;
+            }
+        }
+    }
+}
+
 /// Emit a receipt for the current state of a running agent (via syscall).
 /// Returns the store index on success.
 pub fn emit_receipt_for_agent(agent_id: u16) -> Option<usize> {
     let tick_now = crate::arch::x86_64::timer::get_ticks();
 
-    // Read agent's current energy budget
-    let energy_used = match crate::agent::get_agent(agent_id) {
-        Some(agent) => agent.energy_budget,
-        None => 0,
+    // Read agent's current energy budget and saved initial state root
+    let (energy_used, initial_root, tick_start) = match crate::agent::get_agent(agent_id) {
+        Some(agent) => (agent.energy_budget, agent.initial_state_root, agent.tick_created),
+        None => (0, [0u8; 32], 0u64),
     };
 
-    emit_receipt_on_exit(
+    // Compute final state root from agent's keyspace
+    let mut final_root = [0u8; 32];
+    if let Some(root16) = crate::state::get_root(agent_id as u16) {
+        final_root[..16].copy_from_slice(&root16);
+    }
+
+    // Compute trace commitment from transcript
+    let trace_commitment = crate::syscall::compute_transcript_hash(agent_id, tick_start, tick_now);
+
+    let idx = emit_receipt_on_exit(
         agent_id,
         RuntimeClassTag::ProofGradeWasm,
         energy_used,
-        [0; 32], // initial state root placeholder
-        [0; 32], // final state root placeholder
-        0,       // tick_start placeholder
+        initial_root,
+        final_root,
+        tick_start,
         tick_now,
-    )
+    );
+
+    // Patch trace_commitment into the receipt
+    if let Some(i) = idx {
+        patch_trace_commitment(i, trace_commitment);
+    }
+
+    idx
 }

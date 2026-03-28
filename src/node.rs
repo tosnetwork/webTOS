@@ -49,6 +49,8 @@ pub type NodeId = [u8; 32];
 pub struct NodeIdentity {
     pub id: NodeId,
     pub signing_key: [u8; 32],
+    /// Ed25519 verifying (public) key bytes for this node.
+    pub verifying_key: [u8; 32],
     pub attestation_hash: [u8; 32],
     pub is_attested: bool,
     pub cluster_id: u32,
@@ -75,17 +77,23 @@ pub fn init_node_identity() {
         let tsc = (hi as u64) << 32 | lo as u64;
         id[4..12].copy_from_slice(&tsc.to_le_bytes());
     }
+    // Generate a real Ed25519 keypair for this node.
+    let (sk, vk) = crate::crypto::generate_keypair();
+    let sk_bytes = sk.to_bytes();
+    let vk_bytes = vk.to_bytes();
     unsafe {
         LOCAL_NODE = Some(NodeIdentity {
             id,
-            signing_key: [0; 32],
+            signing_key: sk_bytes,
+            verifying_key: vk_bytes,
             attestation_hash: [0; 32],
             is_attested: false,
             cluster_id: 0,
             last_heartbeat_tick: 0,
         });
     }
-    crate::serial_println!("[NODE] Extended identity initialised (cluster_id=0)");
+    crate::serial_println!("[NODE] Extended identity initialised (cluster_id=0, vk={:02x}{:02x}..)",
+        vk_bytes[0], vk_bytes[1]);
 }
 
 /// Return the full 32-byte `NodeId`, or all-zeros if not yet initialised.

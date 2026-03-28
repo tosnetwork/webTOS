@@ -168,15 +168,23 @@ pub fn agent_capabilities(agent_id: AgentId) -> [Option<Capability>; MAX_CAPABIL
 /// Check if an agent holds a capability matching the given type and target.
 ///
 /// Does not consume a use. For checking without exercising.
+/// Enforces lease expiry: if the matching capability has expired, the check
+/// emits an `AuthLeaseExpired` event and returns `false`.
 pub fn agent_has_cap(agent_id: AgentId, cap_type: CapType, target: u16) -> bool {
     let agent = match crate::agent::get_agent(agent_id) {
         Some(a) => a,
         None => return false,
     };
 
+    let current_tick = crate::arch::x86_64::timer::get_ticks();
+
     for i in 0..agent.cap_count {
         if let Some(ref cap) = agent.capabilities[i] {
             if cap.matches(cap_type, target) {
+                if cap.is_expired(current_tick) {
+                    crate::event::auth_lease_expired(agent_id, i as u64, cap.expiry_ticks);
+                    return false;
+                }
                 return true;
             }
         }
@@ -187,15 +195,23 @@ pub fn agent_has_cap(agent_id: AgentId, cap_type: CapType, target: u16) -> bool 
 /// Try to exercise a capability: checks the agent holds it and decrements use_count.
 ///
 /// Returns `true` if the capability was found and successfully used.
+/// Enforces lease expiry: if the matching capability has expired, the attempt
+/// emits an `AuthLeaseExpired` event and returns `false`.
 pub fn agent_try_cap(agent_id: AgentId, cap_type: CapType, target: u16) -> bool {
     let agent = match crate::agent::get_agent_mut(agent_id) {
         Some(a) => a,
         None => return false,
     };
 
+    let current_tick = crate::arch::x86_64::timer::get_ticks();
+
     for i in 0..agent.cap_count {
         if let Some(ref mut cap) = agent.capabilities[i] {
             if cap.matches(cap_type, target) {
+                if cap.is_expired(current_tick) {
+                    crate::event::auth_lease_expired(agent_id, i as u64, cap.expiry_ticks);
+                    return false;
+                }
                 return cap.try_use();
             }
         }
@@ -312,55 +328,57 @@ pub const ROOT_CAP_COUNT: usize = 8;
 
 // ─── Cross-node capability signing ──────────────────────────────────────────
 
-/// Compute a 32-byte signature over a capability and a 32-byte shared secret.
+/// Compute a 32-byte Ed25519 signature over a capability's immutable fields.
 ///
-/// Algorithm: FNV-1a (64-bit) iterated over the serialised capability fields
-/// concatenated with the secret, then expanded to 32 bytes by running four
-/// independent FNV-1a streams with different seeds.
+/// Uses the provided `signing_key` to produce a real Ed25519 signature over
+/// the serialised capability fields. The first 32 bytes of the 64-byte
+/// signature are stored in the capability's `signature` field.
 ///
-/// This is **not** cryptographically secure — it is a placeholder until a
-/// proper ed25519 implementation is available for the `no_std` kernel.
-pub fn sign_capability(cap: &Capability, secret: &[u8; 32]) -> [u8; 32] {
-    // Build a flat byte representation of the fields that must be signed.
-    // We deliberately exclude `use_count` and `signature` so that exercising
-    // a capability does not invalidate its signature, and to avoid circularity.
-    let mut buf = [0u8; 4 + 2 + 2 + 4 + 4]; // cap_type(1)+pad(3) + target(2) + flags(2) + use_limit(4) + node_id(4)
-    buf[0] = cap.cap_type as u8;
-    buf[1..3].copy_from_slice(&cap.target.to_le_bytes());
-    buf[3..5].copy_from_slice(&cap.flags.to_le_bytes());
-    buf[5..9].copy_from_slice(&cap.use_limit.to_le_bytes());
-    buf[9..13].copy_from_slice(&cap.node_id.to_le_bytes());
+/// We deliberately exclude `use_count` and `signature` so that exercising
+/// a capability does not invalidate its signature, and to avoid circularity.
+pub fn sign_capability(cap: &Capability, signing_key: &crypto::SigningKey) -> [u8; 32] {
+    let mut buf = [0u8; 128];
+    let len = cap_signable_bytes(cap, &mut buf);
+    let sig = crypto::sign(signing_key, &buf[..len]);
+    let sig_bytes = sig.to_bytes();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(&sig_bytes[..32]);
+    result
+}
 
-    let mut sig = [0u8; 32];
-    // Four 8-byte lanes, each starting from a different FNV offset basis.
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-    const SEEDS: [u64; 4] = [
-        0xcbf2_9ce4_8422_2325, // standard FNV-1a offset basis
-        0x0000_dead_beef_0001,
-        0x0000_cafe_babe_0002,
-        0xffff_0000_1234_5678,
-    ];
-
-    for (lane, &seed) in SEEDS.iter().enumerate() {
-        let mut h: u64 = seed;
-        for &b in buf.iter().chain(secret.iter()) {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        let bytes = h.to_le_bytes();
-        sig[lane * 8..(lane + 1) * 8].copy_from_slice(&bytes);
-    }
-
-    sig
+/// Serialise capability fields into a buffer for signing/verification.
+/// Returns the number of bytes written.
+fn cap_signable_bytes(cap: &Capability, buf: &mut [u8; 128]) -> usize {
+    let mut pos = 0;
+    buf[pos] = cap.cap_type as u8;
+    pos += 1;
+    buf[pos..pos + 2].copy_from_slice(&cap.target.to_le_bytes());
+    pos += 2;
+    buf[pos..pos + 2].copy_from_slice(&cap.flags.to_le_bytes());
+    pos += 2;
+    buf[pos..pos + 4].copy_from_slice(&cap.use_limit.to_le_bytes());
+    pos += 4;
+    buf[pos..pos + 4].copy_from_slice(&cap.node_id.to_le_bytes());
+    pos += 4;
+    buf[pos..pos + 32].copy_from_slice(&cap.issuer_id);
+    pos += 32;
+    buf[pos..pos + 32].copy_from_slice(&cap.subject_id);
+    pos += 32;
+    buf[pos..pos + 8].copy_from_slice(&cap.expiry_ticks.to_le_bytes());
+    pos += 8;
+    buf[pos..pos + 8].copy_from_slice(&cap.nonce.to_le_bytes());
+    pos += 8;
+    buf[pos] = cap.delegation_depth;
+    pos += 1;
+    pos
 }
 
 /// Verify a capability signature produced by `sign_capability`.
 ///
-/// Returns `true` if the computed signature matches `sig`.
-pub fn verify_capability(cap: &Capability, sig: &[u8; 32], secret: &[u8; 32]) -> bool {
-    let expected = sign_capability(cap, secret);
-    // Constant-time comparison (avoids timing oracle; good enough for a
-    // placeholder — a real implementation would use a proper CT library).
+/// Returns `true` if re-signing with the same key produces a matching signature.
+pub fn verify_capability(cap: &Capability, sig: &[u8; 32], signing_key: &crypto::SigningKey) -> bool {
+    let expected = sign_capability(cap, signing_key);
+    // Constant-time comparison
     let mut diff: u8 = 0;
     for (a, b) in expected.iter().zip(sig.iter()) {
         diff |= a ^ b;
@@ -370,20 +388,19 @@ pub fn verify_capability(cap: &Capability, sig: &[u8; 32], secret: &[u8; 32]) ->
 
 /// Alias for `sign_capability` — SDK-facing name.
 ///
-/// Create a 32-byte signature over the capability fields using a keyed
-/// FNV-1a hash: hash(secret || cap_type || target || node_id).
+/// Create a 32-byte Ed25519 signature over the capability fields.
 #[inline]
-pub fn cap_sign(cap: &Capability, secret: &[u8; 32]) -> [u8; 32] {
-    sign_capability(cap, secret)
+pub fn cap_sign(cap: &Capability, signing_key: &crypto::SigningKey) -> [u8; 32] {
+    sign_capability(cap, signing_key)
 }
 
 /// Alias for `verify_capability` — SDK-facing name.
 ///
-/// Returns `true` if recomputing the signature from `cap` and `secret`
+/// Returns `true` if recomputing the signature from `cap` and `signing_key`
 /// matches the provided `sig`.
 #[inline]
-pub fn cap_verify(cap: &Capability, sig: &[u8; 32], secret: &[u8; 32]) -> bool {
-    verify_capability(cap, sig, secret)
+pub fn cap_verify(cap: &Capability, sig: &[u8; 32], signing_key: &crypto::SigningKey) -> bool {
+    verify_capability(cap, sig, signing_key)
 }
 
 /// A capability bundled with its cryptographic signature.
@@ -397,15 +414,15 @@ pub struct SignedCapability {
 }
 
 impl SignedCapability {
-    /// Sign a capability with `secret` and bundle the result.
-    pub fn new(cap: Capability, secret: &[u8; 32]) -> Self {
-        let signature = cap_sign(&cap, secret);
+    /// Sign a capability with `signing_key` and bundle the result.
+    pub fn new(cap: Capability, signing_key: &crypto::SigningKey) -> Self {
+        let signature = cap_sign(&cap, signing_key);
         SignedCapability { cap, signature }
     }
 
-    /// Verify the bundled signature against `secret`.
-    pub fn verify(&self, secret: &[u8; 32]) -> bool {
-        cap_verify(&self.cap, &self.signature, secret)
+    /// Verify the bundled signature against `signing_key`.
+    pub fn verify(&self, signing_key: &crypto::SigningKey) -> bool {
+        cap_verify(&self.cap, &self.signature, signing_key)
     }
 }
 

@@ -759,6 +759,17 @@ pub fn init() {
     // ── Initialise extended node identity (Stage 8) ─────────────────────
     crate::node::init_node_identity();
 
+    // ── Initialise receipt signing key ────────────────────────────────────
+    crate::receipts::init_receipt_signing();
+
+    // ── Register local node's verifying key with routerd ─────────────────
+    if let Some(identity) = crate::node::get_node_identity() {
+        if let Ok(vk) = crate::crypto::VerifyingKey::from_bytes(&identity.verifying_key) {
+            crate::agents::routerd::register_node_key(&identity.id, vk);
+            serial_println!("[INIT] Local node verifying key registered with routerd");
+        }
+    }
+
     // ── Set cr3 for KERNEL-MODE agents only ─────────────────────────────
     // User-mode agents already have their own cr3 set in create_user_agent().
     // Kernel-mode agents share the kernel page table.
