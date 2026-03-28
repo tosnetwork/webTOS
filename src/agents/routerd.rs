@@ -30,6 +30,52 @@
 use crate::serial_println;
 use crate::agent::*;
 use crate::syscall;
+use crate::crypto;
+
+// ─── Node verifying key registry ─────────────────────────────────────────────
+
+/// Maximum number of known peer nodes whose verifying keys we cache.
+const MAX_NODE_KEYS: usize = 16;
+
+/// Registry of node verifying keys for cross-node signature verification.
+///
+/// Safety: single-core, no preemption during registry access in Stage-1.
+static mut NODE_KEYS: [([u8; 32], Option<crypto::VerifyingKey>); MAX_NODE_KEYS] =
+    [const { ([0u8; 32], None) }; MAX_NODE_KEYS];
+
+/// Register a node's Ed25519 verifying key in the routing key registry.
+pub fn register_node_key(node_id: &[u8; 32], vk: crypto::VerifyingKey) {
+    unsafe {
+        // Check if already registered (update in place)
+        for entry in NODE_KEYS.iter_mut() {
+            if entry.0 == *node_id && entry.1.is_some() {
+                entry.1 = Some(vk);
+                return;
+            }
+        }
+        // Find an empty slot
+        for entry in NODE_KEYS.iter_mut() {
+            if entry.1.is_none() {
+                entry.0 = *node_id;
+                entry.1 = Some(vk);
+                return;
+            }
+        }
+    }
+    serial_println!("[ROUTERD] WARNING: node key registry full, cannot register key");
+}
+
+/// Look up a node's verifying key from the registry.
+fn get_node_verifying_key(node_id: &[u8; 32]) -> Option<&'static crypto::VerifyingKey> {
+    unsafe {
+        for entry in NODE_KEYS.iter() {
+            if entry.0 == *node_id {
+                return entry.1.as_ref();
+            }
+        }
+    }
+    None
+}
 
 // ─── ATOS Distributed packet constants ───────────────────────────────────────
 
@@ -279,35 +325,23 @@ pub fn sign_routing_header(
     msg[66..68].copy_from_slice(&dest_agent.to_le_bytes());
     msg[68..100].copy_from_slice(authority_hash);
 
-    // Use the node's signing key if available, otherwise produce a deterministic
-    // placeholder signature (FNV-based HMAC-like construction).
+    // Sign with the node's Ed25519 key (always available after boot).
     if let Some(identity) = crate::node::get_node_identity() {
-        if identity.signing_key != [0u8; 32] {
-            let key = crate::crypto::SigningKey::from_bytes(&identity.signing_key);
-            let sig = crate::crypto::sign(&key, &msg);
-            return sig.to_bytes();
-        }
+        let key = crypto::SigningKey::from_bytes(&identity.signing_key);
+        let sig = crypto::sign(&key, &msg);
+        return sig.to_bytes();
     }
 
-    // Fallback: deterministic FNV-based "signature" when no real key is set
-    let mut sig = [0u8; 64];
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in msg.iter() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    for i in 0..8 {
-        let chunk = h.wrapping_add(i as u64).to_le_bytes();
-        sig[i * 8..(i + 1) * 8].copy_from_slice(&chunk);
-    }
-    sig
+    // Should never reach here after boot — return all zeros which will
+    // be rejected by verify_routing_signature.
+    serial_println!("[ROUTERD] WARNING: no node identity available for signing");
+    [0u8; 64]
 }
 
-/// Verify a routing header signature against the source node's claimed key.
+/// Verify a routing header signature against the source node's Ed25519 key.
 ///
-/// In a full implementation this would look up the source node's verifying key
-/// from the membership service. For now it accepts any correctly-structured
-/// signature and performs a format check.
+/// Looks up the source node's verifying key from the node key registry and
+/// performs real Ed25519 signature verification. Rejects unknown nodes.
 fn verify_routing_signature(
     source_node: &[u8; 32],
     dest_node: &[u8; 32],
@@ -331,11 +365,24 @@ fn verify_routing_signature(
         return false;
     }
 
-    // If we know the source node's verifying key, do real Ed25519 verification.
-    // For now, we accept the signature if it passes the zero-check above.
-    // A production system would look up the key from membership_d.
-    let _ = (source_node, &msg); // suppress unused warnings
-    true
+    // Look up source node's verifying key from the registry
+    if let Some(vk) = get_node_verifying_key(source_node) {
+        if let Ok(sig) = crypto::Signature::from_slice(signature) {
+            let valid = crypto::verify(vk, &msg, &sig);
+            if !valid {
+                serial_println!("[ROUTERD] Ed25519 signature verification FAILED for node {:02x}{:02x}..",
+                    source_node[0], source_node[1]);
+            }
+            return valid;
+        }
+        serial_println!("[ROUTERD] Malformed signature from node {:02x}{:02x}..",
+            source_node[0], source_node[1]);
+        return false;
+    }
+
+    serial_println!("[ROUTERD] No verifying key registered for node {:02x}{:02x}..",
+        source_node[0], source_node[1]);
+    false
 }
 
 /// Verify authority_hash is valid: checks that the hash is non-zero and

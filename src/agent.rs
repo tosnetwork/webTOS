@@ -232,6 +232,10 @@ pub struct Agent {
     // Stage 8: placement hints for distributed scheduling
     pub placement_hint_type: u64,
     pub placement_hint_value: u64,
+    // Stage 9: receipt state roots – snapshot of keyspace root at agent creation
+    pub initial_state_root: [u8; 32],
+    /// Tick at which this agent was created (for receipt tick_start).
+    pub tick_created: u64,
 }
 
 impl Agent {
@@ -265,6 +269,8 @@ impl Agent {
             priority: AgentPriority::Normal,
             placement_hint_type: 0,
             placement_hint_value: 0,
+            initial_state_root: [0u8; 32],
+            tick_created: 0,
         }
     }
 }

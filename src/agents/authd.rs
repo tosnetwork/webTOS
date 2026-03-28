@@ -9,10 +9,42 @@
 
 use crate::serial_println;
 use crate::agent::*;
+use crate::principal::PrincipalId;
 
 const OP_REVOKE: u8 = 0x01;
 const OP_STATUS: u8 = 0x02;
 const OP_LEASE_RENEW: u8 = 0x03;
+
+// ─── Principal revocation list ──────────────────────────────────────────────
+
+const MAX_REVOKED_PRINCIPALS: usize = 64;
+
+static mut REVOKED_PRINCIPALS: [PrincipalId; MAX_REVOKED_PRINCIPALS] = [[0u8; 32]; MAX_REVOKED_PRINCIPALS];
+static mut REVOKED_COUNT: usize = 0;
+
+/// Check if a principal has been revoked.
+///
+/// This function is pub so that `syscall.rs` can call it for admission control.
+pub fn is_principal_revoked(principal_id: &PrincipalId) -> bool {
+    unsafe {
+        for i in 0..REVOKED_COUNT {
+            if REVOKED_PRINCIPALS[i] == *principal_id {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Add a principal to the revocation list.
+fn revoke_principal(principal_id: PrincipalId) {
+    unsafe {
+        if REVOKED_COUNT < MAX_REVOKED_PRINCIPALS {
+            REVOKED_PRINCIPALS[REVOKED_COUNT] = principal_id;
+            REVOKED_COUNT += 1;
+        }
+    }
+}
 
 /// Authd agent ID — assigned during init as agent slot 12.
 const AUTHD_ID: AgentId = 12;
@@ -64,6 +96,8 @@ fn handle_revoke(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     let mut principal_id = [0u8; 32];
     principal_id.copy_from_slice(&payload[1..33]);
 
+    revoke_principal(principal_id);
+
     serial_println!("[AUTHD] Principal revoked: {:02x}{:02x}{:02x}{:02x}...",
         principal_id[0], principal_id[1], principal_id[2], principal_id[3]);
     crate::event::auth_revoke(sender_id, 0, OP_REVOKE as u64);
@@ -80,12 +114,14 @@ fn handle_status(payload: &[u8], msg_len: usize, sender_id: AgentId) {
     let mut principal_id = [0u8; 32];
     principal_id.copy_from_slice(&payload[1..33]);
 
-    // Stage 5 stub: all principals are active
-    serial_println!("[AUTHD] STATUS query from agent {} for principal {:02x}{:02x}...: ACTIVE",
-        sender_id, principal_id[0], principal_id[1]);
+    let revoked = is_principal_revoked(&principal_id);
+    let status_str = if revoked { "REVOKED" } else { "ACTIVE" };
+
+    serial_println!("[AUTHD] STATUS query from agent {} for principal {:02x}{:02x}...: {}",
+        sender_id, principal_id[0], principal_id[1], status_str);
 
     // Send response back (1 byte: 0 = active, 1 = revoked)
-    let response = [0u8; 1]; // Active
+    let response = [if revoked { 1u8 } else { 0u8 }; 1];
     let _ = crate::mailbox::send_message(AUTHD_ID, sender_id as MailboxId, &response);
 }
 

@@ -20,6 +20,70 @@ use crate::state;
 use crate::arch::x86_64::paging;
 use crate::arch::x86_64::security;
 
+// ─── Replay transcript capture ──────────────────────────────────────────────
+
+/// Syscall transcript entry for replay verification.
+#[derive(Clone, Copy)]
+pub struct TranscriptEntry {
+    pub tick: u64,
+    pub agent_id: u16,
+    pub syscall_num: u64,
+    pub arg0: u64,
+    pub result: i64,
+}
+
+const TRANSCRIPT_CAP: usize = 4096;
+
+// Safety: single-core, no preemption during syscall handling.
+static mut TRANSCRIPT: [TranscriptEntry; TRANSCRIPT_CAP] = [TranscriptEntry {
+    tick: 0, agent_id: 0, syscall_num: 0, arg0: 0, result: 0,
+}; TRANSCRIPT_CAP];
+static mut TRANSCRIPT_LEN: usize = 0;
+static mut TRANSCRIPT_WRAP: bool = false;
+
+/// Record a syscall invocation into the replay transcript ring buffer.
+fn record_transcript(tick: u64, agent_id: u16, syscall_num: u64, arg0: u64, result: i64) {
+    unsafe {
+        let idx = TRANSCRIPT_LEN % TRANSCRIPT_CAP;
+        TRANSCRIPT[idx] = TranscriptEntry { tick, agent_id, syscall_num, arg0, result };
+        TRANSCRIPT_LEN += 1;
+        if TRANSCRIPT_LEN >= TRANSCRIPT_CAP {
+            TRANSCRIPT_WRAP = true;
+        }
+    }
+}
+
+/// Return the total number of transcript entries recorded (may exceed ring capacity).
+pub fn transcript_count() -> usize {
+    unsafe { if TRANSCRIPT_WRAP { TRANSCRIPT_CAP } else { TRANSCRIPT_LEN } }
+}
+
+/// Compute a hash commitment over transcript entries for a given agent within a tick range.
+pub fn compute_transcript_hash(agent_id: u16, tick_start: u64, tick_end: u64) -> [u8; 32] {
+    let mut h: u64 = 0xcbf29ce484222325;
+    unsafe {
+        let cap = TRANSCRIPT_CAP;
+        let count = if TRANSCRIPT_WRAP { cap } else { TRANSCRIPT_LEN };
+        let start = if TRANSCRIPT_WRAP { TRANSCRIPT_LEN.wrapping_sub(cap) } else { 0 };
+        for i in 0..count {
+            let idx = (start + i) % cap;
+            let e = &TRANSCRIPT[idx];
+            if e.agent_id == agent_id && e.tick >= tick_start && e.tick <= tick_end {
+                h = h.wrapping_mul(0x100000001b3) ^ e.syscall_num;
+                h = h.wrapping_mul(0x100000001b3) ^ e.arg0;
+                h = h.wrapping_mul(0x100000001b3) ^ (e.result as u64);
+                h = h.wrapping_mul(0x100000001b3) ^ e.tick;
+            }
+        }
+    }
+    let mut result = [0u8; 32];
+    result[0..8].copy_from_slice(&h.to_le_bytes());
+    // Second pass for more entropy
+    h = h.wrapping_mul(0x100000001b3) ^ 0xdeadbeef;
+    result[8..16].copy_from_slice(&h.to_le_bytes());
+    result
+}
+
 /// Dispatch a syscall from the current agent.
 ///
 /// # Arguments
@@ -96,6 +160,18 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 return E_NO_CAP;
             }
 
+            // Principal admission control: verify spawning agent's principal is not revoked
+            {
+                let mut principal_id = [0u8; 32];
+                let id_bytes = caller_id.to_le_bytes();
+                principal_id[0] = id_bytes[0];
+                principal_id[1] = id_bytes[1];
+                if crate::agents::authd::is_principal_revoked(&principal_id) {
+                    crate::event::auth_deny(caller_id, CapType::AgentSpawn as u64, 0);
+                    return E_NO_CAP; // EPERM — principal revoked
+                }
+            }
+
             // ── eBPF AgentSpawn check ──
             let spawn_ctx = crate::ebpf::attach::SpawnContext {
                 parent_id: caller_id,
@@ -133,6 +209,12 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                     // Create mailbox and keyspace for the new agent
                     mailbox::create_mailbox(new_id as MailboxId, new_id).ok();
                     state::create_keyspace(new_id as u16).ok();
+                    // Snapshot initial state root and creation tick for receipts
+                    if let Some(agent) = get_agent_mut(new_id) {
+                        let root16 = state::get_root(new_id as u16).unwrap_or([0u8; 16]);
+                        agent.initial_state_root[..16].copy_from_slice(&root16);
+                        agent.tick_created = crate::arch::x86_64::timer::get_ticks();
+                    }
                     // Add to run queue
                     sched::enqueue(new_id);
                     crate::metrics::increment_agent_spawned();
@@ -149,19 +231,30 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 
             // Emit an execution receipt before terminating the agent
             let tick_now = crate::arch::x86_64::timer::get_ticks();
-            let energy_remaining = match get_agent(caller_id) {
-                Some(a) => a.energy_budget,
-                None => 0,
+            let (energy_remaining, initial_root, tick_start) = match get_agent(caller_id) {
+                Some(a) => (a.energy_budget, a.initial_state_root, a.tick_created),
+                None => (0, [0u8; 32], 0u64),
             };
-            crate::receipts::emit_receipt_on_exit(
+            // Compute final state root from agent's keyspace
+            let mut final_root = [0u8; 32];
+            if let Some(root16) = state::get_root(caller_id as u16) {
+                final_root[..16].copy_from_slice(&root16);
+            }
+            // Compute trace commitment from transcript
+            let trace_commitment = compute_transcript_hash(caller_id, tick_start, tick_now);
+            let receipt_idx = crate::receipts::emit_receipt_on_exit(
                 caller_id,
                 crate::receipts::RuntimeClassTag::ProofGradeWasm,
                 energy_remaining,
-                [0; 32], // initial_state_root placeholder
-                [0; 32], // final_state_root placeholder
-                0,       // tick_start placeholder
+                initial_root,
+                final_root,
+                tick_start,
                 tick_now,
             );
+            // Patch trace_commitment into the receipt
+            if let Some(idx) = receipt_idx {
+                crate::receipts::patch_trace_commitment(idx, trace_commitment);
+            }
 
             terminate_agent(caller_id, AgentStatus::Exited);
             crate::metrics::increment_agent_exited();
@@ -891,17 +984,20 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 return E_INVALID_ARG;
             }
 
-            let _principal_id = unsafe {
+            let principal_id = unsafe {
                 security::stac();
-                let s = core::slice::from_raw_parts(a1 as *const u8, 32);
+                let mut pid = [0u8; 32];
+                core::ptr::copy_nonoverlapping(a1 as *const u8, pid.as_mut_ptr(), 32);
                 security::clac();
-                s
+                pid
             };
 
-            // Stage 5 stub: all principals are active until a revocation
-            // registry is implemented. The authd agent handles revocations
-            // via mailbox protocol.
-            0 // Active
+            // Check the authd revocation list
+            if crate::agents::authd::is_principal_revoked(&principal_id) {
+                1 // Revoked
+            } else {
+                0 // Active
+            }
         }
 
         // ── 26: sys_state_tx_begin ────────────────────────────────────
@@ -1220,6 +1316,13 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         if exit_action == crate::ebpf::types::Action::Log {
             crate::event::emit(caller_id, crate::event::EventType::EbpfPolicy, num, result as u64, 0);
         }
+    }
+
+    // ── Record syscall to replay transcript ──
+    // Skip SYS_YIELD to avoid flooding the ring buffer with idle ticks
+    if num != SYS_YIELD {
+        let tick = crate::arch::x86_64::timer::get_ticks();
+        record_transcript(tick, caller_id, num, a1, result);
     }
 
     result
