@@ -909,8 +909,66 @@ pub fn sys_lstat(agent_id: u16, path_ptr: u64, statbuf: u64) -> i64 {
 }
 
 /// poll(fds, nfds, timeout) -> ready count
-pub fn sys_poll(_agent_id: u16, _fds: u64, _nfds: u64, _timeout: i32) -> i64 {
-    0 // no fds ready
+///
+/// Checks fd readiness deterministically. Files are always ready,
+/// sockets/pipes report writable, eventfds check counter > 0.
+/// Iterates fds in ascending order for determinism.
+pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
+    // struct pollfd { int fd; short events; short revents; } = 8 bytes
+    const POLLFD_SIZE: u64 = 8;
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLNVAL: i16 = 0x0020;
+
+    let st = match state::get_state(agent_id) {
+        Some(s) => s,
+        None => return -EINVAL,
+    };
+
+    let count = nfds.min(256) as usize;
+    let mut ready: i64 = 0;
+
+    for i in 0..count {
+        let pfd_addr = fds + (i as u64) * POLLFD_SIZE;
+        let fd = unsafe { core::ptr::read(pfd_addr as *const i32) };
+        let events = unsafe { core::ptr::read((pfd_addr + 4) as *const i16) };
+
+        let revents: i16 = match st.get_fd(fd) {
+            Some(entry) if entry.active => {
+                let mut r: i16 = 0;
+                match entry.kind {
+                    FdKind::File => {
+                        // Files are always ready for read and write
+                        if events & POLLIN != 0 { r |= POLLIN; }
+                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                    }
+                    FdKind::Socket | FdKind::Pipe => {
+                        // Writable always; readable requires mailbox check
+                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                    }
+                    FdKind::EventFd => {
+                        // Readable if counter > 0 (counter stored in keyspace_key)
+                        if events & POLLIN != 0 && entry.keyspace_key > 0 {
+                            r |= POLLIN;
+                        }
+                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                    }
+                    FdKind::Epoll => {}
+                }
+                r
+            }
+            _ => POLLNVAL,
+        };
+
+        // Write revents back to user memory
+        unsafe { core::ptr::write((pfd_addr + 6) as *mut i16, revents); }
+
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+
+    ready
 }
 
 /// pwrite64 stub
@@ -1031,16 +1089,94 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, _flags: i32) -> i64 {
     sys_pipe(agent_id, pipefd_ptr)
 }
 
-/// select stub
+/// select(nfds, readfds, writefds, exceptfds, timeout) -> ready count
+///
+/// Checks fd readiness deterministically for the fd_set bitmasks.
+/// fd_set is a 128-byte (1024-bit) bitmask; we only check up to nfds.
 pub fn sys_select(
-    _agent_id: u16,
-    _nfds: u64,
-    _readfds: u64,
-    _writefds: u64,
+    agent_id: u16,
+    nfds: u64,
+    readfds: u64,
+    writefds: u64,
     _exceptfds: u64,
     _timeout: u64,
 ) -> i64 {
-    0 // no fds ready
+    let st = match state::get_state(agent_id) {
+        Some(s) => s,
+        None => return -EINVAL,
+    };
+
+    let max_fd = nfds.min(256) as i32;
+    let mut ready: i64 = 0;
+
+    // Helper: test bit in fd_set (128-byte bitmask)
+    let test_bit = |set_ptr: u64, fd: i32| -> bool {
+        if set_ptr == 0 { return false; }
+        let byte_idx = (fd / 8) as u64;
+        let bit_idx = (fd % 8) as u8;
+        let byte_val = unsafe { core::ptr::read((set_ptr + byte_idx) as *const u8) };
+        byte_val & (1 << bit_idx) != 0
+    };
+
+    // Helper: set bit in fd_set
+    let set_bit = |set_ptr: u64, fd: i32| {
+        if set_ptr == 0 { return; }
+        let byte_idx = (fd / 8) as u64;
+        let bit_idx = (fd % 8) as u8;
+        unsafe {
+            let ptr = (set_ptr + byte_idx) as *mut u8;
+            *ptr |= 1 << bit_idx;
+        }
+    };
+
+    // Helper: clear bit in fd_set
+    let clear_bit = |set_ptr: u64, fd: i32| {
+        if set_ptr == 0 { return; }
+        let byte_idx = (fd / 8) as u64;
+        let bit_idx = (fd % 8) as u8;
+        unsafe {
+            let ptr = (set_ptr + byte_idx) as *mut u8;
+            *ptr &= !(1 << bit_idx);
+        }
+    };
+
+    // First pass: clear all result bits
+    for fd in 0..max_fd {
+        if readfds != 0 { clear_bit(readfds, fd); }
+        if writefds != 0 { clear_bit(writefds, fd); }
+    }
+
+    // Second pass: check readiness for each fd in ascending order (deterministic)
+    for fd in 0..max_fd {
+        let check_read = test_bit(readfds, fd) || (readfds != 0);
+        let check_write = test_bit(writefds, fd) || (writefds != 0);
+
+        if !check_read && !check_write { continue; }
+
+        if let Some(entry) = st.get_fd(fd) {
+            if !entry.active { continue; }
+
+            let (can_read, can_write) = match entry.kind {
+                FdKind::File => (true, true),
+                FdKind::Socket | FdKind::Pipe => (false, true),
+                FdKind::EventFd => (entry.keyspace_key > 0, true),
+                FdKind::Epoll => (false, false),
+            };
+
+            let mut marked = false;
+            if can_read && readfds != 0 {
+                set_bit(readfds, fd);
+                marked = true;
+            }
+            if can_write && writefds != 0 {
+                set_bit(writefds, fd);
+                marked = true;
+            }
+            if marked { ready += 1; }
+        }
+    }
+
+    ready
 }
 
 /// dup2(oldfd, newfd) -> newfd
