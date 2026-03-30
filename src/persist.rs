@@ -11,7 +11,7 @@
 use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
 use crate::block::StorageDevice;
 
-const MAX_ENTRIES_PER_KEYSPACE: usize = 64;
+const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
 const MAX_VALUE_SIZE: usize = 256;
 const STATE_START_SECTOR: u32 = 0;
 const MAX_LOG_SECTORS: u32 = 1024; // ~512 KB state log region

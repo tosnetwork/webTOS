@@ -369,9 +369,10 @@ fn handle_deploy(req: &ExternalRequest) -> ExternalResponse {
         return resp;
     }
 
-    // Store the WASM bytecode in the agent's keyspace under the well-known
-    // key 0xFFFF so the agent can retrieve it at startup.
-    if crate::state::state_put(ks, 0xFFFF, bytecode).is_err() {
+    // Store the WASM bytecode in the agent's keyspace using chunked large
+    // value storage.  This supports contracts up to 64 KB (256 x 256-byte
+    // chunks), bypassing the 256-byte single-entry limit.
+    if crate::state::store_large_value(ks, bytecode).is_err() {
         resp.status = ResponseStatus::Error;
         return resp;
     }

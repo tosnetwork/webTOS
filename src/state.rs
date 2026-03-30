@@ -9,7 +9,7 @@
 use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
 use crate::merkle::{self, MerkleHash};
 
-const MAX_ENTRIES_PER_KEYSPACE: usize = 64;
+const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
 const MAX_VALUE_SIZE: usize = 256;
 
 // ─── State entry ────────────────────────────────────────────────────────────
@@ -557,5 +557,96 @@ pub fn tx_add_mutation(agent_id: u16, key: u64, value: &[u8]) -> Result<(), i64>
             None => Err(E_NOT_FOUND),
         }
     }
+}
+
+// ─── Large value storage (chunked) ────────────────────────────────────────
+
+/// Large value storage via chunked keyspace entries.
+///
+/// Key `LARGE_VALUE_META_KEY` = metadata: total_len (u32 LE) + chunk_count (u16 LE).
+/// Keys `LARGE_VALUE_CHUNK_BASE` .. `LARGE_VALUE_CHUNK_BASE + chunk_count - 1` = chunk data
+/// (up to 256 bytes each).
+pub const LARGE_VALUE_META_KEY: u64 = 0xFFFF_0000;
+pub const LARGE_VALUE_CHUNK_BASE: u64 = 0xFFFF_0001;
+
+/// Maximum number of chunks for a large value (256 chunks * 256 bytes = 64 KB).
+const MAX_LARGE_VALUE_CHUNKS: usize = 256;
+
+/// Store a large value into a keyspace using chunked entries.
+///
+/// Splits `data` into 256-byte chunks and stores metadata at `LARGE_VALUE_META_KEY`.
+/// Maximum supported size is 65536 bytes (256 chunks of 256 bytes).
+///
+/// Returns `Ok(())` on success, or an error code on failure.
+pub fn store_large_value(keyspace: KeyspaceId, data: &[u8]) -> Result<(), i64> {
+    if data.is_empty() {
+        return Err(E_INVALID_ARG);
+    }
+    if data.len() > MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE {
+        return Err(E_PAYLOAD_TOO_LARGE);
+    }
+
+    // Compute chunk count.
+    let chunk_count = (data.len() + MAX_VALUE_SIZE - 1) / MAX_VALUE_SIZE;
+
+    // Store metadata: total_len (4 bytes LE) + chunk_count (2 bytes LE).
+    let total_len = data.len() as u32;
+    let mut meta = [0u8; 6];
+    meta[0..4].copy_from_slice(&total_len.to_le_bytes());
+    meta[4..6].copy_from_slice(&(chunk_count as u16).to_le_bytes());
+    put(keyspace, LARGE_VALUE_META_KEY, &meta)?;
+
+    // Store each chunk.
+    for i in 0..chunk_count {
+        let start = i * MAX_VALUE_SIZE;
+        let end = (start + MAX_VALUE_SIZE).min(data.len());
+        let chunk_key = LARGE_VALUE_CHUNK_BASE + i as u64;
+        put(keyspace, chunk_key, &data[start..end])?;
+    }
+
+    // Advance version once for the entire store operation.
+    advance_version(keyspace);
+    Ok(())
+}
+
+/// Load a large value from a keyspace that was stored via `store_large_value`.
+///
+/// Reads the metadata at `LARGE_VALUE_META_KEY`, then reassembles chunks into `buf`.
+/// Returns the total number of bytes read, or 0 if no large value is stored.
+pub fn load_large_value(keyspace: KeyspaceId, buf: &mut [u8]) -> usize {
+    // Read metadata.
+    let (meta_buf, meta_len) = match state_get(keyspace, LARGE_VALUE_META_KEY) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    if meta_len < 6 {
+        return 0;
+    }
+
+    let total_len = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
+
+    if total_len == 0 || chunk_count == 0 || total_len > buf.len() {
+        return 0;
+    }
+
+    // Read each chunk and copy into buf.
+    let mut offset = 0;
+    for i in 0..chunk_count {
+        let chunk_key = LARGE_VALUE_CHUNK_BASE + i as u64;
+        let (chunk_buf, chunk_len) = match state_get(keyspace, chunk_key) {
+            Some(v) => v,
+            None => return 0, // missing chunk — corrupt data
+        };
+        let copy_len = chunk_len.min(total_len - offset);
+        buf[offset..offset + copy_len].copy_from_slice(&chunk_buf[..copy_len]);
+        offset += copy_len;
+        if offset >= total_len {
+            break;
+        }
+    }
+
+    total_len
 }
 
