@@ -85,39 +85,16 @@ pub struct ExecutionReceipt {
     pub signature: [u8; 64],
 }
 
-/// Compute a 32-byte commitment hash from arbitrary data.
+/// Compute a 32-byte commitment hash from arbitrary data using SHA-256.
 ///
-/// Uses FNV-1a with 4 different seeds (same approach as
-/// `contract::compute_contract_id`) to produce a 32-byte hash.
+/// Cryptographically secure: collision-resistant and pre-image resistant.
 pub fn compute_commitment(data: &[u8]) -> Hash256 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
-
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
     let mut out = [0u8; 32];
-    let seeds: [u64; 4] = [
-        FNV_OFFSET,
-        FNV_OFFSET ^ 0xDEAD_BEEF_CAFE_BABE,
-        FNV_OFFSET ^ 0x0123_4567_89AB_CDEF,
-        FNV_OFFSET ^ 0xFEDC_BA98_7654_3210,
-    ];
-
-    for (i, &seed) in seeds.iter().enumerate() {
-        let mut h = seed;
-        for &b in data {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        // Mix in the length to differentiate zero-padded inputs.
-        let len_bytes = (data.len() as u64).to_le_bytes();
-        for &lb in &len_bytes {
-            h ^= lb as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        let bytes = h.to_be_bytes();
-        let offset = i * 8;
-        out[offset..offset + 8].copy_from_slice(&bytes);
-    }
-
+    out.copy_from_slice(&result);
     out
 }
 
