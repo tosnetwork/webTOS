@@ -39,7 +39,7 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 
 * **ATOS** — the full system.
 * **ATOS-0** — the privileged kernel substrate: boot, memory, traps, syscalls, scheduling, mailbox IPC, capability enforcement, energy accounting, audit.
-* **ATOS-1** — the runtime host layer: WASM engine, JVM (Ristretto), future managed runtimes.
+* **ATOS-1** — the runtime host layer: WASM engine, deterministic Linux compatibility layer.
 * **ATOS-2** — the contract and system-service layer: deployed contracts, stated, policyd, netd.
 
 ---
@@ -79,7 +79,7 @@ Its first-class concepts are:
 | Traditional VM | ATOS Equivalent | Advantage |
 |---|---|---|
 | EVM (Ethereum) | ATOS with WASM/JVM runtimes | Runs on hardware, not inside a process; multi-language; richer state model |
-| JVM | ATOS with Ristretto | Deterministic execution, energy metering, cryptographic state proofs |
+| JVM (on Linux) | ATOS with Linux compat layer | Runs unmodified OpenJDK deterministically via syscall translation |
 | Docker/VM isolation | ATOS per-contract page tables | Hardware-enforced isolation at the page table level, not process-level |
 | Gas metering (EVM) | ATOS energy budget | Unified across WASM, JVM, native; tick-based preemption, no per-opcode overhead |
 
@@ -107,7 +107,7 @@ Its first-class concepts are:
                                 ▼
 +----------------------------------------------------------------------+
 |  ATOS-1  Runtime Host                                                |
-|  WASM engine | Ristretto JVM | native runtime                      |
+|  WASM engine | Linux compat layer | native runtime                  |
 |  load → execute → meter → syscall_bridge → snapshot                 |
 +-------------------------------+--------------------------------------+
                                 |
@@ -137,7 +137,8 @@ Its first-class concepts are:
 | 5 | Contract Persistent State | Versioned keyspaces, atomic transactions, Merkle proofs, crash recovery |
 | 6 | Contract Package Management | Deployment, addressing, inter-contract calls, upgrade/rollback, signing |
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM attestation |
-| 8 | Language Runtimes | WASM engine (complete), Ristretto JVM |
+| 8 | WASM Runtime | Production WASM engine with fuel metering and selector dispatch |
+| 9 | Deterministic Linux Compatibility | Any Linux x86_64 binary runs deterministically on ATOS |
 
 ### Stage-by-Stage Roadmap
 
@@ -403,19 +404,12 @@ ExecutionReceipt (portable artifact)
 **Success Condition**
 Every contract execution produces an ExecutionReceipt. External verifiers can validate receipts via replay or compact proofs. TPM attestation proves the ATOS VM is running trusted code.
 
-#### Stage-8 — Language Runtimes `[IMPL: ⚠️ WASM complete, JVM planned]`
+#### Stage-8 — WASM Runtime `[IMPL: ✅ Complete]`
 
 **Purpose**
-Support multiple execution formats so contracts can be written in different languages.
+Provide a production-grade WASM execution engine as the primary contract runtime.
 
-**Supported Runtimes**
-
-| Priority | Runtime | Engine | Language | Status |
-|----------|---------|--------|----------|--------|
-| **P0** | WASM | ATOS WASM engine | Any → WASM | ✅ Complete |
-| **P1** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | ⏳ Planned |
-
-**P0 — WASM Engine** `[IMPL: ✅ Complete]`
+**WASM Engine**
 
 The self-built WASM interpreter provides:
 - 100% WASM MVP spec compliance
@@ -423,42 +417,215 @@ The self-built WASM interpreter provides:
 - Type-safe host bindings for ATOS syscalls
 - `#![no_std]` — runs as native ATOS agent
 - Deterministic execution (ideal for verifiable computation)
+- 64 KB chunked code loading from keyspace
+- Per-request selector-based export dispatch
+- Differentiated error status (SUCCESS / REVERT / OUT_OF_ENERGY / ERROR)
 
-Languages without a dedicated ATOS port (Go, C#, Swift, Zig, Rust, Python) compile to WASM and run via the ATOS WASM engine.
-
-**P1 — Ristretto JVM** `[IMPL: ⏳ Planned]`
-
-[Ristretto](https://github.com/theseus-rs/ristretto) is a pure Rust JVM ported as a native ATOS agent. Java programs run unmodified with deterministic semantics:
-
-| Java API | ATOS Mapping | Determinism |
-|----------|-------------|-------------|
-| `System.currentTimeMillis()` | ATOS tick count | ✅ Deterministic |
-| `Object.hashCode()` | Sequential counter | ✅ Deterministic |
-| `Thread` / `Executor` | Child agents via `sys_spawn` | ✅ Deterministic scheduling |
-| `new Random()` | Deterministic seed from ATOS | ✅ Deterministic |
-| File I/O | Keyspace `sys_state_get/put` | ✅ Deterministic |
-| Network sockets | netd mailbox proxy | ✅ Brokered, logged |
-| `UUID.randomUUID()` | Deterministic ATOS random | ✅ Deterministic |
-| GC / finalization | Ristretto-controlled | ✅ Deterministic |
-
-The virtualization layer maps standard OS abstractions to ATOS primitives:
-
-```text
-Java program (unmodified .jar / .class)
-  ↓
-Ristretto (pure Rust JVM, ATOS native agent)
-  ↓ #[cfg(target_os = "atos")] virtualization layer
-ATOS syscall interface
-  ↓
-ATOS kernel (mailbox, capability, keyspace, energy, eBPF)
-```
-
-**Limitation**: JNI third-party native libraries (TensorFlow, OpenCV, etc.) require individual porting effort.
+Any language that compiles to WASM runs on ATOS: Rust, C, C++, Go, Zig, AssemblyScript, Python (via wasm target), Java (via TeaVM/CheerpJ), Kotlin, Swift, C#, and others.
 
 **Success Condition**
-- Any WASM module runs on ATOS with full spec compliance and energy metering.
-- A Java JAR file executes on ATOS with standard library classes functional and deterministic.
-- All ported runtimes pass their respective test suites on ATOS.
+Any WASM module runs on ATOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
+
+#### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ⏳ Planned]`
+
+**Purpose**
+Run any unmodified Linux x86_64 program on ATOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, ATOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
+
+**Core Idea**
+
+```text
+Unmodified Linux ELF64 binary (OpenJDK, Node.js, CPython, Go, curl, etc.)
+  ↓
+Linux SYSCALL instruction (rax = Linux syscall number)
+  ↓ intercepted by ATOS syscall_entry.asm
+┌────────────────────────────────────────────────────────────┐
+│  Deterministic Linux Compatibility Layer                   │
+│                                                            │
+│  Every non-deterministic Linux syscall is replaced with    │
+│  a deterministic ATOS equivalent:                          │
+│                                                            │
+│  Time    → logical tick clock (not wall clock)             │
+│  Random  → deterministic PRNG (seed = agent_id ⊕ tick)    │
+│  Threads → child agents with fixed-order scheduling        │
+│  Locks   → deterministic grant order (lowest agent_id)     │
+│  mmap    → sequential allocation from fixed base address   │
+│  epoll   → fixed-order mailbox polling                     │
+│  Files   → keyspace mapping                                │
+│  Network → netd proxy with I/O trace logging               │
+└────────────────────────────────────────────────────────────┘
+  ↓
+ATOS kernel (scheduler, mailbox, capability, energy, Merkle state)
+```
+
+**Why This Matters**
+
+ATOS is a deterministic execution VM. Programs compiled to WASM already run deterministically. But many important programs (OpenJDK, Node.js, CPython, Go binaries) are distributed as native Linux x86_64 ELF binaries, not WASM. This stage enables those programs to run on ATOS **without modification and without sacrificing determinism**.
+
+The key insight is that non-determinism in Linux programs comes from a small number of syscall-level sources. By controlling the syscall boundary, ATOS can make any Linux program deterministic — the program cannot tell the difference, but its execution becomes fully reproducible.
+
+**Non-Determinism Sources and Deterministic Replacements**
+
+| Linux Syscall | Non-Determinism Source | ATOS Deterministic Replacement |
+|--------------|----------------------|-------------------------------|
+| `gettimeofday` / `clock_gettime` | Wall clock time varies | Return ATOS tick count (logical clock, monotonic, reproducible) |
+| `getrandom` / `read(/dev/urandom)` | True hardware randomness | Deterministic PRNG: `SHA-256(agent_id ∥ tick ∥ counter)` |
+| `clone` (thread creation) | OS thread scheduling is non-deterministic | Create child agent; deterministic scheduler enforces fixed execution order |
+| `futex(WAIT/WAKE)` | Lock contention resolution is non-deterministic | Grant to lowest waiting agent_id first (total order) |
+| `epoll_wait` / `poll` / `select` | Event arrival order varies | Poll file descriptors in ascending numerical order, fixed round-robin |
+| `mmap(NULL, ...)` | Kernel chooses address (ASLR) | Sequential allocation from fixed base `0x1_0000_0000` |
+| `getpid` / `gettid` | OS-assigned process IDs | Derived deterministically from agent_id |
+| `read` / `recvfrom` (network) | Data arrival timing varies | All network I/O logged to trace; replay feeds from trace |
+| `nanosleep` / `clock_nanosleep` | Wake-up time imprecise | Advance logical tick by requested amount (instant, deterministic) |
+| `pipe` / `eventfd` | Reader/writer scheduling | Mailbox pair with deterministic delivery order |
+
+**Interception Mechanism**
+
+Each agent is tagged at spawn time with a `RuntimeKind`:
+
+```text
+RuntimeKind::Native      = 0   // ATOS-native syscall ABI
+RuntimeKind::Wasm        = 1   // WASM execution via interpreter
+RuntimeKind::LinuxCompat = 2   // Linux syscall ABI (deterministic translation)
+```
+
+The syscall dispatcher checks the agent's runtime kind:
+
+```rust
+fn syscall_handler(num: u64, a1-a5: u64) -> i64 {
+    if agent_runtime_kind(current) == LinuxCompat {
+        linux_compat::dispatch(num, a1, a2, a3, a4, a5)  // Linux ABI
+    } else {
+        syscall::syscall(num, a1, a2, a3, a4, a5)         // ATOS ABI
+    }
+}
+```
+
+**Per-Agent Virtual OS State**
+
+Each Linux-compat agent maintains a virtual POSIX state that is fully deterministic:
+
+```text
+LinuxAgentState {
+    fd_table: [FdEntry; 256],        // virtual file descriptor table
+    cwd: [u8; 256],                  // virtual working directory
+    brk_current: u64,                // deterministic heap break
+    mmap_next: u64,                  // next mmap address (sequential)
+    pid: u32,                        // = agent_id (deterministic)
+    uid: u32,                        // = 1000 (fixed)
+    prng_state: [u8; 32],            // SHA-256 PRNG state
+    prng_counter: u64,               // monotonic counter for PRNG
+    epoll_instances: [EpollState; 8], // deterministic epoll
+}
+```
+
+**Deterministic Thread Model**
+
+This is the hardest and most important part. OpenJDK, Node.js (libuv), and Go all create OS threads via `clone()`.
+
+ATOS maps threads to child agents with deterministic scheduling:
+
+```text
+Linux thread model (non-deterministic):
+  Thread A and Thread B run in parallel
+  Lock contention resolved by OS (random winner)
+  → Different runs may produce different results
+
+ATOS deterministic thread model:
+  Thread A → Child Agent A (agent_id = N)
+  Thread B → Child Agent B (agent_id = N+1)
+
+  Scheduling: fixed-tick-quota round-robin by agent_id
+    Tick 0-9:   Agent A runs
+    Tick 10-19: Agent B runs
+    Tick 20-29: Agent A runs
+    ...
+
+  futex(WAKE): always wake lowest agent_id first
+  → Same input always produces same thread interleaving
+  → Same interleaving always produces same output
+```
+
+**Syscall Translation Map**
+
+| Linux # | Name | ATOS Translation |
+|---------|------|-----------------|
+| 0 | `read` | Keyspace `state_get` (files) or mailbox recv (pipes/sockets) |
+| 1 | `write` | Keyspace `state_put` (files) or serial output (stdout/stderr) |
+| 2 | `open` | Allocate fd, map path to keyspace key |
+| 3 | `close` | Release fd entry |
+| 9 | `mmap` | Frame allocation at deterministic address + page mapping |
+| 11 | `munmap` | Frame deallocation |
+| 12 | `brk` | Adjust deterministic heap break |
+| 13 | `rt_sigaction` | Store signal handler in agent state |
+| 14 | `rt_sigprocmask` | Update signal mask in agent state |
+| 20 | `writev` | Scatter-gather write to fd |
+| 21 | `access` | Check keyspace key existence |
+| 39 | `getpid` | Return agent_id |
+| 56 | `clone` | `sys_spawn` child agent with shared keyspace |
+| 60 | `exit` | `sys_exit` |
+| 96 | `gettimeofday` | Return ATOS tick as seconds + microseconds |
+| 158 | `arch_prctl` | Set/get FS/GS base for TLS |
+| 186 | `gettid` | Return agent_id |
+| 202 | `futex` | Deterministic wait/wake with agent_id ordering |
+| 228 | `clock_gettime` | Return ATOS tick as timespec |
+| 231 | `exit_group` | `sys_exit` |
+| 232 | `epoll_create` | Create mailbox watch set |
+| 233 | `epoll_ctl` | Add/remove fd from watch set |
+| 281 | `epoll_pwait` | Fixed-order mailbox polling |
+| 302 | `prlimit64` | Return fixed resource limits |
+| 318 | `getrandom` | Deterministic PRNG output |
+
+**Implementation Phases**
+
+| Phase | Syscalls | Enables | Determinism Mechanism |
+|-------|----------|---------|----------------------|
+| **1: Boot** | ~20 | Static hello world, busybox | mmap sequential, brk deterministic, time=tick |
+| **2: File I/O** | ~40 | CPython (static), file tools | fd table → keyspace, deterministic paths |
+| **3: Network + epoll** | ~60 | Node.js, curl, HTTP | netd proxy + I/O trace, epoll fixed-order |
+| **4: Threads + futex** | ~80 | OpenJDK, Go, multi-threaded apps | clone→child agent, futex→agent_id ordering |
+
+**Deterministic PRNG Specification**
+
+Every Linux-compat agent has a built-in deterministic PRNG:
+
+```text
+seed = SHA-256(agent_id ∥ parent_id ∥ creation_tick)
+state = seed
+
+on getrandom(buf, len):
+    for each 32-byte block needed:
+        state = SHA-256(state ∥ counter)
+        counter += 1
+        copy block to buf
+```
+
+This produces output that appears random to the program but is fully reproducible given the same agent_id and creation_tick.
+
+**I/O Trace for Network Determinism**
+
+Network I/O is inherently non-deterministic (data arrives at unpredictable times). ATOS handles this via I/O tracing:
+
+```text
+First execution:
+  socket() → fd=5
+  connect(fd=5, "api.example.com:443") → netd proxy
+  write(fd=5, request) → netd sends via NIC
+  read(fd=5, buf) → netd receives response → log to trace
+
+Replay:
+  socket() → fd=5 (deterministic)
+  connect(fd=5, ...) → same fd (deterministic)
+  write(fd=5, request) → logged (deterministic)
+  read(fd=5, buf) → replay from trace (deterministic, same bytes)
+```
+
+**Success Condition**
+- A statically-linked OpenJDK JVM runs Java programs on ATOS with deterministic execution.
+- `curl https://example.com` fetches data through netd with I/O trace logging.
+- A Go multi-threaded HTTP server handles concurrent requests via child agent threads with deterministic scheduling.
+- A Node.js program runs on ATOS with deterministic event loop ordering.
+- Two runs with the same input produce bit-identical execution traces and state roots.
+- Linux-compat agents produce valid ExecutionReceipts with ProofGradeWasm-equivalent determinism guarantees.
 
 ### The Three Eras of ATOS
 
@@ -468,21 +635,21 @@ ATOS proves that it can execute contracts on hardware.
 
 Focus: kernel, isolation, runtime, state, hardware, external TCP interface.
 
-#### Era II — Production Execution (Stage-5 to Stage-7)
+#### Era II — Production Execution (Stage-5 to Stage-8)
 
 ATOS becomes a production-grade verifiable execution platform.
 
-Focus: durable state, contract lifecycle, verifiable execution.
+Focus: durable state, contract lifecycle, verifiable execution, WASM runtime.
 
-#### Era III — Ecosystem (Stage-8)
+#### Era III — Universal Deterministic Execution (Stage-9)
 
-ATOS supports multiple language runtimes.
+Any Linux program runs on ATOS with deterministic guarantees.
 
-Focus: WASM, JVM, language ecosystem breadth.
+Focus: Linux syscall translation, deterministic threading, I/O tracing, replay.
 
 ### One-Sentence Definition
 
-**ATOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system.**
+**ATOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program can run on ATOS with deterministic guarantees through the Linux syscall compatibility layer.**
 
 ---
 
@@ -872,10 +1039,10 @@ The following components from yellowpaper v1 are **out of scope** for the ATOS V
 | **Distributed execution fabric** (v1 Stage-8) | routerd, membership_d, placement_d, failover_d — all removed. Single instance. |
 | **billingd / quotad** (v1 Stage-9) | Billing is an external concern. ATOS reports energy usage in receipts; external systems handle billing. |
 | **Appliance-grade operations** (v1 Stage-10) | admind, upgraded, observabilityd, fleet management, multi-tenant, OTA — not needed for a VM. |
-| **RustPython** (v1 Stage-11) | RustPython is not mature enough. Python compiles to WASM via the P0 universal sandbox. |
+| **RustPython** (v1 Stage-11) | RustPython is not mature enough. Python compiles to WASM or runs via Linux compat layer. |
+| **Ristretto JVM** (v1 Stage-11) | Replaced by Linux compat layer — unmodified OpenJDK runs deterministically via syscall translation. |
 | **revm / EVM** (v1 Stage-11) | Removed from scope. |
 | **SP1 zkVM** (v1 Stage-11) | Removed from scope. |
-| **Linux syscall compatibility** (v1 Stage-12) | Contradicts determinism. Not needed for a VM. |
 
 **What is kept from v1 but simplified:**
 
@@ -997,6 +1164,7 @@ ATOS handles execution. The blockchain handles consensus, ordering, and finality
 | 5 | Contract Storage | Versioned keyspaces, transactions, Merkle proofs, crash recovery | ✅ Complete |
 | 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ✅ Complete |
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
-| 8 | Language Runtimes | WASM ✅, Ristretto JVM | ⚠️ WASM done, JVM planned |
+| 8 | WASM Runtime | Production WASM engine with fuel metering | ✅ Complete |
+| 9 | Deterministic Linux Compat | Any Linux x86_64 binary runs deterministically | ⏳ Planned |
 
-**ATOS is complete when an external system can submit a transaction via TCP, ATOS executes it deterministically on bare metal, and returns a cryptographically verifiable receipt.**
+**ATOS is complete when any Linux program runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
