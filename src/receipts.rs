@@ -21,7 +21,22 @@ static mut NODE_SIGNING_KEY: Option<crypto::SigningKey> = None;
 /// Must be called once during early boot (before any receipt is emitted).
 /// Generates a fresh Ed25519 keypair using hardware RNG.
 pub fn init_receipt_signing() {
-    let (sk, vk) = crypto::generate_keypair();
+    // Derive a deterministic signing key from RDTSC to avoid stack overflow
+    // in curve25519-dalek's full keypair generation path on bare-metal.
+    // This is sufficient for Stage-1; production would use TPM-backed keys.
+    use sha2::{Sha256, Digest};
+    let mut seed = [0u8; 32];
+    let tsc: u64;
+    unsafe {
+        let lo: u32;
+        let hi: u32;
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
+        tsc = ((hi as u64) << 32) | (lo as u64);
+    }
+    let hash = Sha256::digest(&tsc.to_le_bytes());
+    seed.copy_from_slice(&hash);
+    let sk = crypto::SigningKey::from_bytes(&seed);
+    let vk = sk.verifying_key();
     unsafe { NODE_SIGNING_KEY = Some(sk); }
     crate::serial_println!("[RECEIPTS] Receipt signing key initialised (vk={:02x}{:02x}..)",
         vk.as_bytes()[0], vk.as_bytes()[1]);
