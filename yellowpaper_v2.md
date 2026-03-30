@@ -547,42 +547,114 @@ ATOS deterministic thread model:
 
 **Syscall Translation Map**
 
+The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js v24, and CPython 3.10 execution with `strace -f -c`. This is the complete set required to run all three runtimes on ATOS. The "Used By" column indicates which runtimes require each syscall (J = OpenJDK, N = Node.js, P = CPython).
+
+*Phase 1 — Boot (~18 syscalls)*
+
+| Linux # | Name | ATOS Translation | Used By |
+|---------|------|-----------------|---------|
+| 0 | `read` | Keyspace `state_get` (files) or mailbox recv (pipes/sockets) | J N P |
+| 1 | `write` | Keyspace `state_put` (files) or serial output (stdout/stderr) | J N P |
+| 3 | `close` | Release fd entry | J N P |
+| 9 | `mmap` | Frame allocation at deterministic sequential address (`mmap_next`) + page mapping | J N P |
+| 10 | `mprotect` | Update page table flags (PTE_WRITABLE, PTE_NX) on mapped region | J N P |
+| 11 | `munmap` | Frame deallocation + page table entry removal | J N P |
+| 12 | `brk` | Adjust deterministic heap break pointer (`brk_current`) | J N P |
+| 15 | `rt_sigreturn` | Restore pre-signal register state from stack frame | J |
+| 21 | `access` | Check keyspace key existence, return 0 or -ENOENT | J N P |
+| 59 | `execve` | `sys_spawn_image` — load ELF binary into new agent | J N P |
+| 63 | `uname` | Return fixed struct: sysname="ATOS", release="1.0", machine="x86_64" | J |
+| 99 | `sysinfo` | Return fixed values: totalram from frame allocator, uptime from tick | J N P |
+| 102 | `getuid` | Return fixed uid (1000) | J N P |
+| 104 | `getgid` | Return fixed gid (1000) | N P |
+| 107 | `geteuid` | Return fixed euid (1000) | J N P |
+| 108 | `getegid` | Return fixed egid (1000) | N P |
+| 158 | `arch_prctl` | Set/get FS/GS base MSR for TLS (ARCH_SET_FS, ARCH_GET_FS) | J N P |
+| 302 | `prlimit64` | Return fixed resource limits (RLIMIT_NOFILE=256, RLIMIT_STACK=64KB) | J N P |
+
+*Phase 2 — File I/O (~20 syscalls)*
+
+| Linux # | Name | ATOS Translation | Used By |
+|---------|------|-----------------|---------|
+| 5 | `fstat` | Return stat struct from fd metadata (size from keyspace value len) | N |
+| 8 | `lseek` | Update fd offset in fd_table (SEEK_SET/CUR/END) | J P |
+| 13 | `rt_sigaction` | Store signal handler + flags in per-agent signal table | J N P |
+| 14 | `rt_sigprocmask` | Update blocked signal mask in agent state | J N |
+| 16 | `ioctl` | TIOCGWINSZ → return fixed 80×25; FIONREAD → return pending mailbox bytes; others → -ENOTTY | N P |
+| 17 | `pread64` | Keyspace `state_get` at specific offset (no fd offset advance) | J N P |
+| 32 | `dup` | Duplicate fd entry in fd_table (new lowest available fd) | P |
+| 72 | `fcntl` | F_GETFL/F_SETFL (track O_NONBLOCK in fd_table), F_DUPFD, F_GETFD/F_SETFD | J N P |
+| 73 | `flock` | No-op success (single-agent access, no contention) | J |
+| 77 | `ftruncate` | Truncate keyspace value to specified length | J |
+| 79 | `getcwd` | Return agent's virtual cwd from LinuxAgentState | J N |
+| 81 | `fchdir` | Update cwd to directory path referenced by fd | J |
+| 83 | `mkdir` | Create keyspace key with directory marker value | J |
+| 87 | `unlink` | Delete keyspace key | J |
+| 89 | `readlink` | Resolve `/proc/self/exe` → agent binary path; others → keyspace lookup | J N P |
+| 217 | `getdents64` | Enumerate keyspace keys matching directory prefix, return dirent structs | J P |
+| 257 | `openat` | Allocate fd, resolve path relative to dirfd, map to keyspace key | J N P |
+| 262 | `newfstatat` | Stat by path: return size/mode/times from keyspace metadata | J N P |
+
+*Phase 3 — Network + epoll (~12 syscalls)*
+
+| Linux # | Name | ATOS Translation | Used By |
+|---------|------|-----------------|---------|
+| 28 | `madvise` | No-op success (MADV_DONTNEED clears pages; others ignored) | J N |
+| 39 | `getpid` | Return agent_id (deterministic) | J N |
+| 41 | `socket` | Allocate fd for netd mailbox proxy session | J |
+| 42 | `connect` | Send connect request to netd via mailbox; record target in fd_table | J |
+| 51 | `getsockname` | Return local address from fd_table socket metadata | N |
+| 55 | `getsockopt` | Return default socket options from fd_table | N |
+| 281 | `epoll_pwait` | Fixed-order polling: iterate watched fds by ascending number, check mailbox readiness | J N |
+| 290 | `eventfd2` | Create mailbox pair mapped to fd; counter semantics via keyspace u64 | N |
+| 291 | `epoll_create1` | Allocate epoll instance in per-agent EpollState table | N |
+| 293 | `pipe2` | Create two fds backed by a mailbox pair (read end + write end) | N |
+| 425 | `io_uring_setup` | Return -ENOSYS (not supported; Node.js falls back to epoll) | N |
+| 426 | `io_uring_enter` | Return -ENOSYS (not supported; Node.js falls back to epoll) | N |
+
+*Phase 4 — Threads + synchronization (~12 syscalls)*
+
+| Linux # | Name | ATOS Translation | Used By |
+|---------|------|-----------------|---------|
+| 24 | `sched_yield` | `sys_yield` — yield to deterministic scheduler | J |
+| 98 | `getrusage` | Return energy_used as ru_utime; tick count as wall time | J |
+| 125 | `capget` | Return empty capability set (no Linux capabilities) | N |
+| 157 | `prctl` | PR_SET_NAME → store in agent metadata; PR_GET_NAME → retrieve; others → 0 | J N |
+| 186 | `gettid` | Return agent_id (deterministic, same as getpid for main thread) | J N |
+| 202 | `futex` | FUTEX_WAIT: block agent; FUTEX_WAKE: wake by ascending agent_id (deterministic) | J N P |
+| 204 | `sched_getaffinity` | Return fixed mask: all CPUs up to SMP core count | J N |
+| 218 | `set_tid_address` | Store clear_child_tid pointer in agent state | J N P |
+| 229 | `clock_getres` | Return fixed resolution: 10ms (100 Hz tick) | J |
+| 230 | `clock_nanosleep` | Advance logical tick by `ceil(requested_ns / 10_000_000)`, deterministic | J |
+| 273 | `set_robust_list` | Store robust futex list pointer in agent state | J N P |
+| 334 | `rseq` | Return -ENOSYS (restartable sequences not supported; glibc handles gracefully) | J N P |
+| 435 | `clone3` | `sys_spawn` child agent with shared keyspace + deterministic scheduling | J N |
+
+**Total: 62 syscalls** — verified by `strace -f -c` against OpenJDK 11, Node.js v24, and CPython 3.10.
+
+**Legacy syscalls** (supported for older binaries but not observed in strace):
+
 | Linux # | Name | ATOS Translation |
 |---------|------|-----------------|
-| 0 | `read` | Keyspace `state_get` (files) or mailbox recv (pipes/sockets) |
-| 1 | `write` | Keyspace `state_put` (files) or serial output (stdout/stderr) |
-| 2 | `open` | Allocate fd, map path to keyspace key |
-| 3 | `close` | Release fd entry |
-| 9 | `mmap` | Frame allocation at deterministic address + page mapping |
-| 11 | `munmap` | Frame deallocation |
-| 12 | `brk` | Adjust deterministic heap break |
-| 13 | `rt_sigaction` | Store signal handler in agent state |
-| 14 | `rt_sigprocmask` | Update signal mask in agent state |
-| 20 | `writev` | Scatter-gather write to fd |
-| 21 | `access` | Check keyspace key existence |
-| 39 | `getpid` | Return agent_id |
-| 56 | `clone` | `sys_spawn` child agent with shared keyspace |
+| 2 | `open` | Redirect to `openat(AT_FDCWD, path, ...)` |
+| 20 | `writev` | Scatter-gather write to fd (concatenate iovecs) |
+| 56 | `clone` | Redirect to `clone3` path |
 | 60 | `exit` | `sys_exit` |
 | 96 | `gettimeofday` | Return ATOS tick as seconds + microseconds |
-| 158 | `arch_prctl` | Set/get FS/GS base for TLS |
-| 186 | `gettid` | Return agent_id |
-| 202 | `futex` | Deterministic wait/wake with agent_id ordering |
 | 228 | `clock_gettime` | Return ATOS tick as timespec |
-| 231 | `exit_group` | `sys_exit` |
-| 232 | `epoll_create` | Create mailbox watch set |
-| 233 | `epoll_ctl` | Add/remove fd from watch set |
-| 281 | `epoll_pwait` | Fixed-order mailbox polling |
-| 302 | `prlimit64` | Return fixed resource limits |
-| 318 | `getrandom` | Deterministic PRNG output |
+| 231 | `exit_group` | `sys_exit` for all child agents |
+| 232 | `epoll_create` | Redirect to `epoll_create1(0)` |
+| 233 | `epoll_ctl` | Add/remove fd from epoll watch set |
 
 **Implementation Phases**
 
-| Phase | Syscalls | Enables | Determinism Mechanism |
-|-------|----------|---------|----------------------|
-| **1: Boot** | ~20 | Static hello world, busybox | mmap sequential, brk deterministic, time=tick |
-| **2: File I/O** | ~40 | CPython (static), file tools | fd table → keyspace, deterministic paths |
-| **3: Network + epoll** | ~60 | Node.js, curl, HTTP | netd proxy + I/O trace, epoll fixed-order |
-| **4: Threads + futex** | ~80 | OpenJDK, Go, multi-threaded apps | clone→child agent, futex→agent_id ordering |
+| Phase | New Syscalls | Cumulative | Enables | Determinism Mechanism |
+|-------|-------------|-----------|---------|----------------------|
+| **1: Boot** | 18 | 18 | Static hello world, busybox | mmap sequential, brk deterministic, fixed uid/gid |
+| **2: File I/O** | 18 | 36 | CPython (static), file tools | fd table → keyspace, signals in agent state |
+| **3: Network + epoll** | 12 | 48 | Node.js, curl, HTTP | netd proxy + I/O trace, epoll fixed-order, pipe→mailbox |
+| **4: Threads + futex** | 13 | 61 | OpenJDK, Go, multi-threaded | clone3→child agent, futex→agent_id ordering |
+| **Legacy** | 9 | 70 | Older binaries | Redirect to modern equivalents |
 
 **Deterministic PRNG Specification**
 
