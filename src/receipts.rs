@@ -270,22 +270,24 @@ pub fn emit_receipt_on_exit(
 
 // ─── Replay & Proof bundles (Stage 9) ───────────────────────────────────
 
-/// A replay bundle containing everything needed for independent replay verification.
+/// A ReplayBundle contains all material needed to independently re-execute
+/// and verify an execution result.
 pub struct ReplayBundle {
-    /// The execution receipt this bundle verifies
+    /// The receipt this replay bundle covers.
     pub receipt_id: Hash256,
-    /// Checkpoint image (compressed agent state at start)
+    /// Checkpoint data: serialized agent state at execution start.
     pub checkpoint_data: [u8; 4096],
-    pub checkpoint_len: usize,
-    /// I/O transcript (all syscalls and their results)
+    pub checkpoint_len: u16,
+    /// Execution transcript: sequence of syscalls, mailbox messages, timer events.
     pub transcript: [u8; 4096],
-    pub transcript_len: usize,
-    /// Initial state snapshot
+    pub transcript_len: u16,
+    /// Initial state snapshot (keyspace values at execution start).
     pub initial_state: [u8; 2048],
-    pub initial_state_len: usize,
+    pub initial_state_len: u16,
 }
 
 impl ReplayBundle {
+    /// Create an empty replay bundle for the given receipt ID.
     pub fn empty(receipt_id: Hash256) -> Self {
         Self {
             receipt_id,
@@ -296,6 +298,52 @@ impl ReplayBundle {
             initial_state: [0; 2048],
             initial_state_len: 0,
         }
+    }
+
+    /// Build a replay bundle by capturing current checkpoint and trace state
+    /// from `crate::checkpoint` for the agent referenced in the receipt.
+    pub fn from_receipt(receipt: &ExecutionReceipt) -> Self {
+        let mut bundle = Self::empty(receipt.receipt_id);
+
+        // Capture checkpoint data from a portable checkpoint if the agent is
+        // still live.
+        if let Some(agent_id) = receipt.local_agent_id {
+            if let Some(pc) = crate::checkpoint::PortableCheckpoint::from_agent(agent_id) {
+                let copy_len = pc.checkpoint_len.min(bundle.checkpoint_data.len());
+                bundle.checkpoint_data[..copy_len]
+                    .copy_from_slice(&pc.checkpoint_data[..copy_len]);
+                bundle.checkpoint_len = copy_len as u16;
+            }
+        }
+
+        // Capture I/O trace entries from checkpoint trace log.
+        // Each trace entry is serialized as: tick(8) + event_type(1) + agent_id(2) = 11 bytes.
+        let trace_count = crate::checkpoint::trace_count();
+        let mut tpos = 0usize;
+        for i in 0..trace_count {
+            if tpos + 11 > bundle.transcript.len() {
+                break;
+            }
+            if let Some(entry) = crate::checkpoint::get_trace(i) {
+                bundle.transcript[tpos..tpos + 8]
+                    .copy_from_slice(&entry.tick.to_le_bytes());
+                tpos += 8;
+                bundle.transcript[tpos] = entry.event_type;
+                tpos += 1;
+                bundle.transcript[tpos..tpos + 2]
+                    .copy_from_slice(&entry.agent_id.to_le_bytes());
+                tpos += 2;
+            }
+        }
+        bundle.transcript_len = tpos as u16;
+
+        // Capture initial state snapshot from the receipt's initial_state_root.
+        // Store the 32-byte root so a verifier can fetch/reconstruct the full
+        // keyspace independently.
+        bundle.initial_state[..32].copy_from_slice(&receipt.initial_state_root);
+        bundle.initial_state_len = 32;
+
+        bundle
     }
 }
 
@@ -411,6 +459,49 @@ pub fn get_proof_bundle(idx: usize) -> Option<&'static ProofBundle> {
 /// Return the current proof bundle count.
 pub fn proof_count() -> usize {
     unsafe { PROOF_COUNT }
+}
+
+// ─── Replay bundle store ──────────────────────────────────────────────────
+
+/// Maximum number of replay bundles stored in the ring buffer.
+const MAX_REPLAY_BUNDLES: usize = 16;
+
+/// Fixed-size replay bundle ring buffer.
+///
+/// Safety: single-core, no preemption during store access in Stage-1.
+static mut REPLAY_STORE: [Option<ReplayBundle>; MAX_REPLAY_BUNDLES] = [const { None }; MAX_REPLAY_BUNDLES];
+static mut REPLAY_COUNT: usize = 0;
+
+/// Store a replay bundle in the global replay store (ring buffer).
+/// Wraps around when full, overwriting the oldest entry.
+pub fn store_replay_bundle(bundle: ReplayBundle) {
+    unsafe {
+        let idx = REPLAY_COUNT % MAX_REPLAY_BUNDLES;
+        REPLAY_STORE[idx] = Some(bundle);
+        REPLAY_COUNT += 1;
+    }
+}
+
+/// Retrieve a replay bundle by index (within the ring buffer).
+pub fn get_replay_bundle(index: usize) -> Option<&'static ReplayBundle> {
+    unsafe {
+        if index < MAX_REPLAY_BUNDLES {
+            REPLAY_STORE[index].as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+/// Return the number of replay bundles stored (capped at ring capacity).
+pub fn replay_bundle_count() -> usize {
+    unsafe {
+        if REPLAY_COUNT > MAX_REPLAY_BUNDLES {
+            MAX_REPLAY_BUNDLES
+        } else {
+            REPLAY_COUNT
+        }
+    }
 }
 
 /// Patch the trace_commitment field of an already-stored receipt.

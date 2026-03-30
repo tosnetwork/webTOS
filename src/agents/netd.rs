@@ -17,6 +17,7 @@ use crate::agent::*;
 use crate::syscall;
 
 const OP_REQUEST: u8 = 0x01;
+const OP_EXTERNAL_REQUEST: u8 = 0x10;
 const METHOD_GET: u8 = 0x01;
 const METHOD_POST: u8 = 0x02;
 
@@ -109,6 +110,52 @@ fn send_test_packet(mac: [u8; 6]) {
     }
 }
 
+/// Process a raw message as an external TCP interface request.
+///
+/// Parses the payload as an `ExternalRequest`, dispatches it via
+/// `tcp_interface::handle_request()`, serializes the response, and
+/// sends it back over the network.
+fn handle_external_message(msg: &[u8]) {
+    use crate::tcp_interface::ExternalRequest;
+
+    let req = match ExternalRequest::parse(msg) {
+        Some(r) => r,
+        None => {
+            serial_println!("[NETD] External request: failed to parse ({} bytes)", msg.len());
+            return;
+        }
+    };
+
+    serial_println!(
+        "[NETD] External request id={} type={:?}",
+        req.request_id, req.request_type,
+    );
+
+    let resp = crate::tcp_interface::handle_request(&req);
+
+    serial_println!(
+        "[NETD] External response id={} status={:?} output_len={}",
+        resp.request_id, resp.status, resp.output_len,
+    );
+
+    // Serialize the response and send it back via the network.
+    let mut resp_buf = [0u8; 4200]; // 4 KiB payload + header overhead
+    let resp_len = resp.serialize(&mut resp_buf);
+    if resp_len == 0 {
+        serial_println!("[NETD] External response: serialization failed (buffer too small)");
+        return;
+    }
+
+    match send_raw(&resp_buf[..resp_len]) {
+        Ok(()) => serial_println!(
+            "[NETD] External response sent ({} bytes)", resp_len
+        ),
+        Err(e) => serial_println!(
+            "[NETD] External response send failed: {}", e
+        ),
+    }
+}
+
 pub extern "C" fn netd_entry() -> ! {
     serial_println!("[NETD] Network broker started");
 
@@ -190,6 +237,9 @@ pub extern "C" fn netd_entry() -> ! {
                         // For now, just log and continue
                     }
                 }
+            } else if msg_len >= 1 && recv_buf[0] == OP_EXTERNAL_REQUEST {
+                // External TCP interface request: payload starts after the op byte.
+                handle_external_message(&recv_buf[1..msg_len]);
             }
         }
 
