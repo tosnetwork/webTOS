@@ -49,7 +49,10 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_FSYNC => fs::sys_fsync(agent_id, a1 as i32),
         SYS_GETCWD => fs::sys_getcwd(agent_id, a1, a2),
         SYS_CHDIR => fs::sys_chdir(agent_id, a1),
+        SYS_FTRUNCATE => fs::sys_ftruncate(agent_id, a1 as i32, a2),
+        SYS_FCHDIR => fs::sys_fchdir(agent_id, a1 as i32),
         SYS_MKDIR => fs::sys_mkdir(agent_id, a1, a2 as u32),
+        SYS_UNLINK => fs::sys_unlink(agent_id, a1),
         SYS_READLINK => fs::sys_readlink(agent_id, a1, a2, a3),
         SYS_OPENAT => fs::sys_openat(agent_id, a1 as i32, a2, a3 as u32, a4 as u32),
         SYS_NEWFSTATAT => fs::sys_newfstatat(agent_id, a1 as i32, a2, a3, a4 as u32),
@@ -123,6 +126,7 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_EPOLL_CREATE1 => epoll::sys_epoll_create1(agent_id, a1 as i32),
         SYS_EPOLL_CTL => epoll::sys_epoll_ctl(agent_id, a1 as i32, a2 as i32, a3 as i32, a4),
         SYS_EPOLL_WAIT => epoll::sys_epoll_wait(agent_id, a1 as i32, a2, a3 as i32, a4 as i32),
+        SYS_EPOLL_PWAIT => epoll::sys_epoll_pwait(agent_id, a1 as i32, a2, a3 as i32, a4 as i32, a5),
         SYS_EVENTFD2 => epoll::sys_eventfd2(agent_id, a1 as u32, a2 as i32),
 
         // ── Time ────────────────────────────────────────────────────────
@@ -132,6 +136,7 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_SETITIMER => time::sys_setitimer(agent_id, a1, a2, a3),
         SYS_CLOCK_GETTIME => time::sys_clock_gettime(agent_id, a1, a2),
         SYS_CLOCK_GETRES => time::sys_clock_getres(agent_id, a1, a2),
+        SYS_CLOCK_NANOSLEEP => time::sys_clock_nanosleep(agent_id, a1 as u32, a2 as u32, a3, a4),
 
         // ── Identity / system info ──────────────────────────────────────
         SYS_GETUID => identity::sys_getuid(agent_id),
@@ -149,6 +154,11 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
 
         // ── Random ──────────────────────────────────────────────────────
         SYS_GETRANDOM => identity::sys_getrandom(agent_id, a1, a2, a3),
+        SYS_RSEQ => identity::sys_rseq(agent_id, a1, a2 as u32, a3 as u32, a4 as u32),
+
+        // ── io_uring (not supported — runtimes fall back to epoll) ──
+        SYS_IO_URING_SETUP => network::sys_io_uring_setup(agent_id, a1 as u32, a2),
+        SYS_IO_URING_ENTER => network::sys_io_uring_enter(agent_id, a1 as u32, a2 as u32, a3 as u32, a4 as u32, a5),
 
         // ── Unknown ─────────────────────────────────────────────────────
         _ => {

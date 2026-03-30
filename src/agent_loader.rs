@@ -112,12 +112,19 @@ fn spawn_native_elf(
     // 2. Create isolated address space
     let agent_cr3 = paging::create_address_space().ok_or(E_QUOTA_EXCEEDED)?;
 
-    // 3. Load each segment into the new address space
+    // 3. Load each segment into the new address space.
+    //    Skip segments below USER_CODE_VADDR (e.g., 0x400000 ELF header
+    //    metadata segment) since they conflict with identity-mapped pages.
     for i in 0..elf_info.segment_count {
         let seg = match &elf_info.segments[i] {
             Some(s) => s,
             None => continue,
         };
+
+        // Skip segments below user space (ELF metadata at 0x400000 etc.)
+        if seg.vaddr < USER_CODE_VADDR as u64 {
+            continue;
+        }
 
         // Calculate number of pages needed for this segment
         let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
