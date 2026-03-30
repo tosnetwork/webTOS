@@ -1044,7 +1044,7 @@ pub fn sys_writev(agent_id: u16, fd: i32, iov_ptr: u64, iovcnt: u64) -> i64 {
 pub fn sys_pipe(agent_id: u16, pipefd_ptr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let read_fd = match st.alloc_fd() {

@@ -23,7 +23,7 @@ pub fn sys_epoll_create(agent_id: u16, size: i32) -> i64 {
 pub fn sys_epoll_create1(agent_id: u16, flags: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     // Find a free epoll instance slot
@@ -82,7 +82,7 @@ const EPOLL_CTL_MOD: i32 = 3;
 pub fn sys_epoll_ctl(agent_id: u16, epfd: i32, op: i32, fd: i32, _event_ptr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     // Validate the epoll fd
@@ -177,7 +177,7 @@ pub fn sys_epoll_wait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32,
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     // Get the epoll instance index from the fd
@@ -280,7 +280,7 @@ pub fn sys_epoll_pwait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32
 pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let fd = match st.alloc_fd() {

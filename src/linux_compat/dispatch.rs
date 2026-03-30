@@ -64,14 +64,14 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_MADVISE => memory::sys_madvise(agent_id, a1, a2, a3 as u32),
 
         // ── Process control ─────────────────────────────────────────────
-        SYS_CLONE => -ENOSYS,  // use clone3 instead
+        SYS_CLONE => process::sys_clone(agent_id, a1, a2, a3, a4, a5),
         SYS_CLONE3 => process::sys_clone3(agent_id, a1, a2),
-        SYS_FORK => -ENOSYS,
+        SYS_FORK => process::sys_fork(agent_id),
         SYS_EXECVE => process::sys_execve(agent_id, a1, a2, a3),
         SYS_EXIT => process::sys_exit(agent_id, a1 as i32),
         SYS_EXIT_GROUP => process::sys_exit_group(agent_id, a1 as i32),
-        SYS_WAIT4 => -ENOSYS,
-        SYS_KILL => -EPERM,
+        SYS_WAIT4 => process::sys_wait4(agent_id, a1, a2, a3, a4),
+        SYS_KILL => process::sys_kill(agent_id, a1 as i32, a2 as i32),
         SYS_GETPID => process::sys_getpid(agent_id),
         SYS_GETTID => process::sys_gettid(agent_id),
         SYS_GETPPID => {
@@ -87,7 +87,7 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_SCHED_YIELD => process::sys_sched_yield(agent_id),
         SYS_SET_TID_ADDRESS => process::sys_set_tid_address(agent_id, a1),
         SYS_SET_ROBUST_LIST => process::sys_set_robust_list(agent_id, a1, a2),
-        SYS_GET_ROBUST_LIST => -ENOSYS,
+        SYS_GET_ROBUST_LIST => process::sys_get_robust_list(agent_id, a1, a2, a3),
         SYS_PRCTL => process::sys_prctl(agent_id, a1 as u32, a2, a3, a4, a5),
         SYS_SCHED_GETAFFINITY => process::sys_sched_getaffinity(agent_id, a1 as u32, a2, a3),
         SYS_GETRUSAGE => process::sys_getrusage(agent_id, a1 as i32, a2),
