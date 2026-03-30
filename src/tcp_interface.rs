@@ -29,6 +29,12 @@ pub enum RequestType {
     Query = 3,
     /// Submit a raw transaction.
     Submit = 4,
+    /// Retrieve a full execution receipt by index.
+    GetReceipt = 5,
+    /// Retrieve a proof bundle by index.
+    GetProof = 6,
+    /// Retrieve a replay bundle by index.
+    GetReplay = 7,
 }
 
 impl RequestType {
@@ -39,6 +45,9 @@ impl RequestType {
             2 => Some(RequestType::Call),
             3 => Some(RequestType::Query),
             4 => Some(RequestType::Submit),
+            5 => Some(RequestType::GetReceipt),
+            6 => Some(RequestType::GetProof),
+            7 => Some(RequestType::GetReplay),
             _ => None,
         }
     }
@@ -309,6 +318,9 @@ pub fn handle_request(req: &ExternalRequest) -> ExternalResponse {
         RequestType::Call   => handle_call(req),
         RequestType::Query  => handle_query(req),
         RequestType::Submit => handle_submit(req),
+        RequestType::GetReceipt => handle_get_receipt(req),
+        RequestType::GetProof => handle_get_proof(req),
+        RequestType::GetReplay => handle_get_replay(req),
     }
 }
 
@@ -578,4 +590,194 @@ fn handle_submit(req: &ExternalRequest) -> ExternalResponse {
     // The contract_id in the request identifies the target contract; the
     // input payload is treated as calldata just like a Call request.
     handle_call(req)
+}
+
+// ─── GetReceipt handler ───────────────────────────────────────────────────
+
+/// Handle a GetReceipt request: retrieve a full execution receipt by index.
+///
+/// If `contract_id` is all zeros, `input[0..2]` is interpreted as a u16
+/// index into the receipt store. Otherwise, `contract_id` is used as the
+/// receipt hash to look up (linear scan).
+fn handle_get_receipt(req: &ExternalRequest) -> ExternalResponse {
+    let mut resp = ExternalResponse::new(req.request_id);
+
+    let is_zero = req.contract_id.iter().all(|&b| b == 0);
+
+    let receipt = if is_zero {
+        // Use input[0..2] as a u16 index.
+        if req.input_len < 2 {
+            resp.status = ResponseStatus::Error;
+            return resp;
+        }
+        let index = u16::from_le_bytes([req.input[0], req.input[1]]) as usize;
+        crate::receipts::get_receipt(index)
+    } else {
+        // Linear scan by receipt_id matching contract_id field.
+        let count = crate::receipts::receipt_count();
+        let mut found = None;
+        for i in 0..count {
+            if let Some(r) = crate::receipts::get_receipt(i) {
+                if r.receipt_id == req.contract_id {
+                    found = Some(r);
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let receipt = match receipt {
+        Some(r) => r,
+        None => {
+            resp.status = ResponseStatus::NotFound;
+            return resp;
+        }
+    };
+
+    // Serialize receipt fields into output buffer:
+    //   receipt_id(32) + contract_id(32) + execution_id(32) + caller_id(32)
+    //   + code_hash(32) + input_commitment(32) + output_commitment(32)
+    //   + initial_state_root(32) + final_state_root(32)
+    //   + energy_used(8) + tick_start(8) + tick_end(8)
+    //   + signature(64) = 360 bytes total
+    let mut pos = 0usize;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.receipt_id);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.contract_id);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.execution_id);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.caller_id);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.code_hash);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.input_commitment);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.output_commitment);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.initial_state_root);
+    pos += 32;
+    resp.output[pos..pos + 32].copy_from_slice(&receipt.final_state_root);
+    pos += 32;
+    resp.output[pos..pos + 8].copy_from_slice(&receipt.energy_used.to_le_bytes());
+    pos += 8;
+    resp.output[pos..pos + 8].copy_from_slice(&receipt.tick_start.to_le_bytes());
+    pos += 8;
+    resp.output[pos..pos + 8].copy_from_slice(&receipt.tick_end.to_le_bytes());
+    pos += 8;
+    resp.output[pos..pos + 64].copy_from_slice(&receipt.signature);
+    pos += 64;
+
+    resp.output_len = pos as u16; // 360
+    resp.receipt_hash = receipt.receipt_id;
+    resp.state_root = receipt.final_state_root;
+    resp.energy_used = 0;
+    resp.status = ResponseStatus::Success;
+    resp
+}
+
+// ─── GetProof handler ─────────────────────────────────────────────────────
+
+/// Handle a GetProof request: retrieve a proof bundle by index.
+///
+/// `input[0..2]` is interpreted as a u16 index into the proof bundle store.
+fn handle_get_proof(req: &ExternalRequest) -> ExternalResponse {
+    let mut resp = ExternalResponse::new(req.request_id);
+
+    if req.input_len < 2 {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    let index = u16::from_le_bytes([req.input[0], req.input[1]]) as usize;
+
+    let proof = match crate::receipts::get_proof_bundle(index) {
+        Some(p) => p,
+        None => {
+            resp.status = ResponseStatus::NotFound;
+            return resp;
+        }
+    };
+
+    // Serialize proof bundle into output:
+    //   receipt_id(32) + proof_type(1) + proof_len(2) + proof_data(proof_len)
+    //   + verifier_key(32)
+    let mut pos = 0usize;
+    resp.output[pos..pos + 32].copy_from_slice(&proof.receipt_id);
+    pos += 32;
+    resp.output[pos] = proof.proof_type;
+    pos += 1;
+    let plen = proof.proof_len.min(1024);
+    resp.output[pos..pos + 2].copy_from_slice(&(plen as u16).to_le_bytes());
+    pos += 2;
+    resp.output[pos..pos + plen].copy_from_slice(&proof.proof_data[..plen]);
+    pos += plen;
+    resp.output[pos..pos + 32].copy_from_slice(&proof.verifier_key);
+    pos += 32;
+
+    resp.output_len = pos as u16;
+    resp.receipt_hash = proof.receipt_id;
+    resp.energy_used = 0;
+    resp.status = ResponseStatus::Success;
+    resp
+}
+
+// ─── GetReplay handler ────────────────────────────────────────────────────
+
+/// Handle a GetReplay request: retrieve a replay bundle by index.
+///
+/// `input[0..2]` is interpreted as a u16 index into the replay bundle store.
+fn handle_get_replay(req: &ExternalRequest) -> ExternalResponse {
+    let mut resp = ExternalResponse::new(req.request_id);
+
+    if req.input_len < 2 {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    let index = u16::from_le_bytes([req.input[0], req.input[1]]) as usize;
+
+    let replay = match crate::receipts::get_replay_bundle(index) {
+        Some(r) => r,
+        None => {
+            resp.status = ResponseStatus::NotFound;
+            return resp;
+        }
+    };
+
+    // Serialize replay bundle into output:
+    //   receipt_id(32) + checkpoint_len(2) + checkpoint_data(checkpoint_len)
+    //   + transcript_len(2) + transcript(transcript_len)
+    //   + initial_state_len(2) + initial_state(initial_state_len)
+    let mut pos = 0usize;
+    resp.output[pos..pos + 32].copy_from_slice(&replay.receipt_id);
+    pos += 32;
+
+    let ck_len = replay.checkpoint_len as usize;
+    resp.output[pos..pos + 2].copy_from_slice(&replay.checkpoint_len.to_le_bytes());
+    pos += 2;
+    let ck_copy = ck_len.min(4096 - pos);
+    resp.output[pos..pos + ck_copy].copy_from_slice(&replay.checkpoint_data[..ck_copy]);
+    pos += ck_copy;
+
+    let tr_len = replay.transcript_len as usize;
+    resp.output[pos..pos + 2].copy_from_slice(&replay.transcript_len.to_le_bytes());
+    pos += 2;
+    let tr_copy = tr_len.min(4096 - pos);
+    resp.output[pos..pos + tr_copy].copy_from_slice(&replay.transcript[..tr_copy]);
+    pos += tr_copy;
+
+    let is_len = replay.initial_state_len as usize;
+    resp.output[pos..pos + 2].copy_from_slice(&replay.initial_state_len.to_le_bytes());
+    pos += 2;
+    let is_copy = is_len.min(4096 - pos);
+    resp.output[pos..pos + is_copy].copy_from_slice(&replay.initial_state[..is_copy]);
+    pos += is_copy;
+
+    resp.output_len = pos as u16;
+    resp.receipt_hash = replay.receipt_id;
+    resp.energy_used = 0;
+    resp.status = ResponseStatus::Success;
+    resp
 }

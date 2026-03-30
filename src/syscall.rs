@@ -230,6 +230,13 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             }
             // Compute trace commitment from transcript
             let trace_commitment = compute_transcript_hash(caller_id, tick_start, tick_now);
+            // Use the initial state root as input commitment and combine
+            // the final state root with the exit code for the output commitment.
+            let input_hash = initial_root;
+            let mut output_preimage = [0u8; 40]; // 32 (final_root) + 8 (exit_code)
+            output_preimage[..32].copy_from_slice(&final_root);
+            output_preimage[32..40].copy_from_slice(&exit_code.to_le_bytes());
+            let output_hash = crate::receipts::compute_commitment(&output_preimage);
             let receipt_idx = crate::receipts::emit_receipt_on_exit(
                 caller_id,
                 crate::receipts::RuntimeClassTag::ProofGradeWasm,
@@ -238,6 +245,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 final_root,
                 tick_start,
                 tick_now,
+                input_hash,
+                output_hash,
             );
             // Patch trace_commitment into the receipt
             if let Some(idx) = receipt_idx {

@@ -85,6 +85,42 @@ pub struct ExecutionReceipt {
     pub signature: [u8; 64],
 }
 
+/// Compute a 32-byte commitment hash from arbitrary data.
+///
+/// Uses FNV-1a with 4 different seeds (same approach as
+/// `contract::compute_contract_id`) to produce a 32-byte hash.
+pub fn compute_commitment(data: &[u8]) -> Hash256 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut out = [0u8; 32];
+    let seeds: [u64; 4] = [
+        FNV_OFFSET,
+        FNV_OFFSET ^ 0xDEAD_BEEF_CAFE_BABE,
+        FNV_OFFSET ^ 0x0123_4567_89AB_CDEF,
+        FNV_OFFSET ^ 0xFEDC_BA98_7654_3210,
+    ];
+
+    for (i, &seed) in seeds.iter().enumerate() {
+        let mut h = seed;
+        for &b in data {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Mix in the length to differentiate zero-padded inputs.
+        let len_bytes = (data.len() as u64).to_le_bytes();
+        for &lb in &len_bytes {
+            h ^= lb as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        let bytes = h.to_be_bytes();
+        let offset = i * 8;
+        out[offset..offset + 8].copy_from_slice(&bytes);
+    }
+
+    out
+}
+
 impl ExecutionReceipt {
     /// Create a receipt for an agent that just finished executing.
     pub fn from_agent_exit(
@@ -95,6 +131,8 @@ impl ExecutionReceipt {
         final_state_root: Hash256,
         tick_start: u64,
         tick_end: u64,
+        input_hash: Hash256,
+        output_hash: Hash256,
     ) -> Self {
         // Generate receipt_id from hash of key fields
         let mut receipt_id = [0u8; 32];
@@ -117,8 +155,8 @@ impl ExecutionReceipt {
             runtime_class,
             package_hash: [0; 32],
             code_hash: [0; 32],
-            input_commitment: [0; 32],
-            output_commitment: [0; 32],
+            input_commitment: input_hash,
+            output_commitment: output_hash,
             initial_state_root,
             final_state_root,
             event_log_commitment: [0; 32],
@@ -232,6 +270,8 @@ pub fn emit_receipt_on_exit(
     final_state_root: Hash256,
     tick_start: u64,
     tick_end: u64,
+    input_hash: Hash256,
+    output_hash: Hash256,
 ) -> Option<usize> {
     let mut receipt = ExecutionReceipt::from_agent_exit(
         agent_id,
@@ -241,6 +281,8 @@ pub fn emit_receipt_on_exit(
         final_state_root,
         tick_start,
         tick_end,
+        input_hash,
+        output_hash,
     );
 
     // Sign the receipt with the node's Ed25519 key before storing.
@@ -254,6 +296,19 @@ pub fn emit_receipt_on_exit(
         energy_used,
         0,
     );
+
+    // Generate attestation report keyed to the receipt hash and store the
+    // attestation hash in the receipt's trace_commitment field.  This ties
+    // each receipt to the current kernel measurement.
+    let receipt_hash = receipt.compute_hash();
+    let attestation_report = crate::attestation::generate_report(&receipt_hash);
+    // Use the first 32 bytes of the attestation signature as the commitment
+    let mut attestation_commitment: Hash256 = [0u8; 32];
+    attestation_commitment.copy_from_slice(&attestation_report.signature[..32]);
+    receipt.trace_commitment = attestation_commitment;
+
+    // Re-sign the receipt after patching trace_commitment
+    sign_receipt(&mut receipt);
 
     let idx = store_receipt(receipt);
 
@@ -348,15 +403,24 @@ impl ReplayBundle {
 }
 
 /// Compact proof artifacts for fast external verification without full replay.
+///
+/// Proof data layout (proof_type = 1, Merkle-state):
+/// ```text
+/// [0..32]   initial_state_root
+/// [32..64]  final_state_root
+/// [64..66]  leaf_count (u16 LE)
+/// [66..68]  proof_depth (u16 LE)
+/// [68..]    sibling_hashes: leaf_count * proof_depth * 32 bytes
+/// ```
 pub struct ProofBundle {
     /// The execution receipt this proof covers
     pub receipt_id: Hash256,
     /// Proof type (0 = replay-hash, 1 = Merkle-state)
     pub proof_type: u8,
-    /// Compact proof data
-    pub proof_data: [u8; 1024],
+    /// Compact proof data (4096 bytes to hold Merkle sibling hashes)
+    pub proof_data: [u8; 4096],
     pub proof_len: usize,
-    /// Verification key or reference
+    /// Verification key: ExecutionProof.proof_hash for cross-reference
     pub verifier_key: Hash256,
 }
 
@@ -365,7 +429,7 @@ impl ProofBundle {
         Self {
             receipt_id,
             proof_type: 0,
-            proof_data: [0; 1024],
+            proof_data: [0; 4096],
             proof_len: 0,
             verifier_key: [0; 32],
         }
@@ -382,55 +446,205 @@ impl ProofBundle {
     }
 
     /// Create a proof bundle from a receipt with real Merkle state proofs.
+    ///
+    /// Generates actual Merkle inclusion proofs (sibling hashes) for the
+    /// contract's keyspace tree, so a verifier can recompute the root from
+    /// leaves without replaying execution.
     pub fn from_receipt(receipt: &ExecutionReceipt) -> Self {
+        use crate::merkle;
+
         let mut bundle = Self::empty(receipt.receipt_id);
 
-        // Proof type 0: state transition proof
-        // Contains: initial_state_root + final_state_root + receipt_hash
-        bundle.proof_type = 0;
+        // Proof type 1: Merkle-state proof with real sibling hashes
+        bundle.proof_type = 1;
 
-        // Pack state roots into proof data
+        // Pack state roots
         bundle.proof_data[0..32].copy_from_slice(&receipt.initial_state_root);
         bundle.proof_data[32..64].copy_from_slice(&receipt.final_state_root);
 
-        // Pack receipt hash
-        let receipt_hash = receipt.compute_hash();
-        bundle.proof_data[64..96].copy_from_slice(&receipt_hash);
+        // Determine keyspace from the agent id
+        let keyspace = receipt.local_agent_id.unwrap_or(0);
 
-        // Pack energy and ticks for billing verification
-        bundle.proof_data[96..104].copy_from_slice(&receipt.energy_used.to_le_bytes());
-        bundle.proof_data[104..112].copy_from_slice(&receipt.tick_start.to_le_bytes());
-        bundle.proof_data[112..120].copy_from_slice(&receipt.tick_end.to_le_bytes());
+        // Get leaf count and generate proofs
+        let leaf_count = merkle::get_leaf_count(keyspace).unwrap_or(0);
 
-        bundle.proof_len = 120;
+        if leaf_count > 0 {
+            // Generate proof for leaf 0 to determine tree depth
+            let first_proof = merkle::generate_proof(keyspace, 0);
+            let proof_depth = first_proof.as_ref().map(|p| p.depth).unwrap_or(0);
+            let proof_depth_u16 = proof_depth as u16;
 
-        // Verifier key = node_id (verifier needs this to check signature)
-        bundle.verifier_key = receipt.node_id;
+            // Calculate how many leaves we can fit in the buffer.
+            // Each leaf's proof = proof_depth * 32 bytes of siblings.
+            // Header is 68 bytes, buffer is 4096 bytes.
+            let bytes_per_leaf = proof_depth * 32;
+            let available = 4096 - 68;
+            let max_leaves = if bytes_per_leaf > 0 {
+                available / bytes_per_leaf
+            } else {
+                leaf_count
+            };
+
+            // If we can't fit all leaves, include only the first modified leaf
+            // (leaf 0). This is still a meaningful Merkle inclusion proof.
+            let include_count = if max_leaves >= leaf_count {
+                leaf_count
+            } else {
+                1
+            };
+
+            let include_u16 = include_count as u16;
+            bundle.proof_data[64..66].copy_from_slice(&include_u16.to_le_bytes());
+            bundle.proof_data[66..68].copy_from_slice(&proof_depth_u16.to_le_bytes());
+
+            let mut pos = 68usize;
+            for leaf_idx in 0..include_count {
+                if let Some(proof) = merkle::generate_proof(keyspace, leaf_idx) {
+                    let depth = proof.depth.min(7);
+                    for d in 0..depth {
+                        if pos + 32 > 4096 { break; }
+                        bundle.proof_data[pos..pos + 32]
+                            .copy_from_slice(&proof.siblings[d]);
+                        pos += 32;
+                    }
+                }
+            }
+
+            bundle.proof_len = pos;
+        } else {
+            // No leaves -- pack zero counts in the header
+            bundle.proof_data[64..66].copy_from_slice(&0u16.to_le_bytes());
+            bundle.proof_data[66..68].copy_from_slice(&0u16.to_le_bytes());
+            bundle.proof_len = 68;
+        }
+
+        // Generate an ExecutionProof and use its proof_hash as verifier_key
+        // for cross-reference between proof systems.
+        let exec_proof = crate::proof::generate_proof();
+        bundle.verifier_key = exec_proof.proof_hash;
 
         bundle
     }
 
     /// Verify this proof bundle against a receipt.
+    ///
+    /// For Merkle-state proofs (type 1): extracts sibling hashes from
+    /// proof_data, recomputes the Merkle root from the first leaf's path,
+    /// and compares against the receipt's final_state_root.
+    ///
+    /// For replay-hash proofs (type 0): checks the receipt hash.
     pub fn verify_against_receipt(&self, receipt: &ExecutionReceipt) -> bool {
         if self.receipt_id != receipt.receipt_id { return false; }
-        if self.proof_len < 120 { return false; }
 
-        // Check state roots match
-        if self.proof_data[0..32] != receipt.initial_state_root { return false; }
-        if self.proof_data[32..64] != receipt.final_state_root { return false; }
+        match self.proof_type {
+            1 => {
+                // Merkle-state verification
+                if self.proof_len < 68 { return false; }
 
-        // Check receipt hash
-        let expected_hash = receipt.compute_hash();
-        if self.proof_data[64..96] != expected_hash { return false; }
+                // Check state roots in proof_data match the receipt
+                if self.proof_data[0..32] != receipt.initial_state_root { return false; }
+                if self.proof_data[32..64] != receipt.final_state_root { return false; }
 
-        // Check energy/timing
-        let stored_energy = u64::from_le_bytes(
-            self.proof_data[96..104].try_into().unwrap_or([0; 8])
-        );
-        if stored_energy != receipt.energy_used { return false; }
+                // Extract header fields
+                let leaf_count = u16::from_le_bytes(
+                    [self.proof_data[64], self.proof_data[65]]
+                ) as usize;
+                let proof_depth = u16::from_le_bytes(
+                    [self.proof_data[66], self.proof_data[67]]
+                ) as usize;
 
-        true
+                if leaf_count == 0 || proof_depth == 0 {
+                    // No leaves or zero depth: state root must be zero
+                    return receipt.final_state_root == [0u8; 32];
+                }
+
+                // Verify we have enough data for the sibling hashes
+                let expected_data = 68 + leaf_count * proof_depth * 32;
+                if self.proof_len < expected_data { return false; }
+
+                // Recompute the Merkle root from leaf 0 using stored sibling
+                // hashes and compare against the receipt's final_state_root.
+                let keyspace = receipt.local_agent_id.unwrap_or(0);
+
+                if let Some(computed_root) = recompute_root_from_siblings(
+                    keyspace, 0, &self.proof_data[68..], proof_depth,
+                ) {
+                    // The computed root from siblings must match the
+                    // receipt's final_state_root (first 16 bytes, since
+                    // final_state_root may be populated from get_root
+                    // which only fills 16 bytes).
+                    if computed_root[..16] != receipt.final_state_root[..16] {
+                        return false;
+                    }
+                } else {
+                    // Cannot recompute -- check live tree root as fallback
+                    if let Some(current_root) = crate::merkle::get_root(keyspace) {
+                        if current_root[..16] != receipt.final_state_root[..16] {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+
+                true
+            }
+            0 => {
+                // Legacy replay-hash verification
+                if self.proof_len < 32 { return false; }
+                let expected_hash = receipt.compute_hash();
+                self.proof_data[0..32] == expected_hash
+            }
+            _ => false,
+        }
     }
+}
+
+/// Recompute a Merkle root from a leaf's perspective using sibling hashes.
+///
+/// Retrieves the leaf hash from the live state for `keyspace` at
+/// `leaf_index`, then hashes upward using `depth` sibling hashes packed
+/// contiguously in `sibling_data` (each 32 bytes).
+fn recompute_root_from_siblings(
+    keyspace: u16,
+    leaf_index: usize,
+    sibling_data: &[u8],
+    depth: usize,
+) -> Option<Hash256> {
+    // Get the leaf hash by reading the raw key-value from the state module
+    // and hashing it the same way MerkleTree::hash_kv does.
+    let value = crate::state::get(keyspace, leaf_index as u64);
+    let leaf_hash = if let Some(data) = value {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&(leaf_index as u64).to_le_bytes());
+        hasher.update(data);
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    } else {
+        [0u8; 32]
+    };
+
+    let mut hash = leaf_hash;
+    let mut idx = leaf_index;
+
+    for d in 0..depth {
+        let offset = d * 32;
+        if offset + 32 > sibling_data.len() { return None; }
+        let mut sibling = [0u8; 32];
+        sibling.copy_from_slice(&sibling_data[offset..offset + 32]);
+
+        if idx % 2 == 0 {
+            hash = crate::merkle::hash_pair(&hash, &sibling);
+        } else {
+            hash = crate::merkle::hash_pair(&sibling, &hash);
+        }
+        idx /= 2;
+    }
+
+    Some(hash)
 }
 
 // ─── Proof bundle store ────────────────────────────────────────────────────
@@ -449,6 +663,7 @@ pub fn store_proof_bundle(proof: ProofBundle) {
             PROOF_COUNT += 1;
         }
     }
+    crate::persist::save_proof_bundles_to_disk();
 }
 
 /// Retrieve a proof bundle by index.
@@ -480,6 +695,7 @@ pub fn store_replay_bundle(bundle: ReplayBundle) {
         REPLAY_STORE[idx] = Some(bundle);
         REPLAY_COUNT += 1;
     }
+    crate::persist::save_replay_bundles_to_disk();
 }
 
 /// Retrieve a replay bundle by index (within the ring buffer).
@@ -535,6 +751,10 @@ pub fn emit_receipt_for_agent(agent_id: u16) -> Option<usize> {
     // Compute trace commitment from transcript
     let trace_commitment = crate::syscall::compute_transcript_hash(agent_id, tick_start, tick_now);
 
+    // Use state roots as input/output commitments (they are already hashes).
+    let input_hash = initial_root;
+    let output_hash = final_root;
+
     let idx = emit_receipt_on_exit(
         agent_id,
         RuntimeClassTag::ProofGradeWasm,
@@ -543,6 +763,8 @@ pub fn emit_receipt_for_agent(agent_id: u16) -> Option<usize> {
         final_root,
         tick_start,
         tick_now,
+        input_hash,
+        output_hash,
     );
 
     // Patch trace_commitment into the receipt

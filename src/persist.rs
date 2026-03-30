@@ -319,9 +319,11 @@ pub fn init() {
 
     crate::serial_println!("[persist] replayed {} log entries", replayed);
 
-    // Load receipts and packages from their dedicated disk regions
+    // Load receipts, packages, replay bundles, and proof bundles from disk
     load_receipts_from_disk();
     load_packages_from_disk();
+    load_replay_bundles_from_disk();
+    load_proof_bundles_from_disk();
 }
 
 /// Create a new keyspace with the given ID.
@@ -981,4 +983,354 @@ pub fn save_state_to_disk() {
 /// `load_receipts_from_disk()` and `load_packages_from_disk()`.
 pub fn load_state_from_disk() {
     // State is loaded during init() via log replay — nothing extra needed.
+}
+
+// ─── Disk layout for replay bundles and proof bundles ──────────────────────
+//
+// Sectors 1186:          replay bundle header (magic + count)
+// Sectors 1187..1538:    replay bundle data   (16 bundles x 22 sectors each)
+// Sector  1539:          proof bundle header   (magic + count)
+// Sectors 1540..2115:    proof bundle data     (64 bundles x 9 sectors each)
+
+const REPLAY_HEADER_SECTOR: u64 = 1186;
+const REPLAY_DATA_START: u64 = 1187;
+const REPLAY_SECTORS_EACH: u64 = 22; // ceil(10278 / 512)
+const MAX_PERSIST_REPLAY: usize = 16;
+const REPLAY_ENTRY_SIZE: usize = 22 * 512; // 11264 bytes
+
+const PROOF_HEADER_SECTOR: u64 = 1539;
+const PROOF_DATA_START: u64 = 1540;
+const PROOF_SECTORS_EACH: u64 = 9; // ceil(4224 / 512) = 9 sectors
+const MAX_PERSIST_PROOFS: usize = 64;
+const PROOF_ENTRY_SIZE: usize = 9 * 512; // 4608 bytes (fits 4096-byte proof_data)
+const PROOF_CRC_OFFSET: usize = 4604;
+
+// ─── ReplayBundle serialization ────────────────────────────────────────────
+//
+// Layout within REPLAY_ENTRY_SIZE (11264 bytes):
+//   0:     receipt_id       (32 bytes)
+//   32:    checkpoint_len   (u16)
+//   34:    transcript_len   (u16)
+//   36:    initial_state_len(u16)
+//   38:    reserved         (26 bytes, pad to 64)
+//   64:    checkpoint_data  (4096 bytes)
+//   4160:  transcript       (4096 bytes)
+//   8256:  initial_state    (2048 bytes)
+//   10304: padding
+//   11260: crc32            (u32, covers bytes 0..11260)
+
+const REPLAY_CRC_OFFSET: usize = 11260;
+
+fn serialize_replay_bundle(buf: &mut [u8], bundle: &crate::receipts::ReplayBundle) {
+    // Zero the buffer
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+
+    buf[0..32].copy_from_slice(&bundle.receipt_id);
+    put_u16(buf, 32, bundle.checkpoint_len);
+    put_u16(buf, 34, bundle.transcript_len);
+    put_u16(buf, 36, bundle.initial_state_len);
+    // 38..64 reserved
+
+    buf[64..64 + 4096].copy_from_slice(&bundle.checkpoint_data);
+    buf[4160..4160 + 4096].copy_from_slice(&bundle.transcript);
+    buf[8256..8256 + 2048].copy_from_slice(&bundle.initial_state);
+
+    let checksum = crc32(&buf[..REPLAY_CRC_OFFSET]);
+    put_u32(buf, REPLAY_CRC_OFFSET, checksum);
+}
+
+fn deserialize_replay_bundle(buf: &[u8]) -> Option<crate::receipts::ReplayBundle> {
+    if buf.len() < REPLAY_ENTRY_SIZE {
+        return None;
+    }
+
+    // Verify CRC
+    let stored_crc = get_u32(buf, REPLAY_CRC_OFFSET);
+    let computed_crc = crc32(&buf[..REPLAY_CRC_OFFSET]);
+    if stored_crc != computed_crc {
+        return None;
+    }
+
+    let mut receipt_id = [0u8; 32];
+    receipt_id.copy_from_slice(&buf[0..32]);
+
+    // Check if slot is empty (all-zero receipt_id)
+    if receipt_id.iter().all(|&b| b == 0) {
+        return None;
+    }
+
+    let checkpoint_len = get_u16(buf, 32);
+    let transcript_len = get_u16(buf, 34);
+    let initial_state_len = get_u16(buf, 36);
+
+    let mut bundle = crate::receipts::ReplayBundle::empty(receipt_id);
+    bundle.checkpoint_len = checkpoint_len;
+    bundle.transcript_len = transcript_len;
+    bundle.initial_state_len = initial_state_len;
+
+    bundle.checkpoint_data.copy_from_slice(&buf[64..64 + 4096]);
+    bundle.transcript.copy_from_slice(&buf[4160..4160 + 4096]);
+    bundle.initial_state.copy_from_slice(&buf[8256..8256 + 2048]);
+
+    Some(bundle)
+}
+
+// ─── ProofBundle serialization ─────────────────────────────────────────────
+//
+// Layout within PROOF_ENTRY_SIZE (4608 bytes):
+//   0:    receipt_id    (32 bytes)
+//   32:   proof_type    (u8)
+//   33:   reserved      (3 bytes)
+//   36:   proof_len     (u32)
+//   40:   verifier_key  (32 bytes)
+//   72:   reserved      (56 bytes, pad to 128)
+//   128:  proof_data    (4096 bytes)
+//   4224: padding
+//   4604: crc32         (u32, covers bytes 0..4604)
+
+fn serialize_proof_bundle(buf: &mut [u8], proof: &crate::receipts::ProofBundle) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+
+    buf[0..32].copy_from_slice(&proof.receipt_id);
+    buf[32] = proof.proof_type;
+    put_u32(buf, 36, proof.proof_len as u32);
+    buf[40..72].copy_from_slice(&proof.verifier_key);
+    buf[128..128 + 4096].copy_from_slice(&proof.proof_data);
+
+    let checksum = crc32(&buf[..PROOF_CRC_OFFSET]);
+    put_u32(buf, PROOF_CRC_OFFSET, checksum);
+}
+
+fn deserialize_proof_bundle(buf: &[u8]) -> Option<crate::receipts::ProofBundle> {
+    if buf.len() < PROOF_ENTRY_SIZE {
+        return None;
+    }
+
+    let stored_crc = get_u32(buf, PROOF_CRC_OFFSET);
+    let computed_crc = crc32(&buf[..PROOF_CRC_OFFSET]);
+    if stored_crc != computed_crc {
+        return None;
+    }
+
+    let mut receipt_id = [0u8; 32];
+    receipt_id.copy_from_slice(&buf[0..32]);
+
+    if receipt_id.iter().all(|&b| b == 0) {
+        return None;
+    }
+
+    let proof_type = buf[32];
+    let proof_len = get_u32(buf, 36) as usize;
+    let mut verifier_key = [0u8; 32];
+    verifier_key.copy_from_slice(&buf[40..72]);
+    let mut proof_data = [0u8; 4096];
+    proof_data.copy_from_slice(&buf[128..128 + 4096]);
+
+    Some(crate::receipts::ProofBundle {
+        receipt_id,
+        proof_type,
+        proof_data,
+        proof_len,
+        verifier_key,
+    })
+}
+
+// ─── Public replay bundle persistence API ──────────────────────────────────
+
+/// Save all replay bundles from the in-memory store to disk.
+pub fn save_replay_bundles_to_disk() {
+    let disk_ok = unsafe { DISK_AVAILABLE };
+    if !disk_ok {
+        return;
+    }
+
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let count = crate::receipts::replay_bundle_count();
+    let save_count = if count > MAX_PERSIST_REPLAY { MAX_PERSIST_REPLAY } else { count };
+
+    // Write header sector
+    let mut header = [0u8; 512];
+    put_u32(&mut header, 0, PERSIST_MAGIC);
+    put_u32(&mut header, 4, save_count as u32);
+    let hdr_crc = crc32(&header[..508]);
+    put_u32(&mut header, 508, hdr_crc);
+
+    if device.write(REPLAY_HEADER_SECTOR, 1, &header).is_err() {
+        crate::serial_println!("[persist] WARNING: failed to write replay bundle header");
+        return;
+    }
+
+    // Write each replay bundle
+    let mut entry_buf = [0u8; REPLAY_ENTRY_SIZE];
+    for i in 0..save_count {
+        if let Some(bundle) = crate::receipts::get_replay_bundle(i) {
+            serialize_replay_bundle(&mut entry_buf, bundle);
+            let sector = REPLAY_DATA_START + (i as u64) * REPLAY_SECTORS_EACH;
+            if device.write(sector, REPLAY_SECTORS_EACH as u32, &entry_buf).is_err() {
+                crate::serial_println!("[persist] WARNING: failed to write replay bundle {} at sector {}", i, sector);
+            }
+        }
+    }
+
+    crate::serial_println!("[persist] saved {} replay bundles to disk", save_count);
+}
+
+/// Load replay bundles from disk into the in-memory store.
+pub fn load_replay_bundles_from_disk() {
+    let disk_ok = unsafe { DISK_AVAILABLE };
+    if !disk_ok {
+        return;
+    }
+
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let mut header = [0u8; 512];
+    if device.read(REPLAY_HEADER_SECTOR, 1, &mut header).is_err() {
+        return;
+    }
+
+    let magic = get_u32(&header, 0);
+    if magic != PERSIST_MAGIC {
+        return;
+    }
+
+    let hdr_crc_stored = get_u32(&header, 508);
+    let hdr_crc_computed = crc32(&header[..508]);
+    if hdr_crc_stored != hdr_crc_computed {
+        crate::serial_println!("[persist] replay bundle header CRC mismatch, skipping");
+        return;
+    }
+
+    let count = get_u32(&header, 4) as usize;
+    if count > MAX_PERSIST_REPLAY {
+        crate::serial_println!("[persist] replay bundle count {} exceeds max, skipping", count);
+        return;
+    }
+
+    let mut loaded: usize = 0;
+    let mut entry_buf = [0u8; REPLAY_ENTRY_SIZE];
+    for i in 0..count {
+        let sector = REPLAY_DATA_START + (i as u64) * REPLAY_SECTORS_EACH;
+        if device.read(sector, REPLAY_SECTORS_EACH as u32, &mut entry_buf).is_err() {
+            break;
+        }
+
+        if let Some(bundle) = deserialize_replay_bundle(&entry_buf) {
+            crate::receipts::store_replay_bundle(bundle);
+            loaded += 1;
+        }
+    }
+
+    if loaded > 0 {
+        crate::serial_println!("[persist] loaded {} replay bundles from disk", loaded);
+    }
+}
+
+// ─── Public proof bundle persistence API ───────────────────────────────────
+
+/// Save all proof bundles from the in-memory store to disk.
+pub fn save_proof_bundles_to_disk() {
+    let disk_ok = unsafe { DISK_AVAILABLE };
+    if !disk_ok {
+        return;
+    }
+
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let count = crate::receipts::proof_count();
+    let save_count = if count > MAX_PERSIST_PROOFS { MAX_PERSIST_PROOFS } else { count };
+
+    // Write header sector
+    let mut header = [0u8; 512];
+    put_u32(&mut header, 0, PERSIST_MAGIC);
+    put_u32(&mut header, 4, save_count as u32);
+    let hdr_crc = crc32(&header[..508]);
+    put_u32(&mut header, 508, hdr_crc);
+
+    if device.write(PROOF_HEADER_SECTOR, 1, &header).is_err() {
+        crate::serial_println!("[persist] WARNING: failed to write proof bundle header");
+        return;
+    }
+
+    // Write each proof bundle
+    let mut entry_buf = [0u8; PROOF_ENTRY_SIZE];
+    for i in 0..save_count {
+        if let Some(proof) = crate::receipts::get_proof_bundle(i) {
+            serialize_proof_bundle(&mut entry_buf, proof);
+            let sector = PROOF_DATA_START + (i as u64) * PROOF_SECTORS_EACH;
+            if device.write(sector, PROOF_SECTORS_EACH as u32, &entry_buf).is_err() {
+                crate::serial_println!("[persist] WARNING: failed to write proof bundle {} at sector {}", i, sector);
+            }
+        }
+    }
+
+    crate::serial_println!("[persist] saved {} proof bundles to disk", save_count);
+}
+
+/// Load proof bundles from disk into the in-memory store.
+pub fn load_proof_bundles_from_disk() {
+    let disk_ok = unsafe { DISK_AVAILABLE };
+    if !disk_ok {
+        return;
+    }
+
+    let device = match StorageDevice::detect() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let mut header = [0u8; 512];
+    if device.read(PROOF_HEADER_SECTOR, 1, &mut header).is_err() {
+        return;
+    }
+
+    let magic = get_u32(&header, 0);
+    if magic != PERSIST_MAGIC {
+        return;
+    }
+
+    let hdr_crc_stored = get_u32(&header, 508);
+    let hdr_crc_computed = crc32(&header[..508]);
+    if hdr_crc_stored != hdr_crc_computed {
+        crate::serial_println!("[persist] proof bundle header CRC mismatch, skipping");
+        return;
+    }
+
+    let count = get_u32(&header, 4) as usize;
+    if count > MAX_PERSIST_PROOFS {
+        crate::serial_println!("[persist] proof bundle count {} exceeds max, skipping", count);
+        return;
+    }
+
+    let mut loaded: usize = 0;
+    let mut entry_buf = [0u8; PROOF_ENTRY_SIZE];
+    for i in 0..count {
+        let sector = PROOF_DATA_START + (i as u64) * PROOF_SECTORS_EACH;
+        if device.read(sector, PROOF_SECTORS_EACH as u32, &mut entry_buf).is_err() {
+            break;
+        }
+
+        if let Some(proof) = deserialize_proof_bundle(&entry_buf) {
+            crate::receipts::store_proof_bundle(proof);
+            loaded += 1;
+        }
+    }
+
+    if loaded > 0 {
+        crate::serial_println!("[persist] loaded {} proof bundles from disk", loaded);
+    }
 }
