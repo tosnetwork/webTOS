@@ -5,6 +5,7 @@
 //! entry-point selector.
 
 use crate::agent::{E_INVALID_ARG, E_QUOTA_EXCEEDED};
+use sha2::{Sha256, Digest};
 
 /// Maximum number of contracts that can be registered simultaneously.
 const MAX_CONTRACTS: usize = 64;
@@ -33,7 +34,7 @@ pub struct EntryPoint {
     pub name: [u8; 32],
     /// Actual length of the name (excluding any null terminator).
     pub name_len: u8,
-    /// 4-byte selector derived from FNV-1a hash of the name.
+    /// 4-byte selector derived from SHA-256 hash of the name.
     pub selector: u32,
 }
 
@@ -68,67 +69,27 @@ static mut REGISTRY: [Option<ContractEntry>; MAX_CONTRACTS] = [const { None }; M
 static mut CONTRACT_COUNT: usize = 0;
 
 // ---------------------------------------------------------------------------
-// FNV-1a helpers
-// ---------------------------------------------------------------------------
-
-/// FNV-1a 64-bit hash of an arbitrary byte slice.
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
-
-fn fnv1a_64(data: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Compute a 4-byte selector from a function name using FNV-1a.
+/// Compute a 4-byte selector from a function name using SHA-256.
 ///
-/// The selector is the first 4 bytes (big-endian) of the 64-bit FNV-1a hash.
+/// The selector is the first 4 bytes of the SHA-256 hash, interpreted as a
+/// big-endian u32.  This mirrors Ethereum's approach (keccak truncated to 4
+/// bytes) but uses SHA-256.
 pub fn compute_selector(name: &[u8]) -> u32 {
-    let h = fnv1a_64(name);
-    (h >> 32) as u32
+    let hash = Sha256::digest(name);
+    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
 }
 
 /// Compute a 32-byte contract ID from the contract code.
 ///
-/// Uses XOR-folded FNV-1a: the code is processed in overlapping rounds to
-/// produce four independent 64-bit hashes which are packed into 32 bytes.
-/// This is deterministic and reasonably collision-resistant for registry use.
+/// Returns the SHA-256 digest of the code, providing a cryptographically
+/// strong content-addressed identity.
 pub fn compute_contract_id(code: &[u8]) -> ContractId {
+    let hash = Sha256::digest(code);
     let mut id = [0u8; 32];
-
-    // Produce four 64-bit hashes with different initial seeds.
-    let seeds: [u64; 4] = [
-        FNV_OFFSET,
-        FNV_OFFSET ^ 0xDEAD_BEEF_CAFE_BABE,
-        FNV_OFFSET ^ 0x0123_4567_89AB_CDEF,
-        FNV_OFFSET ^ 0xFEDC_BA98_7654_3210,
-    ];
-
-    for (i, &seed) in seeds.iter().enumerate() {
-        let mut h = seed;
-        for &b in code {
-            h ^= b as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        // Also mix in the length to differentiate zero-padded inputs.
-        let len_bytes = (code.len() as u64).to_le_bytes();
-        for &lb in &len_bytes {
-            h ^= lb as u64;
-            h = h.wrapping_mul(FNV_PRIME);
-        }
-        let bytes = h.to_be_bytes();
-        let offset = i * 8;
-        id[offset..offset + 8].copy_from_slice(&bytes);
-    }
-
+    id.copy_from_slice(&hash);
     id
 }
 

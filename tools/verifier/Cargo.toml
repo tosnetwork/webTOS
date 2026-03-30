@@ -6,6 +6,9 @@ description = "ATOS Execution Receipt verifier library"
 
 [workspace]
 
+[dependencies]
+sha2 = "0.10"
+
 [lib]
 name = "atos_verifier"
 path = "src/lib.rs"

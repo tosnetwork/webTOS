@@ -3,16 +3,16 @@
 //! This library allows third parties to verify ATOS execution receipts
 //! without trusting the originating node.
 
+use sha2::{Sha256, Digest};
+
 pub type Hash256 = [u8; 32];
 
 /// Runtime class tags matching ATOS kernel's RuntimeClassTag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RuntimeClass {
-    BestEffortNative = 0,
+    ProofGradeWasm = 0,
     ReplayGradeNative = 1,
-    ProofGradeWasm = 2,
-    BrokerService = 3,
 }
 
 /// A portable execution receipt (matches kernel's ExecutionReceipt layout).
@@ -20,9 +20,9 @@ pub enum RuntimeClass {
 pub struct ExecutionReceipt {
     pub receipt_version: u16,
     pub receipt_id: Hash256,
-    pub workload_id: Hash256,
+    pub contract_id: Hash256,
     pub execution_id: Hash256,
-    pub principal_id: Hash256,
+    pub caller_id: Hash256,
     pub node_id: Hash256,
     pub runtime_class: RuntimeClass,
     pub code_hash: Hash256,
@@ -47,61 +47,48 @@ pub enum VerifyResult {
 }
 
 impl ExecutionReceipt {
-    /// Compute the hash of this receipt.
+    /// Compute the SHA-256 hash of this receipt's critical fields.
     pub fn compute_hash(&self) -> Hash256 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in &self.receipt_id {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        for b in &self.workload_id {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        for b in &self.initial_state_root {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        for b in &self.final_state_root {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        h = h.wrapping_mul(0x100000001b3) ^ self.energy_used;
-        h = h.wrapping_mul(0x100000001b3) ^ self.tick_start;
-        h = h.wrapping_mul(0x100000001b3) ^ self.tick_end;
-        let mut result = [0u8; 32];
-        result[0..8].copy_from_slice(&h.to_le_bytes());
-        h = h.wrapping_mul(0x100000001b3) ^ (self.runtime_class as u64);
-        result[8..16].copy_from_slice(&h.to_le_bytes());
-        result
+        let mut hasher = Sha256::new();
+        hasher.update(&self.receipt_id);
+        hasher.update(&self.contract_id);
+        hasher.update(&self.execution_id);
+        hasher.update(&self.caller_id);
+        hasher.update(&self.node_id);
+        hasher.update(&[self.runtime_class as u8]);
+        hasher.update(&self.code_hash);
+        hasher.update(&self.input_commitment);
+        hasher.update(&self.output_commitment);
+        hasher.update(&self.initial_state_root);
+        hasher.update(&self.final_state_root);
+        hasher.update(&self.energy_used.to_le_bytes());
+        hasher.update(&self.tick_start.to_le_bytes());
+        hasher.update(&self.tick_end.to_le_bytes());
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
     }
 
     /// Verify receipt internal consistency.
     pub fn verify(&self) -> VerifyResult {
-        // Check required fields are non-zero
         if self.receipt_id == [0; 32] {
             return VerifyResult::MissingField("receipt_id");
         }
         if self.execution_id == [0; 32] {
             return VerifyResult::MissingField("execution_id");
         }
-
-        // Check signature is present
         if self.signature == [0; 64] {
             return VerifyResult::InvalidSignature;
         }
-
-        // Check tick ordering
         if self.tick_end < self.tick_start {
             return VerifyResult::InvalidHash;
         }
 
-        // Verify hash matches
-        let hash = self.compute_hash();
-        // In a full implementation, verify signature over hash
-        let _ = hash;
-
         VerifyResult::Valid
     }
 
-    /// Verify a state transition: check that initial_state_root != final_state_root
-    /// (or both zero for stateless execution).
+    /// Check if there was a state transition.
     pub fn has_state_transition(&self) -> bool {
         self.initial_state_root != self.final_state_root
     }
@@ -114,12 +101,15 @@ impl ExecutionReceipt {
 
 /// Verify a proof bundle against a receipt.
 pub fn verify_proof(receipt: &ExecutionReceipt, proof_data: &[u8]) -> VerifyResult {
-    if proof_data.len() < 32 {
+    if proof_data.len() < 64 {
         return VerifyResult::InvalidHash;
     }
 
-    let receipt_hash = receipt.compute_hash();
-    if proof_data[0..8] != receipt_hash[0..8] {
+    // Check that initial and final state roots in proof match receipt
+    if proof_data[0..32] != receipt.initial_state_root {
+        return VerifyResult::InvalidHash;
+    }
+    if proof_data[32..64] != receipt.final_state_root {
         return VerifyResult::InvalidHash;
     }
 
@@ -130,14 +120,13 @@ pub fn verify_proof(receipt: &ExecutionReceipt, proof_data: &[u8]) -> VerifyResu
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_receipt_hash_deterministic() {
-        let r1 = ExecutionReceipt {
+    fn make_receipt() -> ExecutionReceipt {
+        ExecutionReceipt {
             receipt_version: 1,
             receipt_id: [1; 32],
-            workload_id: [2; 32],
+            contract_id: [2; 32],
             execution_id: [3; 32],
-            principal_id: [4; 32],
+            caller_id: [4; 32],
             node_id: [5; 32],
             runtime_class: RuntimeClass::ProofGradeWasm,
             code_hash: [6; 32],
@@ -149,22 +138,39 @@ mod tests {
             tick_start: 100,
             tick_end: 200,
             signature: [0xFF; 64],
-        };
-        let h1 = r1.compute_hash();
-        let h2 = r1.compute_hash();
+        }
+    }
+
+    #[test]
+    fn test_receipt_hash_deterministic() {
+        let r = make_receipt();
+        let h1 = r.compute_hash();
+        let h2 = r.compute_hash();
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_receipt_hash_is_sha256() {
+        let r = make_receipt();
+        let h = r.compute_hash();
+        // SHA-256 produces 32 non-zero bytes for non-trivial input
+        assert_ne!(h, [0; 32]);
+        // Verify it's not just the first 8 bytes filled (old FNV behavior)
+        assert_ne!(h[8..16], [0; 8]);
+        assert_ne!(h[16..24], [0; 8]);
+        assert_ne!(h[24..32], [0; 8]);
     }
 
     #[test]
     fn test_verify_missing_fields() {
         let r = ExecutionReceipt {
             receipt_version: 1,
-            receipt_id: [0; 32], // zero = missing
-            workload_id: [0; 32],
+            receipt_id: [0; 32],
+            contract_id: [0; 32],
             execution_id: [0; 32],
-            principal_id: [0; 32],
+            caller_id: [0; 32],
             node_id: [0; 32],
-            runtime_class: RuntimeClass::BestEffortNative,
+            runtime_class: RuntimeClass::ReplayGradeNative,
             code_hash: [0; 32],
             input_commitment: [0; 32],
             output_commitment: [0; 32],
@@ -183,24 +189,7 @@ mod tests {
 
     #[test]
     fn test_proof_grade_check() {
-        let r = ExecutionReceipt {
-            receipt_version: 1,
-            receipt_id: [1; 32],
-            workload_id: [0; 32],
-            execution_id: [1; 32],
-            principal_id: [0; 32],
-            node_id: [0; 32],
-            runtime_class: RuntimeClass::ProofGradeWasm,
-            code_hash: [0; 32],
-            input_commitment: [0; 32],
-            output_commitment: [0; 32],
-            initial_state_root: [0; 32],
-            final_state_root: [0; 32],
-            energy_used: 0,
-            tick_start: 0,
-            tick_end: 0,
-            signature: [1; 64],
-        };
+        let r = make_receipt();
         assert!(r.is_proof_grade());
     }
 }
