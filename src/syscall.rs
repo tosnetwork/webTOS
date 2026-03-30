@@ -252,8 +252,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             };
             // Compute final state root from agent's keyspace
             let mut final_root = [0u8; 32];
-            if let Some(root16) = state::get_root(caller_id as u16) {
-                final_root[..16].copy_from_slice(&root16);
+            if let Some(root32) = state::get_root(caller_id as u16) {
+                final_root.copy_from_slice(&root32);
             }
             // Compute trace commitment from transcript
             let trace_commitment = compute_transcript_hash(caller_id, tick_start, tick_now);

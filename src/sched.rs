@@ -225,27 +225,24 @@ pub fn schedule() {
             let mut best_priority = AgentPriority::Background as u8 + 1; // worse than worst
             let mut best_idx = 0;
 
-            for offset in 0..rq.len {
+            // Round-robin: pick the NEXT Ready agent from current_index.
+            // This ensures all agents get a fair share of CPU time,
+            // preventing priority starvation of Normal agents.
+            for offset in 1..=rq.len {
                 let idx = (start + offset) % rq.len;
                 if let Some(agent_id) = rq.queue[idx] {
                     if let Some(agent) = get_agent_mut(agent_id) {
                         if agent.status == AgentStatus::Ready {
-                            // On AP cores, skip ring-3 agents: they need
-                            // CURRENT_KERNEL_RSP which is a BSP-only global.
-                            // Kernel-mode agents use direct Rust calls, not
-                            // the SYSCALL instruction, so they are safe on APs.
+                            // On AP cores, skip ring-3 agents
                             let on_ap = crate::arch::x86_64::lapic::is_active()
                                 && crate::arch::x86_64::lapic::id() != 0;
                             if on_ap && agent.mode == AgentMode::User {
                                 continue;
                             }
 
-                            let p = agent.priority as u8;
-                            if p < best_priority {
-                                best_priority = p;
-                                best_id = agent_id;
-                                best_idx = idx;
-                            }
+                            best_id = agent_id;
+                            best_idx = idx;
+                            break; // take the first ready agent (round-robin)
                         }
                     }
                 }
