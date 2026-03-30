@@ -25,6 +25,30 @@ const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
 
+// ── FUTEX wait queue ──────────────────────────────────────────────────────
+
+const MAX_FUTEX_WAITERS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct FutexWaiter {
+    agent_id: u16,
+    futex_addr: u64,
+    active: bool,
+}
+
+const FUTEX_WAITER_EMPTY: FutexWaiter = FutexWaiter {
+    agent_id: 0,
+    futex_addr: 0,
+    active: false,
+};
+
+static mut FUTEX_WAITERS: [FutexWaiter; MAX_FUTEX_WAITERS] =
+    [FUTEX_WAITER_EMPTY; MAX_FUTEX_WAITERS];
+
+// ── wait4 options ─────────────────────────────────────────────────────────
+
+const WNOHANG: u64 = 1;
+
 // ── Clone3 args layout (subset of Linux struct clone_args) ─────────────────
 
 /// Minimal clone_args parsed from user memory.
@@ -239,13 +263,13 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     );
 
     // Clear child_tid if set (CLONE_CHILD_CLEARTID behavior).
+    // The futex_wake on this address is done below after termination.
     if let Some(ls) = state::get_state(agent_id) {
         if ls.clear_child_tid != 0 {
             unsafe {
                 let ptr = ls.clear_child_tid as *mut u32;
                 core::ptr::write_volatile(ptr, 0);
             }
-            // A real implementation would also do futex_wake on that address.
         }
     }
 
@@ -254,9 +278,33 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
         ls.active = false;
     }
 
+    // Read parent_id before termination (terminate sets active=false).
+    let parent_id = match agent::get_agent(agent_id) {
+        Some(agent) => agent.parent_id,
+        None => None,
+    };
+
     // Remove from scheduler and terminate.
     sched::remove_from_run_queue(agent_id);
     agent::terminate_agent(agent_id, AgentStatus::Exited);
+
+    // Wake parent if it's blocked in wait4.
+    if let Some(pid) = parent_id {
+        if let Some(parent) = agent::get_agent_mut(pid) {
+            if parent.status == AgentStatus::BlockedRecv {
+                parent.status = AgentStatus::Ready;
+                sched::add_to_run_queue(pid);
+            }
+        }
+    }
+
+    // Also do futex_wake on the clear_child_tid address (CLONE_CHILD_CLEARTID).
+    if let Some(ls) = state::get_state(agent_id) {
+        if ls.clear_child_tid != 0 {
+            // Wake one waiter on this address (matching Linux behavior).
+            sys_futex(agent_id, ls.clear_child_tid, FUTEX_WAKE as u64, 1, 0, 0);
+        }
+    }
 
     // This syscall never returns; the scheduler will pick the next agent.
     sched::yield_current();
@@ -596,20 +644,135 @@ pub fn sys_fork(agent_id: u16) -> i64 {
     sys_clone(agent_id, 0, 0, 0, 0, 0)
 }
 
-/// wait4(2) -- Wait for a child process to change state.
+/// wait4(2) -- Wait for a child agent to terminate.
 ///
-/// Stub: returns -ECHILD since ATOS agents terminate asynchronously
-/// and the scheduler handles cleanup.
+/// Supports pid > 0 (specific child) and pid == -1 (any child).
+/// Blocks the parent until a child terminates unless WNOHANG is set.
 pub fn sys_wait4(
-    _agent_id: u16,
-    _pid: u64,
-    _wstatus_ptr: u64,
-    _options: u64,
-    _rusage_ptr: u64,
+    agent_id: u16,
+    pid: u64,
+    wstatus_ptr: u64,
+    options: u64,
+    rusage_ptr: u64,
 ) -> i64 {
-    // In ATOS, child agents are independent. wait4 would require blocking
-    // until a child changes state. For now, return -ECHILD (no children).
-    -10 // ECHILD = 10
+    let pid_i32 = pid as i64 as i32;
+
+    // Determine which child to wait for.
+    let specific_pid = if pid_i32 > 0 {
+        // Wait for specific child -- verify it's actually our child.
+        if !agent::is_child_of_any_state(pid_i32 as u16, agent_id) {
+            return -ECHILD;
+        }
+        pid_i32
+    } else if pid_i32 == -1 || pid_i32 == 0 {
+        // Wait for any child.
+        if !agent::has_any_child(agent_id) {
+            return -ECHILD;
+        }
+        -1
+    } else {
+        // pid < -1: wait for any child in process group |pid|.
+        // We don't implement process groups; treat as any child.
+        -1
+    };
+
+    // Check for an already-terminated child.
+    if let Some((child_id, child_status)) = agent::find_terminated_child(agent_id, specific_pid) {
+        // Compute the wait status word.
+        let wstatus: u32 = match child_status {
+            AgentStatus::Exited => {
+                // Normal exit: status << 8 (W_EXITCODE macro).
+                // Exit code is 0 since we don't store per-agent exit codes yet.
+                0u32 << 8
+            }
+            AgentStatus::Faulted => {
+                // Killed by signal: encode as SIGSEGV (11).
+                11u32 // terminated by signal, signal number in low 7 bits
+            }
+            _ => 0,
+        };
+
+        // Write wstatus to user memory if pointer is non-null.
+        if wstatus_ptr != 0 {
+            unsafe {
+                core::ptr::write_volatile(wstatus_ptr as *mut u32, wstatus);
+            }
+        }
+
+        // Fill rusage if requested.
+        if rusage_ptr != 0 {
+            // Zero out the rusage struct (144 bytes on x86_64).
+            unsafe {
+                let dst = rusage_ptr as *mut u8;
+                for i in 0..144 {
+                    core::ptr::write_volatile(dst.add(i), 0u8);
+                }
+            }
+        }
+
+        // Reap the terminated child (remove from agent table).
+        agent::reap_agent(child_id);
+
+        serial_println!(
+            "[linux_compat] wait4: parent={} reaped child={} status={:#x}",
+            agent_id,
+            child_id,
+            wstatus
+        );
+
+        return child_id as i64;
+    }
+
+    // No terminated child found yet.
+    if options & WNOHANG != 0 {
+        // Non-blocking: return 0 (no child ready).
+        return 0;
+    }
+
+    // Blocking wait: block the parent until a child exits.
+    // The sys_exit handler will wake parents via futex_wake_parent().
+    if let Some(agent) = agent::get_agent_mut(agent_id) {
+        agent.status = AgentStatus::BlockedRecv;
+    }
+    sched::remove_from_run_queue(agent_id);
+    sched::yield_current();
+
+    // Resumed after being woken -- retry the check.
+    if let Some((child_id, child_status)) = agent::find_terminated_child(agent_id, specific_pid) {
+        let wstatus: u32 = match child_status {
+            AgentStatus::Exited => 0u32 << 8,
+            AgentStatus::Faulted => 11u32,
+            _ => 0,
+        };
+
+        if wstatus_ptr != 0 {
+            unsafe {
+                core::ptr::write_volatile(wstatus_ptr as *mut u32, wstatus);
+            }
+        }
+
+        if rusage_ptr != 0 {
+            unsafe {
+                let dst = rusage_ptr as *mut u8;
+                for i in 0..144 {
+                    core::ptr::write_volatile(dst.add(i), 0u8);
+                }
+            }
+        }
+
+        agent::reap_agent(child_id);
+
+        serial_println!(
+            "[linux_compat] wait4: parent={} reaped child={} (after block)",
+            agent_id,
+            child_id
+        );
+
+        return child_id as i64;
+    }
+
+    // Spurious wakeup or child not yet terminated -- return -ECHILD.
+    -ECHILD
 }
 
 /// kill(2) -- Send a signal to a process.
@@ -761,12 +924,13 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
     }
 }
 
-/// futex(2) -- Fast userspace mutex.
+/// futex(2) -- Fast userspace mutex with deterministic wait queue.
 ///
-/// Minimal implementation: FUTEX_WAIT yields, FUTEX_WAKE is a no-op.
-/// A full implementation would maintain wait queues keyed by address.
+/// Implements FUTEX_WAIT and FUTEX_WAKE with a static wait queue keyed
+/// by futex address. Determinism: WAKE always wakes waiters in ascending
+/// agent_id order, and WAIT always blocks (no spin-waiting races).
 pub fn sys_futex(
-    _agent_id: u16,
+    agent_id: u16,
     uaddr: u64,
     op: u64,
     val: u64,
@@ -780,25 +944,122 @@ pub fn sys_futex(
             if uaddr == 0 {
                 return -EFAULT;
             }
-            // Check if *uaddr == val; if so, yield (simplified blocking).
+
+            // Step 1: Read the current value at the futex address.
             let current_val = unsafe {
                 core::ptr::read_volatile(uaddr as *const u32)
             };
+
+            // Step 2: Spurious wakeup check -- if value changed, return -EAGAIN.
             if current_val != val as u32 {
                 return -EAGAIN;
             }
-            // In a real implementation we would block. For now, yield once.
+
+            // Step 3: Add this agent to the futex wait queue.
+            let added = unsafe {
+                let mut slot_found = false;
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if !FUTEX_WAITERS[i].active {
+                        FUTEX_WAITERS[i] = FutexWaiter {
+                            agent_id,
+                            futex_addr: uaddr,
+                            active: true,
+                        };
+                        slot_found = true;
+                        break;
+                    }
+                }
+                slot_found
+            };
+
+            if !added {
+                // Wait queue full -- cannot block, return -EAGAIN.
+                serial_println!("[linux_compat] futex: wait queue full, agent={}", agent_id);
+                return -EAGAIN;
+            }
+
+            // Step 4: Block the agent (set status to BlockedRecv).
+            if let Some(agent) = agent::get_agent_mut(agent_id) {
+                agent.status = AgentStatus::BlockedRecv;
+            }
+
+            // Step 5: Remove from scheduler run queue.
+            sched::remove_from_run_queue(agent_id);
+
+            // Step 6: Yield to let another agent run.
             sched::yield_current();
+
+            // Step 7: When we resume, we've been woken -- return 0.
             0
         }
         FUTEX_WAKE => {
-            // Wake up to `val` waiters. Since we don't maintain wait queues,
-            // this is a no-op. Return 0 (no waiters woken).
-            let _ = val;
-            0
+            // Wake up to `val` waiters on this futex address, deterministically.
+            if uaddr == 0 {
+                return 0;
+            }
+            let max_wake = val as usize;
+            if max_wake == 0 {
+                return 0;
+            }
+
+            // Step 1: Collect matching waiters.
+            let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+            let mut matching_indices: [usize; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+            let mut match_count: usize = 0;
+
+            unsafe {
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if FUTEX_WAITERS[i].active && FUTEX_WAITERS[i].futex_addr == uaddr {
+                        matching[match_count] = FUTEX_WAITERS[i].agent_id;
+                        matching_indices[match_count] = i;
+                        match_count += 1;
+                    }
+                }
+            }
+
+            if match_count == 0 {
+                return 0;
+            }
+
+            // Step 2: Sort matching entries by agent_id (deterministic ordering).
+            // Simple insertion sort -- small array.
+            for i in 1..match_count {
+                let key_id = matching[i];
+                let key_idx = matching_indices[i];
+                let mut j = i;
+                while j > 0 && matching[j - 1] > key_id {
+                    matching[j] = matching[j - 1];
+                    matching_indices[j] = matching_indices[j - 1];
+                    j -= 1;
+                }
+                matching[j] = key_id;
+                matching_indices[j] = key_idx;
+            }
+
+            // Step 3: Wake up to max_wake waiters (lowest agent_id first).
+            let wake_count = match_count.min(max_wake);
+            for w in 0..wake_count {
+                let wid = matching[w];
+                let widx = matching_indices[w];
+
+                // Mark waiter as inactive.
+                unsafe {
+                    FUTEX_WAITERS[widx].active = false;
+                }
+
+                // Set agent status back to Ready and add to run queue.
+                if let Some(agent) = agent::get_agent_mut(wid) {
+                    agent.status = AgentStatus::Ready;
+                }
+                sched::add_to_run_queue(wid);
+            }
+
+            // Step 4: Return number of waiters woken.
+            wake_count as i64
         }
         _ => {
             // Other futex ops (FUTEX_FD, FUTEX_REQUEUE, etc.) not implemented.
+            // Return 0 to avoid crashing programs.
             0
         }
     }

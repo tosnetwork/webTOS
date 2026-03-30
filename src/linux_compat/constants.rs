@@ -157,6 +157,7 @@ pub const EINVAL: i64 = 22;
 pub const EMFILE: i64 = 24;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
+pub const ECHILD: i64 = 10;
 pub const ENOTSOCK: i64 = 88;
 pub const EAFNOSUPPORT: i64 = 97;
 

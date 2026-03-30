@@ -6,6 +6,17 @@
 
 use super::constants::*;
 use super::state::{self, FdEntry, FdKind};
+use crate::agent::MAX_MESSAGE_PAYLOAD;
+
+/// Netd's mailbox ID (agent 9).
+const NETD_MAILBOX: u16 = 9;
+
+/// Socket fd flag: listening (set by listen()).
+const FD_FLAG_LISTENING: u32 = 0x0100_0000;
+/// Socket fd flag: shutdown read side.
+const FD_FLAG_SHUT_RD: u32 = 0x0200_0000;
+/// Socket fd flag: shutdown write side.
+const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
 
 // ── socket ─────────────────────────────────────────────────────────────────
 
@@ -42,7 +53,7 @@ pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) 
 ///
 /// Stores the target address metadata in the fd entry.
 /// In a full implementation this would send a connect request to netd via mailbox.
-pub fn sys_connect(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen: u64) -> i64 {
+pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
@@ -54,8 +65,28 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen: u64) ->
         None => return -EBADF,
     }
 
-    // TODO: parse sockaddr, send connect request to netd via mailbox.
-    // For now, return success (connection is "established" logically).
+    if addr_ptr == 0 {
+        return -EFAULT;
+    }
+
+    // Read sockaddr_in from user memory: family(u16) + port(u16) + ip(u32)
+    let (port, ip) = unsafe {
+        let p = addr_ptr as *const u8;
+        // sin_family at offset 0 (u16) — we don't validate, just skip
+        // sin_port at offset 2 (u16, network byte order / big-endian)
+        let port = u16::from_be_bytes([*p.add(2), *p.add(3)]);
+        // sin_addr at offset 4 (u32, network byte order)
+        let ip = u32::from_be_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]);
+        (port, ip)
+    };
+
+    // Pack ip:port into keyspace_key — ip in upper 32 bits, port in lower 16
+    let packed = ((ip as u64) << 16) | (port as u64);
+
+    let entry = st.get_fd_mut(sockfd).unwrap();
+    entry.keyspace_key = packed;
+    entry.mailbox_id = NETD_MAILBOX;
+
     0
 }
 
@@ -96,85 +127,207 @@ pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64)
 
 /// sendto(int sockfd, const void *buf, size_t len, int flags,
 ///        const struct sockaddr *dest_addr, socklen_t addrlen)
-pub fn sys_sendto(agent_id: u16, sockfd: i32, _buf_ptr: u64, len: u64,
+pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
                   _flags: u64, _dest_addr: u64) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
     };
 
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
+    let packed_addr = match st.get_fd(sockfd) {
+        Some(entry) if entry.kind == FdKind::Socket => entry.keyspace_key,
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
+    };
+
+    if buf_ptr == 0 || len == 0 {
+        return 0;
     }
 
-    // TODO: proxy data through mailbox to netd.
-    // For now, report all bytes as sent.
-    len as i64
+    // Read user data
+    let data_len = (len as usize).min(MAX_MESSAGE_PAYLOAD - 32);
+    let data = unsafe {
+        core::slice::from_raw_parts(buf_ptr as *const u8, data_len)
+    };
+
+    // Build URL from packed ip:port in keyspace_key
+    let port = (packed_addr & 0xFFFF) as u16;
+    let ip = ((packed_addr >> 16) & 0xFFFF_FFFF) as u32;
+    let ip_bytes = ip.to_be_bytes();
+
+    // Format URL as "ip0.ip1.ip2.ip3:port/"
+    let mut url_buf = [0u8; 32];
+    let mut url_pos = 0usize;
+    for (i, &octet) in ip_bytes.iter().enumerate() {
+        if i > 0 {
+            url_buf[url_pos] = b'.';
+            url_pos += 1;
+        }
+        url_pos += fmt_u8(octet, &mut url_buf[url_pos..]);
+    }
+    url_buf[url_pos] = b':';
+    url_pos += 1;
+    url_pos += fmt_u16_decimal(port, &mut url_buf[url_pos..]);
+    url_buf[url_pos] = b'/';
+    url_pos += 1;
+
+    // Build netd request message:
+    // [op=0x01, reply_mailbox: u8, method: u8, url_len: u16 LE, url: [u8], body_len: u16 LE, body: [u8]]
+    let mut msg = [0u8; MAX_MESSAGE_PAYLOAD];
+    let mut pos = 0usize;
+    msg[pos] = 0x01; pos += 1;                              // op = OP_REQUEST
+    msg[pos] = agent_id as u8; pos += 1;                     // reply_mailbox
+    msg[pos] = 0x02; pos += 1;                               // method = POST
+    let url_len_bytes = (url_pos as u16).to_le_bytes();
+    msg[pos] = url_len_bytes[0]; pos += 1;
+    msg[pos] = url_len_bytes[1]; pos += 1;                   // url_len
+    let url_copy = url_pos.min(msg.len() - pos);
+    msg[pos..pos + url_copy].copy_from_slice(&url_buf[..url_copy]);
+    pos += url_copy;                                         // url
+    let body_len_bytes = (data_len as u16).to_le_bytes();
+    if pos + 2 + data_len <= msg.len() {
+        msg[pos] = body_len_bytes[0]; pos += 1;
+        msg[pos] = body_len_bytes[1]; pos += 1;              // body_len
+        msg[pos..pos + data_len].copy_from_slice(data);
+        pos += data_len;                                     // body
+    }
+
+    // Send to netd's mailbox
+    let _ = crate::mailbox::send_message(agent_id, NETD_MAILBOX, &msg[..pos]);
+
+    data_len as i64
 }
 
 // ── recvfrom ───────────────────────────────────────────────────────────────
 
 /// recvfrom(int sockfd, void *buf, size_t len, int flags,
 ///          struct sockaddr *src_addr, socklen_t *addrlen)
-pub fn sys_recvfrom(agent_id: u16, sockfd: i32, _buf_ptr: u64, _len: u64,
+pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
                     _flags: u64, _src_addr: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
-        Some(s) => s,
-        None => return -ENOSYS,
+    let fd_flags = {
+        let st = match state::get_state(agent_id) {
+            Some(s) => s,
+            None => return -ENOSYS,
+        };
+
+        match st.get_fd(sockfd) {
+            Some(entry) if entry.kind == FdKind::Socket => entry.flags,
+            Some(_) => return -ENOTSOCK,
+            None => return -EBADF,
+        }
     };
 
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
-        Some(_) => return -ENOTSOCK,
-        None => return -EBADF,
+    if buf_ptr == 0 || len == 0 {
+        return 0;
     }
 
-    // No data available yet (non-blocking semantics)
-    -EAGAIN
+    // Try non-blocking recv from the agent's own mailbox
+    match crate::mailbox::recv_message(agent_id, agent_id) {
+        Ok(msg) => {
+            let payload_len = msg.len as usize;
+            let copy_len = payload_len.min(len as usize);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    msg.payload.as_ptr(),
+                    buf_ptr as *mut u8,
+                    copy_len,
+                );
+            }
+            copy_len as i64
+        }
+        Err(_) => {
+            // No message available
+            if fd_flags & O_NONBLOCK != 0 {
+                return -EAGAIN;
+            }
+            // Blocking mode: yield once and retry
+            crate::sched::yield_current();
+            match crate::mailbox::recv_message(agent_id, agent_id) {
+                Ok(msg) => {
+                    let payload_len = msg.len as usize;
+                    let copy_len = payload_len.min(len as usize);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            msg.payload.as_ptr(),
+                            buf_ptr as *mut u8,
+                            copy_len,
+                        );
+                    }
+                    copy_len as i64
+                }
+                Err(_) => -EAGAIN,
+            }
+        }
+    }
 }
 
 // ── sendmsg / recvmsg ──────────────────────────────────────────────────────
 
 /// sendmsg(int sockfd, const struct msghdr *msg, int flags)
-pub fn sys_sendmsg(agent_id: u16, sockfd: i32, _msg_ptr: u64, _flags: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
-        Some(s) => s,
-        None => return -ENOSYS,
-    };
-
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
-        Some(_) => return -ENOTSOCK,
-        None => return -EBADF,
+///
+/// Extracts the first iov from msghdr and delegates to sys_sendto.
+pub fn sys_sendmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 {
+    if msg_ptr == 0 {
+        return -EFAULT;
     }
 
-    // TODO: proxy through netd mailbox
-    0
+    // struct msghdr layout (x86_64):
+    //   msg_name:       *void       (offset 0,  8 bytes)
+    //   msg_namelen:    socklen_t   (offset 8,  4 bytes)
+    //   msg_iov:        *iovec      (offset 16, 8 bytes)
+    //   msg_iovlen:     size_t      (offset 24, 8 bytes)
+    // struct iovec: { iov_base: *void (8), iov_len: size_t (8) }
+    unsafe {
+        let p = msg_ptr as *const u8;
+        let iov_ptr = core::ptr::read_unaligned(p.add(16) as *const u64);
+        let iov_len = core::ptr::read_unaligned(p.add(24) as *const u64);
+
+        if iov_len == 0 || iov_ptr == 0 {
+            return 0;
+        }
+
+        // Read first iovec
+        let iov = iov_ptr as *const u8;
+        let iov_base = core::ptr::read_unaligned(iov as *const u64);
+        let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
+
+        sys_sendto(agent_id, sockfd, iov_base, iov_buf_len, flags, 0)
+    }
 }
 
 /// recvmsg(int sockfd, struct msghdr *msg, int flags)
-pub fn sys_recvmsg(agent_id: u16, sockfd: i32, _msg_ptr: u64, _flags: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
-        Some(s) => s,
-        None => return -ENOSYS,
-    };
-
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
-        Some(_) => return -ENOTSOCK,
-        None => return -EBADF,
+///
+/// Extracts the first iov from msghdr and delegates to sys_recvfrom.
+pub fn sys_recvmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 {
+    if msg_ptr == 0 {
+        return -EFAULT;
     }
 
-    -EAGAIN
+    // Extract first iovec from msghdr (same layout as sendmsg)
+    unsafe {
+        let p = msg_ptr as *const u8;
+        let iov_ptr = core::ptr::read_unaligned(p.add(16) as *const u64);
+        let iov_len = core::ptr::read_unaligned(p.add(24) as *const u64);
+
+        if iov_len == 0 || iov_ptr == 0 {
+            return 0;
+        }
+
+        let iov = iov_ptr as *const u8;
+        let iov_base = core::ptr::read_unaligned(iov as *const u64);
+        let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
+
+        sys_recvfrom(agent_id, sockfd, iov_base, iov_buf_len, flags, 0)
+    }
 }
 
 // ── shutdown ───────────────────────────────────────────────────────────────
 
 /// shutdown(int sockfd, int how)
-pub fn sys_shutdown(agent_id: u16, sockfd: i32, _how: i32) -> i64 {
-    let st = match state::get_state(agent_id) {
+///
+/// how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
+pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
+    let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
     };
@@ -183,6 +336,14 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, _how: i32) -> i64 {
         Some(entry) if entry.kind == FdKind::Socket => {}
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
+    }
+
+    let entry = st.get_fd_mut(sockfd).unwrap();
+    match how {
+        0 => entry.flags |= FD_FLAG_SHUT_RD,              // SHUT_RD
+        1 => entry.flags |= FD_FLAG_SHUT_WR,              // SHUT_WR
+        2 => entry.flags |= FD_FLAG_SHUT_RD | FD_FLAG_SHUT_WR, // SHUT_RDWR
+        _ => return -EINVAL,
     }
 
     0
@@ -191,8 +352,10 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, _how: i32) -> i64 {
 // ── bind ───────────────────────────────────────────────────────────────────
 
 /// bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-pub fn sys_bind(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
+///
+/// Stores the bind port in the fd's keyspace_key field.
+pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
+    let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
     };
@@ -202,6 +365,19 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen: u64) -> i6
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
     }
+
+    if addr_ptr == 0 {
+        return -EFAULT;
+    }
+
+    // Read sin_port from sockaddr_in (offset 2, network byte order)
+    let port = unsafe {
+        let p = addr_ptr as *const u8;
+        u16::from_be_bytes([*p.add(2), *p.add(3)])
+    };
+
+    let entry = st.get_fd_mut(sockfd).unwrap();
+    entry.keyspace_key = port as u64;
 
     0
 }
@@ -209,8 +385,10 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen: u64) -> i6
 // ── listen ─────────────────────────────────────────────────────────────────
 
 /// listen(int sockfd, int backlog)
+///
+/// Marks the socket fd as listening.
 pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
     };
@@ -220,6 +398,9 @@ pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
     }
+
+    let entry = st.get_fd_mut(sockfd).unwrap();
+    entry.flags |= FD_FLAG_LISTENING;
 
     0
 }
@@ -459,6 +640,55 @@ pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
     });
 
     fd as i64
+}
+
+// ── Formatting helpers ─────────────────────────────────────────────────────
+
+/// Format a u8 as decimal ASCII into a buffer. Returns the number of bytes written.
+fn fmt_u8(val: u8, buf: &mut [u8]) -> usize {
+    if val >= 100 {
+        let d2 = val / 100;
+        let d1 = (val / 10) % 10;
+        let d0 = val % 10;
+        if buf.len() >= 3 {
+            buf[0] = b'0' + d2;
+            buf[1] = b'0' + d1;
+            buf[2] = b'0' + d0;
+            return 3;
+        }
+    } else if val >= 10 {
+        let d1 = val / 10;
+        let d0 = val % 10;
+        if buf.len() >= 2 {
+            buf[0] = b'0' + d1;
+            buf[1] = b'0' + d0;
+            return 2;
+        }
+    } else if !buf.is_empty() {
+        buf[0] = b'0' + val;
+        return 1;
+    }
+    0
+}
+
+/// Format a u16 as decimal ASCII into a buffer. Returns the number of bytes written.
+fn fmt_u16_decimal(mut val: u16, buf: &mut [u8]) -> usize {
+    if val == 0 {
+        if !buf.is_empty() { buf[0] = b'0'; return 1; }
+        return 0;
+    }
+    let mut tmp = [0u8; 5];
+    let mut i = 0usize;
+    while val > 0 && i < 5 {
+        tmp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    let len = i.min(buf.len());
+    for j in 0..len {
+        buf[j] = tmp[i - 1 - j];
+    }
+    len
 }
 
 // ── io_uring stubs ─────────────────────────────────────────────────────────

@@ -498,21 +498,123 @@ pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64)
 
 /// Read directory entries.
 ///
-/// Directories are not first-class in ATOS Stage-1. Returns 0 (empty
-/// directory) so callers don't crash when enumerating.
+/// Enumerates active entries in the agent's keyspace as `linux_dirent64`
+/// structures.  Each key is rendered as a 16-character hex filename.
+/// The fd offset tracks how many entries have already been returned so
+/// that successive calls eventually yield 0 (end of directory).
 pub fn sys_getdents64(agent_id: u16, fd: i32, dirp_ptr: u64, count: u64) -> i64 {
-    let _ = dirp_ptr;
-    let _ = count;
-
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
 
-    match st.get_fd(fd) {
-        Some(e) if e.active => 0, // empty directory
-        _ => -EBADF,
+    let entry = match st.get_fd(fd) {
+        Some(e) if e.active => e,
+        _ => return -EBADF,
+    };
+
+    let already_returned = entry.offset as usize;
+    let buf_size = count as usize;
+
+    // Collect keys from the keyspace, skipping already-returned entries.
+    // We use a fixed-size buffer to avoid allocation.
+    const MAX_COLLECT: usize = 64;
+    let mut keys: [u64; MAX_COLLECT] = [0u64; MAX_COLLECT];
+    let mut key_count: usize = 0;
+    let mut visited: usize = 0;
+
+    crate::state::iter_entries(agent_id, |key, _value| {
+        if visited >= already_returned && key_count < MAX_COLLECT {
+            keys[key_count] = key;
+            key_count += 1;
+        }
+        visited += 1;
+        true
+    });
+
+    if key_count == 0 {
+        // If this is the very first call, return a "." entry so programs
+        // don't see a completely empty directory.
+        if already_returned == 0 {
+            // Build a minimal "." dirent64
+            // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name(".\0") = 21
+            // Align to 8 bytes → 24
+            const DOT_RECLEN: u16 = 24;
+            if buf_size < DOT_RECLEN as usize {
+                return -EINVAL;
+            }
+            let mut buf = [0u8; 24];
+            // d_ino = 1
+            buf[0..8].copy_from_slice(&1u64.to_le_bytes());
+            // d_off = 1 (offset to next)
+            buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+            // d_reclen
+            buf[16..18].copy_from_slice(&DOT_RECLEN.to_le_bytes());
+            // d_type = DT_DIR = 4
+            buf[18] = 4;
+            // d_name = "."
+            buf[19] = b'.';
+            buf[20] = 0;
+            unsafe { write_user_mem(dirp_ptr, &buf) }
+            // Advance offset so next call returns 0
+            if let Some(e) = st.get_fd_mut(fd) {
+                e.offset = 1;
+            }
+            return DOT_RECLEN as i64;
+        }
+        return 0;
     }
+
+    // Write dirent64 entries into the user buffer.
+    let mut written: usize = 0;
+    let mut entries_emitted: usize = 0;
+
+    for idx in 0..key_count {
+        // Render the key as a 16-char hex filename
+        let key = keys[idx];
+        let key_bytes = key.to_le_bytes();
+        let mut name = [0u8; 17]; // 16 hex chars + null
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for j in 0..8 {
+            name[j * 2] = HEX[(key_bytes[j] >> 4) as usize];
+            name[j * 2 + 1] = HEX[(key_bytes[j] & 0xf) as usize];
+        }
+        name[16] = 0;
+
+        // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name(17) = 36
+        // Align to 8 bytes → 40
+        let name_len = 17usize; // includes null terminator
+        let reclen_raw = 8 + 8 + 2 + 1 + name_len;
+        let reclen = (reclen_raw + 7) & !7; // align to 8
+
+        if written + reclen > buf_size {
+            break;
+        }
+
+        let mut dirent = [0u8; 40];
+        // d_ino = key (use the key itself as inode number)
+        dirent[0..8].copy_from_slice(&key.to_le_bytes());
+        // d_off = offset to next entry
+        let next_off = (already_returned + entries_emitted + 1) as u64;
+        dirent[8..16].copy_from_slice(&next_off.to_le_bytes());
+        // d_reclen
+        dirent[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        // d_type = DT_REG = 8
+        dirent[18] = 8;
+        // d_name
+        dirent[19..19 + name_len].copy_from_slice(&name[..name_len]);
+
+        unsafe { write_user_mem(dirp_ptr + written as u64, &dirent[..reclen]) }
+        written += reclen;
+        entries_emitted += 1;
+    }
+
+    // Advance the fd offset so the next call skips these entries
+    if let Some(e) = st.get_fd_mut(fd) {
+        e.offset += entries_emitted as u64;
+    }
+
+    written as i64
 }
 
 // ── sys_fcntl ──────────────────────────────────────────────────────────────
@@ -608,19 +710,23 @@ pub fn sys_dup(agent_id: u16, oldfd: i32) -> i64 {
 
 // ── sys_unlink ─────────────────────────────────────────────────────────────
 
-/// Delete a file.
+/// Delete a file by removing its keyspace entry.
 ///
-/// No-op in Stage-1: keyspace entries are not deleted to avoid accidental
-/// data loss.  Returns 0 (success) so callers proceed normally.
+/// The pathname is hashed to a keyspace key and the corresponding entry
+/// is marked inactive.  Returns 0 on success or `-ENOENT` if the key
+/// did not exist.
 pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
-    let _ = agent_id;
-
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
     if path_len == 0 {
         return -ENOENT;
     }
-    0 // no-op success
+
+    let key = path_to_key(&path_buf[..path_len]);
+    match crate::state::state_delete(agent_id, key) {
+        Ok(()) => 0,
+        Err(_) => -ENOENT,
+    }
 }
 
 // ── sys_mkdir ──────────────────────────────────────────────────────────────
@@ -837,32 +943,47 @@ pub fn sys_pwrite64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u6
     }
 }
 
-/// readv stub
-pub fn sys_readv(agent_id: u16, fd: i32, _iov: u64, _iovcnt: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
-        Some(s) => s,
-        None => return -EBADF,
-    };
-    match st.get_fd(fd) {
-        Some(e) if e.active => 0,
-        _ => -EBADF,
+/// readv — scatter-gather read
+pub fn sys_readv(agent_id: u16, fd: i32, iov_ptr: u64, iovcnt: u64) -> i64 {
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as usize {
+        let iov_addr = iov_ptr + (i * 16) as u64;
+        let base = unsafe { core::ptr::read(iov_addr as *const u64) };
+        let len = unsafe { core::ptr::read((iov_addr + 8) as *const u64) };
+        if len > 0 {
+            let result = sys_read(agent_id, fd, base, len);
+            if result < 0 {
+                return if total > 0 { total } else { result };
+            }
+            total += result;
+            if (result as u64) < len {
+                break; // short read — don't continue to next iovec
+            }
+        }
     }
+    total
 }
 
-/// writev stub
-pub fn sys_writev(agent_id: u16, fd: i32, _iov: u64, _iovcnt: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
-        Some(s) => s,
-        None => return -EBADF,
-    };
-    match st.get_fd(fd) {
-        Some(e) if e.active => 0,
-        _ => -EBADF,
+/// writev — scatter-gather write
+pub fn sys_writev(agent_id: u16, fd: i32, iov_ptr: u64, iovcnt: u64) -> i64 {
+    let mut total: i64 = 0;
+    for i in 0..iovcnt as usize {
+        let iov_addr = iov_ptr + (i * 16) as u64;
+        let base = unsafe { core::ptr::read(iov_addr as *const u64) };
+        let len = unsafe { core::ptr::read((iov_addr + 8) as *const u64) };
+        if len > 0 {
+            let result = sys_write(agent_id, fd, base, len);
+            if result < 0 {
+                return if total > 0 { total } else { result };
+            }
+            total += result;
+        }
     }
+    total
 }
 
 /// pipe(pipefd[2]) -> 0 or error
-pub fn sys_pipe(agent_id: u16, _pipefd_ptr: u64) -> i64 {
+pub fn sys_pipe(agent_id: u16, pipefd_ptr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -ENOSYS,
@@ -897,7 +1018,11 @@ pub fn sys_pipe(agent_id: u16, _pipefd_ptr: u64) -> i64 {
         active: true,
     });
 
-    // TODO: write [read_fd, write_fd] to pipefd_ptr in agent memory
+    unsafe {
+        let ptr = pipefd_ptr as *mut i32;
+        core::ptr::write(ptr, read_fd as i32);
+        core::ptr::write(ptr.add(1), write_fd as i32);
+    }
     0
 }
 
