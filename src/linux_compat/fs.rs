@@ -241,7 +241,8 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
         return -ENOENT;
     }
 
-    let key = path_to_key(&path_buf[..path_len]);
+    let path = &path_buf[..path_len];
+    let (keyspace_id, key) = super::vfs::resolve_path(agent_id, path);
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
@@ -256,6 +257,7 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
     st.fd_table[fd_idx] = Some(FdEntry {
         kind: FdKind::File,
         keyspace_key: key,
+        keyspace_id,
         mailbox_id: 0,
         offset: 0,
         flags,
@@ -1054,6 +1056,7 @@ pub fn sys_pipe(agent_id: u16, pipefd_ptr: u64) -> i64 {
     st.fd_table[read_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: O_RDONLY,
@@ -1070,6 +1073,7 @@ pub fn sys_pipe(agent_id: u16, pipefd_ptr: u64) -> i64 {
     st.fd_table[write_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: O_WRONLY,

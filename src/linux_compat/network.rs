@@ -8,6 +8,96 @@ use super::constants::*;
 use super::state::{self, FdEntry, FdKind};
 use crate::agent::MAX_MESSAGE_PAYLOAD;
 
+// ── Network I/O replay buffer ─────────────────────────────────────────────
+
+const MAX_NET_IO_LOG: usize = 256;
+const MAX_NET_IO_SIZE: usize = 256;
+
+#[repr(C)]
+struct NetIoEntry {
+    agent_id: u16,
+    data: [u8; MAX_NET_IO_SIZE],
+    len: u16,
+    tick: u64,
+    is_send: bool,
+    active: bool,
+}
+
+impl NetIoEntry {
+    const fn empty() -> Self {
+        NetIoEntry {
+            agent_id: 0,
+            data: [0u8; MAX_NET_IO_SIZE],
+            len: 0,
+            tick: 0,
+            is_send: false,
+            active: false,
+        }
+    }
+}
+
+static mut NET_IO_LOG: [NetIoEntry; MAX_NET_IO_LOG] = [const { NetIoEntry::empty() }; MAX_NET_IO_LOG];
+static mut NET_IO_COUNT: usize = 0;
+
+/// Record a network I/O payload for deterministic replay.
+fn record_network_io(agent_id: u16, data: &[u8], is_send: bool) {
+    unsafe {
+        if NET_IO_COUNT >= MAX_NET_IO_LOG {
+            return;
+        }
+        let entry = &mut NET_IO_LOG[NET_IO_COUNT];
+        entry.agent_id = agent_id;
+        let copy_len = data.len().min(MAX_NET_IO_SIZE);
+        entry.data[..copy_len].copy_from_slice(&data[..copy_len]);
+        entry.len = copy_len as u16;
+        entry.tick = crate::arch::x86_64::timer::get_ticks();
+        entry.is_send = is_send;
+        entry.active = true;
+        NET_IO_COUNT += 1;
+    }
+}
+
+/// Get a recorded network I/O entry by index.
+pub fn get_network_io(index: usize) -> Option<&'static NetIoEntry> {
+    unsafe {
+        if index < NET_IO_COUNT && NET_IO_LOG[index].active {
+            Some(&NET_IO_LOG[index])
+        } else {
+            None
+        }
+    }
+}
+
+/// Get the number of recorded network I/O entries.
+pub fn network_io_count() -> usize {
+    unsafe { NET_IO_COUNT }
+}
+
+/// Replay a recorded recv for the given agent.
+///
+/// Scans the NET_IO_LOG for the next unconsumed recv entry matching `agent_id`,
+/// copies the saved payload into the user buffer, and returns the byte count.
+fn replay_network_recv(agent_id: u16, buf_ptr: u64, count: u64) -> i64 {
+    unsafe {
+        for i in 0..NET_IO_COUNT {
+            let entry = &mut NET_IO_LOG[i];
+            if entry.active && !entry.is_send && entry.agent_id == agent_id {
+                let copy_len = (entry.len as usize).min(count as usize);
+                core::ptr::copy_nonoverlapping(
+                    entry.data.as_ptr(),
+                    buf_ptr as *mut u8,
+                    copy_len,
+                );
+                // Mark consumed so it won't be replayed again
+                entry.active = false;
+                return copy_len as i64;
+            }
+        }
+    }
+    // No more recorded data for this agent
+    -EAGAIN
+}
+
 /// Netd's mailbox ID (agent 9).
 const NETD_MAILBOX: u16 = 9;
 
@@ -38,6 +128,7 @@ pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) 
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id, // will be updated on connect
         offset: 0,
         flags: 0,
@@ -114,6 +205,7 @@ pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64)
     st.fd_table[new_fd] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: 0,
@@ -195,6 +287,14 @@ pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
     // Send to netd's mailbox
     let _ = crate::mailbox::send_message(agent_id, NETD_MAILBOX, &msg[..pos]);
 
+    // Record trace entry for deterministic replay
+    crate::checkpoint::record_trace(
+        crate::arch::x86_64::timer::get_ticks(),
+        crate::checkpoint::TRACE_NET_SEND,
+        agent_id,
+    );
+    record_network_io(agent_id, data, true);
+
     data_len as i64
 }
 
@@ -221,6 +321,11 @@ pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
         return 0;
     }
 
+    // In replay mode, read from the recorded I/O log instead of the network
+    if crate::replay::is_replay_mode() {
+        return replay_network_recv(agent_id, buf_ptr, len);
+    }
+
     // Try non-blocking recv from the agent's own mailbox
     match crate::mailbox::recv_message(agent_id, agent_id) {
         Ok(msg) => {
@@ -233,6 +338,13 @@ pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
                     copy_len,
                 );
             }
+            // Record the received data for replay determinism
+            crate::checkpoint::record_trace(
+                crate::arch::x86_64::timer::get_ticks(),
+                crate::checkpoint::TRACE_NET_RECV,
+                agent_id,
+            );
+            record_network_io(agent_id, &msg.payload[..copy_len], false);
             copy_len as i64
         }
         Err(_) => {
@@ -253,6 +365,13 @@ pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
                             copy_len,
                         );
                     }
+                    // Record the received data for replay determinism
+                    crate::checkpoint::record_trace(
+                        crate::arch::x86_64::timer::get_ticks(),
+                        crate::checkpoint::TRACE_NET_RECV,
+                        agent_id,
+                    );
+                    record_network_io(agent_id, &msg.payload[..copy_len], false);
                     copy_len as i64
                 }
                 Err(_) => -EAGAIN,
@@ -476,6 +595,7 @@ pub fn sys_socketpair(agent_id: u16, _domain: u64, _sock_type: u64, _protocol: u
     st.fd_table[fd0] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: 0,
@@ -492,6 +612,7 @@ pub fn sys_socketpair(agent_id: u16, _domain: u64, _sock_type: u64, _protocol: u
     st.fd_table[fd1] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: 0,
@@ -581,6 +702,7 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
     st.fd_table[read_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: flags as u32,
@@ -598,6 +720,7 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
     st.fd_table[write_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
+        keyspace_id: 0,
         mailbox_id: agent_id,
         offset: 0,
         flags: flags as u32,
@@ -633,6 +756,7 @@ pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::EventFd,
         keyspace_key: initval as u64, // counter value stored here
+        keyspace_id: 0,
         mailbox_id: 0,
         offset: 0,
         flags: flags as u32,
