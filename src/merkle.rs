@@ -170,7 +170,7 @@ fn hash_kv(key: u64, value: &[u8]) -> MerkleHash {
 }
 
 /// Hash two child hashes into a parent hash using SHA-256.
-fn hash_pair(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
+pub fn hash_pair(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
     let mut hasher = Sha256::new();
     hasher.update(left);
     hasher.update(right);
@@ -215,6 +215,19 @@ pub fn get_root(keyspace: KeyspaceId) -> Option<MerkleHash> {
         if idx < MAX_AGENTS {
             if let Some(ref tree) = MERKLE_TREES[idx] {
                 return Some(*tree.root());
+            }
+        }
+        None
+    }
+}
+
+/// Get the leaf count for a keyspace's Merkle tree
+pub fn get_leaf_count(keyspace: KeyspaceId) -> Option<usize> {
+    unsafe {
+        let idx = keyspace as usize;
+        if idx < MAX_AGENTS {
+            if let Some(ref tree) = MERKLE_TREES[idx] {
+                return Some(tree.leaf_count());
             }
         }
         None

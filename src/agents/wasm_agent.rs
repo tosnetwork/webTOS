@@ -16,6 +16,36 @@ use crate::mailbox;
 /// Maximum size of a deployed WASM contract binary (64 KB).
 const MAX_WASM_CODE_SIZE: usize = 65536;
 
+// ─── Input/output commitment tracking ──────────────────────────────────────
+
+/// Last input hash computed during contract call execution.
+///
+/// Safety: single-core, no preemption — written during call processing,
+/// read when building receipts.
+static mut LAST_INPUT_HASH: [u8; 32] = [0u8; 32];
+/// Last output hash computed during contract call execution.
+static mut LAST_OUTPUT_HASH: [u8; 32] = [0u8; 32];
+
+/// Record the input and output commitment hashes for the most recent execution.
+pub fn record_io_hashes(input: &[u8], output: &[u8]) {
+    let ih = crate::receipts::compute_commitment(input);
+    let oh = crate::receipts::compute_commitment(output);
+    unsafe {
+        LAST_INPUT_HASH = ih;
+        LAST_OUTPUT_HASH = oh;
+    }
+}
+
+/// Retrieve the last recorded input hash.
+pub fn last_input_hash() -> [u8; 32] {
+    unsafe { LAST_INPUT_HASH }
+}
+
+/// Retrieve the last recorded output hash.
+pub fn last_output_hash() -> [u8; 32] {
+    unsafe { LAST_OUTPUT_HASH }
+}
+
 /// Default fuel budget for contract execution per call.
 const DEFAULT_FUEL: u64 = 100_000;
 
@@ -361,6 +391,12 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 }
             }
         }
+
+        // 6b. Record input/output commitment hashes for receipt generation.
+        record_io_hashes(
+            &call_req.input[..input_len],
+            &output[..output_len],
+        );
 
         // 7. Build the response.
         let response = contract_call::build_response(status, energy_used, &output[..output_len]);

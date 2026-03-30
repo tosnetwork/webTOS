@@ -239,6 +239,51 @@ pub fn check_divergence() -> DiffReport {
     report
 }
 
+// ─── Replay bundle verification ─────────────────────────────────────────
+
+/// Structurally verify a replay bundle against its corresponding receipt.
+///
+/// Checks that:
+/// 1. The bundle's receipt_id matches the receipt's receipt_id
+/// 2. The bundle's initial_state matches the receipt's initial_state_root
+/// 3. The transcript is non-empty (has actual recorded events)
+/// 4. The checkpoint data is non-empty
+///
+/// This is a structural verification only. Full replay re-execution requires
+/// running a second ATOS instance with deterministic scheduling.
+pub fn verify_replay_bundle(bundle: &crate::receipts::ReplayBundle, receipt: &crate::receipts::ExecutionReceipt) -> bool {
+    // 1. Check receipt_id match
+    if bundle.receipt_id != receipt.receipt_id {
+        serial_println!("[REPLAY] verify: receipt_id mismatch");
+        return false;
+    }
+
+    // 2. Verify initial_state matches receipt's initial_state_root
+    //    The bundle stores the 32-byte initial_state_root in initial_state[..32]
+    if bundle.initial_state_len < 32 {
+        serial_println!("[REPLAY] verify: initial_state too short (len={})", bundle.initial_state_len);
+        return false;
+    }
+    if bundle.initial_state[..32] != receipt.initial_state_root {
+        serial_println!("[REPLAY] verify: initial_state_root mismatch");
+        return false;
+    }
+
+    // 3. Verify transcript is non-empty
+    if bundle.transcript_len == 0 {
+        serial_println!("[REPLAY] verify: transcript is empty");
+        return false;
+    }
+
+    // 4. Verify checkpoint data is non-empty
+    if bundle.checkpoint_len == 0 {
+        serial_println!("[REPLAY] verify: checkpoint data is empty");
+        return false;
+    }
+
+    true
+}
+
 /// Print a divergence report to serial output.
 pub fn print_report(report: &DiffReport) {
     serial_println!("╔══════════════════════════════════════════════╗");
