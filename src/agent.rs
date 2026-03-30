@@ -99,6 +99,7 @@ pub const E_BAD_IMAGE: i64 = -11;
 pub enum RuntimeKind {
     Native = 0,
     Wasm = 1,
+    LinuxCompat = 2,
 }
 
 /// Re-export RuntimeClass from wasm types for agent-level use.

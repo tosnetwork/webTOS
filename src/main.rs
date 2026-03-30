@@ -50,6 +50,7 @@ mod contract;
 mod contract_call;
 pub mod package;
 pub mod tcp_interface;
+pub mod linux_compat;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

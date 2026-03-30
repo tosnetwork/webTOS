@@ -85,6 +85,11 @@ pub fn spawn_from_image_with_class(
     match kind {
         RuntimeKind::Native => spawn_native_elf(caller_id, image, energy, mem_quota),
         RuntimeKind::Wasm => spawn_wasm_with_class(caller_id, image, energy, mem_quota, runtime_class),
+        RuntimeKind::LinuxCompat => {
+            // Linux compat agents are loaded as native ELF binaries
+            // with the Linux syscall translation layer enabled.
+            spawn_native_elf(caller_id, image, energy, mem_quota)
+        }
     }
 }
 
