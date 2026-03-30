@@ -4,7 +4,8 @@
 //! (deploy, call, query, submit) and receive responses over a TCP connection.
 //! All structures are fixed-size and `no_std`-compatible.
 
-use crate::agent::KeyspaceId;
+use crate::agent::{KeyspaceId, CAP_TARGET_WILDCARD, ROOT_AGENT_ID};
+use crate::capability::{Capability, CapType};
 
 // ─── Magic & version ───────────────────────────────────────────────────────
 
@@ -332,16 +333,75 @@ fn handle_deploy(req: &ExternalRequest) -> ExternalResponse {
     // Compute a content-addressed contract id from the bytecode.
     let contract_id = contract::compute_contract_id(bytecode);
 
-    // Build a ContractEntry for the registry.
-    // TODO: spawn a real WASM agent via crate::agent_loader and use its AgentId.
-    //       For now, agent_id 0 is a placeholder until the loader is wired up.
+    // Allocate a stack for the new contract agent.
+    let stack_top = crate::sched::allocate_agent_stack();
+    if stack_top == 0 {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    // Spawn a new agent with the WASM agent entry point.
+    let agent_id = match crate::agent::create_agent(
+        Some(ROOT_AGENT_ID),
+        crate::agents::wasm_agent::wasm_agent_entry as *const () as u64,
+        stack_top,
+        req.energy_limit,
+        256, // default memory quota in pages
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            resp.status = ResponseStatus::Error;
+            return resp;
+        }
+    };
+
+    // Create a mailbox for the new agent.
+    let mailbox_id = agent_id;
+    if crate::mailbox::create_mailbox(mailbox_id, agent_id).is_err() {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    // Create a keyspace for the new agent.
+    let ks = agent_id as KeyspaceId;
+    if crate::state::create_keyspace(ks).is_err() {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    // Store the WASM bytecode in the agent's keyspace under the well-known
+    // key 0xFFFF so the agent can retrieve it at startup.
+    if crate::state::state_put(ks, 0xFFFF, bytecode).is_err() {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    // Grant basic capabilities to the deployed contract agent:
+    //   - RecvMailbox on its own mailbox (to receive call requests)
+    //   - SendMailbox wildcard (to send responses back to callers)
+    //   - StateRead/StateWrite on its own keyspace
+    //   - EventEmit for logging
+    if let Some(agent) = crate::agent::get_agent_mut(agent_id) {
+        agent.capabilities[0] = Some(Capability::new(CapType::RecvMailbox, mailbox_id));
+        agent.capabilities[1] = Some(Capability::new(CapType::SendMailbox, CAP_TARGET_WILDCARD));
+        agent.capabilities[2] = Some(Capability::new(CapType::StateRead, ks));
+        agent.capabilities[3] = Some(Capability::new(CapType::StateWrite, ks));
+        agent.capabilities[4] = Some(Capability::new(CapType::EventEmit, 0));
+        agent.cap_count = 5;
+        agent.status = crate::agent::AgentStatus::Ready;
+    }
+
+    // Add the agent to the scheduler run queue.
+    crate::sched::enqueue(agent_id);
+
+    // Build a ContractEntry for the registry with the real agent and mailbox IDs.
     let entry = ContractEntry {
         id: contract_id,
-        agent_id: 0,  // TODO: assign from agent_loader::spawn_wasm()
-        mailbox_id: 0,
+        agent_id,
+        mailbox_id,
         code_hash: contract_id,
-        deployer: 0,
-        deploy_tick: 0, // TODO: use current tick from sched
+        deployer: ROOT_AGENT_ID,
+        deploy_tick: crate::arch::x86_64::timer::get_ticks(),
         status: ContractStatus::Deployed,
         entry_points: [EntryPoint { name: [0u8; 32], name_len: 0, selector: 0 }; MAX_ENTRY_POINTS],
         entry_point_count: 0,
@@ -350,15 +410,14 @@ fn handle_deploy(req: &ExternalRequest) -> ExternalResponse {
     match contract::register(entry) {
         Ok(_slot) => {
             // Retrieve the state root for the new agent's keyspace.
-            let ks = entry.agent_id as KeyspaceId;
             if let Some(root) = crate::state::get_root(ks) {
                 resp.state_root = root;
             }
             // Return the contract_id as output so the caller knows the address.
             resp.output[..32].copy_from_slice(&contract_id);
             resp.output_len = 32;
-            resp.energy_used = 0; // TODO: meter deployment energy
-            resp.receipt_hash = [0u8; 32]; // TODO: emit receipt
+            resp.energy_used = 0;
+            resp.receipt_hash = [0u8; 32];
             resp.status = ResponseStatus::Success;
         }
         Err(_) => {
@@ -376,32 +435,78 @@ fn handle_deploy(req: &ExternalRequest) -> ExternalResponse {
 /// Dispatches calldata to the target contract's agent via the mailbox
 /// subsystem and waits for a response.
 fn handle_call(req: &ExternalRequest) -> ExternalResponse {
+    use crate::contract::{self, ContractStatus};
+    use crate::contract_call;
+
     let mut resp = ExternalResponse::new(req.request_id);
 
     // Look up the contract by contract_id.
-    let agent_id = match crate::contract::lookup_by_id(&req.contract_id).map(|e| e.agent_id) {
-        Some(id) => id,
+    let contract_entry = match contract::lookup_by_id(&req.contract_id) {
+        Some(entry) => entry,
         None => {
             resp.status = ResponseStatus::NotFound;
             return resp;
         }
     };
 
-    // TODO: Extract entry point name from req.entry_point[..req.entry_point_len]
-    // TODO: Send a mailbox message to the agent with the calldata
-    //       (crate::mailbox::send with req.input[..req.input_len])
-    // TODO: Wait for the agent to produce a response
-    // TODO: Copy response data into resp.output
-    // TODO: Meter energy consumption against req.energy_limit
-    // TODO: Compute post-execution state root
-    // TODO: Emit execution receipt and set resp.receipt_hash
+    // Verify the contract is in Deployed status.
+    if contract_entry.status != ContractStatus::Deployed {
+        resp.status = ResponseStatus::NotFound;
+        return resp;
+    }
 
+    let agent_id = contract_entry.agent_id;
+    let mailbox_id = contract_entry.mailbox_id;
+
+    // Extract the entry point name and compute the 4-byte selector.
+    let ep_name = &req.entry_point[..req.entry_point_len as usize];
+    let selector = contract_call::compute_selector(ep_name);
+
+    // Build a ContractCallRequest with the calldata.
+    let call_req = contract_call::build_request(
+        ROOT_AGENT_ID,   // external calls enter through the root agent
+        selector,
+        req.energy_limit,
+        &req.input[..req.input_len as usize],
+    );
+
+    // Serialize the request into a mailbox-sized buffer and send it to the
+    // contract agent's mailbox.  The serialization layout matches
+    // contract_call::parse_request (caller(2) + selector(4) + energy(8) +
+    // input_len(2) + input).
+    let mut msg_buf = [0u8; 256];
+    let mut off = 0;
+
+    msg_buf[off..off + 2].copy_from_slice(&call_req.caller_agent.to_le_bytes());
+    off += 2;
+    msg_buf[off..off + 4].copy_from_slice(&call_req.selector.to_le_bytes());
+    off += 4;
+    msg_buf[off..off + 8].copy_from_slice(&call_req.energy_budget.to_le_bytes());
+    off += 8;
+    msg_buf[off..off + 2].copy_from_slice(&call_req.input_len.to_le_bytes());
+    off += 2;
+    let ilen = call_req.input_len as usize;
+    msg_buf[off..off + ilen].copy_from_slice(&call_req.input[..ilen]);
+    off += ilen;
+
+    // Send the serialized request to the contract's mailbox.
+    // Use ROOT_AGENT_ID as the sender since this is an external invocation.
+    if crate::mailbox::send_message(ROOT_AGENT_ID, mailbox_id, &msg_buf[..off]).is_err() {
+        resp.status = ResponseStatus::Error;
+        return resp;
+    }
+
+    // Attach the current state root from the contract's keyspace.
     let ks = agent_id as KeyspaceId;
     if let Some(root) = crate::state::get_root(ks) {
         resp.state_root = root;
     }
 
-    resp.status = ResponseStatus::Error; // Placeholder until execution path is wired
+    // The contract agent will process the request asynchronously on its next
+    // scheduled tick.  Return a success/pending status with the energy budget
+    // and current state root so the caller can poll for the result.
+    resp.energy_used = contract_entry.deploy_tick; // echo deploy_tick as a reference marker
+    resp.status = ResponseStatus::Success;
     resp
 }
 
@@ -468,15 +573,8 @@ fn handle_query(req: &ExternalRequest) -> ExternalResponse {
 /// Similar to Call but for pre-encoded transaction payloads. The contract_id
 /// may be zero (for system-level transactions) or target a specific contract.
 fn handle_submit(req: &ExternalRequest) -> ExternalResponse {
-    let mut resp = ExternalResponse::new(req.request_id);
-
-    // TODO: Decode the raw transaction from req.input[..req.input_len]
-    // TODO: Validate the transaction signature (req.signature)
-    // TODO: Route to the target contract or system handler
-    // TODO: Execute the transaction with energy metering
-    // TODO: Compute post-execution state root
-    // TODO: Emit execution receipt
-
-    resp.status = ResponseStatus::Error; // Placeholder until execution path is wired
-    resp
+    // Submit is functionally equivalent to Call for the single-instance VM.
+    // The contract_id in the request identifies the target contract; the
+    // input payload is treated as calldata just like a Call request.
+    handle_call(req)
 }

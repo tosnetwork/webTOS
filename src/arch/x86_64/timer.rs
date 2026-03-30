@@ -34,6 +34,12 @@ pub fn get_ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Set the tick counter to a specific value.
+/// Used by replay to restore tick state from a checkpoint.
+pub fn set_ticks(val: u64) {
+    TICKS.store(val, Ordering::Relaxed);
+}
+
 /// Increment the tick counter. Called from the timer interrupt handler.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);

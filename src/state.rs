@@ -297,9 +297,66 @@ pub fn get_historical_root(keyspace: KeyspaceId, version: u32) -> Option<MerkleH
     }
 }
 
+/// Find the entry index for a key in a keyspace.
+///
+/// Returns `Some(index)` if the key exists in the keyspace, where `index` is
+/// the position in the entries array (and thus the Merkle tree leaf index).
+pub fn find_entry_index(keyspace: KeyspaceId, key: u64) -> Option<usize> {
+    unsafe {
+        let idx = keyspace as usize;
+        if idx >= MAX_AGENTS {
+            return None;
+        }
+        match KEYSPACES[idx].as_ref() {
+            Some(ks) => {
+                for (i, entry) in ks.entries.iter().enumerate() {
+                    if entry.active && entry.key == key {
+                        return Some(i);
+                    }
+                }
+                None
+            }
+            None => None,
+        }
+    }
+}
+
 /// Return the current Merkle root for a keyspace.
 pub fn get_root(keyspace: KeyspaceId) -> Option<MerkleHash> {
     merkle::get_root(keyspace)
+}
+
+/// Compact a keyspace's root history by trimming it to the most recent `keep`
+/// entries.  Returns `true` if entries were actually removed, `false` if the
+/// history was already at or below `keep`.
+pub fn compact_keyspace_history(keyspace_id: KeyspaceId, keep: u8) -> bool {
+    unsafe {
+        let idx = keyspace_id as usize;
+        if idx >= MAX_AGENTS {
+            return false;
+        }
+        let ks = match KEYSPACES[idx].as_mut() {
+            Some(ks) => ks,
+            None => return false,
+        };
+        let count = ks.root_history_count as usize;
+        let keep = keep as usize;
+        if count <= keep {
+            return false;
+        }
+        // Keep the most recent `keep` entries: they sit at indices [count-keep .. count).
+        // Shift them to the front of the array.
+        let start = count - keep;
+        for i in 0..keep {
+            ks.root_history[i] = ks.root_history[start + i];
+        }
+        // Zero out the vacated tail slots
+        for i in keep..count {
+            ks.root_history[i] = (0u32, [0u8; 32]);
+        }
+        ks.root_history_count = keep as u8;
+        true
+    }
 }
 
 // ─── State transaction model ────────────────────────────────────────────────

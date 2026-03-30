@@ -121,6 +121,13 @@ pub fn get_sequence() -> u64 {
     unsafe { EVENT_SEQUENCE }
 }
 
+/// Set the event sequence counter to a specific value.
+/// Used by replay to restore sequence state from a checkpoint.
+pub fn set_sequence(val: u64) {
+    // Safety: single-core, no preemption during event access
+    unsafe { EVENT_SEQUENCE = val; }
+}
+
 // ─── Core emit function ─────────────────────────────────────────────────────
 
 /// Emit a structured audit event.
