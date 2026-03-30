@@ -51,6 +51,8 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         SYS_CHDIR => fs::sys_chdir(agent_id, a1),
         SYS_MKDIR => fs::sys_mkdir(agent_id, a1, a2 as u32),
         SYS_READLINK => fs::sys_readlink(agent_id, a1, a2, a3),
+        SYS_OPENAT => fs::sys_openat(agent_id, a1 as i32, a2, a3 as u32, a4 as u32),
+        SYS_NEWFSTATAT => fs::sys_newfstatat(agent_id, a1 as i32, a2, a3, a4 as u32),
         SYS_GETDENTS64 => fs::sys_getdents64(agent_id, a1 as i32, a2, a3),
         SYS_IOCTL => fs::sys_ioctl(agent_id, a1 as i32, a2, a3),
 

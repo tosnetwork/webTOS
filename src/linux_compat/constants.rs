@@ -137,8 +137,18 @@ pub const SYS_GETTID: u64 = 186;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
 
 // ── Misc ────────────────────────────────────────────────────────────────────
+pub const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_FCHDIR: u64 = 81;
+pub const SYS_UNLINK: u64 = 87;
+pub const SYS_OPENAT: u64 = 257;
+pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
+pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_GETRANDOM: u64 = 318;
+pub const SYS_RSEQ: u64 = 334;
+pub const SYS_IO_URING_SETUP: u64 = 425;
+pub const SYS_IO_URING_ENTER: u64 = 426;
 pub const SYS_CLONE3: u64 = 435;
 
 // ── Linux errno values ──────────────────────────────────────────────────────
