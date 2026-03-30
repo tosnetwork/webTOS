@@ -36,22 +36,17 @@ pub const STATUS_ERROR: u8 = 3;
 /// `ContractCallResponse` from the callee.
 pub const STATUS_PENDING: u8 = 4;
 
-// ─── FNV-1a selector computation ────────────────────────────────────────────
+// ─── SHA-256 selector computation ───────────────────────────────────────────
 
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
+use sha2::{Sha256, Digest};
 
-/// Compute a 4-byte function selector from a function name using FNV-1a.
+/// Compute a 4-byte function selector from a function name using SHA-256.
 ///
-/// Takes the upper 32 bits of the 64-bit FNV-1a hash, consistent with
-/// `crate::contract::compute_selector`.
+/// Returns the first 4 bytes of the SHA-256 hash as a big-endian u32,
+/// consistent with `crate::contract::compute_selector`.
 pub fn compute_selector(name: &[u8]) -> u32 {
-    let mut h = FNV_OFFSET;
-    for &b in name {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    (h >> 32) as u32
+    let hash = Sha256::digest(name);
+    u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]])
 }
 
 // ─── ContractCallRequest ────────────────────────────────────────────────────
@@ -63,7 +58,7 @@ pub fn compute_selector(name: &[u8]) -> u32 {
 pub struct ContractCallRequest {
     /// Agent ID of the caller.
     pub caller_agent: u16,
-    /// 4-byte function selector (FNV-1a hash of entry point name).
+    /// 4-byte function selector (SHA-256 hash of entry point name, first 4 bytes).
     pub selector: u32,
     /// Energy budget allocated by the caller for this invocation.
     pub energy_budget: u64,

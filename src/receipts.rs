@@ -111,15 +111,18 @@ impl ExecutionReceipt {
         input_hash: Hash256,
         output_hash: Hash256,
     ) -> Self {
-        // Generate receipt_id from hash of key fields
+        // Generate receipt_id from SHA-256 of key fields
         let mut receipt_id = [0u8; 32];
-        // Simple FNV-based hash for now
-        let mut h: u64 = 0xcbf29ce484222325;
-        h = h.wrapping_mul(0x100000001b3) ^ (agent_id as u64);
-        h = h.wrapping_mul(0x100000001b3) ^ tick_start;
-        h = h.wrapping_mul(0x100000001b3) ^ tick_end;
-        h = h.wrapping_mul(0x100000001b3) ^ energy_used;
-        receipt_id[0..8].copy_from_slice(&h.to_le_bytes());
+        {
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&(agent_id as u64).to_le_bytes());
+            hasher.update(&tick_start.to_le_bytes());
+            hasher.update(&tick_end.to_le_bytes());
+            hasher.update(&energy_used.to_le_bytes());
+            let result = hasher.finalize();
+            receipt_id.copy_from_slice(&result);
+        }
 
         Self {
             receipt_version: 1,
@@ -152,7 +155,7 @@ impl ExecutionReceipt {
     /// critical receipt fields into a buffer and sign it with a deterministic
     /// "hash key" derived from the receipt_id. The first 32 bytes of the
     /// resulting signature are used as the hash. This provides collision
-    /// resistance far beyond the previous FNV-1a placeholder.
+    /// resistance needed for cryptographic commitments.
     pub fn compute_hash(&self) -> Hash256 {
         // Serialise all critical fields into a flat buffer for hashing.
         let mut buf = [0u8; 256];

@@ -1,9 +1,10 @@
 //! Standalone execution proof verifier
 //!
 //! Reads an ATOS execution proof file (ATSP format) and verifies
-//! the hash chain integrity.
+//! the hash chain integrity using SHA-256.
 
 use std::fs;
+use sha2::{Sha256, Digest};
 
 const PROOF_MAGIC: &[u8; 4] = b"ATSP";
 const PROOF_VERSION: u8 = 1;
@@ -33,19 +34,16 @@ pub fn verify_file(path: &str) {
         std::process::exit(1);
     }
 
-    // Validate magic
     if &data[0..4] != PROOF_MAGIC {
         eprintln!("[atos-verify] Invalid magic: expected ATSP, got {:?}", &data[0..4]);
         std::process::exit(1);
     }
 
-    // Validate version
     if data[4] != PROOF_VERSION {
         eprintln!("[atos-verify] Unsupported version: {}", data[4]);
         std::process::exit(1);
     }
 
-    // Parse proof
     let proof = parse_proof(&data);
 
     println!("╔══════════════════════════════════════════════╗");
@@ -67,14 +65,14 @@ pub fn verify_file(path: &str) {
         proof.proof_hash[6], proof.proof_hash[7]);
     println!("╠══════════════════════════════════════════════╣");
 
-    // Verify hash chain: H(root || tick || event_count) should equal proof_hash
-    let recomputed = fnv1a_128_proof(&proof.checkpoint_root, proof.checkpoint_tick, proof.event_count);
+    // Verify hash chain: SHA-256(root || tick || event_count) truncated to 16 bytes
+    let recomputed = sha256_proof(&proof.checkpoint_root, proof.checkpoint_tick, proof.event_count);
 
     if recomputed == proof.proof_hash {
-        println!("║ Status: ✓ VALID                              ║");
+        println!("║ Status: VALID                                ║");
         println!("║ Hash chain verified successfully              ║");
     } else {
-        println!("║ Status: ✗ INVALID                             ║");
+        println!("║ Status: INVALID                               ║");
         println!("║ Hash chain verification FAILED                ║");
         println!("║ Expected: {:02x}{:02x}{:02x}{:02x}...                      ║",
             recomputed[0], recomputed[1], recomputed[2], recomputed[3]);
@@ -102,29 +100,17 @@ fn parse_proof(data: &[u8]) -> ExecutionProof {
     }
 }
 
-/// FNV-1a 128-bit hash — must match the kernel's implementation exactly
-fn fnv1a_128_proof(root: &[u8; 16], tick: u64, event_count: u64) -> [u8; 16] {
-    // FNV-1a 128-bit offset basis and prime (same as kernel merkle.rs)
-    let mut h: u128 = 0x6c62272e07bb0142_62b821756295c58d;
-    let prime: u128 = 0x0000000001000000_000000000000013B;
-
-    // Hash root bytes
-    for &b in root.iter() {
-        h ^= b as u128;
-        h = h.wrapping_mul(prime);
-    }
-    // Hash tick
-    for &b in &tick.to_le_bytes() {
-        h ^= b as u128;
-        h = h.wrapping_mul(prime);
-    }
-    // Hash event_count
-    for &b in &event_count.to_le_bytes() {
-        h ^= b as u128;
-        h = h.wrapping_mul(prime);
-    }
-
-    h.to_le_bytes()
+/// SHA-256 proof hash — must match the kernel's implementation.
+/// Computes SHA-256(root || tick || event_count) and truncates to 16 bytes.
+fn sha256_proof(root: &[u8; 16], tick: u64, event_count: u64) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(root);
+    hasher.update(&tick.to_le_bytes());
+    hasher.update(&event_count.to_le_bytes());
+    let result = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&result[..16]);
+    out
 }
 
 fn truncate(s: &str, max: usize) -> &str {

@@ -46,15 +46,13 @@ impl PackageManifest {
         core::str::from_utf8(&self.author[..self.author_len as usize]).unwrap_or("")
     }
 
-    /// Verify code hash matches actual code (FNV-1a, first 8 bytes).
+    /// Verify code hash matches actual code (SHA-256).
     pub fn verify_code_hash(&self, code: &[u8]) -> bool {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in code {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        let mut expected = [0u8; 8];
-        expected.copy_from_slice(&h.to_le_bytes());
-        expected == self.code_hash[0..8]
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(code);
+        let mut computed = [0u8; 32];
+        computed.copy_from_slice(&hash);
+        computed == self.code_hash
     }
 }
 

@@ -63,13 +63,11 @@ fn cmd_build(args: &[String]) {
     let name = input.rsplit('/').next().unwrap_or(input);
     let name_bytes = name.as_bytes();
 
-    // Compute code hash (FNV-1a)
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in &wasm_bytes {
-        h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-    }
+    // Compute code hash (SHA-256)
+    use sha2::{Sha256, Digest};
+    let hash = Sha256::digest(&wasm_bytes);
     let mut code_hash = [0u8; 32];
-    code_hash[0..8].copy_from_slice(&h.to_le_bytes());
+    code_hash.copy_from_slice(&hash);
 
     // Build manifest (simplified binary format matching kernel's PackageManifest)
     let mut manifest = vec![0u8; 256]; // fixed-size manifest
@@ -94,12 +92,9 @@ fn cmd_build(args: &[String]) {
     // manifest_hash at 184, 32 bytes (computed later)
     // signature at 216, 64 bytes (added by 'sign')
 
-    // Compute manifest hash
-    let mut mh: u64 = 0xcbf29ce484222325;
-    for b in &manifest[0..184] {
-        mh = mh.wrapping_mul(0x100000001b3) ^ (*b as u64);
-    }
-    manifest[184..192].copy_from_slice(&mh.to_le_bytes());
+    // Compute manifest hash (SHA-256)
+    let manifest_hash = Sha256::digest(&manifest[0..184]);
+    manifest[184..216].copy_from_slice(&manifest_hash);
 
     // Write .tos file
     let manifest_size = manifest.len() as u32;
@@ -112,11 +107,14 @@ fn cmd_build(args: &[String]) {
     output_data.extend_from_slice(&wasm_bytes);
 
     match fs::write(output, &output_data) {
-        Ok(()) => println!(
-            "Built {output} ({} bytes, code hash: {:016x})",
-            output_data.len(),
-            h
-        ),
+        Ok(()) => {
+            let hash_hex: String = code_hash.iter().map(|b| format!("{b:02x}")).collect();
+            println!(
+                "Built {output} ({} bytes, code hash: {})",
+                output_data.len(),
+                hash_hex
+            );
+        }
         Err(e) => {
             eprintln!("Error writing {output}: {e}");
             process::exit(1);
@@ -241,17 +239,13 @@ fn cmd_verify(args: &[String]) {
         0
     };
 
-    // Verify code hash
+    // Verify code hash (SHA-256)
     if code_offset + code_size <= data.len() {
+        use sha2::{Sha256, Digest};
         let code = &data[code_offset..code_offset + code_size];
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in code {
-            h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        let mut expected = [0u8; 8];
-        expected.copy_from_slice(&data[4 + 152..4 + 160]);
-        let actual = h.to_le_bytes();
-        if expected == actual {
+        let computed = Sha256::digest(code);
+        let expected = &data[4 + 152..4 + 184];
+        if computed.as_slice() == expected {
             println!("\u{2713} Code hash verified");
         } else {
             println!("\u{2717} Code hash MISMATCH");

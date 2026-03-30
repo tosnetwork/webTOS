@@ -9,6 +9,7 @@ description = "ATOS Package Tool - build, sign, install, and manage .tos package
 [dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+sha2 = "0.10"
 
 [[bin]]
 name = "atp"

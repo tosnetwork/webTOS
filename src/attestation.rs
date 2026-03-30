@@ -3,7 +3,7 @@
 //! Provides kernel measurement and attestation report generation.
 //! When a TPM 2.0 CRB is available, measurements use hardware PCR values
 //! and the report is signed with Ed25519 using the node's signing key.
-//! When no TPM is present, falls back to a keyed-hash (FNV-based) approach.
+//! When no TPM is present, falls back to a keyed SHA-256 hash approach.
 //!
 //! The measurement covers:
 //!   - A hash of the kernel's `.text` section bounds (start/end pointers)
@@ -17,17 +17,6 @@
 
 use crate::serial_println;
 use crate::crypto;
-
-// ─── FNV-1a helpers (local copy so attestation has no external hash dep) ──
-
-fn fnv1a_64(data: &[u8], offset_basis: u64) -> u64 {
-    let mut hash = offset_basis;
-    for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
-}
 
 /// Produce a 32-byte SHA-256 hash over `data`.
 fn sha256_hash(data: &[u8]) -> [u8; 32] {
@@ -52,8 +41,8 @@ fn chain_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 
 /// Kernel measurement: hash of critical kernel state at boot.
 ///
-/// `kernel_hash`      — FNV-1a over the kernel `.text` section address bounds.
-/// `boot_config_hash` — FNV-1a over the boot-time configuration (tick, agent
+/// `kernel_hash`      — SHA-256 over the kernel `.text` section address bounds.
+/// `boot_config_hash` — SHA-256 over the boot-time configuration (tick, agent
 ///                      count, event sequence).
 pub struct KernelMeasurement {
     /// SHA-256 of kernel .text section bounds (start + end addresses).
@@ -94,7 +83,7 @@ pub fn measure_kernel() -> KernelMeasurement {
     let tick = crate::arch::x86_64::timer::get_ticks();
     let event_seq = crate::event::get_sequence();
 
-    // ── kernel_hash: FNV-1a over .text bounds ──────────────────────────────
+    // ── kernel_hash: SHA-256 over .text bounds ─────────────────────────────
     // Use the address of kernel_main as the start of .text, and a fixed
     // sentinel to approximate the end.  In a production build a linker script
     // would expose __kernel_text_start / __kernel_text_end.
@@ -108,7 +97,7 @@ pub fn measure_kernel() -> KernelMeasurement {
     text_buf[8..16].copy_from_slice(&text_end.to_le_bytes());
     let mut kernel_hash = sha256_hash(&text_buf);
 
-    // ── boot_config_hash: FNV-1a over tick + agent_count + event_seq ───────
+    // ── boot_config_hash: SHA-256 over tick + agent_count + event_seq ──────
     let mut agent_count: u32 = 0;
     crate::agent::for_each_agent_mut(|agent| {
         if agent.active {
@@ -148,7 +137,7 @@ pub fn measure_kernel() -> KernelMeasurement {
 /// When a TPM is available, the report reads PCR0/PCR1 into the
 /// measurement, extends a PCR with the combined measurement data,
 /// and signs the report with Ed25519.  Otherwise falls back to a
-/// keyed FNV-1a hash.
+/// keyed SHA-256 hash.
 pub fn generate_report(secret: &[u8; 32]) -> AttestationReport {
     let measurement = measure_kernel();
 
@@ -184,21 +173,16 @@ pub fn generate_report(secret: &[u8; 32]) -> AttestationReport {
             verifying_key: vk_bytes,
         }
     } else {
-        // ── Fallback: keyed FNV-1a hash (no TPM) ──────────────────────
-        let mut sig_input = [0u8; 64]; // combined(32) + secret(32)
-        sig_input[0..32].copy_from_slice(&combined);
-        sig_input[32..64].copy_from_slice(secret);
+        // ── Fallback: SHA-256 keyed hash (no TPM) ─────────────────────
+        // HMAC-like construction: SHA-256(secret || combined)
+        let mut sig_input = [0u8; 64]; // secret(32) + combined(32)
+        sig_input[0..32].copy_from_slice(secret);
+        sig_input[32..64].copy_from_slice(&combined);
 
-        let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
-        let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
-        let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
-        let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
+        let keyed_hash = sha256_hash(&sig_input);
 
         let mut signature = [0u8; 64];
-        signature[0..8].copy_from_slice(&h1.to_le_bytes());
-        signature[8..16].copy_from_slice(&h2.to_le_bytes());
-        signature[16..24].copy_from_slice(&h3.to_le_bytes());
-        signature[24..32].copy_from_slice(&h4.to_le_bytes());
+        signature[0..32].copy_from_slice(&keyed_hash);
         // bytes [32..64] remain zero — distinguishes fallback from Ed25519
 
         AttestationReport {
@@ -216,7 +200,7 @@ pub fn generate_report(secret: &[u8; 32]) -> AttestationReport {
 /// For TPM-backed reports: verifies the Ed25519 signature using the
 /// embedded verifying key against the recomputed measurement hash.
 ///
-/// For fallback reports: recomputes the keyed FNV-1a hash using
+/// For fallback reports: recomputes the keyed SHA-256 hash using
 /// `secret` and compares it to the stored signature.
 ///
 /// Returns `true` if the report is authentic.
@@ -236,21 +220,16 @@ pub fn verify_report(report: &AttestationReport, secret: &[u8; 32]) -> bool {
         let sig = crypto::Signature::from_bytes(&report.signature);
         crypto::verify(&vk, &combined, &sig)
     } else {
-        // ── Fallback: keyed FNV-1a verification ────────────────────────
+        // ── Fallback: SHA-256 keyed hash verification ───────────────────
+        // Recompute: SHA-256(secret || combined)
         let mut sig_input = [0u8; 64];
-        sig_input[0..32].copy_from_slice(&combined);
-        sig_input[32..64].copy_from_slice(secret);
+        sig_input[0..32].copy_from_slice(secret);
+        sig_input[32..64].copy_from_slice(&combined);
 
-        let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
-        let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
-        let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
-        let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
+        let keyed_hash = sha256_hash(&sig_input);
 
         let mut expected = [0u8; 64];
-        expected[0..8].copy_from_slice(&h1.to_le_bytes());
-        expected[8..16].copy_from_slice(&h2.to_le_bytes());
-        expected[16..24].copy_from_slice(&h3.to_le_bytes());
-        expected[24..32].copy_from_slice(&h4.to_le_bytes());
+        expected[0..32].copy_from_slice(&keyed_hash);
         // [32..64] stays zero, matching fallback signature layout
 
         // Constant-time comparison to avoid timing side-channels.

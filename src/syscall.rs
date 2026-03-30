@@ -60,7 +60,8 @@ pub fn transcript_count() -> usize {
 
 /// Compute a hash commitment over transcript entries for a given agent within a tick range.
 pub fn compute_transcript_hash(agent_id: u16, tick_start: u64, tick_end: u64) -> [u8; 32] {
-    let mut h: u64 = 0xcbf29ce484222325;
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
     unsafe {
         let cap = TRANSCRIPT_CAP;
         let count = if TRANSCRIPT_WRAP { cap } else { TRANSCRIPT_LEN };
@@ -69,18 +70,16 @@ pub fn compute_transcript_hash(agent_id: u16, tick_start: u64, tick_end: u64) ->
             let idx = (start + i) % cap;
             let e = &TRANSCRIPT[idx];
             if e.agent_id == agent_id && e.tick >= tick_start && e.tick <= tick_end {
-                h = h.wrapping_mul(0x100000001b3) ^ e.syscall_num;
-                h = h.wrapping_mul(0x100000001b3) ^ e.arg0;
-                h = h.wrapping_mul(0x100000001b3) ^ (e.result as u64);
-                h = h.wrapping_mul(0x100000001b3) ^ e.tick;
+                hasher.update(&e.syscall_num.to_le_bytes());
+                hasher.update(&e.arg0.to_le_bytes());
+                hasher.update(&(e.result as u64).to_le_bytes());
+                hasher.update(&e.tick.to_le_bytes());
             }
         }
     }
+    let hash = hasher.finalize();
     let mut result = [0u8; 32];
-    result[0..8].copy_from_slice(&h.to_le_bytes());
-    // Second pass for more entropy
-    h = h.wrapping_mul(0x100000001b3) ^ 0xdeadbeef;
-    result[8..16].copy_from_slice(&h.to_le_bytes());
+    result.copy_from_slice(&hash);
     result
 }
 

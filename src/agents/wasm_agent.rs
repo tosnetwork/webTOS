@@ -177,12 +177,12 @@ fn run_wasm_function(
 /// Try to find an exported function suitable for handling a contract call.
 ///
 /// Lookup order:
-///   1. An export whose name matches the selector (checked via FNV-1a hash
-///      of the export name against the 4-byte selector).
+///   1. An export whose name matches the selector (checked via SHA-256 hash
+///      of the export name, truncated to 4 bytes).
 ///   2. Well-known names: "call", "handle", "main", "run".
 fn find_call_export(module: &wasm::decoder::WasmModule, selector: u32) -> Option<u32> {
     // 1. Try to match the selector against all exported functions by computing
-    //    FNV-1a of each export name and comparing the first 4 bytes.
+    //    SHA-256 of each export name and comparing the first 4 bytes.
     for exp in module.get_exports() {
         if let wasm::decoder::ExportKind::Func(idx) = exp.kind {
             let name = module.get_name(exp.name_offset, exp.name_len);
