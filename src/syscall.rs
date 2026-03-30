@@ -144,10 +144,10 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
     }
 
     // ── LinuxCompat ABI routing ──────────────────────────────────────────
-    // If this agent uses the Linux syscall ABI, route to the Linux compat
-    // dispatcher instead of the ATOS native dispatcher.
-    if let Some(agent) = get_agent(caller_id) {
-        if agent.runtime_kind == RuntimeKind::LinuxCompat {
+    // If this agent has a LinuxAgentState initialized, route to the Linux
+    // compat dispatcher instead of the ATOS native dispatcher.
+    if crate::linux_compat::state::get_state(caller_id).is_some() {
+        {
             let result = crate::linux_compat::dispatch::dispatch(
                 caller_id, num, a1, a2, a3, _a4, _a5,
             );
