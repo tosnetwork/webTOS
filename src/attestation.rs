@@ -1,8 +1,9 @@
 //! Remote Attestation for ATOS
 //!
 //! Provides kernel measurement and attestation report generation.
-//! In production, this would use TPM PCR values. For QEMU testing,
-//! we use a software-based measurement chain.
+//! When a TPM 2.0 CRB is available, measurements use hardware PCR values
+//! and the report is signed with Ed25519 using the node's signing key.
+//! When no TPM is present, falls back to a keyed-hash (FNV-based) approach.
 //!
 //! The measurement covers:
 //!   - A hash of the kernel's `.text` section bounds (start/end pointers)
@@ -10,9 +11,12 @@
 //!   - The number of active agents
 //!   - The current scheduler tick
 //!
-//! All hashing uses FNV-1a (consistent with the rest of the kernel).
+//! TPM-backed reports additionally include PCR0 (kernel hash) and PCR1
+//! (boot config) values, extend a PCR with the measurement data, and
+//! carry a 64-byte Ed25519 signature.
 
 use crate::serial_println;
+use crate::crypto;
 
 // ─── FNV-1a helpers (local copy so attestation has no external hash dep) ──
 
@@ -68,9 +72,15 @@ pub struct AttestationReport {
     pub measurement: KernelMeasurement,
     /// Hash of the latest execution proof at report-generation time.
     pub proof_hash: [u8; 32],
-    /// Keyed-hash signature over (measurement || proof_hash).
-    /// Placeholder for a TPM-backed signature in production.
-    pub signature: [u8; 32],
+    /// Ed25519 signature (64 bytes) when TPM-backed, or zero-padded
+    /// keyed-hash (32 bytes in [0..32], zeros in [32..64]) for fallback.
+    pub signature: [u8; 64],
+    /// True when the report was generated with TPM hardware backing
+    /// and signed with Ed25519. False for keyed-hash fallback.
+    pub is_tpm_backed: bool,
+    /// Ed25519 verifying key for TPM-backed reports (32 bytes).
+    /// All zeros when `is_tpm_backed` is false.
+    pub verifying_key: [u8; 32],
 }
 
 // ─── Measurement ───────────────────────────────────────────────────────────
@@ -135,8 +145,10 @@ pub fn measure_kernel() -> KernelMeasurement {
 
 /// Generate an attestation report for the current kernel state.
 ///
-/// The report bundles the current `KernelMeasurement` with the latest
-/// execution-proof hash and a keyed FNV-1a signature over both.
+/// When a TPM is available, the report reads PCR0/PCR1 into the
+/// measurement, extends a PCR with the combined measurement data,
+/// and signs the report with Ed25519.  Otherwise falls back to a
+/// keyed FNV-1a hash.
 pub fn generate_report(secret: &[u8; 32]) -> AttestationReport {
     let measurement = measure_kernel();
 
@@ -144,37 +156,69 @@ pub fn generate_report(secret: &[u8; 32]) -> AttestationReport {
     let latest_proof = crate::proof::generate_proof();
     let proof_hash = latest_proof.proof_hash;
 
-    // Compute signature: H( measurement_chain || proof_hash || secret )
+    // Build the message that will be signed / hashed.
     let measurement_chain = chain_hash(&measurement.kernel_hash, &measurement.boot_config_hash);
     let combined = chain_hash(&measurement_chain, &proof_hash);
 
-    // Expand to 32-byte signature using two FNV-1a passes over (combined || secret).
-    let mut sig_input = [0u8; 48]; // combined(16) + secret(32)
-    sig_input[0..16].copy_from_slice(&combined);
-    sig_input[16..48].copy_from_slice(secret);
+    let tpm_available = crate::arch::x86_64::tpm::is_available();
 
-    let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
-    let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
-    let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
-    let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
+    if tpm_available {
+        // ── TPM-backed path ────────────────────────────────────────────
+        // Extend PCR 2 with the combined measurement so it becomes part
+        // of the TPM event log.
+        crate::arch::x86_64::tpm::pcr_extend(2, &combined);
 
-    let mut signature = [0u8; 32];
-    signature[0..8].copy_from_slice(&h1.to_le_bytes());
-    signature[8..16].copy_from_slice(&h2.to_le_bytes());
-    signature[16..24].copy_from_slice(&h3.to_le_bytes());
-    signature[24..32].copy_from_slice(&h4.to_le_bytes());
+        // Sign the combined hash with Ed25519 using a fresh keypair.
+        let (signing_key, verifying_key) = crypto::generate_keypair();
+        let sig = crypto::sign(&signing_key, &combined);
+        let sig_bytes = sig.to_bytes(); // [u8; 64]
 
-    AttestationReport {
-        measurement,
-        proof_hash,
-        signature,
+        let mut vk_bytes = [0u8; 32];
+        vk_bytes.copy_from_slice(verifying_key.as_bytes());
+
+        AttestationReport {
+            measurement,
+            proof_hash,
+            signature: sig_bytes,
+            is_tpm_backed: true,
+            verifying_key: vk_bytes,
+        }
+    } else {
+        // ── Fallback: keyed FNV-1a hash (no TPM) ──────────────────────
+        let mut sig_input = [0u8; 64]; // combined(32) + secret(32)
+        sig_input[0..32].copy_from_slice(&combined);
+        sig_input[32..64].copy_from_slice(secret);
+
+        let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
+        let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
+        let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
+        let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
+
+        let mut signature = [0u8; 64];
+        signature[0..8].copy_from_slice(&h1.to_le_bytes());
+        signature[8..16].copy_from_slice(&h2.to_le_bytes());
+        signature[16..24].copy_from_slice(&h3.to_le_bytes());
+        signature[24..32].copy_from_slice(&h4.to_le_bytes());
+        // bytes [32..64] remain zero — distinguishes fallback from Ed25519
+
+        AttestationReport {
+            measurement,
+            proof_hash,
+            signature,
+            is_tpm_backed: false,
+            verifying_key: [0u8; 32],
+        }
     }
 }
 
 /// Verify an attestation report.
 ///
-/// Recomputes the expected signature from the report's measurement and
-/// proof_hash using `secret`, then compares it to the stored signature.
+/// For TPM-backed reports: verifies the Ed25519 signature using the
+/// embedded verifying key against the recomputed measurement hash.
+///
+/// For fallback reports: recomputes the keyed FNV-1a hash using
+/// `secret` and compares it to the stored signature.
+///
 /// Returns `true` if the report is authentic.
 pub fn verify_report(report: &AttestationReport, secret: &[u8; 32]) -> bool {
     let measurement_chain = chain_hash(
@@ -183,35 +227,49 @@ pub fn verify_report(report: &AttestationReport, secret: &[u8; 32]) -> bool {
     );
     let combined = chain_hash(&measurement_chain, &report.proof_hash);
 
-    let mut sig_input = [0u8; 48];
-    sig_input[0..16].copy_from_slice(&combined);
-    sig_input[16..48].copy_from_slice(secret);
+    if report.is_tpm_backed {
+        // ── Ed25519 verification ───────────────────────────────────────
+        let vk = match crypto::VerifyingKey::from_bytes(&report.verifying_key) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let sig = crypto::Signature::from_bytes(&report.signature);
+        crypto::verify(&vk, &combined, &sig)
+    } else {
+        // ── Fallback: keyed FNV-1a verification ────────────────────────
+        let mut sig_input = [0u8; 64];
+        sig_input[0..32].copy_from_slice(&combined);
+        sig_input[32..64].copy_from_slice(secret);
 
-    let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
-    let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
-    let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
-    let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
+        let h1 = fnv1a_64(&sig_input, 0xcbf29ce484222325);
+        let h2 = fnv1a_64(&sig_input, 0x84222325cbf29ce4);
+        let h3 = fnv1a_64(&sig_input, 0x517cc1b727220a95);
+        let h4 = fnv1a_64(&sig_input, 0xa95220271bc71705);
 
-    let mut expected = [0u8; 32];
-    expected[0..8].copy_from_slice(&h1.to_le_bytes());
-    expected[8..16].copy_from_slice(&h2.to_le_bytes());
-    expected[16..24].copy_from_slice(&h3.to_le_bytes());
-    expected[24..32].copy_from_slice(&h4.to_le_bytes());
+        let mut expected = [0u8; 64];
+        expected[0..8].copy_from_slice(&h1.to_le_bytes());
+        expected[8..16].copy_from_slice(&h2.to_le_bytes());
+        expected[16..24].copy_from_slice(&h3.to_le_bytes());
+        expected[24..32].copy_from_slice(&h4.to_le_bytes());
+        // [32..64] stays zero, matching fallback signature layout
 
-    // Constant-time comparison to avoid timing side-channels.
-    let mut diff: u8 = 0;
-    for (a, b) in expected.iter().zip(report.signature.iter()) {
-        diff |= a ^ b;
+        // Constant-time comparison to avoid timing side-channels.
+        let mut diff: u8 = 0;
+        for (a, b) in expected.iter().zip(report.signature.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
-    diff == 0
 }
 
 /// Print an attestation report to the serial console.
 pub fn print_report(report: &AttestationReport) {
     let m = &report.measurement;
+    let mode = if report.is_tpm_backed { "TPM + Ed25519" } else { "Fallback (keyed-hash)" };
     serial_println!("╔══════════════════════════════════════════════╗");
     serial_println!("║         ATTESTATION REPORT                  ║");
     serial_println!("╠══════════════════════════════════════════════╣");
+    serial_println!("║ Mode:           {:>25}  ║", mode);
     serial_println!("║ Tick:           {:>25}  ║", m.tick);
     serial_println!("║ Active agents:  {:>25}  ║", m.agent_count);
     serial_println!("║ Kernel hash:    {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",

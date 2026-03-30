@@ -31,6 +31,10 @@ pub const STATUS_SUCCESS: u8 = 0;
 pub const STATUS_REVERT: u8 = 1;
 pub const STATUS_OUT_OF_ENERGY: u8 = 2;
 pub const STATUS_ERROR: u8 = 3;
+/// The request was sent but the response has not yet arrived.
+/// The caller should check its own mailbox (recv on `caller_id`) for a
+/// `ContractCallResponse` from the callee.
+pub const STATUS_PENDING: u8 = 4;
 
 // ─── FNV-1a selector computation ────────────────────────────────────────────
 
@@ -225,8 +229,12 @@ fn serialise_request(req: &ContractCallRequest, buf: &mut [u8]) -> usize {
 /// 3. Transfer `energy_limit` energy from the caller to the callee agent.
 /// 4. Serialise a `ContractCallRequest` and deliver it to the callee's mailbox.
 /// 5. Emit an audit event recording the inter-contract call.
-/// 6. Return a placeholder pending response (actual result arrives
-///    asynchronously via the scheduler).
+/// 6. Attempt a non-blocking receive on the caller's own mailbox for the
+///    response. If the callee has already processed the request (e.g. it
+///    was scheduled between steps 4 and 6), the real result is returned.
+///    Otherwise returns `STATUS_PENDING` — the caller must poll its own
+///    mailbox (agent_id == mailbox_id in Stage-1) for the
+///    `ContractCallResponse`.
 ///
 /// # Errors
 ///
@@ -291,9 +299,24 @@ pub fn call_contract(
         0,
     );
 
-    // 6. Return a placeholder "pending" response.
-    //    The actual result will be delivered asynchronously: the callee
-    //    processes the request on its next scheduled run and sends a
-    //    ContractCallResponse back to the caller's mailbox.
-    Ok(build_response(STATUS_SUCCESS, 0, &[]))
+    // 6. Try a non-blocking receive on the caller's own mailbox.
+    //    In Stage-1, mailbox_id == agent_id (1:1 binding).
+    //    If the callee happened to run synchronously (e.g. in a cooperative
+    //    scheduling window), its response may already be waiting.
+    let caller_mailbox: u16 = caller_id;
+    if let Ok(msg) = crate::mailbox::recv_message(caller_id, caller_mailbox) {
+        // Try to parse the received message as a ContractCallResponse.
+        let payload = &msg.payload[..msg.len as usize];
+        if let Some(resp) = parse_response(payload) {
+            return Ok(resp);
+        }
+        // Received a message but it wasn't a valid ContractCallResponse.
+        // This could be an unrelated message — fall through to PENDING.
+        // TODO: re-enqueue the non-response message so it isn't lost.
+    }
+
+    // No response available yet. Return STATUS_PENDING so the caller knows
+    // the request was sent and it should poll its own mailbox for the real
+    // ContractCallResponse from the callee.
+    Ok(build_response(STATUS_PENDING, 0, &[]))
 }

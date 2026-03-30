@@ -351,7 +351,7 @@ impl ReplayBundle {
 pub struct ProofBundle {
     /// The execution receipt this proof covers
     pub receipt_id: Hash256,
-    /// Proof type (0 = replay-hash, 1 = Merkle-state, 2 = zk-snark placeholder)
+    /// Proof type (0 = replay-hash, 1 = Merkle-state)
     pub proof_type: u8,
     /// Compact proof data
     pub proof_data: [u8; 1024],
