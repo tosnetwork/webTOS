@@ -104,27 +104,15 @@ fn handle_compact_status(sender_id: AgentId) {
 /// Scan all keyspaces and compact those with excessive root history.
 ///
 /// For each keyspace with root_history_count > HISTORY_THRESHOLD,
-/// shift entries to keep only the last HISTORY_KEEP entries.
+/// trim the root_history ring buffer down to HISTORY_KEEP entries.
 fn compact_keyspaces() -> u32 {
-    // Access the global keyspace table directly (kernel mode).
-    // We iterate over all possible keyspace slots and check history depth.
     let mut compacted: u32 = 0;
 
-    // We access the keyspaces through the state module's public version API.
-    // Since we have StateRead+StateWrite caps, iterate known agent IDs.
     for ks_id in 0..MAX_AGENTS {
-        if let Some(version) = crate::state::get_version(ks_id as u16) {
-            // A keyspace exists if it has a version.
-            // We can check if history is deep by probing old versions.
-            // If version > HISTORY_THRESHOLD, the keyspace may benefit from compaction.
-            if version > HISTORY_THRESHOLD as u32 {
-                // Log the compaction target
-                serial_println!("[COMPACTD] Keyspace {} has version {} (compaction candidate)",
-                    ks_id, version);
-                // Advance version to trigger ring-buffer wrap (compaction effect).
-                // The keyspace's root_history ring naturally overwrites old entries
-                // once root_history_count reaches MAX_ROOT_HISTORY (16).
-                // Our job is to note that compaction was considered.
+        if crate::state::get_version(ks_id as u16).is_some() {
+            if crate::state::compact_keyspace_history(ks_id as u16, HISTORY_KEEP) {
+                serial_println!("[COMPACTD] Keyspace {} history trimmed to {} entries",
+                    ks_id, HISTORY_KEEP);
                 compacted += 1;
             }
         }

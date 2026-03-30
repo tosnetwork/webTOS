@@ -317,24 +317,10 @@ pub fn generate_historical_proof(
 /// Helper: find the entry index for a key in a keyspace and generate a
 /// Merkle proof for that leaf.
 fn find_entry_and_prove(keyspace: crate::agent::KeyspaceId, key: u64) -> Option<merkle::MerkleProof> {
-    // We need to find the entry index.  Walk the keyspace entries.
-    // state::get returns the value but not the index, so we search via
-    // the Merkle tree leaf count and try indices until we find a match.
-    // For simplicity in Stage-6 we scan up to MAX entries (64).
-    if crate::state::get(keyspace, key).is_some() {
-        // Try each possible entry index
-        for idx in 0..64usize {
-            if let Some(proof) = merkle::generate_proof(keyspace, idx) {
-                // We found a valid proof slot.  Since the Merkle tree
-                // tracks leaves by entry index (not by key), we accept the
-                // first non-zero leaf at this index.
-                if proof.depth > 0 {
-                    return Some(proof);
-                }
-            }
-        }
-    }
-    None
+    // Look up the key's actual index in the keyspace entry array.
+    // This index corresponds directly to the Merkle tree leaf index.
+    let entry_index = crate::state::find_entry_index(keyspace, key)?;
+    merkle::generate_proof(keyspace, entry_index)
 }
 
 /// Print a proof summary to serial

@@ -93,6 +93,17 @@ pub fn allocate_agent_stack() -> u64 {
     }
 }
 
+/// Clear the run queue, removing all entries.
+/// Used by replay to rebuild the queue from checkpoint state.
+pub fn clear_run_queue() {
+    let mut rq = SCHED_LOCK.lock();
+    for i in 0..RUN_QUEUE_SIZE {
+        rq.queue[i] = None;
+    }
+    rq.len = 0;
+    rq.current_index = 0;
+}
+
 /// Alias for `add_to_run_queue`.
 pub fn enqueue(id: AgentId) {
     add_to_run_queue(id);

@@ -8,6 +8,7 @@ use crate::agent::*;
 use crate::checkpoint;
 use crate::merkle::{self, MerkleHash};
 use crate::deterministic;
+use crate::sched;
 
 // ─── Replay state ────────────────────────────────────────────────────────
 
@@ -22,54 +23,138 @@ pub fn is_active() -> bool {
     unsafe { REPLAY_ACTIVE }
 }
 
-/// Enter replay mode: load checkpoint from disk and enable deterministic scheduling.
+/// Restore execution state from a checkpoint on disk.
 ///
-/// This loads the Merkle roots saved in the checkpoint so they can be compared
-/// against the current state after re-execution. The deterministic scheduler
-/// ensures agents run in the same order.
-pub fn enter_replay() -> Result<(), i64> {
-    // 1. Load checkpoint header
+/// Loads the checkpoint header, agent states, and Merkle roots from disk.
+/// For each agent: restores its context (registers, stack pointer, instruction
+/// pointer), energy budget, and status. Resets the scheduler tick counter and
+/// event sequence to the checkpoint's values, clears and rebuilds the run queue
+/// with restored agents, and enables deterministic mode.
+///
+/// Returns `true` if the restore succeeded, `false` otherwise.
+pub fn restore_from_checkpoint() -> bool {
+    // 1. Load checkpoint header from disk
     let header = match checkpoint::load_header_from_disk() {
         Some(h) => h,
         None => {
-            serial_println!("[REPLAY] No checkpoint found on disk");
-            return Err(E_NOT_FOUND);
+            serial_println!("[REPLAY] restore_from_checkpoint: no checkpoint found on disk");
+            return false;
         }
     };
 
+    // 2. Load agent states from disk
+    let checkpoint_agents = checkpoint::load_agents_from_disk(&header);
+
+    // 3. Restore each agent's context, energy budget, and status
+    let mut restored_count: u16 = 0;
+    let mut restored_ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
+
+    for i in 0..MAX_AGENTS {
+        if let Some(ref cp_agent) = checkpoint_agents[i] {
+            // Try to find the agent in the live table by ID
+            if let Some(agent) = get_agent_mut(cp_agent.id) {
+                // Restore CPU context (registers, stack pointer, instruction pointer)
+                agent.context = cp_agent.context;
+
+                // Restore energy budget
+                agent.energy_budget = cp_agent.energy_budget;
+
+                // Restore status from serialized byte
+                agent.status = match cp_agent.status {
+                    0 => AgentStatus::Created,
+                    1 => AgentStatus::Ready,
+                    2 => AgentStatus::Running,  // will be set to Ready for run queue
+                    3 => AgentStatus::BlockedRecv,
+                    4 => AgentStatus::BlockedSend,
+                    5 => AgentStatus::Suspended,
+                    6 => AgentStatus::Exited,
+                    7 => AgentStatus::Faulted,
+                    _ => AgentStatus::Ready,
+                };
+
+                if (restored_count as usize) < MAX_AGENTS {
+                    restored_ids[restored_count as usize] = Some(cp_agent.id);
+                    restored_count += 1;
+                }
+
+                serial_println!(
+                    "[REPLAY] Restored agent {}: status={} energy={} rip={:#x} rsp={:#x}",
+                    cp_agent.id, cp_agent.status, cp_agent.energy_budget,
+                    cp_agent.context.rip, cp_agent.context.rsp
+                );
+            } else {
+                serial_println!(
+                    "[REPLAY] Warning: agent {} from checkpoint not found in live table",
+                    cp_agent.id
+                );
+            }
+        }
+    }
+
+    // 4. Load Merkle roots from disk (save for later divergence comparison)
+    let merkle_roots = checkpoint::load_merkle_from_disk(&header);
     unsafe {
-        // 2. Save checkpoint metadata
+        SAVED_MERKLE_ROOTS = merkle_roots;
         SAVED_TICK = header.tick;
         SAVED_EVENT_SEQ = header.event_sequence;
         SAVED_AGENT_COUNT = header.agent_count;
-
-        // 3. Load and save Merkle roots from checkpoint
-        SAVED_MERKLE_ROOTS = checkpoint::load_merkle_from_disk(&header);
-
-        // 4. Load agent metadata (for logging/comparison, not full restore)
-        let agents = checkpoint::load_agents_from_disk(&header);
-        let mut loaded = 0;
-        for agent in agents.iter() {
-            if agent.is_some() { loaded += 1; }
-        }
-
-        serial_println!(
-            "[REPLAY] Checkpoint loaded: tick={} event_seq={} agents={} merkle_roots loaded",
-            SAVED_TICK, SAVED_EVENT_SEQ, loaded
-        );
-
-        // 5. Enable deterministic scheduler (fixed tick quotas)
-        deterministic::enable(10);
-
-        // 6. Enable I/O tracing for this replay run
-        checkpoint::enable_tracing();
-
-        // 7. Mark replay active
-        REPLAY_ACTIVE = true;
-
-        serial_println!("[REPLAY] Replay mode active — deterministic scheduling enabled");
     }
 
+    // 5. Reset the scheduler tick counter to the checkpoint's tick value
+    crate::arch::x86_64::timer::set_ticks(header.tick);
+
+    // 6. Reset the event sequence counter to the checkpoint's value
+    crate::event::set_sequence(header.event_sequence);
+
+    // 7. Clear and rebuild the run queue with restored agents
+    sched::clear_run_queue();
+    for i in 0..restored_count as usize {
+        if let Some(agent_id) = restored_ids[i] {
+            if let Some(agent) = get_agent_mut(agent_id) {
+                // Only enqueue agents that should be schedulable
+                match agent.status {
+                    AgentStatus::Ready | AgentStatus::Running | AgentStatus::Created => {
+                        agent.status = AgentStatus::Ready;
+                        sched::add_to_run_queue(agent_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 8. Enable deterministic mode
+    deterministic::enable(10);
+
+    serial_println!(
+        "[REPLAY] State restored from checkpoint: tick={} event_seq={} agents_restored={}",
+        header.tick, header.event_sequence, restored_count
+    );
+
+    true
+}
+
+/// Enter replay mode: restore state from checkpoint and enable deterministic scheduling.
+///
+/// Loads the full checkpoint from disk, restores agent contexts, resets the
+/// tick counter and event sequence, rebuilds the run queue, and enables
+/// deterministic scheduling for reproducible re-execution.
+pub fn enter_replay() -> Result<(), i64> {
+    // Restore full state from checkpoint
+    if !restore_from_checkpoint() {
+        serial_println!("[REPLAY] Failed to restore from checkpoint");
+        return Err(E_NOT_FOUND);
+    }
+
+    // Enable I/O tracing for this replay run
+    checkpoint::enable_tracing();
+
+    // Mark replay active
+    unsafe {
+        REPLAY_ACTIVE = true;
+    }
+
+    serial_println!("[REPLAY] Replay mode active — state restored, deterministic scheduling enabled");
     Ok(())
 }
 
