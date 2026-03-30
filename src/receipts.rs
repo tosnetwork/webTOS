@@ -312,11 +312,14 @@ pub fn emit_receipt_on_exit(
 
     let idx = store_receipt(receipt);
 
-    // Generate and store a ProofBundle alongside the receipt.
+    // Generate and store a ProofBundle and ReplayBundle alongside the receipt.
     if let Some(i) = idx {
         if let Some(stored) = get_receipt(i) {
             let proof = ProofBundle::from_receipt(stored);
             store_proof_bundle(proof);
+
+            let replay = ReplayBundle::from_receipt(stored);
+            store_replay_bundle(replay);
         }
     }
 
