@@ -21,7 +21,7 @@ extern "C" {
 const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
 
 /// Stack size for dynamically spawned agents (4 KiB).
-const SPAWN_STACK_SIZE: usize = 4096;
+const SPAWN_STACK_SIZE: usize = 16384;  // 16KB: must handle interrupt frame + TrapFrame + schedule() + context_switch on each preemption
 
 /// Static stack pool for spawned agents.
 static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] = [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS];

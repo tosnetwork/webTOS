@@ -175,17 +175,31 @@ fn spawn_native_elf(
         }
     }
 
-    // 4. Allocate user stack page
+    // 4. Allocate user stack page — placed ABOVE the highest loaded segment
+    //    to avoid overwriting code/data.
+    let mut highest_seg_end: u64 = USER_STACK_VADDR; // fallback
+    for i in 0..elf_info.segment_count {
+        if let Some(s) = &elf_info.segments[i] {
+            if s.vaddr >= USER_CODE_VADDR as u64 {
+                let end = s.vaddr + s.mem_size;
+                if end > highest_seg_end {
+                    highest_seg_end = end;
+                }
+            }
+        }
+    }
+    // Align to page boundary and add a guard gap
+    let user_stack_base = (highest_seg_end + paging::PAGE_SIZE as u64) & !(paging::PAGE_SIZE as u64 - 1);
+
     let stack_phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
     unsafe {
         core::ptr::write_bytes(stack_phys as *mut u8, 0, paging::PAGE_SIZE);
     }
     paging::map_page(
-        agent_cr3, USER_STACK_VADDR, stack_phys,
+        agent_cr3, user_stack_base, stack_phys,
         paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER,
     ).map_err(|_| E_QUOTA_EXCEEDED)?;
-    let user_stack_top = USER_STACK_VADDR.checked_add(paging::PAGE_SIZE as u64)
-        .ok_or(E_INVALID_ARG)?;
+    let user_stack_top = user_stack_base + paging::PAGE_SIZE as u64;
 
     // 5. Allocate kernel stack for syscall handling
     let k_stack_top = sched::allocate_agent_stack();
