@@ -283,25 +283,138 @@ fn handle_list() {
 }
 
 fn handle_upgrade(recv_buf: &[u8], msg_len: usize) {
-    // Upgrade protocol: checkpoint old -> install new -> migrate state -> verify
-    if msg_len < 3 {
+    // Upgrade wire format:
+    //   [0]       op (0x04)
+    //   [1..3]    package index to upgrade (u16 LE)
+    //   [3+]      manifest fields (same as install: name_len, name, version, caps, energy, memory, code_hash, signature)
+
+    // Minimum: op(1) + pkg_idx(2) + name_len(1) + name(>=1) + fixed_tail(118)
+    if msg_len < 3 + 2 + INSTALL_FIXED_TAIL {
+        serial_println!("[PKGD] Upgrade failed: message too short ({} bytes)", msg_len);
         return;
     }
+
     let pkg_idx = u16::from_le_bytes([recv_buf[1], recv_buf[2]]) as usize;
 
-    if let Some(old) = package::get_package(pkg_idx) {
+    // Step 1: Retrieve the old package to verify it exists
+    let (old_name_str_buf, old_name_len, old_major, old_minor, old_patch) = match package::get_package(pkg_idx) {
+        Some(old) => {
+            // Copy old version info before we modify the registry
+            let mut buf = [0u8; 64];
+            let len = old.name_len as usize;
+            buf[..len].copy_from_slice(&old.name[..len]);
+            (buf, len, old.version_major, old.version_minor, old.version_patch)
+        }
+        None => {
+            serial_println!("[PKGD] Upgrade failed: no package at index {}", pkg_idx);
+            return;
+        }
+    };
+
+    // Step 2: Checkpoint current state before modifying the registry
+    if !crate::checkpoint::save_to_disk() {
+        serial_println!("[PKGD] Upgrade warning: checkpoint failed (no disk?), proceeding anyway");
+    }
+
+    // Step 3: Parse new manifest fields from bytes starting at offset 3
+    let name_len = recv_buf[3] as usize;
+    if name_len == 0 || name_len > 64 {
+        serial_println!("[PKGD] Upgrade failed: invalid name length {}", name_len);
+        return;
+    }
+
+    let required = 4 + name_len + INSTALL_FIXED_TAIL;
+    if msg_len < required {
         serial_println!(
-            "[PKGD] Upgrade requested for '{}' v{}.{}.{}",
-            old.name_str(),
-            old.version_major,
-            old.version_minor,
-            old.version_patch,
+            "[PKGD] Upgrade failed: message too short for full manifest ({} < {})",
+            msg_len, required
         );
-        // TODO: checkpoint old agent state via SYS_CHECKPOINT
-        // TODO: parse new .tos from remaining message bytes
-        // TODO: install new version, migrate state, verify
-        serial_println!("[PKGD] Upgrade: checkpoint + migration not yet implemented");
-    } else {
-        serial_println!("[PKGD] Upgrade failed: no package at index {}", pkg_idx);
+        return;
+    }
+
+    let mut name = [0u8; 64];
+    let copy_len = name_len.min(64);
+    name[..copy_len].copy_from_slice(&recv_buf[4..4 + copy_len]);
+
+    let mut off = 4 + name_len;
+
+    let version_major = u16::from_le_bytes([recv_buf[off], recv_buf[off + 1]]);
+    off += 2;
+    let version_minor = u16::from_le_bytes([recv_buf[off], recv_buf[off + 1]]);
+    off += 2;
+    let version_patch = u16::from_le_bytes([recv_buf[off], recv_buf[off + 1]]);
+    off += 2;
+
+    let required_capabilities =
+        u32::from_le_bytes([recv_buf[off], recv_buf[off + 1], recv_buf[off + 2], recv_buf[off + 3]]);
+    off += 4;
+
+    let min_energy = u64::from_le_bytes([
+        recv_buf[off],
+        recv_buf[off + 1],
+        recv_buf[off + 2],
+        recv_buf[off + 3],
+        recv_buf[off + 4],
+        recv_buf[off + 5],
+        recv_buf[off + 6],
+        recv_buf[off + 7],
+    ]);
+    off += 8;
+
+    let max_memory_pages =
+        u32::from_le_bytes([recv_buf[off], recv_buf[off + 1], recv_buf[off + 2], recv_buf[off + 3]]);
+    off += 4;
+
+    let mut code_hash = [0u8; 32];
+    code_hash.copy_from_slice(&recv_buf[off..off + 32]);
+    off += 32;
+
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&recv_buf[off..off + 64]);
+
+    let new_manifest = package::PackageManifest {
+        name,
+        name_len: copy_len as u8,
+        version_major,
+        version_minor,
+        version_patch,
+        author: [0u8; 64],
+        author_len: 0,
+        required_capabilities,
+        min_energy,
+        max_memory_pages,
+        code_hash,
+        manifest_hash: [0u8; 32],
+        signature,
+    };
+
+    let new_name_str = core::str::from_utf8(&name[..copy_len]).unwrap_or("<invalid>");
+
+    // Step 4: Uninstall the old package and install the new manifest
+    if !package::uninstall_package(pkg_idx) {
+        serial_println!("[PKGD] Upgrade failed: could not remove old package at index {}", pkg_idx);
+        return;
+    }
+
+    match package::install_package(new_manifest) {
+        Some(new_idx) => {
+            // Step 5: Log the upgrade (old version -> new version)
+            let old_name_str = core::str::from_utf8(
+                &old_name_str_buf[..old_name_len]
+            ).unwrap_or("<invalid>");
+            serial_println!(
+                "[PKGD] Upgrade complete: '{}' v{}.{}.{} -> '{}' v{}.{}.{} (old idx={}, new idx={})",
+                old_name_str, old_major, old_minor, old_patch,
+                new_name_str, version_major, version_minor, version_patch,
+                pkg_idx, new_idx,
+            );
+        }
+        None => {
+            // Step 6: Log failure — registry full after removing old entry
+            serial_println!(
+                "[PKGD] Upgrade failed: package registry full, could not install new version of '{}'",
+                new_name_str
+            );
+        }
     }
 }
