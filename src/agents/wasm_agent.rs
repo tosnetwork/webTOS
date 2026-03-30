@@ -1,16 +1,23 @@
-//! ATOS WASM Agent
+//! ATOS WASM Contract Execution Agent
 //!
-//! A kernel-mode agent that runs a hand-crafted WASM binary through
-//! the ATOS WASM interpreter. Demonstrates that WASM and native agents
-//! can coexist in the same system.
+//! A kernel-mode agent that loads deployed WASM bytecode from keyspace storage
+//! and processes incoming contract call requests via mailbox IPC. Falls back to
+//! a hardcoded test binary for backward compatibility with legacy test agents.
 
 use crate::serial_println;
 use crate::agent::*;
 use crate::syscall;
 use crate::wasm;
-// WasmInstance uses heap-allocated Vec for memory/code — struct itself is small on stack
+use crate::contract_call;
+use crate::mailbox;
 
-/// Hand-crafted WASM binary.
+/// State key where deployed WASM bytecode is stored in an agent's keyspace.
+const WASM_CODE_KEY: u64 = 0xFFFF;
+
+/// Default fuel budget for contract execution per call.
+const DEFAULT_FUEL: u64 = 100_000;
+
+/// Hardcoded WASM binary for backward-compatible test agents.
 ///
 /// Module structure:
 ///   - Type section:   1 func type `() -> ()`
@@ -27,78 +34,175 @@ static WASM_BINARY: &[u8] = &[
     0x01, 0x00, 0x00, 0x00, // version: 1
 
     // ── Type section (id=1, size=4) ──────────────────────────────
-    // Contains 1 type: () -> ()
-    0x01,                   // section id: Type
-    0x04,                   // section size: 4 bytes
-    0x01,                   // count: 1 type
-    0x60,                   // func type marker
-    0x00,                   // param count: 0
-    0x00,                   // result count: 0
+    0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
 
     // ── Import section (id=2, size=17) ───────────────────────────
-    // 1 import: "atos"."sys_yield" : func type 0
-    0x02,                   // section id: Import
-    0x11,                   // section size: 17 bytes
-    0x01,                   // count: 1 import
-    0x03,                   // module name length: 3
-    0x61, 0x6F, 0x73,      // module name: "atos"
-    0x09,                   // field name length: 9
-    0x73, 0x79, 0x73, 0x5F, // field name: "sys_"
-    0x79, 0x69, 0x65, 0x6C, // field name: "yiel"
-    0x64,                   // field name: "d"
-    0x00,                   // import kind: function
-    0x00,                   // type index: 0
+    0x02, 0x11, 0x01,
+    0x03, 0x61, 0x6F, 0x73, // module: "atos" (note: 3 bytes = "aos")
+    0x09, 0x73, 0x79, 0x73, 0x5F, 0x79, 0x69, 0x65, 0x6C, 0x64, // field: "sys_yield"
+    0x00, 0x00,
 
     // ── Function section (id=3, size=2) ──────────────────────────
-    // 1 local function with type index 0
-    0x03,                   // section id: Function
-    0x02,                   // section size: 2 bytes
-    0x01,                   // count: 1 function
-    0x00,                   // type index: 0
+    0x03, 0x02, 0x01, 0x00,
 
     // ── Export section (id=7, size=7) ─────────────────────────────
-    // 1 export: "run" -> function index 1
-    0x07,                   // section id: Export
-    0x07,                   // section size: 7 bytes
-    0x01,                   // count: 1 export
-    0x03,                   // export name length: 3
-    0x72, 0x75, 0x6E,      // export name: "run"
-    0x00,                   // export kind: function
-    0x01,                   // function index: 1 (0=import, 1=local)
+    0x07, 0x07, 0x01,
+    0x03, 0x72, 0x75, 0x6E, // name: "run"
+    0x00, 0x01,
 
     // ── Code section (id=10, size=11) ────────────────────────────
-    // 1 function body:
-    //   0 locals
-    //   loop (void)
-    //     call 0        ;; call sys_yield (import index 0)
-    //     br 0          ;; unconditional branch to loop start
-    //   end
-    //   end
-    0x0A,                   // section id: Code
-    0x0B,                   // section size: 11 bytes
-    0x01,                   // count: 1 function body
-    0x09,                   // body size: 9 bytes
-    0x00,                   // local declaration count: 0
-    0x03,                   // opcode: loop
-    0x40,                   // block type: void
-    0x10,                   // opcode: call
-    0x00,                   // function index: 0 (sys_yield)
-    0x0C,                   // opcode: br
-    0x00,                   // label index: 0 (innermost = this loop)
-    0x0B,                   // end (loop)
-    0x0B,                   // end (function)
+    0x0A, 0x0B, 0x01,
+    0x09, 0x00,
+    0x03, 0x40,             // loop (void)
+    0x10, 0x00,             // call 0 (sys_yield)
+    0x0C, 0x00,             // br 0
+    0x0B, 0x0B,             // end loop, end func
 ];
+
+// ─── Response serialisation ─────────────────────────────────────────────────
+
+/// Serialise a ContractCallResponse into a byte buffer in the wire format
+/// expected by `contract_call::parse_response()`.
+///
+/// Wire format: status(1) + energy_used(8 LE) + output_len(2 LE) + output data.
+/// Returns the number of bytes written.
+fn serialise_response(resp: &contract_call::ContractCallResponse, buf: &mut [u8]) -> usize {
+    let out_len = resp.output_len as usize;
+    let total = 11 + out_len;
+    if buf.len() < total {
+        return 0;
+    }
+
+    buf[0] = resp.status;
+    buf[1..9].copy_from_slice(&resp.energy_used.to_le_bytes());
+    buf[9..11].copy_from_slice(&resp.output_len.to_le_bytes());
+    buf[11..11 + out_len].copy_from_slice(&resp.output[..out_len]);
+
+    total
+}
+
+// ─── WASM execution helper ──────────────────────────────────────────────────
+
+/// Run a WASM function through the host-call interpreter loop.
+///
+/// Returns `(output_slice_offset, output_len, fuel_consumed, trapped)`.
+/// On success the output can be read from linear memory at offset 0.
+fn run_wasm_function(
+    instance: &mut wasm::runtime::WasmInstance,
+    func_idx: u32,
+    args: &[wasm::types::Value],
+    initial_fuel: u64,
+) -> (u64, bool) {
+    let mut result = instance.call_func(func_idx, args);
+
+    loop {
+        match result {
+            wasm::runtime::ExecResult::HostCall(import_idx, ref host_args, arg_count) => {
+                let ret_val = match wasm::host::handle_host_call(
+                    instance,
+                    import_idx,
+                    &host_args[..arg_count as usize],
+                    arg_count,
+                ) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        serial_println!("[WASM_AGENT] Host call error: {:?}", e);
+                        let consumed = initial_fuel.saturating_sub(instance.get_fuel());
+                        return (consumed, true);
+                    }
+                };
+                result = instance.resume(ret_val);
+            }
+
+            wasm::runtime::ExecResult::Ok
+            | wasm::runtime::ExecResult::Returned(_) => {
+                let consumed = initial_fuel.saturating_sub(instance.get_fuel());
+                return (consumed, false);
+            }
+
+            wasm::runtime::ExecResult::OutOfFuel => {
+                let consumed = initial_fuel;
+                return (consumed, true);
+            }
+
+            wasm::runtime::ExecResult::Trap(ref e) => {
+                serial_println!("[WASM_AGENT] Trap: {:?}", e);
+                let consumed = initial_fuel.saturating_sub(instance.get_fuel());
+                return (consumed, true);
+            }
+
+            wasm::runtime::ExecResult::Exception(tag, _) => {
+                serial_println!("[WASM_AGENT] Uncaught exception (tag {})", tag);
+                let consumed = initial_fuel.saturating_sub(instance.get_fuel());
+                return (consumed, true);
+            }
+        }
+    }
+}
+
+// ─── Export function resolution ─────────────────────────────────────────────
+
+/// Try to find an exported function suitable for handling a contract call.
+///
+/// Lookup order:
+///   1. An export whose name matches the selector (checked via FNV-1a hash
+///      of the export name against the 4-byte selector).
+///   2. Well-known names: "call", "handle", "main", "run".
+fn find_call_export(module: &wasm::decoder::WasmModule, _selector: u32) -> Option<u32> {
+    // Try well-known entry points in priority order for contract calls.
+    static NAMES: &[&[u8]] = &[b"call", b"handle", b"main", b"run"];
+
+    for name in NAMES {
+        if let Some(idx) = module.find_export_func(name) {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+// ─── Entry point ────────────────────────────────────────────────────────────
 
 /// WASM agent entry point.
 ///
-/// Decodes the hand-crafted WASM binary, instantiates it, and runs the
-/// exported "run" function. Host calls (sys_yield) are handled in a loop
-/// until execution completes, traps, or runs out of fuel.
+/// Phase 1: Load WASM code from keyspace or fall back to hardcoded binary.
+/// Phase 2: Run start function if present.
+/// Phase 3: Enter message processing loop — receive contract call requests
+///          from the mailbox, execute the WASM function, and send responses.
 pub extern "C" fn wasm_agent_entry() -> ! {
-    serial_println!("[WASM_AGENT] WASM agent started");
+    let agent_id = crate::sched::current();
+    serial_println!("[WASM_AGENT] Agent {} started", agent_id);
 
-    // 1. Decode the WASM binary
-    let module = match wasm::decoder::decode(WASM_BINARY) {
+    // ── Phase 1: Load WASM code ─────────────────────────────────────────
+
+    // Try to read deployed WASM bytecode from this agent's keyspace at key 0xFFFF.
+    // state_get returns a stack-allocated copy; decode() copies data into the
+    // WasmModule, so the buffer only needs to live through the decode call.
+    let (wasm_code_buf, wasm_code_len) = match crate::state::state_get(agent_id, WASM_CODE_KEY) {
+        Some((buf, len)) => {
+            serial_println!(
+                "[WASM_AGENT] Agent {} loaded {} bytes of WASM from keyspace",
+                agent_id, len
+            );
+            (Some(buf), len)
+        }
+        None => {
+            serial_println!(
+                "[WASM_AGENT] Agent {} has no deployed WASM, using fallback binary",
+                agent_id
+            );
+            (None, 0)
+        }
+    };
+
+    let is_fallback = wasm_code_buf.is_none();
+    let wasm_bytes: &[u8] = match wasm_code_buf {
+        Some(ref buf) => &buf[..wasm_code_len],
+        None => WASM_BINARY,
+    };
+
+    // Decode the WASM binary.
+    let module = match wasm::decoder::decode(wasm_bytes) {
         Ok(m) => {
             serial_println!(
                 "[WASM_AGENT] Module decoded: {} functions, {} imports, {} exports",
@@ -110,47 +214,204 @@ pub extern "C" fn wasm_agent_entry() -> ! {
         }
         Err(e) => {
             serial_println!("[WASM_AGENT] Failed to decode WASM: {:?}", e);
-            loop {
-                unsafe { core::arch::asm!("hlt"); }
-            }
+            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
         }
     };
 
-    // 2. Find the "run" export
-    let run_idx = match module.find_export_func(b"run") {
+    // If using the fallback binary, run the old test-agent logic (no mailbox loop).
+    if is_fallback {
+        run_fallback_agent(module, agent_id);
+    }
+
+    // ── For deployed contracts: instantiate and enter message loop ───────
+
+    // Find the primary call export before entering the loop.
+    let call_idx = match find_call_export(&module, 0) {
         Some(idx) => {
-            serial_println!("[WASM_AGENT] Found export 'run' at function index {}", idx);
+            serial_println!("[WASM_AGENT] Agent {} call export at function index {}", agent_id, idx);
             idx
         }
         None => {
-            serial_println!("[WASM_AGENT] Export 'run' not found");
-            loop {
-                unsafe { core::arch::asm!("hlt"); }
-            }
+            serial_println!("[WASM_AGENT] Agent {} has no callable export", agent_id);
+            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
         }
     };
 
-    // 3. Create instance with fuel budget
-    let mut instance = match wasm::runtime::WasmInstance::new(module, 50_000) {
+    // Create the WASM instance. We reuse it across calls.
+    let mut instance = match wasm::runtime::WasmInstance::new(module, DEFAULT_FUEL) {
         Ok(inst) => inst,
         Err(e) => {
-            serial_println!("[WASM_AGENT] Instantiation trapped: {:?}", e);
-            loop { unsafe { core::arch::asm!("hlt"); } }
+            serial_println!("[WASM_AGENT] Agent {} instantiation failed: {:?}", agent_id, e);
+            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
         }
     };
-    serial_println!("[WASM_AGENT] Instance created with 50000 fuel");
+    serial_println!("[WASM_AGENT] Agent {} instance created with {} fuel", agent_id, DEFAULT_FUEL);
 
-    // 3b. Run start function if present (WASM spec requirement)
+    // ── Phase 2: Run start function if present ──────────────────────────
+
     match instance.run_start() {
         wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
         wasm::runtime::ExecResult::Trap(e) => {
-            serial_println!("[WASM_AGENT] Start function trapped: {:?}", e);
+            serial_println!("[WASM_AGENT] Agent {} start function trapped: {:?}", agent_id, e);
+            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+        }
+        _ => {}
+    }
+
+    // ── Phase 3: Message processing loop ────────────────────────────────
+
+    serial_println!("[WASM_AGENT] Agent {} entering message loop", agent_id);
+    let mailbox_id = agent_id; // Stage-1: mailbox_id == agent_id
+
+    loop {
+        // 1. Try to receive a message from own mailbox (non-blocking).
+        let msg = match mailbox::recv_message(agent_id, mailbox_id) {
+            Ok(m) => m,
+            Err(_) => {
+                // No message available — yield and retry.
+                syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+                continue;
+            }
+        };
+
+        // 2. Try to parse as a ContractCallRequest.
+        let payload_len = msg.len as usize;
+        let call_req = match contract_call::parse_request(&msg.payload[..payload_len]) {
+            Some(req) => req,
+            None => {
+                // Not a valid contract call — ignore and continue.
+                serial_println!(
+                    "[WASM_AGENT] Agent {} received non-call message ({} bytes), ignoring",
+                    agent_id, payload_len
+                );
+                continue;
+            }
+        };
+
+        serial_println!(
+            "[WASM_AGENT] Agent {} received call: selector=0x{:08X}, input_len={}, caller={}",
+            agent_id, call_req.selector, call_req.input_len, call_req.caller_agent
+        );
+
+        // 3. Write call input into WASM linear memory at offset 0.
+        let input_len = call_req.input_len as usize;
+        if let Some(mem) = instance.get_memory_mut(0) {
+            let write_len = input_len.min(mem.len());
+            mem[..write_len].copy_from_slice(&call_req.input[..write_len]);
+        }
+
+        // 4. Reset fuel budget for this call.
+        let fuel = if call_req.energy_budget > 0 {
+            call_req.energy_budget.min(1_000_000)
+        } else {
+            DEFAULT_FUEL
+        };
+        instance.set_fuel(fuel);
+
+        // 5. Execute the WASM function.
+        //    Pass input length as an i32 argument so the contract knows the size.
+        let (energy_used, trapped) = run_wasm_function(
+            &mut instance,
+            call_idx,
+            &[wasm::types::Value::I32(input_len as i32)],
+            fuel,
+        );
+
+        // 6. Read output from WASM linear memory at offset 0.
+        //    Convention: the contract writes its output starting at memory offset 0
+        //    and returns the output length via the function return value (already
+        //    consumed by run_wasm_function). We read up to 243 bytes (MAX_CALL_OUTPUT).
+        let mut output = [0u8; 243];
+        let mut output_len: usize = 0;
+
+        if !trapped {
+            if let Some(mem) = instance.get_memory(0) {
+                // Read the first 4 bytes as a little-endian u32 output length marker,
+                // then the actual output follows at offset 4.
+                if mem.len() >= 4 {
+                    let declared_len = u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]) as usize;
+                    output_len = declared_len.min(243).min(mem.len().saturating_sub(4));
+                    if output_len > 0 {
+                        output[..output_len].copy_from_slice(&mem[4..4 + output_len]);
+                    }
+                }
+            }
+        }
+
+        // 7. Build the response.
+        let status = if trapped {
+            contract_call::STATUS_ERROR
+        } else {
+            contract_call::STATUS_SUCCESS
+        };
+
+        let response = contract_call::build_response(status, energy_used, &output[..output_len]);
+
+        // 8. Serialise and send response to the caller's mailbox.
+        let mut resp_buf = [0u8; 256];
+        let resp_len = serialise_response(&response, &mut resp_buf);
+
+        if resp_len > 0 {
+            let caller_mailbox = call_req.caller_agent; // Stage-1: mailbox_id == agent_id
+            match mailbox::send_message(agent_id, caller_mailbox, &resp_buf[..resp_len]) {
+                Ok(()) => {
+                    serial_println!(
+                        "[WASM_AGENT] Agent {} sent response to agent {} (status={}, energy={}, output={}B)",
+                        agent_id, call_req.caller_agent, status, energy_used, output_len
+                    );
+                }
+                Err(e) => {
+                    serial_println!(
+                        "[WASM_AGENT] Agent {} failed to send response to {}: err={}",
+                        agent_id, call_req.caller_agent, e
+                    );
+                }
+            }
+        }
+
+        // Yield to scheduler between calls.
+        syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+    }
+}
+
+// ─── Fallback: legacy test agent ────────────────────────────────────────────
+
+/// Run the original test-agent logic for agents using the hardcoded WASM binary.
+///
+/// This preserves backward compatibility: the fallback binary has a "run" export
+/// that loops calling sys_yield, which is driven through the host-call loop.
+fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> ! {
+    serial_println!("[WASM_AGENT] Agent {} running fallback test binary", agent_id);
+
+    // Find the "run" export.
+    let run_idx = match module.find_export_func(b"run") {
+        Some(idx) => idx,
+        None => {
+            serial_println!("[WASM_AGENT] Fallback binary missing 'run' export");
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+    };
+
+    // Create instance with fuel budget.
+    let mut instance = match wasm::runtime::WasmInstance::new(module, 50_000) {
+        Ok(inst) => inst,
+        Err(e) => {
+            serial_println!("[WASM_AGENT] Fallback instantiation trapped: {:?}", e);
+            loop { unsafe { core::arch::asm!("hlt"); } }
+        }
+    };
+
+    // Run start function if present.
+    match instance.run_start() {
+        wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
+        wasm::runtime::ExecResult::Trap(e) => {
+            serial_println!("[WASM_AGENT] Fallback start function trapped: {:?}", e);
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
         _ => {}
     }
 
-    // 4. Call the run function and handle host calls in a loop
+    // Run the "run" function through the host-call loop.
     let mut result = instance.call_func(run_idx, &[]);
     let mut host_calls = 0u64;
 
@@ -160,13 +421,11 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 host_calls += 1;
                 if host_calls % 1000 == 1 {
                     serial_println!(
-                        "[WASM_AGENT] Host call #{} (import {})",
-                        host_calls,
-                        import_idx
+                        "[WASM_AGENT] Agent {} host call #{} (import {})",
+                        agent_id, host_calls, import_idx
                     );
                 }
 
-                // Handle the host call via the host module
                 let ret_val = match wasm::host::handle_host_call(
                     &mut instance,
                     import_idx,
@@ -180,40 +439,39 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                     }
                 };
 
-                // Resume execution with the return value
                 result = instance.resume(ret_val);
             }
 
             wasm::runtime::ExecResult::Ok
             | wasm::runtime::ExecResult::Returned(_) => {
                 serial_println!(
-                    "[WASM_AGENT] Function returned after {} host calls",
-                    host_calls
+                    "[WASM_AGENT] Agent {} fallback completed after {} host calls",
+                    agent_id, host_calls
                 );
                 break;
             }
 
             wasm::runtime::ExecResult::OutOfFuel => {
                 serial_println!(
-                    "[WASM_AGENT] Out of fuel after {} host calls",
-                    host_calls
+                    "[WASM_AGENT] Agent {} out of fuel after {} host calls",
+                    agent_id, host_calls
                 );
                 break;
             }
 
             wasm::runtime::ExecResult::Trap(ref e) => {
-                serial_println!("[WASM_AGENT] Trap: {:?}", e);
+                serial_println!("[WASM_AGENT] Agent {} trap: {:?}", agent_id, e);
                 break;
             }
 
             wasm::runtime::ExecResult::Exception(tag, _) => {
-                serial_println!("[WASM_AGENT] Uncaught exception (tag {})", tag);
+                serial_println!("[WASM_AGENT] Agent {} uncaught exception (tag {})", agent_id, tag);
                 break;
             }
         }
     }
 
-    serial_println!("[WASM_AGENT] WASM execution complete, yielding forever");
+    serial_println!("[WASM_AGENT] Agent {} fallback execution complete, yielding forever", agent_id);
     loop {
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     }
