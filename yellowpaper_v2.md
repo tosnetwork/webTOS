@@ -691,13 +691,136 @@ Replay:
   read(fd=5, buf) → replay from trace (deterministic, same bytes)
 ```
 
+**Base Image Model for Dynamic Linking**
+
+Linux programs (especially OpenJDK, Node.js, CPython) depend on dynamically linked shared libraries (`.so` files). A simple Java "Hello World" loads 13 `.so` files totaling ~26 MB at runtime:
+
+```text
+OpenJDK runtime dependency chain (verified by strace):
+
+ld-linux-x86-64.so.2          ← dynamic linker (loaded by kernel)
+├── libc.so.6                  ← C standard library (2 MB)
+├── libm.so.6                  ← math library
+├── libz.so.1                  ← compression (JAR decompression)
+├── libstdc++.so.6             ← C++ standard library (JVM is C++)
+├── libgcc_s.so.1              ← GCC runtime
+├── librt.so.1                 ← POSIX realtime extensions
+libjli.so                      ← JVM launcher
+libjvm.so                      ← JVM core (22 MB — largest)
+├── libverify.so               ← bytecode verification
+├── libjava.so                 ← Java native methods
+├── libjimage.so               ← module image reader
+└── libzip.so                  ← ZIP/JAR handling
+```
+
+These `.so` files must be accessible through the virtual filesystem. ATOS solves this with a **base image** model:
+
+**1. Base Image Pre-Installation**
+
+Runtime base images are deployed once to a dedicated system keyspace. Each `.so` file is stored using the chunked large-value storage (64 KB max per file, multiple files per image). The virtual filesystem maps standard Linux paths to keyspace keys:
+
+```text
+Virtual Path                              Keyspace Key
+/lib/x86_64-linux-gnu/ld-linux-x86-64.so  → "base:ld-linux"
+/lib/x86_64-linux-gnu/libc.so.6           → "base:libc"
+/lib/x86_64-linux-gnu/libm.so.6           → "base:libm"
+/lib/x86_64-linux-gnu/libz.so.1           → "base:libz"
+/lib/x86_64-linux-gnu/libstdc++.so.6      → "base:libstdc++"
+/lib/x86_64-linux-gnu/libgcc_s.so.1       → "base:libgcc_s"
+/lib/x86_64-linux-gnu/librt.so.1          → "base:librt"
+/jdk/lib/jli/libjli.so                    → "base:jdk/libjli"
+/jdk/lib/server/libjvm.so                 → "base:jdk/libjvm"
+/jdk/lib/libjava.so                       → "base:jdk/libjava"
+/jdk/lib/libverify.so                     → "base:jdk/libverify"
+/jdk/lib/libjimage.so                     → "base:jdk/libjimage"
+/jdk/lib/libzip.so                        → "base:jdk/libzip"
+```
+
+**2. Dynamic Linking Flow**
+
+When a Linux-compat agent executes, the dynamic linker loads `.so` files via the normal syscall path — no special handling needed beyond the virtual filesystem:
+
+```text
+execve("/jdk/bin/java", ...)
+  ↓ kernel loads ELF, finds PT_INTERP = /lib/ld-linux-x86-64.so.2
+  ↓ loads dynamic linker from keyspace "base:ld-linux"
+  ↓
+ld-linux resolves DT_NEEDED entries:
+  openat("/lib/libc.so.6")      → keyspace "base:libc" → load_large_value()
+  mmap(deterministic_addr, ...)  → map code segment with PROT_EXEC
+  mprotect(...)                  → set correct permissions
+  ↓ (repeat for each .so)
+  ↓
+All symbols resolved, jump to _start
+```
+
+The existing 62 syscalls fully cover this flow. No new syscalls are needed — `openat` resolves paths to keyspace keys, `mmap` maps code to deterministic addresses, `mprotect` sets permissions.
+
+**3. Available Base Images**
+
+| Image | Contents | Size | Enables |
+|-------|----------|------|---------|
+| `base-minimal` | ld-linux + libc + libm + libpthread | ~3 MB | Static C/C++ programs, Go, Rust |
+| `base-java` | base-minimal + JDK libs (libjvm, libjava, libzip, ...) | ~26 MB | OpenJDK, Kotlin, Scala |
+| `base-node` | base-minimal + libstdc++ + libuv | ~8 MB | Node.js, Deno |
+| `base-python` | base-minimal + libpython3 + standard library | ~15 MB | CPython |
+
+**4. /etc/ld.so.cache and Library Search**
+
+The dynamic linker normally reads `/etc/ld.so.cache` to find library locations. ATOS provides a deterministic version:
+
+```text
+Virtual /etc/ld.so.cache:
+  Precomputed at base image installation time
+  Maps library names to fixed keyspace paths
+  Identical across all runs (deterministic)
+  Stored at keyspace key "base:ld.so.cache"
+```
+
+If `ld.so.cache` is missing, ld-linux falls back to searching `/lib` and `/usr/lib` — both mapped to the base image keyspace.
+
+**5. User Application Deployment**
+
+With the base image installed, deploying a Java application is straightforward:
+
+```text
+TCP Deploy request:
+  contract_id = SHA-256(Hello.jar)
+  input = Hello.jar contents
+  base_image = "base-java"
+
+ATOS:
+  1. Store Hello.jar in agent keyspace ("app/Hello.jar")
+  2. Create agent with RuntimeKind::LinuxCompat
+  3. Link agent to base image keyspace (read-only access)
+  4. Set entry point: /jdk/bin/java -cp /app/Hello.jar Hello
+  5. Agent starts → ld-linux loads → JVM boots → Java runs
+```
+
+**6. Storage Requirements**
+
+Each `.so` file uses chunked storage (256 bytes per chunk, up to 64 KB per large value). For files larger than 64 KB (libjvm.so is 22 MB), a multi-segment extension is used:
+
+```text
+libjvm.so (22 MB) storage:
+  "base:jdk/libjvm:meta"  → { total_size: 22_000_000, segment_count: 344 }
+  "base:jdk/libjvm:0"     → 64 KB segment (256 chunks)
+  "base:jdk/libjvm:1"     → 64 KB segment
+  ...
+  "base:jdk/libjvm:343"   → final partial segment
+```
+
+This requires extending `store_large_value()` to support multi-segment files (currently limited to 64 KB). The extension is backward-compatible — files under 64 KB continue to use single-segment storage.
+
 **Success Condition**
-- A statically-linked OpenJDK JVM runs Java programs on ATOS with deterministic execution.
+- OpenJDK runs Java programs on ATOS with deterministic execution via the Linux compatibility layer.
+- Dynamic linking works: `ld-linux` loads `.so` files from keyspace-backed virtual filesystem.
+- Base images are pre-installed once; user applications deploy as lightweight packages.
 - `curl https://example.com` fetches data through netd with I/O trace logging.
 - A Go multi-threaded HTTP server handles concurrent requests via child agent threads with deterministic scheduling.
 - A Node.js program runs on ATOS with deterministic event loop ordering.
 - Two runs with the same input produce bit-identical execution traces and state roots.
-- Linux-compat agents produce valid ExecutionReceipts with ProofGradeWasm-equivalent determinism guarantees.
+- Linux-compat agents produce valid ExecutionReceipts with determinism guarantees.
 
 ### The Three Eras of ATOS
 
