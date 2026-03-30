@@ -6,6 +6,10 @@ description = "ATOS Package Tool - build, sign, install, and manage .tos package
 
 [workspace]
 
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+
 [[bin]]
 name = "atp"
 path = "src/main.rs"

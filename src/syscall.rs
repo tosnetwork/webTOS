@@ -1122,6 +1122,46 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         // ── 38: sys_send_remote (removed — distributed feature)
         SYS_SEND_REMOTE => { E_INVALID_ARG }
 
+        // ── 39: sys_contract_call ──────────────────────────────────────
+        // a1 = pointer to 32-byte contract_id, a2 = selector (u32),
+        // a3 = pointer to input data, a4 = input length, a5 = energy_limit
+        SYS_CONTRACT_CALL => {
+            let input_len = _a4 as usize;
+            let energy_limit = _a5;
+
+            if input_len > 236 {
+                return E_INVALID_ARG;
+            }
+
+            // Read the 32-byte contract_id from user memory.
+            let contract_id: [u8; 32] = unsafe {
+                security::stac();
+                let ptr = a1 as *const [u8; 32];
+                let id = core::ptr::read(ptr);
+                security::clac();
+                id
+            };
+
+            // Read the input data from user memory.
+            let input_slice = unsafe {
+                security::stac();
+                let s = core::slice::from_raw_parts(a3 as *const u8, input_len);
+                security::clac();
+                s
+            };
+
+            match crate::contract_call::call_contract(
+                caller_id as u16,
+                &contract_id,
+                a2 as u32,
+                input_slice,
+                energy_limit,
+            ) {
+                Ok(_) => E_OK,
+                Err(e) => e,
+            }
+        }
+
         _ => {
             serial_println!(
                 "[SYSCALL] Unknown syscall {} from agent {}",

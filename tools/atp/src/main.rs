@@ -1,6 +1,9 @@
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process;
+
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -121,6 +124,34 @@ fn cmd_build(args: &[String]) {
     }
 }
 
+/// Return the path to the Ed25519 key file (next to the binary, or in cwd).
+fn key_file_path() -> PathBuf {
+    let mut p = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    p.push("atp_ed25519.key");
+    p
+}
+
+/// Load an existing Ed25519 signing key or generate (and persist) a new one.
+fn load_or_generate_keypair() -> SigningKey {
+    let path = key_file_path();
+    if let Ok(bytes) = fs::read(&path) {
+        if bytes.len() == 32 {
+            let secret: [u8; 32] = bytes.try_into().unwrap();
+            return SigningKey::from_bytes(&secret);
+        }
+        eprintln!("Warning: key file has unexpected size, generating new keypair");
+    }
+    // Generate a new keypair and save the 32-byte secret seed
+    let mut rng = rand::thread_rng();
+    let key = SigningKey::generate(&mut rng);
+    if let Err(e) = fs::write(&path, key.to_bytes()) {
+        eprintln!("Warning: could not save keypair to {}: {e}", path.display());
+    } else {
+        println!("Generated new Ed25519 keypair -> {}", path.display());
+    }
+    key
+}
+
 fn cmd_sign(args: &[String]) {
     if args.is_empty() {
         eprintln!("Usage: atp sign <package.tos>");
@@ -140,31 +171,34 @@ fn cmd_sign(args: &[String]) {
         process::exit(1);
     }
     let manifest_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if data.len() < 4 + manifest_size {
+    if data.len() < 4 + manifest_size || manifest_size < 64 {
         eprintln!("Truncated manifest");
         process::exit(1);
     }
 
-    // Sign manifest bytes with keyed hash
-    let mut h: u64 = 0xcbf29ce484222325;
-    // Use a fixed "dev key" for signing
-    let dev_key = [0x42u8; 32];
-    for b in &dev_key {
-        h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-    }
-    for b in &data[4..4 + manifest_size - 64] {
-        h = h.wrapping_mul(0x100000001b3) ^ (*b as u64);
-    }
+    // Load or generate the Ed25519 signing key
+    let signing_key = load_or_generate_keypair();
+    let verifying_key = signing_key.verifying_key();
 
-    // Write signature into manifest (last 64 bytes)
+    // The signable content is everything in the manifest *before* the 64-byte signature slot
+    let signable = &data[4..4 + manifest_size - 64];
+
+    // Sign with Ed25519
+    let signature = signing_key.sign(signable);
+
+    // Write the 64-byte Ed25519 signature into the manifest's signature field
     let sig_offset = 4 + manifest_size - 64;
-    for i in 0..8 {
-        let val = h.wrapping_mul(0x100000001b3) ^ (i as u64);
-        data[sig_offset + i * 8..sig_offset + (i + 1) * 8].copy_from_slice(&val.to_le_bytes());
-    }
+    data[sig_offset..sig_offset + 64].copy_from_slice(&signature.to_bytes());
 
     match fs::write(path, &data) {
-        Ok(()) => println!("Signed {path}"),
+        Ok(()) => {
+            let pk_hex: String = verifying_key
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            println!("Signed {path} (pubkey: {pk_hex})");
+        }
         Err(e) => {
             eprintln!("Error: {e}");
             process::exit(1);
@@ -174,7 +208,7 @@ fn cmd_sign(args: &[String]) {
 
 fn cmd_verify(args: &[String]) {
     if args.is_empty() {
-        eprintln!("Usage: atp verify <package.tos>");
+        eprintln!("Usage: atp verify <package.tos> [--pubkey <hex>]");
         process::exit(1);
     }
     let path = &args[0];
@@ -191,6 +225,10 @@ fn cmd_verify(args: &[String]) {
         process::exit(1);
     }
     let manifest_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if manifest_size < 64 {
+        eprintln!("Invalid manifest size");
+        process::exit(1);
+    }
     let code_offset = 4 + manifest_size + 4;
     let code_size = if data.len() > 4 + manifest_size + 4 {
         u32::from_le_bytes([
@@ -221,13 +259,74 @@ fn cmd_verify(args: &[String]) {
         }
     }
 
-    // Check if signature is non-zero
+    // Verify Ed25519 signature
     let sig_offset = 4 + manifest_size - 64;
     let sig_all_zero = data[sig_offset..sig_offset + 64].iter().all(|&b| b == 0);
     if sig_all_zero {
         println!("\u{26a0} Package is UNSIGNED");
     } else {
-        println!("\u{2713} Signature present");
+        // Try to load the public key: either from --pubkey flag or from the key file
+        let pubkey_bytes: Option<[u8; 32]> = if args.len() >= 3 && args[1] == "--pubkey" {
+            // Parse hex-encoded 32-byte public key
+            let hex = &args[2];
+            if hex.len() != 64 {
+                eprintln!("Error: --pubkey must be 64 hex characters (32 bytes)");
+                process::exit(1);
+            }
+            let mut pk = [0u8; 32];
+            for i in 0..32 {
+                pk[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
+                    eprintln!("Error: invalid hex in --pubkey");
+                    process::exit(1);
+                });
+            }
+            Some(pk)
+        } else {
+            // Try loading from key file
+            let kp = key_file_path();
+            if let Ok(bytes) = fs::read(&kp) {
+                if bytes.len() == 32 {
+                    let secret: [u8; 32] = bytes.try_into().unwrap();
+                    let sk = SigningKey::from_bytes(&secret);
+                    Some(sk.verifying_key().to_bytes())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        match pubkey_bytes {
+            Some(pk_bytes) => {
+                let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        eprintln!("Error: invalid public key: {e}");
+                        process::exit(1);
+                    }
+                };
+
+                let sig_bytes: [u8; 64] = data[sig_offset..sig_offset + 64]
+                    .try_into()
+                    .expect("signature slice must be 64 bytes");
+                let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+                let signable = &data[4..4 + manifest_size - 64];
+                match verifying_key.verify(signable, &signature) {
+                    Ok(()) => println!("\u{2713} Ed25519 signature VALID"),
+                    Err(_) => {
+                        println!("\u{2717} Ed25519 signature INVALID");
+                        process::exit(1);
+                    }
+                }
+            }
+            None => {
+                println!("\u{26a0} Signature present but no public key available for verification");
+                println!("  Use: atp verify <package.tos> --pubkey <hex>");
+                println!("  Or place the signing key at: {}", key_file_path().display());
+            }
+        }
     }
 
     println!(
