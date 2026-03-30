@@ -6,6 +6,7 @@ pub mod state;
 pub mod dispatch;
 pub mod memory;
 pub mod fs;
+pub mod vfs;
 pub mod process;
 pub mod signal;
 pub mod network;

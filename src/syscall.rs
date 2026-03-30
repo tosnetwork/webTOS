@@ -143,6 +143,34 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
         }
     }
 
+    // ── LinuxCompat ABI routing ──────────────────────────────────────────
+    // If this agent uses the Linux syscall ABI, route to the Linux compat
+    // dispatcher instead of the ATOS native dispatcher.
+    if let Some(agent) = get_agent(caller_id) {
+        if agent.runtime_kind == RuntimeKind::LinuxCompat {
+            let result = crate::linux_compat::dispatch::dispatch(
+                caller_id, num, a1, a2, a3, _a4, _a5,
+            );
+
+            // ── eBPF SyscallExit hook (same as native path) ──
+            if num != SYS_YIELD {
+                let exit_ctx = crate::ebpf::attach::SyscallContext {
+                    agent_id: caller_id,
+                    syscall_num: num,
+                    arg0: result as u64,
+                    arg1: 0,
+                    arg2: 0,
+                };
+                crate::ebpf::attach::run_at(
+                    crate::ebpf::attach::AttachPoint::SyscallExit(num),
+                    &exit_ctx as *const crate::ebpf::attach::SyscallContext as u64,
+                );
+            }
+
+            return result;
+        }
+    }
+
     let result = match num {
         // ── 0: sys_yield ────────────────────────────────────────────────
         SYS_YIELD => {

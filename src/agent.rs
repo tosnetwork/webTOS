@@ -233,6 +233,8 @@ pub struct Agent {
     pub stack_bottom: u64,   // address of stack guard canary (lowest stack address)
     pub active: bool,       // whether this slot is in use
     pub priority: AgentPriority,
+    /// Runtime kind: Native (ATOS syscalls), Wasm, or LinuxCompat (Linux syscalls).
+    pub runtime_kind: RuntimeKind,
     // Stage 9: receipt state roots – snapshot of keyspace root at agent creation
     pub initial_state_root: [u8; 32],
     /// Tick at which this agent was created (for receipt tick_start).
@@ -268,6 +270,7 @@ impl Agent {
             stack_bottom: 0,
             active: true,
             priority: AgentPriority::Normal,
+            runtime_kind: RuntimeKind::Native,
             initial_state_root: [0u8; 32],
             tick_created: 0,
         }

@@ -60,6 +60,7 @@ pub fn sys_epoll_create1(agent_id: u16, flags: i32) -> i64 {
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::Epoll,
         keyspace_key: epoll_idx as u64, // index into epoll_instances
+        keyspace_id: 0,
         mailbox_id: 0,
         offset: 0,
         flags: flags as u32,
@@ -291,6 +292,7 @@ pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::EventFd,
         keyspace_key: initval as u64,
+        keyspace_id: 0,
         mailbox_id: 0,
         offset: 0,
         flags: flags as u32,

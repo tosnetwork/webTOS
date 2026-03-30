@@ -25,6 +25,7 @@ pub enum FdKind {
 pub struct FdEntry {
     pub kind: FdKind,
     pub keyspace_key: u64,    // for File: keyspace key
+    pub keyspace_id: u16,     // which keyspace to read/write from
     pub mailbox_id: u16,      // for Socket/Pipe: mailbox
     pub offset: u64,          // current read/write offset
     pub flags: u32,           // O_NONBLOCK, O_CLOEXEC, etc.
@@ -36,6 +37,7 @@ impl FdEntry {
         FdEntry {
             kind: FdKind::File,
             keyspace_key: 0,
+            keyspace_id: 0,
             mailbox_id: 0,
             offset: 0,
             flags: 0,

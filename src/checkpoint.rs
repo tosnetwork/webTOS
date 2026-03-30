@@ -54,6 +54,15 @@ pub struct TraceEntry {
     pub data_len: u16,
 }
 
+// ─── Trace event type constants ───────────────────────────────────────────
+
+pub const TRACE_TIMER: u8 = 0;
+pub const TRACE_DISK_READ: u8 = 1;
+pub const TRACE_DISK_WRITE: u8 = 2;
+pub const TRACE_NET_RECV_LEGACY: u8 = 3;
+pub const TRACE_NET_SEND: u8 = 10;
+pub const TRACE_NET_RECV: u8 = 11;
+
 // ─── Trace recording ──────────────────────────────────────────────────────
 
 const MAX_TRACE_ENTRIES: usize = 4096;

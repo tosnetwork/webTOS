@@ -708,3 +708,328 @@ pub fn load_large_value(keyspace: KeyspaceId, buf: &mut [u8]) -> usize {
     total_len
 }
 
+// ─── Multi-segment large value storage ─────────────────────────────────────
+//
+// Files larger than 64 KB (e.g. libjvm.so at 22 MB) are split into 64 KB
+// "segments", each stored via `store_large_value()`.  A metadata entry at
+// `base_key` records the total size and segment count.  Segments are stored
+// at keys `base_key + 1` through `base_key + N`.
+//
+// Because `store_large_value` itself chunks each 64 KB segment into 256-byte
+// entries inside a keyspace, and our per-keyspace entry limit is small, we
+// use a separate dedicated storage table for the base image (see below).
+
+/// Maximum size of a single segment (64 KB, matching `store_large_value` limit).
+const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; // 65536
+
+// ─── Base image dedicated storage ──────────────────────────────────────────
+//
+// The base image keyspace (0xFFFE) cannot use the normal per-agent KEYSPACES
+// table (which only has MAX_AGENTS=28 slots).  Instead, base image data is
+// stored in a flat static table keyed by u64.  Each entry holds up to 256
+// bytes, just like a normal keyspace entry.
+
+/// Maximum number of entries in the base image store.
+const BASE_IMAGE_MAX_ENTRIES: usize = 4096;
+
+struct BaseImageEntry {
+    key: u64,
+    value: [u8; MAX_VALUE_SIZE],
+    len: usize,
+    active: bool,
+}
+
+impl BaseImageEntry {
+    const fn empty() -> Self {
+        BaseImageEntry {
+            key: 0,
+            value: [0u8; MAX_VALUE_SIZE],
+            len: 0,
+            active: false,
+        }
+    }
+}
+
+// Safety: single-core, no preemption.
+static mut BASE_IMAGE_STORE: [BaseImageEntry; BASE_IMAGE_MAX_ENTRIES] =
+    [const { BaseImageEntry::empty() }; BASE_IMAGE_MAX_ENTRIES];
+
+/// Read a value from the base image store.
+fn base_image_get(key: u64) -> Option<&'static [u8]> {
+    unsafe {
+        for entry in BASE_IMAGE_STORE.iter() {
+            if entry.active && entry.key == key {
+                return Some(&entry.value[..entry.len]);
+            }
+        }
+        None
+    }
+}
+
+/// Write a value to the base image store.
+fn base_image_put(key: u64, value: &[u8]) -> Result<(), i64> {
+    if value.len() > MAX_VALUE_SIZE {
+        return Err(E_PAYLOAD_TOO_LARGE);
+    }
+    unsafe {
+        // Update existing entry
+        for entry in BASE_IMAGE_STORE.iter_mut() {
+            if entry.active && entry.key == key {
+                entry.value[..value.len()].copy_from_slice(value);
+                entry.len = value.len();
+                return Ok(());
+            }
+        }
+        // Find free slot
+        for entry in BASE_IMAGE_STORE.iter_mut() {
+            if !entry.active {
+                entry.key = key;
+                entry.value[..value.len()].copy_from_slice(value);
+                entry.len = value.len();
+                entry.active = true;
+                return Ok(());
+            }
+        }
+        Err(E_QUOTA_EXCEEDED)
+    }
+}
+
+/// Read a value from the base image store with a copy.
+fn base_image_state_get(key: u64) -> Option<([u8; MAX_VALUE_SIZE], usize)> {
+    match base_image_get(key) {
+        Some(data) => {
+            let mut buf = [0u8; MAX_VALUE_SIZE];
+            buf[..data.len()].copy_from_slice(data);
+            Some((buf, data.len()))
+        }
+        None => None,
+    }
+}
+
+/// The base image keyspace ID (must match `linux_compat::vfs::BASE_IMAGE_KEYSPACE`).
+pub const BASE_IMAGE_KEYSPACE: u16 = 0xFFFE;
+
+/// Store a large value into the base image keyspace using chunked entries.
+///
+/// This mirrors `store_large_value` but targets the dedicated base image
+/// store instead of a normal per-agent keyspace.
+fn store_large_value_base_image(base_key: u64, data: &[u8]) -> Result<(), i64> {
+    if data.is_empty() {
+        return Err(E_INVALID_ARG);
+    }
+    if data.len() > MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE {
+        return Err(E_PAYLOAD_TOO_LARGE);
+    }
+
+    let chunk_count = (data.len() + MAX_VALUE_SIZE - 1) / MAX_VALUE_SIZE;
+
+    // Metadata: total_len(u32 LE) + chunk_count(u16 LE)
+    let total_len = data.len() as u32;
+    let mut meta = [0u8; 6];
+    meta[0..4].copy_from_slice(&total_len.to_le_bytes());
+    meta[4..6].copy_from_slice(&(chunk_count as u16).to_le_bytes());
+    base_image_put(base_key, &meta)?;
+
+    for i in 0..chunk_count {
+        let start = i * MAX_VALUE_SIZE;
+        let end = (start + MAX_VALUE_SIZE).min(data.len());
+        let chunk_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+        base_image_put(chunk_key, &data[start..end])?;
+    }
+
+    Ok(())
+}
+
+/// Load a large value from the base image keyspace.
+fn load_large_value_base_image(base_key: u64, buf: &mut [u8]) -> usize {
+    let (meta_buf, meta_len) = match base_image_state_get(base_key) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if meta_len < 6 {
+        return 0;
+    }
+
+    let total_len = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
+
+    if total_len == 0 || chunk_count == 0 || total_len > buf.len() {
+        return 0;
+    }
+
+    let mut offset = 0;
+    for i in 0..chunk_count {
+        let chunk_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+        let (chunk_buf, chunk_len) = match base_image_state_get(chunk_key) {
+            Some(v) => v,
+            None => return 0,
+        };
+        let copy_len = chunk_len.min(total_len - offset);
+        buf[offset..offset + copy_len].copy_from_slice(&chunk_buf[..copy_len]);
+        offset += copy_len;
+        if offset >= total_len {
+            break;
+        }
+    }
+
+    total_len
+}
+
+/// Extended large value storage for files >64KB.
+///
+/// Splits data into 64KB segments, each stored as a separate large value.
+///
+/// Segment layout:
+/// - Key `base_key`: metadata — total_size(u32 LE) + segment_count(u16 LE)
+/// - Key `base_key + 1` .. `base_key + N`: each segment stored via
+///   `store_large_value_base_image()` (64KB each, last may be smaller)
+///
+/// For normal keyspaces this delegates to `store_large_value()` when the
+/// data fits in a single segment (<=64KB).  For the base image keyspace,
+/// the dedicated base image store is used.
+pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> Result<(), i64> {
+    if data.is_empty() {
+        return Err(E_INVALID_ARG);
+    }
+
+    let segment_count = (data.len() + MULTI_SEGMENT_SIZE - 1) / MULTI_SEGMENT_SIZE;
+
+    // Store metadata at base_key: total_size(u32 LE) + segment_count(u16 LE)
+    let mut meta = [0u8; 6];
+    meta[0..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    meta[4..6].copy_from_slice(&(segment_count as u16).to_le_bytes());
+
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        base_image_put(base_key, &meta)?;
+    } else {
+        put(keyspace, base_key, &meta)?;
+    }
+
+    // Store each segment as a large value at base_key + 1 + i
+    // Each segment itself is chunked into 256-byte entries.
+    for i in 0..segment_count {
+        let start = i * MULTI_SEGMENT_SIZE;
+        let end = (start + MULTI_SEGMENT_SIZE).min(data.len());
+        let segment_data = &data[start..end];
+
+        // The segment key is offset from base_key.  Each segment's internal
+        // chunk keys are derived from the segment key.
+        let segment_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+
+        // We store the segment as a "large value" rooted at segment_key.
+        // For the base image this uses the dedicated store; for normal
+        // keyspaces it uses the standard store_large_value approach.
+        if keyspace == BASE_IMAGE_KEYSPACE {
+            store_large_value_base_image(segment_key, segment_data)?;
+        } else {
+            // For normal keyspaces, fall back to direct chunked storage
+            // at the segment key offset.  This reuses the base image
+            // chunking logic but targeting the agent keyspace.
+            let chunk_count = (segment_data.len() + MAX_VALUE_SIZE - 1) / MAX_VALUE_SIZE;
+            let mut seg_meta = [0u8; 6];
+            seg_meta[0..4].copy_from_slice(&(segment_data.len() as u32).to_le_bytes());
+            seg_meta[4..6].copy_from_slice(&(chunk_count as u16).to_le_bytes());
+            put(keyspace, segment_key, &seg_meta)?;
+            for c in 0..chunk_count {
+                let cs = c * MAX_VALUE_SIZE;
+                let ce = (cs + MAX_VALUE_SIZE).min(segment_data.len());
+                put(keyspace, segment_key.wrapping_add(1).wrapping_add(c as u64), &segment_data[cs..ce])?;
+            }
+        }
+    }
+
+    if keyspace != BASE_IMAGE_KEYSPACE {
+        advance_version(keyspace);
+    }
+    Ok(())
+}
+
+/// Load a multi-segment value that was stored via `store_multi_segment`.
+///
+/// Reads the metadata at `base_key`, then reassembles all segments into
+/// `buf`.  Returns the total number of bytes read, or 0 on failure.
+pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -> usize {
+    // Read top-level metadata
+    let (meta_buf, meta_len) = if keyspace == BASE_IMAGE_KEYSPACE {
+        match base_image_state_get(base_key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    } else {
+        match state_get(keyspace, base_key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    };
+
+    if meta_len < 6 {
+        return 0;
+    }
+
+    let total_size = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let segment_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
+
+    if total_size == 0 || segment_count == 0 || total_size > buf.len() {
+        return 0;
+    }
+
+    let mut offset = 0;
+    for i in 0..segment_count {
+        let segment_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+        let segment_size = MULTI_SEGMENT_SIZE.min(total_size - offset);
+
+        let loaded = if keyspace == BASE_IMAGE_KEYSPACE {
+            load_large_value_base_image(segment_key, &mut buf[offset..offset + segment_size])
+        } else {
+            // Load segment from normal keyspace using chunked reads
+            let (seg_meta_buf, seg_meta_len) = match state_get(keyspace, segment_key) {
+                Some(v) => v,
+                None => return 0,
+            };
+            if seg_meta_len < 6 {
+                return 0;
+            }
+            let seg_total = u32::from_le_bytes([seg_meta_buf[0], seg_meta_buf[1], seg_meta_buf[2], seg_meta_buf[3]]) as usize;
+            let seg_chunks = u16::from_le_bytes([seg_meta_buf[4], seg_meta_buf[5]]) as usize;
+            if seg_total == 0 || seg_chunks == 0 || seg_total > segment_size {
+                return 0;
+            }
+            let mut seg_off = 0;
+            for c in 0..seg_chunks {
+                let ck = segment_key.wrapping_add(1).wrapping_add(c as u64);
+                let (cbuf, clen) = match state_get(keyspace, ck) {
+                    Some(v) => v,
+                    None => return 0,
+                };
+                let copy = clen.min(seg_total - seg_off);
+                buf[offset + seg_off..offset + seg_off + copy].copy_from_slice(&cbuf[..copy]);
+                seg_off += copy;
+                if seg_off >= seg_total {
+                    break;
+                }
+            }
+            seg_total
+        };
+
+        if loaded == 0 {
+            return 0;
+        }
+        offset += loaded;
+        if offset >= total_size {
+            break;
+        }
+    }
+
+    total_size
+}
+
+/// Install a file into the base image keyspace.
+///
+/// The file is stored using multi-segment storage at the key derived from
+/// the given path (via `vfs::sha256_key`).  This is the entry point for
+/// pre-installing `.so` files, JDK binaries, and other base image assets.
+pub fn install_base_image_file(path: &[u8], data: &[u8]) -> Result<(), i64> {
+    let key = crate::linux_compat::vfs::sha256_key(path);
+    store_multi_segment(BASE_IMAGE_KEYSPACE, key, data)
+}
+

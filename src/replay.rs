@@ -23,6 +23,11 @@ pub fn is_active() -> bool {
     unsafe { REPLAY_ACTIVE }
 }
 
+/// Check if replay mode is active (alias for use by I/O subsystems).
+pub fn is_replay_mode() -> bool {
+    unsafe { REPLAY_ACTIVE }
+}
+
 /// Restore execution state from a checkpoint on disk.
 ///
 /// Loads the checkpoint header, agent states, and Merkle roots from disk.
