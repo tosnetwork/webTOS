@@ -95,10 +95,10 @@ pub fn generate_proof() -> ExecutionProof {
 
     // The proof hash is: H(combined_root || tick || seq)
     let mut proof_data = [0u8; 48];
-    proof_data[0..16].copy_from_slice(&combined_root);
-    proof_data[16..24].copy_from_slice(&tick.to_le_bytes());
-    proof_data[24..32].copy_from_slice(&seq.to_le_bytes());
-    let proof_hash = hash_bytes(&proof_data[..32]);
+    proof_data[0..32].copy_from_slice(&combined_root);
+    proof_data[32..40].copy_from_slice(&tick.to_le_bytes());
+    proof_data[40..48].copy_from_slice(&seq.to_le_bytes());
+    let proof_hash = hash_bytes(&proof_data);
 
     let proof = ExecutionProof {
         checkpoint_tick: tick,

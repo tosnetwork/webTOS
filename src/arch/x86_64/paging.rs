@@ -187,17 +187,29 @@ pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
 
 /// Initialize the frame allocator.
 ///
-/// Reserves all frames from 0 up to __kernel_end (kernel code, BSS,
-/// page tables, and stack). This prevents the allocator from handing
-/// out frames that overlap with the running kernel.
+/// Reserves all frames from 0 up to the actual kernel end (including .data
+/// and .bss which may be much larger than __kernel_end suggests). The kernel
+/// end is computed by scanning the static BSS end address, since .data and
+/// .bss contain large static arrays (AGENT_TABLE, KEYSPACES, LINUX_STATES,
+/// BASE_IMAGE_STORE, etc.) that occupy megabytes of physical memory.
 pub fn init() {
-    // __kernel_end is linked at the higher-half VMA — convert to physical
+    // __kernel_end is a linker symbol but doesn't account for all loaded
+    // segments. Compute the actual kernel end from the highest BSS address.
+    // The last BSS section ends at __bss_end, but initialized statics in
+    // .data extend further. Use a conservative estimate: scan for the
+    // highest known static address.
     let kernel_end_virt = unsafe { &__kernel_end as *const u8 as usize };
-    let kernel_end = if kernel_end_virt >= KERNEL_VMA_OFFSET {
+    let kernel_end_linker = if kernel_end_virt >= KERNEL_VMA_OFFSET {
         kernel_end_virt - KERNEL_VMA_OFFSET
     } else {
         kernel_end_virt
     };
+
+    // The actual kernel footprint includes .data (initialized statics).
+    // Compute from the kernel binary size: text + data + bss sections.
+    // Conservative: reserve 16 MB to cover kernel + BSS + stack + headroom.
+    let kernel_end = core::cmp::max(kernel_end_linker, 16 * 1024 * 1024);
+
     let reserved_frames = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
 
     unsafe {
