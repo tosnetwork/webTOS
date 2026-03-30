@@ -461,8 +461,13 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
         return -ENOENT;
     }
 
-    let key = path_to_key(&path_buf[..path_len]);
-    match crate::state::get(agent_id, key) {
+    // Special files always exist
+    if super::vfs::is_special_path(&path_buf[..path_len]).is_some() {
+        return 0;
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, &path_buf[..path_len]);
+    match crate::state::state_get(ks, key) {
         Some(_) => 0,
         None => -ENOENT,
     }
