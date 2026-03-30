@@ -231,6 +231,10 @@ fn create_user_agent(
 /// Kernel-mode agents (idle, root, stated, policyd) run in ring 0.
 /// User-mode agents (ping, pong, bad) run in ring 3 with isolated address spaces.
 pub fn init() {
+    // Disable interrupts during init to prevent the timer interrupt from
+    // scheduling agents before their contexts are fully set up (cr3, stacks).
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
     serial_println!("[INIT] Creating system agents...");
 
     // ── Idle agent (agent 0) ────────────────────────────────────────────
@@ -617,4 +621,7 @@ pub fn init() {
     }
 
     serial_println!("[INIT] All agents created and queued");
+
+    // Re-enable interrupts now that all agent contexts are fully set up.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 }

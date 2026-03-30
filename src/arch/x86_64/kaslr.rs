@@ -51,8 +51,12 @@ pub fn init() {
     // the upper bits are nearly zero at boot) still produces good low-byte
     // entropy for the offsets derived below.
     let mixed = tsc ^ (tsc >> 17) ^ (tsc << 13);
+    let _ = mixed;
 
-    KASLR_ENTROPY.store(mixed, Ordering::Relaxed);
+    // KASLR disabled for Stage-9 testing — identity-mapped 512MB region
+    // requires predictable frame addresses. Re-enable once higher-half
+    // kernel with 4KB page granularity is implemented.
+    KASLR_ENTROPY.store(0, Ordering::Relaxed);
 
     // Log only the bottom 16 bits — enough to confirm randomisation without
     // leaking the full entropy value (which would help an attacker).
