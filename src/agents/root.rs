@@ -22,14 +22,14 @@ pub extern "C" fn root_entry() -> ! {
     // ── Stage 9: Load Linux ELF test binary ────────────────────────────
     // Done in root agent (not init) to avoid boot stack overflow.
     {
-        static HELLO_ELF: &[u8] = include_bytes!("../../test_data/hello_linux.elf");
+        static HELLO_ELF: &[u8] = include_bytes!("../../test_data/test_syscalls.elf");
         serial_println!("[ROOT] Loading Linux ELF test binary ({} bytes)...", HELLO_ELF.len());
         match crate::agent_loader::spawn_from_image(
             1, // root_id
             HELLO_ELF,
             crate::agent::RuntimeKind::LinuxCompat,
-            10_000,
-            64,
+            1_000_000,  // generous energy for syscall test suite
+            256,        // memory quota for mmap tests
         ) {
             Ok(id) => serial_println!("[ROOT] Linux ELF agent created: id={} (LinuxCompat)", id),
             Err(e) => serial_println!("[ROOT] Linux ELF load failed: error {}", e),

@@ -100,8 +100,25 @@ impl LinuxAgentState {
         prng_state[2] = 0xA7;
         prng_state[3] = 0x05;
 
+        let mut fd_table: [Option<FdEntry>; MAX_FDS] = [const { None }; MAX_FDS];
+
+        // Pre-open fd 0 (stdin), 1 (stdout), 2 (stderr) — like Linux init.
+        // stdout/stderr map to serial console via sys_write special-case.
+        // stdin reads return 0 (EOF).
+        for fd in 0..3u16 {
+            fd_table[fd as usize] = Some(FdEntry {
+                kind: FdKind::File,
+                keyspace_key: 0,
+                keyspace_id: agent_id,
+                mailbox_id: 0,
+                offset: 0,
+                flags: if fd == 0 { 0 } else { 1 }, // O_WRONLY for stdout/stderr
+                active: true,
+            });
+        }
+
         LinuxAgentState {
-            fd_table: [const { None }; MAX_FDS],
+            fd_table,
             cwd,
             cwd_len: 1,
             brk_current: 0x0060_0000, // conventional brk start
