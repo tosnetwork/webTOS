@@ -426,7 +426,7 @@ Any language that compiles to WASM runs on ATOS: Rust, C, C++, Go, Zig, Assembly
 **Success Condition**
 Any WASM module runs on ATOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
 
-#### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ⏳ Planned]`
+#### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ⚠️ Syscall handlers implemented, integration incomplete]`
 
 **Purpose**
 Run any unmodified Linux x86_64 program on ATOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, ATOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
@@ -463,7 +463,7 @@ ATOS is a deterministic execution VM. Programs compiled to WASM already run dete
 
 The key insight is that non-determinism in Linux programs comes from a small number of syscall-level sources. By controlling the syscall boundary, ATOS can make any Linux program deterministic — the program cannot tell the difference, but its execution becomes fully reproducible.
 
-**Non-Determinism Sources and Deterministic Replacements**
+**Non-Determinism Sources and Deterministic Replacements** `[IMPL: ✅ All replacements implemented in linux_compat/]`
 
 | Linux Syscall | Non-Determinism Source | ATOS Deterministic Replacement |
 |--------------|----------------------|-------------------------------|
@@ -478,7 +478,7 @@ The key insight is that non-determinism in Linux programs comes from a small num
 | `nanosleep` / `clock_nanosleep` | Wake-up time imprecise | Advance logical tick by requested amount (instant, deterministic) |
 | `pipe` / `eventfd` | Reader/writer scheduling | Mailbox pair with deterministic delivery order |
 
-**Interception Mechanism**
+**Interception Mechanism** `[IMPL: ⚠️ RuntimeKind::LinuxCompat=2 added to agent.rs, but syscall.rs does NOT yet route LinuxCompat agents to linux_compat::dispatch()]`
 
 Each agent is tagged at spawn time with a `RuntimeKind`:
 
@@ -500,7 +500,7 @@ fn syscall_handler(num: u64, a1-a5: u64) -> i64 {
 }
 ```
 
-**Per-Agent Virtual OS State**
+**Per-Agent Virtual OS State** `[IMPL: ✅ LinuxAgentState with fd_table(256), cwd, brk, mmap_next, PRNG, epoll instances — state.rs]`
 
 Each Linux-compat agent maintains a virtual POSIX state that is fully deterministic:
 
@@ -518,7 +518,7 @@ LinuxAgentState {
 }
 ```
 
-**Deterministic Thread Model**
+**Deterministic Thread Model** `[IMPL: ✅ clone3 creates child agent + deterministic scheduler; futex wait queue with agent_id ordering — process.rs]`
 
 This is the hardest and most important part. OpenJDK, Node.js (libuv), and Go all create OS threads via `clone()`.
 
@@ -630,7 +630,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 | 334 | `rseq` | Return -ENOSYS (restartable sequences not supported; glibc handles gracefully) | J N P |
 | 435 | `clone3` | `sys_spawn` child agent with shared keyspace + deterministic scheduling | J N |
 
-**Total: 62 syscalls** — verified by `strace -f -c` against OpenJDK 11, Node.js v24, and CPython 3.10.
+**Total: 62 syscalls** — verified by `strace -f -c` against OpenJDK 11, Node.js v24, and CPython 3.10. `[IMPL: ✅ 60/62 real implementations, 2 intentional -ENOSYS (io_uring only — Java doesn't use it, Node falls back to epoll)]`
 
 **Legacy syscalls** (supported for older binaries but not observed in strace):
 
@@ -656,7 +656,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 | **4: Threads + futex** | 13 | 61 | OpenJDK, Go, multi-threaded | clone3→child agent, futex→agent_id ordering |
 | **Legacy** | 9 | 70 | Older binaries | Redirect to modern equivalents |
 
-**Deterministic PRNG Specification**
+**Deterministic PRNG Specification** `[IMPL: ✅ SHA-256 chaining in identity.rs sys_getrandom()]`
 
 Every Linux-compat agent has a built-in deterministic PRNG:
 
@@ -673,7 +673,7 @@ on getrandom(buf, len):
 
 This produces output that appears random to the program but is fully reproducible given the same agent_id and creation_tick.
 
-**I/O Trace for Network Determinism**
+**I/O Trace for Network Determinism** `[IMPL: ⚠️ sendto proxies through netd mailbox, recvfrom does non-blocking recv; I/O trace recording not yet integrated with replay]`
 
 Network I/O is inherently non-deterministic (data arrives at unpredictable times). ATOS handles this via I/O tracing:
 
@@ -691,7 +691,7 @@ Replay:
   read(fd=5, buf) → replay from trace (deterministic, same bytes)
 ```
 
-**Base Image Model for Dynamic Linking**
+**Base Image Model for Dynamic Linking** `[IMPL: ❌ Not yet implemented — no base image storage, no virtual filesystem path→keyspace mapping, no multi-segment storage for files >64KB]`
 
 Linux programs (especially OpenJDK, Node.js, CPython) depend on dynamically linked shared libraries (`.so` files). A simple Java "Hello World" loads 13 `.so` files totaling ~26 MB at runtime:
 
@@ -813,14 +813,14 @@ libjvm.so (22 MB) storage:
 This requires extending `store_large_value()` to support multi-segment files (currently limited to 64 KB). The extension is backward-compatible — files under 64 KB continue to use single-segment storage.
 
 **Success Condition**
-- OpenJDK runs Java programs on ATOS with deterministic execution via the Linux compatibility layer.
-- Dynamic linking works: `ld-linux` loads `.so` files from keyspace-backed virtual filesystem.
-- Base images are pre-installed once; user applications deploy as lightweight packages.
-- `curl https://example.com` fetches data through netd with I/O trace logging.
-- A Go multi-threaded HTTP server handles concurrent requests via child agent threads with deterministic scheduling.
-- A Node.js program runs on ATOS with deterministic event loop ordering.
-- Two runs with the same input produce bit-identical execution traces and state roots.
-- Linux-compat agents produce valid ExecutionReceipts with determinism guarantees.
+- OpenJDK runs Java programs on ATOS with deterministic execution via the Linux compatibility layer. `[NOT YET — requires syscall routing + base image]`
+- Dynamic linking works: `ld-linux` loads `.so` files from keyspace-backed virtual filesystem. `[NOT YET — requires base image + multi-segment storage]`
+- Base images are pre-installed once; user applications deploy as lightweight packages. `[NOT YET — requires base image model]`
+- `curl https://example.com` fetches data through netd with I/O trace logging. `[PARTIAL — sendto proxies to netd, but I/O trace not integrated]`
+- A Go multi-threaded HTTP server handles concurrent requests via child agent threads with deterministic scheduling. `[PARTIAL — clone3 + futex work, but untested end-to-end]`
+- A Node.js program runs on ATOS with deterministic event loop ordering. `[PARTIAL — epoll + poll + select implemented, but untested end-to-end]`
+- Two runs with the same input produce bit-identical execution traces and state roots. `[PARTIAL — deterministic replacements in place, but I/O trace replay not wired]`
+- Linux-compat agents produce valid ExecutionReceipts with determinism guarantees. `[PARTIAL — receipts work, but LinuxCompat agents not yet routed through linux_compat dispatch]`
 
 ### The Three Eras of ATOS
 
@@ -1360,6 +1360,6 @@ ATOS handles execution. The blockchain handles consensus, ordering, and finality
 | 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ✅ Complete |
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
 | 8 | WASM Runtime | Production WASM engine with fuel metering | ✅ Complete |
-| 9 | Deterministic Linux Compat | Any Linux x86_64 binary runs deterministically | ⏳ Planned |
+| 9 | Deterministic Linux Compat | Any Linux x86_64 binary runs deterministically | ⚠️ Syscall handlers done, integration needed |
 
 **ATOS is complete when any Linux program runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
