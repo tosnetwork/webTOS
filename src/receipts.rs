@@ -43,10 +43,8 @@ pub type Hash256 = [u8; 32];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RuntimeClassTag {
-    BestEffortNative = 0,
+    ProofGradeWasm = 0,
     ReplayGradeNative = 1,
-    ProofGradeWasm = 2,
-    BrokerService = 3,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,9 +58,9 @@ pub struct ExecutionReceipt {
     pub receipt_version: u16,
     pub receipt_id: Hash256,
 
-    pub workload_id: Hash256,
+    pub contract_id: Hash256,
     pub execution_id: Hash256,
-    pub principal_id: [u8; 32],
+    pub caller_id: [u8; 32],
     pub local_agent_id: Option<u16>,
     pub node_id: Hash256,
 
@@ -78,12 +76,7 @@ pub struct ExecutionReceipt {
     pub event_log_commitment: Hash256,
     pub trace_commitment: Hash256,
 
-    pub authority_commitment: Hash256,
-    pub policy_bundle_hash: Hash256,
-    pub policy_decision_commitment: Hash256,
-
     pub energy_used: u64,
-    pub pricing_class: u32,
 
     pub tick_start: u64,
     pub tick_end: u64,
@@ -116,9 +109,9 @@ impl ExecutionReceipt {
         Self {
             receipt_version: 1,
             receipt_id,
-            workload_id: [0; 32],  // set by caller
+            contract_id: [0; 32],  // set by caller
             execution_id: receipt_id,
-            principal_id: [0; 32],  // set by caller
+            caller_id: [0; 32],  // set by caller
             local_agent_id: Some(agent_id),
             node_id: [0; 32],  // set by node identity
             runtime_class,
@@ -130,11 +123,7 @@ impl ExecutionReceipt {
             final_state_root,
             event_log_commitment: [0; 32],
             trace_commitment: [0; 32],
-            authority_commitment: [0; 32],
-            policy_bundle_hash: [0; 32],
-            policy_decision_commitment: [0; 32],
             energy_used,
-            pricing_class: runtime_class as u32,
             tick_start,
             tick_end,
             wall_clock_hint: 0,
@@ -156,7 +145,7 @@ impl ExecutionReceipt {
 
         buf[pos..pos + 32].copy_from_slice(&self.receipt_id);
         pos += 32;
-        buf[pos..pos + 32].copy_from_slice(&self.workload_id);
+        buf[pos..pos + 32].copy_from_slice(&self.contract_id);
         pos += 32;
         buf[pos..pos + 32].copy_from_slice(&self.execution_id);
         pos += 32;
@@ -172,8 +161,6 @@ impl ExecutionReceipt {
         pos += 8;
         buf[pos] = self.runtime_class as u8;
         pos += 1;
-        buf[pos..pos + 4].copy_from_slice(&self.pricing_class.to_le_bytes());
-        pos += 4;
         buf[pos..pos + 32].copy_from_slice(&self.node_id);
         pos += 32;
 
