@@ -3,8 +3,7 @@
 //! Defines fixed-size policy bundles for `no_std` environments. A policy
 //! bundle groups up to 16 rules that govern capability access decisions.
 
-use crate::principal::Hash256;
-use crate::crypto;
+type Hash256 = [u8; 32];
 
 /// Maximum number of rules per policy bundle (fixed-size for no_std).
 pub const MAX_POLICY_RULES: usize = 16;
@@ -46,8 +45,6 @@ pub struct PolicyBundle {
     pub rules: [PolicyRule; MAX_POLICY_RULES],
     pub rule_count: u8,
     pub manifest_hash: Hash256,
-    /// Cryptographic signature over (version || manifest_hash || rules).
-    pub signature: [u8; 64],
 }
 
 impl PolicyBundle {
@@ -58,7 +55,6 @@ impl PolicyBundle {
             rules: [PolicyRule::empty(); MAX_POLICY_RULES],
             rule_count: 0,
             manifest_hash: [0u8; 32],
-            signature: [0u8; 64],
         }
     }
 
@@ -85,48 +81,4 @@ impl PolicyBundle {
         PolicyAction::Permit
     }
 
-    /// Serialise the signable fields into a fixed-size buffer.
-    ///
-    /// Layout: version (4 bytes) || manifest_hash (32 bytes) || rules
-    /// (rule_count * 7 bytes: kind(1) + target(4) + action(1) + pad(1)).
-    /// Returns the number of valid bytes written.
-    fn signable_bytes(&self, buf: &mut [u8; 256]) -> usize {
-        let mut pos = 0;
-        // version
-        buf[pos..pos + 4].copy_from_slice(&self.version.to_le_bytes());
-        pos += 4;
-        // manifest_hash
-        buf[pos..pos + 32].copy_from_slice(&self.manifest_hash);
-        pos += 32;
-        // rules
-        for i in 0..self.rule_count as usize {
-            let r = &self.rules[i];
-            buf[pos] = r.kind as u8;
-            pos += 1;
-            buf[pos..pos + 4].copy_from_slice(&r.target_capability.to_le_bytes());
-            pos += 4;
-            buf[pos] = r.action as u8;
-            pos += 1;
-        }
-        pos
-    }
-
-    /// Sign the bundle with a signing key and store the signature.
-    pub fn sign_bundle(&mut self, key: &crypto::SigningKey) {
-        let mut buf = [0u8; 256];
-        let len = self.signable_bytes(&mut buf);
-        let sig = crypto::sign(key, &buf[..len]);
-        self.signature = sig.to_bytes();
-    }
-
-    /// Verify the bundle signature against a verify key.
-    pub fn verify_bundle(&self, key: &crypto::VerifyingKey) -> bool {
-        let mut buf = [0u8; 256];
-        let len = self.signable_bytes(&mut buf);
-        if let Ok(sig) = crypto::Signature::from_slice(&self.signature) {
-            crypto::verify(key, &buf[..len], &sig)
-        } else {
-            false
-        }
-    }
 }

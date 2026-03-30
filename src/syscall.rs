@@ -160,18 +160,6 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
                 return E_NO_CAP;
             }
 
-            // Principal admission control: verify spawning agent's principal is not revoked
-            {
-                let mut principal_id = [0u8; 32];
-                let id_bytes = caller_id.to_le_bytes();
-                principal_id[0] = id_bytes[0];
-                principal_id[1] = id_bytes[1];
-                if crate::agents::authd::is_principal_revoked(&principal_id) {
-                    crate::event::auth_deny(caller_id, CapType::AgentSpawn as u64, 0);
-                    return E_NO_CAP; // EPERM — principal revoked
-                }
-            }
-
             // ── eBPF AgentSpawn check ──
             let spawn_ctx = crate::ebpf::attach::SpawnContext {
                 parent_id: caller_id,
@@ -947,58 +935,11 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             E_OK
         }
 
-        // ── 24: sys_lease_verify ────────────────────────────────────────
-        // a1 = cap_index -> checks if capability lease is still valid
-        // Returns 0 if valid, -1 if expired/revoked
-        SYS_LEASE_VERIFY => {
-            let cap_index = a1 as usize;
-            let current_tick = crate::arch::x86_64::timer::get_ticks();
+        // ── 24: sys_lease_verify (removed — distributed feature)
+        SYS_LEASE_VERIFY => { E_INVALID_ARG }
 
-            let agent = match get_agent(caller_id) {
-                Some(a) => a,
-                None => return E_INVALID_ARG,
-            };
-
-            if cap_index >= agent.cap_count {
-                return E_INVALID_ARG;
-            }
-
-            match &agent.capabilities[cap_index] {
-                Some(cap) => {
-                    if cap.is_expired(current_tick) {
-                        crate::event::auth_lease_expired(caller_id, cap_index as u64, cap.expiry_ticks);
-                        -1
-                    } else {
-                        E_OK
-                    }
-                }
-                None => E_NOT_FOUND,
-            }
-        }
-
-        // ── 25: sys_revocation_check ────────────────────────────────────
-        // a1 = principal_id_ptr, a2 = principal_id_len (must be 32)
-        // Returns 0 if active, 1 if revoked
-        SYS_REVOCATION_CHECK => {
-            if a2 != 32 {
-                return E_INVALID_ARG;
-            }
-
-            let principal_id = unsafe {
-                security::stac();
-                let mut pid = [0u8; 32];
-                core::ptr::copy_nonoverlapping(a1 as *const u8, pid.as_mut_ptr(), 32);
-                security::clac();
-                pid
-            };
-
-            // Check the authd revocation list
-            if crate::agents::authd::is_principal_revoked(&principal_id) {
-                1 // Revoked
-            } else {
-                0 // Active
-            }
-        }
+        // ── 25: sys_revocation_check (removed — authority feature)
+        SYS_REVOCATION_CHECK => { E_INVALID_ARG }
 
         // ── 26: sys_state_tx_begin ────────────────────────────────────
         // a1 = keyspace_id (0 = own keyspace)
@@ -1134,62 +1075,14 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             }
         }
 
-        // ── 33: sys_node_attest ───────────────────────────────────────
-        // Return a summary of the node attestation hash (first 8 bytes as u64).
-        SYS_NODE_ATTEST => {
-            let hash = crate::node::get_attestation_hash();
-            i64::from_le_bytes([hash[0], hash[1], hash[2], hash[3],
-                                hash[4], hash[5], hash[6], hash[7]])
-        }
+        // ── 33: sys_node_attest (removed — distributed feature)
+        SYS_NODE_ATTEST => { E_INVALID_ARG }
 
-        // ── 34: sys_agent_migrate ─────────────────────────────────────
-        // Initiate checkpoint-based migration. a1 = ptr to 32-byte target node ID.
-        SYS_AGENT_MIGRATE => {
-            let _target_ptr = a1;
-            serial_println!(
-                "[SYSCALL] AGENT_MIGRATE: agent {} requests migration (target_ptr={:#x})",
-                caller_id, _target_ptr
-            );
+        // ── 34: sys_agent_migrate (removed — distributed feature)
+        SYS_AGENT_MIGRATE => { E_INVALID_ARG }
 
-            // Build a portable checkpoint for this agent
-            match crate::checkpoint::PortableCheckpoint::from_agent(caller_id) {
-                Some(pc) => {
-                    serial_println!(
-                        "[SYSCALL] AGENT_MIGRATE: checkpoint ready, data_len={} auth_len={}",
-                        pc.checkpoint_len, pc.authority_len
-                    );
-                    // In a full implementation the checkpoint would be sent via
-                    // routerd to the target node. For now we mark the agent as
-                    // suspended to indicate migration-in-progress.
-                    if let Some(agent) = crate::agent::get_agent_mut(caller_id) {
-                        agent.status = crate::agent::AgentStatus::Suspended;
-                    }
-                    E_OK
-                }
-                None => {
-                    serial_println!("[SYSCALL] AGENT_MIGRATE: checkpoint failed for agent {}", caller_id);
-                    E_INVALID_ARG
-                }
-            }
-        }
-
-        // ── 35: sys_placement_hint ────────────────────────────────────
-        // Declare placement preference. a1 = hint_type, a2 = hint_value.
-        SYS_PLACEMENT_HINT => {
-            let hint_type = a1;
-            let hint_value = a2;
-            if let Some(agent) = crate::agent::get_agent_mut(caller_id) {
-                agent.placement_hint_type = hint_type;
-                agent.placement_hint_value = hint_value;
-                serial_println!(
-                    "[SYSCALL] PLACEMENT_HINT: agent {} type={} value={}",
-                    caller_id, hint_type, hint_value
-                );
-                E_OK
-            } else {
-                E_INVALID_ARG
-            }
-        }
+        // ── 35: sys_placement_hint (removed — distributed feature)
+        SYS_PLACEMENT_HINT => { E_INVALID_ARG }
 
         // ── 36: sys_quote_request ──────────────────────────────────────
         // Return estimated energy cost for a workload.
@@ -1226,81 +1119,8 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
             }
         }
 
-        // ── 38: sys_send_remote ─────────────────────────────────────────
-        // Send a message to a remote agent via cross-node routing.
-        // a1 = dest_agent_id (remote), a2 = payload ptr, a3 = payload len
-        // The kernel looks up the remote agent's home node, wraps the message
-        // with a routing header (including authority hash + signature), and
-        // forwards it to routerd (mailbox 10) for network delivery.
-        SYS_SEND_REMOTE => {
-            use crate::capability::CapType;
-            use crate::agents::routerd;
-
-            let dest_agent = a1 as u16;
-            let payload_len = a3 as usize;
-
-            if payload_len > MAX_MESSAGE_PAYLOAD {
-                return E_PAYLOAD_TOO_LARGE;
-            }
-
-            // Check that the sender has the SendRemote capability.
-            if !crate::capability::agent_try_cap(caller_id, CapType::SendRemote, dest_agent) {
-                crate::event::cap_denied(caller_id, CapType::SendRemote as u64, dest_agent as u64);
-                return E_NO_CAP;
-            }
-
-            // Look up the remote agent's home node.
-            let dest_node = match routerd::lookup_remote_agent(dest_agent) {
-                Some(node) => node,
-                None => {
-                    serial_println!(
-                        "[SYSCALL] SYS_SEND_REMOTE: agent {} not found in remote registry",
-                        dest_agent
-                    );
-                    return E_NOT_FOUND;
-                }
-            };
-
-            // Read the payload from user space.
-            let payload = unsafe {
-                security::stac();
-                let s = core::slice::from_raw_parts(a2 as *const u8, payload_len);
-                security::clac();
-                s
-            };
-
-            // Compute authority hash over the sender's capabilities.
-            let authority_hash = routerd::compute_authority_hash(caller_id);
-
-            // Sign the routing header fields with the node's signing key.
-            let source_node = crate::node::get_node_id();
-            let signature = routerd::sign_routing_header(
-                &source_node, &dest_node, caller_id, dest_agent, &authority_hash,
-            );
-
-            // Build the forwarding message for routerd:
-            //   [0x10] [dest_node:32] [src_agent:2] [dest_agent:2]
-            //   [authority_hash:32] [signature:64] [payload...]
-            let mut fwd_buf = [0u8; MAX_MESSAGE_PAYLOAD];
-            let hdr_len = 1 + 32 + 2 + 2 + 32 + 64; // = 133
-            if hdr_len + payload_len > MAX_MESSAGE_PAYLOAD {
-                return E_PAYLOAD_TOO_LARGE;
-            }
-            fwd_buf[0] = 0x10; // ROUTE_REMOTE
-            fwd_buf[1..33].copy_from_slice(&dest_node);
-            fwd_buf[33..35].copy_from_slice(&caller_id.to_le_bytes());
-            fwd_buf[35..37].copy_from_slice(&dest_agent.to_le_bytes());
-            fwd_buf[37..69].copy_from_slice(&authority_hash);
-            fwd_buf[69..133].copy_from_slice(&signature);
-            fwd_buf[133..133 + payload_len].copy_from_slice(payload);
-
-            let total_len = hdr_len + payload_len;
-            // Deliver to routerd's mailbox (10) as kernel (sender 0).
-            match mailbox::send_message(0, 10, &fwd_buf[..total_len]) {
-                Ok(()) => E_OK,
-                Err(e) => e,
-            }
-        }
+        // ── 38: sys_send_remote (removed — distributed feature)
+        SYS_SEND_REMOTE => { E_INVALID_ARG }
 
         _ => {
             serial_println!(

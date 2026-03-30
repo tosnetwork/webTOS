@@ -7,7 +7,6 @@
 extern crate alloc;
 
 use crate::crypto;
-use crate::principal::PrincipalId;
 
 // ─── Node-level receipt signing key ──────────────────────────────────────────
 
@@ -63,7 +62,7 @@ pub struct ExecutionReceipt {
 
     pub workload_id: Hash256,
     pub execution_id: Hash256,
-    pub principal_id: PrincipalId,
+    pub principal_id: [u8; 32],
     pub local_agent_id: Option<u16>,
     pub node_id: Hash256,
 

@@ -33,68 +33,6 @@ impl StateEntry {
     }
 }
 
-// ─── Encryption context ─────────────────────────────────────────────────────
-
-/// Encryption context for sealed keyspaces.
-///
-/// Uses a keyed PRNG stream cipher (FNV-1a + LCG based) with a 64-bit nonce
-/// to produce a per-byte keystream.  Significantly stronger than static XOR
-/// because every (key, nonce) pair yields a unique stream.
-pub struct KeyspaceEncryption {
-    pub enabled: bool,
-    pub key: [u8; 32],
-}
-
-impl KeyspaceEncryption {
-    /// Encrypt/decrypt a value using a keyed PRNG stream cipher.
-    ///
-    /// The keystream is derived by mixing the 32-byte key with a caller-supplied
-    /// nonce through FNV-1a, then expanding via a 64-bit LCG.  The operation is
-    /// symmetric: `transform(transform(v, n), n) == v`.
-    pub fn transform(&self, value: &mut [u8], nonce: u64) {
-        if !self.enabled { return; }
-
-        // Seed: FNV-1a-64 over key bytes, then mix nonce
-        let mut state: u64 = 0xcbf29ce484222325;
-        for b in &self.key {
-            state = state.wrapping_mul(0x100000001b3) ^ (*b as u64);
-        }
-        state = state.wrapping_mul(0x100000001b3) ^ nonce;
-
-        // Generate keystream byte-by-byte via LCG and XOR
-        for (i, byte) in value.iter_mut().enumerate() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let ks_byte = ((state >> ((i % 8) * 8)) & 0xFF) as u8;
-            *byte ^= ks_byte;
-        }
-    }
-
-    /// Encrypt a value in place.
-    pub fn encrypt(&self, value: &mut [u8], nonce: u64) {
-        self.transform(value, nonce);
-    }
-
-    /// Decrypt a value in place (symmetric with encrypt).
-    pub fn decrypt(&self, value: &mut [u8], nonce: u64) {
-        self.transform(value, nonce);
-    }
-}
-
-// ─── State access mode ─────────────────────────────────────────────────────
-
-/// How state is handled during cross-node agent migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateAccessMode {
-    /// State moves with the agent to the new node.
-    MoveWithAgent,
-    /// State stays on the original node, accessed via remote broker.
-    RemoteBroker,
-    /// State is snapshot'd, agent gets a copy, reconcile later.
-    SnapshotAndReconcile,
-}
-
 // ─── Keyspace ───────────────────────────────────────────────────────────────
 
 /// Maximum number of version roots retained in history.
@@ -158,19 +96,6 @@ impl Keyspace {
             }
         }
         None
-    }
-
-    /// Encrypt a value before storing using keyed stream cipher.
-    ///
-    /// The nonce is derived from the keyspace version so each write produces
-    /// a different keystream even for the same key material.
-    pub fn encrypt_value(&self, value: &mut [u8], enc: &KeyspaceEncryption) {
-        enc.encrypt(value, self.version as u64);
-    }
-
-    /// Decrypt a value after loading using keyed stream cipher.
-    pub fn decrypt_value(&self, value: &mut [u8], enc: &KeyspaceEncryption) {
-        enc.decrypt(value, self.version as u64);
     }
 
     /// Get a reference to an entry by key (used for transaction rollback).
@@ -517,33 +442,18 @@ pub fn tx_begin(agent_id: u16, keyspace_id: KeyspaceId) -> Result<u64, i64> {
 
 /// Commit the pending transaction for the given agent.
 ///
-/// On success the keyspace state is persisted to disk and a replication
-/// event is emitted for future cross-node consistency.
+/// On success the keyspace state is persisted to disk.
 pub fn tx_commit(agent_id: u16) -> Result<(), i64> {
     unsafe {
         let idx = agent_id as usize;
         if idx >= MAX_AGENTS {
             return Err(E_INVALID_ARG);
         }
-        let keyspace_id;
         match TX_SLOTS[idx].as_mut() {
             Some(tx) => {
-                keyspace_id = tx.keyspace_id;
                 if tx.commit() {
                     TX_SLOTS[idx] = None;
                     crate::persist::save_state_to_disk();
-
-                    // Emit replication event
-                    let version = get_version(keyspace_id).unwrap_or(0);
-                    let state_root = get_root(keyspace_id).unwrap_or([0u8; 32]);
-                    on_state_committed(ReplicationEvent {
-                        keyspace_id,
-                        version,
-                        key: 0, // batch commit; individual keys in tx
-                        value_hash: [0u8; 32],
-                        state_root,
-                        tick: 0,
-                    });
                     Ok(())
                 } else {
                     Err(E_INVALID_ARG)
@@ -592,24 +502,3 @@ pub fn tx_add_mutation(agent_id: u16, key: u64, value: &[u8]) -> Result<(), i64>
     }
 }
 
-// ─── Replication hook ──────────────────────────────────────────────────────
-
-/// Replication event that can be sent to a follower node.
-#[derive(Clone, Copy)]
-pub struct ReplicationEvent {
-    pub keyspace_id: KeyspaceId,
-    pub version: u32,
-    pub key: u64,
-    pub value_hash: [u8; 32],
-    pub state_root: [u8; 32],
-    pub tick: u64,
-}
-
-/// Replication hook: called after every committed state change.
-/// In single-node mode this is a no-op.  In distributed mode the hook
-/// would send the event to follower nodes via routerd.
-pub fn on_state_committed(event: ReplicationEvent) {
-    // Currently single-node: suppress unused-variable warning.
-    let _ = event;
-    // Future: send to routerd for cross-node replication.
-}
