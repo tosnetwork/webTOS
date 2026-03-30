@@ -398,7 +398,7 @@ pub fn init() {
     serial_println!("[INIT] Accountd agent created: id={}", accountd_id);
     event::agent_created(accountd_id, root_id);
 
-    // ── Netd agent (agent 9) ── network broker (stub) ────────────────
+    // ── Netd agent (agent 9) ── network broker ──────────────────────
     let netd_id = create_agent(
         Some(root_id),
         agents::netd::netd_entry as *const () as u64,
