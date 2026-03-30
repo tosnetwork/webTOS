@@ -335,17 +335,17 @@ Key properties:
 **Success Condition**
 A developer can build, sign, deploy, invoke, upgrade, and roll back contracts via the atp CLI. Inter-contract calls work with deterministic semantics. Package signatures are verified at deployment.
 
-#### Stage-7 — Verifiable Execution `[IMPL: ⚠️ Mostly Complete]`
+#### Stage-7 — Verifiable Execution `[IMPL: ✅ Complete]`
 
 **Purpose**
 Make every execution produce a portable, cryptographically verifiable receipt.
 
 **Core Capabilities**
-- **ExecutionReceipt**: canonical receipt with contract identity, runtime class, input/output commitments, state roots, energy used, and Ed25519 signature `[IMPL: ✅ receipts.rs]`
-- **Replay Bundle**: checkpoint + execution transcript + I/O trace (for full re-execution verification) `[IMPL: ⚠️ components exist, no unified ReplayBundle struct]`
-- **Proof Bundle**: compact Merkle proofs and state commitments (for fast verification without replay) `[IMPL: ✅ receipts.rs ProofBundle]`
-- **TPM measured boot**: prove the ATOS VM is running unmodified code (TPM 2.0 CRB + PCR extend/read) `[IMPL: ✅ tpm.rs]`
-- **Attestation report**: signed measurement of kernel hash + boot config + policy bundle `[IMPL: ✅ attestation.rs]`
+- **ExecutionReceipt**: canonical receipt with contract identity, runtime class, input/output commitments, state roots, energy used, and Ed25519 signature `[IMPL: ✅ receipts.rs — input/output commitments computed via FNV-1a 4-seed hash, signed with Ed25519]`
+- **Replay Bundle**: checkpoint + execution transcript + I/O trace (for full re-execution verification) `[IMPL: ✅ receipts.rs ReplayBundle — auto-generated on agent exit, persisted to disk, retrievable via TCP GetReplay]`
+- **Proof Bundle**: compact Merkle proofs and state commitments (for fast verification without replay) `[IMPL: ✅ receipts.rs ProofBundle — real SHA-256 Merkle sibling hashes, root recomputation verification, persisted to disk, retrievable via TCP GetProof]`
+- **TPM measured boot**: prove the ATOS VM is running unmodified code (TPM 2.0 CRB + PCR extend/read) `[IMPL: ✅ tpm.rs — PCR0 (kernel) + PCR1 (boot config) extended during boot]`
+- **Attestation report**: signed measurement of kernel hash + boot config + policy bundle `[IMPL: ✅ attestation.rs — Ed25519 or keyed-hash, integrated into receipt flow via trace_commitment]`
 
 **ExecutionReceipt Specification**
 
@@ -996,7 +996,7 @@ ATOS handles execution. The blockchain handles consensus, ordering, and finality
 | 4 | Hardware + TCP Interface | Real hardware, TCP external interface, SDKs | ✅ Complete |
 | 5 | Contract Storage | Versioned keyspaces, transactions, Merkle proofs, crash recovery | ✅ Complete |
 | 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ✅ Complete |
-| 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ⚠️ Mostly Complete |
+| 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
 | 8 | Language Runtimes | WASM ✅, Ristretto JVM | ⚠️ WASM done, JVM planned |
 
 **ATOS is complete when an external system can submit a transaction via TCP, ATOS executes it deterministically on bare metal, and returns a cryptographically verifiable receipt.**
