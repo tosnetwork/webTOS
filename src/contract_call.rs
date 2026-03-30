@@ -311,8 +311,9 @@ pub fn call_contract(
             return Ok(resp);
         }
         // Received a message but it wasn't a valid ContractCallResponse.
-        // This could be an unrelated message — fall through to PENDING.
-        // TODO: re-enqueue the non-response message so it isn't lost.
+        // Re-enqueue it so unrelated messages aren't lost.
+        let _ = crate::mailbox::send_message(caller_id, caller_mailbox, payload);
+        return Ok(build_response(STATUS_PENDING, 0, &[]));
     }
 
     // No response available yet. Return STATUS_PENDING so the caller knows
