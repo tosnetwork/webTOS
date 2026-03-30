@@ -144,11 +144,10 @@ pub fn init() {
             options(nostack)
         );
 
-        // Enable interrupts
-        core::arch::asm!("sti", options(nomem, nostack));
+        // Interrupts enabled later by kernel_main (sti before sched::start).
     }
 
-    serial_println!("[idt] IDT loaded ({} entries), PIC remapped, interrupts enabled", 256);
+    serial_println!("[idt] IDT loaded ({} entries), PIC remapped", 256);
 }
 
 /// Reload the IDT on the current core.

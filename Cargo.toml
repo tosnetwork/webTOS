@@ -18,3 +18,4 @@ debug-assertions = false  # Avoid UB checks that panic on bare metal (e.g. ptr a
 
 [profile.release]
 panic = "abort"
+opt-level = "s"  # Size-optimized: avoids opt-level=3 codegen issue that corrupts serial_println string pointers when dispatch.rs match table grows large
