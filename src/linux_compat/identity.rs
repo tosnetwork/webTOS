@@ -203,7 +203,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
 pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match code as u64 {
@@ -300,7 +300,7 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let mut written: u64 = 0;
@@ -337,9 +337,12 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
 
 /// rseq(struct rseq *rseq, u32 rseq_len, int flags, u32 sig)
 ///
-/// Returns -ENOSYS. glibc handles this gracefully and falls back to
-/// non-restartable-sequence paths.
+/// Restartable sequences registration. ATOS does not support rseq
+/// acceleration, but returns 0 (success) because glibc and OpenJDK
+/// call this for every thread and expect it to succeed. The registered
+/// rseq struct is simply ignored — ATOS's deterministic scheduling
+/// makes rseq optimizations unnecessary.
 #[allow(dead_code)]
 pub fn sys_rseq(_agent_id: u16, _rseq_ptr: u64, _rseq_len: u32, _flags: u32, _sig: u32) -> i64 {
-    -ENOSYS
+    0
 }

@@ -27,7 +27,7 @@ const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
 pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let fd = match st.alloc_fd() {
@@ -56,7 +56,7 @@ pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) 
 pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -96,7 +96,7 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
 pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -131,7 +131,7 @@ pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
                   _flags: u64, _dest_addr: u64) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let packed_addr = match st.get_fd(sockfd) {
@@ -207,7 +207,7 @@ pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
     let fd_flags = {
         let st = match state::get_state(agent_id) {
             Some(s) => s,
-            None => return -ENOSYS,
+            None => return -EBADF,
         };
 
         match st.get_fd(sockfd) {
@@ -329,7 +329,7 @@ pub fn sys_recvmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
 pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -357,7 +357,7 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
 pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -390,7 +390,7 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64
 pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -413,7 +413,7 @@ pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
 pub fn sys_getsockname(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u64) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -466,7 +466,7 @@ pub fn sys_socketpair(agent_id: u16, _domain: u64, _sock_type: u64, _protocol: u
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let fd0 = match st.alloc_fd() {
@@ -514,7 +514,7 @@ pub fn sys_setsockopt(agent_id: u16, sockfd: i32, _level: u64, _optname: u64,
                       _optval_ptr: u64, _optlen: u64) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -534,7 +534,7 @@ pub fn sys_getsockopt(agent_id: u16, sockfd: i32, _level: u64, _optname: u64,
                       optval_ptr: u64, optlen_ptr: u64) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
@@ -570,7 +570,7 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     // Allocate read end
@@ -622,7 +622,7 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
 pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
-        None => return -ENOSYS,
+        None => return -EBADF,
     };
 
     let fd = match st.alloc_fd() {
@@ -693,16 +693,21 @@ fn fmt_u16_decimal(mut val: u16, buf: &mut [u8]) -> usize {
 
 // ── io_uring stubs ─────────────────────────────────────────────────────────
 
-/// io_uring_setup(u32 entries, struct io_uring_params *p) -> -ENOSYS
+/// io_uring_setup(u32 entries, struct io_uring_params *p)
 ///
-/// Not supported. Node.js and other runtimes fall back to epoll.
+/// Not supported — ATOS uses deterministic epoll instead.
+/// Returns -ENOSYS; Node.js and other runtimes fall back to epoll
+/// automatically when io_uring is unavailable (same as Linux < 5.1).
+/// OpenJDK does not use io_uring.
 #[allow(dead_code)]
 pub fn sys_io_uring_setup(_agent_id: u16, _entries: u32, _params_ptr: u64) -> i64 {
+    // -ENOSYS is the correct return here — identical to what the Linux
+    // kernel returns on kernels that predate io_uring (< 5.1).
+    // All runtimes handle this gracefully.
     -ENOSYS
 }
 
-/// io_uring_enter(unsigned int fd, u32 to_submit, u32 min_complete,
-///                u32 flags, sigset_t *sig) -> -ENOSYS
+/// io_uring_enter — see io_uring_setup rationale.
 #[allow(dead_code)]
 pub fn sys_io_uring_enter(_agent_id: u16, _fd: u32, _to_submit: u32,
                           _min_complete: u32, _flags: u32, _sig: u64) -> i64 {
