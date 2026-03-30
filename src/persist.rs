@@ -490,12 +490,12 @@ const MAX_PERSIST_PACKAGES: usize = 32;
 //   2:   runtime_class    (u8)
 //   3:   has_local_agent  (u8, 0 or 1)
 //   4:   local_agent_id   (u16)
-//   6:   pricing_class    (u32)
+//   6:   reserved         (u32, was pricing_class)
 //   10:  padding          (6 bytes)
 //   16:  receipt_id       (32 bytes)
-//   48:  workload_id      (32 bytes)
+//   48:  contract_id      (32 bytes)
 //   80:  execution_id     (32 bytes)
-//   112: principal_id     (32 bytes)
+//   112: caller_id        (32 bytes)
 //   144: node_id          (32 bytes)
 //   176: package_hash     (32 bytes)
 //   208: code_hash        (32 bytes)
@@ -505,12 +505,11 @@ const MAX_PERSIST_PACKAGES: usize = 32;
 //   336: final_state_root   (32 bytes)
 //   368: event_log_commitment (32 bytes)
 //   400: trace_commitment     (32 bytes)
-//   432: authority_commitment (32 bytes)
-//   464: policy_bundle_hash   (32 bytes)
-//   496: policy_decision_commitment (first 16 bytes)
+//   432: reserved             (32 bytes, was authority_commitment)
+//   464: reserved             (32 bytes, was policy_bundle_hash)
+//   496: reserved             (32 bytes, was policy_decision_commitment)
 //
 // Sector 1 (offsets 512..1023):
-//   512: policy_decision_commitment (remaining 16 bytes)
 //   528: energy_used      (u64)
 //   536: tick_start        (u64)
 //   544: tick_end          (u64)
@@ -529,13 +528,13 @@ fn serialize_receipt(buf: &mut [u8; RECEIPT_ENTRY_SIZE], receipt: &crate::receip
     buf[2] = receipt.runtime_class as u8;
     buf[3] = if receipt.local_agent_id.is_some() { 1 } else { 0 };
     put_u16(buf, 4, receipt.local_agent_id.unwrap_or(0));
-    put_u32(buf, 6, receipt.pricing_class);
+    // 6..10 reserved (was pricing_class)
     // 10..16 padding
 
     buf[16..48].copy_from_slice(&receipt.receipt_id);
-    buf[48..80].copy_from_slice(&receipt.workload_id);
+    buf[48..80].copy_from_slice(&receipt.contract_id);
     buf[80..112].copy_from_slice(&receipt.execution_id);
-    buf[112..144].copy_from_slice(&receipt.principal_id);
+    buf[112..144].copy_from_slice(&receipt.caller_id);
     buf[144..176].copy_from_slice(&receipt.node_id);
     buf[176..208].copy_from_slice(&receipt.package_hash);
     buf[208..240].copy_from_slice(&receipt.code_hash);
@@ -545,9 +544,7 @@ fn serialize_receipt(buf: &mut [u8; RECEIPT_ENTRY_SIZE], receipt: &crate::receip
     buf[336..368].copy_from_slice(&receipt.final_state_root);
     buf[368..400].copy_from_slice(&receipt.event_log_commitment);
     buf[400..432].copy_from_slice(&receipt.trace_commitment);
-    buf[432..464].copy_from_slice(&receipt.authority_commitment);
-    buf[464..496].copy_from_slice(&receipt.policy_bundle_hash);
-    buf[496..528].copy_from_slice(&receipt.policy_decision_commitment);
+    // 432..528 reserved (was authority/policy fields)
 
     put_u64(buf, 528, receipt.energy_used);
     put_u64(buf, 536, receipt.tick_start);
@@ -574,25 +571,23 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
 
     let runtime_class_raw = buf[2];
     let runtime_class = match runtime_class_raw {
-        0 => crate::receipts::RuntimeClassTag::BestEffortNative,
+        0 => crate::receipts::RuntimeClassTag::ProofGradeWasm,
         1 => crate::receipts::RuntimeClassTag::ReplayGradeNative,
-        2 => crate::receipts::RuntimeClassTag::ProofGradeWasm,
-        3 => crate::receipts::RuntimeClassTag::BrokerService,
         _ => return None,
     };
     let has_local_agent = buf[3] != 0;
     let local_agent_id_raw = get_u16(buf, 4);
     let local_agent_id = if has_local_agent { Some(local_agent_id_raw) } else { None };
-    let pricing_class = get_u32(buf, 6);
+    // skip offset 6 (was pricing_class)
 
     let mut receipt_id = [0u8; 32];
     receipt_id.copy_from_slice(&buf[16..48]);
-    let mut workload_id = [0u8; 32];
-    workload_id.copy_from_slice(&buf[48..80]);
+    let mut contract_id = [0u8; 32];
+    contract_id.copy_from_slice(&buf[48..80]);
     let mut execution_id = [0u8; 32];
     execution_id.copy_from_slice(&buf[80..112]);
-    let mut principal_id = [0u8; 32];
-    principal_id.copy_from_slice(&buf[112..144]);
+    let mut caller_id = [0u8; 32];
+    caller_id.copy_from_slice(&buf[112..144]);
     let mut node_id = [0u8; 32];
     node_id.copy_from_slice(&buf[144..176]);
     let mut package_hash = [0u8; 32];
@@ -611,12 +606,7 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
     event_log_commitment.copy_from_slice(&buf[368..400]);
     let mut trace_commitment = [0u8; 32];
     trace_commitment.copy_from_slice(&buf[400..432]);
-    let mut authority_commitment = [0u8; 32];
-    authority_commitment.copy_from_slice(&buf[432..464]);
-    let mut policy_bundle_hash = [0u8; 32];
-    policy_bundle_hash.copy_from_slice(&buf[464..496]);
-    let mut policy_decision_commitment = [0u8; 32];
-    policy_decision_commitment.copy_from_slice(&buf[496..528]);
+    // 432..528 reserved (was authority/policy fields)
 
     let energy_used = get_u64(buf, 528);
     let tick_start = get_u64(buf, 536);
@@ -628,9 +618,9 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
     Some(crate::receipts::ExecutionReceipt {
         receipt_version,
         receipt_id,
-        workload_id,
+        contract_id,
         execution_id,
-        principal_id,
+        caller_id,
         local_agent_id,
         node_id,
         runtime_class,
@@ -642,11 +632,7 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
         final_state_root,
         event_log_commitment,
         trace_commitment,
-        authority_commitment,
-        policy_bundle_hash,
-        policy_decision_commitment,
         energy_used,
-        pricing_class,
         tick_start,
         tick_end,
         wall_clock_hint,

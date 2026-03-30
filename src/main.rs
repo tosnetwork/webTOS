@@ -46,7 +46,10 @@ mod policy;
 mod crypto;
 mod receipts;
 pub mod metrics;
+mod contract;
+mod contract_call;
 pub mod package;
+pub mod tcp_interface;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]

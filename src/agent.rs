@@ -74,6 +74,9 @@ pub const SYS_PROOF_GENERATE: u64 = 37;
 // Stage 10: Cross-node mailbox routing syscall
 pub const SYS_SEND_REMOTE: u64 = 38;
 
+// Inter-contract call syscall
+pub const SYS_CONTRACT_CALL: u64 = 39;
+
 // ─── Error codes ────────────────────────────────────────────────────────────
 
 pub const E_OK: i64 = 0;
