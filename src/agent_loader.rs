@@ -88,7 +88,12 @@ pub fn spawn_from_image_with_class(
         RuntimeKind::LinuxCompat => {
             // Linux compat agents are loaded as native ELF binaries
             // with the Linux syscall translation layer enabled.
-            spawn_native_elf(caller_id, image, energy, mem_quota)
+            let agent_id = spawn_native_elf(caller_id, image, energy, mem_quota)?;
+            // Initialize per-agent Linux virtual OS state (fd table, cwd, PRNG, etc.)
+            // The presence of LinuxAgentState signals the syscall dispatcher to route
+            // through linux_compat::dispatch() instead of the ATOS native path.
+            crate::linux_compat::state::init_state(agent_id);
+            Ok(agent_id)
         }
     }
 }
