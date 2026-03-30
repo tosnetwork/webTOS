@@ -2944,7 +2944,7 @@ Priority closure items:
 * eBPF-lite SDK and toolchain so policy is not limited to hand-assembled bytecode
 * MSI-X wiring for real hardware interrupt delivery
 * complete brokered HTTP/TCP path in `netd`, rather than UDP-only transport and HTTP-like stubs
-* **`x86_64-unknown-atos` custom Rust target**: ATOS defines its own Rust compilation target (`x86_64-unknown-atos.json`), enabling `#[cfg(target_os = "atos")]` in all Rust code. This is the foundation for porting third-party crates (Ristretto, RustPython) with ATOS-specific code paths via standard `cfg` conditional compilation, rather than ad-hoc feature flags. Developers compile agents with `cargo build --target x86_64-unknown-atos.json`. The target spec is based on `x86_64-unknown-none` with `"os": "atos"` and kernel code model. `[IMPL: ✅ x86_64-unknown-atos.json + .cargo/config.toml + Makefile updated]`
+* **`x86_64-unknown-atos` custom Rust target**: ATOS defines its own Rust compilation target (`x86_64-unknown-atos.json`), enabling `#[cfg(target_os = "atos")]` in all Rust code. This is the foundation for porting third-party crates (Ristretto) with ATOS-specific code paths via standard `cfg` conditional compilation, rather than ad-hoc feature flags. Developers compile agents with `cargo build --target x86_64-unknown-atos.json`. The target spec is based on `x86_64-unknown-none` with `"os": "atos"` and kernel code model. `[IMPL: ✅ x86_64-unknown-atos.json + .cargo/config.toml + Makefile updated]`
 * **ATOS WASM engine**: the self-built WASM interpreter provides a production-ready, `#![no_std]` WebAssembly engine with 100% spec compliance, built-in fuel metering, and type-safe host bindings. The engine runs as a native ATOS agent; existing `.wasm` binaries and the `atos-wasm-sdk` require zero changes. See [WASM-runtime-spec.md](WASM-runtime-spec.md) for the full specification. `[IMPL: ✅ Complete]`
 * **Ristretto JVM integration** (Phase 1–2): port [Ristretto](https://github.com/theseus-rs/ristretto) as a native ATOS agent to provide Java execution capability. Java's standard APIs (file I/O, networking, threading) are virtualized through ATOS primitives — files map to keyspaces, sockets map to netd mailbox proxy, threads map to child agents. Java programs run unmodified, gaining ATOS capability isolation, eBPF policy filtering, energy metering, and verifiable execution for free. See [Ristretto.md](Ristretto.md) for the full porting plan. `[IMPL: ⏳ Planned]`
 
@@ -3456,11 +3456,8 @@ Runtime porting priority, ranked by AI agent ecosystem value:
 
 | Priority | Runtime | Engine | Language | Rationale | Design Doc |
 |----------|---------|--------|----------|-----------|------------|
-| **P0** | WASM | ATOS WASM engine | Any → WASM | Universal sandbox; 100% spec compliant, built-in fuel metering. Languages without a dedicated ATOS port (Go, C#, Swift, Zig, Rust) compile to WASM and run via the ATOS WASM engine. | [WASM-runtime-spec.md](WASM-runtime-spec.md) |
-| **P1** | Python | [RustPython](https://github.com/RustPython/RustPython) | Python | 99% of AI/ML agent code is Python (LangChain, AutoGPT, CrewAI, HuggingFace). Without Python support, ATOS cannot serve the AI agent ecosystem. Pure Rust, actively developed. | Planned |
-| **P2** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | Enterprise AI ecosystem (Spring AI, LangChain4j), Android agent frameworks, Kotlin coroutine agents. Pure Rust, actively developed, already has `#[cfg(target_family = "wasm")]` platform gating. | [Ristretto.md](Ristretto.md) |
-| **P3** | EVM | [revm](https://github.com/bluealloy/revm) | Solidity / Vyper | Smart contract agents, DeFi protocols, L2 execution. Gas maps 1:1 to ATOS energy. `#![no_std]` native, production-grade (Reth, Foundry, Optimism). Reentrancy impossible (mailbox-based calls), storage isolation via keyspace. | [Revm.md](Revm.md) |
-| **P4** | RISC-V zkVM | [SP1](https://github.com/succinctlabs/sp1) | Any → RISC-V | Zero-knowledge provable execution. Upgrades ATOS from replay-based proofs (O(n) verification) to ZK proofs (O(1) verification). Any program compiled to RISC-V can be proven. Aligned with Ethereum 2029 RISC-V zkEVM roadmap. Enables trustless computation, zkRollup execution, and verifiable AI agents. | [ZkVM.md](ZkVM.md) |
+| **P0** | WASM | ATOS WASM engine | Any → WASM | Universal sandbox; 100% spec compliant, built-in fuel metering. Languages without a dedicated ATOS port (Go, C#, Swift, Zig, Rust, Python) compile to WASM and run via the ATOS WASM engine. | [WASM-runtime-spec.md](WASM-runtime-spec.md) |
+| **P1** | JVM | [Ristretto](https://github.com/theseus-rs/ristretto) | Java / Kotlin / Scala | Enterprise AI ecosystem (Spring AI, LangChain4j), Android agent frameworks, Kotlin coroutine agents. Pure Rust, actively developed, already has `#[cfg(target_family = "wasm")]` platform gating. | [Ristretto.md](Ristretto.md) |
 
 Each ported runtime follows the same pattern:
 
@@ -3492,21 +3489,14 @@ Languages not listed above (Go, C#, Swift, Zig, Rust itself) compile to WASM and
 Objectives:
 
 * build the production ATOS WASM engine (P0, spec-compliant interpreter with full WASM MVP + extensions support)
-* port RustPython to enable Python AI agent workloads on ATOS (P1)
-* port Ristretto to enable Java/Kotlin enterprise agent workloads (P2)
-* port revm to enable EVM smart contract execution on ATOS (P3) — gas→energy, storage→keyspace, calls→mailbox
-* integrate SP1 RISC-V zkVM for zero-knowledge provable execution (P4) — upgrades ProofGrade from replay-based O(n) to ZK-based O(1) verification
+* port Ristretto to enable Java/Kotlin enterprise agent workloads (P1)
 * define the standard ATOS virtualization layer API so all runtimes share the same file/network/thread mapping
 * ensure all ported runtimes benefit from ATOS energy metering via timer-tick preemption (no per-opcode instrumentation needed)
 * publish `x86_64-unknown-atos` target spec upstream to Rust compiler (like Redox OS did with `x86_64-unknown-redox`)
 
 Success criteria:
 
-* a Python AI agent (LangChain) runs on ATOS, communicates via mailbox, energy-metered, checkpointable
 * a Java JAR file executes on ATOS with standard library classes (ArrayList, HashMap, String) functional
-* a Solidity smart contract deploys and executes on ATOS with gas metered as ATOS energy, storage in keyspace
-* a RISC-V program executes inside SP1 zkVM on ATOS and produces a ZK proof verifiable in O(1) time
-* revm compiled to RISC-V runs inside zkVM, enabling ATOS as a zkRollup execution engine
 * any language that compiles to WASM runs on ATOS via the ATOS WASM engine with full spec compliance
 * all ported runtimes pass their respective language test suites on ATOS
 * the ATOS virtualization layer is documented and reusable across all runtime ports
@@ -3565,7 +3555,7 @@ The intended sequence of Stage-5 through Stage-12 is:
 * Stage-8: make multi-node execution explicit and survivable
 * Stage-9: make execution receipts economically and cryptographically meaningful
 * Stage-10: make the whole system deployable as a trusted appliance
-* Stage-11: bring WASM, Python, and Java ecosystems to ATOS via native runtime ports
+* Stage-11: bring WASM and Java ecosystems to ATOS via native runtime ports
 * Stage-12: run any Linux program on ATOS via syscall translation
 
 If these later stages are executed correctly, ATOS remains faithful to its original intent: not a Unix derivative with agent tooling, but a purpose-built execution substrate for autonomous, capability-scoped, auditable, replay-aware systems — with the full breadth of both the AI agent ecosystem and the Linux software ecosystem running on top.
