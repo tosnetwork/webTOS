@@ -407,6 +407,80 @@ pub fn is_child_of(child_id: AgentId, parent_id: AgentId) -> bool {
     }
 }
 
+/// Find a terminated (inactive) child of `parent_id`.
+///
+/// If `specific_pid > 0`, only check that specific agent_id.
+/// If `specific_pid == -1`, find any terminated child.
+/// Returns `Some((child_id, exit_status))` if found, where exit_status
+/// is `AgentStatus::Exited` or `AgentStatus::Faulted`.
+/// Returns `None` if no terminated child matches.
+pub fn find_terminated_child(parent_id: AgentId, specific_pid: i32) -> Option<(AgentId, AgentStatus)> {
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(agent) = slot {
+                // Terminated agents have active == false
+                if !agent.active
+                    && agent.parent_id == Some(parent_id)
+                    && (agent.status == AgentStatus::Exited || agent.status == AgentStatus::Faulted)
+                {
+                    if specific_pid > 0 {
+                        if agent.id == specific_pid as AgentId {
+                            return Some((agent.id, agent.status));
+                        }
+                    } else {
+                        // pid == -1: any terminated child
+                        return Some((agent.id, agent.status));
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Check whether `parent_id` has any children (active or terminated).
+pub fn has_any_child(parent_id: AgentId) -> bool {
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(agent) = slot {
+                if agent.parent_id == Some(parent_id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Check whether a specific agent_id is a child of parent_id (including terminated).
+pub fn is_child_of_any_state(child_id: AgentId, parent_id: AgentId) -> bool {
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(agent) = slot {
+                if agent.id == child_id && agent.parent_id == Some(parent_id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Remove a terminated agent from the agent table (reap).
+/// Only removes agents that are inactive (already terminated).
+pub fn reap_agent(id: AgentId) {
+    unsafe {
+        for slot in AGENT_TABLE.iter_mut() {
+            if let Some(agent) = slot {
+                if agent.id == id && !agent.active {
+                    *slot = None;
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Iterate over all active agents (callback-based to avoid iterator issues).
 ///
 /// The callback receives a mutable reference to each active agent.

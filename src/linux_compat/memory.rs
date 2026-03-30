@@ -170,16 +170,30 @@ pub fn sys_mmap(
         }
     }
 
-    // Suppress unused warnings for file-backed mapping parameters.
-    // These will be used once the fs layer supports read-into-physical.
-    let _ = (fd, offset);
-
-    // File-backed mapping: read content from the agent's keyspace
+    // File-backed mapping: copy content from keyspace into the mapped pages.
     if fd >= 0 && (flags & MAP_ANONYMOUS == 0) {
-        // TODO: copy file content from keyspace into the mapped pages
-        // once the fs layer exposes a read-into-physical interface.
-        // For now, file-backed mappings are zeroed (pages already zeroed above).
+        if let Some(st) = super::state::get_state(agent_id) {
+            if let Some(entry) = st.get_fd(fd) {
+                let ks = agent_id;
+                let key = entry.keyspace_key;
+                if let Some((val_buf, val_len)) = crate::state::state_get(ks, key) {
+                    // Copy file content starting at `offset` into the mapped pages.
+                    let file_offset = offset as usize;
+                    let copy_len = val_len.saturating_sub(file_offset).min(aligned_len as usize);
+                    if copy_len > 0 {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                val_buf.as_ptr().add(file_offset),
+                                vaddr as *mut u8,
+                                copy_len,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
+    let _ = offset; // used above in file-backed path
 
     vaddr as i64
 }

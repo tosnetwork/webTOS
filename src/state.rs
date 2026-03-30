@@ -257,6 +257,64 @@ pub fn state_put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64
     Ok(())
 }
 
+/// Delete a key from a keyspace by marking its entry as inactive.
+///
+/// Returns `Ok(())` if the key was found and deleted, or `Err(E_NOT_FOUND)`
+/// if it did not exist.
+pub fn state_delete(keyspace: KeyspaceId, key: u64) -> Result<(), i64> {
+    unsafe {
+        let idx = keyspace as usize;
+        if idx >= MAX_AGENTS {
+            return Err(E_INVALID_ARG);
+        }
+        match KEYSPACES[idx].as_mut() {
+            Some(ks) => {
+                for entry in ks.entries.iter_mut() {
+                    if entry.active && entry.key == key {
+                        entry.active = false;
+                        entry.len = 0;
+                        ks.advance_version();
+                        return Ok(());
+                    }
+                }
+                Err(E_NOT_FOUND)
+            }
+            None => Err(E_NOT_FOUND),
+        }
+    }
+}
+
+/// Iterate over active entries in a keyspace, calling `f` for each one.
+///
+/// The callback receives `(key, value_slice)`.  Returns the number of
+/// entries visited.
+pub fn iter_entries<F>(keyspace: KeyspaceId, mut f: F) -> usize
+where
+    F: FnMut(u64, &[u8]) -> bool,
+{
+    unsafe {
+        let idx = keyspace as usize;
+        if idx >= MAX_AGENTS {
+            return 0;
+        }
+        match KEYSPACES[idx].as_ref() {
+            Some(ks) => {
+                let mut count = 0usize;
+                for entry in ks.entries.iter() {
+                    if entry.active {
+                        count += 1;
+                        if !f(entry.key, &entry.value[..entry.len]) {
+                            break;
+                        }
+                    }
+                }
+                count
+            }
+            None => 0,
+        }
+    }
+}
+
 // ─── Versioned state helpers ────────────────────────────────────────────────
 
 /// Advance the version counter for a keyspace and snapshot its Merkle root.
