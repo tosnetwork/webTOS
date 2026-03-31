@@ -3,6 +3,7 @@
 set -e
 
 KERNEL="${1:-target/x86_64-unknown-none/debug/atos0}"
+QEMU_MEMORY="${QEMU_MEMORY:-256M}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "Kernel binary not found: $KERNEL"
@@ -11,6 +12,7 @@ if [ ! -f "$KERNEL" ]; then
 fi
 
 exec qemu-system-x86_64 \
+    -m "$QEMU_MEMORY" \
     -serial stdio \
     -display none \
     -kernel "$KERNEL" \

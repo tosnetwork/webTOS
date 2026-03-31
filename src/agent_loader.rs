@@ -146,6 +146,85 @@ fn map_user_stack_region(agent_cr3: u64, user_stack_base: u64) -> Result<u64, i6
     Ok(user_stack_base + USER_STACK_SIZE as u64)
 }
 
+fn map_segment_pages(
+    agent_cr3: u64,
+    seg: &crate::loader::LoadSegment,
+) -> Result<(), i64> {
+    let page_mask = paging::PAGE_SIZE as u64 - 1;
+    let seg_page_base = seg.vaddr & !page_mask;
+    let page_bias = seg.vaddr & page_mask;
+    let total_map_len = seg
+        .mem_size
+        .checked_add(page_bias)
+        .ok_or(E_INVALID_ARG)?;
+
+    let pages_needed = pages_for_bytes(total_map_len).ok_or(E_INVALID_ARG)?;
+    let is_write = seg.flags & 0x2 != 0;
+    let mut flags = paging::PTE_PRESENT | paging::PTE_USER;
+    if is_write {
+        flags |= paging::PTE_WRITABLE;
+    }
+
+    for page_idx in 0..pages_needed {
+        let page_offset = (page_idx as u64)
+            .checked_mul(paging::PAGE_SIZE as u64)
+            .ok_or(E_INVALID_ARG)?;
+        let vaddr = seg_page_base
+            .checked_add(page_offset)
+            .ok_or(E_INVALID_ARG)?;
+        let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
+        }
+        paging::map_page(agent_cr3, vaddr, phys, flags).map_err(|_| E_QUOTA_EXCEEDED)?;
+    }
+
+    Ok(())
+}
+
+fn copy_segment_file_bytes(
+    agent_cr3: u64,
+    seg: &crate::loader::LoadSegment,
+    image: &[u8],
+) -> Result<(), i64> {
+    if seg.file_size == 0 {
+        return Ok(());
+    }
+
+    let copy_start = seg.file_offset as usize;
+    let copy_len = seg.file_size as usize;
+    let copy_end = copy_start.checked_add(copy_len).ok_or(E_INVALID_ARG)?;
+    if copy_end > image.len() {
+        return Err(E_BAD_IMAGE);
+    }
+
+    write_agent_user_bytes(agent_cr3, seg.vaddr, &image[copy_start..copy_end])
+}
+
+fn load_segments_into_address_space(
+    agent_cr3: u64,
+    image: &[u8],
+    elf_info: &crate::loader::ElfInfo,
+    min_vaddr: u64,
+) -> Result<u64, i64> {
+    let mut highest_end = 0u64;
+
+    for seg in elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|s| s.as_ref())
+    {
+        if seg.vaddr < min_vaddr {
+            continue;
+        }
+
+        highest_end = highest_end.max(seg.vaddr.saturating_add(seg.mem_size));
+        map_segment_pages(agent_cr3, seg)?;
+        copy_segment_file_bytes(agent_cr3, seg, image)?;
+    }
+
+    Ok(highest_end)
+}
+
 /// Spawn a new agent from an in-memory binary image.
 ///
 /// # Arguments
@@ -203,14 +282,8 @@ pub fn spawn_from_image_with_class(
             spawn_wasm_with_class(caller_id, image, energy, mem_quota, runtime_class)
         }
         RuntimeKind::LinuxCompat => {
-            // Linux compat agents are loaded as native ELF binaries
-            // with the Linux syscall translation layer enabled.
-            let agent_id = spawn_native_elf(caller_id, image, energy, mem_quota)?;
-            // Initialize per-agent Linux virtual OS state (fd table, cwd, PRNG, etc.)
-            // The presence of LinuxAgentState signals the syscall dispatcher to route
-            // through linux_compat::dispatch() instead of the ATOS native path.
-            crate::linux_compat::state::init_state(agent_id);
-            Ok(agent_id)
+            // Linux compat agents use the full Linux stack builder.
+            spawn_linux_agent(caller_id, image, energy, mem_quota, &[], &[])
         }
     }
 }
@@ -281,66 +354,7 @@ fn spawn_native_elf(
     // 3. Load each segment into the new address space.
     //    Skip segments below USER_CODE_VADDR (e.g., 0x400000 ELF header
     //    metadata segment) since they conflict with identity-mapped pages.
-    for i in 0..elf_info.segment_count {
-        let seg = match &elf_info.segments[i] {
-            Some(s) => s,
-            None => continue,
-        };
-
-        // Skip segments below user space (ELF metadata at 0x400000 etc.)
-        if seg.vaddr < USER_CODE_VADDR as u64 {
-            continue;
-        }
-
-        // Calculate number of pages needed for this segment
-        let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
-
-        for page_idx in 0..pages_needed {
-            let page_offset = (page_idx as u64)
-                .checked_mul(paging::PAGE_SIZE as u64)
-                .ok_or(E_INVALID_ARG)?;
-            let vaddr = seg.vaddr.checked_add(page_offset).ok_or(E_INVALID_ARG)?;
-
-            // Allocate a physical frame
-            let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
-
-            // Zero the frame first
-            unsafe {
-                core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
-            }
-
-            // Copy data from the ELF image for this page
-            let seg_page_start = page_offset as usize;
-            let file_data_start = seg.file_offset as usize;
-            if seg_page_start < seg.file_size as usize {
-                let copy_start = file_data_start
-                    .checked_add(seg_page_start)
-                    .ok_or(E_INVALID_ARG)?;
-                let remaining_file = (seg.file_size as usize).saturating_sub(seg_page_start);
-                let copy_len = remaining_file.min(paging::PAGE_SIZE);
-                if copy_start.checked_add(copy_len).ok_or(E_INVALID_ARG)? <= image.len() {
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            image.as_ptr().add(copy_start),
-                            phys as *mut u8,
-                            copy_len,
-                        );
-                    }
-                }
-            }
-
-            // Determine page flags
-            let is_exec = seg.flags & 0x1 != 0; // PF_X
-            let is_write = seg.flags & 0x2 != 0; // PF_W
-            let mut flags = paging::PTE_PRESENT | paging::PTE_USER;
-            if is_write {
-                flags |= paging::PTE_WRITABLE;
-            }
-            let _ = is_exec; // NX bit handling deferred
-
-            paging::map_page(agent_cr3, vaddr, phys, flags).map_err(|_| E_QUOTA_EXCEEDED)?;
-        }
-    }
+    let _ = load_segments_into_address_space(agent_cr3, image, &elf_info, USER_CODE_VADDR as u64)?;
 
     // 3b. If dynamic: load the interpreter (ld-linux) and adjust entry point.
     //     The interpreter is loaded at INTERP_BASE_VADDR, well above the main
@@ -399,51 +413,12 @@ fn spawn_native_elf(
                         }
                     }
 
-                    // Load interpreter segments into agent address space
-                    for i in 0..interp_elf.segment_count {
-                        let seg = match &interp_elf.segments[i] {
-                            Some(s) => s,
-                            None => continue,
-                        };
-
-                        interp_highest_end = interp_highest_end.max(seg.vaddr.saturating_add(seg.mem_size));
-
-                        let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
-                        for page_idx in 0..pages_needed {
-                            let page_offset = (page_idx as u64)
-                                .checked_mul(paging::PAGE_SIZE as u64)
-                                .ok_or(E_INVALID_ARG)?;
-                            let vaddr = seg.vaddr.checked_add(page_offset).ok_or(E_INVALID_ARG)?;
-
-                            let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
-                            unsafe {
-                                core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
-                            }
-
-                            let seg_page_start = page_offset as usize;
-                            let file_data_start = seg.file_offset as usize;
-                            if seg_page_start < seg.file_size as usize {
-                                let copy_start = file_data_start + seg_page_start;
-                                let remaining_file = (seg.file_size as usize).saturating_sub(seg_page_start);
-                                let copy_len = remaining_file.min(paging::PAGE_SIZE);
-                                if copy_start + copy_len <= interp_len {
-                                    unsafe {
-                                        core::ptr::copy_nonoverlapping(
-                                            interp_buf.as_ptr().add(copy_start),
-                                            phys as *mut u8,
-                                            copy_len,
-                                        );
-                                    }
-                                }
-                            }
-
-                            let is_write = seg.flags & 0x2 != 0;
-                            let mut flags = paging::PTE_PRESENT | paging::PTE_USER;
-                            if is_write { flags |= paging::PTE_WRITABLE; }
-                            paging::map_page(agent_cr3, vaddr, phys, flags)
-                                .map_err(|_| E_QUOTA_EXCEEDED)?;
-                        }
-                    }
+                    interp_highest_end = load_segments_into_address_space(
+                        agent_cr3,
+                        &interp_buf[..interp_len],
+                        &interp_elf,
+                        USER_CODE_VADDR as u64,
+                    )?;
 
                     serial_println!(
                         "[AGENT_LOADER] Interpreter loaded at base={:#x}, entry={:#x}",
@@ -568,6 +543,398 @@ fn spawn_native_elf(
         agent_id,
         entry,
         caller_id
+    );
+
+    Ok(agent_id)
+}
+
+// ─── Linux-compat ELF loading path ─────────────────────────────────────────
+
+/// Spawn a Linux-compat agent with a real Linux initial stack.
+///
+/// Builds the standard Linux user stack layout:
+///   [low address]
+///   argc                   ← RSP points here
+///   argv[0] ptr
+///   argv[1] ptr
+///   ...
+///   NULL                   (argv terminator)
+///   envp[0] ptr
+///   ...
+///   NULL                   (envp terminator)
+///   auxv[0].type, auxv[0].value
+///   ...
+///   AT_NULL, 0             (auxv terminator)
+///   padding (16-byte align)
+///   string data: argv strings, envp strings, AT_RANDOM bytes
+///   [high address = stack top]
+///
+/// `exe_path`: the executable path (e.g., b"/app/hello"). Used for AT_EXECFN
+///   and stored in LinuxAgentState. If empty, defaults to b"/app/unknown".
+/// `argv`: argument strings. If empty, a single argv[0] = exe_path is used.
+pub fn spawn_linux_agent(
+    caller_id: AgentId,
+    image: &[u8],
+    energy: u64,
+    mem_quota: u32,
+    exe_path: &[u8],
+    argv: &[&[u8]],
+) -> Result<AgentId, i64> {
+    spawn_linux_agent_with_env(caller_id, image, energy, mem_quota, exe_path, argv, &[])
+}
+
+/// Spawn a Linux-compatible agent with an explicit environment block.
+///
+/// If `envp` is empty, a minimal deterministic default environment is used.
+pub fn spawn_linux_agent_with_env(
+    caller_id: AgentId,
+    image: &[u8],
+    energy: u64,
+    mem_quota: u32,
+    exe_path: &[u8],
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+) -> Result<AgentId, i64> {
+    // ── Input validation ────────────────────────────────────────────────
+    if image.is_empty() {
+        return Err(E_INVALID_ARG);
+    }
+    if image.len() > MAX_IMAGE_SIZE {
+        return Err(E_PAYLOAD_TOO_LARGE);
+    }
+
+    // Default exe_path
+    let exe = if exe_path.is_empty() { b"/app/unknown" as &[u8] } else { exe_path };
+
+    // 1. Parse ELF
+    let mut elf_info = crate::loader::parse_elf64(image).map_err(|_| E_BAD_IMAGE)?;
+
+    // 1b. Handle dynamically-linked binaries (ET_DYN / PT_INTERP)
+    if elf_info.is_dynamic {
+        if elf_info.load_bias == 0 {
+            let min_vaddr = elf_info.segments[..elf_info.segment_count]
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.vaddr)
+                .min()
+                .unwrap_or(0);
+            if min_vaddr < USER_CODE_VADDR {
+                elf_info.load_bias = USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+            }
+        }
+        elf_info.entry_point = elf_info.entry_point.wrapping_add(elf_info.load_bias);
+        for i in 0..elf_info.segment_count {
+            if let Some(ref mut seg) = elf_info.segments[i] {
+                seg.vaddr = seg.vaddr.wrapping_add(elf_info.load_bias);
+            }
+        }
+        serial_println!(
+            "[AGENT_LOADER] Linux dynamic ELF: load_bias={:#x}, entry={:#x}",
+            elf_info.load_bias, elf_info.entry_point
+        );
+    }
+
+    // 2. Create isolated address space
+    let agent_cr3 = paging::create_address_space().ok_or(E_QUOTA_EXCEEDED)?;
+
+    // 3. Load each segment
+    let _ = load_segments_into_address_space(agent_cr3, image, &elf_info, USER_CODE_VADDR as u64)?;
+
+    // 3b. Load interpreter if dynamic
+    const INTERP_BASE_VADDR: u64 = 0x7F00_0000;
+    let main_entry = elf_info.entry_point;
+    let main_phdr_vaddr = (elf_info.phdr_entry_size as u64)
+        .checked_mul(elf_info.phdr_count as u64)
+        .and_then(|size| loaded_file_vaddr(&elf_info, elf_info.phdr_offset, size));
+    let mut interp_base: u64 = 0;
+    let mut interp_highest_end: u64 = 0;
+
+    let final_entry = if elf_info.is_dynamic && elf_info.interp_len > 0 {
+        let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+        let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+        let interp_path = &interp_bytes[..interp_end];
+
+        serial_println!(
+            "[AGENT_LOADER] PT_INTERP: {:?}",
+            core::str::from_utf8(interp_path).unwrap_or("<non-utf8>")
+        );
+
+        let (interp_ks, interp_key) = crate::linux_compat::vfs::resolve_path(0, interp_path);
+        let mut interp_buf = alloc::vec![0u8; 2 * 1024 * 1024];
+        let interp_len = crate::state::load_multi_segment(interp_ks, interp_key, &mut interp_buf);
+
+        if interp_len == 0 {
+            // HARD ERROR: interpreter required but not installed
+            serial_println!(
+                "[AGENT_LOADER] FATAL: interpreter {:?} not found in base image — cannot start dynamic ELF",
+                core::str::from_utf8(interp_path).unwrap_or("?")
+            );
+            return Err(E_NOT_FOUND);
+        }
+
+        serial_println!(
+            "[AGENT_LOADER] Loaded interpreter ({} bytes), first 16: [{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x}]",
+            interp_len,
+            interp_buf[0], interp_buf[1], interp_buf[2], interp_buf[3],
+            interp_buf[4], interp_buf[5], interp_buf[6], interp_buf[7],
+            interp_buf[8], interp_buf[9], interp_buf[10], interp_buf[11],
+            interp_buf[12], interp_buf[13], interp_buf[14], interp_buf[15]
+        );
+
+        // Also check what's actually at the key directly
+        let (_iks, ikey) = crate::linux_compat::vfs::resolve_path(0, interp_path);
+        if let Some((raw, raw_len)) = crate::state::state_get(interp_ks, ikey) {
+            serial_println!(
+                "[AGENT_LOADER] Direct state_get: len={}, first 6: [{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x}]",
+                raw_len, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]
+            );
+        }
+
+        let mut interp_elf = crate::loader::parse_elf64(&interp_buf[..interp_len])
+            .map_err(|e| {
+                serial_println!("[AGENT_LOADER] FATAL: interpreter ELF parse failed: {:?}", e);
+                E_BAD_IMAGE
+            })?;
+
+        let interp_min_vaddr = interp_elf.segments[..interp_elf.segment_count]
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .map(|s| s.vaddr)
+            .min()
+            .unwrap_or(0);
+        let bias = INTERP_BASE_VADDR - (interp_min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+        interp_base = bias;
+
+        interp_elf.entry_point = interp_elf.entry_point.wrapping_add(bias);
+        for i in 0..interp_elf.segment_count {
+            if let Some(ref mut seg) = interp_elf.segments[i] {
+                seg.vaddr = seg.vaddr.wrapping_add(bias);
+            }
+        }
+
+        interp_highest_end = load_segments_into_address_space(
+            agent_cr3,
+            &interp_buf[..interp_len],
+            &interp_elf,
+            USER_CODE_VADDR as u64,
+        )?;
+
+        serial_println!(
+            "[AGENT_LOADER] Interpreter at base={:#x}, entry={:#x}",
+            interp_base, interp_elf.entry_point
+        );
+        interp_elf.entry_point
+    } else if elf_info.is_dynamic && elf_info.interp_len == 0 {
+        // Static-PIE: no interpreter needed, use main entry directly
+        main_entry
+    } else {
+        main_entry
+    };
+
+    // 4. Allocate user stack above the highest loaded segment
+    let mut highest_seg_end: u64 = USER_STACK_VADDR;
+    for i in 0..elf_info.segment_count {
+        if let Some(s) = &elf_info.segments[i] {
+            if s.vaddr >= USER_CODE_VADDR {
+                highest_seg_end = highest_seg_end.max(s.vaddr + s.mem_size);
+            }
+        }
+    }
+    if interp_highest_end > highest_seg_end {
+        highest_seg_end = interp_highest_end;
+    }
+    let user_stack_base =
+        (highest_seg_end + paging::PAGE_SIZE as u64) & !(paging::PAGE_SIZE as u64 - 1);
+    let user_stack_top = map_user_stack_region(agent_cr3, user_stack_base)?;
+
+    // 5. Build the Linux initial stack layout
+    //
+    //    The Linux kernel places strings at the top of the stack, then builds
+    //    the pointer table (argc/argv/envp/auxv) below them.
+    //
+    //    Layout (growing downward):
+    //      [string area]   ← near stack_top
+    //        AT_RANDOM 16 bytes
+    //        exe_path string (NUL-terminated)
+    //        argv[0] string, argv[1] string, ...
+    //        envp strings: "LANG=C", "HOME=/", "PATH=/usr/bin:/bin"
+    //      [pointer area]  ← RSP points to argc
+    //        argc (u64)
+    //        argv[0] ptr, argv[1] ptr, ..., NULL
+    //        envp[0] ptr, envp[1] ptr, ..., NULL
+    //        auxv entries (type, value pairs)
+    //        AT_NULL, 0
+
+    // Default environment variables (minimal, deterministic)
+    let default_env_vars: [&[u8]; 3] = [
+        b"LANG=C",
+        b"HOME=/",
+        b"PATH=/usr/bin:/bin",
+    ];
+
+    // Build effective argv: if caller provided none, use exe_path as argv[0]
+    let default_argv: [&[u8]; 1] = [exe];
+    let effective_argv: &[&[u8]] = if argv.is_empty() { &default_argv } else { argv };
+    let effective_envp: &[&[u8]] = if envp.is_empty() {
+        &default_env_vars
+    } else {
+        envp
+    };
+
+    // --- Pass 1: calculate string area size ---
+    let mut string_area_size: usize = 16; // AT_RANDOM (16 bytes)
+    string_area_size += exe.len() + 1; // exe_path + NUL (for AT_EXECFN)
+    for arg in effective_argv {
+        string_area_size += arg.len() + 1;
+    }
+    for env in effective_envp {
+        string_area_size += env.len() + 1;
+    }
+
+    // --- Pass 2: calculate pointer area size ---
+    let argc = effective_argv.len();
+    let envc = effective_envp.len();
+    // auxv entries count (including AT_NULL)
+    let auxv_count = if elf_info.is_dynamic && interp_base > 0 { 12 } else { 7 };
+    let pointer_area_size: usize =
+        8                           // argc
+        + (argc + 1) * 8           // argv ptrs + NULL
+        + (envc + 1) * 8           // envp ptrs + NULL
+        + auxv_count * 16;         // auxv entries (type + value)
+
+    let total_size = string_area_size + pointer_area_size;
+    // Align to 16 bytes (x86_64 ABI)
+    let _total_aligned = (total_size + 15) & !15;
+
+    // String area starts at stack_top - string_area_size
+    let string_base = user_stack_top - string_area_size as u64;
+    // Pointer area starts below string area
+    let ptr_base = string_base - pointer_area_size as u64;
+    // Align RSP to 16 bytes
+    let initial_rsp = ptr_base & !0xF;
+
+    // --- Write string area ---
+    let mut sptr = string_base;
+
+    // AT_RANDOM: 16 deterministic bytes
+    let at_random_addr = sptr;
+    let mut random_bytes = [0u8; 16];
+    for (i, b) in random_bytes.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(0x37).wrapping_add(0x42);
+    }
+    write_agent_user_bytes(agent_cr3, sptr, &random_bytes)?;
+    sptr += 16;
+
+    // AT_EXECFN string
+    let _execfn_addr = sptr;
+    write_agent_user_bytes(agent_cr3, sptr, exe)?;
+    write_agent_user_bytes(agent_cr3, sptr + exe.len() as u64, &[0])?;
+    sptr += exe.len() as u64 + 1;
+
+    // argv strings
+    let mut argv_addrs = [0u64; 64]; // max 64 argv entries
+    for (i, arg) in effective_argv.iter().enumerate() {
+        argv_addrs[i] = sptr;
+        write_agent_user_bytes(agent_cr3, sptr, arg)?;
+        write_agent_user_bytes(agent_cr3, sptr + arg.len() as u64, &[0])?;
+        sptr += arg.len() as u64 + 1;
+    }
+
+    // envp strings
+    let mut envp_addrs = [0u64; 16]; // max 16 env vars
+    for (i, env) in effective_envp.iter().enumerate() {
+        envp_addrs[i] = sptr;
+        write_agent_user_bytes(agent_cr3, sptr, env)?;
+        write_agent_user_bytes(agent_cr3, sptr + env.len() as u64, &[0])?;
+        sptr += env.len() as u64 + 1;
+    }
+
+    // --- Write pointer area ---
+    let mut wptr = initial_rsp;
+
+    // argc
+    write_agent_user_u64(agent_cr3, wptr, argc as u64)?;
+    wptr += 8;
+
+    // argv pointers
+    for i in 0..argc {
+        write_agent_user_u64(agent_cr3, wptr, argv_addrs[i])?;
+        wptr += 8;
+    }
+    write_agent_user_u64(agent_cr3, wptr, 0)?; // NULL terminator
+    wptr += 8;
+
+    // envp pointers
+    for i in 0..envc {
+        write_agent_user_u64(agent_cr3, wptr, envp_addrs[i])?;
+        wptr += 8;
+    }
+    write_agent_user_u64(agent_cr3, wptr, 0)?; // NULL terminator
+    wptr += 8;
+
+    // auxv entries
+    let phdr_addr = main_phdr_vaddr.unwrap_or(0);
+
+    // Common auxv entries for all ELFs
+    let write_auxv = |wptr: &mut u64, cr3: u64, atype: u64, aval: u64| -> Result<(), i64> {
+        write_agent_user_u64(cr3, *wptr, atype)?;
+        write_agent_user_u64(cr3, *wptr + 8, aval)?;
+        *wptr += 16;
+        Ok(())
+    };
+
+    if elf_info.is_dynamic && interp_base > 0 {
+        // Full auxv for dynamic linking
+        write_auxv(&mut wptr, agent_cr3, 3, phdr_addr)?;           // AT_PHDR
+        write_auxv(&mut wptr, agent_cr3, 4, elf_info.phdr_entry_size as u64)?; // AT_PHENT
+        write_auxv(&mut wptr, agent_cr3, 5, elf_info.phdr_count as u64)?; // AT_PHNUM
+        write_auxv(&mut wptr, agent_cr3, 6, paging::PAGE_SIZE as u64)?; // AT_PAGESZ
+        write_auxv(&mut wptr, agent_cr3, 7, interp_base)?;         // AT_BASE
+        write_auxv(&mut wptr, agent_cr3, 9, main_entry)?;          // AT_ENTRY
+        write_auxv(&mut wptr, agent_cr3, 11, 1000)?;               // AT_UID
+        write_auxv(&mut wptr, agent_cr3, 12, 1000)?;               // AT_EUID
+        write_auxv(&mut wptr, agent_cr3, 13, 1000)?;               // AT_GID
+        write_auxv(&mut wptr, agent_cr3, 14, 1000)?;               // AT_EGID
+        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?;     // AT_RANDOM
+        write_auxv(&mut wptr, agent_cr3, 0, 0)?;                   // AT_NULL
+    } else {
+        // Minimal auxv for static binaries
+        write_auxv(&mut wptr, agent_cr3, 6, paging::PAGE_SIZE as u64)?; // AT_PAGESZ
+        write_auxv(&mut wptr, agent_cr3, 11, 1000)?;               // AT_UID
+        write_auxv(&mut wptr, agent_cr3, 12, 1000)?;               // AT_EUID
+        write_auxv(&mut wptr, agent_cr3, 13, 1000)?;               // AT_GID
+        write_auxv(&mut wptr, agent_cr3, 14, 1000)?;               // AT_EGID
+        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?;     // AT_RANDOM
+        write_auxv(&mut wptr, agent_cr3, 0, 0)?;                   // AT_NULL
+    }
+
+    // 6. Allocate kernel stack
+    let k_stack_top = sched::allocate_agent_stack();
+    if k_stack_top == 0 {
+        return Err(E_QUOTA_EXCEEDED);
+    }
+
+    // 7. Create the agent
+    let entry = final_entry;
+    let agent_id = create_agent(Some(caller_id), entry, user_stack_top, energy, mem_quota)?;
+
+    // 8. Configure user-mode context — RSP always points to argc
+    if let Some(agent) = get_agent_mut(agent_id) {
+        agent.mode = AgentMode::User;
+        agent.kernel_stack_top = k_stack_top;
+        agent.context = new_user_context(entry, initial_rsp, k_stack_top);
+        agent.context.cr3 = agent_cr3;
+    }
+
+    // 9. Initialize Linux-compat state and store exe_path
+    finish_agent_setup(agent_id, caller_id)?;
+    crate::linux_compat::state::init_state(agent_id);
+    crate::linux_compat::state::set_exe_path(agent_id, exe);
+
+    serial_println!(
+        "[AGENT_LOADER] Spawned Linux agent {} (entry={:#x}, argc={}, exe={:?})",
+        agent_id, entry, argc,
+        core::str::from_utf8(exe).unwrap_or("?")
     );
 
     Ok(agent_id)

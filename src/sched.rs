@@ -20,8 +20,13 @@ extern "C" {
 /// Maximum run queue size (same as MAX_AGENTS).
 const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
 
-/// Stack size for dynamically spawned agents (4 KiB).
-const SPAWN_STACK_SIZE: usize = 16384; // 16KB: must handle interrupt frame + TrapFrame + schedule() + context_switch on each preemption
+/// Kernel stack size for dynamically spawned agents.
+///
+/// Linux-compat paths like `execve` and dynamic loading can materialize
+/// sizeable temporary buffers on the kernel stack. Keeping the spawned-agent
+/// pool aligned with the global ring-3 kernel stack size avoids cross-agent
+/// corruption when those deeper paths run.
+const SPAWN_STACK_SIZE: usize = KERNEL_STACK_SIZE;
 
 /// Static stack pool for spawned agents.
 static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] =

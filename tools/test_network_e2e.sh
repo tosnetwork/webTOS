@@ -18,6 +18,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-none/release/atos}"
 ELF32="/tmp/atos_net_test.elf"
+QEMU_MEMORY="${QEMU_MEMORY:-256M}"
 
 echo "=== ATOS Network End-to-End Test ==="
 
@@ -30,6 +31,7 @@ objcopy -I elf64-x86-64 -O elf32-i386 "$KERNEL" "$ELF32"
 # Use virtio-net with user-mode networking (NAT)
 echo "[2/4] Launching ATOS with virtio-net..."
 timeout 8 qemu-system-x86_64 \
+    -m "$QEMU_MEMORY" \
     -serial file:/tmp/atos_net_e2e.log \
     -display none \
     -kernel "$ELF32" \

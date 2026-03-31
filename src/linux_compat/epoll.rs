@@ -238,9 +238,16 @@ pub fn sys_epoll_wait(
         let ready_events = match st.get_fd(fd) {
             Some(entry) => {
                 match entry.kind {
-                    // Pipes and sockets: report EPOLLOUT (always writable)
-                    // EPOLLIN would require checking mailbox — for now, not ready
-                    FdKind::Socket | FdKind::Pipe => EPOLLOUT,
+                    // Pipes and sockets: check mailbox for readable data
+                    FdKind::Socket | FdKind::Pipe => {
+                        let mut events = EPOLLOUT;
+                        if let Some(mb) = crate::mailbox::get_mailbox(entry.mailbox_id) {
+                            if !mb.is_empty() {
+                                events |= EPOLLIN;
+                            }
+                        }
+                        events
+                    }
                     // EventFd: readable if counter > 0
                     FdKind::EventFd => {
                         let mut events = EPOLLOUT;
@@ -250,7 +257,7 @@ pub fn sys_epoll_wait(
                         events
                     }
                     // Regular files are always ready
-                    FdKind::File => EPOLLIN | EPOLLOUT,
+                    FdKind::File | FdKind::Directory => EPOLLIN | EPOLLOUT,
                     // Epoll fds themselves — skip
                     FdKind::Epoll => continue,
                 }

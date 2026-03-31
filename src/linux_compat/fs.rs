@@ -4,6 +4,8 @@
 //! Files are backed by the agent's private keyspace; pipes and sockets map
 //! to ATOS mailbox IPC.
 
+extern crate alloc;
+
 use super::constants::*;
 use super::state::{self, FdEntry, FdKind, MAX_FDS, MAX_PATH};
 use sha2::{Digest, Sha256};
@@ -30,6 +32,11 @@ const AT_EMPTY_PATH: u32 = 0x1000;
 // ── Limits ─────────────────────────────────────────────────────────────────
 
 const MAX_VALUE_SIZE: usize = 256;
+const DT_CHR: u8 = 2;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+const MAX_DIRENTS_COLLECT: usize = 64;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -78,6 +85,266 @@ unsafe fn read_user_mem(src: u64, dst: &mut [u8], len: usize) {
     }
 }
 
+/// Read file data from a keyspace at the given offset into user memory.
+///
+/// Handles both small values (≤256 bytes via state_get) and large files
+/// stored via store_multi_segment. Returns the number of bytes copied.
+fn read_file_data(keyspace: u16, key: u64, offset: usize, buf_ptr: u64, count: usize) -> usize {
+    // Try small value first
+    if let Some((value, value_len)) = crate::state::state_get(keyspace, key) {
+        // Check if this looks like multi-segment metadata (6 bytes with valid header)
+        if value_len == 6 {
+            let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+            let seg_count = u16::from_le_bytes([value[4], value[5]]) as usize;
+            if seg_count > 0 && total > 0 && total > MAX_VALUE_SIZE {
+                // This is multi-segment metadata — load via multi-segment path
+                return read_multi_segment_at(keyspace, key, offset, buf_ptr, count);
+            }
+        }
+        // Plain small value
+        if offset >= value_len {
+            return 0;
+        }
+        let available = value_len - offset;
+        let to_copy = count.min(available);
+        unsafe { write_user_mem(buf_ptr, &value[offset..offset + to_copy]); }
+        return to_copy;
+    }
+    0
+}
+
+/// Read from a multi-segment file at a given offset into user memory.
+fn read_multi_segment_at(keyspace: u16, key: u64, offset: usize, buf_ptr: u64, count: usize) -> usize {
+    let total_size = crate::state::query_file_size(keyspace, key);
+    if total_size == 0 || offset >= total_size {
+        return 0;
+    }
+    let available = total_size - offset;
+    let to_copy = count.min(available);
+
+    // Allocate temp buffer large enough for the entire file.
+    // load_multi_segment requires buf.len() >= total_size.
+    let mut tmp = alloc::vec![0u8; total_size];
+    let loaded = crate::state::load_multi_segment(keyspace, key, &mut tmp);
+    if loaded == 0 || offset >= loaded {
+        return 0;
+    }
+    let real_copy = to_copy.min(loaded - offset);
+    unsafe { write_user_mem(buf_ptr, &tmp[offset..offset + real_copy]); }
+    real_copy
+}
+
+fn base_image_namespace_has_entries(namespace: super::vfs::BaseImageNamespace) -> bool {
+    let mut found = false;
+    crate::state::iter_base_image_paths(|entry_ns, _| {
+        if entry_ns == namespace {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
+}
+
+fn base_image_directory_namespace(path: &[u8]) -> Option<(super::vfs::BaseImageNamespace, &[u8])> {
+    if path == b"/lib" {
+        return Some((super::vfs::BaseImageNamespace::Lib, b""));
+    }
+    if path == b"/lib64" {
+        return Some((super::vfs::BaseImageNamespace::Lib, b""));
+    }
+    if path == b"/usr/lib" {
+        return Some((super::vfs::BaseImageNamespace::Lib, b""));
+    }
+    if path == b"/usr/bin" {
+        return Some((super::vfs::BaseImageNamespace::UsrBin, b""));
+    }
+    if path == b"/jdk" {
+        return Some((super::vfs::BaseImageNamespace::Jdk, b""));
+    }
+    if path == b"/etc" {
+        return Some((super::vfs::BaseImageNamespace::Etc, b""));
+    }
+    if path.len() > 5 && &path[..5] == b"/lib/" {
+        return Some((super::vfs::BaseImageNamespace::Lib, &path[5..]));
+    }
+    if path.len() > 7 && &path[..7] == b"/lib64/" {
+        return Some((super::vfs::BaseImageNamespace::Lib, &path[7..]));
+    }
+    if path.len() > 9 && &path[..9] == b"/usr/lib/" {
+        return Some((super::vfs::BaseImageNamespace::Lib, &path[9..]));
+    }
+    if path.len() > 9 && &path[..9] == b"/usr/bin/" {
+        return Some((super::vfs::BaseImageNamespace::UsrBin, &path[9..]));
+    }
+    if path.len() > 5 && &path[..5] == b"/jdk/" {
+        return Some((super::vfs::BaseImageNamespace::Jdk, &path[5..]));
+    }
+    None
+}
+
+fn base_image_directory_exists(path: &[u8]) -> bool {
+    let Some((namespace, prefix)) = base_image_directory_namespace(path) else {
+        return false;
+    };
+
+    let mut found = false;
+    crate::state::iter_base_image_paths(|entry_ns, relative| {
+        if entry_ns != namespace {
+            return true;
+        }
+
+        match namespace {
+            super::vfs::BaseImageNamespace::Etc => {
+                if prefix.is_empty() && relative == b"ld.so.cache" {
+                    found = true;
+                    return false;
+                }
+            }
+            super::vfs::BaseImageNamespace::Lib
+            | super::vfs::BaseImageNamespace::Jdk
+            | super::vfs::BaseImageNamespace::UsrBin => {
+                if prefix.is_empty() {
+                    found = true;
+                    return false;
+                }
+                if relative.len() > prefix.len()
+                    && &relative[..prefix.len()] == prefix
+                    && relative[prefix.len()] == b'/'
+                {
+                    found = true;
+                    return false;
+                }
+            }
+        }
+
+        true
+    });
+    found
+}
+
+fn push_dir_entry(
+    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    lens: &mut [u16; MAX_DIRENTS_COLLECT],
+    dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
+    count: &mut usize,
+    name: &[u8],
+    d_type: u8,
+) {
+    if name.is_empty() || name.len() >= MAX_PATH || *count >= MAX_DIRENTS_COLLECT {
+        return;
+    }
+
+    for i in 0..*count {
+        if lens[i] as usize == name.len() && names[i][..name.len()] == name[..] {
+            if d_type == DT_DIR {
+                dtypes[i] = DT_DIR;
+            }
+            return;
+        }
+    }
+
+    names[*count][..name.len()].copy_from_slice(name);
+    lens[*count] = name.len() as u16;
+    dtypes[*count] = d_type;
+    *count += 1;
+}
+
+fn collect_base_image_children(
+    dir_path: &[u8],
+    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    lens: &mut [u16; MAX_DIRENTS_COLLECT],
+    dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
+    count: &mut usize,
+) {
+    let Some((namespace, prefix)) = base_image_directory_namespace(dir_path) else {
+        return;
+    };
+
+    crate::state::iter_base_image_paths(|entry_ns, relative| {
+        if entry_ns != namespace {
+            return true;
+        }
+
+        match namespace {
+            super::vfs::BaseImageNamespace::Etc => {
+                if prefix.is_empty() && relative == b"ld.so.cache" {
+                    push_dir_entry(names, lens, dtypes, count, b"ld.so.cache", DT_REG);
+                }
+            }
+            super::vfs::BaseImageNamespace::Lib
+            | super::vfs::BaseImageNamespace::Jdk
+            | super::vfs::BaseImageNamespace::UsrBin => {
+                let remainder = if prefix.is_empty() {
+                    relative
+                } else {
+                    if relative.len() <= prefix.len()
+                        || &relative[..prefix.len()] != prefix
+                        || relative[prefix.len()] != b'/'
+                    {
+                        return true;
+                    }
+                    &relative[prefix.len() + 1..]
+                };
+
+                if remainder.is_empty() {
+                    return true;
+                }
+
+                if let Some(pos) = remainder.iter().position(|&b| b == b'/') {
+                    push_dir_entry(names, lens, dtypes, count, &remainder[..pos], DT_DIR);
+                } else {
+                    push_dir_entry(names, lens, dtypes, count, remainder, DT_REG);
+                }
+            }
+        }
+
+        true
+    });
+}
+
+fn collect_directory_entries(
+    dir_path: &[u8],
+    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    lens: &mut [u16; MAX_DIRENTS_COLLECT],
+    dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
+) -> usize {
+    let mut count = 0usize;
+
+    if dir_path == b"." || dir_path == b"/" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"app", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"bin", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"dev", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"etc", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"lib", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"lib64", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"proc", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"tmp", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"usr", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"var", DT_DIR);
+        if base_image_namespace_has_entries(super::vfs::BaseImageNamespace::Jdk) {
+            push_dir_entry(names, lens, dtypes, &mut count, b"jdk", DT_DIR);
+        }
+    } else if dir_path == b"/usr" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"bin", DT_DIR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"lib", DT_DIR);
+    } else if dir_path == b"/var" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"run", DT_DIR);
+    } else if dir_path == b"/proc" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"self", DT_DIR);
+    } else if dir_path == b"/proc/self" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"exe", DT_LNK);
+    } else if dir_path == b"/dev" {
+        push_dir_entry(names, lens, dtypes, &mut count, b"null", DT_CHR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"random", DT_CHR);
+        push_dir_entry(names, lens, dtypes, &mut count, b"urandom", DT_CHR);
+    }
+
+    collect_base_image_children(dir_path, names, lens, dtypes, &mut count);
+    count
+}
+
 // ── sys_read ───────────────────────────────────────────────────────────────
 
 /// Read from a file descriptor.
@@ -99,28 +366,18 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
 
     let kind = entry.kind;
     let key = entry.keyspace_key;
+    let ks = entry.keyspace_id;
     let offset = entry.offset as usize;
 
     match kind {
         FdKind::File => {
-            match crate::state::state_get(agent_id, key) {
-                Some((value, value_len)) => {
-                    if offset >= value_len {
-                        return 0; // EOF
-                    }
-                    let available = value_len - offset;
-                    let to_copy = (count as usize).min(available);
-                    unsafe {
-                        write_user_mem(buf_ptr, &value[offset..offset + to_copy]);
-                    }
-                    // Advance fd offset
-                    if let Some(e) = st.get_fd_mut(fd) {
-                        e.offset += to_copy as u64;
-                    }
-                    to_copy as i64
+            let to_copy = read_file_data(ks, key, offset, buf_ptr, count as usize);
+            if to_copy > 0 {
+                if let Some(e) = st.get_fd_mut(fd) {
+                    e.offset += to_copy as u64;
                 }
-                None => 0, // file empty / never written → EOF
             }
+            to_copy as i64
         }
         FdKind::Pipe | FdKind::Socket => {
             let mailbox_id = entry.mailbox_id;
@@ -136,6 +393,7 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 Err(_) => 0, // no message available → EOF-like
             }
         }
+        FdKind::Directory => -EISDIR,
         _ => -EINVAL,
     }
 }
@@ -188,6 +446,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
 
     let kind = entry.kind;
     let key = entry.keyspace_key;
+    let ks = entry.keyspace_id;
 
     match kind {
         FdKind::File => {
@@ -196,7 +455,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
             unsafe {
                 read_user_mem(buf_ptr, &mut value, to_write);
             }
-            match crate::state::state_put(agent_id, key, &value[..to_write]) {
+            match crate::state::state_put(ks, key, &value[..to_write]) {
                 Ok(()) => {
                     // Advance fd offset
                     if let Some(e) = st.get_fd_mut(fd) {
@@ -219,6 +478,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 Err(_) => -EAGAIN,
             }
         }
+        FdKind::Directory => -EISDIR,
         _ => -EINVAL,
     }
 }
@@ -240,7 +500,34 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
     }
 
     let path = &path_buf[..path_len];
+
+    // Special paths always succeed (e.g. /dev/null, /proc/*)
+    let is_special = super::vfs::is_special_path(path).is_some();
+
+    // Check if it's a directory open (for getdents64)
+    let is_dir = (flags & O_DIRECTORY) != 0;
+    let directory_target = is_directory_path(path);
+
     let (keyspace_id, key) = super::vfs::resolve_path(agent_id, path);
+
+    if is_dir && !directory_target {
+        let exists = crate::state::query_file_size(keyspace_id, key) > 0
+            || crate::state::state_get(keyspace_id, key).is_some()
+            || is_special;
+        return if exists { -ENOTDIR } else { -ENOENT };
+    }
+
+    // If not creating and not a special path and not a directory,
+    // verify the file actually exists in the keyspace
+    if (flags & O_CREAT) == 0 && !is_special && !directory_target {
+        let size = crate::state::query_file_size(keyspace_id, key);
+        if size == 0 {
+            // Also check plain state_get for empty/small files
+            if crate::state::state_get(keyspace_id, key).is_none() {
+                return -ENOENT;
+            }
+        }
+    }
 
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
@@ -252,15 +539,31 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
         None => return -EMFILE,
     };
 
-    st.fd_table[fd_idx] = Some(FdEntry {
-        kind: FdKind::File,
-        keyspace_key: key,
-        keyspace_id,
-        mailbox_id: 0,
-        offset: 0,
-        flags,
-        active: true,
-    });
+    if directory_target {
+        let dir_handle = match st.alloc_directory_handle(path) {
+            Some(id) => id,
+            None => return -EMFILE,
+        };
+        st.fd_table[fd_idx] = Some(FdEntry {
+            kind: FdKind::Directory,
+            keyspace_key: dir_handle as u64,
+            keyspace_id: 0,
+            mailbox_id: 0,
+            offset: 0,
+            flags,
+            active: true,
+        });
+    } else {
+        st.fd_table[fd_idx] = Some(FdEntry {
+            kind: FdKind::File,
+            keyspace_key: key,
+            keyspace_id,
+            mailbox_id: 0,
+            offset: 0,
+            flags,
+            active: true,
+        });
+    }
 
     fd_idx as i64
 }
@@ -300,11 +603,13 @@ pub fn sys_fstat(agent_id: u16, fd: i32, statbuf_ptr: u64) -> i64 {
         _ => return -EBADF,
     };
 
+    if entry.kind == FdKind::Directory {
+        fill_stat_buf_dir(statbuf_ptr);
+        return 0;
+    }
+
     let file_size: u64 = if entry.kind == FdKind::File {
-        match crate::state::state_get(agent_id, entry.keyspace_key) {
-            Some((_val, len)) => len as u64,
-            None => 0,
-        }
+        crate::state::query_file_size(entry.keyspace_id, entry.keyspace_key) as u64
     } else {
         0
     };
@@ -365,14 +670,70 @@ pub fn sys_newfstatat(
         return -ENOENT;
     }
 
-    let key = path_to_key(&path_buf[..path_len]);
-    let file_size: u64 = match crate::state::state_get(agent_id, key) {
-        Some((_val, len)) => len as u64,
-        None => 0, // report size 0 for non-existent files
-    };
+    let path = &path_buf[..path_len];
 
-    fill_stat_buf(statbuf_ptr, file_size);
+    // Special paths always exist
+    if super::vfs::is_special_path(path).is_some() {
+        fill_stat_buf(statbuf_ptr, 0);
+        return 0;
+    }
+
+    // Directory-like paths always succeed (return S_IFDIR)
+    if is_directory_path(path) {
+        fill_stat_buf_dir(statbuf_ptr);
+        return 0;
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+
+    // Check existence: try query_file_size, then state_get for empty/small files
+    let file_size = crate::state::query_file_size(ks, key);
+    if file_size == 0 && crate::state::state_get(ks, key).is_none() {
+        return -ENOENT;
+    }
+
+    fill_stat_buf(statbuf_ptr, file_size as u64);
     0
+}
+
+/// Check if a path is a known directory.
+fn is_directory_path(path: &[u8]) -> bool {
+    matches!(
+        path,
+        b"."
+            | b"/"
+            | b"/app"
+            | b"/bin"
+            | b"/dev"
+            | b"/etc"
+            | b"/lib"
+            | b"/lib64"
+            | b"/proc"
+            | b"/proc/self"
+            | b"/tmp"
+            | b"/usr"
+            | b"/usr/bin"
+            | b"/usr/lib"
+            | b"/var"
+            | b"/var/run"
+    )
+        || base_image_directory_exists(path)
+}
+
+/// Fill a stat buf with S_IFDIR mode.
+fn fill_stat_buf_dir(ptr: u64) {
+    let mut buf = [0u8; 144];
+    // st_mode = S_IFDIR | 0755 = 0o40755 = 0x41ED
+    buf[24..28].copy_from_slice(&0x41EDu32.to_le_bytes());
+    // st_nlink = 2
+    buf[16..24].copy_from_slice(&2u64.to_le_bytes());
+    // st_uid = 1000
+    buf[28..32].copy_from_slice(&1000u32.to_le_bytes());
+    // st_gid = 1000
+    buf[32..36].copy_from_slice(&1000u32.to_le_bytes());
+    // st_blksize = 4096
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    unsafe { write_user_mem(ptr, &buf) }
 }
 
 // ── sys_lseek ──────────────────────────────────────────────────────────────
@@ -390,13 +751,13 @@ pub fn sys_lseek(agent_id: u16, fd: i32, offset: i64, whence: u32) -> i64 {
     };
 
     if entry.kind != FdKind::File {
+        if entry.kind == FdKind::Directory {
+            return -EISDIR;
+        }
         return -EINVAL; // cannot seek pipes/sockets
     }
 
-    let file_size: u64 = match crate::state::state_get(agent_id, entry.keyspace_key) {
-        Some((_val, len)) => len as u64,
-        None => 0,
-    };
+    let file_size = crate::state::query_file_size(entry.keyspace_id, entry.keyspace_key) as u64;
 
     let new_offset: i64 = match whence {
         SEEK_SET => offset,
@@ -428,24 +789,13 @@ pub fn sys_pread64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u64
     };
 
     if entry.kind != FdKind::File {
+        if entry.kind == FdKind::Directory {
+            return -EISDIR;
+        }
         return -EINVAL;
     }
 
-    match crate::state::state_get(agent_id, entry.keyspace_key) {
-        Some((value, value_len)) => {
-            let off = offset as usize;
-            if off >= value_len {
-                return 0; // EOF
-            }
-            let available = value_len - off;
-            let to_copy = (count as usize).min(available);
-            unsafe {
-                write_user_mem(buf_ptr, &value[off..off + to_copy]);
-            }
-            to_copy as i64
-        }
-        None => 0,
-    }
+    read_file_data(entry.keyspace_id, entry.keyspace_key, offset as usize, buf_ptr, count as usize) as i64
 }
 
 // ── sys_access ─────────────────────────────────────────────────────────────
@@ -468,10 +818,15 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
         return 0;
     }
 
+    if is_directory_path(&path_buf[..path_len]) {
+        return 0;
+    }
+
     let (ks, key) = super::vfs::resolve_path(agent_id, &path_buf[..path_len]);
-    match crate::state::state_get(ks, key) {
-        Some(_) => 0,
-        None => -ENOENT,
+    if crate::state::query_file_size(ks, key) > 0 || crate::state::state_get(ks, key).is_some() {
+        0
+    } else {
+        -ENOENT
     }
 }
 
@@ -482,8 +837,6 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
 /// `/proc/self/exe` is handled specially and returns `"/app/binary"`.
 /// All other paths return `-EINVAL` (no real symlinks).
 pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
-    let _ = agent_id;
-
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
     if path_len == 0 {
@@ -492,15 +845,139 @@ pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64)
 
     const PROC_SELF_EXE: &[u8] = b"/proc/self/exe";
     if path_len == PROC_SELF_EXE.len() && path_buf[..path_len] == *PROC_SELF_EXE {
-        const RESULT: &[u8] = b"/app/binary";
-        let to_copy = (bufsiz as usize).min(RESULT.len());
+        // Return the real exe_path from LinuxAgentState
+        let result = match state::get_state(agent_id) {
+            Some(s) if s.exe_path_len > 0 => &s.exe_path[..s.exe_path_len as usize],
+            _ => b"/app/binary" as &[u8],
+        };
+        let to_copy = (bufsiz as usize).min(result.len());
         unsafe {
-            write_user_mem(buf_ptr, &RESULT[..to_copy]);
+            write_user_mem(buf_ptr, &result[..to_copy]);
         }
         return to_copy as i64;
     }
 
     -EINVAL
+}
+
+// ── sys_readlinkat ────────────────────────────────────────────────────────
+
+/// Read a symbolic link relative to a directory fd.
+///
+/// Delegates to sys_readlink for the actual path handling.
+pub fn sys_readlinkat(agent_id: u16, dirfd: i32, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+    let _ = dirfd; // AT_FDCWD or ignored
+    sys_readlink(agent_id, pathname_ptr, buf_ptr, bufsiz)
+}
+
+// ── sys_statx ─────────────────────────────────────────────────────────────
+
+/// statx — extended file status.
+///
+/// Linux `struct statx` is 256 bytes. We fill a minimal subset:
+///   0: stx_mask (u32), 4: stx_blksize (u32), 8: stx_attributes (u64),
+///   16: stx_nlink (u32), 20: stx_uid (u32), 24: stx_gid (u32),
+///   28: stx_mode (u16), 40: stx_ino (u64), 48: stx_size (u64),
+///   56: stx_blocks (u64)
+pub fn sys_statx(
+    agent_id: u16,
+    dirfd: i32,
+    pathname_ptr: u64,
+    flags: u32,
+    _mask: u32,
+    statxbuf_ptr: u64,
+) -> i64 {
+    // AT_EMPTY_PATH with dirfd → fstat equivalent
+    if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+        let st = match state::get_state(agent_id) {
+            Some(s) => s,
+            None => return -EBADF,
+        };
+        let entry = match st.get_fd(dirfd) {
+            Some(e) if e.active => e,
+            _ => return -EBADF,
+        };
+        if entry.kind == FdKind::Directory {
+            fill_statx_buf_dir(statxbuf_ptr);
+            return 0;
+        }
+        let file_size = if entry.kind == FdKind::File {
+            crate::state::query_file_size(entry.keyspace_id, entry.keyspace_key) as u64
+        } else {
+            0
+        };
+        fill_statx_buf(statxbuf_ptr, file_size);
+        return 0;
+    }
+
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
+    if path_len == 0 {
+        return -ENOENT;
+    }
+
+    let path = &path_buf[..path_len];
+
+    // Special paths always exist
+    if super::vfs::is_special_path(path).is_some() {
+        fill_statx_buf(statxbuf_ptr, 0);
+        return 0;
+    }
+
+    // Directory-like paths always succeed
+    if is_directory_path(path) {
+        fill_statx_buf_dir(statxbuf_ptr);
+        return 0;
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+    let file_size = crate::state::query_file_size(ks, key);
+    if file_size == 0 && crate::state::state_get(ks, key).is_none() {
+        return -ENOENT;
+    }
+    fill_statx_buf(statxbuf_ptr, file_size as u64);
+    0
+}
+
+/// Write a `struct statx` for a directory.
+fn fill_statx_buf_dir(ptr: u64) {
+    let mut buf = [0u8; 256];
+    buf[0..4].copy_from_slice(&0x07FFu32.to_le_bytes()); // stx_mask
+    buf[4..8].copy_from_slice(&4096u32.to_le_bytes());   // stx_blksize
+    buf[16..20].copy_from_slice(&2u32.to_le_bytes());    // stx_nlink
+    buf[20..24].copy_from_slice(&1000u32.to_le_bytes()); // stx_uid
+    buf[24..28].copy_from_slice(&1000u32.to_le_bytes()); // stx_gid
+    // stx_mode = S_IFDIR | 0755 = 0x41ED
+    buf[28..30].copy_from_slice(&0x41EDu16.to_le_bytes());
+    buf[40..48].copy_from_slice(&1u64.to_le_bytes());    // stx_ino
+    unsafe { write_user_mem(ptr, &buf) }
+}
+
+/// Write a populated `struct statx` (256 bytes) to user memory.
+fn fill_statx_buf(ptr: u64, file_size: u64) {
+    let mut buf = [0u8; 256];
+
+    // stx_mask = STATX_BASIC_STATS (0x07FF)
+    buf[0..4].copy_from_slice(&0x07FFu32.to_le_bytes());
+    // stx_blksize = 4096
+    buf[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    // stx_nlink = 1
+    buf[16..20].copy_from_slice(&1u32.to_le_bytes());
+    // stx_uid = 1000
+    buf[20..24].copy_from_slice(&1000u32.to_le_bytes());
+    // stx_gid = 1000
+    buf[24..28].copy_from_slice(&1000u32.to_le_bytes());
+    // stx_mode = S_IFREG | 0644 = 0o100644 = 0x81A4
+    buf[28..30].copy_from_slice(&0x81A4u16.to_le_bytes());
+    // stx_ino = 1
+    buf[40..48].copy_from_slice(&1u64.to_le_bytes());
+    // stx_size
+    buf[48..56].copy_from_slice(&file_size.to_le_bytes());
+    // stx_blocks = ceil(size / 512)
+    let blocks = (file_size + 511) / 512;
+    buf[56..64].copy_from_slice(&blocks.to_le_bytes());
+
+    unsafe { write_user_mem(ptr, &buf) }
 }
 
 // ── sys_getdents64 ─────────────────────────────────────────────────────────
@@ -522,103 +999,78 @@ pub fn sys_getdents64(agent_id: u16, fd: i32, dirp_ptr: u64, count: u64) -> i64 
         _ => return -EBADF,
     };
 
+    if entry.kind != FdKind::Directory {
+        return -ENOTDIR;
+    }
+
+    let dir_handle = match st.get_directory_handle(entry.keyspace_key as u16) {
+        Some(handle) => *handle,
+        None => return -EBADF,
+    };
+
     let already_returned = entry.offset as usize;
     let buf_size = count as usize;
 
-    // Collect keys from the keyspace, skipping already-returned entries.
-    // We use a fixed-size buffer to avoid allocation.
-    const MAX_COLLECT: usize = 64;
-    let mut keys: [u64; MAX_COLLECT] = [0u64; MAX_COLLECT];
-    let mut key_count: usize = 0;
-    let mut visited: usize = 0;
+    let mut path = [0u8; MAX_PATH];
+    let path_len = dir_handle.path_len as usize;
+    path[..path_len].copy_from_slice(&dir_handle.path[..path_len]);
 
-    crate::state::iter_entries(agent_id, |key, _value| {
-        if visited >= already_returned && key_count < MAX_COLLECT {
-            keys[key_count] = key;
-            key_count += 1;
-        }
-        visited += 1;
-        true
-    });
+    let mut child_names = [[0u8; MAX_PATH]; MAX_DIRENTS_COLLECT];
+    let mut child_lens = [0u16; MAX_DIRENTS_COLLECT];
+    let mut child_dtypes = [0u8; MAX_DIRENTS_COLLECT];
+    let child_count = collect_directory_entries(
+        &path[..path_len],
+        &mut child_names,
+        &mut child_lens,
+        &mut child_dtypes,
+    );
 
-    if key_count == 0 {
-        // If this is the very first call, return a "." entry so programs
-        // don't see a completely empty directory.
-        if already_returned == 0 {
-            // Build a minimal "." dirent64
-            // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name(".\0") = 21
-            // Align to 8 bytes → 24
-            const DOT_RECLEN: u16 = 24;
-            if buf_size < DOT_RECLEN as usize {
-                return -EINVAL;
-            }
-            let mut buf = [0u8; 24];
-            // d_ino = 1
-            buf[0..8].copy_from_slice(&1u64.to_le_bytes());
-            // d_off = 1 (offset to next)
-            buf[8..16].copy_from_slice(&1u64.to_le_bytes());
-            // d_reclen
-            buf[16..18].copy_from_slice(&DOT_RECLEN.to_le_bytes());
-            // d_type = DT_DIR = 4
-            buf[18] = 4;
-            // d_name = "."
-            buf[19] = b'.';
-            buf[20] = 0;
-            unsafe { write_user_mem(dirp_ptr, &buf) }
-            // Advance offset so next call returns 0
-            if let Some(e) = st.get_fd_mut(fd) {
-                e.offset = 1;
-            }
-            return DOT_RECLEN as i64;
-        }
+    let mut names = [[0u8; MAX_PATH]; MAX_DIRENTS_COLLECT];
+    let mut lens = [0u16; MAX_DIRENTS_COLLECT];
+    let mut dtypes = [0u8; MAX_DIRENTS_COLLECT];
+    let mut total_entries = 0usize;
+    push_dir_entry(&mut names, &mut lens, &mut dtypes, &mut total_entries, b".", DT_DIR);
+    push_dir_entry(&mut names, &mut lens, &mut dtypes, &mut total_entries, b"..", DT_DIR);
+    for idx in 0..child_count {
+        push_dir_entry(
+            &mut names,
+            &mut lens,
+            &mut dtypes,
+            &mut total_entries,
+            &child_names[idx][..child_lens[idx] as usize],
+            child_dtypes[idx],
+        );
+    }
+
+    if already_returned >= total_entries {
         return 0;
     }
 
-    // Write dirent64 entries into the user buffer.
-    let mut written: usize = 0;
-    let mut entries_emitted: usize = 0;
-
-    for idx in 0..key_count {
-        // Render the key as a 16-char hex filename
-        let key = keys[idx];
-        let key_bytes = key.to_le_bytes();
-        let mut name = [0u8; 17]; // 16 hex chars + null
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for j in 0..8 {
-            name[j * 2] = HEX[(key_bytes[j] >> 4) as usize];
-            name[j * 2 + 1] = HEX[(key_bytes[j] & 0xf) as usize];
-        }
-        name[16] = 0;
-
-        // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1) + d_name(17) = 36
-        // Align to 8 bytes → 40
-        let name_len = 17usize; // includes null terminator
+    let mut written = 0usize;
+    let mut entries_emitted = 0usize;
+    for idx in already_returned..total_entries {
+        let name_len = lens[idx] as usize + 1;
         let reclen_raw = 8 + 8 + 2 + 1 + name_len;
-        let reclen = (reclen_raw + 7) & !7; // align to 8
-
+        let reclen = (reclen_raw + 7) & !7;
         if written + reclen > buf_size {
             break;
         }
 
-        let mut dirent = [0u8; 40];
-        // d_ino = key (use the key itself as inode number)
-        dirent[0..8].copy_from_slice(&key.to_le_bytes());
-        // d_off = offset to next entry
-        let next_off = (already_returned + entries_emitted + 1) as u64;
-        dirent[8..16].copy_from_slice(&next_off.to_le_bytes());
-        // d_reclen
+        let mut dirent = [0u8; MAX_PATH + 24];
+        let ino = (idx as u64) + 1;
+        dirent[0..8].copy_from_slice(&ino.to_le_bytes());
+        dirent[8..16].copy_from_slice(&((idx + 1) as u64).to_le_bytes());
         dirent[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        // d_type = DT_REG = 8
-        dirent[18] = 8;
-        // d_name
-        dirent[19..19 + name_len].copy_from_slice(&name[..name_len]);
+        dirent[18] = dtypes[idx];
+        let entry_len = lens[idx] as usize;
+        dirent[19..19 + entry_len].copy_from_slice(&names[idx][..entry_len]);
+        dirent[19 + entry_len] = 0;
 
         unsafe { write_user_mem(dirp_ptr + written as u64, &dirent[..reclen]) }
         written += reclen;
         entries_emitted += 1;
     }
 
-    // Advance the fd offset so the next call skips these entries
     if let Some(e) = st.get_fd_mut(fd) {
         e.offset += entries_emitted as u64;
     }
@@ -646,7 +1098,11 @@ pub fn sys_fcntl(agent_id: u16, fd: i32, cmd: u32, arg: u64) -> i64 {
             };
             for i in min_fd..MAX_FDS {
                 if st.fd_table[i].is_none() {
-                    st.fd_table[i] = Some(entry);
+                    let cloned = match clone_fd_entry(st, entry) {
+                        Ok(e) => e,
+                        Err(e) => return e,
+                    };
+                    st.fd_table[i] = Some(cloned);
                     return i as i64;
                 }
             }
@@ -708,7 +1164,11 @@ pub fn sys_dup(agent_id: u16, oldfd: i32) -> i64 {
 
     match st.alloc_fd() {
         Some(new_fd) => {
-            st.fd_table[new_fd] = Some(entry);
+            let cloned = match clone_fd_entry(st, entry) {
+                Ok(e) => e,
+                Err(e) => return e,
+            };
+            st.fd_table[new_fd] = Some(cloned);
             new_fd as i64
         }
         None => -EMFILE,
@@ -757,17 +1217,46 @@ pub fn sys_mkdir(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
 
 /// Change working directory via an open fd.
 ///
-/// Validates the fd exists but is otherwise a no-op in Stage-1.
+/// The fd must reference a directory handle.
 pub fn sys_fchdir(agent_id: u16, fd: i32) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
 
-    match st.get_fd(fd) {
-        Some(e) if e.active => 0,
-        _ => -EBADF,
+    let entry = match st.get_fd(fd) {
+        Some(e) if e.active => *e,
+        _ => return -EBADF,
+    };
+
+    if entry.kind != FdKind::Directory {
+        return -ENOTDIR;
     }
+
+    let handle = match st.get_directory_handle(entry.keyspace_key as u16) {
+        Some(h) => *h,
+        None => return -EBADF,
+    };
+
+    let copy_len = handle.path_len as usize;
+    st.cwd[..copy_len].copy_from_slice(&handle.path[..copy_len]);
+    st.cwd_len = copy_len as u16;
+    0
+}
+
+fn clone_fd_entry(st: &mut state::LinuxAgentState, entry: FdEntry) -> Result<FdEntry, i64> {
+    if entry.kind != FdKind::Directory {
+        return Ok(entry);
+    }
+
+    let Some(handle_id) = st.clone_directory_handle(entry.keyspace_key as u16) else {
+        return Err(-EMFILE);
+    };
+
+    Ok(FdEntry {
+        keyspace_key: handle_id as u64,
+        ..entry
+    })
 }
 
 // ── sys_getcwd ─────────────────────────────────────────────────────────────
@@ -833,21 +1322,25 @@ pub fn sys_ftruncate(agent_id: u16, fd: i32, length: u64) -> i64 {
     };
 
     if entry.kind != FdKind::File {
+        if entry.kind == FdKind::Directory {
+            return -EISDIR;
+        }
         return -EINVAL;
     }
 
     let key = entry.keyspace_key;
+    let ks = entry.keyspace_id;
 
     if length == 0 {
-        match crate::state::state_put(agent_id, key, &[]) {
+        match crate::state::state_put(ks, key, &[]) {
             Ok(()) => 0,
             Err(_) => -ENOSPC,
         }
     } else {
-        match crate::state::state_get(agent_id, key) {
+        match crate::state::state_get(ks, key) {
             Some((value, value_len)) => {
                 let new_len = (length as usize).min(value_len);
-                match crate::state::state_put(agent_id, key, &value[..new_len]) {
+                match crate::state::state_put(ks, key, &value[..new_len]) {
                     Ok(()) => 0,
                     Err(_) => -ENOSPC,
                 }
@@ -856,7 +1349,7 @@ pub fn sys_ftruncate(agent_id: u16, fd: i32, length: u64) -> i64 {
                 // File doesn't exist; create zero-filled content.
                 let zeros = [0u8; MAX_VALUE_SIZE];
                 let new_len = (length as usize).min(MAX_VALUE_SIZE);
-                match crate::state::state_put(agent_id, key, &zeros[..new_len]) {
+                match crate::state::state_put(ks, key, &zeros[..new_len]) {
                     Ok(()) => 0,
                     Err(_) => -ENOSPC,
                 }
@@ -952,7 +1445,7 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
             Some(entry) if entry.active => {
                 let mut r: i16 = 0;
                 match entry.kind {
-                    FdKind::File => {
+                    FdKind::File | FdKind::Directory => {
                         // Files are always ready for read and write
                         if events & POLLIN != 0 {
                             r |= POLLIN;
@@ -962,9 +1455,15 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
                         }
                     }
                     FdKind::Socket | FdKind::Pipe => {
-                        // Writable always; readable requires mailbox check
                         if events & POLLOUT != 0 {
                             r |= POLLOUT;
+                        }
+                        if events & POLLIN != 0 {
+                            if let Some(mb) = crate::mailbox::get_mailbox(entry.mailbox_id) {
+                                if !mb.is_empty() {
+                                    r |= POLLIN;
+                                }
+                            }
                         }
                     }
                     FdKind::EventFd => {
@@ -1009,6 +1508,9 @@ pub fn sys_pwrite64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u6
     };
 
     if entry.kind != FdKind::File {
+        if entry.kind == FdKind::Directory {
+            return -EISDIR;
+        }
         return -EINVAL;
     }
 
@@ -1020,7 +1522,7 @@ pub fn sys_pwrite64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u6
     unsafe {
         read_user_mem(buf_ptr, &mut value, to_write);
     }
-    match crate::state::state_put(agent_id, entry.keyspace_key, &value[..to_write]) {
+    match crate::state::state_put(entry.keyspace_id, entry.keyspace_key, &value[..to_write]) {
         Ok(()) => to_write as i64,
         Err(_) => -ENOSPC,
     }
@@ -1198,8 +1700,13 @@ pub fn sys_select(
             }
 
             let (can_read, can_write) = match entry.kind {
-                FdKind::File => (true, true),
-                FdKind::Socket | FdKind::Pipe => (false, true),
+                FdKind::File | FdKind::Directory => (true, true),
+                FdKind::Socket | FdKind::Pipe => {
+                    let readable = crate::mailbox::get_mailbox(entry.mailbox_id)
+                        .map(|mb| !mb.is_empty())
+                        .unwrap_or(false);
+                    (readable, true)
+                }
                 FdKind::EventFd => (entry.keyspace_key > 0, true),
                 FdKind::Epoll => (false, false),
             };
@@ -1236,7 +1743,11 @@ pub fn sys_dup2(agent_id: u16, oldfd: i32, newfd: i32) -> i64 {
         _ => return -EBADF,
     };
     st.close_fd(newfd);
-    st.fd_table[newfd as usize] = Some(entry);
+    let cloned = match clone_fd_entry(st, entry) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    st.fd_table[newfd as usize] = Some(cloned);
     newfd as i64
 }
 
@@ -1258,6 +1769,10 @@ pub fn sys_chdir(agent_id: u16, path_ptr: u64) -> i64 {
     let path_len = unsafe { read_pathname(path_ptr, &mut path_buf) };
     if path_len == 0 {
         return -ENOENT;
+    }
+
+    if !is_directory_path(&path_buf[..path_len]) {
+        return -ENOTDIR;
     }
 
     let st = match state::get_state_mut(agent_id) {

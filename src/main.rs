@@ -13,6 +13,7 @@ mod agent_loader;
 mod agents;
 pub mod arch;
 mod attestation;
+mod base_image;
 mod block;
 mod capability;
 mod checkpoint;

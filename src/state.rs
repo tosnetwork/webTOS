@@ -12,7 +12,7 @@ use crate::agent::{
 use crate::merkle::{self, MerkleHash};
 
 const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
-const MAX_VALUE_SIZE: usize = 256;
+pub const MAX_VALUE_SIZE: usize = 256;
 
 // ─── State entry ────────────────────────────────────────────────────────────
 
@@ -239,6 +239,14 @@ pub fn put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64> {
 ///
 /// Returns `Some((value_copy, len))` if found.
 pub fn state_get(keyspace: KeyspaceId, key: u64) -> Option<([u8; MAX_VALUE_SIZE], usize)> {
+    // Route base-image keyspace to embedded files first, then the
+    // dedicated mutable hash table for runtime-installed additions.
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        if let Some(value) = crate::base_image::state_get(key) {
+            return Some(value);
+        }
+        return base_image_state_get(key);
+    }
     match get(keyspace, key) {
         Some(data) => {
             let mut buf = [0u8; MAX_VALUE_SIZE];
@@ -254,6 +262,10 @@ pub fn state_get(keyspace: KeyspaceId, key: u64) -> Option<([u8; MAX_VALUE_SIZE]
 /// Each direct put advances the keyspace version so that the state root
 /// history reflects every mutation.
 pub fn state_put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64> {
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        let _ = base_image_put(key, value);
+        return Ok(());
+    }
     put(keyspace, key, value)?;
     advance_version(keyspace);
     Ok(())
@@ -723,7 +735,11 @@ pub fn load_large_value(keyspace: KeyspaceId, buf: &mut [u8]) -> usize {
 // use a separate dedicated storage table for the base image (see below).
 
 /// Maximum size of a single segment (64 KB, matching `store_large_value` limit).
-const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; // 65536
+pub const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; // 65536
+
+/// Key stride between consecutive segments.  Each segment occupies 1 metadata
+/// key + up to MAX_LARGE_VALUE_CHUNKS chunk keys = 257 keys total.
+const SEGMENT_KEY_STRIDE: u64 = (MAX_LARGE_VALUE_CHUNKS as u64) + 2; // 258
 
 // ─── Base image dedicated storage ──────────────────────────────────────────
 //
@@ -737,6 +753,8 @@ const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; // 65
 /// For 22 MB files stored in 256-byte chunks we need ~90K entries.
 /// We use a power-of-two size for efficient hash-table indexing.
 const BASE_IMAGE_MAX_ENTRIES: usize = 131072; // 128K slots — holds up to ~32 MB
+const MAX_BASE_IMAGE_PATHS: usize = 512;
+const MAX_BASE_IMAGE_PATH_LEN: usize = 256;
 
 struct BaseImageEntry {
     key: u64,
@@ -759,6 +777,105 @@ impl BaseImageEntry {
 // Safety: single-core, no preemption.
 static mut BASE_IMAGE_STORE: [BaseImageEntry; BASE_IMAGE_MAX_ENTRIES] =
     [const { BaseImageEntry::empty() }; BASE_IMAGE_MAX_ENTRIES];
+
+#[derive(Clone, Copy)]
+struct BaseImagePathEntry {
+    active: bool,
+    namespace: u8,
+    rel_len: u16,
+    rel_path: [u8; MAX_BASE_IMAGE_PATH_LEN],
+}
+
+impl BaseImagePathEntry {
+    const fn empty() -> Self {
+        BaseImagePathEntry {
+            active: false,
+            namespace: 0,
+            rel_len: 0,
+            rel_path: [0u8; MAX_BASE_IMAGE_PATH_LEN],
+        }
+    }
+}
+
+static mut BASE_IMAGE_PATHS: [BaseImagePathEntry; MAX_BASE_IMAGE_PATHS] =
+    [const { BaseImagePathEntry::empty() }; MAX_BASE_IMAGE_PATHS];
+
+fn record_base_image_path(path: &[u8]) {
+    let Some((namespace, relative)) = crate::linux_compat::vfs::classify_base_image_path(path) else {
+        return;
+    };
+    let rel_len = relative.len().min(MAX_BASE_IMAGE_PATH_LEN);
+
+    unsafe {
+        for entry in BASE_IMAGE_PATHS.iter() {
+            if entry.active
+                && entry.namespace == namespace as u8
+                && entry.rel_len as usize == rel_len
+                && entry.rel_path[..rel_len] == relative[..rel_len]
+            {
+                return;
+            }
+        }
+
+        for entry in BASE_IMAGE_PATHS.iter_mut() {
+            if !entry.active {
+                entry.active = true;
+                entry.namespace = namespace as u8;
+                entry.rel_len = rel_len as u16;
+                entry.rel_path[..rel_len].copy_from_slice(&relative[..rel_len]);
+                return;
+            }
+        }
+    }
+}
+
+pub fn iter_base_image_paths<F>(mut f: F) -> usize
+where
+    F: FnMut(crate::linux_compat::vfs::BaseImageNamespace, &[u8]) -> bool,
+{
+    let mut count = 0usize;
+    let mut stopped = false;
+    count += crate::base_image::iter_paths(|namespace, relative| {
+        let keep_going = f(namespace, relative);
+        if !keep_going {
+            stopped = true;
+        }
+        keep_going
+    });
+    if stopped {
+        return count;
+    }
+
+    unsafe {
+        for entry in BASE_IMAGE_PATHS.iter() {
+            if !entry.active {
+                continue;
+            }
+
+            let namespace = match entry.namespace {
+                x if x == crate::linux_compat::vfs::BaseImageNamespace::Lib as u8 => {
+                    crate::linux_compat::vfs::BaseImageNamespace::Lib
+                }
+                x if x == crate::linux_compat::vfs::BaseImageNamespace::Jdk as u8 => {
+                    crate::linux_compat::vfs::BaseImageNamespace::Jdk
+                }
+                x if x == crate::linux_compat::vfs::BaseImageNamespace::Etc as u8 => {
+                    crate::linux_compat::vfs::BaseImageNamespace::Etc
+                }
+                x if x == crate::linux_compat::vfs::BaseImageNamespace::UsrBin as u8 => {
+                    crate::linux_compat::vfs::BaseImageNamespace::UsrBin
+                }
+                _ => continue,
+            };
+
+            count += 1;
+            if !f(namespace, &entry.rel_path[..entry.rel_len as usize]) {
+                break;
+            }
+        }
+        count
+    }
+}
 
 /// Hash a u64 key to a slot index (Fibonacci hashing).
 #[inline]
@@ -936,9 +1053,9 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
         let end = (start + MULTI_SEGMENT_SIZE).min(data.len());
         let segment_data = &data[start..end];
 
-        // The segment key is offset from base_key.  Each segment's internal
-        // chunk keys are derived from the segment key.
-        let segment_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+        // Each segment occupies SEGMENT_KEY_STRIDE keys (metadata + chunks).
+        // Spacing them apart prevents key collisions between segments.
+        let segment_key = base_key.wrapping_add(1).wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
 
         // We store the segment as a "large value" rooted at segment_key.
         // For the base image this uses the dedicated store; for normal
@@ -976,7 +1093,77 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
 ///
 /// Reads the metadata at `base_key`, then reassembles all segments into
 /// `buf`.  Returns the total number of bytes read, or 0 on failure.
+/// Query the size of a file stored via `store_multi_segment`.
+///
+/// Returns the total size in bytes, or 0 if the key doesn't exist or
+/// is not a multi-segment value.
+pub fn query_multi_segment_size(keyspace: KeyspaceId, base_key: u64) -> usize {
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        if let Some(size) = crate::base_image::file_size(base_key) {
+            if size > MAX_VALUE_SIZE {
+                return size;
+            }
+        }
+    }
+
+    let (meta_buf, meta_len) = if keyspace == BASE_IMAGE_KEYSPACE {
+        match base_image_state_get(base_key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    } else {
+        match state_get(keyspace, base_key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    };
+
+    if meta_len < 6 {
+        // Not a multi-segment value — could be a plain value
+        return 0;
+    }
+
+    u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize
+}
+
+/// Query the total size of a file in a keyspace.
+///
+/// Tries multi-segment first (metadata = 6 bytes with size+count),
+/// then falls back to plain value size. Returns 0 if key not found.
+pub fn query_file_size(keyspace: KeyspaceId, key: u64) -> usize {
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        if let Some(size) = crate::base_image::file_size(key) {
+            return size;
+        }
+    }
+
+    let ms = query_multi_segment_size(keyspace, key);
+    if ms > 0 {
+        return ms;
+    }
+    // Fall back to plain value
+    let (_, len) = if keyspace == BASE_IMAGE_KEYSPACE {
+        match base_image_state_get(key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    } else {
+        match state_get(keyspace, key) {
+            Some(v) => v,
+            None => return 0,
+        }
+    };
+    len
+}
+
 pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -> usize {
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        let loaded = crate::base_image::load_file(base_key, buf);
+        if loaded > 0 {
+            return loaded;
+        }
+    }
+
     // Read top-level metadata
     let (meta_buf, meta_len) = if keyspace == BASE_IMAGE_KEYSPACE {
         match base_image_state_get(base_key) {
@@ -1004,7 +1191,7 @@ pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -
 
     let mut offset = 0;
     for i in 0..segment_count {
-        let segment_key = base_key.wrapping_add(1).wrapping_add(i as u64);
+        let segment_key = base_key.wrapping_add(1).wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
         let segment_size = MULTI_SEGMENT_SIZE.min(total_size - offset);
 
         let loaded = if keyspace == BASE_IMAGE_KEYSPACE {
@@ -1062,7 +1249,16 @@ pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -
 /// The file is stored using multi-segment storage at the key derived from
 /// the given path (via `vfs::sha256_key`).  This is the entry point for
 /// pre-installing `.so` files, JDK binaries, and other base image assets.
+/// Install a file into the base image keyspace.
+///
+/// The `path` must be a Linux absolute path (e.g. `/lib/ld-musl-x86_64.so.1`).
+/// The key is derived via the same VFS resolution as `openat`/`stat` so that
+/// subsequent file I/O finds the correct data.
 pub fn install_base_image_file(path: &[u8], data: &[u8]) -> Result<(), i64> {
-    let key = crate::linux_compat::vfs::sha256_key(path);
-    store_multi_segment(BASE_IMAGE_KEYSPACE, key, data)
+    let (ks, key) = crate::linux_compat::vfs::resolve_path(0, path);
+    // Sanity: this should always resolve to BASE_IMAGE_KEYSPACE for /lib/ etc.
+    debug_assert_eq!(ks, BASE_IMAGE_KEYSPACE);
+    store_multi_segment(BASE_IMAGE_KEYSPACE, key, data)?;
+    record_base_image_path(path);
+    Ok(())
 }

@@ -4,6 +4,8 @@
 //! clone3 is the critical syscall: it creates a child agent that shares the
 //! parent's keyspace and gets a deterministic, sequential agent_id.
 
+extern crate alloc;
+
 use crate::agent::{self, AgentId, AgentStatus, USER_STACK_SIZE};
 use crate::linux_compat::constants::*;
 use crate::linux_compat::state::{self, MAX_FDS, MAX_LINUX_AGENTS};
@@ -284,19 +286,156 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
     child_id as i64
 }
 
-/// execve(2) -- Replace current agent image.
+/// execve(2) -- Replace current agent with a new program image.
 ///
-/// Not commonly needed after initial load. Returns -ENOSYS for now.
-pub fn sys_execve(_agent_id: u16, _pathname_ptr: u64, _argv_ptr: u64, _envp_ptr: u64) -> i64 {
-    // Most programs don't execve after initial load in ATOS.
-    // A full implementation would call crate::agent_loader::spawn_from_image().
-    let _execve_limits = (
-        EXECVE_ARG_MAX,
-        EXECVE_ARG_LEN_MAX,
-        EXECVE_ENV_MAX,
-        EXECVE_ENV_LEN_MAX,
-    );
-    -ENOSYS
+/// In ATOS, this spawns a new Linux agent from the target ELF binary
+/// (resolved via VFS) with the provided argv, then exits the calling agent.
+/// The new agent inherits the caller's parent.
+pub fn sys_execve(agent_id: u16, pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> i64 {
+    // 1. Read pathname
+    let mut path_buf = [0u8; state::MAX_PATH];
+    let path_len = unsafe { read_user_cstr(pathname_ptr, &mut path_buf) };
+    if path_len == 0 {
+        return -ENOENT;
+    }
+    let path = &path_buf[..path_len];
+
+    // 2. Resolve path → keyspace and load the binary
+    let (ks, key) = crate::linux_compat::vfs::resolve_path(agent_id, path);
+
+    // Try to load the file (up to 4 MB)
+    let mut image_buf = alloc::vec![0u8; 4 * 1024 * 1024];
+    let image_len = crate::state::load_multi_segment(ks, key, &mut image_buf);
+    if image_len == 0 {
+        // Try plain state_get for small files
+        match crate::state::state_get(ks, key) {
+            Some((val, len)) => {
+                image_buf[..len].copy_from_slice(&val[..len]);
+                if len == 0 {
+                    return -ENOENT;
+                }
+                // Use len as image_len below
+                let image_len = len;
+                return do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr);
+            }
+            None => return -ENOENT,
+        }
+    }
+
+    do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr)
+}
+
+fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: u64) -> i64 {
+    // 3. Read argv from user memory
+    let mut argv_bufs: [[u8; 256]; 32] = [[0u8; 256]; 32];
+    let mut argv_lens: [usize; 32] = [0; 32];
+    let mut argc: usize = 0;
+
+    if argv_ptr != 0 {
+        for i in 0..32 {
+            let ptr = unsafe {
+                core::ptr::read((argv_ptr + (i as u64) * 8) as *const u64)
+            };
+            if ptr == 0 {
+                break;
+            }
+            let len = unsafe { read_user_cstr(ptr, &mut argv_bufs[i]) };
+            argv_lens[i] = len;
+            argc += 1;
+        }
+    }
+
+    // Build argv slice references
+    let mut argv_refs: [&[u8]; 32] = [b"" as &[u8]; 32];
+    for i in 0..argc {
+        argv_refs[i] = &argv_bufs[i][..argv_lens[i]];
+    }
+
+    // 4. Read envp from user memory
+    let mut envp_bufs: [[u8; 256]; 32] = [[0u8; 256]; 32];
+    let mut envp_lens: [usize; 32] = [0; 32];
+    let mut envc: usize = 0;
+
+    if envp_ptr != 0 {
+        for i in 0..32 {
+            let ptr = unsafe { core::ptr::read((envp_ptr + (i as u64) * 8) as *const u64) };
+            if ptr == 0 {
+                break;
+            }
+            let len = unsafe { read_user_cstr(ptr, &mut envp_bufs[i]) };
+            envp_lens[i] = len;
+            envc += 1;
+        }
+    }
+
+    let mut envp_refs: [&[u8]; 32] = [b"" as &[u8]; 32];
+    for i in 0..envc {
+        envp_refs[i] = &envp_bufs[i][..envp_lens[i]];
+    }
+
+    // 5. Determine parent: use the current agent's parent
+    let parent_id = agent::get_agent(agent_id)
+        .and_then(|a| a.parent_id)
+        .unwrap_or(1); // fallback to root
+
+    let energy = agent::get_agent(agent_id)
+        .map(|a| a.energy_budget)
+        .unwrap_or(100_000);
+
+    let mem_quota = agent::get_agent(agent_id)
+        .map(|a| a.memory_quota)
+        .unwrap_or(256);
+
+    // 6. Spawn new Linux agent with the loaded image
+    match crate::agent_loader::spawn_linux_agent_with_env(
+        parent_id,
+        image,
+        energy,
+        mem_quota,
+        path,
+        &argv_refs[..argc],
+        &envp_refs[..envc],
+    ) {
+        Ok(new_id) => {
+            serial_println!(
+                "[execve] agent {} replaced by {} ({:?})",
+                agent_id, new_id,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+            // 7. Exit the calling agent — same sequence as sys_exit()
+            if let Some(ls) = state::get_state_mut(agent_id) {
+                ls.active = false;
+            }
+            sched::remove_from_run_queue(agent_id);
+            agent::terminate_agent(agent_id, AgentStatus::Exited);
+            // Must yield so we never sysret back to the dead agent's RIP/RSP
+            sched::yield_current();
+            0 // unreachable
+        }
+        Err(e) => {
+            serial_println!("[execve] failed to spawn: error {}", e);
+            e
+        }
+    }
+}
+
+/// Read a null-terminated string from user memory into buf.
+/// Returns the number of bytes read (excluding NUL).
+unsafe fn read_user_cstr(ptr: u64, buf: &mut [u8]) -> usize {
+    if ptr == 0 {
+        return 0;
+    }
+    let max = buf.len();
+    let mut len = 0;
+    while len < max {
+        let b = core::ptr::read((ptr + len as u64) as *const u8);
+        if b == 0 {
+            break;
+        }
+        buf[len] = b;
+        len += 1;
+    }
+    len
 }
 
 /// exit(2) -- Terminate the calling agent.

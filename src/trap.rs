@@ -78,11 +78,9 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                     );
                 } else {
                     serial_println!(
-                        "[TRAP] Page fault: agent={} cr2={:#x} error_code={:#x} rip={:#x}",
-                        agent_id,
-                        cr2,
-                        frame.error_code,
-                        frame.rip
+                        "[TRAP] Page fault: agent={} cr2={:#x} error_code={:#x} rip={:#x} rsp={:#x} rdi={:#x} rsi={:#x} r10={:#x}",
+                        agent_id, cr2, frame.error_code, frame.rip,
+                        frame.rsp, frame.rdi, frame.rsi, frame.r10
                     );
                 }
             } else {
