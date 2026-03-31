@@ -138,7 +138,8 @@ Its first-class concepts are:
 | 6 | Contract Package Management | Deployment, addressing, inter-contract calls, upgrade/rollback, signing |
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM attestation |
 | 8 | WASM Runtime | Production WASM engine with fuel metering and selector dispatch |
-| 9 | Deterministic Linux Compatibility | Any Linux x86_64 binary runs deterministically on ATOS |
+| 9 | Deterministic Linux Compatibility | 104 Linux syscalls with deterministic translation (67/67 tests pass) |
+| 10 | Production Runtime Depth | Dynamic linking, multi-threading, signals, file mmap for OpenJDK/Node.js |
 
 ### Stage-by-Stage Roadmap
 
@@ -426,7 +427,7 @@ Any language that compiles to WASM runs on ATOS: Rust, C, C++, Go, Zig, Assembly
 **Success Condition**
 Any WASM module runs on ATOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
 
-#### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ✅ Complete]`
+#### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ✅ Complete — 104 syscalls, 67/67 tests pass in QEMU]`
 
 **Purpose**
 Run any unmodified Linux x86_64 program on ATOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, ATOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
@@ -822,6 +823,74 @@ This requires extending `store_large_value()` to support multi-segment files (cu
 - Two runs with the same input produce bit-identical execution traces and state roots. `[IMPL: ✅ all non-determinism sources replaced; network I/O recorded for replay; awaits end-to-end verification]`
 - Linux-compat agents produce valid ExecutionReceipts with determinism guarantees. `[IMPL: ✅ LinuxCompat agents routed through linux_compat::dispatch(); eBPF exit hooks + receipts work on LinuxCompat path]`
 
+#### Stage-10 — Production Runtime Depth `[IMPL: ⏳ Planned]`
+
+**Purpose**
+Close the remaining gaps between the 104-syscall translation layer and actually running production Linux programs (OpenJDK, Node.js, CPython) on ATOS. Stage-9 proves the syscall ABI works (67/67 tests pass); Stage-10 makes the runtime deep enough for real-world binaries.
+
+**Core Capabilities**
+
+1. **Dynamic Linking** `[IMPL: ⏳]`
+   - Implement `execve` to truly load ELF binaries and start `ld-linux-x86-64.so.2`
+   - `ld-linux` uses `openat` → `mmap(fd, PROT_READ|PROT_EXEC)` → symbol resolution
+   - All addresses deterministic: `mmap_next` provides sequential fixed addresses
+   - `.so` files served from base image keyspace via VFS path resolver
+   - No new syscalls needed — uses existing `openat`, `mmap`, `mprotect`, `close`
+
+2. **File-Backed mmap** `[IMPL: ⏳]`
+   - Extend `sys_mmap` to support `fd >= 0` with `MAP_PRIVATE` + `PROT_EXEC`
+   - Load file content from keyspace into mapped pages at deterministic addresses
+   - Pre-load all pages on map (no lazy page fault — deterministic)
+   - Required by dynamic linker to map `.so` code segments
+
+3. **Deterministic Multi-Threading** `[IMPL: ⏳]`
+   - Extend `clone3` to support `CLONE_VM` (shared address space between parent and child)
+   - Currently each child agent gets its own keyspace; shared memory requires shared page tables
+   - Futex: extend from simple wait/wake to full `FUTEX_WAIT_BITSET`, `FUTEX_REQUEUE`
+   - All thread scheduling remains deterministic: fixed-order round-robin by agent_id
+   - All futex wake ordering remains deterministic: lowest agent_id first
+
+4. **Signal Delivery** `[IMPL: ⏳]`
+   - Implement synchronous signal delivery at deterministic points (syscall return boundaries)
+   - `SIGSEGV`: JVM uses this for NullPointerException detection (deliberate NULL access → catch → throw NPE)
+   - `SIGCHLD`: delivered when child agent exits (wake parent blocked in `wait4`)
+   - Signal delivery modifies user stack (push signal frame) and redirects RIP to handler
+   - `rt_sigreturn` restores pre-signal state from the signal frame
+   - Deterministic: signals delivered only at syscall return, in order of signal number
+
+5. **Base Image Multi-Segment Storage** `[IMPL: ⏳]`
+   - Extend `store_large_value` / `load_large_value` beyond 64KB limit
+   - `libjvm.so` is 22MB = 344 × 64KB segments
+   - Multi-segment index: metadata key stores total_size + segment_count
+   - Segment keys: `base_key + 1` through `base_key + N`
+   - `install_base_image_file(path, data)` handles the full flow
+
+**Non-Goals (not needed for deterministic VM)**
+- Full VFS with inodes/dentries — keyspace + VFS path resolver is sufficient
+- Lazy page fault / demand paging — pre-load is simpler and deterministic
+- `MAP_SHARED` between processes — not needed; each agent has its own keyspace
+- POSIX signals fully — only SIGSEGV, SIGCHLD, and SIGUSR1/2 needed
+
+**Determinism Guarantees**
+
+All Stage-10 features maintain determinism:
+
+| Feature | Non-Determinism Source | Deterministic Implementation |
+|---------|----------------------|------------------------------|
+| Dynamic linking | Library load addresses (ASLR) | `mmap_next` sequential allocation |
+| Threads | OS scheduler decides order | Round-robin by agent_id, fixed tick quota |
+| Futex | Wake order non-deterministic | Lowest agent_id wakes first |
+| Signals | Delivery timing asynchronous | Deliver at syscall return only, ordered by signal number |
+| File mmap | Page fault timing | Pre-load all pages on mmap (no lazy faulting) |
+
+**Success Condition**
+- A statically-linked OpenJDK JVM runs `Hello.class` on ATOS with deterministic output.
+- A dynamically-linked OpenJDK JVM loads `libjvm.so` via `ld-linux` from base image keyspace and runs `Hello.class`.
+- JVM thread creation (`clone3` + shared memory) works with deterministic scheduling.
+- JVM NullPointerException detection via `SIGSEGV` handler works.
+- Node.js runs a simple HTTP handler with deterministic event loop.
+- Two runs with identical input produce bit-identical execution traces.
+
 ### The Three Eras of ATOS
 
 #### Era I — Execution Foundation (Stage-1 to Stage-4)
@@ -836,15 +905,16 @@ ATOS becomes a production-grade verifiable execution platform.
 
 Focus: durable state, contract lifecycle, verifiable execution, WASM runtime.
 
-#### Era III — Universal Deterministic Execution (Stage-9)
+#### Era III — Universal Deterministic Execution (Stage-9 to Stage-10)
 
 Any Linux program runs on ATOS with deterministic guarantees.
 
-Focus: Linux syscall translation, deterministic threading, I/O tracing, replay.
+Stage-9: syscall translation layer (104 syscalls, 67/67 tests pass).
+Stage-10: runtime depth for real-world binaries (dynamic linking, threads, signals).
 
 ### One-Sentence Definition
 
-**ATOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program can run on ATOS with deterministic guarantees through the Linux syscall compatibility layer.**
+**ATOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program, including dynamically-linked runtimes like OpenJDK and Node.js, can run on ATOS with deterministic guarantees through the 104-syscall Linux compatibility layer.**
 
 ---
 
@@ -1360,6 +1430,7 @@ ATOS handles execution. The blockchain handles consensus, ordering, and finality
 | 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ✅ Complete |
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
 | 8 | WASM Runtime | Production WASM engine with fuel metering | ✅ Complete |
-| 9 | Deterministic Linux Compat | Any Linux x86_64 binary runs deterministically | ✅ Complete (awaits end-to-end testing) |
+| 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
+| 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ⏳ Planned |
 
-**ATOS is complete when any Linux program runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
+**ATOS is complete when any Linux program — including dynamically-linked OpenJDK and Node.js — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
