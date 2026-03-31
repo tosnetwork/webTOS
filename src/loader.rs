@@ -69,6 +69,12 @@ pub struct ElfInfo {
     pub interp_len: usize,
     /// Load bias for ET_DYN binaries (0 for ET_EXEC)
     pub load_bias: u64,
+    /// File offset of the program header table.
+    pub phdr_offset: u64,
+    /// Size of each program header entry.
+    pub phdr_entry_size: u16,
+    /// Number of program header entries.
+    pub phdr_count: u16,
 }
 
 /// ELF64 file header (64 bytes)
@@ -150,6 +156,9 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         interp_offset: 0,
         interp_len: 0,
         load_bias: 0,
+        phdr_offset: e_phoff,
+        phdr_entry_size: e_phentsize,
+        phdr_count: e_phnum,
     };
 
     // Parse program headers
@@ -166,6 +175,11 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         if p_type == PT_INTERP {
             let p_offset = unsafe { core::ptr::addr_of!(phdr.p_offset).read_unaligned() };
             let p_filesz = unsafe { core::ptr::addr_of!(phdr.p_filesz).read_unaligned() };
+            let interp_end = (p_offset as usize).checked_add(p_filesz as usize);
+            match interp_end {
+                Some(end) if end <= data.len() => {}
+                _ => return Err(ElfError::SegmentOutOfBounds),
+            }
             info.is_dynamic = true;
             info.interp_offset = p_offset as usize;
             info.interp_len = p_filesz as usize;

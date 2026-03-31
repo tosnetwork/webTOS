@@ -133,7 +133,11 @@ pub fn compute_transcript_hash(agent_id: u16, tick_start: u64, tick_end: u64) ->
 /// Syscall-specific return value. Negative values indicate errors (as i64 bit pattern).
 ///
 /// In Stage-1, this is a direct function call. No privilege transition occurs.
-pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
+pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    syscall_with_a6(num, a1, a2, a3, a4, a5, 0)
+}
+
+fn syscall_with_a6(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
     let restore_if = interrupts_were_enabled();
     unsafe {
         core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
@@ -142,7 +146,7 @@ pub fn syscall(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
     // Spectre v2: restrict indirect branch speculation on kernel entry
     security::spectre_kernel_enter();
 
-    let result = syscall_inner(num, a1, a2, a3, _a4, _a5);
+    let result = syscall_inner(num, a1, a2, a3, a4, a5, a6);
 
     // Spectre v2: relax speculation restrictions before returning to user mode
     security::spectre_user_enter();
@@ -165,6 +169,7 @@ fn handle_linux_compat_syscall(
     a3: u64,
     a4: u64,
     a5: u64,
+    a6: u64,
 ) -> i64 {
     if num == crate::linux_compat::constants::SYS_EXIT
         || num == crate::linux_compat::constants::SYS_EXIT_GROUP
@@ -179,7 +184,7 @@ fn handle_linux_compat_syscall(
         set_linux_exit_debug_stage(0xE120);
         crate::linux_compat::process::sys_exit_group(caller_id, a1 as i32)
     } else {
-        crate::linux_compat::dispatch::dispatch(caller_id, num, a1, a2, a3, a4, a5)
+        crate::linux_compat::dispatch::dispatch(caller_id, num, a1, a2, a3, a4, a5, a6)
     };
 
     // Keep the LinuxCompat path out of syscall_inner(): qemu64 TCG remains
@@ -800,7 +805,7 @@ fn handle_memory_syscall(caller_id: u16, num: u64, a1: u64, a2: u64) -> Option<i
 }
 
 #[inline(never)]
-fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64 {
+fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64, _a6: u64) -> i64 {
     let caller_id = sched::current();
 
     crate::metrics::increment_syscall_count();
@@ -847,7 +852,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
     // If this agent has a LinuxAgentState initialized, route to the Linux
     // compat dispatcher instead of the ATOS native dispatcher.
     if crate::linux_compat::state::get_state(caller_id).is_some() {
-        return handle_linux_compat_syscall(caller_id, num, a1, a2, a3, _a4, _a5);
+        return handle_linux_compat_syscall(caller_id, num, a1, a2, a3, _a4, _a5, _a6);
     }
 
     if let Some(result) = handle_mailbox_syscall(caller_id, num, a1, a2, a3, _a4) {
@@ -1426,8 +1431,16 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> i64
 /// the SYSCALL instruction. This is just a thin wrapper around the existing
 /// syscall dispatcher.
 #[no_mangle]
-pub extern "C" fn syscall_handler(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    syscall(num, a1, a2, a3, a4, a5)
+pub extern "C" fn syscall_handler(
+    num: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> i64 {
+    syscall_with_a6(num, a1, a2, a3, a4, a5, a6)
 }
 
 /// Read CR3 safely. Returns 0 if inline assembly is not available.

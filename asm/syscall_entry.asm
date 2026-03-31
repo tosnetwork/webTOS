@@ -4,7 +4,7 @@
 ;   RCX = saved user RIP (return address)
 ;   R11 = saved user RFLAGS
 ;   RAX = syscall number
-;   RDI = arg0, RSI = arg1, RDX = arg2, R10 = arg3, R8 = arg4
+;   RDI = arg0, RSI = arg1, RDX = arg2, R10 = arg3, R8 = arg4, R9 = arg5
 ;
 ; SFMASK clears IF, so interrupts are disabled on entry.
 ;
@@ -50,7 +50,11 @@ syscall_entry:
     push r14
     push r15
 
-    ; Remap: syscall ABI -> System V ABI
+    ; Remap: syscall ABI -> System V ABI.
+    ; Rust handler signature is:
+    ;   syscall_handler(num, a1, a2, a3, a4, a5, a6)
+    ; so the 7th integer argument is passed on the stack.
+    mov r11, r9     ; preserve Linux arg5 for the stacked 7th parameter
     mov r9, r8      ; arg4 -> r9
     mov r8, r10     ; arg3 -> r8
     mov rcx, rdx    ; arg2 -> rcx
@@ -58,7 +62,10 @@ syscall_entry:
     mov rsi, rdi    ; arg0 -> rsi
     mov rdi, rax    ; num  -> rdi
 
+    sub rsp, 16
+    mov [rsp], r11
     call syscall_handler
+    add rsp, 16
     mov r10, rax    ; preserve syscall return value across stack restoration
 
     ; Restore callee-saved registers (reverse order)

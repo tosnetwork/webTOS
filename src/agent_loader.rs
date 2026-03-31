@@ -38,6 +38,94 @@ static mut WASM_MODULES: [Option<wasm::decoder::WasmModule>; MAX_WASM_MODULES] =
 static mut WASM_RUNTIME_CLASSES: [wasm::types::RuntimeClass; MAX_WASM_MODULES] =
     [wasm::types::RuntimeClass::ProofGrade; MAX_WASM_MODULES];
 
+fn translate_agent_vaddr(agent_cr3: u64, vaddr: u64) -> Option<u64> {
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    unsafe {
+        let pml4 = agent_cr3 as *const u64;
+        let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+        if pml4e & paging::PTE_PRESENT == 0 {
+            return None;
+        }
+
+        let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+        if pdpte & paging::PTE_PRESENT == 0 {
+            return None;
+        }
+
+        let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pde = core::ptr::read_volatile(pd.add(pd_idx));
+        if pde & paging::PTE_PRESENT == 0 {
+            return None;
+        }
+
+        if pde & paging::PTE_HUGE != 0 {
+            let base = pde & 0x000F_FFFF_FFE0_0000;
+            return Some(base + (vaddr & 0x1F_FFFF));
+        }
+
+        let pt = (pde & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pte = core::ptr::read_volatile(pt.add(pt_idx));
+        if pte & paging::PTE_PRESENT == 0 {
+            return None;
+        }
+
+        Some((pte & 0x000F_FFFF_FFFF_F000) + (vaddr & (paging::PAGE_SIZE as u64 - 1)))
+    }
+}
+
+fn write_agent_user_bytes(agent_cr3: u64, user_vaddr: u64, data: &[u8]) -> Result<(), i64> {
+    let mut written = 0usize;
+
+    while written < data.len() {
+        let vaddr = user_vaddr
+            .checked_add(written as u64)
+            .ok_or(E_INVALID_ARG)?;
+        let phys = translate_agent_vaddr(agent_cr3, vaddr).ok_or(E_BAD_IMAGE)?;
+        let page_off = (vaddr as usize) & (paging::PAGE_SIZE - 1);
+        let chunk_len = (data.len() - written).min(paging::PAGE_SIZE - page_off);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr().add(written),
+                phys as *mut u8,
+                chunk_len,
+            );
+        }
+
+        written += chunk_len;
+    }
+
+    Ok(())
+}
+
+fn write_agent_user_u64(agent_cr3: u64, user_vaddr: u64, value: u64) -> Result<(), i64> {
+    write_agent_user_bytes(agent_cr3, user_vaddr, &value.to_ne_bytes())
+}
+
+fn loaded_file_vaddr(elf_info: &crate::loader::ElfInfo, file_offset: u64, size: u64) -> Option<u64> {
+    let end = file_offset.checked_add(size)?;
+
+    for seg in elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|seg| seg.as_ref())
+    {
+        let seg_file_start = seg.file_offset;
+        let seg_file_end = seg.file_offset.checked_add(seg.file_size)?;
+        if file_offset >= seg_file_start && end <= seg_file_end {
+            return seg
+                .vaddr
+                .checked_add(file_offset.checked_sub(seg_file_start)?);
+        }
+    }
+
+    None
+}
+
 fn map_user_stack_region(agent_cr3: u64, user_stack_base: u64) -> Result<u64, i64> {
     debug_assert_eq!(USER_STACK_SIZE % paging::PAGE_SIZE, 0);
 
@@ -259,15 +347,11 @@ fn spawn_native_elf(
     //     binary, so address spaces don't collide.
     const INTERP_BASE_VADDR: u64 = 0x7F00_0000;
     let main_entry = elf_info.entry_point;
-    let main_phdr_vaddr = elf_info.segments[..elf_info.segment_count]
-        .iter()
-        .filter_map(|s| s.as_ref())
-        .map(|s| s.vaddr)
-        .min()
-        .unwrap_or(0);
-    let main_phnum = image.get(56..58).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
-    let main_phent = image.get(54..56).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(56);
+    let main_phdr_vaddr = (elf_info.phdr_entry_size as u64)
+        .checked_mul(elf_info.phdr_count as u64)
+        .and_then(|size| loaded_file_vaddr(&elf_info, elf_info.phdr_offset, size));
     let mut interp_base: u64 = 0;
+    let mut interp_highest_end: u64 = 0;
 
     let final_entry = if elf_info.is_dynamic && elf_info.interp_len > 0 {
         // Extract interpreter path
@@ -322,6 +406,8 @@ fn spawn_native_elf(
                             None => continue,
                         };
 
+                        interp_highest_end = interp_highest_end.max(seg.vaddr.saturating_add(seg.mem_size));
+
                         let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
                         for page_idx in 0..pages_needed {
                             let page_offset = (page_idx as u64)
@@ -360,8 +446,8 @@ fn spawn_native_elf(
                     }
 
                     serial_println!(
-                        "[AGENT_LOADER] Interpreter loaded at {:#x}, entry={:#x}",
-                        INTERP_BASE_VADDR,
+                        "[AGENT_LOADER] Interpreter loaded at base={:#x}, entry={:#x}",
+                        interp_base,
                         interp_elf.entry_point
                     );
 
@@ -392,11 +478,8 @@ fn spawn_native_elf(
         }
     }
     // Also account for interpreter segments
-    if interp_base > 0 {
-        let interp_end = INTERP_BASE_VADDR + 2 * 1024 * 1024; // conservative
-        if interp_end > highest_seg_end {
-            highest_seg_end = interp_end;
-        }
+    if interp_highest_end > highest_seg_end {
+        highest_seg_end = interp_highest_end;
     }
     // Align to page boundary and add a guard gap
     let user_stack_base =
@@ -418,42 +501,38 @@ fn spawn_native_elf(
     //       argv: NULL
     //       argc: 0
     //     Each auxv entry is { type: u64, value: u64 } = 16 bytes.
+    let auxv_base = user_stack_top - 256;
     if elf_info.is_dynamic && interp_base > 0 {
         // Write auxv below the stack top
-        let auxv_base = user_stack_top - 256; // 256 bytes for auxv + argc/argv/envp
-        let phdr_addr = main_phdr_vaddr + elf_info.load_bias; // program headers in memory
+        let phdr_addr = main_phdr_vaddr.ok_or(E_BAD_IMAGE)?;
 
         let auxv: [(u64, u64); 8] = [
-            (9,  final_entry),         // AT_ENTRY: main binary entry
+            (9,  main_entry),          // AT_ENTRY: main program entry
             (7,  interp_base),         // AT_BASE: interpreter base address
             (3,  phdr_addr),           // AT_PHDR: program header table address
-            (4,  main_phent as u64),   // AT_PHENT: size of phdr entry
-            (5,  main_phnum as u64),   // AT_PHNUM: number of phdr entries
+            (4,  elf_info.phdr_entry_size as u64), // AT_PHENT: size of phdr entry
+            (5,  elf_info.phdr_count as u64), // AT_PHNUM: number of phdr entries
             (6,  paging::PAGE_SIZE as u64), // AT_PAGESZ
             (25, auxv_base + 128),     // AT_RANDOM: pointer to 16 "random" bytes
             (0,  0),                   // AT_NULL: terminator
         ];
 
-        unsafe {
-            let p = auxv_base as *mut u64;
-            // argc = 0
-            core::ptr::write(p, 0);
-            // argv[0] = NULL
-            core::ptr::write(p.add(1), 0);
-            // envp[0] = NULL
-            core::ptr::write(p.add(2), 0);
-            // auxv starts at offset 24
-            let auxv_ptr = p.add(3);
-            for (i, (atype, aval)) in auxv.iter().enumerate() {
-                core::ptr::write(auxv_ptr.add(i * 2), *atype);
-                core::ptr::write(auxv_ptr.add(i * 2 + 1), *aval);
-            }
-            // Write 16 deterministic "random" bytes at AT_RANDOM pointer
-            let random_ptr = (auxv_base + 128) as *mut u8;
-            for i in 0..16u8 {
-                core::ptr::write(random_ptr.add(i as usize), i.wrapping_add(0x42));
-            }
+        write_agent_user_u64(agent_cr3, auxv_base, 0)?;
+        write_agent_user_u64(agent_cr3, auxv_base + 8, 0)?;
+        write_agent_user_u64(agent_cr3, auxv_base + 16, 0)?;
+
+        let auxv_ptr = auxv_base + 24;
+        for (i, (atype, aval)) in auxv.iter().enumerate() {
+            let entry_base = auxv_ptr + (i as u64) * 16;
+            write_agent_user_u64(agent_cr3, entry_base, *atype)?;
+            write_agent_user_u64(agent_cr3, entry_base + 8, *aval)?;
         }
+
+        let mut random = [0u8; 16];
+        for (i, byte) in random.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_add(0x42);
+        }
+        write_agent_user_bytes(agent_cr3, auxv_base + 128, &random)?;
     }
 
     // 5. Allocate kernel stack for syscall handling
@@ -470,7 +549,7 @@ fn spawn_native_elf(
     // 7. Configure user-mode context
     //    For dynamic binaries, RSP points to the auxv area so ld-linux can find it.
     let initial_rsp = if elf_info.is_dynamic && interp_base > 0 {
-        user_stack_top - 256 // RSP points to argc at auxv_base
+        auxv_base // RSP points to argc at auxv_base
     } else {
         user_stack_top
     };
