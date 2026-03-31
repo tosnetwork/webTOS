@@ -7,7 +7,10 @@
 ;   RDI = arg0, RSI = arg1, RDX = arg2, R10 = arg3, R8 = arg4
 ;
 ; SFMASK clears IF, so interrupts are disabled on entry.
-; We must switch to the kernel stack before re-enabling them.
+;
+; Stage-1 code assumes syscalls are non-preemptive on a single core, so we
+; keep interrupts disabled for the entire syscall and restore the kernel stack
+; top before returning to user mode.
 
 bits 64
 section .text
@@ -20,15 +23,20 @@ section .data
 global CURRENT_KERNEL_RSP
 CURRENT_KERNEL_RSP: dq 0
 
-global SAVED_USER_RSP
-SAVED_USER_RSP: dq 0
-
 section .text
 
 syscall_entry:
-    ; Switch to kernel stack (interrupts disabled by SFMASK)
-    mov [rel SAVED_USER_RSP], rsp
-    mov rsp, [rel CURRENT_KERNEL_RSP]
+    ; Swap to the per-agent kernel stack.
+    ;   RSP = kernel stack top
+    ;   CURRENT_KERNEL_RSP = user RSP
+    xchg rsp, [rel CURRENT_KERNEL_RSP]
+
+    ; Save the kernel stack top and user RSP on the kernel stack.
+    ; Keeping the top on-stack lets us restore CURRENT_KERNEL_RSP before
+    ; SYSRET, so repeated syscalls reuse the same stack top instead of
+    ; walking down the stack forever.
+    push rsp
+    push qword [rel CURRENT_KERNEL_RSP]
 
     ; Save user return context
     push rcx        ; user RIP
@@ -43,8 +51,6 @@ syscall_entry:
     push r15
 
     ; Remap: syscall ABI -> System V ABI
-    ; Syscall: RAX=num, RDI=arg0, RSI=arg1, RDX=arg2, R10=arg3, R8=arg4
-    ; SysV:    RDI=num, RSI=arg0, RDX=arg1, RCX=arg2, R8=arg3, R9=arg4
     mov r9, r8      ; arg4 -> r9
     mov r8, r10     ; arg3 -> r8
     mov rcx, rdx    ; arg2 -> rcx
@@ -52,13 +58,8 @@ syscall_entry:
     mov rsi, rdi    ; arg0 -> rsi
     mov rdi, rax    ; num  -> rdi
 
-    ; Re-enable interrupts
-    sti
-
     call syscall_handler
-
-    ; Disable interrupts for return
-    cli
+    mov r10, rax    ; preserve syscall return value across stack restoration
 
     ; Restore callee-saved registers (reverse order)
     pop r15
@@ -72,8 +73,12 @@ syscall_entry:
     pop r11         ; user RFLAGS
     pop rcx         ; user RIP
 
-    ; Switch to user stack
-    mov rsp, [rel SAVED_USER_RSP]
+    ; Restore user RSP and reset CURRENT_KERNEL_RSP back to the kernel
+    ; stack top saved on entry.
+    pop rax         ; user RSP
+    pop qword [rel CURRENT_KERNEL_RSP]
+    mov rsp, rax
+    mov rax, r10
 
     ; Return to ring 3
     o64 sysret

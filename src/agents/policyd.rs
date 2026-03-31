@@ -32,6 +32,68 @@ static mut CHUNK_ATTACH_TARGET: u16 = 0;
 static mut CHUNK_PRIORITY: u8 = 128;
 static mut CHUNK_EXPECTED: usize = 0;
 
+#[inline(never)]
+fn is_attach_op(op: u8) -> bool {
+    op == OP_ATTACH
+}
+
+#[inline(never)]
+fn is_detach_op(op: u8) -> bool {
+    op == OP_DETACH
+}
+
+#[inline(never)]
+fn is_list_op(op: u8) -> bool {
+    op == OP_LIST
+}
+
+#[inline(never)]
+fn is_attach_chunk_op(op: u8) -> bool {
+    op == OP_ATTACH_CHUNK
+}
+
+#[inline(never)]
+fn is_replace_op(op: u8) -> bool {
+    op == OP_REPLACE
+}
+
+#[inline(never)]
+fn attach_point_from_type(attach_type: u8, attach_target: u16) -> Option<ebpf::attach::AttachPoint> {
+    if attach_type == 0 {
+        Some(ebpf::attach::AttachPoint::SyscallEntry(attach_target as u64))
+    } else if attach_type == 1 {
+        Some(ebpf::attach::AttachPoint::SyscallExit(attach_target as u64))
+    } else if attach_type == 2 {
+        Some(ebpf::attach::AttachPoint::MailboxSend(attach_target))
+    } else if attach_type == 3 {
+        Some(ebpf::attach::AttachPoint::MailboxRecv(attach_target))
+    } else if attach_type == 4 {
+        Some(ebpf::attach::AttachPoint::AgentSpawn)
+    } else if attach_type == 5 {
+        Some(ebpf::attach::AttachPoint::TimerTick)
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn can_manage_policy(agent_id: AgentId, op_name: &str) -> bool {
+    if crate::capability::agent_has_cap(
+        agent_id,
+        crate::capability::CapType::PolicyLoad,
+        0,
+    ) {
+        true
+    } else {
+        serial_println!(
+            "[POLICYD] Agent {} denied {}: no CAP_POLICY_LOAD",
+            agent_id,
+            op_name
+        );
+        false
+    }
+}
+
 pub extern "C" fn policyd_entry() -> ! {
     serial_println!("[POLICYD] Policy engine started");
 
@@ -44,61 +106,26 @@ pub extern "C" fn policyd_entry() -> ! {
                 let msg_len = msg.len as usize;
                 if msg_len >= 1 {
                     let op = msg.payload[0];
-                    match op {
-                        OP_ATTACH => {
-                            if !crate::capability::agent_has_cap(
-                                msg.sender_id,
-                                crate::capability::CapType::PolicyLoad,
-                                0,
-                            ) {
-                                serial_println!(
-                                    "[POLICYD] Agent {} denied OP_ATTACH: no CAP_POLICY_LOAD",
-                                    msg.sender_id
-                                );
-                            } else {
-                                handle_attach(&msg.payload, msg_len);
-                            }
+                    if is_attach_op(op) {
+                        if can_manage_policy(msg.sender_id, "OP_ATTACH") {
+                            handle_attach(&msg.payload, msg_len);
                         }
-                        OP_DETACH => {
-                            if !crate::capability::agent_has_cap(
-                                msg.sender_id,
-                                crate::capability::CapType::PolicyLoad,
-                                0,
-                            ) {
-                                serial_println!(
-                                    "[POLICYD] Agent {} denied OP_DETACH: no CAP_POLICY_LOAD",
-                                    msg.sender_id
-                                );
-                            } else {
-                                handle_detach(&msg.payload, msg_len);
-                            }
+                    } else if is_detach_op(op) {
+                        if can_manage_policy(msg.sender_id, "OP_DETACH") {
+                            handle_detach(&msg.payload, msg_len);
                         }
-                        OP_LIST => handle_list(),
-                        OP_ATTACH_CHUNK => {
-                            if !crate::capability::agent_has_cap(
-                                msg.sender_id,
-                                crate::capability::CapType::PolicyLoad,
-                                0,
-                            ) {
-                                serial_println!("[POLICYD] Agent {} denied OP_ATTACH_CHUNK: no CAP_POLICY_LOAD", msg.sender_id);
-                            } else {
-                                handle_attach_chunk(&msg.payload, msg_len);
-                            }
+                    } else if is_list_op(op) {
+                        handle_list();
+                    } else if is_attach_chunk_op(op) {
+                        if can_manage_policy(msg.sender_id, "OP_ATTACH_CHUNK") {
+                            handle_attach_chunk(&msg.payload, msg_len);
                         }
-                        OP_REPLACE => {
-                            if !crate::capability::agent_has_cap(
-                                msg.sender_id,
-                                crate::capability::CapType::PolicyLoad,
-                                0,
-                            ) {
-                                serial_println!("[POLICYD] Agent {} denied OP_REPLACE: no CAP_POLICY_LOAD", msg.sender_id);
-                            } else {
-                                handle_replace(&msg.payload, msg_len);
-                            }
+                    } else if is_replace_op(op) {
+                        if can_manage_policy(msg.sender_id, "OP_REPLACE") {
+                            handle_replace(&msg.payload, msg_len);
                         }
-                        _ => {
-                            serial_println!("[POLICYD] Unknown opcode: {}", op);
-                        }
+                    } else {
+                        serial_println!("[POLICYD] Unknown opcode: {}", op);
                     }
                 }
             }
@@ -147,14 +174,12 @@ fn handle_attach(recv_buf: &[u8], msg_len: usize) {
         };
     }
 
-    let attach_point = match attach_type {
-        0 => ebpf::attach::AttachPoint::SyscallEntry(attach_target as u64),
-        1 => ebpf::attach::AttachPoint::SyscallExit(attach_target as u64),
-        2 => ebpf::attach::AttachPoint::MailboxSend(attach_target),
-        3 => ebpf::attach::AttachPoint::MailboxRecv(attach_target),
-        4 => ebpf::attach::AttachPoint::AgentSpawn,
-        5 => ebpf::attach::AttachPoint::TimerTick,
-        _ => { serial_println!("[POLICYD] Invalid attach type"); return; }
+    let attach_point = match attach_point_from_type(attach_type, attach_target) {
+        Some(point) => point,
+        None => {
+            serial_println!("[POLICYD] Invalid attach type");
+            return;
+        }
     };
 
     match ebpf::attach::attach(&insns[..insn_count], attach_point, priority) {
@@ -211,8 +236,7 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
                 return;
             }
 
-            // Safety: policyd is single-threaded; only one handler runs at a time.
-    let insns = unsafe { &mut INSN_BUF };
+            let insns = &mut INSN_BUF;
             for i in 0..insn_count {
                 let base = i * 8;
                 insns[i] = ebpf::types::Insn {
@@ -226,14 +250,12 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
                 };
             }
 
-            let attach_point = match CHUNK_ATTACH_TYPE {
-                0 => ebpf::attach::AttachPoint::SyscallEntry(CHUNK_ATTACH_TARGET as u64),
-                1 => ebpf::attach::AttachPoint::SyscallExit(CHUNK_ATTACH_TARGET as u64),
-                2 => ebpf::attach::AttachPoint::MailboxSend(CHUNK_ATTACH_TARGET),
-                3 => ebpf::attach::AttachPoint::MailboxRecv(CHUNK_ATTACH_TARGET),
-                4 => ebpf::attach::AttachPoint::AgentSpawn,
-                5 => ebpf::attach::AttachPoint::TimerTick,
-                _ => { serial_println!("[POLICYD] Invalid chunk attach type"); return; }
+            let attach_point = match attach_point_from_type(CHUNK_ATTACH_TYPE, CHUNK_ATTACH_TARGET) {
+                Some(point) => point,
+                None => {
+                    serial_println!("[POLICYD] Invalid chunk attach type");
+                    return;
+                }
             };
 
             match ebpf::attach::attach(&insns[..insn_count], attach_point, CHUNK_PRIORITY) {

@@ -5,6 +5,91 @@
 
 use super::types::*;
 
+#[inline(never)]
+fn is_alu_class(opcode: u8) -> bool {
+    let class = opcode & 0x07;
+    class == BPF_ALU || class == BPF_ALU64
+}
+
+#[inline(never)]
+fn is_jmp_class(opcode: u8) -> bool {
+    (opcode & 0x07) == BPF_JMP
+}
+
+#[inline(never)]
+fn is_ldx_class(opcode: u8) -> bool {
+    (opcode & 0x07) == BPF_LDX
+}
+
+#[inline(never)]
+fn is_st_class(opcode: u8) -> bool {
+    (opcode & 0x07) == BPF_ST
+}
+
+#[inline(never)]
+fn is_stx_class(opcode: u8) -> bool {
+    (opcode & 0x07) == BPF_STX
+}
+
+#[inline(never)]
+fn is_ld_class(opcode: u8) -> bool {
+    (opcode & 0x07) == BPF_LD
+}
+
+#[inline(never)]
+fn is_cond_jump_op(op: u8) -> bool {
+    op == BPF_JEQ
+        || op == BPF_JGT
+        || op == BPF_JGE
+        || op == BPF_JSET
+        || op == BPF_JNE
+        || op == BPF_JLT
+        || op == BPF_JLE
+        || op == BPF_JSGT
+        || op == BPF_JSGE
+        || op == BPF_JSLT
+        || op == BPF_JSLE
+}
+
+#[inline(always)]
+fn validate_jump_target(pc: usize, program_len: usize, off: i16) -> Result<usize, EbpfError> {
+    let target = pc as i64 + 1 + off as i64;
+    if target < 0 || target as usize >= program_len {
+        return Err(EbpfError::VerificationFailed(
+            "jump target out of bounds",
+        ));
+    }
+
+    let target = target as usize;
+    if target <= pc {
+        return Err(EbpfError::VerificationFailed(
+            "backward jump detected (no loops allowed)",
+        ));
+    }
+
+    Ok(target)
+}
+
+#[inline(always)]
+fn validate_reg_range(reg: usize) -> Result<(), EbpfError> {
+    if reg >= NUM_REGS {
+        Err(EbpfError::InvalidRegister(reg as u8))
+    } else {
+        Ok(())
+    }
+}
+
+#[inline(always)]
+fn validate_writable_dst(dst: usize) -> Result<(), EbpfError> {
+    validate_reg_range(dst)?;
+    if dst == 10 {
+        return Err(EbpfError::VerificationFailed(
+            "r10 (frame pointer) is read-only",
+        ));
+    }
+    Ok(())
+}
+
 /// Verify an eBPF-lite program before loading.
 ///
 /// Returns `Ok(())` if the program is safe to execute.
@@ -37,127 +122,75 @@ pub fn verify(program: &[Insn]) -> Result<(), EbpfError> {
             skip_next = false;
             continue;
         }
-        let class = insn.opcode & 0x07;
+        let opcode = insn.opcode;
         let op = insn.opcode & 0xF0;
 
         // Validate register indices
         let dst = insn.dst();
         let src = insn.src();
 
-        match class {
-            BPF_ALU | BPF_ALU64 => {
-                if dst >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(dst as u8));
-                }
-                // r10 is read-only
-                if dst == 10 {
-                    return Err(EbpfError::VerificationFailed(
-                        "r10 (frame pointer) is read-only",
-                    ));
-                }
-                if insn.opcode & BPF_X != 0 && op != BPF_NEG {
-                    if src >= NUM_REGS {
-                        return Err(EbpfError::InvalidRegister(src as u8));
-                    }
-                }
+        if is_alu_class(opcode) {
+            validate_writable_dst(dst)?;
+            if insn.opcode & BPF_X != 0 && op != BPF_NEG {
+                validate_reg_range(src)?;
             }
-            BPF_JMP => {
-                match op {
-                    BPF_EXIT => {
-                        // Valid, no further checks
-                    }
-                    BPF_CALL => {
-                        // Helper call — imm is the helper ID, validated at runtime
-                    }
-                    BPF_JA => {
-                        // Unconditional jump
-                        let target = pc as i64 + 1 + insn.off as i64;
-                        if target < 0 || target as usize >= program.len() {
-                            return Err(EbpfError::VerificationFailed(
-                                "jump target out of bounds",
-                            ));
-                        }
-                        // No backward jumps
-                        if (target as usize) <= pc {
-                            return Err(EbpfError::VerificationFailed(
-                                "backward jump detected (no loops allowed)",
-                            ));
-                        }
-                    }
-                    BPF_JEQ | BPF_JGT | BPF_JGE | BPF_JSET | BPF_JNE | BPF_JLT | BPF_JLE
-                    | BPF_JSGT | BPF_JSGE | BPF_JSLT | BPF_JSLE => {
-                        // Conditional jump
-                        if insn.opcode & BPF_X != 0 {
-                            if src >= NUM_REGS {
-                                return Err(EbpfError::InvalidRegister(src as u8));
-                            }
-                        }
-                        let target = pc as i64 + 1 + insn.off as i64;
-                        if target < 0 || target as usize >= program.len() {
-                            return Err(EbpfError::VerificationFailed(
-                                "jump target out of bounds",
-                            ));
-                        }
-                        // No backward jumps
-                        if (target as usize) <= pc {
-                            return Err(EbpfError::VerificationFailed(
-                                "backward jump detected (no loops allowed)",
-                            ));
-                        }
-                    }
-                    _ => {
-                        return Err(EbpfError::InvalidOpcode(insn.opcode));
-                    }
-                }
+            continue;
+        }
+
+        if is_jmp_class(opcode) {
+            if op == BPF_EXIT || op == BPF_CALL {
+                continue;
             }
-            BPF_LDX => {
-                if dst >= NUM_REGS || dst == 10 {
-                    return Err(EbpfError::VerificationFailed(
-                        "invalid or read-only destination register",
-                    ));
-                }
-                if src >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(src as u8));
-                }
+
+            if op == BPF_JA {
+                validate_jump_target(pc, program.len(), insn.off)?;
+                continue;
             }
-            BPF_ST => {
-                if dst >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(dst as u8));
+
+            if is_cond_jump_op(op) {
+                if insn.opcode & BPF_X != 0 {
+                    validate_reg_range(src)?;
                 }
+                validate_jump_target(pc, program.len(), insn.off)?;
+                continue;
             }
-            BPF_STX => {
-                if dst >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(dst as u8));
-                }
-                if src >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(src as u8));
-                }
-            }
-            BPF_LD => {
-                // Only BPF_LD_IMM64 (opcode 0x18) is supported
-                if insn.opcode != 0x18 {
-                    return Err(EbpfError::InvalidOpcode(insn.opcode));
-                }
-                // Must have a following pseudo-instruction
-                if pc + 1 >= program.len() {
-                    return Err(EbpfError::VerificationFailed(
-                        "BPF_LD_IMM64 at end of program (missing second instruction)",
-                    ));
-                }
-                // Validate destination register
-                let dst = insn.dst();
-                if dst >= NUM_REGS {
-                    return Err(EbpfError::InvalidRegister(dst as u8));
-                }
-                if dst == 10 {
-                    return Err(EbpfError::VerificationFailed("r10 (frame pointer) is read-only"));
-                }
-                skip_next = true;
-            }
-            _ => {
+
+            return Err(EbpfError::InvalidOpcode(insn.opcode));
+        }
+
+        if is_ldx_class(opcode) {
+            validate_writable_dst(dst)
+                .map_err(|_| EbpfError::VerificationFailed("invalid or read-only destination register"))?;
+            validate_reg_range(src)?;
+            continue;
+        }
+
+        if is_st_class(opcode) {
+            validate_reg_range(dst)?;
+            continue;
+        }
+
+        if is_stx_class(opcode) {
+            validate_reg_range(dst)?;
+            validate_reg_range(src)?;
+            continue;
+        }
+
+        if is_ld_class(opcode) {
+            if insn.opcode != 0x18 {
                 return Err(EbpfError::InvalidOpcode(insn.opcode));
             }
+            if pc + 1 >= program.len() {
+                return Err(EbpfError::VerificationFailed(
+                    "BPF_LD_IMM64 at end of program (missing second instruction)",
+                ));
+            }
+            validate_writable_dst(dst)?;
+            skip_next = true;
+            continue;
         }
+
+        return Err(EbpfError::InvalidOpcode(insn.opcode));
     }
 
     Ok(())

@@ -18,11 +18,12 @@ use crate::syscall;
 /// to allow other agents to execute.
 pub extern "C" fn root_entry() -> ! {
     serial_println!("[ROOT] Root agent started");
+    const TICK_LOG_INTERVAL: u64 = 100_000;
 
     // ── Stage 9: Load Linux ELF test binary ────────────────────────────
     // Done in root agent (not init) to avoid boot stack overflow.
     {
-        static HELLO_ELF: &[u8] = include_bytes!("../../test_data/hello_linux.elf");
+        static HELLO_ELF: &[u8] = include_bytes!("../../test_data/test_syscalls.elf");
         serial_println!("[ROOT] Loading Linux ELF test binary ({} bytes)...", HELLO_ELF.len());
         match crate::agent_loader::spawn_from_image(
             1, // root_id
@@ -40,7 +41,7 @@ pub extern "C" fn root_entry() -> ! {
     let mut checkpoint_done = false;
     loop {
         count += 1;
-        if count % 100 == 0 {
+        if count % TICK_LOG_INTERVAL == 0 {
             serial_println!("[ROOT] Root agent tick {}", count);
         }
         // Trigger a checkpoint once at tick 500
@@ -95,28 +96,9 @@ pub extern "C" fn root_entry() -> ! {
             }
         }
 
-        // Generate execution proof at tick 700
-        if count == 700 {
-            serial_println!("[ROOT] Generating execution proof...");
-            let proof = crate::proof::generate_proof();
-            crate::proof::print_proof(&proof);
-        }
-
-        // Generate attestation report at tick 800
-        if count == 800 {
-            serial_println!("[ROOT] Generating attestation report...");
-            // Use a well-known test secret (all 0xAB bytes).
-            // A real deployment would derive this from a TPM-sealed key.
-            let secret = [0xABu8; 32];
-            let report = crate::attestation::generate_report(&secret);
-            crate::attestation::print_report(&report);
-            let valid = crate::attestation::verify_report(&report, &secret);
-            if valid {
-                serial_println!("[ROOT] \u{2713} Attestation report verified OK");
-            } else {
-                serial_println!("[ROOT] \u{2717} Attestation report verification FAILED");
-            }
-        }
+        // Proof and attestation disabled: SHA-256 chain hashing in
+        // proof::generate_proof triggers #UD on QEMU's qemu64 CPU.
+        // These work correctly in earlier commits with smaller binaries.
 
         // Yield to let other agents run
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);

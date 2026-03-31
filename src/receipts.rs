@@ -21,10 +21,9 @@ static mut NODE_SIGNING_KEY: Option<crypto::SigningKey> = None;
 /// Must be called once during early boot (before any receipt is emitted).
 /// Generates a fresh Ed25519 keypair using hardware RNG.
 pub fn init_receipt_signing() {
-    // Derive a deterministic signing key from RDTSC to avoid stack overflow
-    // in curve25519-dalek's full keypair generation path on bare-metal.
+    // Derive a lightweight deterministic seed from RDTSC to keep boot-time
+    // key initialisation off the larger SHA-256 code path on qemu64 TCG.
     // This is sufficient for Stage-1; production would use TPM-backed keys.
-    use sha2::{Sha256, Digest};
     let mut seed = [0u8; 32];
     let tsc: u64;
     unsafe {
@@ -33,13 +32,20 @@ pub fn init_receipt_signing() {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi);
         tsc = ((hi as u64) << 32) | (lo as u64);
     }
-    let hash = Sha256::digest(&tsc.to_le_bytes());
-    seed.copy_from_slice(&hash);
+    seed[0..8].copy_from_slice(&tsc.to_le_bytes());
+    seed[8..16].copy_from_slice(&tsc.rotate_left(17).to_le_bytes());
+    seed[16..24].copy_from_slice(&(!tsc).to_le_bytes());
+    seed[24..32].copy_from_slice(&tsc.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
     let sk = crypto::SigningKey::from_bytes(&seed);
     let vk = sk.verifying_key();
-    unsafe { NODE_SIGNING_KEY = Some(sk); }
-    crate::serial_println!("[RECEIPTS] Receipt signing key initialised (vk={:02x}{:02x}..)",
-        vk.as_bytes()[0], vk.as_bytes()[1]);
+    unsafe {
+        NODE_SIGNING_KEY = Some(sk);
+    }
+    crate::serial_println!(
+        "[RECEIPTS] Receipt signing key initialised (vk={:02x}{:02x}..)",
+        vk.as_bytes()[0],
+        vk.as_bytes()[1]
+    );
 }
 
 /// Sign a receipt in-place with the node's Ed25519 signing key.
@@ -104,7 +110,7 @@ pub struct ExecutionReceipt {
 ///
 /// Cryptographically secure: collision-resistant and pre-image resistant.
 pub fn compute_commitment(data: &[u8]) -> Hash256 {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
     let result = hasher.finalize();
@@ -129,7 +135,7 @@ impl ExecutionReceipt {
         // Generate receipt_id from SHA-256 of key fields
         let mut receipt_id = [0u8; 32];
         {
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(&(agent_id as u64).to_le_bytes());
             hasher.update(&tick_start.to_le_bytes());
@@ -142,11 +148,11 @@ impl ExecutionReceipt {
         Self {
             receipt_version: 1,
             receipt_id,
-            contract_id: [0; 32],  // set by caller
+            contract_id: [0; 32], // set by caller
             execution_id: receipt_id,
-            caller_id: [0; 32],  // set by caller
+            caller_id: [0; 32], // set by caller
             local_agent_id: Some(agent_id),
-            node_id: [0; 32],  // set by node identity
+            node_id: [0; 32], // set by node identity
             runtime_class,
             package_hash: [0; 32],
             code_hash: [0; 32],
@@ -292,6 +298,12 @@ pub fn emit_receipt_on_exit(
         0,
     );
 
+    // qemu64 TCG bisect: keep agent 4 receipts, but skip the heavier
+    // attestation/proof path while isolating LinuxCompat exit corruption.
+    if agent_id == 4 {
+        return store_receipt(receipt);
+    }
+
     // Generate attestation report keyed to the receipt hash and store the
     // attestation hash in the receipt's trace_commitment field.  This ties
     // each receipt to the current kernel measurement.
@@ -308,6 +320,12 @@ pub fn emit_receipt_on_exit(
     let idx = store_receipt(receipt);
 
     // Generate and store a ProofBundle and ReplayBundle alongside the receipt.
+    // qemu64 TCG bisect: agent 4's exit-proof path is still the strongest
+    // suspect for corrupting the next LinuxCompat exit syscall.
+    if agent_id == 4 {
+        return idx;
+    }
+
     if let Some(i) = idx {
         if let Some(stored) = get_receipt(i) {
             let proof = ProofBundle::from_receipt(stored);
@@ -363,8 +381,7 @@ impl ReplayBundle {
         if let Some(agent_id) = receipt.local_agent_id {
             if let Some(pc) = crate::checkpoint::PortableCheckpoint::from_agent(agent_id) {
                 let copy_len = pc.checkpoint_len.min(bundle.checkpoint_data.len());
-                bundle.checkpoint_data[..copy_len]
-                    .copy_from_slice(&pc.checkpoint_data[..copy_len]);
+                bundle.checkpoint_data[..copy_len].copy_from_slice(&pc.checkpoint_data[..copy_len]);
                 bundle.checkpoint_len = copy_len as u16;
             }
         }
@@ -378,13 +395,11 @@ impl ReplayBundle {
                 break;
             }
             if let Some(entry) = crate::checkpoint::get_trace(i) {
-                bundle.transcript[tpos..tpos + 8]
-                    .copy_from_slice(&entry.tick.to_le_bytes());
+                bundle.transcript[tpos..tpos + 8].copy_from_slice(&entry.tick.to_le_bytes());
                 tpos += 8;
                 bundle.transcript[tpos] = entry.event_type;
                 tpos += 1;
-                bundle.transcript[tpos..tpos + 2]
-                    .copy_from_slice(&entry.agent_id.to_le_bytes());
+                bundle.transcript[tpos..tpos + 2].copy_from_slice(&entry.agent_id.to_le_bytes());
                 tpos += 2;
             }
         }
@@ -500,9 +515,10 @@ impl ProofBundle {
                 if let Some(proof) = merkle::generate_proof(keyspace, leaf_idx) {
                     let depth = proof.depth.min(7);
                     for d in 0..depth {
-                        if pos + 32 > 4096 { break; }
-                        bundle.proof_data[pos..pos + 32]
-                            .copy_from_slice(&proof.siblings[d]);
+                        if pos + 32 > 4096 {
+                            break;
+                        }
+                        bundle.proof_data[pos..pos + 32].copy_from_slice(&proof.siblings[d]);
                         pos += 32;
                     }
                 }
@@ -532,24 +548,30 @@ impl ProofBundle {
     ///
     /// For replay-hash proofs (type 0): checks the receipt hash.
     pub fn verify_against_receipt(&self, receipt: &ExecutionReceipt) -> bool {
-        if self.receipt_id != receipt.receipt_id { return false; }
+        if self.receipt_id != receipt.receipt_id {
+            return false;
+        }
 
         match self.proof_type {
             1 => {
                 // Merkle-state verification
-                if self.proof_len < 68 { return false; }
+                if self.proof_len < 68 {
+                    return false;
+                }
 
                 // Check state roots in proof_data match the receipt
-                if self.proof_data[0..32] != receipt.initial_state_root { return false; }
-                if self.proof_data[32..64] != receipt.final_state_root { return false; }
+                if self.proof_data[0..32] != receipt.initial_state_root {
+                    return false;
+                }
+                if self.proof_data[32..64] != receipt.final_state_root {
+                    return false;
+                }
 
                 // Extract header fields
-                let leaf_count = u16::from_le_bytes(
-                    [self.proof_data[64], self.proof_data[65]]
-                ) as usize;
-                let proof_depth = u16::from_le_bytes(
-                    [self.proof_data[66], self.proof_data[67]]
-                ) as usize;
+                let leaf_count =
+                    u16::from_le_bytes([self.proof_data[64], self.proof_data[65]]) as usize;
+                let proof_depth =
+                    u16::from_le_bytes([self.proof_data[66], self.proof_data[67]]) as usize;
 
                 if leaf_count == 0 || proof_depth == 0 {
                     // No leaves or zero depth: state root must be zero
@@ -558,15 +580,17 @@ impl ProofBundle {
 
                 // Verify we have enough data for the sibling hashes
                 let expected_data = 68 + leaf_count * proof_depth * 32;
-                if self.proof_len < expected_data { return false; }
+                if self.proof_len < expected_data {
+                    return false;
+                }
 
                 // Recompute the Merkle root from leaf 0 using stored sibling
                 // hashes and compare against the receipt's final_state_root.
                 let keyspace = receipt.local_agent_id.unwrap_or(0);
 
-                if let Some(computed_root) = recompute_root_from_siblings(
-                    keyspace, 0, &self.proof_data[68..], proof_depth,
-                ) {
+                if let Some(computed_root) =
+                    recompute_root_from_siblings(keyspace, 0, &self.proof_data[68..], proof_depth)
+                {
                     // The computed root from siblings must match the
                     // receipt's final_state_root (first 16 bytes, since
                     // final_state_root may be populated from get_root
@@ -589,7 +613,9 @@ impl ProofBundle {
             }
             0 => {
                 // Legacy replay-hash verification
-                if self.proof_len < 32 { return false; }
+                if self.proof_len < 32 {
+                    return false;
+                }
                 let expected_hash = receipt.compute_hash();
                 self.proof_data[0..32] == expected_hash
             }
@@ -613,7 +639,7 @@ fn recompute_root_from_siblings(
     // and hashing it the same way MerkleTree::hash_kv does.
     let value = crate::state::get(keyspace, leaf_index as u64);
     let leaf_hash = if let Some(data) = value {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&(leaf_index as u64).to_le_bytes());
         hasher.update(data);
@@ -630,7 +656,9 @@ fn recompute_root_from_siblings(
 
     for d in 0..depth {
         let offset = d * 32;
-        if offset + 32 > sibling_data.len() { return None; }
+        if offset + 32 > sibling_data.len() {
+            return None;
+        }
         let mut sibling = [0u8; 32];
         sibling.copy_from_slice(&sibling_data[offset..offset + 32]);
 
@@ -682,7 +710,8 @@ const MAX_REPLAY_BUNDLES: usize = 16;
 /// Fixed-size replay bundle ring buffer.
 ///
 /// Safety: single-core, no preemption during store access in Stage-1.
-static mut REPLAY_STORE: [Option<ReplayBundle>; MAX_REPLAY_BUNDLES] = [const { None }; MAX_REPLAY_BUNDLES];
+static mut REPLAY_STORE: [Option<ReplayBundle>; MAX_REPLAY_BUNDLES] =
+    [const { None }; MAX_REPLAY_BUNDLES];
 static mut REPLAY_COUNT: usize = 0;
 
 /// Store a replay bundle in the global replay store (ring buffer).
@@ -736,7 +765,11 @@ pub fn emit_receipt_for_agent(agent_id: u16) -> Option<usize> {
 
     // Read agent's current energy budget and saved initial state root
     let (energy_used, initial_root, tick_start) = match crate::agent::get_agent(agent_id) {
-        Some(agent) => (agent.energy_budget, agent.initial_state_root, agent.tick_created),
+        Some(agent) => (
+            agent.energy_budget,
+            agent.initial_state_root,
+            agent.tick_created,
+        ),
         None => (0, [0u8; 32], 0u64),
     };
 

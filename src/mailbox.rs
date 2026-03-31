@@ -175,6 +175,10 @@ pub fn send_message(sender_id: AgentId, target_mailbox: MailboxId, payload: &[u8
         let msg = Message::new(sender_id, tick, payload);
         mailbox.enqueue(msg)?;
 
+        // A successful send makes data available immediately. Wake the
+        // mailbox owner if it is currently blocked in SYS_RECV.
+        crate::sched::unblock(mailbox.owner);
+
         // Check for backpressure: emit MAILBOX_PRESSURE if > 75% full
         let count = mailbox.count;
         let capacity = MAX_MAILBOX_CAPACITY;

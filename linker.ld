@@ -79,32 +79,30 @@ SECTIONS
 
     .bss ALIGN(4096) : AT(ADDR(.bss) - KERNEL_VMA)
     {
-        __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
-        __bss_end = .;
     }
 
+    . = ADDR(.bss) + SIZEOF(.bss);
     . = ALIGN(4096);
+    . += 4096; /* Guard page (reserved gap) between BSS and boot stack. */
+    __stack_bottom = ABSOLUTE(.);
+    . += 65536; /* Kernel stack: 64 KB, grows downward. */
+    __stack_top = ABSOLUTE(.);
+    __kernel_end = ABSOLUTE(.);
 
-    /* Guard page (unmapped gap) between BSS and stack */
-    . += 4096;
-
-    /* Kernel stack: 64 KB, grows downward */
-    __stack_bottom = .;
-    . += 65536;
-    __stack_top = .;
-
-    __kernel_end = .;
+    __bss_start = ADDR(.bss);
+    __bss_end = ADDR(.bss) + SIZEOF(.bss);
 
     /* ── Physical equivalents for 32-bit boot code ──────────────────
-     * 32-bit code cannot use 64-bit addresses. These symbols provide
-     * the physical addresses of high-VMA sections.
+     * Derive these from concrete section addresses instead of the outer
+     * location counter; lld was resolving the latter against a synthetic
+     * zero-sized section near KERNEL_VMA.
      */
-    __bss_phys_start  = __bss_start - KERNEL_VMA;
-    __bss_phys_end    = __bss_end   - KERNEL_VMA;
-    __stack_phys_top  = __stack_top - KERNEL_VMA;
-    __kernel_phys_end = __kernel_end - KERNEL_VMA;
+    __bss_phys_start  = ABSOLUTE(ADDR(.bss) - KERNEL_VMA);
+    __bss_phys_end    = ABSOLUTE(ADDR(.bss) + SIZEOF(.bss) - KERNEL_VMA);
+    __stack_phys_top  = ABSOLUTE(__stack_top - KERNEL_VMA);
+    __kernel_phys_end = ABSOLUTE(__kernel_end - KERNEL_VMA);
 
     /DISCARD/ :
     {

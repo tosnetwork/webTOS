@@ -25,9 +25,12 @@ pub fn read_cr3() -> u64 {
 /// Sets up RIP to the entry point, RSP to the top of the given stack,
 /// rflags with IF=1 (interrupts enabled), and CR3 to the current page table.
 pub fn new_kernel_context(entry: u64, stack_top: u64) -> AgentContext {
+    extern "C" { fn enter_kernel_mode(); }
+
     AgentContext {
         rsp: stack_top,
-        rip: entry,
+        rip: enter_kernel_mode as *const () as u64,
+        r12: entry,
         rflags: 0x200, // IF=1
         cr3: read_cr3(),
         ..AgentContext::zero()

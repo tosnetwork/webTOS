@@ -190,6 +190,50 @@ pub fn unblock(id: AgentId) {
     }
 }
 
+fn select_next_ready_agent() -> AgentId {
+    let mut rq = SCHED_LOCK.lock();
+
+    let mut found = IDLE_AGENT_ID;
+    if rq.len > 0 {
+        let start = rq.current_index % rq.len.max(1);
+
+        // Round-robin: pick the NEXT Ready agent from current_index.
+        // This ensures all agents get a fair share of CPU time.
+        let mut best_id = IDLE_AGENT_ID;
+        let mut best_idx = 0;
+
+        for offset in 1..=rq.len {
+            let idx = (start + offset) % rq.len;
+            if let Some(agent_id) = rq.queue[idx] {
+                if let Some(agent) = get_agent_mut(agent_id) {
+                    if agent.status == AgentStatus::Ready {
+                        // On AP cores, skip ring-3 agents
+                        let on_ap = crate::arch::x86_64::lapic::is_active()
+                            && crate::arch::x86_64::lapic::id() != 0;
+                        if on_ap && agent.mode == AgentMode::User {
+                            continue;
+                        }
+
+                        best_id = agent_id;
+                        best_idx = idx;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if best_id != IDLE_AGENT_ID {
+            if let Some(agent) = get_agent_mut(best_id) {
+                agent.status = AgentStatus::Running;
+            }
+            rq.current_index = (best_idx + 1) % rq.len.max(1);
+        }
+        found = best_id;
+    }
+
+    found
+}
+
 /// Select the next agent to run and perform a context switch.
 ///
 /// Protected by SpinLock: safe for concurrent calls from multiple cores.
@@ -211,54 +255,7 @@ pub fn schedule() {
         }
     }
 
-    let next_id = {
-        let mut rq = SCHED_LOCK.lock();
-
-        let mut found = IDLE_AGENT_ID;
-        if rq.len > 0 {
-            let start = rq.current_index % rq.len.max(1);
-
-            // Find highest-priority Ready agent (lowest AgentPriority value).
-            // Among agents with equal priority, round-robin by picking the
-            // first one encountered from the current index.
-            let mut best_id = IDLE_AGENT_ID;
-            let mut best_priority = AgentPriority::Background as u8 + 1; // worse than worst
-            let mut best_idx = 0;
-
-            // Round-robin: pick the NEXT Ready agent from current_index.
-            // This ensures all agents get a fair share of CPU time,
-            // preventing priority starvation of Normal agents.
-            for offset in 1..=rq.len {
-                let idx = (start + offset) % rq.len;
-                if let Some(agent_id) = rq.queue[idx] {
-                    if let Some(agent) = get_agent_mut(agent_id) {
-                        if agent.status == AgentStatus::Ready {
-                            // On AP cores, skip ring-3 agents
-                            let on_ap = crate::arch::x86_64::lapic::is_active()
-                                && crate::arch::x86_64::lapic::id() != 0;
-                            if on_ap && agent.mode == AgentMode::User {
-                                continue;
-                            }
-
-                            best_id = agent_id;
-                            best_idx = idx;
-                            break; // take the first ready agent (round-robin)
-                        }
-                    }
-                }
-            }
-
-            // Mark the best agent as Running
-            if best_id != IDLE_AGENT_ID {
-                if let Some(agent) = get_agent_mut(best_id) {
-                    agent.status = AgentStatus::Running;
-                }
-                rq.current_index = (best_idx + 1) % rq.len.max(1);
-            }
-            found = best_id;
-        }
-        found
-    };
+    let next_id = select_next_ready_agent();
     // SpinLock dropped here — interrupts re-enabled
 
     if next_id == old_id {
@@ -339,12 +336,66 @@ pub fn schedule() {
     }
 }
 
+/// Switch away from the current trap context without ever returning to the
+/// interrupted stack frame.
+///
+/// This is used for faults and timer-driven budget exhaustion. The current
+/// trap frame is already unusable as a normal resumable context, so we save
+/// a scratch continuation into the per-core boot context and jump directly
+/// into the next runnable agent.
+pub fn switch_from_trap() -> ! {
+    let old_id = current();
+    let next_id = select_next_ready_agent();
+
+    if next_id == IDLE_AGENT_ID {
+        if let Some(agent) = get_agent_mut(IDLE_AGENT_ID) {
+            agent.status = AgentStatus::Running;
+        }
+    }
+
+    set_current(next_id);
+
+    if let Some(agent) = get_agent(next_id) {
+        if agent.mode == AgentMode::User {
+            gdt::set_tss_rsp0(agent.kernel_stack_top);
+            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+        }
+    }
+
+    let new_ctx = match get_agent(next_id) {
+        Some(agent) => &agent.context as *const AgentContext,
+        None => loop {
+            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+        },
+    };
+
+    let core_id = if crate::arch::x86_64::lapic::is_active() {
+        crate::arch::x86_64::lapic::id() as usize
+    } else {
+        0
+    };
+    let scratch_ctx = unsafe { &mut BOOT_CONTEXTS[core_id.min(15)] as *mut AgentContext };
+
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+        context_switch(scratch_ctx, new_ctx);
+    }
+
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+    }
+}
+
 /// Start the scheduler by context-switching to the first agent.
 pub fn start() {
     serial_println!("[SCHED] Scheduler starting");
 
+    // The BSP must not take timer IRQs while it is still resolving the first
+    // runnable agent and building the initial boot-context switch.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
     let first_id = {
-        let rq = SCHED_LOCK.lock();
+        let rq = SCHED_LOCK.lock_raw();
         if rq.len == 0 {
             serial_println!("[SCHED] No agents in run queue");
             return;
@@ -354,20 +405,18 @@ pub fn start() {
 
     set_current(first_id);
 
-    if let Some(agent) = get_agent_mut(first_id) {
+    let new_ctx = {
+        let agent = get_agent_mut(first_id).expect("First agent not found");
         agent.status = AgentStatus::Running;
-    }
-
-    serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
-
-    if let Some(agent) = get_agent(first_id) {
         if agent.mode == AgentMode::User {
             gdt::set_tss_rsp0(agent.kernel_stack_top);
             unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
         }
-    }
+        &agent.context as *const AgentContext
+    };
 
-    let new_ctx = &get_agent(first_id).unwrap().context as *const AgentContext;
+    serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
+
     unsafe {
         context_switch(&mut BOOT_CONTEXTS[0] as *mut AgentContext, new_ctx);
     }
@@ -385,8 +434,7 @@ pub fn timer_tick() {
             }
             crate::event::energy_exhausted(id);
             remove_from_run_queue(id);
-            schedule();
-            return;
+            switch_from_trap();
         }
     }
 
@@ -432,12 +480,10 @@ pub fn timer_tick() {
         // Programs use map helpers to record metrics or trigger alerts.
     }
 
-    // Preemptive reschedule
+    // Stage-1 trap handling does not save enough interrupted state to
+    // preempt arbitrary code safely. Cooperative yields still switch
+    // agents; timer IRQs only drive accounting and observability.
     if crate::deterministic::is_enabled() {
-        if crate::deterministic::tick().is_some() {
-            schedule();
-        }
-    } else {
-        schedule();
+        let _ = crate::deterministic::tick();
     }
 }

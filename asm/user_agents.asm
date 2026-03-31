@@ -23,12 +23,15 @@ section .text
 
 global user_ping_entry
 user_ping_entry:
+    xor r12d, r12d              ; completed round-trips
     ; Send initial "ping" to mailbox 3
     mov rax, SYS_SEND
     mov rdi, 3                  ; mailbox_id = pong's mailbox
     lea rsi, [rel .ping_msg]    ; payload pointer
     mov rdx, 4                  ; payload length
     syscall
+    test rax, rax
+    js .ping_exit_fail
 
 .ping_loop:
     ; Receive reply from own mailbox (2)
@@ -38,6 +41,13 @@ user_ping_entry:
     mov rsi, rsp                ; buffer pointer
     mov rdx, 256                ; buffer capacity
     syscall
+    add rsp, 256                ; deallocate buffer
+    test rax, rax
+    jle .ping_yield
+
+    inc r12
+    cmp r12, 4
+    jae .ping_exit_ok
 
     ; Send another "ping"
     mov rax, SYS_SEND
@@ -45,14 +55,29 @@ user_ping_entry:
     lea rsi, [rel .ping_msg]    ; payload pointer
     mov rdx, 4                  ; payload length
     syscall
+    test rax, rax
+    js .ping_exit_fail
 
-    add rsp, 256                ; deallocate buffer
-
+.ping_yield:
     ; Yield
     mov rax, SYS_YIELD
     syscall
 
     jmp .ping_loop
+
+.ping_exit_ok:
+    mov rax, SYS_EXIT
+    xor rdi, rdi
+    syscall
+    hlt
+    jmp $
+
+.ping_exit_fail:
+    mov rax, SYS_EXIT
+    mov rdi, 1
+    syscall
+    hlt
+    jmp $
 
 .ping_msg: db "ping"
 
@@ -65,6 +90,7 @@ user_ping_end:
 
 global user_pong_entry
 user_pong_entry:
+    xor r12d, r12d              ; replies sent
 .pong_loop:
     ; Receive from own mailbox (3)
     sub rsp, 256
@@ -73,6 +99,9 @@ user_pong_entry:
     mov rsi, rsp                ; buffer
     mov rdx, 256                ; capacity
     syscall
+    add rsp, 256
+    test rax, rax
+    jle .pong_yield
 
     ; Send "pong" to mailbox 2
     mov rax, SYS_SEND
@@ -80,14 +109,33 @@ user_pong_entry:
     lea rsi, [rel .pong_msg]    ; payload pointer
     mov rdx, 4                  ; payload length
     syscall
+    test rax, rax
+    js .pong_exit_fail
 
-    add rsp, 256
+    inc r12
+    cmp r12, 4
+    jae .pong_exit_ok
 
+.pong_yield:
     ; Yield
     mov rax, SYS_YIELD
     syscall
 
     jmp .pong_loop
+
+.pong_exit_ok:
+    mov rax, SYS_EXIT
+    xor rdi, rdi
+    syscall
+    hlt
+    jmp $
+
+.pong_exit_fail:
+    mov rax, SYS_EXIT
+    mov rdi, 1
+    syscall
+    hlt
+    jmp $
 
 .pong_msg: db "pong"
 

@@ -151,6 +151,7 @@ context_switch:
 ; We build an iretq frame on the kernel stack and iretq to ring 3.
 
 global enter_user_mode
+global enter_kernel_mode
 
 enter_user_mode:
     ; Build iretq frame:
@@ -165,3 +166,17 @@ enter_user_mode:
     push r14            ; CS (USER_CS = 0x23)
     push r12            ; RIP (user entry point)
     iretq
+
+; ─── Kernel entry trampoline ───────────────────────────────────────────────
+;
+; Used for the FIRST context switch to a kernel-mode agent. `context_switch`
+; jumps here with:
+;   r12 = kernel entry point
+;
+; We synthesize a normal call-frame shape so Rust/C entry functions see the
+; SysV-required stack alignment, then enable interrupts and jump to the
+; agent entry point.
+
+enter_kernel_mode:
+    push qword 0        ; fake return address: gives normal SysV stack shape
+    jmp r12

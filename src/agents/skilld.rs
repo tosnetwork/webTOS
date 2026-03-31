@@ -35,7 +35,7 @@ static mut SKILL_COUNT: usize = 0;
 pub extern "C" fn skilld_entry() -> ! {
     serial_println!("[SKILLD] Skill module manager started");
 
-    let my_mailbox: u64 = 11; // skilld's mailbox
+    let my_mailbox = crate::sched::current() as u64;
     let mut recv_buf = [0u8; MAX_MESSAGE_PAYLOAD];
 
     loop {

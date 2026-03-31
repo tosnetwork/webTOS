@@ -25,7 +25,7 @@ const OP_UPGRADE: u8 = 0x04;
 pub extern "C" fn pkgd_entry() -> ! {
     serial_println!("[PKGD] Package manager started");
 
-    let my_mailbox: u64 = 13; // pkgd's mailbox (agent slot 13)
+    let my_mailbox = crate::sched::current() as u64;
     let mut recv_buf = [0u8; MAX_MESSAGE_PAYLOAD];
 
     loop {
