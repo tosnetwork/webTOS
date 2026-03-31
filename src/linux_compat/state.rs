@@ -3,32 +3,33 @@
 //! Each agent running in Linux-compat mode gets its own virtual fd table,
 //! cwd, brk pointer, mmap region, identity, etc.
 
-use crate::serial_println;
+use crate::{agent::MAX_AGENTS, serial_println};
 
-pub const MAX_FDS: usize = 256;
+pub const MAX_FDS: usize = 1024;
 pub const MAX_EPOLL_INSTANCES: usize = 8;
-pub const MAX_LINUX_AGENTS: usize = 32;
+pub const MAX_LINUX_AGENTS: usize = MAX_AGENTS;
+pub const MAX_PATH: usize = 512;
 
 // ── FD types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FdKind {
-    File = 0,      // keyspace-backed file
-    Socket = 1,    // netd proxy session
-    Pipe = 2,      // mailbox pair
-    Epoll = 3,     // epoll instance reference
-    EventFd = 4,   // eventfd counter
+    File = 0,    // keyspace-backed file
+    Socket = 1,  // netd proxy session
+    Pipe = 2,    // mailbox pair
+    Epoll = 3,   // epoll instance reference
+    EventFd = 4, // eventfd counter
 }
 
 #[derive(Clone, Copy)]
 pub struct FdEntry {
     pub kind: FdKind,
-    pub keyspace_key: u64,    // for File: keyspace key
-    pub keyspace_id: u16,     // which keyspace to read/write from
-    pub mailbox_id: u16,      // for Socket/Pipe: mailbox
-    pub offset: u64,          // current read/write offset
-    pub flags: u32,           // O_NONBLOCK, O_CLOEXEC, etc.
+    pub keyspace_key: u64, // for File: keyspace key
+    pub keyspace_id: u16,  // which keyspace to read/write from
+    pub mailbox_id: u16,   // for Socket/Pipe: mailbox
+    pub offset: u64,       // current read/write offset
+    pub flags: u32,        // O_NONBLOCK, O_CLOEXEC, etc.
     pub active: bool,
 }
 
@@ -68,8 +69,8 @@ impl EpollInstance {
 
 pub struct LinuxAgentState {
     pub fd_table: [Option<FdEntry>; MAX_FDS],
-    pub cwd: [u8; 256],
-    pub cwd_len: u8,
+    pub cwd: [u8; MAX_PATH],
+    pub cwd_len: u16,
     pub brk_current: u64,
     pub mmap_next: u64,       // next deterministic mmap address
     pub pid: u32,             // = agent_id
@@ -80,14 +81,14 @@ pub struct LinuxAgentState {
     pub epoll_instances: [EpollInstance; MAX_EPOLL_INSTANCES],
     pub robust_list_head: u64,
     pub clear_child_tid: u64,
-    pub fs_base: u64,         // TLS FS base (arch_prctl SET_FS)
+    pub fs_base: u64, // TLS FS base (arch_prctl SET_FS)
     pub active: bool,
 }
 
 impl LinuxAgentState {
     /// Create a new Linux agent state for the given agent ID.
     pub fn new(agent_id: u16) -> Self {
-        let mut cwd = [0u8; 256];
+        let mut cwd = [0u8; MAX_PATH];
         // Default cwd = "/"
         cwd[0] = b'/';
 
@@ -122,15 +123,13 @@ impl LinuxAgentState {
             cwd,
             cwd_len: 1,
             brk_current: 0x0060_0000, // conventional brk start
-            mmap_next: 0x1_0000_0000,     // deterministic base (4 GB)
+            mmap_next: 0x1_0000_0000, // deterministic base (4 GB)
             pid: agent_id as u32,
             uid: 1000,
             gid: 1000,
             prng_state,
             prng_counter: 0,
-            epoll_instances: [
-                const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES
-            ],
+            epoll_instances: [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES],
             robust_list_head: 0,
             clear_child_tid: 0,
             fs_base: 0,
@@ -209,9 +208,6 @@ pub fn init_state(agent_id: u16) {
         unsafe {
             LINUX_STATES[agent_id as usize] = Some(LinuxAgentState::new(agent_id));
         }
-        serial_println!(
-            "[linux_compat] initialized state for agent {}",
-            agent_id
-        );
+        serial_println!("[linux_compat] initialized state for agent {}", agent_id);
     }
 }

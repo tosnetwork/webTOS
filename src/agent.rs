@@ -13,11 +13,11 @@ pub type Tick = u64;
 pub type EnergyUnit = u64;
 pub type KeyspaceId = u16;
 
-pub const MAX_AGENTS: usize = 28;
+pub const MAX_AGENTS: usize = 64;
 pub const IDLE_AGENT_ID: AgentId = 0;
 pub const ROOT_AGENT_ID: AgentId = 1;
 pub const MAX_MAILBOX_CAPACITY: usize = 16;
-pub const MAX_MESSAGE_PAYLOAD: usize = 256;
+pub const MAX_MESSAGE_PAYLOAD: usize = 1024;
 pub const MAX_CAPABILITIES_PER_AGENT: usize = 32;
 pub const SYSCALL_ENERGY_COST: EnergyUnit = 1;
 pub const TICK_ENERGY_COST: EnergyUnit = 1;
@@ -112,10 +112,10 @@ pub use crate::wasm::types::RuntimeClass;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum AgentPriority {
-    SystemCritical = 0,  // idle, root
-    SystemService = 1,   // stated, policyd, accountd, netd
-    Normal = 2,          // user agents (default)
-    Background = 3,      // batch/idle workloads
+    SystemCritical = 0, // idle, root
+    SystemService = 1,  // stated, policyd, accountd, netd
+    Normal = 2,         // user agents (default)
+    Background = 3,     // batch/idle workloads
 }
 
 // ─── Agent mode ─────────────────────────────────────────────────────────────
@@ -131,6 +131,10 @@ pub enum AgentMode {
 // proof/replay/checkpoint bundles on the kernel stack. 16 KiB is not
 // enough for those frames and corrupts adjacent per-agent kernel stacks.
 pub const KERNEL_STACK_SIZE: usize = 65536;
+
+// User-mode agents reserve a Linux-like 128 KiB stack window so the
+// reported RLIMIT_STACK matches the bytes actually mapped.
+pub const USER_STACK_SIZE: usize = 128 * 1024;
 
 // ─── Agent status ───────────────────────────────────────────────────────────
 
@@ -229,12 +233,12 @@ pub struct Agent {
     pub capabilities: [Option<Capability>; MAX_CAPABILITIES_PER_AGENT],
     pub cap_count: usize,
     pub energy_budget: EnergyUnit,
-    pub memory_quota: u32,  // in pages
+    pub memory_quota: u32, // in pages
     pub memory_used: u32,
     pub mode: AgentMode,
     pub kernel_stack_top: u64,
-    pub stack_bottom: u64,   // address of stack guard canary (lowest stack address)
-    pub active: bool,       // whether this slot is in use
+    pub stack_bottom: u64, // address of stack guard canary (lowest stack address)
+    pub active: bool,      // whether this slot is in use
     pub priority: AgentPriority,
     // Stage 9: receipt state roots – snapshot of keyspace root at agent creation
     pub initial_state_root: [u8; 32],
@@ -417,7 +421,10 @@ pub fn is_child_of(child_id: AgentId, parent_id: AgentId) -> bool {
 /// Returns `Some((child_id, exit_status))` if found, where exit_status
 /// is `AgentStatus::Exited` or `AgentStatus::Faulted`.
 /// Returns `None` if no terminated child matches.
-pub fn find_terminated_child(parent_id: AgentId, specific_pid: i32) -> Option<(AgentId, AgentStatus)> {
+pub fn find_terminated_child(
+    parent_id: AgentId,
+    specific_pid: i32,
+) -> Option<(AgentId, AgentStatus)> {
     unsafe {
         for slot in AGENT_TABLE.iter() {
             if let Some(agent) = slot {

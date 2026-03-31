@@ -4,9 +4,9 @@
 //! clone3 is the critical syscall: it creates a child agent that shares the
 //! parent's keyspace and gets a deterministic, sequential agent_id.
 
-use crate::agent::{self, AgentId, AgentStatus};
+use crate::agent::{self, AgentId, AgentStatus, USER_STACK_SIZE};
 use crate::linux_compat::constants::*;
-use crate::linux_compat::state::{self, MAX_LINUX_AGENTS};
+use crate::linux_compat::state::{self, MAX_FDS, MAX_LINUX_AGENTS};
 use crate::sched;
 use crate::serial_println;
 
@@ -27,7 +27,15 @@ const FUTEX_PRIVATE_FLAG: u32 = 128;
 
 // ── FUTEX wait queue ──────────────────────────────────────────────────────
 
-const MAX_FUTEX_WAITERS: usize = 64;
+const MAX_FUTEX_WAITERS: usize = MAX_LINUX_AGENTS * 2;
+
+// Kerla-aligned execve envelope. execve itself is still stubbed, but the
+// interface limits are defined here so future argument parsing uses a
+// Linux-like shape instead of ad hoc fixed buffers.
+const EXECVE_ARG_MAX: usize = 512;
+const EXECVE_ARG_LEN_MAX: usize = 4096;
+const EXECVE_ENV_MAX: usize = 512;
+const EXECVE_ENV_LEN_MAX: usize = 4096;
 
 #[derive(Clone, Copy)]
 struct FutexWaiter {
@@ -246,6 +254,12 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
 pub fn sys_execve(_agent_id: u16, _pathname_ptr: u64, _argv_ptr: u64, _envp_ptr: u64) -> i64 {
     // Most programs don't execve after initial load in ATOS.
     // A full implementation would call crate::agent_loader::spawn_from_image().
+    let _execve_limits = (
+        EXECVE_ARG_MAX,
+        EXECVE_ARG_LEN_MAX,
+        EXECVE_ENV_MAX,
+        EXECVE_ENV_LEN_MAX,
+    );
     -ENOSYS
 }
 
@@ -1051,9 +1065,9 @@ pub fn sys_prlimit64(
     // struct rlimit { rlim_cur: u64, rlim_max: u64 } = 16 bytes
     if old_limit_ptr != 0 {
         let (cur, max) = match resource {
-            RLIMIT_NOFILE => (256u64, 256u64),
-            RLIMIT_STACK => (8 * 1024 * 1024, 8 * 1024 * 1024), // 8 MiB
-            _ => (u64::MAX, u64::MAX),                          // RLIM_INFINITY
+            RLIMIT_NOFILE => (MAX_FDS as u64, MAX_FDS as u64),
+            RLIMIT_STACK => (USER_STACK_SIZE as u64, USER_STACK_SIZE as u64),
+            _ => (u64::MAX, u64::MAX), // RLIM_INFINITY
         };
         unsafe {
             let dst = old_limit_ptr as *mut u64;

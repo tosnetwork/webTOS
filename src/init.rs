@@ -4,17 +4,17 @@
 //! Kernel-mode agents (idle, root, stated, policyd) run in ring 0.
 //! User-mode agents (ping, pong, bad) run in ring 3 with per-agent page tables.
 
-use crate::serial_println;
-use crate::agent::*;
 use crate::agent::AgentPriority;
-use crate::capability::*;
-use crate::sched;
-use crate::mailbox;
-use crate::state;
-use crate::event;
+use crate::agent::*;
 use crate::agents;
-use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
+use crate::arch::x86_64::paging;
+use crate::capability::*;
+use crate::event;
+use crate::mailbox;
+use crate::sched;
+use crate::serial_println;
+use crate::state;
 
 /// Stack guard magic value (same concept as Linux's STACK_END_MAGIC).
 /// Written at the bottom of every agent stack and checked on each context switch.
@@ -33,8 +33,8 @@ const AGENT_STACK_SIZE: usize = 65536;
 
 /// Static stacks for agents.
 ///
-/// Each agent gets a fixed 4 KiB stack allocated in BSS. This avoids
-/// the need for a dynamic allocator during early boot.
+/// Each agent gets a fixed 64 KiB kernel stack allocated in BSS. This
+/// avoids the need for a dynamic allocator during early boot.
 ///
 /// Safety: each stack is used by exactly one agent. Single-core Stage-1
 /// guarantees no concurrent access.
@@ -75,17 +75,12 @@ fn stack_top(agent_index: usize) -> u64 {
 
 #[inline(never)]
 fn prepare_user_code_page(agent_cr3: u64, code_start: u64, code_end: u64) {
-    let code_phys = paging::alloc_frame()
-        .expect("Failed to allocate user code page");
+    let code_phys = paging::alloc_frame().expect("Failed to allocate user code page");
     let code_size = (code_end - code_start) as usize;
     let code_size = code_size.min(paging::PAGE_SIZE);
     unsafe {
         core::ptr::write_bytes(code_phys as *mut u8, 0, paging::PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(
-            code_start as *const u8,
-            code_phys as *mut u8,
-            code_size,
-        );
+        core::ptr::copy_nonoverlapping(code_start as *const u8, code_phys as *mut u8, code_size);
     }
     paging::map_page(
         agent_cr3,
@@ -97,20 +92,24 @@ fn prepare_user_code_page(agent_cr3: u64, code_start: u64, code_end: u64) {
 }
 
 #[inline(never)]
-fn prepare_user_stack_page(agent_cr3: u64) -> u64 {
-    let stack_phys = paging::alloc_frame()
-        .expect("Failed to allocate user stack page");
-    unsafe {
-        core::ptr::write_bytes(stack_phys as *mut u8, 0, paging::PAGE_SIZE);
+fn prepare_user_stack_region(agent_cr3: u64) -> u64 {
+    debug_assert_eq!(USER_STACK_SIZE % paging::PAGE_SIZE, 0);
+
+    for page_idx in 0..(USER_STACK_SIZE / paging::PAGE_SIZE) {
+        let stack_phys = paging::alloc_frame().expect("Failed to allocate user stack page");
+        unsafe {
+            core::ptr::write_bytes(stack_phys as *mut u8, 0, paging::PAGE_SIZE);
+        }
+        paging::map_page(
+            agent_cr3,
+            USER_STACK_VADDR + (page_idx * paging::PAGE_SIZE) as u64,
+            stack_phys,
+            paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER,
+        )
+        .expect("Failed to map user stack page");
     }
-    paging::map_page(
-        agent_cr3,
-        USER_STACK_VADDR,
-        stack_phys,
-        paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER,
-    )
-    .expect("Failed to map user stack page");
-    USER_STACK_VADDR + paging::PAGE_SIZE as u64
+
+    USER_STACK_VADDR + USER_STACK_SIZE as u64
 }
 
 #[inline(never)]
@@ -213,7 +212,7 @@ const USER_STACK_VADDR: u64 = 0x4000_1000; // 1 GB + 4 KB
 ///
 /// 1. Creates a new page table (PML4) with kernel mapped as supervisor-only
 /// 2. Copies the agent's code to a user-accessible page at USER_CODE_VADDR
-/// 3. Allocates a user stack page at USER_STACK_VADDR
+/// 3. Allocates a user stack region at USER_STACK_VADDR
 /// 4. Maps both with PTE_USER
 /// 5. Returns the agent ID
 fn create_user_agent(
@@ -225,23 +224,17 @@ fn create_user_agent(
     caps: &[(CapType, u16)],
 ) -> AgentId {
     // 1. Create isolated address space
-    let agent_cr3 = paging::create_address_space()
-        .expect("Failed to create address space");
+    let agent_cr3 = paging::create_address_space().expect("Failed to create address space");
 
     // 2. Allocate user code page and copy agent code
     prepare_user_code_page(agent_cr3, code_start, code_end);
 
-    // 3. Allocate user stack page
-    let user_stack_top = prepare_user_stack_page(agent_cr3);
+    // 3. Allocate a 128 KiB user stack region
+    let user_stack_top = prepare_user_stack_region(agent_cr3);
 
     // 5. Create the agent (entry point is the user VIRTUAL address)
-    let agent_id = create_agent(
-        Some(parent_id),
-        USER_CODE_VADDR,
-        user_stack_top,
-        energy,
-        64,
-    ).expect("Failed to create user agent");
+    let agent_id = create_agent(Some(parent_id), USER_CODE_VADDR, user_stack_top, energy, 64)
+        .expect("Failed to create user agent");
 
     // 6. Set up user-mode context and metadata
     configure_user_agent(agent_id, agent_slot, agent_cr3, user_stack_top, caps);
@@ -335,7 +328,10 @@ fn attach_init_ebpf_programs() {
 
         match attach::attach(&program, attach::AttachPoint::MailboxSend(3), 128) {
             Ok(idx) => {
-                serial_println!("[INIT] eBPF program attached at MailboxSend(3), index={}", idx);
+                serial_println!(
+                    "[INIT] eBPF program attached at MailboxSend(3), index={}",
+                    idx
+                );
             }
             Err(e) => {
                 serial_println!("[INIT] eBPF attach failed: {:?}", e);
@@ -364,7 +360,10 @@ fn attach_init_ebpf_programs() {
 
         match attach::attach(&deny_program, attach::AttachPoint::MailboxSend(1), 128) {
             Ok(idx) => {
-                serial_println!("[INIT] eBPF DENY program attached at MailboxSend(1), index={}", idx);
+                serial_println!(
+                    "[INIT] eBPF DENY program attached at MailboxSend(1), index={}",
+                    idx
+                );
             }
             Err(e) => {
                 serial_println!("[INIT] eBPF deny attach failed: {:?}", e);
@@ -382,7 +381,9 @@ fn attach_init_ebpf_programs() {
 pub fn init() {
     // Disable interrupts during init to prevent the timer interrupt from
     // scheduling agents before their contexts are fully set up (cr3, stacks).
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
 
     serial_println!("[INIT] Creating system agents...");
 
@@ -390,12 +391,13 @@ pub fn init() {
     // The idle agent runs when no other agent is ready. It has no
     // capabilities and unlimited energy so it never gets suspended.
     let idle_id = create_agent(
-        None,                                // no parent
-        agents::idle::idle_entry as *const () as u64,     // entry point
-        stack_top(0),                        // stack
-        u64::MAX,                            // unlimited energy
-        16,                                  // minimal memory quota (pages)
-    ).expect("Failed to create idle agent");
+        None,                                         // no parent
+        agents::idle::idle_entry as *const () as u64, // entry point
+        stack_top(0),                                 // stack
+        u64::MAX,                                     // unlimited energy
+        16,                                           // minimal memory quota (pages)
+    )
+    .expect("Failed to create idle agent");
     if let Some(agent) = get_agent_mut(idle_id) {
         agent.stack_bottom = unsafe { AGENT_STACKS.stacks[0].as_ptr() as u64 };
         agent.priority = AgentPriority::SystemCritical;
@@ -405,12 +407,13 @@ pub fn init() {
     // ── Root agent (agent 1) ────────────────────────────────────────────
     let root_caps = create_root_capabilities();
     let root_id = create_agent(
-        None,                                  // no parent (root)
-        agents::root::root_entry as *const () as u64,       // entry point
-        stack_top(1),                          // stack
-        ROOT_AGENT_ENERGY_BUDGET,              // large energy budget
-        1024,                                  // memory quota (pages)
-    ).expect("Failed to create root agent");
+        None,                                         // no parent (root)
+        agents::root::root_entry as *const () as u64, // entry point
+        stack_top(1),                                 // stack
+        ROOT_AGENT_ENERGY_BUDGET,                     // large energy budget
+        1024,                                         // memory quota (pages)
+    )
+    .expect("Failed to create root agent");
 
     // Set stack guard address and grant root capabilities
     {
@@ -459,9 +462,12 @@ pub fn init() {
         user_bad_end as *const () as u64,
         4,
         10_000,
-        &[(CapType::EventEmit, 0)],  // NO send capability
+        &[(CapType::EventEmit, 0)], // NO send capability
     );
-    serial_println!("[INIT] Bad agent created: id={} (ring 3, no send caps)", bad_id);
+    serial_println!(
+        "[INIT] Bad agent created: id={} (ring 3, no send caps)",
+        bad_id
+    );
     event::agent_created(bad_id, root_id);
 
     // ── Stated agent (agent 5) ── state persistence manager ──────────
@@ -655,7 +661,10 @@ pub fn init() {
 
     // ── Write stack guard canaries at the bottom of every agent stack ──
     write_stack_guards();
-    serial_println!("[INIT] Stack guard canaries written ({:#x})", STACK_GUARD_MAGIC);
+    serial_println!(
+        "[INIT] Stack guard canaries written ({:#x})",
+        STACK_GUARD_MAGIC
+    );
 
     attach_init_ebpf_programs();
 

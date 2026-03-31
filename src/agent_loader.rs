@@ -9,12 +9,12 @@
 
 extern crate alloc;
 
-use crate::serial_println;
 use crate::agent::*;
-use crate::arch::x86_64::paging;
 use crate::arch::x86_64::context::new_user_context;
-use crate::sched;
+use crate::arch::x86_64::paging;
 use crate::mailbox;
+use crate::sched;
+use crate::serial_println;
 use crate::state;
 use crate::wasm;
 
@@ -38,6 +38,26 @@ static mut WASM_MODULES: [Option<wasm::decoder::WasmModule>; MAX_WASM_MODULES] =
 static mut WASM_RUNTIME_CLASSES: [wasm::types::RuntimeClass; MAX_WASM_MODULES] =
     [wasm::types::RuntimeClass::ProofGrade; MAX_WASM_MODULES];
 
+fn map_user_stack_region(agent_cr3: u64, user_stack_base: u64) -> Result<u64, i64> {
+    debug_assert_eq!(USER_STACK_SIZE % paging::PAGE_SIZE, 0);
+
+    for page_idx in 0..(USER_STACK_SIZE / paging::PAGE_SIZE) {
+        let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
+        }
+        paging::map_page(
+            agent_cr3,
+            user_stack_base + (page_idx * paging::PAGE_SIZE) as u64,
+            phys,
+            paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER,
+        )
+        .map_err(|_| E_QUOTA_EXCEEDED)?;
+    }
+
+    Ok(user_stack_base + USER_STACK_SIZE as u64)
+}
+
 /// Spawn a new agent from an in-memory binary image.
 ///
 /// # Arguments
@@ -56,7 +76,14 @@ pub fn spawn_from_image(
     energy: u64,
     mem_quota: u32,
 ) -> Result<AgentId, i64> {
-    spawn_from_image_with_class(caller_id, image, kind, energy, mem_quota, wasm::types::DEFAULT_RUNTIME_CLASS)
+    spawn_from_image_with_class(
+        caller_id,
+        image,
+        kind,
+        energy,
+        mem_quota,
+        wasm::types::DEFAULT_RUNTIME_CLASS,
+    )
 }
 
 /// Spawn a new agent with a specific RuntimeClass.
@@ -84,7 +111,9 @@ pub fn spawn_from_image_with_class(
 
     match kind {
         RuntimeKind::Native => spawn_native_elf(caller_id, image, energy, mem_quota),
-        RuntimeKind::Wasm => spawn_wasm_with_class(caller_id, image, energy, mem_quota, runtime_class),
+        RuntimeKind::Wasm => {
+            spawn_wasm_with_class(caller_id, image, energy, mem_quota, runtime_class)
+        }
         RuntimeKind::LinuxCompat => {
             // Linux compat agents are loaded as native ELF binaries
             // with the Linux syscall translation layer enabled.
@@ -130,7 +159,8 @@ fn spawn_native_elf(
         let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
 
         for page_idx in 0..pages_needed {
-            let page_offset = (page_idx as u64).checked_mul(paging::PAGE_SIZE as u64)
+            let page_offset = (page_idx as u64)
+                .checked_mul(paging::PAGE_SIZE as u64)
                 .ok_or(E_INVALID_ARG)?;
             let vaddr = seg.vaddr.checked_add(page_offset).ok_or(E_INVALID_ARG)?;
 
@@ -146,7 +176,8 @@ fn spawn_native_elf(
             let seg_page_start = page_offset as usize;
             let file_data_start = seg.file_offset as usize;
             if seg_page_start < seg.file_size as usize {
-                let copy_start = file_data_start.checked_add(seg_page_start)
+                let copy_start = file_data_start
+                    .checked_add(seg_page_start)
                     .ok_or(E_INVALID_ARG)?;
                 let remaining_file = (seg.file_size as usize).saturating_sub(seg_page_start);
                 let copy_len = remaining_file.min(paging::PAGE_SIZE);
@@ -170,13 +201,12 @@ fn spawn_native_elf(
             }
             let _ = is_exec; // NX bit handling deferred
 
-            paging::map_page(agent_cr3, vaddr, phys, flags)
-                .map_err(|_| E_QUOTA_EXCEEDED)?;
+            paging::map_page(agent_cr3, vaddr, phys, flags).map_err(|_| E_QUOTA_EXCEEDED)?;
         }
     }
 
-    // 4. Allocate user stack page — placed ABOVE the highest loaded segment
-    //    to avoid overwriting code/data.
+    // 4. Allocate a 128 KiB user stack region ABOVE the highest loaded
+    //    segment to avoid overwriting code/data.
     let mut highest_seg_end: u64 = USER_STACK_VADDR; // fallback
     for i in 0..elf_info.segment_count {
         if let Some(s) = &elf_info.segments[i] {
@@ -189,17 +219,9 @@ fn spawn_native_elf(
         }
     }
     // Align to page boundary and add a guard gap
-    let user_stack_base = (highest_seg_end + paging::PAGE_SIZE as u64) & !(paging::PAGE_SIZE as u64 - 1);
-
-    let stack_phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
-    unsafe {
-        core::ptr::write_bytes(stack_phys as *mut u8, 0, paging::PAGE_SIZE);
-    }
-    paging::map_page(
-        agent_cr3, user_stack_base, stack_phys,
-        paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER,
-    ).map_err(|_| E_QUOTA_EXCEEDED)?;
-    let user_stack_top = user_stack_base + paging::PAGE_SIZE as u64;
+    let user_stack_base =
+        (highest_seg_end + paging::PAGE_SIZE as u64) & !(paging::PAGE_SIZE as u64 - 1);
+    let user_stack_top = map_user_stack_region(agent_cr3, user_stack_base)?;
 
     // 5. Allocate kernel stack for syscall handling
     let k_stack_top = sched::allocate_agent_stack();
@@ -224,7 +246,9 @@ fn spawn_native_elf(
 
     serial_println!(
         "[AGENT_LOADER] Spawned native ELF agent {} (entry={:#x}, parent={})",
-        agent_id, entry, caller_id
+        agent_id,
+        entry,
+        caller_id
     );
 
     Ok(agent_id)
@@ -279,7 +303,9 @@ fn spawn_wasm_with_class(
     // 6. Set cr3 to current kernel page table (WASM agents run in kernel mode)
     if let Some(agent) = get_agent_mut(agent_id) {
         let cr3: u64;
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        }
         agent.context.cr3 = cr3;
     }
 
@@ -288,7 +314,8 @@ fn spawn_wasm_with_class(
 
     serial_println!(
         "[AGENT_LOADER] Spawned WASM agent {} (parent={})",
-        agent_id, caller_id
+        agent_id,
+        caller_id
     );
 
     Ok(agent_id)
@@ -303,33 +330,46 @@ fn spawn_wasm_with_class(
 pub extern "C" fn wasm_runner_entry() -> ! {
     let agent_id = sched::current();
 
-    serial_println!("[WASM_RUNNER] Agent {} starting dynamic WASM execution", agent_id);
+    serial_println!(
+        "[WASM_RUNNER] Agent {} starting dynamic WASM execution",
+        agent_id
+    );
 
     // Take ownership of the module from the table
     let module = unsafe {
         let slot = agent_id as usize;
         if slot >= MAX_WASM_MODULES {
-            serial_println!("[WASM_RUNNER] Agent {} has no WASM module (slot out of range)", agent_id);
-            loop { crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+            serial_println!(
+                "[WASM_RUNNER] Agent {} has no WASM module (slot out of range)",
+                agent_id
+            );
+            loop {
+                crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+            }
         }
         match WASM_MODULES[slot].take() {
             Some(m) => m,
             None => {
                 serial_println!("[WASM_RUNNER] Agent {} has no WASM module", agent_id);
-                loop { crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+                loop {
+                    crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+                }
             }
         }
     };
 
     // Find entry point: try "run", "_start", "main" in order
-    let run_idx = match module.find_export_func(b"run")
+    let run_idx = match module
+        .find_export_func(b"run")
         .or_else(|| module.find_export_func(b"_start"))
         .or_else(|| module.find_export_func(b"main"))
     {
         Some(idx) => idx,
         None => {
             serial_println!("[WASM_RUNNER] Agent {} missing entry point", agent_id);
-            loop { crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+            loop {
+                crate::syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+            }
         }
     };
 
@@ -342,7 +382,11 @@ pub extern "C" fn wasm_runner_entry() -> ! {
     let mut instance = match wasm::runtime::WasmInstance::with_class(module, fuel, rc) {
         Ok(inst) => inst,
         Err(e) => {
-            serial_println!("[WASM_RUNNER] Agent {} instantiation trapped: {:?}", agent_id, e);
+            serial_println!(
+                "[WASM_RUNNER] Agent {} instantiation trapped: {:?}",
+                agent_id,
+                e
+            );
             crate::syscall::syscall(SYS_EXIT, 1, 0, 0, 0, 0);
             loop {} // unreachable
         }
@@ -352,7 +396,11 @@ pub extern "C" fn wasm_runner_entry() -> ! {
     match instance.run_start() {
         wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
         wasm::runtime::ExecResult::Trap(e) => {
-            serial_println!("[WASM_RUNNER] Agent {} start function trapped: {:?}", agent_id, e);
+            serial_println!(
+                "[WASM_RUNNER] Agent {} start function trapped: {:?}",
+                agent_id,
+                e
+            );
             crate::syscall::syscall(SYS_EXIT, 1, 0, 0, 0, 0);
         }
         _ => {}
@@ -369,7 +417,9 @@ pub extern "C" fn wasm_runner_entry() -> ! {
                 if host_calls % 5000 == 1 {
                     serial_println!(
                         "[WASM_RUNNER] Agent {} host call #{} (import {})",
-                        agent_id, host_calls, import_idx
+                        agent_id,
+                        host_calls,
+                        import_idx
                     );
                 }
 
@@ -386,11 +436,11 @@ pub extern "C" fn wasm_runner_entry() -> ! {
                 result = instance.resume(ret_val);
             }
 
-            wasm::runtime::ExecResult::Ok
-            | wasm::runtime::ExecResult::Returned(_) => {
+            wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {
                 serial_println!(
                     "[WASM_RUNNER] Agent {} completed after {} host calls",
-                    agent_id, host_calls
+                    agent_id,
+                    host_calls
                 );
                 break;
             }
@@ -398,7 +448,8 @@ pub extern "C" fn wasm_runner_entry() -> ! {
             wasm::runtime::ExecResult::OutOfFuel => {
                 serial_println!(
                     "[WASM_RUNNER] Agent {} out of fuel after {} host calls",
-                    agent_id, host_calls
+                    agent_id,
+                    host_calls
                 );
                 break;
             }
@@ -409,7 +460,11 @@ pub extern "C" fn wasm_runner_entry() -> ! {
             }
 
             wasm::runtime::ExecResult::Exception(tag, _) => {
-                serial_println!("[WASM_RUNNER] Agent {} uncaught exception (tag {})", agent_id, tag);
+                serial_println!(
+                    "[WASM_RUNNER] Agent {} uncaught exception (tag {})",
+                    agent_id,
+                    tag
+                );
                 break;
             }
         }
@@ -448,9 +503,11 @@ pub fn load_from_disk(
     mem_quota: u32,
 ) -> Result<AgentId, i64> {
     // Validate sector range is within Agent Storage Region
-    let abs_start = AGENT_STORAGE_START.checked_add(disk_offset_sectors)
+    let abs_start = AGENT_STORAGE_START
+        .checked_add(disk_offset_sectors)
         .ok_or(E_INVALID_ARG)?;
-    let abs_end = abs_start.checked_add(size_sectors as u64)
+    let abs_end = abs_start
+        .checked_add(size_sectors as u64)
         .ok_or(E_INVALID_ARG)?;
     if abs_end > AGENT_STORAGE_END {
         return Err(E_INVALID_ARG);
@@ -462,7 +519,9 @@ pub fn load_from_disk(
     }
 
     // Calculate buffer size
-    let buf_size = (size_sectors as usize).checked_mul(512).ok_or(E_INVALID_ARG)?;
+    let buf_size = (size_sectors as usize)
+        .checked_mul(512)
+        .ok_or(E_INVALID_ARG)?;
 
     // Allocate temporary buffer via kernel heap
     let mut buf = alloc::vec![0u8; buf_size];
@@ -476,17 +535,24 @@ pub fn load_from_disk(
     while sectors_read < size_sectors {
         let remaining = size_sectors.saturating_sub(sectors_read);
         let count = remaining.min(batch_size);
-        let lba = abs_start.checked_add(sectors_read as u64).ok_or(E_INVALID_ARG)?;
-        let offset = (sectors_read as usize).checked_mul(512).ok_or(E_INVALID_ARG)?;
-        let end = offset.checked_add((count as usize).checked_mul(512).ok_or(E_INVALID_ARG)?)
+        let lba = abs_start
+            .checked_add(sectors_read as u64)
             .ok_or(E_INVALID_ARG)?;
-        dev.read(lba, count, &mut buf[offset..end]).map_err(|_| E_NOT_FOUND)?;
+        let offset = (sectors_read as usize)
+            .checked_mul(512)
+            .ok_or(E_INVALID_ARG)?;
+        let end = offset
+            .checked_add((count as usize).checked_mul(512).ok_or(E_INVALID_ARG)?)
+            .ok_or(E_INVALID_ARG)?;
+        dev.read(lba, count, &mut buf[offset..end])
+            .map_err(|_| E_NOT_FOUND)?;
         sectors_read = sectors_read.checked_add(count).ok_or(E_INVALID_ARG)?;
     }
 
     serial_println!(
         "[AGENT_LOADER] Read {} sectors from disk at LBA {}",
-        size_sectors, abs_start
+        size_sectors,
+        abs_start
     );
 
     // Spawn from the loaded bytes
@@ -497,10 +563,8 @@ pub fn load_from_disk(
 
 /// Common post-creation setup: create mailbox, keyspace, enqueue, emit event.
 fn finish_agent_setup(agent_id: AgentId, parent_id: AgentId) -> Result<(), i64> {
-    mailbox::create_mailbox(agent_id as MailboxId, agent_id)
-        .map_err(|_| E_QUOTA_EXCEEDED)?;
-    state::create_keyspace(agent_id as u16)
-        .map_err(|_| E_QUOTA_EXCEEDED)?;
+    mailbox::create_mailbox(agent_id as MailboxId, agent_id).map_err(|_| E_QUOTA_EXCEEDED)?;
+    state::create_keyspace(agent_id as u16).map_err(|_| E_QUOTA_EXCEEDED)?;
     // Snapshot initial state root and creation tick for receipts
     if let Some(agent) = crate::agent::get_agent_mut(agent_id) {
         let root32 = state::get_root(agent_id as u16).unwrap_or([0u8; 32]);
@@ -515,7 +579,8 @@ fn finish_agent_setup(agent_id: AgentId, parent_id: AgentId) -> Result<(), i64> 
 /// Calculate the number of 4 KiB pages needed for a given byte count.
 fn pages_for_bytes(bytes: u64) -> Option<usize> {
     let page_size = paging::PAGE_SIZE as u64;
-    bytes.checked_add(page_size.saturating_sub(1))
+    bytes
+        .checked_add(page_size.saturating_sub(1))
         .and_then(|v| v.checked_div(page_size))
         .map(|v| v as usize)
 }

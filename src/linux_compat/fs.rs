@@ -5,8 +5,8 @@
 //! to ATOS mailbox IPC.
 
 use super::constants::*;
-use super::state::{self, FdEntry, FdKind, MAX_FDS};
-use sha2::{Sha256, Digest};
+use super::state::{self, FdEntry, FdKind, MAX_FDS, MAX_PATH};
+use sha2::{Digest, Sha256};
 
 // ── Seek whence values ─────────────────────────────────────────────────────
 
@@ -29,7 +29,6 @@ const AT_EMPTY_PATH: u32 = 0x1000;
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 
-const MAX_PATH: usize = 256;
 const MAX_VALUE_SIZE: usize = 256;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -39,8 +38,7 @@ const MAX_VALUE_SIZE: usize = 256;
 fn path_to_key(path: &[u8]) -> u64 {
     let hash = Sha256::digest(path);
     u64::from_le_bytes([
-        hash[0], hash[1], hash[2], hash[3],
-        hash[4], hash[5], hash[6], hash[7],
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ])
 }
 
@@ -233,7 +231,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
 /// SHA-256, and a new fd is allocated in the agent's fd table.
 pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode: u32) -> i64 {
     let _ = dirfd; // AT_FDCWD or ignored; flat namespace in Stage-1
-    let _ = mode;  // permissions not enforced
+    let _ = mode; // permissions not enforced
 
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
@@ -275,7 +273,11 @@ pub fn sys_close(agent_id: u16, fd: i32) -> i64 {
         Some(s) => s,
         None => return -EBADF,
     };
-    if st.close_fd(fd) { 0 } else { -EBADF }
+    if st.close_fd(fd) {
+        0
+    } else {
+        -EBADF
+    }
 }
 
 // ── sys_fstat ──────────────────────────────────────────────────────────────
@@ -650,33 +652,31 @@ pub fn sys_fcntl(agent_id: u16, fd: i32, cmd: u32, arg: u64) -> i64 {
             }
             -EMFILE
         }
-        F_GETFD => {
-            match st.get_fd(fd) {
-                Some(e) if e.active => {
-                    if (e.flags & O_CLOEXEC) != 0 { 1 } else { 0 }
-                }
-                _ => -EBADF,
-            }
-        }
-        F_SETFD => {
-            match st.get_fd_mut(fd) {
-                Some(e) if e.active => {
-                    if (arg & 1) != 0 {
-                        e.flags |= O_CLOEXEC;
-                    } else {
-                        e.flags &= !O_CLOEXEC;
-                    }
+        F_GETFD => match st.get_fd(fd) {
+            Some(e) if e.active => {
+                if (e.flags & O_CLOEXEC) != 0 {
+                    1
+                } else {
                     0
                 }
-                _ => -EBADF,
             }
-        }
-        F_GETFL => {
-            match st.get_fd(fd) {
-                Some(e) if e.active => e.flags as i64,
-                _ => -EBADF,
+            _ => -EBADF,
+        },
+        F_SETFD => match st.get_fd_mut(fd) {
+            Some(e) if e.active => {
+                if (arg & 1) != 0 {
+                    e.flags |= O_CLOEXEC;
+                } else {
+                    e.flags &= !O_CLOEXEC;
+                }
+                0
             }
-        }
+            _ => -EBADF,
+        },
+        F_GETFL => match st.get_fd(fd) {
+            Some(e) if e.active => e.flags as i64,
+            _ => -EBADF,
+        },
         F_SETFL => {
             match st.get_fd_mut(fd) {
                 Some(e) if e.active => {
@@ -946,19 +946,27 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
                 match entry.kind {
                     FdKind::File => {
                         // Files are always ready for read and write
-                        if events & POLLIN != 0 { r |= POLLIN; }
-                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                        if events & POLLIN != 0 {
+                            r |= POLLIN;
+                        }
+                        if events & POLLOUT != 0 {
+                            r |= POLLOUT;
+                        }
                     }
                     FdKind::Socket | FdKind::Pipe => {
                         // Writable always; readable requires mailbox check
-                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                        if events & POLLOUT != 0 {
+                            r |= POLLOUT;
+                        }
                     }
                     FdKind::EventFd => {
                         // Readable if counter > 0 (counter stored in keyspace_key)
                         if events & POLLIN != 0 && entry.keyspace_key > 0 {
                             r |= POLLIN;
                         }
-                        if events & POLLOUT != 0 { r |= POLLOUT; }
+                        if events & POLLOUT != 0 {
+                            r |= POLLOUT;
+                        }
                     }
                     FdKind::Epoll => {}
                 }
@@ -968,7 +976,9 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
         };
 
         // Write revents back to user memory
-        unsafe { core::ptr::write((pfd_addr + 6) as *mut i16, revents); }
+        unsafe {
+            core::ptr::write((pfd_addr + 6) as *mut i16, revents);
+        }
 
         if revents != 0 {
             ready += 1;
@@ -1120,7 +1130,9 @@ pub fn sys_select(
 
     // Helper: test bit in fd_set (128-byte bitmask)
     let test_bit = |set_ptr: u64, fd: i32| -> bool {
-        if set_ptr == 0 { return false; }
+        if set_ptr == 0 {
+            return false;
+        }
         let byte_idx = (fd / 8) as u64;
         let bit_idx = (fd % 8) as u8;
         let byte_val = unsafe { core::ptr::read((set_ptr + byte_idx) as *const u8) };
@@ -1129,7 +1141,9 @@ pub fn sys_select(
 
     // Helper: set bit in fd_set
     let set_bit = |set_ptr: u64, fd: i32| {
-        if set_ptr == 0 { return; }
+        if set_ptr == 0 {
+            return;
+        }
         let byte_idx = (fd / 8) as u64;
         let bit_idx = (fd % 8) as u8;
         unsafe {
@@ -1140,7 +1154,9 @@ pub fn sys_select(
 
     // Helper: clear bit in fd_set
     let clear_bit = |set_ptr: u64, fd: i32| {
-        if set_ptr == 0 { return; }
+        if set_ptr == 0 {
+            return;
+        }
         let byte_idx = (fd / 8) as u64;
         let bit_idx = (fd % 8) as u8;
         unsafe {
@@ -1151,8 +1167,12 @@ pub fn sys_select(
 
     // First pass: clear all result bits
     for fd in 0..max_fd {
-        if readfds != 0 { clear_bit(readfds, fd); }
-        if writefds != 0 { clear_bit(writefds, fd); }
+        if readfds != 0 {
+            clear_bit(readfds, fd);
+        }
+        if writefds != 0 {
+            clear_bit(writefds, fd);
+        }
     }
 
     // Second pass: check readiness for each fd in ascending order (deterministic)
@@ -1160,10 +1180,14 @@ pub fn sys_select(
         let check_read = test_bit(readfds, fd) || (readfds != 0);
         let check_write = test_bit(writefds, fd) || (writefds != 0);
 
-        if !check_read && !check_write { continue; }
+        if !check_read && !check_write {
+            continue;
+        }
 
         if let Some(entry) = st.get_fd(fd) {
-            if !entry.active { continue; }
+            if !entry.active {
+                continue;
+            }
 
             let (can_read, can_write) = match entry.kind {
                 FdKind::File => (true, true),
@@ -1181,7 +1205,9 @@ pub fn sys_select(
                 set_bit(writefds, fd);
                 marked = true;
             }
-            if marked { ready += 1; }
+            if marked {
+                ready += 1;
+            }
         }
     }
 
@@ -1233,6 +1259,6 @@ pub fn sys_chdir(agent_id: u16, path_ptr: u64) -> i64 {
 
     let copy_len = path_len.min(st.cwd.len());
     st.cwd[..copy_len].copy_from_slice(&path_buf[..copy_len]);
-    st.cwd_len = copy_len as u8;
+    st.cwd_len = copy_len as u16;
     0
 }
