@@ -10,6 +10,7 @@ pub const MAX_EPOLL_INSTANCES: usize = 8;
 pub const MAX_LINUX_AGENTS: usize = MAX_AGENTS;
 pub const MAX_PATH: usize = 512;
 pub const MAX_DIRECTORY_HANDLES: usize = 64;
+pub const MAX_VMAS: usize = 1024;
 
 // ── FD types ────────────────────────────────────────────────────────────────
 
@@ -66,8 +67,53 @@ impl DirectoryHandle {
     }
 }
 
+// ── Linux user mappings ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VmaKind {
+    Empty = 0,
+    Anonymous = 1,
+    File = 2,
+}
+
+#[derive(Clone, Copy)]
+pub struct VmaEntry {
+    pub active: bool,
+    pub start: u64,
+    pub len: u64,
+    pub prot: u32,
+    pub flags: u32,
+    pub kind: VmaKind,
+    pub keyspace_id: u16,
+    pub keyspace_key: u64,
+    pub file_offset: u64,
+}
+
+impl VmaEntry {
+    pub const fn empty() -> Self {
+        VmaEntry {
+            active: false,
+            start: 0,
+            len: 0,
+            prot: 0,
+            flags: 0,
+            kind: VmaKind::Empty,
+            keyspace_id: 0,
+            keyspace_key: 0,
+            file_offset: 0,
+        }
+    }
+
+    #[inline]
+    pub fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
+
 // ── Epoll instance ──────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
 pub struct EpollInstance {
     pub active: bool,
     pub watched_fds: [i32; 16],
@@ -89,10 +135,12 @@ impl EpollInstance {
 pub struct LinuxAgentState {
     pub fd_table: [Option<FdEntry>; MAX_FDS],
     pub dir_handles: [DirectoryHandle; MAX_DIRECTORY_HANDLES],
+    pub vmas: [VmaEntry; MAX_VMAS],
     pub cwd: [u8; MAX_PATH],
     pub cwd_len: u16,
     pub brk_current: u64,
     pub mmap_next: u64,       // next deterministic mmap address
+    pub vm_space_owner: u16,  // Linux agent that owns the shared VM metadata
     pub pid: u32,             // = agent_id
     pub uid: u32,             // = 1000
     pub gid: u32,             // = 1000
@@ -101,8 +149,9 @@ pub struct LinuxAgentState {
     pub epoll_instances: [EpollInstance; MAX_EPOLL_INSTANCES],
     pub robust_list_head: u64,
     pub clear_child_tid: u64,
-    pub fs_base: u64,          // TLS FS base (arch_prctl SET_FS)
-    pub pending_signals: u64,  // bitmask of pending signals (bit N = signal N+1)
+    pub fs_base: u64,             // TLS FS base (arch_prctl SET_FS)
+    pub gs_base: u64,             // TLS GS base (arch_prctl SET_GS)
+    pub pending_signals: u64,     // bitmask of pending signals (bit N = signal N+1)
     pub exe_path: [u8; MAX_PATH], // executable path (for /proc/self/exe, AT_EXECFN)
     pub exe_path_len: u16,
     pub active: bool,
@@ -144,10 +193,12 @@ impl LinuxAgentState {
         LinuxAgentState {
             fd_table,
             dir_handles: [const { DirectoryHandle::empty() }; MAX_DIRECTORY_HANDLES],
+            vmas: [const { VmaEntry::empty() }; MAX_VMAS],
             cwd,
             cwd_len: 1,
             brk_current: 0x0060_0000, // conventional brk start
             mmap_next: 0x1_0000_0000, // deterministic base (4 GB)
+            vm_space_owner: agent_id,
             pid: agent_id as u32,
             uid: 1000,
             gid: 1000,
@@ -157,6 +208,7 @@ impl LinuxAgentState {
             robust_list_head: 0,
             clear_child_tid: 0,
             fs_base: 0,
+            gs_base: 0,
             pending_signals: 0,
             exe_path: [0u8; MAX_PATH],
             exe_path_len: 0,
@@ -252,6 +304,25 @@ impl LinuxAgentState {
         }
         self.dir_handles[handle_id as usize] = DirectoryHandle::empty();
     }
+
+    pub fn alloc_vma_slot(&mut self) -> Option<usize> {
+        for i in 0..MAX_VMAS {
+            if !self.vmas[i].active {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn find_vma_index(&self, addr: u64) -> Option<usize> {
+        for i in 0..MAX_VMAS {
+            let vma = &self.vmas[i];
+            if vma.active && addr >= vma.start && addr < vma.end() {
+                return Some(i);
+            }
+        }
+        None
+    }
 }
 
 // ── Global state table ──────────────────────────────────────────────────────
@@ -296,6 +367,25 @@ pub fn set_exe_path(agent_id: u16, path: &[u8]) {
         s.exe_path[..len].copy_from_slice(&path[..len]);
         s.exe_path_len = len as u16;
     }
+}
+
+/// Return true if the agent executable path matches `path`.
+pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
+    match get_state(agent_id) {
+        Some(s) => {
+            let len = s.exe_path_len as usize;
+            len == path.len() && s.exe_path[..len] == path[..]
+        }
+        None => false,
+    }
+}
+
+/// Return true if detailed Linux runtime tracing should be enabled for this agent.
+pub fn trace_runtime_agent(agent_id: u16) -> bool {
+    exe_path_eq(agent_id, b"/usr/bin/python3")
+        || exe_path_eq(agent_id, b"/usr/bin/node")
+        || exe_path_eq(agent_id, b"/app/hello_dynamic")
+        || exe_path_eq(agent_id, b"/usr/bin/hello_dynamic")
 }
 
 // ── Signal pending helpers ─────────────────────────────────────────────────
