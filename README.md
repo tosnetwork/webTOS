@@ -98,6 +98,27 @@ cd atos
 make run
 ```
 
+The default QEMU launch now uses `256M` of guest RAM. Override it with
+`QEMU_MEMORY=<size>` if you need a different setting.
+
+### Optional Linux Runtime Payloads
+
+Base-image payloads are declared through manifest files, not hardcoded in
+kernel Rust source:
+
+- `base_image.manifest` for repo-tracked payloads
+- `base_image.runtime.manifest` for host-specific runtime bundles
+
+The build script embeds both manifests automatically when present. To
+generate a host-specific runtime manifest for Python, Node.js, or OpenJDK:
+
+```bash
+python3 tools/generate_runtime_manifest.py
+```
+
+That script emits `base_image.runtime.manifest` with explicit file and tree
+entries for the selected runtimes and their shared-library dependencies.
+
 You will see agents booting, communicating via mailboxes, and enforcing policies:
 
 ```

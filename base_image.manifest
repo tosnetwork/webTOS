@@ -1,0 +1,16 @@
+# Base-image payload manifest
+#
+# Format:
+#   /atos/absolute/path = relative/or/absolute/host/path
+#   @tree /atos/prefix = relative/or/absolute/host/directory
+#
+# These files are embedded at build time and installed into the shared
+# base-image keyspace by the root agent during boot.
+#
+# Keep runtime payloads here instead of hardcoding individual include_bytes!
+# calls in kernel source. Large or host-specific runtime payload sets can be
+# emitted into `base_image.runtime.manifest`, which is loaded automatically
+# when present.
+
+/lib/ld-musl-x86_64.so.1 = test_data/musl_libc.so
+/usr/bin/hello_dynamic = test_data/hello_dynamic.elf

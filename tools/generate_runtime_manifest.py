@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+Generate base_image.runtime.manifest from host-installed runtimes.
+
+The generated manifest is consumed automatically by build.rs when present.
+It is intentionally host-specific and should usually stay uncommitted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+
+def run(cmd: list[str]) -> str:
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
+
+
+def resolve_executable(spec: str) -> Path:
+    candidate = Path(spec)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    resolved = shutil.which(spec)
+    if not resolved:
+        raise SystemExit(f"executable not found: {spec}")
+    return Path(resolved).resolve()
+
+
+def parse_ldd(binary: Path) -> list[Path]:
+    deps: list[Path] = []
+    output = run(["ldd", str(binary)])
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=>" in line:
+            _, rhs = line.split("=>", 1)
+            rhs = rhs.strip()
+            if rhs == "not found":
+                continue
+            path = rhs.split("(", 1)[0].strip()
+            if path.startswith("/"):
+                deps.append(Path(path).resolve())
+            continue
+        token = line.split("(", 1)[0].strip()
+        if token.startswith("/"):
+            deps.append(Path(token).resolve())
+    return deps
+
+
+def python_stdlib(python_bin: Path) -> Path:
+    code = (
+        "import sysconfig; "
+        "print(sysconfig.get_paths().get('stdlib', ''))"
+    )
+    output = run([str(python_bin), "-c", code]).strip()
+    if not output:
+        raise SystemExit("failed to discover Python stdlib path")
+    return Path(output).resolve()
+
+
+def java_home(java_bin: Path) -> Path:
+    output = run([str(java_bin), "-XshowSettings:properties", "-version"])
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("java.home = "):
+            return Path(line.split("=", 1)[1].strip()).resolve()
+    raise SystemExit("failed to discover java.home")
+
+
+def add_file(entries: OrderedDict[str, str], atos_path: str, host_path: Path) -> None:
+    entries[atos_path] = str(host_path.resolve())
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", default="base_image.runtime.manifest")
+    parser.add_argument("--python", default="python3")
+    parser.add_argument("--node", default="node")
+    parser.add_argument("--java", default="java")
+    parser.add_argument(
+        "--runtimes",
+        default="python,node,java",
+        help="comma-separated subset of: python,node,java",
+    )
+    parser.add_argument(
+        "--python-stdlib",
+        choices=("full", "encodings", "none"),
+        default="full",
+        help="how much Python stdlib to include",
+    )
+    parser.add_argument(
+        "--java-home",
+        choices=("full", "none"),
+        default="full",
+        help="whether to include the full java.home tree",
+    )
+    args = parser.parse_args()
+
+    runtimes = {item.strip() for item in args.runtimes.split(",") if item.strip()}
+    files: OrderedDict[str, str] = OrderedDict()
+    trees: OrderedDict[str, str] = OrderedDict()
+
+    if "python" in runtimes:
+        python_bin = resolve_executable(args.python)
+        add_file(files, "/usr/bin/python3", python_bin)
+        for dep in parse_ldd(python_bin):
+            add_file(files, dep.as_posix(), dep)
+
+        stdlib = python_stdlib(python_bin)
+        if args.python_stdlib == "full":
+            trees[f"@tree {stdlib.as_posix()}"] = stdlib.as_posix()
+        elif args.python_stdlib == "encodings":
+            enc_dir = stdlib / "encodings"
+            if enc_dir.is_dir():
+                trees[f"@tree {(Path(stdlib.as_posix()) / 'encodings').as_posix()}"] = enc_dir.as_posix()
+            for name in ("site.py", "os.py", "codecs.py"):
+                candidate = stdlib / name
+                if candidate.is_file():
+                    add_file(files, f"{stdlib.as_posix()}/{name}", candidate)
+
+    if "node" in runtimes:
+        node_bin = resolve_executable(args.node)
+        add_file(files, "/usr/bin/node", node_bin)
+        for dep in parse_ldd(node_bin):
+            add_file(files, dep.as_posix(), dep)
+
+    if "java" in runtimes:
+        java_bin = resolve_executable(args.java)
+        add_file(files, "/usr/bin/java", java_bin)
+        for dep in parse_ldd(java_bin):
+            add_file(files, dep.as_posix(), dep)
+
+        if args.java_home == "full":
+            home = java_home(java_bin)
+            trees[f"@tree {home.as_posix()}"] = home.as_posix()
+            etc_dir = Path("/etc/java-11-openjdk")
+            if etc_dir.is_dir():
+                trees[f"@tree {etc_dir.as_posix()}"] = etc_dir.as_posix()
+
+    lines = [
+        "# Auto-generated by tools/generate_runtime_manifest.py",
+        "# Host-specific runtime payloads. Re-generate on the machine that owns the binaries.",
+        "",
+    ]
+    for atos_path, host_path in files.items():
+        lines.append(f"{atos_path} = {host_path}")
+    if files and trees:
+        lines.append("")
+    for tree_decl, host_path in trees.items():
+        lines.append(f"{tree_decl} = {host_path}")
+
+    output_path = Path(args.output)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {output_path} ({len(files)} files, {len(trees)} trees)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

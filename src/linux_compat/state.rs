@@ -9,17 +9,19 @@ pub const MAX_FDS: usize = 1024;
 pub const MAX_EPOLL_INSTANCES: usize = 8;
 pub const MAX_LINUX_AGENTS: usize = MAX_AGENTS;
 pub const MAX_PATH: usize = 512;
+pub const MAX_DIRECTORY_HANDLES: usize = 64;
 
 // ── FD types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FdKind {
-    File = 0,    // keyspace-backed file
-    Socket = 1,  // netd proxy session
-    Pipe = 2,    // mailbox pair
-    Epoll = 3,   // epoll instance reference
-    EventFd = 4, // eventfd counter
+    File = 0,      // keyspace-backed file
+    Socket = 1,    // netd proxy session
+    Pipe = 2,      // mailbox pair
+    Epoll = 3,     // epoll instance reference
+    EventFd = 4,   // eventfd counter
+    Directory = 5, // virtual directory handle
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +49,23 @@ impl FdEntry {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct DirectoryHandle {
+    pub active: bool,
+    pub path: [u8; MAX_PATH],
+    pub path_len: u16,
+}
+
+impl DirectoryHandle {
+    pub const fn empty() -> Self {
+        DirectoryHandle {
+            active: false,
+            path: [0u8; MAX_PATH],
+            path_len: 0,
+        }
+    }
+}
+
 // ── Epoll instance ──────────────────────────────────────────────────────────
 
 pub struct EpollInstance {
@@ -69,6 +88,7 @@ impl EpollInstance {
 
 pub struct LinuxAgentState {
     pub fd_table: [Option<FdEntry>; MAX_FDS],
+    pub dir_handles: [DirectoryHandle; MAX_DIRECTORY_HANDLES],
     pub cwd: [u8; MAX_PATH],
     pub cwd_len: u16,
     pub brk_current: u64,
@@ -83,6 +103,8 @@ pub struct LinuxAgentState {
     pub clear_child_tid: u64,
     pub fs_base: u64,          // TLS FS base (arch_prctl SET_FS)
     pub pending_signals: u64,  // bitmask of pending signals (bit N = signal N+1)
+    pub exe_path: [u8; MAX_PATH], // executable path (for /proc/self/exe, AT_EXECFN)
+    pub exe_path_len: u16,
     pub active: bool,
 }
 
@@ -121,6 +143,7 @@ impl LinuxAgentState {
 
         LinuxAgentState {
             fd_table,
+            dir_handles: [const { DirectoryHandle::empty() }; MAX_DIRECTORY_HANDLES],
             cwd,
             cwd_len: 1,
             brk_current: 0x0060_0000, // conventional brk start
@@ -135,6 +158,8 @@ impl LinuxAgentState {
             clear_child_tid: 0,
             fs_base: 0,
             pending_signals: 0,
+            exe_path: [0u8; MAX_PATH],
+            exe_path_len: 0,
             active: true,
         }
     }
@@ -170,12 +195,62 @@ impl LinuxAgentState {
         if fd < 0 || fd as usize >= MAX_FDS {
             return false;
         }
-        if self.fd_table[fd as usize].is_some() {
+        if let Some(entry) = self.fd_table[fd as usize] {
+            if entry.kind == FdKind::Directory {
+                self.free_directory_handle(entry.keyspace_key as u16);
+            }
             self.fd_table[fd as usize] = None;
             true
         } else {
             false
         }
+    }
+
+    /// Allocate a lightweight directory handle that stores the opened path.
+    pub fn alloc_directory_handle(&mut self, path: &[u8]) -> Option<u16> {
+        let copy_len = path.len().min(MAX_PATH);
+        for i in 0..MAX_DIRECTORY_HANDLES {
+            if !self.dir_handles[i].active {
+                self.dir_handles[i] = DirectoryHandle::empty();
+                self.dir_handles[i].active = true;
+                self.dir_handles[i].path[..copy_len].copy_from_slice(&path[..copy_len]);
+                self.dir_handles[i].path_len = copy_len as u16;
+                return Some(i as u16);
+            }
+        }
+        None
+    }
+
+    /// Duplicate an existing directory handle by copying its stored path.
+    pub fn clone_directory_handle(&mut self, handle_id: u16) -> Option<u16> {
+        if handle_id as usize >= MAX_DIRECTORY_HANDLES {
+            return None;
+        }
+        let handle = self.dir_handles[handle_id as usize];
+        if !handle.active {
+            return None;
+        }
+        self.alloc_directory_handle(&handle.path[..handle.path_len as usize])
+    }
+
+    /// Get an immutable directory handle reference.
+    pub fn get_directory_handle(&self, handle_id: u16) -> Option<&DirectoryHandle> {
+        if handle_id as usize >= MAX_DIRECTORY_HANDLES {
+            return None;
+        }
+        let handle = &self.dir_handles[handle_id as usize];
+        if handle.active {
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
+    fn free_directory_handle(&mut self, handle_id: u16) {
+        if handle_id as usize >= MAX_DIRECTORY_HANDLES {
+            return;
+        }
+        self.dir_handles[handle_id as usize] = DirectoryHandle::empty();
     }
 }
 
@@ -211,6 +286,15 @@ pub fn init_state(agent_id: u16) {
             LINUX_STATES[agent_id as usize] = Some(LinuxAgentState::new(agent_id));
         }
         serial_println!("[linux_compat] initialized state for agent {}", agent_id);
+    }
+}
+
+/// Set the executable path for a Linux-compat agent.
+pub fn set_exe_path(agent_id: u16, path: &[u8]) {
+    if let Some(s) = get_state_mut(agent_id) {
+        let len = path.len().min(MAX_PATH);
+        s.exe_path[..len].copy_from_slice(&path[..len]);
+        s.exe_path_len = len as u16;
     }
 }
 

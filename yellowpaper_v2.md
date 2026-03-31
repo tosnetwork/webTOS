@@ -1554,7 +1554,164 @@ Request { request_type: GetProof (6), ... }
 → ProofBundle with Merkle sibling hashes for root recomputation
 ```
 
-### 28.5 Closing Statement
+### 28.5 Package Distribution Model
+
+ATOS is a sealed execution environment. It does **not** compile code, host registries, or download packages. All compilation and packaging happens on the developer's own machine. ATOS only receives pre-built binaries, executes them, and produces receipts.
+
+#### 28.5.1 Two Package Categories
+
+ATOS distinguishes two categories of packages with separate namespaces, distribution paths, and lifecycle rules.
+
+**Runtime Packages** (e.g., OpenJDK, CPython, Node.js, libc):
+
+| Aspect | Description |
+|--------|-------------|
+| Examples | `openjdk-21`, `python-3.12`, `node-22`, `musl-libc` |
+| Built by | Runtime vendor or ATOS team |
+| Built where | Developer/CI machine (never inside ATOS VM) |
+| Size | Tens of MB to hundreds of MB |
+| Installed to | Base image keyspace (shared, available to all contracts) |
+| Update frequency | Low (follows upstream release cadence) |
+| Registry path | `atos.im/runtimes/` |
+| Review | Signed by ATOS team; users verify before installing |
+
+**Contract Packages** (e.g., token.tos, dex.tos):
+
+| Aspect | Description |
+|--------|-------------|
+| Examples | `token-1.0.0.tos`, `dex-2.1.0.tos` |
+| Built by | Contract developer |
+| Built where | Developer's own machine (never inside ATOS VM) |
+| Size | Kilobytes to a few MB |
+| Installed to | Contract keyspace (per-contract, isolated) |
+| Update frequency | High (business iteration) |
+| Registry path | `atos.im/contracts/` |
+| Review | Community-published; consumers verify signature before installing |
+
+#### 28.5.2 Distribution Architecture
+
+```text
+┌──────────────────────────────────────────────────────┐
+│  atos.im Registry (external web service)             │
+│                                                      │
+│  /runtimes/openjdk-21.tar.gz                         │
+│  /runtimes/python-3.12.tar.gz                        │
+│  /runtimes/node-22.tar.gz                            │
+│                                                      │
+│  /contracts/token-1.0.0.tos                          │
+│  /contracts/dex-2.1.0.tos                            │
+├──────────────────────────────────────────────────────┤
+│  Separate namespaces, separate review processes      │
+└───────────┬─────────────────────────────┬────────────┘
+            │                             │
+     Operator downloads             Developer uploads
+            │                             │
+            ▼                             │
+┌───────────────────────┐                 │
+│  Operator's machine   │                 │
+│                       │                 │
+│  atp install openjdk  │←── download     │
+│  atp install token    │←── download     │
+│                       │                 │
+│  Developer's machine  │                 │
+│  1. Write contract    │                 │
+│  2. Compile locally   │                 │
+│  3. atp build/sign    │                 │
+│  4. atp publish ──────│─────────────────→ upload
+└───────────┬───────────┘
+            │ TCP: Deploy / Call
+            ▼
+┌───────────────────────┐
+│  ATOS VM              │
+│  (bare metal / QEMU)  │
+│                       │
+│  Receives binaries    │
+│  Executes             │
+│  Returns receipts     │
+│                       │
+│  Does NOT:            │
+│   - compile code      │
+│   - host registries   │
+│   - download packages │
+│   - access internet   │
+└───────────────────────┘
+```
+
+#### 28.5.3 Package Lifecycle
+
+**Runtime installation (operator-side):**
+
+```text
+1. Operator downloads runtime from atos.im (or builds from source)
+2. Operator verifies signature: atp verify openjdk-21.tar.gz
+3. Operator installs to ATOS base image:
+   → TCP Deploy with runtime files
+   → ATOS stores in BASE_IMAGE_KEYSPACE
+   → Available to all contracts on this ATOS instance
+4. Upgrade: same flow, new version replaces old
+```
+
+**Contract deployment (developer-side):**
+
+```text
+1. Developer writes contract code on their own machine
+2. Developer compiles: cargo build --target wasm32 (or gcc, javac, etc.)
+3. Developer packages: atp build --input contract.wasm
+4. Developer signs: atp sign contract.tos --key developer.key
+5. Developer publishes: atp publish contract.tos --registry atos.im
+6. Consumer downloads: atp install contract --from atos.im
+7. Consumer verifies: atp verify contract.tos --pubkey developer.pub
+8. Consumer deploys to ATOS: TCP Deploy → contract registered
+9. Anyone calls: TCP Call → execute → receipt
+```
+
+#### 28.5.4 What ATOS Does Not Do
+
+- ATOS does **not** compile source code inside the VM
+- ATOS does **not** run a package registry service
+- ATOS does **not** download packages from the internet
+- ATOS does **not** mix runtime packages with contract packages
+- Runtime packages and contract packages live in separate keyspaces and have separate trust models
+
+ATOS is a **sealed execution environment**: pre-built binaries go in, deterministic results and cryptographic receipts come out.
+
+#### 28.5.5 Registry API (atos.im — External Service)
+
+The registry at `atos.im` is an ordinary HTTP service, **not** part of the ATOS kernel:
+
+```text
+GET  /api/v1/runtimes                          List available runtimes
+GET  /api/v1/runtimes/{name}/{version}         Download runtime archive
+PUT  /api/v1/runtimes/{name}/{version}         Upload runtime (ATOS team only)
+
+GET  /api/v1/contracts                         List published contracts
+GET  /api/v1/contracts?q={query}               Search contracts
+GET  /api/v1/contracts/{name}/{version}        Download .tos package
+PUT  /api/v1/contracts/{name}/{version}        Publish .tos package (any developer)
+
+GET  /api/v1/contracts/{name}/{version}/sig    Download Ed25519 signature
+```
+
+Each `.tos` package contains:
+- Ed25519 signature (publisher identity)
+- Code hash (SHA-256, content-addressed)
+- Manifest (name, version, runtime type, energy estimate)
+
+#### 28.5.6 Licensing
+
+Runtime packages bundled by the ATOS project or distributed via `atos.im` must comply with their upstream licenses:
+
+| Runtime | License | Bundling Obligation |
+|---------|---------|---------------------|
+| OpenJDK | GPLv2 + Classpath Exception | Include license file; Classpath Exception allows proprietary applications |
+| CPython | PSF License (BSD-style) | Include license file + copyright notice |
+| Node.js | MIT | Include copyright notice |
+| musl libc | MIT | Include copyright notice |
+| glibc | LGPL | Dynamic linking (default); include library source if distributing glibc |
+
+A `LICENSES/` directory ships with each runtime package containing the applicable license texts.
+
+### 28.6 Closing Statement
 
 > ATOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
 

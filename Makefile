@@ -3,26 +3,27 @@
 KERNEL_DEBUG = target/x86_64-unknown-atos/debug/atos
 KERNEL_RELEASE = target/x86_64-unknown-atos/release/atos
 KERNEL_ELF32 = target/atos_32.elf
+QEMU_MEMORY ?= 256M
 
 build:
 	cargo build --release
 
 run: build
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
-	qemu-system-x86_64 -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown
+	qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown
 
 debug-build:
 	cargo build
 
 debug-run: debug-build
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_DEBUG) $(KERNEL_ELF32)
-	qemu-system-x86_64 -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown -s -S &
+	qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown -s -S &
 	@echo "GDB: target remote :1234"
 
 test: build
 	@echo "Running single-node test..."
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
-	timeout 8 qemu-system-x86_64 -serial stdio -display none -kernel $(KERNEL_ELF32) \
+	timeout 8 qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) \
 		-device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
 		-drive file=/tmp/atos_test.img,format=raw,if=ide \
 		-no-reboot -no-shutdown 2>&1 | head -50
@@ -41,7 +42,7 @@ uefi-build: build
 uefi-run: uefi-build
 	mkdir -p $(ESP_DIR)/EFI/BOOT
 	cp $(UEFI_EFI) $(ESP_DIR)/EFI/BOOT/BOOTX64.EFI
-	qemu-system-x86_64 -bios $(OVMF) \
+	qemu-system-x86_64 -m $(QEMU_MEMORY) -bios $(OVMF) \
 		-drive format=raw,file=fat:rw:$(ESP_DIR) \
 		-serial stdio -display none -no-reboot -no-shutdown
 
@@ -49,7 +50,7 @@ uefi-test: uefi-build
 	mkdir -p $(ESP_DIR)/EFI/BOOT
 	cp $(UEFI_EFI) $(ESP_DIR)/EFI/BOOT/BOOTX64.EFI
 	@echo "Running UEFI boot test..."
-	timeout 10 qemu-system-x86_64 -bios $(OVMF) \
+	timeout 10 qemu-system-x86_64 -m $(QEMU_MEMORY) -bios $(OVMF) \
 		-drive format=raw,file=fat:rw:$(ESP_DIR) \
 		-serial stdio -display none -no-reboot -no-shutdown 2>&1 | head -40
 

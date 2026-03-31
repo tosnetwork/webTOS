@@ -10,6 +10,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-none/release/atos}"
 ELF32="/tmp/atos_crossnode.elf"
+QEMU_MEMORY="${QEMU_MEMORY:-256M}"
 
 echo "=== ATOS Cross-Node Test ==="
 echo "Building kernel..."
@@ -18,6 +19,7 @@ objcopy -I elf64-x86-64 -O elf32-i386 "$KERNEL" "$ELF32"
 
 echo "Launching Node A (port 10000)..."
 timeout 8 qemu-system-x86_64 \
+    -m "$QEMU_MEMORY" \
     -serial file:/tmp/node_a.log \
     -display none \
     -kernel "$ELF32" \
@@ -30,6 +32,7 @@ sleep 1
 
 echo "Launching Node B (connect to port 10000)..."
 timeout 7 qemu-system-x86_64 \
+    -m "$QEMU_MEMORY" \
     -serial file:/tmp/node_b.log \
     -display none \
     -kernel "$ELF32" \

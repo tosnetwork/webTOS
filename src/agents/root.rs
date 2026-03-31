@@ -40,6 +40,66 @@ pub extern "C" fn root_entry() -> ! {
         }
     }
 
+    // Load argv/envp/auxv smoke test
+    {
+        static ARGV_ELF: &[u8] = include_bytes!("../../test_data/test_argv.elf");
+        serial_println!("[ROOT] Loading argv test binary ({} bytes)...", ARGV_ELF.len());
+        match crate::agent_loader::spawn_linux_agent(
+            1,
+            ARGV_ELF,
+            100_000,
+            64,
+            b"/app/test_argv",
+            &[b"/app/test_argv" as &[u8], b"--hello"],
+        ) {
+            Ok(id) => serial_println!("[ROOT] argv test agent created: id={}", id),
+            Err(e) => serial_println!("[ROOT] argv test load failed: error {}", e),
+        }
+    }
+
+    // ── Install embedded base-image files and test dynamic linking ─────────
+    {
+        serial_println!(
+            "[ROOT] {} embedded base-image file(s) available",
+            crate::base_image::embedded_file_count()
+        );
+
+        // Load a dynamically-linked ELF directly from memory.
+        static DYNAMIC_ELF: &[u8] = include_bytes!("../../test_data/hello_dynamic.elf");
+        serial_println!(
+            "[ROOT] Loading dynamic ELF test ({} bytes)...",
+            DYNAMIC_ELF.len()
+        );
+        match crate::agent_loader::spawn_linux_agent(
+            1,
+            DYNAMIC_ELF,
+            1_000_000,
+            512, // more memory for dynamic linker
+            b"/app/hello_dynamic",
+            &[b"/app/hello_dynamic" as &[u8]],
+        ) {
+            Ok(id) => serial_println!("[ROOT] dynamic ELF agent created: id={}", id),
+            Err(e) => serial_println!("[ROOT] dynamic ELF load failed: error {}", e),
+        }
+
+        static EXECVE_ELF: &[u8] = include_bytes!("../../test_data/test_execve.elf");
+        serial_println!(
+            "[ROOT] Loading execve smoke test ({} bytes)...",
+            EXECVE_ELF.len()
+        );
+        match crate::agent_loader::spawn_linux_agent(
+            1,
+            EXECVE_ELF,
+            100_000,
+            64,
+            b"/app/test_execve",
+            &[b"/app/test_execve" as &[u8]],
+        ) {
+            Ok(id) => serial_println!("[ROOT] execve smoke test agent created: id={}", id),
+            Err(e) => serial_println!("[ROOT] execve smoke test load failed: error {}", e),
+        }
+    }
+
     let mut count: u64 = 0;
     let mut checkpoint_done = false;
     loop {
