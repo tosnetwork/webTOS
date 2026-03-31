@@ -180,17 +180,8 @@ fn spawn_native_elf(
             }
         }
 
-        // TODO: Full dynamic linking support
-        // - Load the interpreter ELF (e.g. /lib64/ld-linux-x86-64.so.2) from VFS
-        // - Parse interpreter as a second ELF and load its segments at a
-        //   separate base address (e.g. 0x7F00_0000_0000)
-        // - Set entry point to the interpreter's entry point
-        // - Build an auxiliary vector (AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY,
-        //   AT_BASE) on the user stack so the interpreter can find the main binary
-        // For now, we load the main binary directly and use its own entry point.
-        // This works for static-PIE binaries (ET_DYN without actual shared libs).
         serial_println!(
-            "[AGENT_LOADER] Dynamic ELF: load_bias={:#x}, entry={:#x} (interpreter loading not yet implemented)",
+            "[AGENT_LOADER] Dynamic ELF: load_bias={:#x}, entry={:#x}",
             elf_info.load_bias,
             elf_info.entry_point
         );
@@ -263,6 +254,130 @@ fn spawn_native_elf(
         }
     }
 
+    // 3b. If dynamic: load the interpreter (ld-linux) and adjust entry point.
+    //     The interpreter is loaded at INTERP_BASE_VADDR, well above the main
+    //     binary, so address spaces don't collide.
+    const INTERP_BASE_VADDR: u64 = 0x7F00_0000;
+    let main_entry = elf_info.entry_point;
+    let main_phdr_vaddr = elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(|s| s.vaddr)
+        .min()
+        .unwrap_or(0);
+    let main_phnum = image.get(56..58).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0);
+    let main_phent = image.get(54..56).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(56);
+    let mut interp_base: u64 = 0;
+
+    let final_entry = if elf_info.is_dynamic && elf_info.interp_len > 0 {
+        // Extract interpreter path
+        let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+        let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+        let interp_path = &interp_bytes[..interp_end];
+
+        // Resolve interpreter path via VFS → base image keyspace
+        let (interp_ks, interp_key) = crate::linux_compat::vfs::resolve_path(0, interp_path);
+
+        // Load interpreter bytes from keyspace
+        let mut interp_buf = alloc::vec![0u8; 2 * 1024 * 1024]; // 2MB max for ld-linux
+        let interp_len = crate::state::load_multi_segment(interp_ks, interp_key, &mut interp_buf);
+
+        if interp_len == 0 {
+            // Interpreter not found in base image — fall back to main entry
+            serial_println!(
+                "[AGENT_LOADER] Interpreter not in base image, using main entry {:#x}",
+                main_entry
+            );
+            main_entry
+        } else {
+            serial_println!(
+                "[AGENT_LOADER] Loaded interpreter ({} bytes) from keyspace",
+                interp_len
+            );
+
+            // Parse interpreter ELF
+            match crate::loader::parse_elf64(&interp_buf[..interp_len]) {
+                Ok(mut interp_elf) => {
+                    // Apply load bias: place interpreter at INTERP_BASE_VADDR
+                    let interp_min_vaddr = interp_elf.segments[..interp_elf.segment_count]
+                        .iter()
+                        .filter_map(|s| s.as_ref())
+                        .map(|s| s.vaddr)
+                        .min()
+                        .unwrap_or(0);
+                    let bias = INTERP_BASE_VADDR - (interp_min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+                    interp_base = bias;
+
+                    interp_elf.entry_point = interp_elf.entry_point.wrapping_add(bias);
+                    for i in 0..interp_elf.segment_count {
+                        if let Some(ref mut seg) = interp_elf.segments[i] {
+                            seg.vaddr = seg.vaddr.wrapping_add(bias);
+                        }
+                    }
+
+                    // Load interpreter segments into agent address space
+                    for i in 0..interp_elf.segment_count {
+                        let seg = match &interp_elf.segments[i] {
+                            Some(s) => s,
+                            None => continue,
+                        };
+
+                        let pages_needed = pages_for_bytes(seg.mem_size).ok_or(E_INVALID_ARG)?;
+                        for page_idx in 0..pages_needed {
+                            let page_offset = (page_idx as u64)
+                                .checked_mul(paging::PAGE_SIZE as u64)
+                                .ok_or(E_INVALID_ARG)?;
+                            let vaddr = seg.vaddr.checked_add(page_offset).ok_or(E_INVALID_ARG)?;
+
+                            let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
+                            unsafe {
+                                core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
+                            }
+
+                            let seg_page_start = page_offset as usize;
+                            let file_data_start = seg.file_offset as usize;
+                            if seg_page_start < seg.file_size as usize {
+                                let copy_start = file_data_start + seg_page_start;
+                                let remaining_file = (seg.file_size as usize).saturating_sub(seg_page_start);
+                                let copy_len = remaining_file.min(paging::PAGE_SIZE);
+                                if copy_start + copy_len <= interp_len {
+                                    unsafe {
+                                        core::ptr::copy_nonoverlapping(
+                                            interp_buf.as_ptr().add(copy_start),
+                                            phys as *mut u8,
+                                            copy_len,
+                                        );
+                                    }
+                                }
+                            }
+
+                            let is_write = seg.flags & 0x2 != 0;
+                            let mut flags = paging::PTE_PRESENT | paging::PTE_USER;
+                            if is_write { flags |= paging::PTE_WRITABLE; }
+                            paging::map_page(agent_cr3, vaddr, phys, flags)
+                                .map_err(|_| E_QUOTA_EXCEEDED)?;
+                        }
+                    }
+
+                    serial_println!(
+                        "[AGENT_LOADER] Interpreter loaded at {:#x}, entry={:#x}",
+                        INTERP_BASE_VADDR,
+                        interp_elf.entry_point
+                    );
+
+                    // Entry point is the interpreter's entry, not the main binary's
+                    interp_elf.entry_point
+                }
+                Err(e) => {
+                    serial_println!("[AGENT_LOADER] Interpreter ELF parse failed: {:?}", e);
+                    main_entry
+                }
+            }
+        }
+    } else {
+        main_entry
+    };
+
     // 4. Allocate a 128 KiB user stack region ABOVE the highest loaded
     //    segment to avoid overwriting code/data.
     let mut highest_seg_end: u64 = USER_STACK_VADDR; // fallback
@@ -276,10 +391,70 @@ fn spawn_native_elf(
             }
         }
     }
+    // Also account for interpreter segments
+    if interp_base > 0 {
+        let interp_end = INTERP_BASE_VADDR + 2 * 1024 * 1024; // conservative
+        if interp_end > highest_seg_end {
+            highest_seg_end = interp_end;
+        }
+    }
     // Align to page boundary and add a guard gap
     let user_stack_base =
         (highest_seg_end + paging::PAGE_SIZE as u64) & !(paging::PAGE_SIZE as u64 - 1);
     let user_stack_top = map_user_stack_region(agent_cr3, user_stack_base)?;
+
+    // 4b. Build auxiliary vector (auxv) on the user stack for ld-linux.
+    //     The stack layout expected by the dynamic linker:
+    //       [stack top]
+    //       auxv: AT_NULL terminator
+    //       auxv: AT_ENTRY = main binary entry point
+    //       auxv: AT_BASE  = interpreter load base
+    //       auxv: AT_PHDR  = main binary program header address
+    //       auxv: AT_PHENT = size of each program header entry
+    //       auxv: AT_PHNUM = number of program header entries
+    //       auxv: AT_PAGESZ = page size
+    //       auxv: AT_RANDOM = pointer to 16 random bytes
+    //       envp: NULL
+    //       argv: NULL
+    //       argc: 0
+    //     Each auxv entry is { type: u64, value: u64 } = 16 bytes.
+    if elf_info.is_dynamic && interp_base > 0 {
+        // Write auxv below the stack top
+        let auxv_base = user_stack_top - 256; // 256 bytes for auxv + argc/argv/envp
+        let phdr_addr = main_phdr_vaddr + elf_info.load_bias; // program headers in memory
+
+        let auxv: [(u64, u64); 8] = [
+            (9,  final_entry),         // AT_ENTRY: main binary entry
+            (7,  interp_base),         // AT_BASE: interpreter base address
+            (3,  phdr_addr),           // AT_PHDR: program header table address
+            (4,  main_phent as u64),   // AT_PHENT: size of phdr entry
+            (5,  main_phnum as u64),   // AT_PHNUM: number of phdr entries
+            (6,  paging::PAGE_SIZE as u64), // AT_PAGESZ
+            (25, auxv_base + 128),     // AT_RANDOM: pointer to 16 "random" bytes
+            (0,  0),                   // AT_NULL: terminator
+        ];
+
+        unsafe {
+            let p = auxv_base as *mut u64;
+            // argc = 0
+            core::ptr::write(p, 0);
+            // argv[0] = NULL
+            core::ptr::write(p.add(1), 0);
+            // envp[0] = NULL
+            core::ptr::write(p.add(2), 0);
+            // auxv starts at offset 24
+            let auxv_ptr = p.add(3);
+            for (i, (atype, aval)) in auxv.iter().enumerate() {
+                core::ptr::write(auxv_ptr.add(i * 2), *atype);
+                core::ptr::write(auxv_ptr.add(i * 2 + 1), *aval);
+            }
+            // Write 16 deterministic "random" bytes at AT_RANDOM pointer
+            let random_ptr = (auxv_base + 128) as *mut u8;
+            for i in 0..16u8 {
+                core::ptr::write(random_ptr.add(i as usize), i.wrapping_add(0x42));
+            }
+        }
+    }
 
     // 5. Allocate kernel stack for syscall handling
     let k_stack_top = sched::allocate_agent_stack();
@@ -287,15 +462,22 @@ fn spawn_native_elf(
         return Err(E_QUOTA_EXCEEDED);
     }
 
-    // 6. Create the agent with the ELF entry point
-    let entry = elf_info.entry_point;
+    // 6. Create the agent with the FINAL entry point
+    //    (interpreter entry for dynamic, main entry for static)
+    let entry = final_entry;
     let agent_id = create_agent(Some(caller_id), entry, user_stack_top, energy, mem_quota)?;
 
     // 7. Configure user-mode context
+    //    For dynamic binaries, RSP points to the auxv area so ld-linux can find it.
+    let initial_rsp = if elf_info.is_dynamic && interp_base > 0 {
+        user_stack_top - 256 // RSP points to argc at auxv_base
+    } else {
+        user_stack_top
+    };
     if let Some(agent) = get_agent_mut(agent_id) {
         agent.mode = AgentMode::User;
         agent.kernel_stack_top = k_stack_top;
-        agent.context = new_user_context(entry, user_stack_top, k_stack_top);
+        agent.context = new_user_context(entry, initial_rsp, k_stack_top);
         agent.context.cr3 = agent_cr3;
     }
 
