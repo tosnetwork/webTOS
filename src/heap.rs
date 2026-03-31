@@ -1,68 +1,76 @@
-//! ATOS Kernel Heap Allocator
+//! ATOS kernel heap allocator.
 //!
-//! A simple linked-list free-list allocator that obtains 4KB pages from the
-//! frame allocator and manages sub-page allocations for kernel data structures.
-//!
-//! Registered as Rust's `#[global_allocator]` so the `alloc` crate (`Vec`,
-//! `Box`, `String`, etc.) works in the kernel.
-//!
-//! Design: single-core only (Stage-1/2). Interrupt-safe via CLI/STI around
-//! critical sections.
+//! Small allocations use page-backed slab caches. Larger allocations fall back
+//! to contiguous frame allocation. This keeps the external `#[global_allocator]`
+//! entry point unchanged while reducing fragmentation and linear free-list
+//! scans in the hot path.
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::ptr;
 
 use crate::arch::x86_64::paging;
 
-/// Page size obtained from the frame allocator.
 const PAGE_SIZE: usize = 4096;
-
-/// Minimum allocation alignment (8 bytes for u64 / pointer alignment).
 const MIN_ALIGN: usize = 8;
+const SLAB_MAGIC: u32 = 0x534C_4142;
+const LARGE_MAGIC: u32 = 0x4C41_5247;
+const SLAB_CLASSES: [usize; 9] = [8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+const NUM_SLAB_CLASSES: usize = SLAB_CLASSES.len();
 
-/// Minimum block size: must be large enough to hold a `FreeBlock` header.
-const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
-
-/// Header stored at the start of every free block in the free list.
 #[repr(C)]
-struct FreeBlock {
-    /// Usable size of this block (not including this header — the header
-    /// *overlaps* the free space since we only need it while the block is free).
-    /// Actually, we store the *total* size of the region (header + payload)
-    /// so we can coalesce and split correctly.
-    size: usize,
-    next: *mut FreeBlock,
+struct FreeSlot {
+    next: *mut FreeSlot,
 }
 
-/// A simple linked-list heap allocator.
-///
-/// The free list is an intrusive singly-linked list threaded through free
-/// blocks. When the list cannot satisfy a request we ask the frame allocator
-/// for a fresh 4KB page (or multiple pages for large allocations).
+#[repr(C)]
+struct SlabPage {
+    magic: u32,
+    class_index: u16,
+    in_partial: u8,
+    _reserved: u8,
+    slot_size: u16,
+    slot_offset: u16,
+    capacity: u16,
+    free_count: u16,
+    next_partial: *mut SlabPage,
+    free_head: *mut FreeSlot,
+}
+
+#[repr(C)]
+struct LargeAllocHeader {
+    magic: u32,
+    pages: u32,
+    base: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SlabClass {
+    partial: *mut SlabPage,
+}
+
+impl SlabClass {
+    const fn new() -> Self {
+        Self {
+            partial: ptr::null_mut(),
+        }
+    }
+}
+
 pub struct KernelAllocator {
-    /// Head of the free list. We use `UnsafeCell` because `GlobalAlloc`
-    /// takes `&self` but we need interior mutability. Safety is ensured
-    /// by disabling interrupts (single-core).
-    head: core::cell::UnsafeCell<*mut FreeBlock>,
+    classes: UnsafeCell<[SlabClass; NUM_SLAB_CLASSES]>,
 }
 
-// Safety: single-core kernel — no concurrent access.
 unsafe impl Sync for KernelAllocator {}
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::new();
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Align `value` up to the next multiple of `align` (must be a power of two).
 #[inline]
 const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-/// Disable interrupts and return whether they were previously enabled.
 #[inline]
 unsafe fn cli() -> bool {
     let flags: u64;
@@ -70,7 +78,6 @@ unsafe fn cli() -> bool {
     flags & (1 << 9) != 0
 }
 
-/// Re-enable interrupts if `was_enabled` is true.
 #[inline]
 unsafe fn restore_interrupts(was_enabled: bool) {
     if was_enabled {
@@ -80,167 +87,223 @@ unsafe fn restore_interrupts(was_enabled: bool) {
 
 impl KernelAllocator {
     pub const fn new() -> Self {
-        KernelAllocator {
-            head: core::cell::UnsafeCell::new(ptr::null_mut()),
+        Self {
+            classes: UnsafeCell::new([const { SlabClass::new() }; NUM_SLAB_CLASSES]),
         }
     }
 
-    /// Add a region of memory `[addr, addr+size)` to the free list.
-    ///
-    /// # Safety
-    /// The region must be valid, writable, and not overlap with any existing
-    /// allocation or free block.
-    unsafe fn add_free_region(&self, addr: usize, size: usize) {
-        debug_assert!(size >= MIN_BLOCK_SIZE);
-        debug_assert!(addr % MIN_ALIGN == 0);
-
-        let block = addr as *mut FreeBlock;
-        let head = self.head.get();
-
-        (*block).size = size;
-        (*block).next = *head;
-        *head = block;
+    #[inline]
+    fn slab_class_index(layout: Layout) -> Option<usize> {
+        let size = layout.size().max(1);
+        let need = size.max(layout.align()).max(MIN_ALIGN);
+        SLAB_CLASSES.iter().position(|&slot_size| slot_size >= need)
     }
 
-    /// Try to obtain new pages from the frame allocator and add them to the
-    /// free list. Returns `true` on success.
-    unsafe fn grow(&self, required: usize) -> bool {
-        // Number of pages we need to satisfy `required` bytes.
-        let pages_needed = align_up(required, PAGE_SIZE) / PAGE_SIZE;
+    #[inline]
+    unsafe fn classes_mut(&self) -> &mut [SlabClass; NUM_SLAB_CLASSES] {
+        &mut *self.classes.get()
+    }
 
-        // Try to allocate contiguous pages. Because the bitmap allocator
-        // hands out frames in roughly ascending order, consecutive calls
-        // often return adjacent frames. We attempt to get `pages_needed`
-        // frames and merge them if contiguous; otherwise we add each page
-        // individually.
+    unsafe fn insert_partial(
+        &self,
+        classes: &mut [SlabClass; NUM_SLAB_CLASSES],
+        class_index: usize,
+        slab: *mut SlabPage,
+    ) {
+        debug_assert!((*slab).in_partial == 0);
+        (*slab).next_partial = classes[class_index].partial;
+        (*slab).in_partial = 1;
+        classes[class_index].partial = slab;
+    }
 
-        let mut base: usize = 0;
-        let mut contiguous_len: usize = 0;
+    unsafe fn remove_partial(
+        &self,
+        classes: &mut [SlabClass; NUM_SLAB_CLASSES],
+        class_index: usize,
+        slab: *mut SlabPage,
+    ) -> bool {
+        let mut prev: *mut SlabPage = ptr::null_mut();
+        let mut current = classes[class_index].partial;
 
-        for _ in 0..pages_needed {
-            match paging::alloc_frame() {
-                Some(phys) => {
-                    let addr = phys as usize;
-                    if contiguous_len > 0 && addr == base + contiguous_len {
-                        // Extends current contiguous run.
-                        contiguous_len += PAGE_SIZE;
-                    } else {
-                        // Flush previous contiguous run (if any).
-                        if contiguous_len > 0 {
-                            self.add_free_region(base, contiguous_len);
-                        }
-                        base = addr;
-                        contiguous_len = PAGE_SIZE;
-                    }
+        while !current.is_null() {
+            if current == slab {
+                let next = (*current).next_partial;
+                if prev.is_null() {
+                    classes[class_index].partial = next;
+                } else {
+                    (*prev).next_partial = next;
                 }
-                None => {
-                    // Flush whatever we managed to collect.
-                    if contiguous_len > 0 {
-                        self.add_free_region(base, contiguous_len);
-                    }
-                    return contiguous_len > 0;
-                }
+                (*current).next_partial = ptr::null_mut();
+                (*current).in_partial = 0;
+                return true;
             }
+            prev = current;
+            current = (*current).next_partial;
         }
 
-        if contiguous_len > 0 {
-            self.add_free_region(base, contiguous_len);
+        false
+    }
+
+    unsafe fn allocate_slab(
+        &self,
+        classes: &mut [SlabClass; NUM_SLAB_CLASSES],
+        class_index: usize,
+    ) -> Option<*mut SlabPage> {
+        let slot_size = SLAB_CLASSES[class_index];
+        let base = paging::alloc_frame_with_kind(paging::FrameKind::KernelHeap)? as usize;
+        let slab = base as *mut SlabPage;
+        let slot_offset = align_up(core::mem::size_of::<SlabPage>(), slot_size);
+
+        if slot_offset >= PAGE_SIZE {
+            let _ = paging::release_frame(base as u64);
+            return None;
         }
 
-        true
+        let capacity = (PAGE_SIZE - slot_offset) / slot_size;
+        if capacity == 0 || capacity > u16::MAX as usize {
+            let _ = paging::release_frame(base as u64);
+            return None;
+        }
+
+        (*slab).magic = SLAB_MAGIC;
+        (*slab).class_index = class_index as u16;
+        (*slab).in_partial = 0;
+        (*slab)._reserved = 0;
+        (*slab).slot_size = slot_size as u16;
+        (*slab).slot_offset = slot_offset as u16;
+        (*slab).capacity = capacity as u16;
+        (*slab).free_count = capacity as u16;
+        (*slab).next_partial = ptr::null_mut();
+        (*slab).free_head = ptr::null_mut();
+
+        for slot_index in (0..capacity).rev() {
+            let slot_addr = base + slot_offset + slot_index * slot_size;
+            let slot = slot_addr as *mut FreeSlot;
+            (*slot).next = (*slab).free_head;
+            (*slab).free_head = slot;
+        }
+
+        self.insert_partial(classes, class_index, slab);
+        Some(slab)
+    }
+
+    unsafe fn alloc_small(&self, class_index: usize) -> *mut u8 {
+        let classes = self.classes_mut();
+        if classes[class_index].partial.is_null() && self.allocate_slab(classes, class_index).is_none()
+        {
+            return ptr::null_mut();
+        }
+
+        let slab = classes[class_index].partial;
+        if slab.is_null() || (*slab).free_head.is_null() {
+            return ptr::null_mut();
+        }
+
+        let slot = (*slab).free_head;
+        (*slab).free_head = (*slot).next;
+        (*slab).free_count -= 1;
+
+        if (*slab).free_count == 0 {
+            classes[class_index].partial = (*slab).next_partial;
+            (*slab).next_partial = ptr::null_mut();
+            (*slab).in_partial = 0;
+        }
+
+        slot as *mut u8
+    }
+
+    unsafe fn dealloc_small(&self, ptr: *mut u8, class_index: usize) {
+        let classes = self.classes_mut();
+        let slab_base = (ptr as usize) & !(PAGE_SIZE - 1);
+        let slab = slab_base as *mut SlabPage;
+
+        debug_assert_eq!((*slab).magic, SLAB_MAGIC);
+        debug_assert_eq!((*slab).class_index as usize, class_index);
+
+        let was_full = (*slab).free_count == 0;
+        let slot = ptr as *mut FreeSlot;
+        (*slot).next = (*slab).free_head;
+        (*slab).free_head = slot;
+        (*slab).free_count += 1;
+
+        if (*slab).free_count == (*slab).capacity {
+            if (*slab).in_partial != 0 {
+                let _ = self.remove_partial(classes, class_index, slab);
+            }
+            (*slab).magic = 0;
+            let _ = paging::release_frame(slab_base as u64);
+            return;
+        }
+
+        if was_full && (*slab).in_partial == 0 {
+            self.insert_partial(classes, class_index, slab);
+        }
+    }
+
+    unsafe fn alloc_large(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size().max(1);
+        let header_size = core::mem::size_of::<LargeAllocHeader>();
+        let align = layout
+            .align()
+            .max(MIN_ALIGN)
+            .max(core::mem::align_of::<LargeAllocHeader>());
+
+        let total = match size
+            .checked_add(header_size)
+            .and_then(|value| value.checked_add(align - 1))
+        {
+            Some(total) => total,
+            None => return ptr::null_mut(),
+        };
+
+        let pages = align_up(total, PAGE_SIZE) / PAGE_SIZE;
+        let base = match paging::alloc_contiguous_frames_with_kind(pages, paging::FrameKind::KernelHeap)
+        {
+            Some(base) => base,
+            None => return ptr::null_mut(),
+        };
+
+        let payload = align_up(base as usize + header_size, align);
+        let header = (payload - header_size) as *mut LargeAllocHeader;
+        (*header).magic = LARGE_MAGIC;
+        (*header).pages = pages as u32;
+        (*header).base = base;
+        payload as *mut u8
+    }
+
+    unsafe fn dealloc_large(&self, ptr: *mut u8) {
+        let header_size = core::mem::size_of::<LargeAllocHeader>();
+        let header = (ptr as usize - header_size) as *mut LargeAllocHeader;
+
+        debug_assert_eq!((*header).magic, LARGE_MAGIC);
+        let _ = paging::release_contiguous_frames((*header).base, (*header).pages as usize);
     }
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let was_enabled = cli();
-
-        let align = layout.align().max(MIN_ALIGN);
-        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_ALIGN);
-
-        // Search for a suitable block (first-fit).
-        let result = self.find_and_remove(size, align);
-
-        if let Some(ptr) = result {
-            restore_interrupts(was_enabled);
-            return ptr;
-        }
-
-        // Free list couldn't satisfy — grow the heap.
-        // We need at least `size + align` to guarantee we can align within
-        // the allocated region (worst case alignment waste).
-        let grow_size = (size + align).max(PAGE_SIZE);
-        if !self.grow(grow_size) {
-            restore_interrupts(was_enabled);
-            return ptr::null_mut();
-        }
-
-        // Retry after growing.
-        let result = self.find_and_remove(size, align);
+        let ptr = match Self::slab_class_index(layout) {
+            Some(class_index) => self.alloc_small(class_index),
+            None => self.alloc_large(layout),
+        };
         restore_interrupts(was_enabled);
-        result.unwrap_or(ptr::null_mut())
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+
         let was_enabled = cli();
-
-        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_ALIGN);
-        self.add_free_region(ptr as usize, size);
-
+        match Self::slab_class_index(layout) {
+            Some(class_index) => self.dealloc_small(ptr, class_index),
+            None => self.dealloc_large(ptr),
+        }
         restore_interrupts(was_enabled);
     }
 }
-
-impl KernelAllocator {
-    /// Search the free list for a block that can satisfy `size` bytes with
-    /// `align` alignment. If found, remove (or split) it and return the
-    /// aligned pointer.
-    unsafe fn find_and_remove(&self, size: usize, align: usize) -> Option<*mut u8> {
-        let head = self.head.get();
-        let mut prev: *mut *mut FreeBlock = head;
-        let mut current = *head;
-
-        while !current.is_null() {
-            let block_start = current as usize;
-            let block_size = (*current).size;
-            let block_end = block_start + block_size;
-
-            // Where the allocation would start within this block, respecting
-            // alignment.
-            let alloc_start = align_up(block_start, align);
-            let alloc_end = alloc_start + size;
-
-            if alloc_end <= block_end {
-                // This block fits. Remove it from the list first.
-                *prev = (*current).next;
-
-                // Front padding: if `alloc_start > block_start`, we have
-                // unused space at the front that we can return to the free list.
-                let front_pad = alloc_start - block_start;
-                if front_pad >= MIN_BLOCK_SIZE {
-                    self.add_free_region(block_start, front_pad);
-                }
-
-                // Back padding: unused space after the allocation.
-                let back_pad = block_end - alloc_end;
-                if back_pad >= MIN_BLOCK_SIZE {
-                    self.add_free_region(alloc_end, back_pad);
-                }
-
-                return Some(alloc_start as *mut u8);
-            }
-
-            prev = &mut (*current).next;
-            current = (*current).next;
-        }
-
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Alloc error handler
-// ---------------------------------------------------------------------------
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {

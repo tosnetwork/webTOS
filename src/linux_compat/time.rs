@@ -68,6 +68,21 @@ pub fn sys_clock_gettime(_agent_id: u16, _clk_id: u64, tp_ptr: u64) -> i64 {
     0
 }
 
+// ── time ───────────────────────────────────────────────────────────────────
+
+/// time(time_t *tloc)
+///
+/// Returns deterministic seconds derived from the global tick counter.
+pub fn sys_time(_agent_id: u16, tloc_ptr: u64) -> i64 {
+    let (sec, _) = ticks_to_timespec();
+    if tloc_ptr != 0 {
+        unsafe {
+            core::ptr::write_volatile(tloc_ptr as *mut i64, sec as i64);
+        }
+    }
+    sec as i64
+}
+
 // ── nanosleep ──────────────────────────────────────────────────────────────
 
 /// nanosleep(const struct timespec *req, struct timespec *rem)

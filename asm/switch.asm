@@ -29,6 +29,8 @@
 ;   128     r15
 ;   136     rflags
 ;   144     cr3
+;   152     padding
+;   160     fxsave area (512 bytes, 16-byte aligned)
 ;
 ; For a cooperative context switch (called from Rust code), we only need
 ; to save/restore callee-saved registers (rbx, rbp, r12-r15, rsp) plus
@@ -62,6 +64,7 @@ global context_switch
 %define CTX_R15     128
 %define CTX_RFLAGS  136
 %define CTX_CR3     144
+%define CTX_FX      160
 
 context_switch:
     ; Arguments (System V AMD64):
@@ -93,6 +96,9 @@ context_switch:
     mov rax, cr3
     mov [rdi + CTX_CR3], rax
 
+    ; Save x87/SSE state for the outgoing context.
+    fxsave [rdi + CTX_FX]
+
     ; ── Restore new context ──
 
     ; Restore callee-saved general-purpose registers
@@ -110,6 +116,9 @@ context_switch:
     je .skip_cr3
     mov cr3, rax
 .skip_cr3:
+
+    ; Restore x87/SSE state for the incoming context.
+    fxrstor [rsi + CTX_FX]
 
     ; Restore rflags with IF (interrupt flag) CLEARED.
     ; Interrupts must stay disabled during the switch because RSP and RIP
@@ -151,6 +160,7 @@ context_switch:
 ; We build an iretq frame on the kernel stack and iretq to ring 3.
 
 global enter_user_mode
+global enter_user_clone_return
 global enter_kernel_mode
 
 enter_user_mode:
@@ -165,6 +175,53 @@ enter_user_mode:
     push qword 0x202    ; RFLAGS (IF=1)
     push r14            ; CS (USER_CS = 0x23)
     push r12            ; RIP (user entry point)
+    iretq
+
+; ─── Ring 3 clone-return trampoline ────────────────────────────────────────
+;
+; Used for clone/clone3 child threads created from a live syscall frame.
+; Unlike enter_user_mode, this path restores the child's callee-saved
+; registers from AgentContext and returns to the saved user RIP instead of
+; restarting the ELF entry point.
+;
+; Conventions:
+;   RSI = pointer to AgentContext (still live from context_switch)
+;   CTX_RCX = saved user RIP
+;   CTX_R9  = child user RSP
+;   CTX_R11 = saved user RFLAGS
+;
+; The remaining general-purpose fields carry the user's visible register
+; state at the clone return point. Caller-saved registers are best-effort;
+; callee-saved registers are restored exactly from the syscall snapshot.
+enter_user_clone_return:
+    mov rax, rsi
+
+    ; Build iretq frame to return directly into the cloned thread's
+    ; post-syscall user continuation.
+    push qword 0x1B                 ; SS (USER_DS)
+    push qword [rax + CTX_R9]       ; RSP (child user stack)
+    push qword [rax + CTX_R11]      ; RFLAGS
+    push qword 0x23                 ; CS (USER_CS)
+    push qword [rax + CTX_RCX]      ; RIP (saved user return address)
+
+    ; Restore user-visible registers. RCX/R11/RDX carry syscall-return
+    ; metadata, so they are intentionally not restored to their original
+    ; pre-syscall values.
+    mov rbx, [rax + CTX_RBX]
+    mov rbp, [rax + CTX_RBP]
+    mov rdi, [rax + CTX_RDI]
+    mov rsi, [rax + CTX_RSI]
+    mov r8,  [rax + CTX_R8]
+    mov r9,  [rax + CTX_R9]
+    mov r10, [rax + CTX_R10]
+    mov r12, [rax + CTX_R12]
+    mov r13, [rax + CTX_R13]
+    mov r14, [rax + CTX_R14]
+    mov r15, [rax + CTX_R15]
+    mov rcx, [rax + CTX_RCX]
+    mov rdx, [rax + CTX_RDX]
+    mov r11, [rax + CTX_R11]
+    mov rax, [rax + CTX_RAX]
     iretq
 
 ; ─── Kernel entry trampoline ───────────────────────────────────────────────

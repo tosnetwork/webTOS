@@ -10,7 +10,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-none/release/atos}"
 ELF32="/tmp/atos_crossnode.elf"
-QEMU_MEMORY="${QEMU_MEMORY:-256M}"
+QEMU_MEMORY="${QEMU_MEMORY:-512M}"
 
 echo "=== ATOS Cross-Node Test ==="
 echo "Building kernel..."

@@ -54,6 +54,7 @@ pub const SYS_SETITIMER: u64 = 38;
 
 // ── Process identity ────────────────────────────────────────────────────────
 pub const SYS_GETPID: u64 = 39;
+pub const SYS_TIME: u64 = 201;
 
 // ── Networking ──────────────────────────────────────────────────────────────
 pub const SYS_SOCKET: u64 = 41;
@@ -118,6 +119,7 @@ pub const SYS_CLOCK_GETRES: u64 = 229;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const SYS_EPOLL_CTL: u64 = 233;
+pub const SYS_TGKILL: u64 = 234;
 
 // ── Robust futex / TLS ─────────────────────────────────────────────────────
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
@@ -131,10 +133,12 @@ pub const SYS_PIPE2: u64 = 293;
 // ── System info / process ───────────────────────────────────────────────────
 pub const SYS_GETRUSAGE: u64 = 98;
 pub const SYS_SYSINFO: u64 = 99;
+pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_CAPGET: u64 = 125;
 pub const SYS_PRCTL: u64 = 157;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
+pub const SYS_GETCPU: u64 = 309;
 
 // ── Misc ────────────────────────────────────────────────────────────────────
 pub const SYS_FTRUNCATE: u64 = 77;
@@ -159,6 +163,7 @@ pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
+pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;

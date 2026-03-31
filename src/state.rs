@@ -723,6 +723,30 @@ pub fn load_large_value(keyspace: KeyspaceId, buf: &mut [u8]) -> usize {
     total_len
 }
 
+/// Query the size of a large value stored via `store_large_value`.
+///
+/// Returns the total length in bytes, or 0 if no valid large value is present.
+pub fn query_large_value_size(keyspace: KeyspaceId) -> usize {
+    let (meta_buf, meta_len) = match state_get(keyspace, LARGE_VALUE_META_KEY) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    if meta_len < 6 {
+        return 0;
+    }
+
+    let total_len =
+        u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
+
+    if total_len == 0 || chunk_count == 0 || total_len > MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE {
+        return 0;
+    }
+
+    total_len
+}
+
 // ─── Multi-segment large value storage ─────────────────────────────────────
 //
 // Files larger than 64 KB (e.g. libjvm.so at 22 MB) are split into 64 KB
@@ -801,7 +825,8 @@ static mut BASE_IMAGE_PATHS: [BaseImagePathEntry; MAX_BASE_IMAGE_PATHS] =
     [const { BaseImagePathEntry::empty() }; MAX_BASE_IMAGE_PATHS];
 
 fn record_base_image_path(path: &[u8]) {
-    let Some((namespace, relative)) = crate::linux_compat::vfs::classify_base_image_path(path) else {
+    let Some((namespace, relative)) = crate::linux_compat::vfs::classify_base_image_path(path)
+    else {
         return;
     };
     let rel_len = relative.len().min(MAX_BASE_IMAGE_PATH_LEN);
@@ -1055,7 +1080,9 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
 
         // Each segment occupies SEGMENT_KEY_STRIDE keys (metadata + chunks).
         // Spacing them apart prevents key collisions between segments.
-        let segment_key = base_key.wrapping_add(1).wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
 
         // We store the segment as a "large value" rooted at segment_key.
         // For the base image this uses the dedicated store; for normal
@@ -1156,6 +1183,139 @@ pub fn query_file_size(keyspace: KeyspaceId, key: u64) -> usize {
     len
 }
 
+fn load_large_value_range(keyspace: KeyspaceId, base_key: u64, offset: usize, buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+
+    let (meta_buf, meta_len) = match state_get(keyspace, base_key) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if meta_len < 6 {
+        return 0;
+    }
+
+    let total_len =
+        u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
+    if total_len == 0 || chunk_count == 0 || offset >= total_len {
+        return 0;
+    }
+
+    let mut copied = 0usize;
+    let mut remaining = buf.len().min(total_len - offset);
+    let mut chunk_index = offset / MAX_VALUE_SIZE;
+    let mut chunk_offset = offset % MAX_VALUE_SIZE;
+
+    while remaining > 0 && chunk_index < chunk_count {
+        let chunk_key = base_key.wrapping_add(1).wrapping_add(chunk_index as u64);
+        let (chunk_buf, chunk_len) = match state_get(keyspace, chunk_key) {
+            Some(v) => v,
+            None => break,
+        };
+        if chunk_offset >= chunk_len {
+            break;
+        }
+
+        let copy_len = remaining.min(chunk_len - chunk_offset);
+        buf[copied..copied + copy_len]
+            .copy_from_slice(&chunk_buf[chunk_offset..chunk_offset + copy_len]);
+        copied += copy_len;
+        remaining -= copy_len;
+        chunk_index += 1;
+        chunk_offset = 0;
+    }
+
+    copied
+}
+
+/// Copy a file range into `buf` without materializing the whole file.
+///
+/// This is the range-read primitive used by Linux file I/O and lazy
+/// file-backed page faults. It works for:
+/// - embedded base-image files,
+/// - plain small values,
+/// - multi-segment files stored in keyspaces or the mutable base-image store.
+pub fn load_file_range(keyspace: KeyspaceId, base_key: u64, offset: usize, buf: &mut [u8]) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        if let Some(entry) = crate::base_image::find_by_key(base_key) {
+            if offset >= entry.data.len() {
+                return 0;
+            }
+            let copy_len = buf.len().min(entry.data.len() - offset);
+            buf[..copy_len].copy_from_slice(&entry.data[offset..offset + copy_len]);
+            return copy_len;
+        }
+    }
+
+    let (value, value_len) = match state_get(keyspace, base_key) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    let maybe_multi_segment = if value_len == 6 {
+        let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+        let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
+        segment_count > 0 && total > MAX_VALUE_SIZE
+    } else {
+        false
+    };
+
+    if !maybe_multi_segment {
+        if offset >= value_len {
+            return 0;
+        }
+        let copy_len = buf.len().min(value_len - offset);
+        buf[..copy_len].copy_from_slice(&value[offset..offset + copy_len]);
+        return copy_len;
+    }
+
+    let total_size = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
+    if total_size == 0 || segment_count == 0 || offset >= total_size {
+        return 0;
+    }
+
+    let mut copied = 0usize;
+    let mut remaining = buf.len().min(total_size - offset);
+    let mut segment_index = offset / MULTI_SEGMENT_SIZE;
+    let mut segment_offset = offset % MULTI_SEGMENT_SIZE;
+
+    while remaining > 0 && segment_index < segment_count {
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((segment_index as u64) * SEGMENT_KEY_STRIDE);
+        let segment_limit =
+            MULTI_SEGMENT_SIZE.min(total_size - segment_index * MULTI_SEGMENT_SIZE);
+        if segment_offset >= segment_limit {
+            break;
+        }
+
+        let target = remaining.min(segment_limit - segment_offset);
+        let loaded = load_large_value_range(
+            keyspace,
+            segment_key,
+            segment_offset,
+            &mut buf[copied..copied + target],
+        );
+
+        if loaded == 0 {
+            break;
+        }
+        copied += loaded;
+        remaining -= loaded;
+        segment_index += 1;
+        segment_offset = 0;
+    }
+
+    copied
+}
+
 pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -> usize {
     if keyspace == BASE_IMAGE_KEYSPACE {
         let loaded = crate::base_image::load_file(base_key, buf);
@@ -1191,7 +1351,9 @@ pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -
 
     let mut offset = 0;
     for i in 0..segment_count {
-        let segment_key = base_key.wrapping_add(1).wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((i as u64) * SEGMENT_KEY_STRIDE);
         let segment_size = MULTI_SEGMENT_SIZE.min(total_size - offset);
 
         let loaded = if keyspace == BASE_IMAGE_KEYSPACE {

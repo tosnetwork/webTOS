@@ -28,10 +28,22 @@ const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
 /// corruption when those deeper paths run.
 const SPAWN_STACK_SIZE: usize = KERNEL_STACK_SIZE;
 
+#[repr(align(4096))]
+struct AlignedSpawnStacks<const SIZE: usize, const COUNT: usize> {
+    stacks: [[u8; SIZE]; COUNT],
+}
+
 /// Static stack pool for spawned agents.
-static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] =
-    [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS];
+static mut SPAWN_STACKS: AlignedSpawnStacks<SPAWN_STACK_SIZE, MAX_AGENTS> = AlignedSpawnStacks {
+    stacks: [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS],
+};
 static mut NEXT_STACK_SLOT: usize = 4;
+
+#[inline]
+unsafe fn write_guard_pair(bottom: *mut u64) {
+    core::ptr::write_volatile(bottom, STACK_GUARD_MAGIC);
+    core::ptr::write_volatile(bottom.add(1), STACK_GUARD_MAGIC);
+}
 
 /// Run queue state protected by SpinLock for SMP safety.
 struct RunQueueState {
@@ -90,6 +102,14 @@ fn set_current(id: AgentId) {
     }
 }
 
+fn prepare_user_entry(agent: &Agent) {
+    gdt::set_tss_rsp0(agent.kernel_stack_top);
+    unsafe {
+        CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+    }
+    crate::linux_compat::identity::restore_thread_pointer_bases(agent.id);
+}
+
 /// Allocate a stack for a dynamically spawned agent.
 pub fn allocate_agent_stack() -> u64 {
     unsafe {
@@ -98,9 +118,41 @@ pub fn allocate_agent_stack() -> u64 {
         }
         let slot = NEXT_STACK_SLOT;
         NEXT_STACK_SLOT += 1;
-        let ptr = SPAWN_STACKS[slot].as_ptr();
-        (ptr as u64) + SPAWN_STACK_SIZE as u64
+        let ptr = SPAWN_STACKS.stacks[slot].as_ptr();
+        write_guard_pair(ptr as *mut u64);
+        ((ptr as u64) + SPAWN_STACK_SIZE as u64) & !0xF
     }
+}
+
+#[inline]
+pub fn stack_bottom_from_top(stack_top: u64) -> u64 {
+    stack_top.saturating_sub(SPAWN_STACK_SIZE as u64)
+}
+
+fn check_stack_guard(agent_id: AgentId) -> bool {
+    if agent_id == IDLE_AGENT_ID {
+        return true;
+    }
+
+    let Some(agent) = get_agent_any_state(agent_id) else {
+        return true;
+    };
+    if agent.stack_bottom == 0 {
+        return true;
+    }
+
+    let guard = unsafe { core::ptr::read_volatile(agent.stack_bottom as *const u64) };
+    if guard == STACK_GUARD_MAGIC {
+        return true;
+    }
+
+    serial_println!(
+        "[STACK OVERFLOW] Agent {} stack corrupted! guard={:#x} expected={:#x}",
+        agent_id,
+        guard,
+        STACK_GUARD_MAGIC
+    );
+    false
 }
 
 /// Clear the run queue, removing all entries.
@@ -205,12 +257,14 @@ fn select_next_ready_agent() -> AgentId {
     if rq.len > 0 {
         let start = rq.current_index % rq.len.max(1);
 
-        // Round-robin: pick the NEXT Ready agent from current_index.
-        // This ensures all agents get a fair share of CPU time.
+        // Round-robin: `current_index` always points at the next candidate to
+        // try, so the scan must begin at `start` itself. Starting at
+        // `start + 1` permanently starves freshly appended agents because the
+        // enqueue path stores them exactly at the next candidate slot.
         let mut best_id = IDLE_AGENT_ID;
         let mut best_idx = 0;
 
-        for offset in 1..=rq.len {
+        for offset in 0..rq.len {
             let idx = (start + offset) % rq.len;
             if let Some(agent_id) = rq.queue[idx] {
                 if let Some(agent) = get_agent_mut(agent_id) {
@@ -282,10 +336,7 @@ pub fn schedule() {
     // For ring 3 agents: update TSS.rsp0
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
-            gdt::set_tss_rsp0(agent.kernel_stack_top);
-            unsafe {
-                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
-            }
+            prepare_user_entry(agent);
         }
     }
 
@@ -326,26 +377,12 @@ pub fn schedule() {
         // Resumed. Re-enable interrupts.
         core::arch::asm!("sti", options(nomem, nostack));
 
-        // Check stack guard canary of the old agent
-        if old_id != IDLE_AGENT_ID {
-            if let Some(old_agent) = get_agent(old_id) {
-                if old_agent.stack_bottom != 0 {
-                    let guard = core::ptr::read_volatile(old_agent.stack_bottom as *const u64);
-                    if guard != STACK_GUARD_MAGIC {
-                        serial_println!(
-                            "[STACK OVERFLOW] Agent {} stack corrupted! guard={:#x} expected={:#x}",
-                            old_id,
-                            guard,
-                            STACK_GUARD_MAGIC
-                        );
-                        if let Some(agent) = get_agent_mut(old_id) {
-                            agent.status = AgentStatus::Faulted;
-                        }
-                        crate::event::agent_faulted(old_id, 0xFF);
-                        remove_from_run_queue(old_id);
-                    }
-                }
+        if !check_stack_guard(old_id) {
+            if let Some(agent) = get_agent_mut(old_id) {
+                agent.status = AgentStatus::Faulted;
             }
+            crate::event::agent_faulted(old_id, 0xFF);
+            remove_from_run_queue(old_id);
         }
     }
 }
@@ -371,10 +408,63 @@ pub fn switch_from_trap() -> ! {
 
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
-            gdt::set_tss_rsp0(agent.kernel_stack_top);
+            prepare_user_entry(agent);
+        }
+    }
+
+    let new_ctx = match get_agent(next_id) {
+        Some(agent) => &agent.context as *const AgentContext,
+        None => loop {
             unsafe {
-                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
             }
+        },
+    };
+
+    let core_id = if crate::arch::x86_64::lapic::is_active() {
+        crate::arch::x86_64::lapic::id() as usize
+    } else {
+        0
+    };
+    let scratch_ctx = unsafe { &mut BOOT_CONTEXTS[core_id.min(15)] as *mut AgentContext };
+
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+        context_switch(scratch_ctx, new_ctx);
+    }
+
+    loop {
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
+    }
+}
+
+/// Switch away from the current syscall/exit path without leaving a resumable
+/// continuation in the current agent context.
+///
+/// This is for paths like `exit(2)` / `execve(2)` success where the current
+/// agent has already been removed from the run queue and must never return to
+/// its saved kernel stack continuation.
+pub fn switch_without_current() -> ! {
+    let old_id = current();
+    if !check_stack_guard(old_id) {
+        crate::event::agent_faulted(old_id, 0xFF);
+    }
+
+    let next_id = select_next_ready_agent();
+
+    if next_id == IDLE_AGENT_ID {
+        if let Some(agent) = get_agent_mut(IDLE_AGENT_ID) {
+            agent.status = AgentStatus::Running;
+        }
+    }
+
+    set_current(next_id);
+
+    if let Some(agent) = get_agent(next_id) {
+        if agent.mode == AgentMode::User {
+            prepare_user_entry(agent);
         }
     }
 
@@ -431,10 +521,7 @@ pub fn start() {
         let agent = get_agent_mut(first_id).expect("First agent not found");
         agent.status = AgentStatus::Running;
         if agent.mode == AgentMode::User {
-            gdt::set_tss_rsp0(agent.kernel_stack_top);
-            unsafe {
-                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
-            }
+            prepare_user_entry(agent);
         }
         &agent.context as *const AgentContext
     };
@@ -461,6 +548,8 @@ pub fn timer_tick() {
             switch_from_trap();
         }
     }
+
+    crate::linux_compat::process::futex_tick();
 
     // Charge energy for blocked agents
     unsafe {

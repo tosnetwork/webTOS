@@ -290,8 +290,10 @@ unsafe fn setup_queue(io_base: u16, queue_idx: u16, is_rx: bool) {
     // Allocate queue memory (descriptors + avail + used)
     // Need: queue_size * 16 (descs) + 6 + queue_size * 2 (avail) + 6 + queue_size * 8 (used)
     // Allocate 2 pages to be safe
-    let queue_phys = paging::alloc_frame().expect("Failed to allocate virtqueue");
-    let queue_phys2 = paging::alloc_frame().expect("Failed to allocate virtqueue page 2");
+    let queue_phys = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+        .expect("Failed to allocate virtqueue");
+    let queue_phys2 = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+        .expect("Failed to allocate virtqueue page 2");
 
     // Zero the pages (identity-mapped, so phys addr == virt addr)
     core::ptr::write_bytes(queue_phys as *mut u8, 0, 4096);
@@ -309,7 +311,8 @@ unsafe fn setup_queue(io_base: u16, queue_idx: u16, is_rx: bool) {
 
         // Allocate RX buffers and populate descriptors
         for i in 0..queue_size {
-            let buf = paging::alloc_frame().expect("Failed to allocate RX buffer");
+            let buf = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+                .expect("Failed to allocate RX buffer");
             core::ptr::write_bytes(buf as *mut u8, 0, 4096);
             VIRTIO_NET.rx_buffers[i] = buf;
 
@@ -329,7 +332,8 @@ unsafe fn setup_queue(io_base: u16, queue_idx: u16, is_rx: bool) {
 
         // Allocate TX buffers
         for i in 0..queue_size {
-            let buf = paging::alloc_frame().expect("Failed to allocate TX buffer");
+            let buf = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+                .expect("Failed to allocate TX buffer");
             core::ptr::write_bytes(buf as *mut u8, 0, 4096);
             VIRTIO_NET.tx_buffers[i] = buf;
         }

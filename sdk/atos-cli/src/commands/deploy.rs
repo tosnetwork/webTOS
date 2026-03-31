@@ -66,7 +66,7 @@ pub fn run(args: &[String]) {
 
     println!();
     println!("[atos-deploy] Agent validated. To deploy:");
-    println!("  1. Start ATOS with serial: qemu-system-x86_64 -m 256M -serial stdio ...");
+    println!("  1. Start ATOS with serial: qemu-system-x86_64 -m 512M -serial stdio ...");
     println!("  2. The skilld agent will load WASM modules from mailbox messages");
     println!("  3. Send the WASM binary as a message to skilld's mailbox");
 }

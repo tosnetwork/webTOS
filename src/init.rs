@@ -75,7 +75,8 @@ fn stack_top(agent_index: usize) -> u64 {
 
 #[inline(never)]
 fn prepare_user_code_page(agent_cr3: u64, code_start: u64, code_end: u64) {
-    let code_phys = paging::alloc_frame().expect("Failed to allocate user code page");
+    let code_phys = paging::alloc_frame_with_kind(paging::FrameKind::Anon)
+        .expect("Failed to allocate user code page");
     let code_size = (code_end - code_start) as usize;
     let code_size = code_size.min(paging::PAGE_SIZE);
     unsafe {
@@ -96,7 +97,8 @@ fn prepare_user_stack_region(agent_cr3: u64) -> u64 {
     debug_assert_eq!(USER_STACK_SIZE % paging::PAGE_SIZE, 0);
 
     for page_idx in 0..(USER_STACK_SIZE / paging::PAGE_SIZE) {
-        let stack_phys = paging::alloc_frame().expect("Failed to allocate user stack page");
+        let stack_phys = paging::alloc_frame_with_kind(paging::FrameKind::Anon)
+            .expect("Failed to allocate user stack page");
         unsafe {
             core::ptr::write_bytes(stack_phys as *mut u8, 0, paging::PAGE_SIZE);
         }

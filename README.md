@@ -98,7 +98,7 @@ cd atos
 make run
 ```
 
-The default QEMU launch now uses `256M` of guest RAM. Override it with
+The default QEMU launch now uses `512M` of guest RAM. Override it with
 `QEMU_MEMORY=<size>` if you need a different setting.
 
 ### Optional Linux Runtime Payloads
@@ -118,6 +118,18 @@ python3 tools/generate_runtime_manifest.py
 
 That script emits `base_image.runtime.manifest` with explicit file and tree
 entries for the selected runtimes and their shared-library dependencies.
+
+To build against an alternate runtime bundle without overwriting the repo's
+default manifest, point Cargo at a different manifest file:
+
+```bash
+python3 tools/generate_runtime_manifest.py \
+  --output /tmp/atos-java.manifest \
+  --runtimes java \
+  --java-home traced
+
+ATOS_RUNTIME_MANIFEST=/tmp/atos-java.manifest make run
+```
 
 You will see agents booting, communicating via mailboxes, and enforcing policies:
 

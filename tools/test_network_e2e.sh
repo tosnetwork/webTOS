@@ -18,7 +18,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-none/release/atos}"
 ELF32="/tmp/atos_net_test.elf"
-QEMU_MEMORY="${QEMU_MEMORY:-256M}"
+QEMU_MEMORY="${QEMU_MEMORY:-512M}"
 
 echo "=== ATOS Network End-to-End Test ==="
 

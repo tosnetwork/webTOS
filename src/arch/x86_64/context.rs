@@ -5,6 +5,12 @@
 
 use crate::agent::AgentContext;
 
+#[repr(align(16))]
+struct FpuStateTemplate([u8; 512]);
+
+static mut INITIAL_FPU_STATE: FpuStateTemplate = FpuStateTemplate([0; 512]);
+static mut INITIAL_FPU_STATE_READY: bool = false;
+
 extern "C" {
     /// Switch CPU context from old to new agent.
     /// Implemented in asm/switch.asm.
@@ -20,6 +26,30 @@ pub fn read_cr3() -> u64 {
     cr3
 }
 
+/// Capture the boot-time clean x87/SSE state into a global aligned template.
+pub fn capture_initial_fpu_state() {
+    unsafe {
+        core::arch::asm!("fninit", options(nostack));
+        core::arch::asm!(
+            "fxsave [{}]",
+            in(reg) INITIAL_FPU_STATE.0.as_mut_ptr(),
+            options(nostack)
+        );
+        INITIAL_FPU_STATE_READY = true;
+    }
+}
+
+/// Initialize a freshly created context with a clean x87/SSE state snapshot.
+pub fn init_fpu_state(ctx: &mut AgentContext) {
+    unsafe {
+        if INITIAL_FPU_STATE_READY {
+            ctx.fpu_state.copy_from_slice(&INITIAL_FPU_STATE.0);
+        } else {
+            ctx.fpu_state.fill(0);
+        }
+    }
+}
+
 /// Create a new kernel-mode agent context.
 ///
 /// Sets up RIP to the entry point, RSP to the top of the given stack,
@@ -29,14 +59,16 @@ pub fn new_kernel_context(entry: u64, stack_top: u64) -> AgentContext {
         fn enter_kernel_mode();
     }
 
-    AgentContext {
+    let mut ctx = AgentContext {
         rsp: stack_top,
         rip: enter_kernel_mode as *const () as u64,
         r12: entry,
         rflags: 0x200, // IF=1
         cr3: read_cr3(),
         ..AgentContext::zero()
-    }
+    };
+    init_fpu_state(&mut ctx);
+    ctx
 }
 
 /// Create a new user-mode (ring 3) agent context.
@@ -49,7 +81,7 @@ pub fn new_user_context(entry: u64, user_stack_top: u64, kernel_stack_top: u64) 
         fn enter_user_mode();
     }
 
-    AgentContext {
+    let mut ctx = AgentContext {
         rsp: kernel_stack_top, // initial RSP = kernel stack (for trampoline)
         rip: enter_user_mode as *const () as u64, // first switch jumps here
         r12: entry,            // user RIP (passed to iretq)
@@ -59,5 +91,7 @@ pub fn new_user_context(entry: u64, user_stack_top: u64, kernel_stack_top: u64) 
         rflags: 0x200,         // IF=1
         cr3: 0,                // filled by caller
         ..AgentContext::zero()
-    }
+    };
+    init_fpu_state(&mut ctx);
+    ctx
 }

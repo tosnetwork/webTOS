@@ -230,9 +230,9 @@ pub fn save_to_disk() -> bool {
 
     // ── Write Merkle roots (packed into one sector) ──
     sector_buf = [0u8; SECTOR_SIZE];
-    for i in 0..MAX_AGENTS.min(32) {
-        // 32 roots × 16 bytes = 512 bytes = exactly one sector
-        sector_buf[i * 16..(i + 1) * 16].copy_from_slice(&merkle_roots[i]);
+    for i in 0..MAX_AGENTS.min(16) {
+        // 16 roots × 32 bytes = 512 bytes = exactly one sector.
+        sector_buf[i * 32..(i + 1) * 32].copy_from_slice(&merkle_roots[i]);
     }
     let merkle_sector = CHECKPOINT_START_SECTOR + 1 + agent_count as u32;
     if device.write(merkle_sector as u64, 1, &sector_buf).is_err() {
@@ -660,8 +660,8 @@ pub fn load_merkle_from_disk(header: &CheckpointHeader) -> [crate::merkle::Merkl
             .read(merkle_sector as u64, 1, &mut sector_buf)
             .is_ok()
         {
-            for i in 0..MAX_AGENTS.min(32) {
-                roots[i].copy_from_slice(&sector_buf[i * 16..(i + 1) * 16]);
+            for i in 0..MAX_AGENTS.min(16) {
+                roots[i].copy_from_slice(&sector_buf[i * 32..(i + 1) * 32]);
             }
         }
     }

@@ -115,15 +115,10 @@ fn dispatch_process_syscall(
         SYS_EXECVE => process::sys_execve(agent_id, a1, a2, a3),
         SYS_WAIT4 => process::sys_wait4(agent_id, a1, a2, a3, a4),
         SYS_KILL => process::sys_kill(agent_id, a1 as i32, a2 as i32),
+        SYS_TGKILL => process::sys_tgkill(agent_id, a1 as i32, a2 as i32, a3 as i32),
         SYS_GETPID => process::sys_getpid(agent_id),
         SYS_GETTID => process::sys_gettid(agent_id),
-        SYS_GETPPID => match crate::agent::get_agent(agent_id) {
-            Some(a) => match a.parent_id {
-                Some(pid) => pid as i64,
-                None => 1,
-            },
-            None => 1,
-        },
+        SYS_GETPPID => process::sys_getppid(agent_id),
         SYS_SCHED_YIELD => process::sys_sched_yield(agent_id),
         SYS_SET_TID_ADDRESS => process::sys_set_tid_address(agent_id, a1),
         SYS_SET_ROBUST_LIST => process::sys_set_robust_list(agent_id, a1, a2),
@@ -226,10 +221,12 @@ fn dispatch_time_syscall(
     a4: u64,
 ) -> Option<i64> {
     let result = match num {
+        SYS_TIME => time::sys_time(agent_id, a1),
         SYS_NANOSLEEP => time::sys_nanosleep(agent_id, a1, a2),
         SYS_GETITIMER => time::sys_getitimer(agent_id, a1, a2),
         SYS_ALARM => time::sys_alarm(agent_id, a1 as u32),
         SYS_SETITIMER => time::sys_setitimer(agent_id, a1, a2, a3),
+        SYS_GETTIMEOFDAY => time::sys_gettimeofday(agent_id, a1, a2),
         SYS_CLOCK_GETTIME => time::sys_clock_gettime(agent_id, a1, a2),
         SYS_CLOCK_GETRES => time::sys_clock_getres(agent_id, a1, a2),
         SYS_CLOCK_NANOSLEEP => time::sys_clock_nanosleep(agent_id, a1 as u32, a2 as u32, a3, a4),
@@ -258,6 +255,7 @@ fn dispatch_identity_syscall(
         SYS_SETGROUPS => identity::sys_setgroups(agent_id, a1, a2),
         SYS_UNAME => identity::sys_uname(agent_id, a1),
         SYS_SYSINFO => identity::sys_sysinfo(agent_id, a1),
+        SYS_GETCPU => identity::sys_getcpu(agent_id, a1, a2, a3),
         SYS_ARCH_PRCTL => identity::sys_arch_prctl(agent_id, a1 as i32, a2),
         SYS_PRLIMIT64 => identity::sys_prlimit64(agent_id, a1, a2, a3, a4),
         SYS_GETRANDOM => identity::sys_getrandom(agent_id, a1, a2, a3),
@@ -271,10 +269,34 @@ fn dispatch_identity_syscall(
 ///
 /// Returns the Linux-convention result: >= 0 on success, negative errno on error.
 #[inline(never)]
-pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+pub fn dispatch(
+    agent_id: u16,
+    num: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> i64 {
     // Ensure the agent has a Linux compat state initialised
     if state::get_state(agent_id).is_none() {
         state::init_state(agent_id);
+    }
+
+    let trace_python = state::trace_runtime_agent(agent_id);
+    if trace_python {
+        serial_println!(
+            "[PYDBG] syscall-enter agent={} nr={} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x}",
+            agent_id,
+            num,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6
+        );
     }
 
     let result = if let Some(r) = dispatch_process_syscall(agent_id, num, a1, a2, a3, a4, a5, a6) {
@@ -305,6 +327,15 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
     // Check and deliver pending signals at syscall return boundary
     // (deterministic: always checked at the same point).
     signal::deliver_pending_signals(agent_id);
+
+    if trace_python {
+        serial_println!(
+            "[PYDBG] syscall-exit agent={} nr={} ret={}",
+            agent_id,
+            num,
+            result
+        );
+    }
 
     result
 }

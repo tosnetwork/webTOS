@@ -3,7 +3,7 @@
 KERNEL_DEBUG = target/x86_64-unknown-atos/debug/atos
 KERNEL_RELEASE = target/x86_64-unknown-atos/release/atos
 KERNEL_ELF32 = target/atos_32.elf
-QEMU_MEMORY ?= 256M
+QEMU_MEMORY ?= 512M
 
 build:
 	cargo build --release

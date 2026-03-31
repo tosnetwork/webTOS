@@ -69,6 +69,80 @@ unsafe fn read_pathname(ptr: u64, buf: &mut [u8; MAX_PATH]) -> usize {
     len
 }
 
+/// Normalize an absolute Linux path in-place style into `dst`.
+///
+/// This collapses repeated slashes plus `.` and `..` components so the VFS
+/// behaves more like Linux for paths such as `/usr/bin/../lib/libc.so.6`.
+fn normalize_absolute_path(src: &[u8], dst: &mut [u8; MAX_PATH]) -> usize {
+    if src.is_empty() || src[0] != b'/' {
+        let copy_len = src.len().min(MAX_PATH);
+        dst[..copy_len].copy_from_slice(&src[..copy_len]);
+        return copy_len;
+    }
+
+    let mut len = 1usize;
+    dst[0] = b'/';
+    let mut segment_ends = [0usize; 64];
+    let mut segment_count = 0usize;
+    let mut i = 1usize;
+
+    while i < src.len() {
+        while i < src.len() && src[i] == b'/' {
+            i += 1;
+        }
+        if i >= src.len() {
+            break;
+        }
+
+        let start = i;
+        while i < src.len() && src[i] != b'/' {
+            i += 1;
+        }
+        let segment = &src[start..i];
+
+        if segment == b"." {
+            continue;
+        }
+        if segment == b".." {
+            if segment_count > 0 {
+                segment_count -= 1;
+                len = if segment_count == 0 {
+                    1
+                } else {
+                    segment_ends[segment_count - 1]
+                };
+            }
+            continue;
+        }
+
+        let needed = if len > 1 { 1 } else { 0 } + segment.len();
+        if len + needed > MAX_PATH {
+            break;
+        }
+        if len > 1 {
+            dst[len] = b'/';
+            len += 1;
+        }
+        dst[len..len + segment.len()].copy_from_slice(segment);
+        len += segment.len();
+        if segment_count < segment_ends.len() {
+            segment_ends[segment_count] = len;
+            segment_count += 1;
+        }
+    }
+
+    len
+}
+
+fn normalized_path<'a>(raw: &'a [u8], scratch: &'a mut [u8; MAX_PATH]) -> &'a [u8] {
+    if raw.first() == Some(&b'/') {
+        let len = normalize_absolute_path(raw, scratch);
+        &scratch[..len]
+    } else {
+        raw
+    }
+}
+
 /// Copy bytes from a kernel buffer to user memory.
 #[inline]
 unsafe fn write_user_mem(dst: u64, src: &[u8]) {
@@ -107,31 +181,64 @@ fn read_file_data(keyspace: u16, key: u64, offset: usize, buf_ptr: u64, count: u
         }
         let available = value_len - offset;
         let to_copy = count.min(available);
-        unsafe { write_user_mem(buf_ptr, &value[offset..offset + to_copy]); }
+        unsafe {
+            write_user_mem(buf_ptr, &value[offset..offset + to_copy]);
+        }
         return to_copy;
     }
     0
 }
 
 /// Read from a multi-segment file at a given offset into user memory.
-fn read_multi_segment_at(keyspace: u16, key: u64, offset: usize, buf_ptr: u64, count: usize) -> usize {
-    let total_size = crate::state::query_file_size(keyspace, key);
-    if total_size == 0 || offset >= total_size {
-        return 0;
-    }
-    let available = total_size - offset;
-    let to_copy = count.min(available);
+fn read_multi_segment_at(
+    keyspace: u16,
+    key: u64,
+    offset: usize,
+    buf_ptr: u64,
+    count: usize,
+) -> usize {
+    let mut copied = 0usize;
+    let mut scratch = [0u8; 4096];
 
-    // Allocate temp buffer large enough for the entire file.
-    // load_multi_segment requires buf.len() >= total_size.
-    let mut tmp = alloc::vec![0u8; total_size];
-    let loaded = crate::state::load_multi_segment(keyspace, key, &mut tmp);
-    if loaded == 0 || offset >= loaded {
-        return 0;
+    while copied < count {
+        let chunk_len = (count - copied).min(scratch.len());
+        let loaded = crate::state::load_file_range(
+            keyspace,
+            key,
+            offset + copied,
+            &mut scratch[..chunk_len],
+        );
+        if loaded == 0 {
+            break;
+        }
+        unsafe {
+            write_user_mem(buf_ptr + copied as u64, &scratch[..loaded]);
+        }
+        copied += loaded;
+        if loaded < chunk_len {
+            break;
+        }
     }
-    let real_copy = to_copy.min(loaded - offset);
-    unsafe { write_user_mem(buf_ptr, &tmp[offset..offset + real_copy]); }
-    real_copy
+
+    copied
+}
+
+#[inline]
+fn stat_dev_for_keyspace(keyspace: u16) -> u64 {
+    if keyspace == super::vfs::BASE_IMAGE_KEYSPACE {
+        1
+    } else {
+        2 + keyspace as u64
+    }
+}
+
+#[inline]
+fn stat_ino_for_key(key: u64) -> u64 {
+    if key == 0 {
+        1
+    } else {
+        key
+    }
 }
 
 fn base_image_namespace_has_entries(namespace: super::vfs::BaseImageNamespace) -> bool {
@@ -166,6 +273,9 @@ fn base_image_directory_namespace(path: &[u8]) -> Option<(super::vfs::BaseImageN
     if path == b"/etc" {
         return Some((super::vfs::BaseImageNamespace::Etc, b""));
     }
+    if path.len() > 5 && &path[..5] == b"/etc/" {
+        return Some((super::vfs::BaseImageNamespace::Etc, &path[5..]));
+    }
     if path.len() > 5 && &path[..5] == b"/lib/" {
         return Some((super::vfs::BaseImageNamespace::Lib, &path[5..]));
     }
@@ -197,7 +307,14 @@ fn base_image_directory_exists(path: &[u8]) -> bool {
 
         match namespace {
             super::vfs::BaseImageNamespace::Etc => {
-                if prefix.is_empty() && relative == b"ld.so.cache" {
+                if prefix.is_empty() {
+                    found = true;
+                    return false;
+                }
+                if relative.len() > prefix.len()
+                    && &relative[..prefix.len()] == prefix
+                    && relative[prefix.len()] == b'/'
+                {
                     found = true;
                     return false;
                 }
@@ -269,8 +386,26 @@ fn collect_base_image_children(
 
         match namespace {
             super::vfs::BaseImageNamespace::Etc => {
-                if prefix.is_empty() && relative == b"ld.so.cache" {
-                    push_dir_entry(names, lens, dtypes, count, b"ld.so.cache", DT_REG);
+                let remainder = if prefix.is_empty() {
+                    relative
+                } else {
+                    if relative.len() <= prefix.len()
+                        || &relative[..prefix.len()] != prefix
+                        || relative[prefix.len()] != b'/'
+                    {
+                        return true;
+                    }
+                    &relative[prefix.len() + 1..]
+                };
+
+                if remainder.is_empty() {
+                    return true;
+                }
+
+                if let Some(pos) = remainder.iter().position(|&b| b == b'/') {
+                    push_dir_entry(names, lens, dtypes, count, &remainder[..pos], DT_DIR);
+                } else {
+                    push_dir_entry(names, lens, dtypes, count, remainder, DT_REG);
                 }
             }
             super::vfs::BaseImageNamespace::Lib
@@ -499,7 +634,19 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
         return -ENOENT;
     }
 
-    let path = &path_buf[..path_len];
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+    let trace_python = super::state::trace_runtime_agent(agent_id);
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] openat-enter agent={} dirfd={} flags={:#x} mode={:#x} path={:?}",
+            agent_id,
+            dirfd,
+            flags,
+            mode,
+            core::str::from_utf8(path).unwrap_or("?")
+        );
+    }
 
     // Special paths always succeed (e.g. /dev/null, /proc/*)
     let is_special = super::vfs::is_special_path(path).is_some();
@@ -514,7 +661,18 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
         let exists = crate::state::query_file_size(keyspace_id, key) > 0
             || crate::state::state_get(keyspace_id, key).is_some()
             || is_special;
-        return if exists { -ENOTDIR } else { -ENOENT };
+        let ret = if exists { -ENOTDIR } else { -ENOENT };
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] openat-exit agent={} ret={} path={:?} ks={} key={:#x}",
+                agent_id,
+                ret,
+                core::str::from_utf8(path).unwrap_or("?"),
+                keyspace_id,
+                key
+            );
+        }
+        return ret;
     }
 
     // If not creating and not a special path and not a directory,
@@ -524,6 +682,16 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
         if size == 0 {
             // Also check plain state_get for empty/small files
             if crate::state::state_get(keyspace_id, key).is_none() {
+                if trace_python {
+                    crate::serial_println!(
+                        "[PYDBG] openat-exit agent={} ret={} path={:?} ks={} key={:#x}",
+                        agent_id,
+                        -ENOENT,
+                        core::str::from_utf8(path).unwrap_or("?"),
+                        keyspace_id,
+                        key
+                    );
+                }
                 return -ENOENT;
             }
         }
@@ -563,6 +731,18 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
             flags,
             active: true,
         });
+    }
+
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] openat-exit agent={} fd={} path={:?} ks={} key={:#x} dir={}",
+            agent_id,
+            fd_idx,
+            core::str::from_utf8(path).unwrap_or("?"),
+            keyspace_id,
+            key,
+            directory_target
+        );
     }
 
     fd_idx as i64
@@ -614,18 +794,21 @@ pub fn sys_fstat(agent_id: u16, fd: i32, statbuf_ptr: u64) -> i64 {
         0
     };
 
-    fill_stat_buf(statbuf_ptr, file_size);
+    fill_stat_buf(
+        statbuf_ptr,
+        file_size,
+        stat_dev_for_keyspace(entry.keyspace_id),
+        stat_ino_for_key(entry.keyspace_key),
+    );
     0
 }
 
 /// Write a populated `struct stat` to user memory.
-fn fill_stat_buf(ptr: u64, file_size: u64) {
+fn fill_stat_buf(ptr: u64, file_size: u64, st_dev: u64, st_ino: u64) {
     let mut buf = [0u8; 144];
 
-    // st_dev = 1
-    buf[0..8].copy_from_slice(&1u64.to_le_bytes());
-    // st_ino = 1
-    buf[8..16].copy_from_slice(&1u64.to_le_bytes());
+    buf[0..8].copy_from_slice(&st_dev.to_le_bytes());
+    buf[8..16].copy_from_slice(&st_ino.to_le_bytes());
     // st_nlink = 1
     buf[16..24].copy_from_slice(&1u64.to_le_bytes());
     // st_mode = S_IFREG | 0644 = 0o100644 = 0x81A4
@@ -657,9 +840,19 @@ pub fn sys_newfstatat(
     statbuf_ptr: u64,
     flags: u32,
 ) -> i64 {
+    let trace_python = super::state::trace_runtime_agent(agent_id);
     // AT_EMPTY_PATH with a valid dirfd → delegate to fstat
     if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-        return sys_fstat(agent_id, dirfd, statbuf_ptr);
+        let ret = sys_fstat(agent_id, dirfd, statbuf_ptr);
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] newfstatat-empty-path agent={} dirfd={} ret={}",
+                agent_id,
+                dirfd,
+                ret
+            );
+        }
+        return ret;
     }
 
     let _ = dirfd;
@@ -670,17 +863,41 @@ pub fn sys_newfstatat(
         return -ENOENT;
     }
 
-    let path = &path_buf[..path_len];
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] newfstatat-enter agent={} dirfd={} flags={:#x} path={:?}",
+            agent_id,
+            dirfd,
+            flags,
+            core::str::from_utf8(path).unwrap_or("?")
+        );
+    }
 
     // Special paths always exist
     if super::vfs::is_special_path(path).is_some() {
-        fill_stat_buf(statbuf_ptr, 0);
+        fill_stat_buf(statbuf_ptr, 0, 0x100, path_to_key(path));
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] newfstatat-exit agent={} ret=0 path={:?} special=true",
+                agent_id,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+        }
         return 0;
     }
 
     // Directory-like paths always succeed (return S_IFDIR)
     if is_directory_path(path) {
         fill_stat_buf_dir(statbuf_ptr);
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] newfstatat-exit agent={} ret=0 path={:?} dir=true",
+                agent_id,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+        }
         return 0;
     }
 
@@ -689,10 +906,35 @@ pub fn sys_newfstatat(
     // Check existence: try query_file_size, then state_get for empty/small files
     let file_size = crate::state::query_file_size(ks, key);
     if file_size == 0 && crate::state::state_get(ks, key).is_none() {
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] newfstatat-exit agent={} ret={} path={:?} ks={} key={:#x}",
+                agent_id,
+                -ENOENT,
+                core::str::from_utf8(path).unwrap_or("?"),
+                ks,
+                key
+            );
+        }
         return -ENOENT;
     }
 
-    fill_stat_buf(statbuf_ptr, file_size as u64);
+    fill_stat_buf(
+        statbuf_ptr,
+        file_size as u64,
+        stat_dev_for_keyspace(ks),
+        stat_ino_for_key(key),
+    );
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] newfstatat-exit agent={} ret=0 path={:?} size={} ks={} key={:#x}",
+            agent_id,
+            core::str::from_utf8(path).unwrap_or("?"),
+            file_size,
+            ks,
+            key
+        );
+    }
     0
 }
 
@@ -700,8 +942,7 @@ pub fn sys_newfstatat(
 fn is_directory_path(path: &[u8]) -> bool {
     matches!(
         path,
-        b"."
-            | b"/"
+        b"." | b"/"
             | b"/app"
             | b"/bin"
             | b"/dev"
@@ -716,8 +957,7 @@ fn is_directory_path(path: &[u8]) -> bool {
             | b"/usr/lib"
             | b"/var"
             | b"/var/run"
-    )
-        || base_image_directory_exists(path)
+    ) || base_image_directory_exists(path)
 }
 
 /// Fill a stat buf with S_IFDIR mode.
@@ -795,7 +1035,13 @@ pub fn sys_pread64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u64
         return -EINVAL;
     }
 
-    read_file_data(entry.keyspace_id, entry.keyspace_key, offset as usize, buf_ptr, count as usize) as i64
+    read_file_data(
+        entry.keyspace_id,
+        entry.keyspace_key,
+        offset as usize,
+        buf_ptr,
+        count as usize,
+    ) as i64
 }
 
 // ── sys_access ─────────────────────────────────────────────────────────────
@@ -806,28 +1052,58 @@ pub fn sys_pread64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u64
 /// Returns 0 if the key exists, `-ENOENT` otherwise.
 pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
     let _ = mode; // all modes granted
+    let trace_python = super::state::trace_runtime_agent(agent_id);
 
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
     if path_len == 0 {
         return -ENOENT;
     }
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] access-enter agent={} mode={:#x} path={:?}",
+            agent_id,
+            mode,
+            core::str::from_utf8(path).unwrap_or("?")
+        );
+    }
 
     // Special files always exist
-    if super::vfs::is_special_path(&path_buf[..path_len]).is_some() {
+    if super::vfs::is_special_path(path).is_some() {
+        if trace_python {
+            crate::serial_println!("[PYDBG] access-exit agent={} ret=0 special=true", agent_id);
+        }
         return 0;
     }
 
-    if is_directory_path(&path_buf[..path_len]) {
+    if is_directory_path(path) {
+        if trace_python {
+            crate::serial_println!("[PYDBG] access-exit agent={} ret=0 dir=true", agent_id);
+        }
         return 0;
     }
 
-    let (ks, key) = super::vfs::resolve_path(agent_id, &path_buf[..path_len]);
-    if crate::state::query_file_size(ks, key) > 0 || crate::state::state_get(ks, key).is_some() {
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+    let ret = if crate::state::query_file_size(ks, key) > 0
+        || crate::state::state_get(ks, key).is_some()
+    {
         0
     } else {
         -ENOENT
+    };
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] access-exit agent={} ret={} path={:?} ks={} key={:#x}",
+            agent_id,
+            ret,
+            core::str::from_utf8(path).unwrap_or("?"),
+            ks,
+            key
+        );
     }
+    ret
 }
 
 // ── sys_readlink ───────────────────────────────────────────────────────────
@@ -837,14 +1113,25 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
 /// `/proc/self/exe` is handled specially and returns `"/app/binary"`.
 /// All other paths return `-EINVAL` (no real symlinks).
 pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+    let trace_python = super::state::trace_runtime_agent(agent_id);
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = unsafe { read_pathname(pathname_ptr, &mut path_buf) };
     if path_len == 0 {
         return -ENOENT;
     }
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] readlink-enter agent={} path={:?} bufsiz={}",
+            agent_id,
+            core::str::from_utf8(path).unwrap_or("?"),
+            bufsiz
+        );
+    }
 
     const PROC_SELF_EXE: &[u8] = b"/proc/self/exe";
-    if path_len == PROC_SELF_EXE.len() && path_buf[..path_len] == *PROC_SELF_EXE {
+    if path == PROC_SELF_EXE {
         // Return the real exe_path from LinuxAgentState
         let result = match state::get_state(agent_id) {
             Some(s) if s.exe_path_len > 0 => &s.exe_path[..s.exe_path_len as usize],
@@ -854,9 +1141,25 @@ pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64)
         unsafe {
             write_user_mem(buf_ptr, &result[..to_copy]);
         }
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] readlink-exit agent={} ret={} path={:?}",
+                agent_id,
+                to_copy,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+        }
         return to_copy as i64;
     }
 
+    if trace_python {
+        crate::serial_println!(
+            "[PYDBG] readlink-exit agent={} ret={} path={:?}",
+            agent_id,
+            -EINVAL,
+            core::str::from_utf8(path).unwrap_or("?")
+        );
+    }
     -EINVAL
 }
 
@@ -865,7 +1168,13 @@ pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64)
 /// Read a symbolic link relative to a directory fd.
 ///
 /// Delegates to sys_readlink for the actual path handling.
-pub fn sys_readlinkat(agent_id: u16, dirfd: i32, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
+pub fn sys_readlinkat(
+    agent_id: u16,
+    dirfd: i32,
+    pathname_ptr: u64,
+    buf_ptr: u64,
+    bufsiz: u64,
+) -> i64 {
     let _ = dirfd; // AT_FDCWD or ignored
     sys_readlink(agent_id, pathname_ptr, buf_ptr, bufsiz)
 }
@@ -906,7 +1215,12 @@ pub fn sys_statx(
         } else {
             0
         };
-        fill_statx_buf(statxbuf_ptr, file_size);
+        fill_statx_buf(
+            statxbuf_ptr,
+            file_size,
+            stat_dev_for_keyspace(entry.keyspace_id),
+            stat_ino_for_key(entry.keyspace_key),
+        );
         return 0;
     }
 
@@ -916,11 +1230,12 @@ pub fn sys_statx(
         return -ENOENT;
     }
 
-    let path = &path_buf[..path_len];
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
 
     // Special paths always exist
     if super::vfs::is_special_path(path).is_some() {
-        fill_statx_buf(statxbuf_ptr, 0);
+        fill_statx_buf(statxbuf_ptr, 0, 0x100, path_to_key(path));
         return 0;
     }
 
@@ -935,7 +1250,12 @@ pub fn sys_statx(
     if file_size == 0 && crate::state::state_get(ks, key).is_none() {
         return -ENOENT;
     }
-    fill_statx_buf(statxbuf_ptr, file_size as u64);
+    fill_statx_buf(
+        statxbuf_ptr,
+        file_size as u64,
+        stat_dev_for_keyspace(ks),
+        stat_ino_for_key(key),
+    );
     0
 }
 
@@ -943,18 +1263,18 @@ pub fn sys_statx(
 fn fill_statx_buf_dir(ptr: u64) {
     let mut buf = [0u8; 256];
     buf[0..4].copy_from_slice(&0x07FFu32.to_le_bytes()); // stx_mask
-    buf[4..8].copy_from_slice(&4096u32.to_le_bytes());   // stx_blksize
-    buf[16..20].copy_from_slice(&2u32.to_le_bytes());    // stx_nlink
+    buf[4..8].copy_from_slice(&4096u32.to_le_bytes()); // stx_blksize
+    buf[16..20].copy_from_slice(&2u32.to_le_bytes()); // stx_nlink
     buf[20..24].copy_from_slice(&1000u32.to_le_bytes()); // stx_uid
     buf[24..28].copy_from_slice(&1000u32.to_le_bytes()); // stx_gid
-    // stx_mode = S_IFDIR | 0755 = 0x41ED
+                                                         // stx_mode = S_IFDIR | 0755 = 0x41ED
     buf[28..30].copy_from_slice(&0x41EDu16.to_le_bytes());
-    buf[40..48].copy_from_slice(&1u64.to_le_bytes());    // stx_ino
+    buf[40..48].copy_from_slice(&1u64.to_le_bytes()); // stx_ino
     unsafe { write_user_mem(ptr, &buf) }
 }
 
 /// Write a populated `struct statx` (256 bytes) to user memory.
-fn fill_statx_buf(ptr: u64, file_size: u64) {
+fn fill_statx_buf(ptr: u64, file_size: u64, st_dev: u64, st_ino: u64) {
     let mut buf = [0u8; 256];
 
     // stx_mask = STATX_BASIC_STATS (0x07FF)
@@ -969,13 +1289,15 @@ fn fill_statx_buf(ptr: u64, file_size: u64) {
     buf[24..28].copy_from_slice(&1000u32.to_le_bytes());
     // stx_mode = S_IFREG | 0644 = 0o100644 = 0x81A4
     buf[28..30].copy_from_slice(&0x81A4u16.to_le_bytes());
-    // stx_ino = 1
-    buf[40..48].copy_from_slice(&1u64.to_le_bytes());
+    buf[40..48].copy_from_slice(&st_ino.to_le_bytes());
     // stx_size
     buf[48..56].copy_from_slice(&file_size.to_le_bytes());
     // stx_blocks = ceil(size / 512)
     let blocks = (file_size + 511) / 512;
     buf[56..64].copy_from_slice(&blocks.to_le_bytes());
+    // stx_dev_major/stx_dev_minor
+    buf[136..140].copy_from_slice(&(st_dev as u32).to_le_bytes());
+    buf[140..144].copy_from_slice(&0u32.to_le_bytes());
 
     unsafe { write_user_mem(ptr, &buf) }
 }
@@ -1029,8 +1351,22 @@ pub fn sys_getdents64(agent_id: u16, fd: i32, dirp_ptr: u64, count: u64) -> i64 
     let mut lens = [0u16; MAX_DIRENTS_COLLECT];
     let mut dtypes = [0u8; MAX_DIRENTS_COLLECT];
     let mut total_entries = 0usize;
-    push_dir_entry(&mut names, &mut lens, &mut dtypes, &mut total_entries, b".", DT_DIR);
-    push_dir_entry(&mut names, &mut lens, &mut dtypes, &mut total_entries, b"..", DT_DIR);
+    push_dir_entry(
+        &mut names,
+        &mut lens,
+        &mut dtypes,
+        &mut total_entries,
+        b".",
+        DT_DIR,
+    );
+    push_dir_entry(
+        &mut names,
+        &mut lens,
+        &mut dtypes,
+        &mut total_entries,
+        b"..",
+        DT_DIR,
+    );
     for idx in 0..child_count {
         push_dir_entry(
             &mut names,
@@ -1771,7 +2107,10 @@ pub fn sys_chdir(agent_id: u16, path_ptr: u64) -> i64 {
         return -ENOENT;
     }
 
-    if !is_directory_path(&path_buf[..path_len]) {
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+
+    if !is_directory_path(path) {
         return -ENOTDIR;
     }
 
@@ -1780,8 +2119,8 @@ pub fn sys_chdir(agent_id: u16, path_ptr: u64) -> i64 {
         None => return -EFAULT,
     };
 
-    let copy_len = path_len.min(st.cwd.len());
-    st.cwd[..copy_len].copy_from_slice(&path_buf[..copy_len]);
+    let copy_len = path.len().min(st.cwd.len());
+    st.cwd[..copy_len].copy_from_slice(&path[..copy_len]);
     st.cwd_len = copy_len as u16;
     0
 }
