@@ -5,7 +5,8 @@
 
 use super::constants::*;
 use super::state;
-use sha2::{Sha256, Digest};
+use crate::agent::USER_STACK_SIZE;
+use sha2::{Digest, Sha256};
 
 // ── Simple identity getters ────────────────────────────────────────────────
 
@@ -54,11 +55,7 @@ pub fn sys_getgroups(_agent_id: u16, size: u64, list_ptr: u64) -> i64 {
     // Write single gid_t (u32) = 1000
     unsafe {
         let val: u32 = 1000;
-        core::ptr::copy_nonoverlapping(
-            &val as *const u32 as *const u8,
-            list_ptr as *mut u8,
-            4,
-        );
+        core::ptr::copy_nonoverlapping(&val as *const u32 as *const u8, list_ptr as *mut u8, 4);
     }
     1
 }
@@ -87,12 +84,12 @@ pub fn sys_uname(_agent_id: u16, buf_ptr: u64) -> i64 {
     }
     unsafe {
         let p = buf_ptr as *mut u8;
-        write_utsname_field(p, b"Linux");                 // sysname
-        write_utsname_field(p.add(65), b"atos");          // nodename
-        write_utsname_field(p.add(130), b"5.15.0-atos");  // release
-        write_utsname_field(p.add(195), b"#1 SMP ATOS");  // version
-        write_utsname_field(p.add(260), b"x86_64");       // machine
-        write_utsname_field(p.add(325), b"(none)");       // domainname
+        write_utsname_field(p, b"Linux"); // sysname
+        write_utsname_field(p.add(65), b"atos"); // nodename
+        write_utsname_field(p.add(130), b"5.15.0-atos"); // release
+        write_utsname_field(p.add(195), b"#1 SMP ATOS"); // version
+        write_utsname_field(p.add(260), b"x86_64"); // machine
+        write_utsname_field(p.add(325), b"(none)"); // domainname
     }
     0
 }
@@ -134,26 +131,16 @@ pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
         core::ptr::write_bytes(p, 0, 112);
 
         // uptime
-        core::ptr::copy_nonoverlapping(
-            &uptime as *const i64 as *const u8, p, 8,
-        );
+        core::ptr::copy_nonoverlapping(&uptime as *const i64 as *const u8, p, 8);
         // totalram at offset 32
-        core::ptr::copy_nonoverlapping(
-            &totalram as *const u64 as *const u8, p.add(32), 8,
-        );
+        core::ptr::copy_nonoverlapping(&totalram as *const u64 as *const u8, p.add(32), 8);
         // freeram at offset 40
-        core::ptr::copy_nonoverlapping(
-            &freeram as *const u64 as *const u8, p.add(40), 8,
-        );
+        core::ptr::copy_nonoverlapping(&freeram as *const u64 as *const u8, p.add(40), 8);
         // procs at offset 80
-        core::ptr::copy_nonoverlapping(
-            &procs as *const u16 as *const u8, p.add(80), 2,
-        );
+        core::ptr::copy_nonoverlapping(&procs as *const u16 as *const u8, p.add(80), 2);
         // mem_unit at offset 104
         let mem_unit: u32 = 1;
-        core::ptr::copy_nonoverlapping(
-            &mem_unit as *const u32 as *const u8, p.add(104), 4,
-        );
+        core::ptr::copy_nonoverlapping(&mem_unit as *const u32 as *const u8, p.add(104), 4);
     }
     0
 }
@@ -209,7 +196,9 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
     match code as u64 {
         ARCH_SET_FS => {
             st.fs_base = addr;
-            unsafe { wrmsr(MSR_FS_BASE, addr); }
+            unsafe {
+                wrmsr(MSR_FS_BASE, addr);
+            }
             0
         }
         ARCH_GET_FS => {
@@ -227,7 +216,9 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
         }
         ARCH_SET_GS => {
             // Write the MSR; no persistent field for GS in state
-            unsafe { wrmsr(MSR_GS_BASE, addr); }
+            unsafe {
+                wrmsr(MSR_GS_BASE, addr);
+            }
             0
         }
         ARCH_GET_GS => {
@@ -236,11 +227,7 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
             }
             let val = unsafe { rdmsr(MSR_GS_BASE) };
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    &val as *const u64 as *const u8,
-                    addr as *mut u8,
-                    8,
-                );
+                core::ptr::copy_nonoverlapping(&val as *const u64 as *const u8, addr as *mut u8, 8);
             }
             0
         }
@@ -259,11 +246,17 @@ const RLIM_INFINITY: u64 = !0; // 0xFFFFFFFFFFFFFFFF
 ///           const struct rlimit64 *new_limit, struct rlimit64 *old_limit)
 ///
 /// rlimit64 struct: { rlim_cur: u64, rlim_max: u64 } = 16 bytes
-pub fn sys_prlimit64(_agent_id: u16, _pid: u64, resource: u64, _new_limit_ptr: u64, old_limit_ptr: u64) -> i64 {
+pub fn sys_prlimit64(
+    _agent_id: u16,
+    _pid: u64,
+    resource: u64,
+    _new_limit_ptr: u64,
+    old_limit_ptr: u64,
+) -> i64 {
     // Determine the limit values for this resource
     let (cur, max) = match resource {
-        RLIMIT_NOFILE => (256u64, 256u64),
-        RLIMIT_STACK => (65536u64, 65536u64),
+        RLIMIT_NOFILE => (state::MAX_FDS as u64, state::MAX_FDS as u64),
+        RLIMIT_STACK => (USER_STACK_SIZE as u64, USER_STACK_SIZE as u64),
         _ => (RLIM_INFINITY, RLIM_INFINITY),
     };
 
@@ -271,12 +264,8 @@ pub fn sys_prlimit64(_agent_id: u16, _pid: u64, resource: u64, _new_limit_ptr: u
     if old_limit_ptr != 0 {
         unsafe {
             let p = old_limit_ptr as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                &cur as *const u64 as *const u8, p, 8,
-            );
-            core::ptr::copy_nonoverlapping(
-                &max as *const u64 as *const u8, p.add(8), 8,
-            );
+            core::ptr::copy_nonoverlapping(&cur as *const u64 as *const u8, p, 8);
+            core::ptr::copy_nonoverlapping(&max as *const u64 as *const u8, p.add(8), 8);
         }
     }
 
@@ -321,11 +310,7 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
         let remaining = (buflen - written) as usize;
         let chunk = if remaining > 32 { 32 } else { remaining };
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                hash.as_ptr(),
-                dst.add(written as usize),
-                chunk,
-            );
+            core::ptr::copy_nonoverlapping(hash.as_ptr(), dst.add(written as usize), chunk);
         }
         written += chunk as u64;
     }

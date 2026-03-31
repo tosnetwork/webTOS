@@ -5,13 +5,13 @@
 //! Messages carry kernel-stamped sender_id and tick for auditability.
 
 use crate::agent::{
-    AgentId, AgentStatus, MailboxId, Tick, MAX_AGENTS, MAX_MAILBOX_CAPACITY, MAX_MESSAGE_PAYLOAD,
-    E_MAILBOX_FULL, E_INVALID_ARG, E_NO_CAP, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE,
+    AgentId, AgentStatus, MailboxId, Tick, E_INVALID_ARG, E_MAILBOX_FULL, E_NOT_FOUND, E_NO_CAP,
+    E_PAYLOAD_TOO_LARGE, MAX_AGENTS, MAX_MAILBOX_CAPACITY, MAX_MESSAGE_PAYLOAD,
 };
-use crate::capability::{agent_try_cap, agent_has_cap, CapType};
+use crate::capability::{agent_has_cap, agent_try_cap, CapType};
 
 /// Maximum number of mailboxes (supports multi-mailbox: more than one per agent).
-pub const MAX_MAILBOXES: usize = 32;
+pub const MAX_MAILBOXES: usize = MAX_AGENTS;
 
 /// Maximum number of agents that can be blocked waiting to send on a single mailbox.
 const MAX_BLOCKED_SENDERS: usize = MAX_AGENTS;
@@ -143,7 +143,11 @@ pub fn create_mailbox(id: MailboxId, owner: AgentId) -> Result<(), i64> {
 /// 3. Check mailbox not full
 /// 4. Create message with sender_id and current tick
 /// 5. Enqueue
-pub fn send_message(sender_id: AgentId, target_mailbox: MailboxId, payload: &[u8]) -> Result<(), i64> {
+pub fn send_message(
+    sender_id: AgentId,
+    target_mailbox: MailboxId,
+    payload: &[u8],
+) -> Result<(), i64> {
     // Check payload size
     if payload.len() > MAX_MESSAGE_PAYLOAD {
         return Err(E_PAYLOAD_TOO_LARGE);
@@ -151,7 +155,11 @@ pub fn send_message(sender_id: AgentId, target_mailbox: MailboxId, payload: &[u8
 
     // Check capability: sender needs CAP_SEND_MAILBOX for the target mailbox
     if !agent_try_cap(sender_id, CapType::SendMailbox, target_mailbox) {
-        crate::event::cap_denied(sender_id, CapType::SendMailbox as u64, target_mailbox as u64);
+        crate::event::cap_denied(
+            sender_id,
+            CapType::SendMailbox as u64,
+            target_mailbox as u64,
+        );
         return Err(E_NO_CAP);
     }
 
