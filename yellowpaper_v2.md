@@ -1412,9 +1412,151 @@ Blockchain / Coordinator
 
 ATOS handles execution. The blockchain handles consensus, ordering, and finality. This separation allows ATOS to be used by any consensus mechanism — not just one blockchain.
 
-### 28.4 Closing Statement
+### 28.4 Integration Reference: Execute-then-Verify Model
 
-> ATOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority, no non-determinism. External systems submit transactions via TCP and receive cryptographic proof of what happened.
+ATOS is designed to be embedded as the execution engine of a larger coordination system (e.g., a blockchain L1, an L2 rollup, or an AI-agent orchestrator). This section describes the canonical integration pattern.
+
+#### 28.4.1 Architecture: Execute-then-Verify
+
+```text
+                   Coordinator Node A (Executor)
+                           │
+                           │ 1. Submit: code + input + energy_budget
+                           ▼
+                   ┌───────────────┐
+                   │   ATOS VM     │
+                   │  runs program │
+                   │  actual: 50K  │
+                   └───────┬───────┘
+                           │ 2. Returns:
+                           │   output, state_root, ExecutionReceipt
+                           ▼
+               Coordinator settles on-chain:
+                 deduct energy_budget (100K)
+                 record state_root
+                 publish receipt_hash
+                           │
+           ┌───────────────┼───────────────┐
+           ▼               ▼               ▼
+       Node B          Node C          Node D
+     (Verifier)      (Verifier)      (Verifier)
+    Does NOT re-run  Does NOT re-run  Does NOT re-run
+    Verifies:        Verifies:        Verifies:
+     - Ed25519 sig    - Ed25519 sig    - Ed25519 sig
+     - state_root     - state_root     - state_root
+     - receipt_hash   - receipt_hash   - receipt_hash
+```
+
+Only the **executor** runs an ATOS VM instance. All other nodes verify the `ExecutionReceipt` cryptographically — no re-execution required.
+
+#### 28.4.2 Energy Billing Model
+
+The coordinator charges the caller `energy_budget` (the pre-declared maximum), not `energy_used` (the actual consumption).
+
+```text
+Caller declares:   energy_budget = 100,000
+ATOS executes:     energy_used   =  50,000
+Coordinator deducts:               100,000  (the budget, not the actual)
+```
+
+**Rationale:**
+
+- **Simplicity**: no dispute over actual consumption; the caller pre-commits to a ceiling.
+- **No re-execution needed**: verifiers do not need to re-run the program to confirm `energy_used`; they only verify the receipt signature and state root.
+- **Analogous to Ethereum gasLimit**: the caller sets a maximum; unused gas is conceptually "burned" (or in some designs, refunded — that is a coordinator policy, not an ATOS concern).
+
+The `ExecutionReceipt` records both values:
+
+```text
+ExecutionReceipt {
+    ...
+    energy_used:   50000,    // actual consumption (informational)
+    energy_budget: 100000,   // pre-declared ceiling (billed)
+    ...
+}
+```
+
+The coordinator may choose to refund `energy_budget - energy_used` to the caller as a policy decision. ATOS itself is agnostic — it reports both values and the coordinator decides the billing rule.
+
+#### 28.4.3 Verification Without Re-Execution
+
+Verifier nodes validate an execution result using only the `ExecutionReceipt`:
+
+1. **Signature check**: verify Ed25519 signature over the receipt hash using the executor node's public key.
+2. **State root check**: confirm the `final_state_root` is a valid SHA-256 Merkle root (optionally verify inclusion proofs for specific keys via the `ProofBundle`).
+3. **Receipt hash check**: recompute `SHA-256(receipt fields)` and compare with `receipt_id`.
+
+All three checks are **O(1)** — no ATOS VM instance is needed on verifier nodes.
+
+#### 28.4.4 Non-Deterministic Runtimes (JVM, CPython)
+
+Programs running under the Linux compatibility layer (e.g., OpenJDK, Node.js, CPython) may exhibit internal non-determinism from:
+
+- **Garbage collection timing**: GC trigger points depend on heap allocation patterns.
+- **JIT compilation thresholds**: the number of interpreted invocations before JIT fires varies with thread interleaving.
+
+ATOS mitigates these at the syscall boundary (deterministic scheduling, deterministic PRNG, logical clock), but cannot eliminate non-determinism that originates entirely within the guest program's internal state machine.
+
+**Consequence**: two runs of the same Java program with the same input may consume different `energy_used` values due to GC/JIT variance, even though both produce the **same output and same final state**.
+
+**This is acceptable** under the execute-then-verify model because:
+
+- The coordinator charges `energy_budget` (fixed), not `energy_used` (variable).
+- Verifiers check the output and state root, not the energy consumption.
+- The `runtime_class` field in the receipt is set to `ReplayGradeNative`, signaling that bit-identical replay is not guaranteed.
+
+For programs that require **exact energy determinism**, use the WASM runtime (`ProofGradeWasm`), which provides instruction-level fuel metering with zero variance.
+
+| Runtime | Determinism Level | Energy Variance | Receipt `runtime_class` |
+|---------|------------------|-----------------|------------------------|
+| WASM | Proof-grade (bit-identical) | Zero | `ProofGradeWasm` |
+| Static Linux ELF | Replay-grade (scheduling-deterministic) | Near-zero | `ReplayGradeNative` |
+| JVM (`-Xint -XX:+UseSerialGC`) | Replay-grade | Low (~1-5%) | `ReplayGradeNative` |
+| JVM (default JIT + G1GC) | Best-effort | Variable (~5-20%) | `ReplayGradeNative` |
+| Node.js / CPython | Best-effort | Variable | `ReplayGradeNative` |
+
+#### 28.4.5 Coordinator Integration API
+
+The coordinator communicates with ATOS via the TCP external interface (Stage-4):
+
+**Submit execution:**
+```text
+Request {
+    request_type: Call (2),
+    contract_id: SHA-256 hash of deployed contract,
+    entry_point: function name or selector,
+    input: calldata (up to 4096 bytes),
+    energy_limit: energy_budget,
+    signature: Ed25519 over request,
+}
+```
+
+**Receive result:**
+```text
+Response {
+    status: Success (0) | Revert (1) | OutOfEnergy (2) | Error (3),
+    output: returndata (up to 4096 bytes),
+    energy_used: actual consumption,
+    state_root: post-execution SHA-256 Merkle root,
+    receipt_hash: SHA-256 of full ExecutionReceipt,
+}
+```
+
+**Retrieve receipt for verification:**
+```text
+Request { request_type: GetReceipt (5), ... }
+→ Full ExecutionReceipt (360 bytes) with Ed25519 signature
+```
+
+**Retrieve proof for state verification:**
+```text
+Request { request_type: GetProof (6), ... }
+→ ProofBundle with Merkle sibling hashes for root recomputation
+```
+
+### 28.5 Closing Statement
+
+> ATOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
 
 ---
 
