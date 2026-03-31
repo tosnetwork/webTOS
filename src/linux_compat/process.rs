@@ -349,7 +349,7 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     if let Some(ls) = state::get_state(agent_id) {
         if ls.clear_child_tid != 0 {
             // Wake one waiter on this address (matching Linux behavior).
-            sys_futex(agent_id, ls.clear_child_tid, FUTEX_WAKE as u64, 1, 0, 0);
+            sys_futex(agent_id, ls.clear_child_tid, FUTEX_WAKE as u64, 1, 0, 0, 0);
         }
     }
 
@@ -990,7 +990,8 @@ pub fn sys_futex(
     op: u64,
     val: u64,
     timeout_or_val2: u64,
-    _uaddr2: u64,
+    uaddr2: u64,
+    val3: u64,
 ) -> i64 {
     let cmd = (op as u32) & !(FUTEX_PRIVATE_FLAG);
 
@@ -1000,11 +1001,10 @@ pub fn sys_futex(
                 return -EFAULT;
             }
 
-            // For FUTEX_WAIT_BITSET, the bitmask is passed as val3 (6th arg,
-            // mapped to _uaddr2 by the syscall dispatcher). A zero bitset is
-            // invalid per the Linux man page.
+            // For FUTEX_WAIT_BITSET, the bitmask is passed as val3 (6th arg).
+            // A zero bitset is invalid per the Linux man page.
             let bitset = if cmd == FUTEX_WAIT_BITSET {
-                let bs = _uaddr2 as u32;
+                let bs = val3 as u32;
                 if bs == 0 {
                     return -EINVAL;
                 }
@@ -1065,13 +1065,9 @@ pub fn sys_futex(
             if timeout_ticks > 0 {
                 // Timed wait: yield up to timeout_ticks times, checking
                 // whether we have been woken (removed from FUTEX_WAITERS)
-                // each iteration.
+                // each iteration. Keep the waiter runnable so the timeout loop
+                // can make forward progress deterministically.
                 for _ in 0..timeout_ticks {
-                    // Block + yield one tick.
-                    if let Some(agent) = agent::get_agent_mut(agent_id) {
-                        agent.status = AgentStatus::BlockedRecv;
-                    }
-                    sched::remove_from_run_queue(agent_id);
                     sched::yield_current();
 
                     // Check if we were woken (our entry cleared by FUTEX_WAKE).
@@ -1161,7 +1157,7 @@ pub fn sys_futex(
 
             // For FUTEX_WAKE_BITSET, only wake waiters whose bitset overlaps.
             let bitset = if cmd == FUTEX_WAKE_BITSET {
-                let bs = _uaddr2 as u32;
+                let bs = val3 as u32;
                 if bs == 0 {
                     return -EINVAL;
                 }
@@ -1231,13 +1227,12 @@ pub fn sys_futex(
         FUTEX_REQUEUE => {
             // FUTEX_REQUEUE: wake `val` waiters on uaddr, then move up to
             // `val2` remaining waiters from uaddr to uaddr2.
-            // val2 is passed via timeout_or_val2, uaddr2 via _uaddr2.
+            // val2 is passed via timeout_or_val2, uaddr2 via the 5th syscall arg.
             if uaddr == 0 {
                 return -EFAULT;
             }
             let max_wake = val as usize;
             let max_requeue = timeout_or_val2 as usize;
-            let uaddr2 = _uaddr2;
 
             // Collect all waiters on uaddr, sorted by agent_id for determinism.
             let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];

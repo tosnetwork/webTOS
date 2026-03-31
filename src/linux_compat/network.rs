@@ -240,6 +240,7 @@ pub fn sys_sendto(
     len: u64,
     _flags: u64,
     _dest_addr: u64,
+    _addrlen: u64,
 ) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
@@ -334,6 +335,7 @@ pub fn sys_recvfrom(
     len: u64,
     _flags: u64,
     _src_addr: u64,
+    _addrlen_ptr: u64,
 ) -> i64 {
     let fd_flags = {
         let st = match state::get_state(agent_id) {
@@ -437,7 +439,7 @@ pub fn sys_sendmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
         let iov_base = core::ptr::read_unaligned(iov as *const u64);
         let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
 
-        sys_sendto(agent_id, sockfd, iov_base, iov_buf_len, flags, 0)
+        sys_sendto(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
     }
 }
 
@@ -463,7 +465,7 @@ pub fn sys_recvmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
         let iov_base = core::ptr::read_unaligned(iov as *const u64);
         let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
 
-        sys_recvfrom(agent_id, sockfd, iov_base, iov_buf_len, flags, 0)
+        sys_recvfrom(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
     }
 }
 

@@ -23,6 +23,7 @@ fn dispatch_file_syscall(
     a3: u64,
     a4: u64,
     a5: u64,
+    _a6: u64,
 ) -> Option<i64> {
     let result = match num {
         SYS_READ => fs::sys_read(agent_id, a1 as i32, a2, a3),
@@ -72,9 +73,10 @@ fn dispatch_memory_syscall(
     a3: u64,
     a4: u64,
     a5: u64,
+    a6: u64,
 ) -> Option<i64> {
     let result = match num {
-        SYS_MMAP => memory::sys_mmap(agent_id, a1, a2, a3 as u32, a4 as u32, a5 as i32, 0),
+        SYS_MMAP => memory::sys_mmap(agent_id, a1, a2, a3 as u32, a4 as u32, a5 as i32, a6),
         SYS_MPROTECT => memory::sys_mprotect(agent_id, a1, a2, a3 as u32),
         SYS_MUNMAP => memory::sys_munmap(agent_id, a1, a2),
         SYS_BRK => memory::sys_brk(agent_id, a1),
@@ -95,6 +97,7 @@ fn dispatch_process_syscall(
     a3: u64,
     a4: u64,
     a5: u64,
+    a6: u64,
 ) -> Option<i64> {
     if num == SYS_EXIT {
         return Some(process::sys_exit(agent_id, a1 as i32));
@@ -127,7 +130,7 @@ fn dispatch_process_syscall(
         SYS_SCHED_GETAFFINITY => process::sys_sched_getaffinity(agent_id, a1 as u32, a2, a3),
         SYS_GETRUSAGE => process::sys_getrusage(agent_id, a1 as i32, a2),
         SYS_CAPGET => process::sys_capget(agent_id, a1, a2),
-        SYS_FUTEX => process::sys_futex(agent_id, a1, a2, a3, a4, a5),
+        SYS_FUTEX => process::sys_futex(agent_id, a1, a2, a3, a4, a5, a6),
         _ => return None,
     };
     Some(result)
@@ -160,13 +163,14 @@ fn dispatch_network_syscall(
     a3: u64,
     a4: u64,
     a5: u64,
+    a6: u64,
 ) -> Option<i64> {
     let result = match num {
         SYS_SOCKET => network::sys_socket(agent_id, a1 as i32, a2 as i32, a3 as i32),
         SYS_CONNECT => network::sys_connect(agent_id, a1 as i32, a2, a3),
         SYS_ACCEPT => network::sys_accept(agent_id, a1 as i32, a2, a3),
-        SYS_SENDTO => network::sys_sendto(agent_id, a1 as i32, a2, a3, a4, a5),
-        SYS_RECVFROM => network::sys_recvfrom(agent_id, a1 as i32, a2, a3, a4, a5),
+        SYS_SENDTO => network::sys_sendto(agent_id, a1 as i32, a2, a3, a4, a5, a6),
+        SYS_RECVFROM => network::sys_recvfrom(agent_id, a1 as i32, a2, a3, a4, a5, a6),
         SYS_SENDMSG => network::sys_sendmsg(agent_id, a1 as i32, a2, a3),
         SYS_RECVMSG => network::sys_recvmsg(agent_id, a1 as i32, a2, a3),
         SYS_SHUTDOWN => network::sys_shutdown(agent_id, a1 as i32, a2 as i32),
@@ -265,21 +269,21 @@ fn dispatch_identity_syscall(
 ///
 /// Returns the Linux-convention result: >= 0 on success, negative errno on error.
 #[inline(never)]
-pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
     // Ensure the agent has a Linux compat state initialised
     if state::get_state(agent_id).is_none() {
         state::init_state(agent_id);
     }
 
-    let result = if let Some(r) = dispatch_process_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+    let result = if let Some(r) = dispatch_process_syscall(agent_id, num, a1, a2, a3, a4, a5, a6) {
         r
-    } else if let Some(r) = dispatch_file_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+    } else if let Some(r) = dispatch_file_syscall(agent_id, num, a1, a2, a3, a4, a5, a6) {
         r
-    } else if let Some(r) = dispatch_memory_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+    } else if let Some(r) = dispatch_memory_syscall(agent_id, num, a1, a2, a3, a4, a5, a6) {
         r
     } else if let Some(r) = dispatch_signal_syscall(agent_id, num, a1, a2, a3, a4) {
         r
-    } else if let Some(r) = dispatch_network_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+    } else if let Some(r) = dispatch_network_syscall(agent_id, num, a1, a2, a3, a4, a5, a6) {
         r
     } else if let Some(r) = dispatch_epoll_syscall(agent_id, num, a1, a2, a3, a4, a5) {
         r
