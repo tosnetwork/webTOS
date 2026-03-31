@@ -14,3 +14,7 @@
 
 /lib/ld-musl-x86_64.so.1 = test_data/musl_libc.so
 /usr/bin/hello_dynamic = test_data/hello_dynamic.elf
+/usr/lib/atos-tests/Hello.class = test_data/Hello.class
+/usr/lib/atos-tests/FsProbe.class = test_data/FsProbe.class
+/usr/lib/atos-tests/java-smoke.jar = test_data/java-smoke.jar
+/usr/lib/atos-tests/payload.txt = test_data/payload.txt
