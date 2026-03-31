@@ -7,8 +7,8 @@
 //! - IBRS (Indirect Branch Restricted Speculation): IA32_SPEC_CTRL bit 0
 //! - STIBP (Single Thread Indirect Branch Predictor): IA32_SPEC_CTRL bit 1
 
-use crate::serial_println;
 use super::kaslr;
+use crate::serial_println;
 
 /// CR4 bit 20: Supervisor Mode Execution Prevention
 const CR4_SMEP: u64 = 1 << 20;
@@ -232,8 +232,12 @@ pub fn spectre_kernel_enter() {
     unsafe {
         if IBRS_SUPPORTED {
             let mut val: u64 = 0;
-            if IBRS_SUPPORTED { val |= SPEC_CTRL_IBRS; }
-            if STIBP_SUPPORTED { val |= SPEC_CTRL_STIBP; }
+            if IBRS_SUPPORTED {
+                val |= SPEC_CTRL_IBRS;
+            }
+            if STIBP_SUPPORTED {
+                val |= SPEC_CTRL_STIBP;
+            }
             wrmsr(MSR_SPEC_CTRL, val);
         }
     }
@@ -298,7 +302,11 @@ pub fn init() {
 
     serial_println!(
         "[security] CPUID: SMEP={} SMAP={} NX={} IBRS={} STIBP={}",
-        smep_ok, smap_ok, nx_ok, ibrs_ok, stibp_ok
+        smep_ok,
+        smap_ok,
+        nx_ok,
+        ibrs_ok,
+        stibp_ok
     );
 
     if nx_ok {

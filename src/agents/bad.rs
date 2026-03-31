@@ -4,8 +4,8 @@
 //! does NOT have CAP_SEND_MAILBOX for. The kernel must deny the request,
 //! emit a CAP_DENIED audit event, and return an error code.
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 /// Bad agent entry point.
@@ -29,7 +29,8 @@ pub extern "C" fn bad_entry() -> ! {
 
     serial_println!(
         "[BAD] Unauthorized send result: {} (expected {})",
-        result, E_NO_CAP
+        result,
+        E_NO_CAP
     );
 
     if result == E_NO_CAP {
@@ -43,6 +44,8 @@ pub extern "C" fn bad_entry() -> ! {
 
     // Unreachable
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

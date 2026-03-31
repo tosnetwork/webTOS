@@ -4,9 +4,9 @@
 //! interface via PCI I/O ports. Supports basic packet send/receive
 //! for the netd system agent.
 
-use crate::serial_println;
-use super::serial::{inb, outb};
 use super::paging;
+use super::serial::{inb, outb};
+use crate::serial_println;
 
 // ─── Virtio PCI I/O Port offsets ─────────────────────────────────────────
 
@@ -38,10 +38,10 @@ const VRING_DESC_F_WRITE: u16 = 2; // buffer is device-writable (for receive)
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct VringDesc {
-    addr: u64,    // physical address of buffer
-    len: u32,     // buffer length
-    flags: u16,   // VRING_DESC_F_*
-    next: u16,    // next descriptor in chain
+    addr: u64,  // physical address of buffer
+    len: u32,   // buffer length
+    flags: u16, // VRING_DESC_F_*
+    next: u16,  // next descriptor in chain
 }
 
 #[repr(C)]
@@ -87,7 +87,7 @@ const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
 
 struct VirtioNet {
-    io_base: u16,           // PCI BAR0 I/O port base
+    io_base: u16, // PCI BAR0 I/O port base
     mac: [u8; 6],
     // RX virtqueue
     rx_descs: *mut VringDesc,
@@ -190,8 +190,12 @@ fn find_virtio_net_pci() -> Option<u16> {
                     if bar0 & 1 != 0 {
                         // I/O port BAR
                         let io_base = (bar0 & 0xFFFC) as u16;
-                        serial_println!("[VIRTIO-NET] Found at PCI {}:{}, BAR0 I/O={:#x}",
-                            bus, dev, io_base);
+                        serial_println!(
+                            "[VIRTIO-NET] Found at PCI {}:{}, BAR0 I/O={:#x}",
+                            bus,
+                            dev,
+                            io_base
+                        );
                         return Some(io_base);
                     }
                 }
@@ -221,11 +225,16 @@ pub fn init() -> bool {
         outb(io_base + VIRTIO_PCI_DEVICE_STATUS, 0);
 
         // 2. Acknowledge
-        outb(io_base + VIRTIO_PCI_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        outb(
+            io_base + VIRTIO_PCI_DEVICE_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE,
+        );
 
         // 3. Driver loaded
-        outb(io_base + VIRTIO_PCI_DEVICE_STATUS,
-            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        outb(
+            io_base + VIRTIO_PCI_DEVICE_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+        );
 
         // 4. Read device features, accept basic features
         let _features = inl(io_base + VIRTIO_PCI_DEVICE_FEATURES);
@@ -235,9 +244,15 @@ pub fn init() -> bool {
         for i in 0..6 {
             VIRTIO_NET.mac[i] = inb(io_base + VIRTIO_PCI_MAC_ADDR + i as u16);
         }
-        serial_println!("[VIRTIO-NET] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            VIRTIO_NET.mac[0], VIRTIO_NET.mac[1], VIRTIO_NET.mac[2],
-            VIRTIO_NET.mac[3], VIRTIO_NET.mac[4], VIRTIO_NET.mac[5]);
+        serial_println!(
+            "[VIRTIO-NET] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            VIRTIO_NET.mac[0],
+            VIRTIO_NET.mac[1],
+            VIRTIO_NET.mac[2],
+            VIRTIO_NET.mac[3],
+            VIRTIO_NET.mac[4],
+            VIRTIO_NET.mac[5]
+        );
 
         // 6. Set up RX virtqueue (queue 0)
         setup_queue(io_base, RX_QUEUE, true);
@@ -246,8 +261,10 @@ pub fn init() -> bool {
         setup_queue(io_base, TX_QUEUE, false);
 
         // 8. Driver ready
-        outb(io_base + VIRTIO_PCI_DEVICE_STATUS,
-            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+        outb(
+            io_base + VIRTIO_PCI_DEVICE_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK,
+        );
 
         VIRTIO_NET.initialized = true;
         serial_println!("[VIRTIO-NET] Initialized, RX/TX queues ready");
@@ -331,8 +348,12 @@ pub fn is_initialized() -> bool {
 
 /// Send a raw Ethernet frame
 pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
-    if !is_initialized() { return Err("not initialized"); }
-    if data.len() > 4096 - VIRTIO_NET_HDR_SIZE { return Err("packet too large"); }
+    if !is_initialized() {
+        return Err("not initialized");
+    }
+    if data.len() > 4096 - VIRTIO_NET_HDR_SIZE {
+        return Err("packet too large");
+    }
 
     unsafe {
         let net = &mut VIRTIO_NET;
@@ -343,8 +364,12 @@ pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
 
         // Write virtio-net header (all zeros for basic send)
         let hdr = VirtioNetHeader {
-            flags: 0, gso_type: 0, hdr_len: 0, gso_size: 0,
-            csum_start: 0, csum_offset: 0,
+            flags: 0,
+            gso_type: 0,
+            hdr_len: 0,
+            gso_size: 0,
+            csum_start: 0,
+            csum_offset: 0,
         };
         core::ptr::copy_nonoverlapping(
             &hdr as *const VirtioNetHeader as *const u8,
@@ -384,7 +409,9 @@ pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
 
 /// Receive a packet (non-blocking). Returns the number of bytes read, or 0 if no packet.
 pub fn recv_packet(buf: &mut [u8]) -> usize {
-    if !is_initialized() { return 0; }
+    if !is_initialized() {
+        return 0;
+    }
 
     unsafe {
         let net = &mut VIRTIO_NET;

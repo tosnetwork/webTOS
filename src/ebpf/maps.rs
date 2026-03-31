@@ -79,9 +79,13 @@ impl EbpfMap {
         match self.map_type {
             MapType::Array => {
                 // Key is interpreted as a little-endian u32 index
-                if key.len() < 4 { return None; }
+                if key.len() < 4 {
+                    return None;
+                }
                 let idx = u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize;
-                if idx >= MAX_MAP_ENTRIES { return None; }
+                if idx >= MAX_MAP_ENTRIES {
+                    return None;
+                }
                 let entry = &self.entries[idx];
                 if entry.occupied {
                     Some(&entry.value[..entry.value_len])
@@ -91,7 +95,8 @@ impl EbpfMap {
             }
             MapType::Hash => {
                 for entry in self.entries.iter() {
-                    if entry.occupied && entry.key_len == key.len()
+                    if entry.occupied
+                        && entry.key_len == key.len()
                         && entry.key[..entry.key_len] == key[..key.len()]
                     {
                         return Some(&entry.value[..entry.value_len]);
@@ -104,14 +109,22 @@ impl EbpfMap {
 
     /// Insert or update a key-value pair.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), EbpfError> {
-        if key.len() > MAX_KEY_SIZE { return Err(EbpfError::KeyTooLarge); }
-        if value.len() > MAX_VALUE_SIZE { return Err(EbpfError::ValueTooLarge); }
+        if key.len() > MAX_KEY_SIZE {
+            return Err(EbpfError::KeyTooLarge);
+        }
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(EbpfError::ValueTooLarge);
+        }
 
         match self.map_type {
             MapType::Array => {
-                if key.len() < 4 { return Err(EbpfError::KeyTooLarge); }
+                if key.len() < 4 {
+                    return Err(EbpfError::KeyTooLarge);
+                }
                 let idx = u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize;
-                if idx >= MAX_MAP_ENTRIES { return Err(EbpfError::OutOfBounds); }
+                if idx >= MAX_MAP_ENTRIES {
+                    return Err(EbpfError::OutOfBounds);
+                }
                 let entry = &mut self.entries[idx];
                 if !entry.occupied {
                     self.count += 1;
@@ -126,7 +139,8 @@ impl EbpfMap {
             MapType::Hash => {
                 // First, try to find existing key
                 for entry in self.entries.iter_mut() {
-                    if entry.occupied && entry.key_len == key.len()
+                    if entry.occupied
+                        && entry.key_len == key.len()
                         && entry.key[..entry.key_len] == key[..key.len()]
                     {
                         entry.value[..value.len()].copy_from_slice(value);
@@ -155,9 +169,13 @@ impl EbpfMap {
     pub fn delete(&mut self, key: &[u8]) -> bool {
         match self.map_type {
             MapType::Array => {
-                if key.len() < 4 { return false; }
+                if key.len() < 4 {
+                    return false;
+                }
                 let idx = u32::from_le_bytes([key[0], key[1], key[2], key[3]]) as usize;
-                if idx >= MAX_MAP_ENTRIES { return false; }
+                if idx >= MAX_MAP_ENTRIES {
+                    return false;
+                }
                 let entry = &mut self.entries[idx];
                 if entry.occupied {
                     entry.occupied = false;
@@ -171,7 +189,8 @@ impl EbpfMap {
             }
             MapType::Hash => {
                 for entry in self.entries.iter_mut() {
-                    if entry.occupied && entry.key_len == key.len()
+                    if entry.occupied
+                        && entry.key_len == key.len()
                         && entry.key[..entry.key_len] == key[..key.len()]
                     {
                         entry.occupied = false;
@@ -323,8 +342,12 @@ pub fn restore_map(map_id: u32, keyspace: u16) -> u32 {
                     Some(v) => v,
                     None => return 1,
                 };
-                if meta_len < 5 { return 1; }
-                let entry_count = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+                if meta_len < 5 {
+                    return 1;
+                }
+                let entry_count =
+                    u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]])
+                        as usize;
 
                 // Clear existing entries
                 for entry in map.entries.iter_mut() {
@@ -341,14 +364,22 @@ pub fn restore_map(map_id: u32, keyspace: u16) -> u32 {
                         Some(v) => v,
                         None => continue,
                     };
-                    if buf_len < 4 { continue; }
+                    if buf_len < 4 {
+                        continue;
+                    }
                     let key_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
                     let val_len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-                    if key_len > MAX_KEY_SIZE || val_len > MAX_VALUE_SIZE { continue; }
-                    if 4 + key_len > buf_len { continue; }
+                    if key_len > MAX_KEY_SIZE || val_len > MAX_VALUE_SIZE {
+                        continue;
+                    }
+                    if 4 + key_len > buf_len {
+                        continue;
+                    }
 
                     let val_off = 4 + MAX_KEY_SIZE;
-                    if val_off + val_len > buf_len { continue; }
+                    if val_off + val_len > buf_len {
+                        continue;
+                    }
 
                     // Find an empty slot (for hash maps) or use index (for array)
                     let target_idx = if map.map_type == MapType::Array && key_len >= 4 {

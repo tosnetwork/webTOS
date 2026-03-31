@@ -25,7 +25,7 @@ pub enum PolicyAction {
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyRule {
     pub kind: PolicyRuleKind,
-    pub target_capability: u32,  // capability bitmask
+    pub target_capability: u32, // capability bitmask
     pub action: PolicyAction,
 }
 
@@ -80,5 +80,4 @@ impl PolicyBundle {
         }
         PolicyAction::Permit
     }
-
 }

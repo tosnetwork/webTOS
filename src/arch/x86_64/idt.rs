@@ -4,9 +4,9 @@
 //! Remaps the 8259 PIC so that IRQ0-7 map to vectors 32-39 and
 //! IRQ8-15 map to vectors 40-47. Only IRQ0 (timer) is unmasked.
 
-use crate::serial_println;
-use crate::arch::x86_64::serial::{outb, inb};
 use crate::arch::x86_64::gdt::KERNEL_CS;
+use crate::arch::x86_64::serial::{inb, outb};
+use crate::serial_println;
 
 // ---- IDT entry ----
 
@@ -101,8 +101,8 @@ unsafe fn remap_pic() {
     outb(PIC2_DATA, 40); // PIC2 starts at vector 40
 
     // ICW3: cascade wiring
-    outb(PIC1_DATA, 4);  // PIC1 has slave at IRQ2
-    outb(PIC2_DATA, 2);  // PIC2 cascade identity = 2
+    outb(PIC1_DATA, 4); // PIC1 has slave at IRQ2
+    outb(PIC2_DATA, 2); // PIC2 cascade identity = 2
 
     // ICW4: 8086 mode
     outb(PIC1_DATA, 0x01);

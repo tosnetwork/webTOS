@@ -143,7 +143,7 @@ pub fn pcr_extend(pcr_index: u32, digest: &[u8; 32]) -> bool {
     // Header
     cmd[pos..pos + 2].copy_from_slice(&0x8002u16.to_be_bytes());
     pos += 2; // tag
-    // commandSize placeholder (fill later)
+              // commandSize placeholder (fill later)
     pos += 4;
     cmd[pos..pos + 4].copy_from_slice(&0x00000182u32.to_be_bytes());
     pos += 4; // commandCode
@@ -212,7 +212,7 @@ pub fn pcr_read(pcr_index: u32) -> Option<[u8; 32]> {
     pos += 2; // SHA256
     cmd[pos] = 3;
     pos += 1; // sizeOfSelect
-    // Set bit for pcr_index
+              // Set bit for pcr_index
     let byte_idx = (pcr_index / 8) as usize;
     let bit_idx = pcr_index % 8;
     cmd[pos] = 0;

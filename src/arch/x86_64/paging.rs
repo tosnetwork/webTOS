@@ -5,9 +5,9 @@
 //! (PML4[511]). Kernel code runs at KERNEL_VMA (0xFFFFFFFF80000000+)
 //! but physical memory remains accessible via the identity mapping.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-use crate::serial_println;
 use super::kaslr;
+use crate::serial_println;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Page/frame size: 4 KiB.
 pub const PAGE_SIZE: usize = 4096;
@@ -113,7 +113,10 @@ pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
     // Sanity-check desc_size: it must be at least the size of our struct.
     let min_desc = core::mem::size_of::<EfiMemoryDescriptor>(); // 40
     if desc_size < min_desc || desc_size > 4096 {
-        serial_println!("[paging] UEFI mmap: invalid desc_size {}, falling back to init()", desc_size);
+        serial_println!(
+            "[paging] UEFI mmap: invalid desc_size {}, falling back to init()",
+            desc_size
+        );
         init();
         return;
     }
@@ -233,7 +236,9 @@ pub fn init() {
         if i < MAX_FRAMES {
             let word = i / 64;
             let bit = i % 64;
-            unsafe { BITMAP[word] |= 1u64 << bit; }
+            unsafe {
+                BITMAP[word] |= 1u64 << bit;
+            }
         }
     }
 
@@ -545,15 +550,21 @@ pub fn unmap_page(pml4_phys: u64, virt_addr: u64) {
     unsafe {
         let pml4 = pml4_phys as *const u64;
         let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-        if pml4e & PTE_PRESENT == 0 { return; }
+        if pml4e & PTE_PRESENT == 0 {
+            return;
+        }
 
         let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-        if pdpte & PTE_PRESENT == 0 { return; }
+        if pdpte & PTE_PRESENT == 0 {
+            return;
+        }
 
         let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pde = core::ptr::read_volatile(pd.add(pd_idx));
-        if pde & PTE_PRESENT == 0 { return; }
+        if pde & PTE_PRESENT == 0 {
+            return;
+        }
 
         let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
         core::ptr::write_volatile(pt.add(pt_idx), 0);

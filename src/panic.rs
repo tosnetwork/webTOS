@@ -7,11 +7,18 @@ use core::panic::PanicInfo;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     // Disable interrupts to prevent further state changes
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
 
     crate::serial_println!("\n!!! KERNEL PANIC !!!");
     if let Some(location) = info.location() {
-        crate::serial_println!("  at {}:{}:{}", location.file(), location.line(), location.column());
+        crate::serial_println!(
+            "  at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
     }
     crate::serial_println!("  {}", info.message());
 
@@ -31,12 +38,16 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     // Emit a final audit event
-    crate::serial_println!("[EVENT seq=PANIC tick={} agent=KERNEL type=KERNEL_PANIC]",
-        crate::arch::x86_64::timer::get_ticks());
+    crate::serial_println!(
+        "[EVENT seq=PANIC tick={} agent=KERNEL type=KERNEL_PANIC]",
+        crate::arch::x86_64::timer::get_ticks()
+    );
 
     // Halt all CPUs
     crate::serial_println!("[PANIC] Halting system");
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

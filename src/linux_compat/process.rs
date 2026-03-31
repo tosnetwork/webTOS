@@ -23,7 +23,13 @@ const RLIMIT_STACK: u64 = 3;
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
+const FUTEX_REQUEUE: u32 = 3;
+const FUTEX_WAIT_BITSET: u32 = 9;
+const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
+
+/// Default bitmask: match everything (used by plain FUTEX_WAIT/FUTEX_WAKE).
+const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
 
 // ── FUTEX wait queue ──────────────────────────────────────────────────────
 
@@ -41,12 +47,14 @@ const EXECVE_ENV_LEN_MAX: usize = 4096;
 struct FutexWaiter {
     agent_id: u16,
     futex_addr: u64,
+    bitset: u32,
     active: bool,
 }
 
 const FUTEX_WAITER_EMPTY: FutexWaiter = FutexWaiter {
     agent_id: 0,
     futex_addr: 0,
+    bitset: FUTEX_BITSET_MATCH_ANY,
     active: false,
 };
 
@@ -174,12 +182,40 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
     };
 
     // Set up child context: copy parent registers, override rax=0 (return value).
+    let clone_vm = args.flags & CLONE_VM != 0;
+
     if let Some(parent) = agent::get_agent(agent_id) {
         let parent_ctx = parent.context;
+        let parent_mode = parent.mode;
         if let Some(child) = agent::get_agent_mut(child_id) {
             child.context = parent_ctx;
             child.context.rax = 0; // clone returns 0 to child
             child.context.rsp = child_stack_top;
+
+            if clone_vm {
+                // CLONE_VM: child shares parent's address space (same cr3).
+                // cr3 is already correct from the parent context copy.
+                // The child gets its own kernel stack but shares user memory.
+            } else {
+                // No CLONE_VM: create an independent address space for the child.
+                if let Some(new_cr3) = crate::arch::x86_64::paging::create_address_space() {
+                    child.context.cr3 = new_cr3;
+                } else {
+                    // Failed to allocate address space -- terminate child and return error.
+                    agent::terminate_agent(child_id, AgentStatus::Faulted);
+                    return -ENOMEM;
+                }
+            }
+
+            // Allocate a dedicated kernel stack for the child so it does not
+            // share the parent's kernel stack during syscalls.
+            let k_stack = sched::allocate_agent_stack();
+            if k_stack != 0 {
+                child.kernel_stack_top = k_stack;
+            }
+
+            // Inherit parent's execution mode (User or Kernel).
+            child.mode = parent_mode;
 
             // If CLONE_SETTLS, set the child's FS base for TLS.
             if args.flags & CLONE_SETTLS != 0 {
@@ -293,6 +329,11 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     // Remove from scheduler and terminate.
     sched::remove_from_run_queue(agent_id);
     agent::terminate_agent(agent_id, AgentStatus::Exited);
+
+    // Raise SIGCHLD on the parent agent.
+    if let Some(pid) = parent_id {
+        super::state::raise_signal(pid, 17); // SIGCHLD = 17
+    }
 
     // Wake parent if it's blocked in wait4.
     if let Some(pid) = parent_id {
@@ -582,12 +623,36 @@ pub fn sys_clone(
     };
 
     // Copy parent context, child returns 0.
+    let clone_vm = flags & CLONE_VM != 0;
+
     if let Some(parent) = agent::get_agent(agent_id) {
         let parent_ctx = parent.context;
+        let parent_mode = parent.mode;
         if let Some(child) = agent::get_agent_mut(child_id) {
             child.context = parent_ctx;
             child.context.rax = 0;
             child.context.rsp = child_stack_top;
+
+            if clone_vm {
+                // CLONE_VM: shared address space -- cr3 already copied from parent.
+            } else {
+                // Separate address space for the child.
+                if let Some(new_cr3) = crate::arch::x86_64::paging::create_address_space() {
+                    child.context.cr3 = new_cr3;
+                } else {
+                    agent::terminate_agent(child_id, AgentStatus::Faulted);
+                    return -ENOMEM;
+                }
+            }
+
+            // Dedicated kernel stack for the child.
+            let k_stack = sched::allocate_agent_stack();
+            if k_stack != 0 {
+                child.kernel_stack_top = k_stack;
+            }
+
+            child.mode = parent_mode;
+
             if flags & CLONE_SETTLS != 0 {
                 child.context.r8 = tls;
             }
@@ -915,9 +980,10 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
 
 /// futex(2) -- Fast userspace mutex with deterministic wait queue.
 ///
-/// Implements FUTEX_WAIT and FUTEX_WAKE with a static wait queue keyed
-/// by futex address. Determinism: WAKE always wakes waiters in ascending
-/// agent_id order, and WAIT always blocks (no spin-waiting races).
+/// Implements FUTEX_WAIT, FUTEX_WAKE, FUTEX_WAIT_BITSET, FUTEX_WAKE_BITSET,
+/// and FUTEX_REQUEUE with a static wait queue keyed by futex address.
+/// Determinism: WAKE always wakes waiters in ascending agent_id order,
+/// and WAIT always blocks (no spin-waiting races).
 pub fn sys_futex(
     agent_id: u16,
     uaddr: u64,
@@ -929,10 +995,23 @@ pub fn sys_futex(
     let cmd = (op as u32) & !(FUTEX_PRIVATE_FLAG);
 
     match cmd {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             if uaddr == 0 {
                 return -EFAULT;
             }
+
+            // For FUTEX_WAIT_BITSET, the bitmask is passed as val3 (6th arg,
+            // mapped to _uaddr2 by the syscall dispatcher). A zero bitset is
+            // invalid per the Linux man page.
+            let bitset = if cmd == FUTEX_WAIT_BITSET {
+                let bs = _uaddr2 as u32;
+                if bs == 0 {
+                    return -EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
 
             // Step 1: Read the current value at the futex address.
             let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
@@ -950,6 +1029,7 @@ pub fn sys_futex(
                         FUTEX_WAITERS[i] = FutexWaiter {
                             agent_id,
                             futex_addr: uaddr,
+                            bitset,
                             active: true,
                         };
                         slot_found = true;
@@ -979,7 +1059,7 @@ pub fn sys_futex(
             // Step 7: When we resume, we've been woken -- return 0.
             0
         }
-        FUTEX_WAKE => {
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
             // Wake up to `val` waiters on this futex address, deterministically.
             if uaddr == 0 {
                 return 0;
@@ -989,14 +1069,28 @@ pub fn sys_futex(
                 return 0;
             }
 
-            // Step 1: Collect matching waiters.
+            // For FUTEX_WAKE_BITSET, only wake waiters whose bitset overlaps.
+            let bitset = if cmd == FUTEX_WAKE_BITSET {
+                let bs = _uaddr2 as u32;
+                if bs == 0 {
+                    return -EINVAL;
+                }
+                bs
+            } else {
+                FUTEX_BITSET_MATCH_ANY
+            };
+
+            // Step 1: Collect matching waiters (address match + bitmask overlap).
             let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
             let mut matching_indices: [usize; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
             let mut match_count: usize = 0;
 
             unsafe {
                 for i in 0..MAX_FUTEX_WAITERS {
-                    if FUTEX_WAITERS[i].active && FUTEX_WAITERS[i].futex_addr == uaddr {
+                    if FUTEX_WAITERS[i].active
+                        && FUTEX_WAITERS[i].futex_addr == uaddr
+                        && (FUTEX_WAITERS[i].bitset & bitset) != 0
+                    {
                         matching[match_count] = FUTEX_WAITERS[i].agent_id;
                         matching_indices[match_count] = i;
                         match_count += 1;
@@ -1044,9 +1138,78 @@ pub fn sys_futex(
             // Step 4: Return number of waiters woken.
             wake_count as i64
         }
+        FUTEX_REQUEUE => {
+            // FUTEX_REQUEUE: wake `val` waiters on uaddr, then move up to
+            // `val2` remaining waiters from uaddr to uaddr2.
+            // val2 is passed via _timeout_or_val2, uaddr2 via _uaddr2.
+            if uaddr == 0 {
+                return -EFAULT;
+            }
+            let max_wake = val as usize;
+            let max_requeue = _timeout_or_val2 as usize;
+            let uaddr2 = _uaddr2;
+
+            // Collect all waiters on uaddr, sorted by agent_id for determinism.
+            let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+            let mut matching_indices: [usize; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+            let mut match_count: usize = 0;
+
+            unsafe {
+                for i in 0..MAX_FUTEX_WAITERS {
+                    if FUTEX_WAITERS[i].active && FUTEX_WAITERS[i].futex_addr == uaddr {
+                        matching[match_count] = FUTEX_WAITERS[i].agent_id;
+                        matching_indices[match_count] = i;
+                        match_count += 1;
+                    }
+                }
+            }
+
+            if match_count == 0 {
+                return 0;
+            }
+
+            // Sort by agent_id (deterministic).
+            for i in 1..match_count {
+                let key_id = matching[i];
+                let key_idx = matching_indices[i];
+                let mut j = i;
+                while j > 0 && matching[j - 1] > key_id {
+                    matching[j] = matching[j - 1];
+                    matching_indices[j] = matching_indices[j - 1];
+                    j -= 1;
+                }
+                matching[j] = key_id;
+                matching_indices[j] = key_idx;
+            }
+
+            // Phase 1: Wake the first `max_wake` waiters.
+            let wake_count = match_count.min(max_wake);
+            for w in 0..wake_count {
+                let wid = matching[w];
+                let widx = matching_indices[w];
+                unsafe {
+                    FUTEX_WAITERS[widx].active = false;
+                }
+                if let Some(agent) = agent::get_agent_mut(wid) {
+                    agent.status = AgentStatus::Ready;
+                }
+                sched::add_to_run_queue(wid);
+            }
+
+            // Phase 2: Move the next `max_requeue` waiters to uaddr2.
+            let requeue_start = wake_count;
+            let requeue_end = match_count.min(requeue_start + max_requeue);
+            for r in requeue_start..requeue_end {
+                let ridx = matching_indices[r];
+                unsafe {
+                    FUTEX_WAITERS[ridx].futex_addr = uaddr2;
+                }
+            }
+
+            wake_count as i64
+        }
         _ => {
-            // Other futex ops (FUTEX_FD, FUTEX_REQUEUE, etc.) not implemented.
-            // Return 0 to avoid crashing programs.
+            // Other futex ops not implemented. Return 0 to avoid crashing.
             0
         }
     }

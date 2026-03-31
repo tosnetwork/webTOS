@@ -3,12 +3,12 @@
 //! Loads a checkpoint from disk, enables deterministic scheduling,
 //! and compares Merkle state roots after execution to detect divergence.
 
-use crate::serial_println;
 use crate::agent::*;
 use crate::checkpoint;
-use crate::merkle::{self, MerkleHash};
 use crate::deterministic;
+use crate::merkle::{self, MerkleHash};
 use crate::sched;
+use crate::serial_println;
 
 // ─── Replay state ────────────────────────────────────────────────────────
 
@@ -68,7 +68,7 @@ pub fn restore_from_checkpoint() -> bool {
                 agent.status = match cp_agent.status {
                     0 => AgentStatus::Created,
                     1 => AgentStatus::Ready,
-                    2 => AgentStatus::Running,  // will be set to Ready for run queue
+                    2 => AgentStatus::Running, // will be set to Ready for run queue
                     3 => AgentStatus::BlockedRecv,
                     4 => AgentStatus::BlockedSend,
                     5 => AgentStatus::Suspended,
@@ -84,8 +84,11 @@ pub fn restore_from_checkpoint() -> bool {
 
                 serial_println!(
                     "[REPLAY] Restored agent {}: status={} energy={} rip={:#x} rsp={:#x}",
-                    cp_agent.id, cp_agent.status, cp_agent.energy_budget,
-                    cp_agent.context.rip, cp_agent.context.rsp
+                    cp_agent.id,
+                    cp_agent.status,
+                    cp_agent.energy_budget,
+                    cp_agent.context.rip,
+                    cp_agent.context.rsp
                 );
             } else {
                 serial_println!(
@@ -133,7 +136,9 @@ pub fn restore_from_checkpoint() -> bool {
 
     serial_println!(
         "[REPLAY] State restored from checkpoint: tick={} event_seq={} agents_restored={}",
-        header.tick, header.event_sequence, restored_count
+        header.tick,
+        header.event_sequence,
+        restored_count
     );
 
     true
@@ -159,7 +164,9 @@ pub fn enter_replay() -> Result<(), i64> {
         REPLAY_ACTIVE = true;
     }
 
-    serial_println!("[REPLAY] Replay mode active — state restored, deterministic scheduling enabled");
+    serial_println!(
+        "[REPLAY] Replay mode active — state restored, deterministic scheduling enabled"
+    );
     Ok(())
 }
 
@@ -256,7 +263,10 @@ pub fn check_divergence() -> DiffReport {
 ///
 /// This is a structural verification only. Full replay re-execution requires
 /// running a second ATOS instance with deterministic scheduling.
-pub fn verify_replay_bundle(bundle: &crate::receipts::ReplayBundle, receipt: &crate::receipts::ExecutionReceipt) -> bool {
+pub fn verify_replay_bundle(
+    bundle: &crate::receipts::ReplayBundle,
+    receipt: &crate::receipts::ExecutionReceipt,
+) -> bool {
     // 1. Check receipt_id match
     if bundle.receipt_id != receipt.receipt_id {
         serial_println!("[REPLAY] verify: receipt_id mismatch");
@@ -266,7 +276,10 @@ pub fn verify_replay_bundle(bundle: &crate::receipts::ReplayBundle, receipt: &cr
     // 2. Verify initial_state matches receipt's initial_state_root
     //    The bundle stores the 32-byte initial_state_root in initial_state[..32]
     if bundle.initial_state_len < 32 {
-        serial_println!("[REPLAY] verify: initial_state too short (len={})", bundle.initial_state_len);
+        serial_println!(
+            "[REPLAY] verify: initial_state too short (len={})",
+            bundle.initial_state_len
+        );
         return false;
     }
     if bundle.initial_state[..32] != receipt.initial_state_root {
@@ -296,16 +309,28 @@ pub fn print_report(report: &DiffReport) {
     serial_println!("╠══════════════════════════════════════════════╣");
     serial_println!("║ Checkpoint tick:    {:>20}     ║", report.checkpoint_tick);
     serial_println!("║ Current tick:       {:>20}     ║", report.current_tick);
-    serial_println!("║ Checkpoint seq:     {:>20}     ║", report.checkpoint_event_seq);
-    serial_println!("║ Current seq:        {:>20}     ║", report.current_event_seq);
+    serial_println!(
+        "║ Checkpoint seq:     {:>20}     ║",
+        report.checkpoint_event_seq
+    );
+    serial_println!(
+        "║ Current seq:        {:>20}     ║",
+        report.current_event_seq
+    );
     serial_println!("║ Total keyspaces:    {:>20}     ║", report.total_keyspaces);
-    serial_println!("║ Divergent:          {:>20}     ║", report.divergent_keyspaces);
+    serial_println!(
+        "║ Divergent:          {:>20}     ║",
+        report.divergent_keyspaces
+    );
     serial_println!("╚══════════════════════════════════════════════╝");
 
     if report.divergent_keyspaces == 0 {
         serial_println!("[DIFF] ✓ No divergence detected — Merkle roots match");
     } else {
-        serial_println!("[DIFF] ✗ {} keyspace(s) diverged:", report.divergent_keyspaces);
+        serial_println!(
+            "[DIFF] ✗ {} keyspace(s) diverged:",
+            report.divergent_keyspaces
+        );
         for i in 0..report.detail_count {
             if let Some(entry) = &report.details[i] {
                 serial_println!(

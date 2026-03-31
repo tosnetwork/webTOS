@@ -36,7 +36,9 @@ pub fn node_id() -> u32 {
 pub fn set_node_id(id: u32) {
     if id != 0 {
         // Safety: called during single-threaded early boot.
-        unsafe { NODE_ID = id; }
+        unsafe {
+            NODE_ID = id;
+        }
     }
 }
 

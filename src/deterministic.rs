@@ -50,7 +50,10 @@ pub fn enable(ticks_per_agent: u64) {
         DETERMINISTIC.current_slot = 0;
         DETERMINISTIC.slot_ticks = 0;
         rebuild_agent_order();
-        serial_println!("[DETERMINISTIC] Enabled with {} ticks per agent", ticks_per_agent);
+        serial_println!(
+            "[DETERMINISTIC] Enabled with {} ticks per agent",
+            ticks_per_agent
+        );
     }
 }
 
@@ -106,10 +109,14 @@ fn rebuild_agent_order() {
 
         // Collect all active, non-idle agents sorted by ID
         for id in 0..MAX_AGENTS as AgentId {
-            if id == IDLE_AGENT_ID { continue; }
+            if id == IDLE_AGENT_ID {
+                continue;
+            }
             if let Some(agent) = crate::agent::get_agent(id) {
-                if agent.active && agent.status != AgentStatus::Exited
-                    && agent.status != AgentStatus::Faulted {
+                if agent.active
+                    && agent.status != AgentStatus::Exited
+                    && agent.status != AgentStatus::Faulted
+                {
                     let idx = DETERMINISTIC.agent_count;
                     if idx < MAX_AGENTS {
                         DETERMINISTIC.agent_order[idx] = Some(id);
@@ -124,6 +131,10 @@ fn rebuild_agent_order() {
 /// Get current deterministic scheduling state for audit/debug
 pub fn get_state() -> (u64, usize, u64) {
     unsafe {
-        (DETERMINISTIC.round, DETERMINISTIC.current_slot, DETERMINISTIC.slot_ticks)
+        (
+            DETERMINISTIC.round,
+            DETERMINISTIC.current_slot,
+            DETERMINISTIC.slot_ticks,
+        )
     }
 }

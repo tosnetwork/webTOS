@@ -15,21 +15,21 @@ const PCI_CAP_MSIX: u8 = 0x11;
 /// MSI-X capability information decoded from PCI config space
 #[derive(Debug, Clone, Copy)]
 pub struct MsixCapability {
-    pub cap_offset: u8,     // Offset in config space where capability starts
-    pub table_size: u16,    // Number of MSI-X vectors (field value + 1)
-    pub table_bar: u8,      // BAR index (BIR) for the MSI-X table
-    pub table_offset: u32,  // Byte offset within that BAR for the table
-    pub pba_bar: u8,        // BAR index (BIR) for the Pending Bit Array
-    pub pba_offset: u32,    // Byte offset within that BAR for the PBA
+    pub cap_offset: u8,    // Offset in config space where capability starts
+    pub table_size: u16,   // Number of MSI-X vectors (field value + 1)
+    pub table_bar: u8,     // BAR index (BIR) for the MSI-X table
+    pub table_offset: u32, // Byte offset within that BAR for the table
+    pub pba_bar: u8,       // BAR index (BIR) for the Pending Bit Array
+    pub pba_offset: u32,   // Byte offset within that BAR for the PBA
 }
 
 /// PCI BAR type
 #[derive(Debug, Clone, Copy)]
 pub enum BarType {
     None,
-    IoPort(u16),         // I/O port address
-    Mmio32(u32),         // 32-bit MMIO address
-    Mmio64(u64),         // 64-bit MMIO address
+    IoPort(u16), // I/O port address
+    Mmio32(u32), // 32-bit MMIO address
+    Mmio64(u64), // 64-bit MMIO address
 }
 
 /// A discovered PCI device
@@ -53,9 +53,14 @@ pub struct PciDevice {
 impl PciDevice {
     const fn empty() -> Self {
         PciDevice {
-            bus: 0, device: 0, function: 0,
-            vendor_id: 0, device_id: 0,
-            class_code: 0, subclass: 0, prog_if: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+            vendor_id: 0,
+            device_id: 0,
+            class_code: 0,
+            subclass: 0,
+            prog_if: 0,
             header_type: 0,
             bars: [BarType::None; 6],
             irq_line: 0,
@@ -123,7 +128,9 @@ fn decode_bar(bus: u8, dev: u8, func: u8, bar_index: usize) -> BarType {
     let offset = 0x10 + (bar_index as u8) * 4;
     let bar = read_config(bus, dev, func, offset);
 
-    if bar == 0 { return BarType::None; }
+    if bar == 0 {
+        return BarType::None;
+    }
 
     if bar & 1 != 0 {
         // I/O port BAR
@@ -229,12 +236,7 @@ pub fn enable_msix(bus: u8, device: u8, func: u8, cap_offset: u8) {
 /// # Safety
 /// `table_base` must be a valid, identity-mapped MMIO address for the MSI-X
 /// table BAR of the device.
-pub unsafe fn configure_msix_entry(
-    table_base: u64,
-    index: u16,
-    vector: u8,
-    apic_id: u8,
-) {
+pub unsafe fn configure_msix_entry(table_base: u64, index: u16, vector: u8, apic_id: u8) {
     let entry_addr = table_base + (index as u64) * 16;
 
     // Message Address: 0xFEEE_xxxx where xx = destination APIC ID (bits 19:12)
@@ -256,14 +258,18 @@ pub unsafe fn configure_msix_entry(
 pub fn init() {
     serial_println!("[PCI] Scanning PCI bus...");
 
-    unsafe { PCI_DEVICE_COUNT = 0; }
+    unsafe {
+        PCI_DEVICE_COUNT = 0;
+    }
 
     for bus in 0..=255u16 {
         for dev in 0..32u8 {
             let id = read_config(bus as u8, dev, 0, 0);
             let vendor = (id & 0xFFFF) as u16;
 
-            if vendor == 0xFFFF || vendor == 0 { continue; }
+            if vendor == 0xFFFF || vendor == 0 {
+                continue;
+            }
 
             let device_id = ((id >> 16) & 0xFFFF) as u16;
             let class_reg = read_config(bus as u8, dev, 0, 0x08);
@@ -280,7 +286,9 @@ pub fn init() {
             let mut i = 0;
             while i < bar_count {
                 bars[i] = decode_bar(bus as u8, dev, 0, i);
-                if matches!(bars[i], BarType::Mmio64(_)) { i += 1; } // skip next BAR (used by 64-bit)
+                if matches!(bars[i], BarType::Mmio64(_)) {
+                    i += 1;
+                } // skip next BAR (used by 64-bit)
                 i += 1;
             }
 
@@ -289,10 +297,17 @@ pub fn init() {
             let msix_supported = msix_cap.is_some();
 
             let pci_dev = PciDevice {
-                bus: bus as u8, device: dev, function: 0,
-                vendor_id: vendor, device_id,
-                class_code, subclass, prog_if, header_type,
-                bars, irq_line,
+                bus: bus as u8,
+                device: dev,
+                function: 0,
+                vendor_id: vendor,
+                device_id,
+                class_code,
+                subclass,
+                prog_if,
+                header_type,
+                bars,
+                irq_line,
                 msix_supported,
                 msix_cap,
             };
@@ -316,14 +331,26 @@ pub fn init() {
                 serial_println!("[PCI] {}:{}.{} vendor={:#06x} device={:#06x} class={:#04x}:{:#04x} ({}) MSI-X: {} vectors",
                     bus, dev, 0, vendor, device_id, class_code, subclass, class_name, cap.table_size);
             } else {
-                serial_println!("[PCI] {}:{}.{} vendor={:#06x} device={:#06x} class={:#04x}:{:#04x} ({})",
-                    bus, dev, 0, vendor, device_id, class_code, subclass, class_name);
+                serial_println!(
+                    "[PCI] {}:{}.{} vendor={:#06x} device={:#06x} class={:#04x}:{:#04x} ({})",
+                    bus,
+                    dev,
+                    0,
+                    vendor,
+                    device_id,
+                    class_code,
+                    subclass,
+                    class_name
+                );
             }
         }
     }
 
     unsafe {
-        serial_println!("[PCI] Enumeration complete: {} device(s) found", PCI_DEVICE_COUNT);
+        serial_println!(
+            "[PCI] Enumeration complete: {} device(s) found",
+            PCI_DEVICE_COUNT
+        );
     }
 }
 

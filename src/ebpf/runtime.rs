@@ -284,25 +284,33 @@ impl EbpfVm {
                 if !self.check_write(addr, 1) {
                     return Err(EbpfError::OutOfBounds);
                 }
-                unsafe { *(addr as *mut u8) = val as u8; }
+                unsafe {
+                    *(addr as *mut u8) = val as u8;
+                }
             }
             BPF_H => {
                 if !self.check_write(addr, 2) {
                     return Err(EbpfError::OutOfBounds);
                 }
-                unsafe { core::ptr::write_unaligned(addr as *mut u16, val as u16); }
+                unsafe {
+                    core::ptr::write_unaligned(addr as *mut u16, val as u16);
+                }
             }
             BPF_W => {
                 if !self.check_write(addr, 4) {
                     return Err(EbpfError::OutOfBounds);
                 }
-                unsafe { core::ptr::write_unaligned(addr as *mut u32, val as u32); }
+                unsafe {
+                    core::ptr::write_unaligned(addr as *mut u32, val as u32);
+                }
             }
             BPF_DW => {
                 if !self.check_write(addr, 8) {
                     return Err(EbpfError::OutOfBounds);
                 }
-                unsafe { core::ptr::write_unaligned(addr as *mut u64, val); }
+                unsafe {
+                    core::ptr::write_unaligned(addr as *mut u64, val);
+                }
             }
             _ => return Err(EbpfError::InvalidOpcode(size_code)),
         }
@@ -407,7 +415,11 @@ impl EbpfVm {
                         for i in 0..key_len {
                             key_buf[i] = unsafe { *key_ptr.add(i) };
                         }
-                        self.regs[0] = if map.delete(&key_buf[..key_len]) { 0 } else { 1 };
+                        self.regs[0] = if map.delete(&key_buf[..key_len]) {
+                            0
+                        } else {
+                            1
+                        };
                     } else {
                         self.regs[0] = 1;
                     }
@@ -432,7 +444,7 @@ impl EbpfVm {
                 crate::event::emit(
                     agent_id,
                     crate::event::EventType::Custom,
-                    self.regs[1],  // event_code from eBPF program
+                    self.regs[1], // event_code from eBPF program
                     0,
                     0,
                 );
@@ -487,8 +499,7 @@ impl EbpfVm {
                 if let Some(map) = super::maps::get_map_mut(map_id) {
                     let current: u64 = match map.lookup(&key_buf[..key_len]) {
                         Some(val) if val.len() >= 8 => u64::from_le_bytes([
-                            val[0], val[1], val[2], val[3],
-                            val[4], val[5], val[6], val[7],
+                            val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7],
                         ]),
                         _ => 0,
                     };
@@ -520,8 +531,7 @@ impl EbpfVm {
                 if let Some(map) = super::maps::get_map(map_id) {
                     self.regs[0] = match map.lookup(&key_buf[..key_len]) {
                         Some(val) if val.len() >= 8 => u64::from_le_bytes([
-                            val[0], val[1], val[2], val[3],
-                            val[4], val[5], val[6], val[7],
+                            val[0], val[1], val[2], val[3], val[4], val[5], val[6], val[7],
                         ]),
                         _ => 0,
                     };

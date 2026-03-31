@@ -271,35 +271,34 @@ pub fn dispatch(agent_id: u16, num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         state::init_state(agent_id);
     }
 
-    if let Some(result) = dispatch_process_syscall(agent_id, num, a1, a2, a3, a4, a5) {
-        return result;
-    }
-    if let Some(result) = dispatch_file_syscall(agent_id, num, a1, a2, a3, a4, a5) {
-        return result;
-    }
-    if let Some(result) = dispatch_memory_syscall(agent_id, num, a1, a2, a3, a4, a5) {
-        return result;
-    }
-    if let Some(result) = dispatch_signal_syscall(agent_id, num, a1, a2, a3, a4) {
-        return result;
-    }
-    if let Some(result) = dispatch_network_syscall(agent_id, num, a1, a2, a3, a4, a5) {
-        return result;
-    }
-    if let Some(result) = dispatch_epoll_syscall(agent_id, num, a1, a2, a3, a4, a5) {
-        return result;
-    }
-    if let Some(result) = dispatch_time_syscall(agent_id, num, a1, a2, a3, a4) {
-        return result;
-    }
-    if let Some(result) = dispatch_identity_syscall(agent_id, num, a1, a2, a3, a4) {
-        return result;
-    }
+    let result = if let Some(r) = dispatch_process_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+        r
+    } else if let Some(r) = dispatch_file_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+        r
+    } else if let Some(r) = dispatch_memory_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+        r
+    } else if let Some(r) = dispatch_signal_syscall(agent_id, num, a1, a2, a3, a4) {
+        r
+    } else if let Some(r) = dispatch_network_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+        r
+    } else if let Some(r) = dispatch_epoll_syscall(agent_id, num, a1, a2, a3, a4, a5) {
+        r
+    } else if let Some(r) = dispatch_time_syscall(agent_id, num, a1, a2, a3, a4) {
+        r
+    } else if let Some(r) = dispatch_identity_syscall(agent_id, num, a1, a2, a3, a4) {
+        r
+    } else {
+        serial_println!(
+            "[linux_compat] agent {}: unimplemented syscall {}",
+            agent_id,
+            num
+        );
+        -ENOSYS
+    };
 
-    serial_println!(
-        "[linux_compat] agent {}: unimplemented syscall {}",
-        agent_id,
-        num
-    );
-    -ENOSYS
+    // Check and deliver pending signals at syscall return boundary
+    // (deterministic: always checked at the same point).
+    signal::deliver_pending_signals(agent_id);
+
+    result
 }

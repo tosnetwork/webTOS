@@ -138,7 +138,11 @@ pub fn sys_epoll_ctl(agent_id: u16, epfd: i32, op: i32, fd: i32, _event_ptr: u64
                     break;
                 }
             }
-            if found { 0 } else { -ENOENT }
+            if found {
+                0
+            } else {
+                -ENOENT
+            }
         }
         EPOLL_CTL_MOD => {
             // Check that fd is in the watch list
@@ -149,7 +153,11 @@ pub fn sys_epoll_ctl(agent_id: u16, epfd: i32, op: i32, fd: i32, _event_ptr: u64
                     break;
                 }
             }
-            if found { 0 } else { -ENOENT }
+            if found {
+                0
+            } else {
+                -ENOENT
+            }
         }
         _ => -EINVAL,
     }
@@ -171,7 +179,13 @@ const EPOLLOUT: u32 = 0x004;
 /// Deterministic polling: iterate watched fds in ascending order, check each
 /// for readiness. Sockets/pipes with data pending are EPOLLIN-ready.
 /// For deterministic behavior, all fds are always reported as EPOLLOUT-ready.
-pub fn sys_epoll_wait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32, _timeout: i32) -> i64 {
+pub fn sys_epoll_wait(
+    agent_id: u16,
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    _timeout: i32,
+) -> i64 {
     if events_ptr == 0 || maxevents <= 0 {
         return -EINVAL;
     }
@@ -247,13 +261,9 @@ pub fn sys_epoll_wait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32,
         // Write epoll_event { events: u32, data: u64 }
         unsafe {
             let p = (events_ptr as *mut u8).add(nevents as usize * EPOLL_EVENT_SIZE);
-            core::ptr::copy_nonoverlapping(
-                &ready_events as *const u32 as *const u8, p, 4,
-            );
+            core::ptr::copy_nonoverlapping(&ready_events as *const u32 as *const u8, p, 4);
             let data = fd as u64;
-            core::ptr::copy_nonoverlapping(
-                &data as *const u64 as *const u8, p.add(4), 8,
-            );
+            core::ptr::copy_nonoverlapping(&data as *const u64 as *const u8, p.add(4), 8);
         }
         nevents += 1;
     }
@@ -268,8 +278,14 @@ pub fn sys_epoll_wait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32,
 ///
 /// We ignore the sigmask (no signal support) and delegate to epoll_wait.
 #[allow(dead_code)]
-pub fn sys_epoll_pwait(agent_id: u16, epfd: i32, events_ptr: u64, maxevents: i32,
-                       timeout: i32, _sigmask_ptr: u64) -> i64 {
+pub fn sys_epoll_pwait(
+    agent_id: u16,
+    epfd: i32,
+    events_ptr: u64,
+    maxevents: i32,
+    timeout: i32,
+    _sigmask_ptr: u64,
+) -> i64 {
     sys_epoll_wait(agent_id, epfd, events_ptr, maxevents, timeout)
 }
 

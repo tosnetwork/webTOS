@@ -8,7 +8,9 @@
 //!
 //! Reference: ATOS Yellow Paper §24.5.
 
-use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
+use crate::agent::{
+    KeyspaceId, E_INVALID_ARG, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE, E_QUOTA_EXCEEDED, MAX_AGENTS,
+};
 use crate::block::StorageDevice;
 
 const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
@@ -256,7 +258,9 @@ fn replay_state_log(device: &StorageDevice) -> u64 {
         // Check for empty sector (all-zero sequence means end of log)
         let sequence = get_u64(buf, 0);
         if sequence == 0 {
-            unsafe { NEXT_SECTOR = sector; }
+            unsafe {
+                NEXT_SECTOR = sector;
+            }
             break;
         }
 
@@ -268,7 +272,9 @@ fn replay_state_log(device: &StorageDevice) -> u64 {
                 "[persist] CRC mismatch at sector {} (stored={:#010x}, computed={:#010x}), truncating log",
                 sector, stored_crc, computed_crc
             );
-            unsafe { NEXT_SECTOR = sector; }
+            unsafe {
+                NEXT_SECTOR = sector;
+            }
             break;
         }
 
@@ -285,8 +291,13 @@ fn replay_state_log(device: &StorageDevice) -> u64 {
                 replayed += 1;
             }
             None => {
-                crate::serial_println!("[persist] invalid entry at sector {}, stopping replay", sector);
-                unsafe { NEXT_SECTOR = sector; }
+                crate::serial_println!(
+                    "[persist] invalid entry at sector {}, stopping replay",
+                    sector
+                );
+                unsafe {
+                    NEXT_SECTOR = sector;
+                }
                 break;
             }
         }
@@ -323,7 +334,10 @@ pub fn init() {
     unsafe {
         DISK_AVAILABLE = true;
     }
-    crate::serial_println!("[persist] {} detected — replaying state log...", device.name());
+    crate::serial_println!(
+        "[persist] {} detected — replaying state log...",
+        device.name()
+    );
 
     let replayed = replay_state_log(&device);
     crate::serial_println!("[persist] replayed {} log entries", replayed);
@@ -416,10 +430,15 @@ pub fn put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64> {
             serialize_entry(&mut sector_buf, NEXT_SEQUENCE, keyspace, key, value);
 
             let dev = StorageDevice::detect();
-            let write_ok = dev.map_or(false, |d| d.write(NEXT_SECTOR as u64, 1, &sector_buf).is_ok());
+            let write_ok = dev.map_or(false, |d| {
+                d.write(NEXT_SECTOR as u64, 1, &sector_buf).is_ok()
+            });
             if !write_ok {
                 // Disk write failed — still update in-memory
-                crate::serial_println!("[persist] WARNING: disk write failed at sector {}", NEXT_SECTOR);
+                crate::serial_println!(
+                    "[persist] WARNING: disk write failed at sector {}",
+                    NEXT_SECTOR
+                );
             } else {
                 NEXT_SEQUENCE += 1;
                 NEXT_SECTOR += 1;
@@ -528,12 +547,19 @@ const MAX_PERSIST_PACKAGES: usize = 32;
 const RECEIPT_ENTRY_SIZE: usize = 1024;
 const RECEIPT_CRC_OFFSET: usize = 1020;
 
-fn serialize_receipt(buf: &mut [u8; RECEIPT_ENTRY_SIZE], receipt: &crate::receipts::ExecutionReceipt) {
+fn serialize_receipt(
+    buf: &mut [u8; RECEIPT_ENTRY_SIZE],
+    receipt: &crate::receipts::ExecutionReceipt,
+) {
     buf.fill(0);
 
     put_u16(buf, 0, receipt.receipt_version);
     buf[2] = receipt.runtime_class as u8;
-    buf[3] = if receipt.local_agent_id.is_some() { 1 } else { 0 };
+    buf[3] = if receipt.local_agent_id.is_some() {
+        1
+    } else {
+        0
+    };
     put_u16(buf, 4, receipt.local_agent_id.unwrap_or(0));
     // 6..10 reserved (was pricing_class)
     // 10..16 padding
@@ -563,7 +589,9 @@ fn serialize_receipt(buf: &mut [u8; RECEIPT_ENTRY_SIZE], receipt: &crate::receip
     put_u32(buf, RECEIPT_CRC_OFFSET, checksum);
 }
 
-fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts::ExecutionReceipt> {
+fn deserialize_receipt(
+    buf: &[u8; RECEIPT_ENTRY_SIZE],
+) -> Option<crate::receipts::ExecutionReceipt> {
     // Verify CRC
     let stored_crc = get_u32(buf, RECEIPT_CRC_OFFSET);
     let computed_crc = crc32(&buf[..RECEIPT_CRC_OFFSET]);
@@ -584,7 +612,11 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
     };
     let has_local_agent = buf[3] != 0;
     let local_agent_id_raw = get_u16(buf, 4);
-    let local_agent_id = if has_local_agent { Some(local_agent_id_raw) } else { None };
+    let local_agent_id = if has_local_agent {
+        Some(local_agent_id_raw)
+    } else {
+        None
+    };
     // skip offset 6 (was pricing_class)
 
     let mut receipt_id = [0u8; 32];
@@ -670,7 +702,10 @@ fn deserialize_receipt(buf: &[u8; RECEIPT_ENTRY_SIZE]) -> Option<crate::receipts
 const PACKAGE_ENTRY_SIZE: usize = 512;
 const PACKAGE_CRC_OFFSET: usize = 508;
 
-fn serialize_package(buf: &mut [u8; PACKAGE_ENTRY_SIZE], manifest: &crate::package::PackageManifest) {
+fn serialize_package(
+    buf: &mut [u8; PACKAGE_ENTRY_SIZE],
+    manifest: &crate::package::PackageManifest,
+) {
     buf.fill(0);
 
     buf[0..64].copy_from_slice(&manifest.name);
@@ -759,7 +794,11 @@ pub fn save_receipts_to_disk() {
     };
 
     let count = crate::receipts::receipt_count();
-    let save_count = if count > MAX_PERSIST_RECEIPTS { MAX_PERSIST_RECEIPTS } else { count };
+    let save_count = if count > MAX_PERSIST_RECEIPTS {
+        MAX_PERSIST_RECEIPTS
+    } else {
+        count
+    };
 
     // Write header sector
     let mut header = [0u8; 512];
@@ -781,7 +820,11 @@ pub fn save_receipts_to_disk() {
             let sector = RECEIPT_DATA_START + (i as u64) * RECEIPT_SECTORS_EACH;
             // Write 2 sectors at once
             if device.write(sector, 2, &entry_buf).is_err() {
-                crate::serial_println!("[persist] WARNING: failed to write receipt {} at sector {}", i, sector);
+                crate::serial_println!(
+                    "[persist] WARNING: failed to write receipt {} at sector {}",
+                    i,
+                    sector
+                );
             }
         }
     }
@@ -869,7 +912,11 @@ pub fn save_packages_to_disk() {
     };
 
     let count = crate::package::package_count();
-    let save_count = if count > MAX_PERSIST_PACKAGES { MAX_PERSIST_PACKAGES } else { count };
+    let save_count = if count > MAX_PERSIST_PACKAGES {
+        MAX_PERSIST_PACKAGES
+    } else {
+        count
+    };
 
     // Write header sector
     let mut header = [0u8; 512];
@@ -891,7 +938,11 @@ pub fn save_packages_to_disk() {
             serialize_package(&mut entry_buf, manifest);
             let sector = PACKAGE_DATA_START + (i as u64);
             if device.write(sector, 1, &entry_buf).is_err() {
-                crate::serial_println!("[persist] WARNING: failed to write package {} at sector {}", i, sector);
+                crate::serial_println!(
+                    "[persist] WARNING: failed to write package {} at sector {}",
+                    i,
+                    sector
+                );
             } else {
                 saved += 1;
             }
@@ -1079,7 +1130,9 @@ fn deserialize_replay_bundle(buf: &[u8]) -> Option<crate::receipts::ReplayBundle
 
     bundle.checkpoint_data.copy_from_slice(&buf[64..64 + 4096]);
     bundle.transcript.copy_from_slice(&buf[4160..4160 + 4096]);
-    bundle.initial_state.copy_from_slice(&buf[8256..8256 + 2048]);
+    bundle
+        .initial_state
+        .copy_from_slice(&buf[8256..8256 + 2048]);
 
     Some(bundle)
 }
@@ -1161,7 +1214,11 @@ pub fn save_replay_bundles_to_disk() {
     };
 
     let count = crate::receipts::replay_bundle_count();
-    let save_count = if count > MAX_PERSIST_REPLAY { MAX_PERSIST_REPLAY } else { count };
+    let save_count = if count > MAX_PERSIST_REPLAY {
+        MAX_PERSIST_REPLAY
+    } else {
+        count
+    };
 
     // Write header sector
     let mut header = [0u8; 512];
@@ -1181,8 +1238,15 @@ pub fn save_replay_bundles_to_disk() {
         if let Some(bundle) = crate::receipts::get_replay_bundle(i) {
             serialize_replay_bundle(&mut entry_buf, bundle);
             let sector = REPLAY_DATA_START + (i as u64) * REPLAY_SECTORS_EACH;
-            if device.write(sector, REPLAY_SECTORS_EACH as u32, &entry_buf).is_err() {
-                crate::serial_println!("[persist] WARNING: failed to write replay bundle {} at sector {}", i, sector);
+            if device
+                .write(sector, REPLAY_SECTORS_EACH as u32, &entry_buf)
+                .is_err()
+            {
+                crate::serial_println!(
+                    "[persist] WARNING: failed to write replay bundle {} at sector {}",
+                    i,
+                    sector
+                );
             }
         }
     }
@@ -1222,7 +1286,10 @@ pub fn load_replay_bundles_from_disk() {
 
     let count = get_u32(&header, 4) as usize;
     if count > MAX_PERSIST_REPLAY {
-        crate::serial_println!("[persist] replay bundle count {} exceeds max, skipping", count);
+        crate::serial_println!(
+            "[persist] replay bundle count {} exceeds max, skipping",
+            count
+        );
         return;
     }
 
@@ -1230,7 +1297,10 @@ pub fn load_replay_bundles_from_disk() {
     let mut entry_buf = [0u8; REPLAY_ENTRY_SIZE];
     for i in 0..count {
         let sector = REPLAY_DATA_START + (i as u64) * REPLAY_SECTORS_EACH;
-        if device.read(sector, REPLAY_SECTORS_EACH as u32, &mut entry_buf).is_err() {
+        if device
+            .read(sector, REPLAY_SECTORS_EACH as u32, &mut entry_buf)
+            .is_err()
+        {
             break;
         }
 
@@ -1260,7 +1330,11 @@ pub fn save_proof_bundles_to_disk() {
     };
 
     let count = crate::receipts::proof_count();
-    let save_count = if count > MAX_PERSIST_PROOFS { MAX_PERSIST_PROOFS } else { count };
+    let save_count = if count > MAX_PERSIST_PROOFS {
+        MAX_PERSIST_PROOFS
+    } else {
+        count
+    };
 
     // Write header sector
     let mut header = [0u8; 512];
@@ -1280,8 +1354,15 @@ pub fn save_proof_bundles_to_disk() {
         if let Some(proof) = crate::receipts::get_proof_bundle(i) {
             serialize_proof_bundle(&mut entry_buf, proof);
             let sector = PROOF_DATA_START + (i as u64) * PROOF_SECTORS_EACH;
-            if device.write(sector, PROOF_SECTORS_EACH as u32, &entry_buf).is_err() {
-                crate::serial_println!("[persist] WARNING: failed to write proof bundle {} at sector {}", i, sector);
+            if device
+                .write(sector, PROOF_SECTORS_EACH as u32, &entry_buf)
+                .is_err()
+            {
+                crate::serial_println!(
+                    "[persist] WARNING: failed to write proof bundle {} at sector {}",
+                    i,
+                    sector
+                );
             }
         }
     }
@@ -1321,7 +1402,10 @@ pub fn load_proof_bundles_from_disk() {
 
     let count = get_u32(&header, 4) as usize;
     if count > MAX_PERSIST_PROOFS {
-        crate::serial_println!("[persist] proof bundle count {} exceeds max, skipping", count);
+        crate::serial_println!(
+            "[persist] proof bundle count {} exceeds max, skipping",
+            count
+        );
         return;
     }
 
@@ -1329,7 +1413,10 @@ pub fn load_proof_bundles_from_disk() {
     let mut entry_buf = [0u8; PROOF_ENTRY_SIZE];
     for i in 0..count {
         let sector = PROOF_DATA_START + (i as u64) * PROOF_SECTORS_EACH;
-        if device.read(sector, PROOF_SECTORS_EACH as u32, &mut entry_buf).is_err() {
+        if device
+            .read(sector, PROOF_SECTORS_EACH as u32, &mut entry_buf)
+            .is_err()
+        {
             break;
         }
 

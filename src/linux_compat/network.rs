@@ -36,7 +36,8 @@ impl NetIoEntry {
     }
 }
 
-static mut NET_IO_LOG: [NetIoEntry; MAX_NET_IO_LOG] = [const { NetIoEntry::empty() }; MAX_NET_IO_LOG];
+static mut NET_IO_LOG: [NetIoEntry; MAX_NET_IO_LOG] =
+    [const { NetIoEntry::empty() }; MAX_NET_IO_LOG];
 static mut NET_IO_COUNT: usize = 0;
 
 /// Record a network I/O payload for deterministic replay.
@@ -83,11 +84,7 @@ fn replay_network_recv(agent_id: u16, buf_ptr: u64, count: u64) -> i64 {
             let entry = &mut NET_IO_LOG[i];
             if entry.active && !entry.is_send && entry.agent_id == agent_id {
                 let copy_len = (entry.len as usize).min(count as usize);
-                core::ptr::copy_nonoverlapping(
-                    entry.data.as_ptr(),
-                    buf_ptr as *mut u8,
-                    copy_len,
-                );
+                core::ptr::copy_nonoverlapping(entry.data.as_ptr(), buf_ptr as *mut u8, copy_len);
                 // Mark consumed so it won't be replayed again
                 entry.active = false;
                 return copy_len as i64;
@@ -219,8 +216,14 @@ pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64)
 
 /// sendto(int sockfd, const void *buf, size_t len, int flags,
 ///        const struct sockaddr *dest_addr, socklen_t addrlen)
-pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
-                  _flags: u64, _dest_addr: u64) -> i64 {
+pub fn sys_sendto(
+    agent_id: u16,
+    sockfd: i32,
+    buf_ptr: u64,
+    len: u64,
+    _flags: u64,
+    _dest_addr: u64,
+) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
@@ -238,9 +241,7 @@ pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
 
     // Read user data
     let data_len = (len as usize).min(MAX_MESSAGE_PAYLOAD - 32);
-    let data = unsafe {
-        core::slice::from_raw_parts(buf_ptr as *const u8, data_len)
-    };
+    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
 
     // Build URL from packed ip:port in keyspace_key
     let port = (packed_addr & 0xFFFF) as u16;
@@ -267,21 +268,28 @@ pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
     // [op=0x01, reply_mailbox: u8, method: u8, url_len: u16 LE, url: [u8], body_len: u16 LE, body: [u8]]
     let mut msg = [0u8; MAX_MESSAGE_PAYLOAD];
     let mut pos = 0usize;
-    msg[pos] = 0x01; pos += 1;                              // op = OP_REQUEST
-    msg[pos] = agent_id as u8; pos += 1;                     // reply_mailbox
-    msg[pos] = 0x02; pos += 1;                               // method = POST
+    msg[pos] = 0x01;
+    pos += 1; // op = OP_REQUEST
+    msg[pos] = agent_id as u8;
+    pos += 1; // reply_mailbox
+    msg[pos] = 0x02;
+    pos += 1; // method = POST
     let url_len_bytes = (url_pos as u16).to_le_bytes();
-    msg[pos] = url_len_bytes[0]; pos += 1;
-    msg[pos] = url_len_bytes[1]; pos += 1;                   // url_len
+    msg[pos] = url_len_bytes[0];
+    pos += 1;
+    msg[pos] = url_len_bytes[1];
+    pos += 1; // url_len
     let url_copy = url_pos.min(msg.len() - pos);
     msg[pos..pos + url_copy].copy_from_slice(&url_buf[..url_copy]);
-    pos += url_copy;                                         // url
+    pos += url_copy; // url
     let body_len_bytes = (data_len as u16).to_le_bytes();
     if pos + 2 + data_len <= msg.len() {
-        msg[pos] = body_len_bytes[0]; pos += 1;
-        msg[pos] = body_len_bytes[1]; pos += 1;              // body_len
+        msg[pos] = body_len_bytes[0];
+        pos += 1;
+        msg[pos] = body_len_bytes[1];
+        pos += 1; // body_len
         msg[pos..pos + data_len].copy_from_slice(data);
-        pos += data_len;                                     // body
+        pos += data_len; // body
     }
 
     // Send to netd's mailbox
@@ -302,8 +310,14 @@ pub fn sys_sendto(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
 
 /// recvfrom(int sockfd, void *buf, size_t len, int flags,
 ///          struct sockaddr *src_addr, socklen_t *addrlen)
-pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
-                    _flags: u64, _src_addr: u64) -> i64 {
+pub fn sys_recvfrom(
+    agent_id: u16,
+    sockfd: i32,
+    buf_ptr: u64,
+    len: u64,
+    _flags: u64,
+    _src_addr: u64,
+) -> i64 {
     let fd_flags = {
         let st = match state::get_state(agent_id) {
             Some(s) => s,
@@ -332,11 +346,7 @@ pub fn sys_recvfrom(agent_id: u16, sockfd: i32, buf_ptr: u64, len: u64,
             let payload_len = msg.len as usize;
             let copy_len = payload_len.min(len as usize);
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    msg.payload.as_ptr(),
-                    buf_ptr as *mut u8,
-                    copy_len,
-                );
+                core::ptr::copy_nonoverlapping(msg.payload.as_ptr(), buf_ptr as *mut u8, copy_len);
             }
             // Record the received data for replay determinism
             crate::checkpoint::record_trace(
@@ -459,8 +469,8 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
 
     let entry = st.get_fd_mut(sockfd).unwrap();
     match how {
-        0 => entry.flags |= FD_FLAG_SHUT_RD,              // SHUT_RD
-        1 => entry.flags |= FD_FLAG_SHUT_WR,              // SHUT_WR
+        0 => entry.flags |= FD_FLAG_SHUT_RD,                   // SHUT_RD
+        1 => entry.flags |= FD_FLAG_SHUT_WR,                   // SHUT_WR
         2 => entry.flags |= FD_FLAG_SHUT_RD | FD_FLAG_SHUT_WR, // SHUT_RDWR
         _ => return -EINVAL,
     }
@@ -552,9 +562,7 @@ pub fn sys_getsockname(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u
         core::ptr::write_bytes(p, 0, 16);
         // sa_family = AF_INET = 2 (u16 at offset 0)
         let af_inet: u16 = 2;
-        core::ptr::copy_nonoverlapping(
-            &af_inet as *const u16 as *const u8, p, 2,
-        );
+        core::ptr::copy_nonoverlapping(&af_inet as *const u16 as *const u8, p, 2);
         // Write addrlen = 16
         let addrlen: u32 = 16;
         core::ptr::copy_nonoverlapping(
@@ -578,7 +586,13 @@ pub fn sys_getpeername(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u
 // ── socketpair ─────────────────────────────────────────────────────────────
 
 /// socketpair(int domain, int type, int protocol, int sv[2])
-pub fn sys_socketpair(agent_id: u16, _domain: u64, _sock_type: u64, _protocol: u64, sv_ptr: u64) -> i64 {
+pub fn sys_socketpair(
+    agent_id: u16,
+    _domain: u64,
+    _sock_type: u64,
+    _protocol: u64,
+    sv_ptr: u64,
+) -> i64 {
     if sv_ptr == 0 {
         return -EFAULT;
     }
@@ -631,8 +645,14 @@ pub fn sys_socketpair(agent_id: u16, _domain: u64, _sock_type: u64, _protocol: u
 // ── setsockopt / getsockopt ────────────────────────────────────────────────
 
 /// setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)
-pub fn sys_setsockopt(agent_id: u16, sockfd: i32, _level: u64, _optname: u64,
-                      _optval_ptr: u64, _optlen: u64) -> i64 {
+pub fn sys_setsockopt(
+    agent_id: u16,
+    sockfd: i32,
+    _level: u64,
+    _optname: u64,
+    _optval_ptr: u64,
+    _optlen: u64,
+) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
@@ -651,8 +671,14 @@ pub fn sys_setsockopt(agent_id: u16, sockfd: i32, _level: u64, _optname: u64,
 /// getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)
 ///
 /// Returns zeroed/default values.
-pub fn sys_getsockopt(agent_id: u16, sockfd: i32, _level: u64, _optname: u64,
-                      optval_ptr: u64, optlen_ptr: u64) -> i64 {
+pub fn sys_getsockopt(
+    agent_id: u16,
+    sockfd: i32,
+    _level: u64,
+    _optname: u64,
+    optval_ptr: u64,
+    optlen_ptr: u64,
+) -> i64 {
     let st = match state::get_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
@@ -798,7 +824,10 @@ fn fmt_u8(val: u8, buf: &mut [u8]) -> usize {
 /// Format a u16 as decimal ASCII into a buffer. Returns the number of bytes written.
 fn fmt_u16_decimal(mut val: u16, buf: &mut [u8]) -> usize {
     if val == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; return 1; }
+        if !buf.is_empty() {
+            buf[0] = b'0';
+            return 1;
+        }
         return 0;
     }
     let mut tmp = [0u8; 5];
@@ -833,7 +862,13 @@ pub fn sys_io_uring_setup(_agent_id: u16, _entries: u32, _params_ptr: u64) -> i6
 
 /// io_uring_enter — see io_uring_setup rationale.
 #[allow(dead_code)]
-pub fn sys_io_uring_enter(_agent_id: u16, _fd: u32, _to_submit: u32,
-                          _min_complete: u32, _flags: u32, _sig: u64) -> i64 {
+pub fn sys_io_uring_enter(
+    _agent_id: u16,
+    _fd: u32,
+    _to_submit: u32,
+    _min_complete: u32,
+    _flags: u32,
+    _sig: u64,
+) -> i64 {
     -ENOSYS
 }

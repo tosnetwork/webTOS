@@ -76,7 +76,9 @@ static mut CUMULATIVE_ENERGY: [u64; crate::agent::MAX_AGENTS] = [0; crate::agent
 pub fn record_consumption(agent_id: crate::agent::AgentId, amount: u64) {
     let idx = agent_id as usize;
     if idx < crate::agent::MAX_AGENTS {
-        unsafe { CUMULATIVE_ENERGY[idx] = CUMULATIVE_ENERGY[idx].wrapping_add(amount); }
+        unsafe {
+            CUMULATIVE_ENERGY[idx] = CUMULATIVE_ENERGY[idx].wrapping_add(amount);
+        }
     }
 }
 

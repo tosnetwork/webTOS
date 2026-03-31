@@ -7,13 +7,13 @@
 //! Tree structure: Binary Merkle Tree with 64 leaves and 7 levels.
 //! Hash function: SHA-256 (cryptographically secure, 128-bit collision resistance).
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// 256-bit Merkle hash (SHA-256).
 pub type MerkleHash = [u8; 32];
 
-const MAX_LEAVES: usize = 64;  // Max entries per keyspace
-const TREE_SIZE: usize = 128;  // Internal nodes (next power of 2 above MAX_LEAVES)
+const MAX_LEAVES: usize = 64; // Max entries per keyspace
+const TREE_SIZE: usize = 128; // Internal nodes (next power of 2 above MAX_LEAVES)
 
 pub struct MerkleTree {
     /// Leaf hashes (one per key-value entry)
@@ -35,7 +35,9 @@ impl MerkleTree {
 
     /// Update a leaf at the given index with a new key-value hash
     pub fn update_leaf(&mut self, index: usize, key: u64, value: &[u8]) {
-        if index >= MAX_LEAVES { return; }
+        if index >= MAX_LEAVES {
+            return;
+        }
         self.leaves[index] = hash_kv(key, value);
         if index >= self.leaf_count {
             self.leaf_count = index + 1;
@@ -45,7 +47,9 @@ impl MerkleTree {
 
     /// Remove a leaf (set to zero hash)
     pub fn remove_leaf(&mut self, index: usize) {
-        if index >= MAX_LEAVES { return; }
+        if index >= MAX_LEAVES {
+            return;
+        }
         self.leaves[index] = [0u8; 32];
         self.recompute_root();
     }
@@ -75,7 +79,9 @@ impl MerkleTree {
         let mut count = self.leaf_count;
         // Round up to next power of 2
         let mut n = 1;
-        while n < count { n *= 2; }
+        while n < count {
+            n *= 2;
+        }
         count = n;
 
         while count > 1 {
@@ -107,7 +113,9 @@ impl MerkleTree {
             level[i] = self.leaves[i];
         }
         let mut count = 1;
-        while count < self.leaf_count { count *= 2; }
+        while count < self.leaf_count {
+            count *= 2;
+        }
 
         let mut idx = index;
         let mut n = count;

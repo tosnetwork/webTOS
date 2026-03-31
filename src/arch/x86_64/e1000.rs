@@ -5,47 +5,47 @@
 //!
 //! QEMU: -device e1000,netdev=n0 -netdev user,id=n0
 
-use crate::serial_println;
 use crate::arch::x86_64::paging;
 use crate::arch::x86_64::pci;
+use crate::serial_println;
 
 // e1000 register offsets (MMIO from BAR0)
-const REG_CTRL: u32 = 0x0000;    // Device Control
-const REG_STATUS: u32 = 0x0008;  // Device Status
+const REG_CTRL: u32 = 0x0000; // Device Control
+const REG_STATUS: u32 = 0x0008; // Device Status
 #[allow(dead_code)]
-const REG_EERD: u32 = 0x0014;    // EEPROM Read
-const REG_ICR: u32 = 0x00C0;     // Interrupt Cause Read
+const REG_EERD: u32 = 0x0014; // EEPROM Read
+const REG_ICR: u32 = 0x00C0; // Interrupt Cause Read
 #[allow(dead_code)]
-const REG_IMS: u32 = 0x00D0;     // Interrupt Mask Set
-const REG_IMC: u32 = 0x00D8;     // Interrupt Mask Clear
-const REG_RCTL: u32 = 0x0100;    // Receive Control
-const REG_TCTL: u32 = 0x0400;    // Transmit Control
-const REG_RDBAL: u32 = 0x2800;   // RX Descriptor Base Low
-const REG_RDBAH: u32 = 0x2804;   // RX Descriptor Base High
-const REG_RDLEN: u32 = 0x2808;   // RX Descriptor Length
-const REG_RDH: u32 = 0x2810;     // RX Descriptor Head
-const REG_RDT: u32 = 0x2818;     // RX Descriptor Tail
-const REG_TDBAL: u32 = 0x3800;   // TX Descriptor Base Low
-const REG_TDBAH: u32 = 0x3804;   // TX Descriptor Base High
-const REG_TDLEN: u32 = 0x3808;   // TX Descriptor Length
-const REG_TDH: u32 = 0x3810;     // TX Descriptor Head
-const REG_TDT: u32 = 0x3818;     // TX Descriptor Tail
-const REG_RAL: u32 = 0x5400;     // Receive Address Low
-const REG_RAH: u32 = 0x5404;     // Receive Address High
+const REG_IMS: u32 = 0x00D0; // Interrupt Mask Set
+const REG_IMC: u32 = 0x00D8; // Interrupt Mask Clear
+const REG_RCTL: u32 = 0x0100; // Receive Control
+const REG_TCTL: u32 = 0x0400; // Transmit Control
+const REG_RDBAL: u32 = 0x2800; // RX Descriptor Base Low
+const REG_RDBAH: u32 = 0x2804; // RX Descriptor Base High
+const REG_RDLEN: u32 = 0x2808; // RX Descriptor Length
+const REG_RDH: u32 = 0x2810; // RX Descriptor Head
+const REG_RDT: u32 = 0x2818; // RX Descriptor Tail
+const REG_TDBAL: u32 = 0x3800; // TX Descriptor Base Low
+const REG_TDBAH: u32 = 0x3804; // TX Descriptor Base High
+const REG_TDLEN: u32 = 0x3808; // TX Descriptor Length
+const REG_TDH: u32 = 0x3810; // TX Descriptor Head
+const REG_TDT: u32 = 0x3818; // TX Descriptor Tail
+const REG_RAL: u32 = 0x5400; // Receive Address Low
+const REG_RAH: u32 = 0x5404; // Receive Address High
 
 // Control register bits
-const CTRL_RST: u32 = 1 << 26;   // Device Reset
-const CTRL_SLU: u32 = 1 << 6;    // Set Link Up
+const CTRL_RST: u32 = 1 << 26; // Device Reset
+const CTRL_SLU: u32 = 1 << 6; // Set Link Up
 
 // RX Control bits
-const RCTL_EN: u32 = 1 << 1;     // Receive Enable
-const RCTL_BAM: u32 = 1 << 15;   // Broadcast Accept Mode
+const RCTL_EN: u32 = 1 << 1; // Receive Enable
+const RCTL_BAM: u32 = 1 << 15; // Broadcast Accept Mode
 const RCTL_BSIZE_4096: u32 = 3 << 16; // Buffer size 4096
 const RCTL_SECRC: u32 = 1 << 26; // Strip Ethernet CRC
 
 // TX Control bits
-const TCTL_EN: u32 = 1 << 1;     // Transmit Enable
-const TCTL_PSP: u32 = 1 << 3;    // Pad Short Packets
+const TCTL_EN: u32 = 1 << 1; // Transmit Enable
+const TCTL_PSP: u32 = 1 << 3; // Pad Short Packets
 
 const QUEUE_SIZE: usize = 8;
 
@@ -53,8 +53,8 @@ const QUEUE_SIZE: usize = 8;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RxDesc {
-    addr: u64,      // Buffer physical address
-    length: u16,    // Packet length
+    addr: u64,   // Buffer physical address
+    length: u16, // Packet length
     checksum: u16,
     status: u8,
     errors: u8,
@@ -68,7 +68,7 @@ struct TxDesc {
     addr: u64,
     length: u16,
     cso: u8,
-    cmd: u8,        // Command bits
+    cmd: u8, // Command bits
     status: u8,
     css: u8,
     special: u16,
@@ -78,8 +78,8 @@ struct TxDesc {
 struct E1000 {
     bar0: u64,
     mac: [u8; 6],
-    rx_descs: u64,      // Physical address of RX descriptor ring
-    tx_descs: u64,      // Physical address of TX descriptor ring
+    rx_descs: u64, // Physical address of RX descriptor ring
+    tx_descs: u64, // Physical address of TX descriptor ring
     rx_buffers: [u64; QUEUE_SIZE],
     tx_buffers: [u64; QUEUE_SIZE],
     rx_tail: u16,
@@ -132,8 +132,14 @@ fn find_e1000_bar0() -> Option<u64> {
 
     for &(vendor, device) in E1000_IDS {
         if let Some(dev) = pci::find_device(vendor, device) {
-            serial_println!("[e1000] Found device {:04x}:{:04x} at PCI {}:{}.{}",
-                vendor, device, dev.bus, dev.device, dev.function);
+            serial_println!(
+                "[e1000] Found device {:04x}:{:04x} at PCI {}:{}.{}",
+                vendor,
+                device,
+                dev.bus,
+                dev.device,
+                dev.function
+            );
 
             // BAR0 should be a 32-bit or 64-bit MMIO BAR for e1000
             let bar0_addr = match dev.bars[0] {
@@ -163,8 +169,13 @@ fn find_e1000_bar0() -> Option<u64> {
 
             // Enable bus mastering in PCI command register so DMA works
             let cmd = pci::read_config(dev.bus, dev.device, dev.function, 0x04);
-            pci::write_config(dev.bus, dev.device, dev.function, 0x04,
-                cmd | 0x04 /* Bus Master */ | 0x02 /* Memory Space Enable */);
+            pci::write_config(
+                dev.bus,
+                dev.device,
+                dev.function,
+                0x04,
+                cmd | 0x04 /* Bus Master */ | 0x02, /* Memory Space Enable */
+            );
 
             serial_println!("[e1000] BAR0 MMIO base: {:#x}", bar0_addr);
             return Some(bar0_addr);
@@ -175,8 +186,13 @@ fn find_e1000_bar0() -> Option<u64> {
     // and check vendor == Intel
     if let Some(dev) = pci::find_by_class(0x02, 0x00) {
         if dev.vendor_id == 0x8086 {
-            serial_println!("[e1000] Found Intel Ethernet via class scan: device={:#x} at PCI {}:{}.{}",
-                dev.device_id, dev.bus, dev.device, dev.function);
+            serial_println!(
+                "[e1000] Found Intel Ethernet via class scan: device={:#x} at PCI {}:{}.{}",
+                dev.device_id,
+                dev.bus,
+                dev.device,
+                dev.function
+            );
 
             let bar0_addr = match dev.bars[0] {
                 pci::BarType::Mmio32(addr) => addr as u64,
@@ -211,7 +227,9 @@ pub fn init() -> bool {
 
 /// Initialize the e1000 device from PCI BAR0 MMIO address
 pub fn init_with_bar0(bar0: u64) -> bool {
-    if bar0 == 0 { return false; }
+    if bar0 == 0 {
+        return false;
+    }
 
     unsafe {
         E1000_DEV.bar0 = bar0;
@@ -219,7 +237,9 @@ pub fn init_with_bar0(bar0: u64) -> bool {
         // Reset device
         write_reg(REG_CTRL, read_reg(REG_CTRL) | CTRL_RST);
         // Wait for reset to complete
-        for _ in 0..100_000 { core::hint::spin_loop(); }
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
 
         // Read MAC address from RAL/RAH
         let ral = read_reg(REG_RAL);
@@ -231,9 +251,15 @@ pub fn init_with_bar0(bar0: u64) -> bool {
         E1000_DEV.mac[4] = (rah & 0xFF) as u8;
         E1000_DEV.mac[5] = ((rah >> 8) & 0xFF) as u8;
 
-        serial_println!("[e1000] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            E1000_DEV.mac[0], E1000_DEV.mac[1], E1000_DEV.mac[2],
-            E1000_DEV.mac[3], E1000_DEV.mac[4], E1000_DEV.mac[5]);
+        serial_println!(
+            "[e1000] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            E1000_DEV.mac[0],
+            E1000_DEV.mac[1],
+            E1000_DEV.mac[2],
+            E1000_DEV.mac[3],
+            E1000_DEV.mac[4],
+            E1000_DEV.mac[5]
+        );
 
         // Set link up
         write_reg(REG_CTRL, read_reg(REG_CTRL) | CTRL_SLU);
@@ -286,7 +312,10 @@ pub fn init_with_bar0(bar0: u64) -> bool {
         write_reg(REG_TCTL, TCTL_EN | TCTL_PSP);
 
         E1000_DEV.initialized = true;
-        serial_println!("[e1000] Initialized: RX/TX queues ready ({} descriptors)", QUEUE_SIZE);
+        serial_println!(
+            "[e1000] Initialized: RX/TX queues ready ({} descriptors)",
+            QUEUE_SIZE
+        );
     }
 
     true
@@ -305,9 +334,15 @@ pub fn is_initialized() -> bool {
 ///   bit 2 (IC)   — Insert Checksum (unused here)
 ///   bit 3 (RS)   — Report Status (set DD bit when done)
 pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
-    if !is_initialized() { return Err("not initialized"); }
-    if data.len() > 4096 { return Err("packet too large"); }
-    if data.len() == 0 { return Err("empty packet"); }
+    if !is_initialized() {
+        return Err("not initialized");
+    }
+    if data.len() > 4096 {
+        return Err("packet too large");
+    }
+    if data.len() == 0 {
+        return Err("empty packet");
+    }
 
     unsafe {
         let idx = E1000_DEV.tx_tail as usize;
@@ -316,12 +351,14 @@ pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
         // Wait for the descriptor to be done if RS was set previously.
         // Spin for at most ~10k iterations to avoid deadlock on a bare-metal stall.
         let mut spins = 0usize;
-        while (*tx_ring.add(idx)).status & 0x01 == 0
-            && (*tx_ring.add(idx)).length != 0  // descriptor was used before
+        while (*tx_ring.add(idx)).status & 0x01 == 0 && (*tx_ring.add(idx)).length != 0
+        // descriptor was used before
         {
             core::hint::spin_loop();
             spins += 1;
-            if spins > 100_000 { return Err("TX timeout"); }
+            if spins > 100_000 {
+                return Err("TX timeout");
+            }
         }
 
         let buf = E1000_DEV.tx_buffers[idx];
@@ -357,7 +394,9 @@ pub fn send_packet(data: &[u8]) -> Result<(), &'static str> {
 ///     last descriptor given to hardware). A descriptor is ready when its
 ///     DD (Descriptor Done) bit is set.
 pub fn recv_packet(buf: &mut [u8]) -> usize {
-    if !is_initialized() { return 0; }
+    if !is_initialized() {
+        return 0;
+    }
 
     unsafe {
         // The next slot to check is rx_tail (pointing to last slot we gave the NIC + 1).
@@ -369,7 +408,9 @@ pub fn recv_packet(buf: &mut [u8]) -> usize {
         let rx_ring = E1000_DEV.rx_descs as *mut RxDesc;
         let desc = &*rx_ring.add(next);
 
-        if desc.status & 0x01 == 0 { return 0; } // DD bit not set — no packet ready
+        if desc.status & 0x01 == 0 {
+            return 0;
+        } // DD bit not set — no packet ready
 
         let len = desc.length as usize;
         if len == 0 {

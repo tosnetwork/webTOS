@@ -6,13 +6,16 @@
 
 #![allow(dead_code)]
 
+extern crate alloc;
+
+use alloc::vec;
+use super::constants::{EINVAL, ENOMEM};
+use super::state::get_state_mut;
 use crate::agent;
 use crate::arch::x86_64::paging::{
-    self, alloc_frame, dealloc_frame, map_page, unmap_page, invlpg,
-    PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NX, PAGE_SIZE,
+    self, alloc_frame, dealloc_frame, invlpg, map_page, unmap_page, PAGE_SIZE, PTE_NX, PTE_PRESENT,
+    PTE_USER, PTE_WRITABLE,
 };
-use super::state::get_state_mut;
-use super::constants::{ENOMEM, EINVAL};
 
 // ── mmap flag constants ────────────────────────────────────────────────────
 
@@ -162,7 +165,9 @@ pub fn sys_mmap(
         };
 
         // Zero the frame (anonymous pages, or placeholder for file-backed)
-        unsafe { zero_frame(frame); }
+        unsafe {
+            zero_frame(frame);
+        }
 
         if map_page(cr3, page_vaddr, frame, pte_flags).is_err() {
             dealloc_frame(frame);
@@ -174,16 +179,36 @@ pub fn sys_mmap(
     if fd >= 0 && (flags & MAP_ANONYMOUS == 0) {
         if let Some(st) = super::state::get_state(agent_id) {
             if let Some(entry) = st.get_fd(fd) {
-                let ks = agent_id;
+                let ks = entry.keyspace_id;
                 let key = entry.keyspace_key;
+                let file_offset = offset as usize;
+                let map_size = aligned_len as usize;
+
+                // Try small value first (< 256 bytes).
                 if let Some((val_buf, val_len)) = crate::state::state_get(ks, key) {
-                    // Copy file content starting at `offset` into the mapped pages.
-                    let file_offset = offset as usize;
-                    let copy_len = val_len.saturating_sub(file_offset).min(aligned_len as usize);
+                    let copy_len = val_len
+                        .saturating_sub(file_offset)
+                        .min(map_size);
                     if copy_len > 0 {
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 val_buf.as_ptr().add(file_offset),
+                                vaddr as *mut u8,
+                                copy_len,
+                            );
+                        }
+                    }
+                } else {
+                    // Not a small value — try loading as a multi-segment
+                    // large file from keyspace.
+                    let buf_size = map_size + file_offset;
+                    let mut file_buf = vec![0u8; buf_size];
+                    let loaded = crate::state::load_multi_segment(ks, key, &mut file_buf);
+                    if loaded > file_offset {
+                        let copy_len = (loaded - file_offset).min(map_size);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                file_buf.as_ptr().add(file_offset),
                                 vaddr as *mut u8,
                                 copy_len,
                             );
@@ -311,7 +336,9 @@ pub fn sys_brk(agent_id: u16, new_brk: u64) -> i64 {
                 }
             };
 
-            unsafe { zero_frame(frame); }
+            unsafe {
+                zero_frame(frame);
+            }
 
             if map_page(cr3, page, frame, pte_flags).is_err() {
                 dealloc_frame(frame);
@@ -370,7 +397,9 @@ pub fn sys_madvise(agent_id: u16, addr: u64, length: u64, advice: u32) -> i64 {
 
             if let Some(phys) = read_pte_phys(cr3, page_vaddr) {
                 // Zero the physical frame but leave the mapping in place
-                unsafe { zero_frame(phys); }
+                unsafe {
+                    zero_frame(phys);
+                }
                 invlpg(page_vaddr);
             }
         }

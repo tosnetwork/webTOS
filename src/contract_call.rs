@@ -38,7 +38,7 @@ pub const STATUS_PENDING: u8 = 4;
 
 // ─── SHA-256 selector computation ───────────────────────────────────────────
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Compute a 4-byte function selector from a function name using SHA-256.
 ///
@@ -69,12 +69,7 @@ pub struct ContractCallRequest {
 }
 
 /// Build a `ContractCallRequest` from components.
-pub fn build_request(
-    caller: u16,
-    selector: u32,
-    energy: u64,
-    input: &[u8],
-) -> ContractCallRequest {
+pub fn build_request(caller: u16, selector: u32, energy: u64, input: &[u8]) -> ContractCallRequest {
     let len = input.len().min(MAX_CALL_INPUT);
     let mut req = ContractCallRequest {
         caller_agent: caller,
@@ -262,7 +257,11 @@ pub fn call_contract(
 
     // 2. Check caller has CAP_SEND_MAILBOX for the target's mailbox.
     if !agent_has_cap(caller_id, CapType::SendMailbox, callee_mailbox) {
-        crate::event::cap_denied(caller_id, CapType::SendMailbox as u64, callee_mailbox as u64);
+        crate::event::cap_denied(
+            caller_id,
+            CapType::SendMailbox as u64,
+            callee_mailbox as u64,
+        );
         return Err(E_NO_CAP);
     }
 

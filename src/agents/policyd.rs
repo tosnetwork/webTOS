@@ -9,9 +9,9 @@
 //!   ATTACH_CHUNK: [op=0x04, flags: u8, ...] (multi-message loading)
 //!   REPLACE:      [op=0x05, program_index: u16, prog_len: u16, bytecode: [u8]]
 
-use crate::serial_println;
 use crate::agent::*;
 use crate::ebpf;
+use crate::serial_println;
 
 const OP_ATTACH: u8 = 0x01;
 const OP_DETACH: u8 = 0x02;
@@ -21,8 +21,12 @@ const OP_REPLACE: u8 = 0x05;
 
 // Shared instruction buffer — avoids 8KB stack allocation per handler call.
 // Safety: policyd is single-threaded; only one handler runs at a time.
-static mut INSN_BUF: [ebpf::types::Insn; ebpf::types::MAX_INSNS] =
-    [ebpf::types::Insn { opcode: 0, regs: 0, off: 0, imm: 0 }; ebpf::types::MAX_INSNS];
+static mut INSN_BUF: [ebpf::types::Insn; ebpf::types::MAX_INSNS] = [ebpf::types::Insn {
+    opcode: 0,
+    regs: 0,
+    off: 0,
+    imm: 0,
+}; ebpf::types::MAX_INSNS];
 
 // Chunked loading state for programs larger than single mailbox message
 static mut CHUNK_BUF: [u8; 8192] = [0u8; 8192]; // 1024 instructions * 8 bytes
@@ -58,9 +62,14 @@ fn is_replace_op(op: u8) -> bool {
 }
 
 #[inline(never)]
-fn attach_point_from_type(attach_type: u8, attach_target: u16) -> Option<ebpf::attach::AttachPoint> {
+fn attach_point_from_type(
+    attach_type: u8,
+    attach_target: u16,
+) -> Option<ebpf::attach::AttachPoint> {
     if attach_type == 0 {
-        Some(ebpf::attach::AttachPoint::SyscallEntry(attach_target as u64))
+        Some(ebpf::attach::AttachPoint::SyscallEntry(
+            attach_target as u64,
+        ))
     } else if attach_type == 1 {
         Some(ebpf::attach::AttachPoint::SyscallExit(attach_target as u64))
     } else if attach_type == 2 {
@@ -78,11 +87,7 @@ fn attach_point_from_type(attach_type: u8, attach_target: u16) -> Option<ebpf::a
 
 #[inline(always)]
 fn can_manage_policy(agent_id: AgentId, op_name: &str) -> bool {
-    if crate::capability::agent_has_cap(
-        agent_id,
-        crate::capability::CapType::PolicyLoad,
-        0,
-    ) {
+    if crate::capability::agent_has_cap(agent_id, crate::capability::CapType::PolicyLoad, 0) {
         true
     } else {
         serial_println!(
@@ -142,7 +147,9 @@ pub extern "C" fn policyd_entry() -> ! {
 /// Format: [op=0x01, attach_type:u8, attach_target:u16, priority:u8, prog_len:u16, bytecode...]
 #[inline(never)]
 fn handle_attach(recv_buf: &[u8], msg_len: usize) {
-    if msg_len < 7 { return; }
+    if msg_len < 7 {
+        return;
+    }
 
     let attach_type = recv_buf[1];
     let attach_target = u16::from_le_bytes([recv_buf[2], recv_buf[3]]);
@@ -162,14 +169,18 @@ fn handle_attach(recv_buf: &[u8], msg_len: usize) {
 
     for i in 0..insn_count {
         let base = bytecode_start + i * 8;
-        if base + 8 > bytecode_end { break; }
+        if base + 8 > bytecode_end {
+            break;
+        }
         insns[i] = ebpf::types::Insn {
             opcode: recv_buf[base],
             regs: recv_buf[base + 1],
             off: i16::from_le_bytes([recv_buf[base + 2], recv_buf[base + 3]]),
             imm: i32::from_le_bytes([
-                recv_buf[base + 4], recv_buf[base + 5],
-                recv_buf[base + 6], recv_buf[base + 7],
+                recv_buf[base + 4],
+                recv_buf[base + 5],
+                recv_buf[base + 6],
+                recv_buf[base + 7],
             ]),
         };
     }
@@ -183,7 +194,11 @@ fn handle_attach(recv_buf: &[u8], msg_len: usize) {
     };
 
     match ebpf::attach::attach(&insns[..insn_count], attach_point, priority) {
-        Ok(idx) => serial_println!("[POLICYD] Program attached: index={} priority={}", idx, priority),
+        Ok(idx) => serial_println!(
+            "[POLICYD] Program attached: index={} priority={}",
+            idx,
+            priority
+        ),
         Err(_) => serial_println!("[POLICYD] Attach failed"),
     }
 }
@@ -194,7 +209,9 @@ fn handle_attach(recv_buf: &[u8], msg_len: usize) {
 /// flags: bit 0 = first, bit 1 = last
 #[inline(never)]
 fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
-    if msg_len < 2 { return; }
+    if msg_len < 2 {
+        return;
+    }
 
     let flags = recv_buf[1];
     let is_first = flags & 0x01 != 0;
@@ -203,7 +220,9 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
     unsafe {
         if is_first {
             // First chunk has header: [op, flags, attach_type, attach_target:u16, priority, total_len:u16, bytecode...]
-            if msg_len < 9 { return; }
+            if msg_len < 9 {
+                return;
+            }
             CHUNK_ATTACH_TYPE = recv_buf[2];
             CHUNK_ATTACH_TARGET = u16::from_le_bytes([recv_buf[3], recv_buf[4]]);
             CHUNK_PRIORITY = recv_buf[5];
@@ -232,7 +251,10 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
             // Assemble and attach the program
             let insn_count = CHUNK_LEN / 8;
             if insn_count == 0 || insn_count > ebpf::types::MAX_INSNS {
-                serial_println!("[POLICYD] Chunked program invalid size: {} instructions", insn_count);
+                serial_println!(
+                    "[POLICYD] Chunked program invalid size: {} instructions",
+                    insn_count
+                );
                 return;
             }
 
@@ -244,13 +266,16 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
                     regs: CHUNK_BUF[base + 1],
                     off: i16::from_le_bytes([CHUNK_BUF[base + 2], CHUNK_BUF[base + 3]]),
                     imm: i32::from_le_bytes([
-                        CHUNK_BUF[base + 4], CHUNK_BUF[base + 5],
-                        CHUNK_BUF[base + 6], CHUNK_BUF[base + 7],
+                        CHUNK_BUF[base + 4],
+                        CHUNK_BUF[base + 5],
+                        CHUNK_BUF[base + 6],
+                        CHUNK_BUF[base + 7],
                     ]),
                 };
             }
 
-            let attach_point = match attach_point_from_type(CHUNK_ATTACH_TYPE, CHUNK_ATTACH_TARGET) {
+            let attach_point = match attach_point_from_type(CHUNK_ATTACH_TYPE, CHUNK_ATTACH_TARGET)
+            {
                 Some(point) => point,
                 None => {
                     serial_println!("[POLICYD] Invalid chunk attach type");
@@ -270,7 +295,9 @@ fn handle_attach_chunk(recv_buf: &[u8], msg_len: usize) {
 /// Format: [op=0x05, program_index:u16, prog_len:u16, bytecode...]
 #[inline(never)]
 fn handle_replace(recv_buf: &[u8], msg_len: usize) {
-    if msg_len < 5 { return; }
+    if msg_len < 5 {
+        return;
+    }
 
     let index = u16::from_le_bytes([recv_buf[1], recv_buf[2]]) as usize;
     let prog_len = u16::from_le_bytes([recv_buf[3], recv_buf[4]]) as usize;
@@ -288,14 +315,18 @@ fn handle_replace(recv_buf: &[u8], msg_len: usize) {
 
     for i in 0..insn_count {
         let base = bytecode_start + i * 8;
-        if base + 8 > bytecode_end { break; }
+        if base + 8 > bytecode_end {
+            break;
+        }
         insns[i] = ebpf::types::Insn {
             opcode: recv_buf[base],
             regs: recv_buf[base + 1],
             off: i16::from_le_bytes([recv_buf[base + 2], recv_buf[base + 3]]),
             imm: i32::from_le_bytes([
-                recv_buf[base + 4], recv_buf[base + 5],
-                recv_buf[base + 6], recv_buf[base + 7],
+                recv_buf[base + 4],
+                recv_buf[base + 5],
+                recv_buf[base + 6],
+                recv_buf[base + 7],
             ]),
         };
     }

@@ -12,8 +12,8 @@
 //!   0x02 = PUT (keyspace, key, value) -> status
 //!   0x03 = CREATE_KEYSPACE (keyspace) -> status
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 const OP_GET: u8 = 0x01;
@@ -49,7 +49,8 @@ pub extern "C" fn stated_entry() -> ! {
             my_mailbox,
             recv_buf.as_mut_ptr() as u64,
             recv_buf.len() as u64,
-            0, 0,
+            0,
+            0,
         );
 
         if len > 0 {
@@ -67,8 +68,14 @@ pub extern "C" fn stated_entry() -> ! {
                 if msg_len >= 11 {
                     let keyspace_id = u16::from_le_bytes([recv_buf[1], recv_buf[2]]);
                     let key = u64::from_le_bytes([
-                        recv_buf[3], recv_buf[4], recv_buf[5], recv_buf[6],
-                        recv_buf[7], recv_buf[8], recv_buf[9], recv_buf[10],
+                        recv_buf[3],
+                        recv_buf[4],
+                        recv_buf[5],
+                        recv_buf[6],
+                        recv_buf[7],
+                        recv_buf[8],
+                        recv_buf[9],
+                        recv_buf[10],
                     ]);
 
                     if let Some(data) = crate::persist::get(keyspace_id, key) {
@@ -99,8 +106,14 @@ pub extern "C" fn stated_entry() -> ! {
                 if msg_len >= 13 {
                     let keyspace_id = u16::from_le_bytes([recv_buf[1], recv_buf[2]]);
                     let key = u64::from_le_bytes([
-                        recv_buf[3], recv_buf[4], recv_buf[5], recv_buf[6],
-                        recv_buf[7], recv_buf[8], recv_buf[9], recv_buf[10],
+                        recv_buf[3],
+                        recv_buf[4],
+                        recv_buf[5],
+                        recv_buf[6],
+                        recv_buf[7],
+                        recv_buf[8],
+                        recv_buf[9],
+                        recv_buf[10],
                     ]);
                     let value_len = u16::from_le_bytes([recv_buf[11], recv_buf[12]]) as usize;
                     let value_len = value_len.min(msg_len - 13);

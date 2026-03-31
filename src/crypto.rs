@@ -3,13 +3,15 @@
 
 extern crate alloc;
 
-pub use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
+pub use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 /// Hardware random number generator using x86_64 RDRAND instruction.
 pub struct RdrandRng;
 
 impl RdrandRng {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     fn rdrand64() -> u64 {
         let mut val: u64;

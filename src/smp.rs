@@ -3,8 +3,8 @@
 //! Orchestrates Application Processor (AP) startup via INIT+SIPI IPI sequence.
 //! APs execute the trampoline code, enter long mode, and call ap_entry().
 
-use crate::serial_println;
 use crate::arch::x86_64::{acpi::AcpiInfo, lapic};
+use crate::serial_println;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Number of APs that have completed initialization
@@ -92,16 +92,14 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
             core::ptr::write_volatile(AP_DATA_STACK as *mut u64, stack_top);
         }
 
-        serial_println!(
-            "[SMP] Sending INIT IPI to AP {} (APIC ID {})",
-            i,
-            apic_id
-        );
+        serial_println!("[SMP] Sending INIT IPI to AP {} (APIC ID {})", i, apic_id);
 
         // Disable interrupts during INIT/SIPI sequence to prevent
         // the LAPIC timer from preempting the BSP (which would context-switch
         // away from boot_aps and never return here).
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+        }
 
         // Send INIT IPI
         lapic::send_init_ipi(apic_id);
@@ -134,16 +132,16 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
         }
 
         if AP_STARTED.load(Ordering::Relaxed) >= expected {
-            serial_println!(
-                "[SMP] AP {} (APIC ID {}) started successfully",
-                i,
-                apic_id
-            );
+            serial_println!("[SMP] AP {} (APIC ID {}) started successfully", i, apic_id);
         }
     }
 
     let total = AP_STARTED.load(Ordering::Relaxed);
-    serial_println!("[SMP] {} AP(s) booted, total {} cores active", total, total + 1);
+    serial_println!(
+        "[SMP] {} AP(s) booted, total {} cores active",
+        total,
+        total + 1
+    );
 
     // Do NOT re-enable interrupts here. The BSP must return to kernel_main
     // to call sched::start(), which properly sets up the boot context before
@@ -157,10 +155,8 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
 /// It initializes per-core hardware state and enters the scheduler loop.
 #[no_mangle]
 pub extern "C" fn ap_entry() -> ! {
-
     // 1. Load the shared IDT on this core
     crate::arch::x86_64::idt::reload();
-
 
     // 2. Init LAPIC (per-core timer)
     lapic::init_ap();
@@ -171,7 +167,10 @@ pub extern "C" fn ap_entry() -> ! {
     // 4. Signal to BSP that this AP is ready
     AP_STARTED.fetch_add(1, Ordering::Release);
     let apic_id = lapic::id();
-    serial_println!("[SMP] AP {} ready, entering scheduler (kernel-mode agents only)", apic_id);
+    serial_println!(
+        "[SMP] AP {} ready, entering scheduler (kernel-mode agents only)",
+        apic_id
+    );
 
     // 5. Enter scheduler loop. The LAPIC timer is unmasked so timer
     //    interrupts fire on this AP, driving preemptive scheduling via
@@ -181,11 +180,15 @@ pub extern "C" fn ap_entry() -> ! {
     //    CURRENT_KERNEL_RSP / SAVED_USER_RSP are BSP-only globals.
     //    Kernel-mode agents use direct Rust function calls (not SYSCALL),
     //    so they are safe to run on any core.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
 
     // Idle loop: hlt until LAPIC timer fires -> timer_tick -> schedule.
     // schedule() picks a Ready kernel-mode agent from the shared run queue.
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

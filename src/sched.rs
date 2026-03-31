@@ -4,13 +4,13 @@
 //! The run queue is protected by a SpinLock for safe concurrent access
 //! from multiple cores. Each core tracks its own current agent.
 
-use crate::serial_println;
-use crate::agent::*;
-use crate::agent::AgentPriority;
-use crate::arch::x86_64::context::context_switch;
 use crate::agent::AgentMode;
+use crate::agent::AgentPriority;
+use crate::agent::*;
+use crate::arch::x86_64::context::context_switch;
 use crate::arch::x86_64::gdt;
 use crate::init::STACK_GUARD_MAGIC;
+use crate::serial_println;
 use crate::sync::SpinLock;
 
 extern "C" {
@@ -21,10 +21,11 @@ extern "C" {
 const RUN_QUEUE_SIZE: usize = MAX_AGENTS;
 
 /// Stack size for dynamically spawned agents (4 KiB).
-const SPAWN_STACK_SIZE: usize = 16384;  // 16KB: must handle interrupt frame + TrapFrame + schedule() + context_switch on each preemption
+const SPAWN_STACK_SIZE: usize = 16384; // 16KB: must handle interrupt frame + TrapFrame + schedule() + context_switch on each preemption
 
 /// Static stack pool for spawned agents.
-static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] = [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS];
+static mut SPAWN_STACKS: [[u8; SPAWN_STACK_SIZE]; MAX_AGENTS] =
+    [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS];
 static mut NEXT_STACK_SLOT: usize = 4;
 
 /// Run queue state protected by SpinLock for SMP safety.
@@ -74,10 +75,14 @@ fn set_current(id: AgentId) {
     if crate::arch::x86_64::lapic::is_active() {
         let core_id = crate::arch::x86_64::lapic::id() as usize;
         if core_id < 16 {
-            unsafe { PER_CORE_AGENT[core_id] = id; }
+            unsafe {
+                PER_CORE_AGENT[core_id] = id;
+            }
         }
     }
-    unsafe { CURRENT_AGENT_ID = id; }
+    unsafe {
+        CURRENT_AGENT_ID = id;
+    }
 }
 
 /// Allocate a stack for a dynamically spawned agent.
@@ -181,9 +186,7 @@ pub fn block_current(reason: AgentStatus) {
 /// Unblock an agent and move it from blocked to Ready.
 pub fn unblock(id: AgentId) {
     if let Some(agent) = get_agent_mut(id) {
-        if agent.status == AgentStatus::BlockedRecv
-            || agent.status == AgentStatus::BlockedSend
-        {
+        if agent.status == AgentStatus::BlockedRecv || agent.status == AgentStatus::BlockedSend {
             agent.status = AgentStatus::Ready;
             add_to_run_queue(id);
         }
@@ -275,7 +278,9 @@ pub fn schedule() {
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
             gdt::set_tss_rsp0(agent.kernel_stack_top);
-            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+            unsafe {
+                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+            }
         }
     }
 
@@ -285,7 +290,9 @@ pub fn schedule() {
             // Each core saves idle state to its own boot context
             let core_id = if crate::arch::x86_64::lapic::is_active() {
                 crate::arch::x86_64::lapic::id() as usize
-            } else { 0 };
+            } else {
+                0
+            };
             &mut BOOT_CONTEXTS[core_id.min(15)] as *mut AgentContext
         } else {
             match get_agent_mut(old_id) {
@@ -322,7 +329,9 @@ pub fn schedule() {
                     if guard != STACK_GUARD_MAGIC {
                         serial_println!(
                             "[STACK OVERFLOW] Agent {} stack corrupted! guard={:#x} expected={:#x}",
-                            old_id, guard, STACK_GUARD_MAGIC
+                            old_id,
+                            guard,
+                            STACK_GUARD_MAGIC
                         );
                         if let Some(agent) = get_agent_mut(old_id) {
                             agent.status = AgentStatus::Faulted;
@@ -358,14 +367,18 @@ pub fn switch_from_trap() -> ! {
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
             gdt::set_tss_rsp0(agent.kernel_stack_top);
-            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+            unsafe {
+                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+            }
         }
     }
 
     let new_ctx = match get_agent(next_id) {
         Some(agent) => &agent.context as *const AgentContext,
         None => loop {
-            unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("cli; hlt", options(nomem, nostack));
+            }
         },
     };
 
@@ -382,7 +395,9 @@ pub fn switch_from_trap() -> ! {
     }
 
     loop {
-        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("cli; hlt", options(nomem, nostack));
+        }
     }
 }
 
@@ -392,7 +407,9 @@ pub fn start() {
 
     // The BSP must not take timer IRQs while it is still resolving the first
     // runnable agent and building the initial boot-context switch.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
 
     let first_id = {
         let rq = SCHED_LOCK.lock_raw();
@@ -410,7 +427,9 @@ pub fn start() {
         agent.status = AgentStatus::Running;
         if agent.mode == AgentMode::User {
             gdt::set_tss_rsp0(agent.kernel_stack_top);
-            unsafe { CURRENT_KERNEL_RSP = agent.kernel_stack_top; }
+            unsafe {
+                CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+            }
         }
         &agent.context as *const AgentContext
     };
@@ -472,10 +491,8 @@ pub fn timer_tick() {
     // scanning 16 empty slots — trivial cost at 100 Hz.
     {
         let tick_count = crate::arch::x86_64::timer::get_ticks();
-        let _action = crate::ebpf::attach::run_at(
-            crate::ebpf::attach::AttachPoint::TimerTick,
-            tick_count,
-        );
+        let _action =
+            crate::ebpf::attach::run_at(crate::ebpf::attach::AttachPoint::TimerTick, tick_count);
         // Action is ignored for TimerTick — observational only.
         // Programs use map helpers to record metrics or trigger alerts.
     }

@@ -81,7 +81,8 @@ pub struct LinuxAgentState {
     pub epoll_instances: [EpollInstance; MAX_EPOLL_INSTANCES],
     pub robust_list_head: u64,
     pub clear_child_tid: u64,
-    pub fs_base: u64, // TLS FS base (arch_prctl SET_FS)
+    pub fs_base: u64,          // TLS FS base (arch_prctl SET_FS)
+    pub pending_signals: u64,  // bitmask of pending signals (bit N = signal N+1)
     pub active: bool,
 }
 
@@ -133,6 +134,7 @@ impl LinuxAgentState {
             robust_list_head: 0,
             clear_child_tid: 0,
             fs_base: 0,
+            pending_signals: 0,
             active: true,
         }
     }
@@ -209,5 +211,43 @@ pub fn init_state(agent_id: u16) {
             LINUX_STATES[agent_id as usize] = Some(LinuxAgentState::new(agent_id));
         }
         serial_println!("[linux_compat] initialized state for agent {}", agent_id);
+    }
+}
+
+// ── Signal pending helpers ─────────────────────────────────────────────────
+
+/// Raise a signal on an agent by setting the corresponding pending bit.
+/// Signal numbers are 1-based (Linux convention); bit N corresponds to signal N+1.
+pub fn raise_signal(agent_id: u16, signum: u32) {
+    if signum < 1 || signum > 64 {
+        return;
+    }
+    if let Some(s) = get_state_mut(agent_id) {
+        s.pending_signals |= 1u64 << (signum - 1);
+    }
+}
+
+/// Return the lowest pending (non-blocked) signal number, or None.
+pub fn has_pending_signal(agent_id: u16) -> Option<u32> {
+    if let Some(s) = get_state(agent_id) {
+        if s.pending_signals == 0 {
+            return None;
+        }
+        // Find lowest set bit
+        let lowest_bit = s.pending_signals.trailing_zeros();
+        if lowest_bit < 64 {
+            return Some(lowest_bit + 1); // signal numbers are 1-based
+        }
+    }
+    None
+}
+
+/// Clear a pending signal bit.
+pub fn clear_signal(agent_id: u16, signum: u32) {
+    if signum < 1 || signum > 64 {
+        return;
+    }
+    if let Some(s) = get_state_mut(agent_id) {
+        s.pending_signals &= !(1u64 << (signum - 1));
     }
 }

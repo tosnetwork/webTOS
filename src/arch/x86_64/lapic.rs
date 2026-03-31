@@ -10,30 +10,30 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // ─── LAPIC Register Offsets (from LAPIC base) ────────────────────────────
 
-const LAPIC_ID: u32 = 0x020;         // Local APIC ID
+const LAPIC_ID: u32 = 0x020; // Local APIC ID
 const LAPIC_VERSION: u32 = 0x030;
-const LAPIC_TPR: u32 = 0x080;        // Task Priority Register
-const LAPIC_EOI: u32 = 0x0B0;        // End Of Interrupt
-const LAPIC_SVR: u32 = 0x0F0;        // Spurious Interrupt Vector Register
-const LAPIC_ICR_LOW: u32 = 0x300;    // Interrupt Command Register (low)
-const LAPIC_ICR_HIGH: u32 = 0x310;   // Interrupt Command Register (high)
-const LAPIC_TIMER_LVT: u32 = 0x320;  // Timer Local Vector Table entry
+const LAPIC_TPR: u32 = 0x080; // Task Priority Register
+const LAPIC_EOI: u32 = 0x0B0; // End Of Interrupt
+const LAPIC_SVR: u32 = 0x0F0; // Spurious Interrupt Vector Register
+const LAPIC_ICR_LOW: u32 = 0x300; // Interrupt Command Register (low)
+const LAPIC_ICR_HIGH: u32 = 0x310; // Interrupt Command Register (high)
+const LAPIC_TIMER_LVT: u32 = 0x320; // Timer Local Vector Table entry
 const LAPIC_LINT0_LVT: u32 = 0x350;
 const LAPIC_LINT1_LVT: u32 = 0x360;
 const LAPIC_TIMER_INIT: u32 = 0x380; // Timer Initial Count
 const LAPIC_TIMER_CURR: u32 = 0x390; // Timer Current Count
-const LAPIC_TIMER_DIV: u32 = 0x3E0;  // Timer Divide Configuration
+const LAPIC_TIMER_DIV: u32 = 0x3E0; // Timer Divide Configuration
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-const SVR_ENABLE: u32 = 1 << 8;      // APIC Software Enable bit
+const SVR_ENABLE: u32 = 1 << 8; // APIC Software Enable bit
 const TIMER_PERIODIC: u32 = 1 << 17; // Periodic timer mode
-const TIMER_VECTOR: u32 = 32;        // Same IRQ vector as PIT (vector 32)
-const TIMER_DIVIDER: u32 = 0x03;     // Divide by 16
+const TIMER_VECTOR: u32 = 32; // Same IRQ vector as PIT (vector 32)
+const TIMER_DIVIDER: u32 = 0x03; // Divide by 16
 const SPURIOUS_VECTOR: u32 = 0xFF;
 
 // ICR delivery modes
-const ICR_INIT: u32 = 0x00000500;    // INIT IPI
+const ICR_INIT: u32 = 0x00000500; // INIT IPI
 const ICR_STARTUP: u32 = 0x00000600; // Startup IPI
 const ICR_LEVEL_ASSERT: u32 = 0x00004000;
 const ICR_DELIVERY_STATUS: u32 = 0x00001000;
@@ -100,8 +100,12 @@ pub fn init(base: u64) {
     }
 
     let apic_id = id();
-    serial_println!("[LAPIC] Initialized: base={:#x} APIC_ID={} timer=vector {} periodic",
-        base, apic_id, TIMER_VECTOR);
+    serial_println!(
+        "[LAPIC] Initialized: base={:#x} APIC_ID={} timer=vector {} periodic",
+        base,
+        apic_id,
+        TIMER_VECTOR
+    );
 }
 
 /// Initialize LAPIC for an Application Processor (AP).
@@ -127,7 +131,9 @@ pub fn init_ap() {
 
 /// Send End-of-Interrupt to LAPIC.
 pub fn eoi() {
-    unsafe { write(LAPIC_EOI, 0); }
+    unsafe {
+        write(LAPIC_EOI, 0);
+    }
 }
 
 /// Get this core's LAPIC ID.

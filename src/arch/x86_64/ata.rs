@@ -97,7 +97,9 @@ fn wait_drq() -> Result<(), &'static str> {
 fn ata_delay() {
     for _ in 0..4 {
         // Reading port 0x3F6 (alternate status) causes ~100ns delay each.
-        unsafe { inb(0x3F6); }
+        unsafe {
+            inb(0x3F6);
+        }
     }
 }
 
@@ -119,7 +121,9 @@ fn select_drive_lba(lba: u32, count: u8) {
 /// primary master channel.
 pub fn init() -> bool {
     // Select master drive
-    unsafe { outb(ATA_DRIVE_HEAD, 0xA0); }
+    unsafe {
+        outb(ATA_DRIVE_HEAD, 0xA0);
+    }
     ata_delay();
 
     // Zero out sector count and LBA registers
@@ -131,7 +135,9 @@ pub fn init() -> bool {
     }
 
     // Send IDENTIFY command
-    unsafe { outb(ATA_COMMAND, ATA_CMD_IDENTIFY); }
+    unsafe {
+        outb(ATA_COMMAND, ATA_CMD_IDENTIFY);
+    }
 
     // If status is 0, no device
     let status = unsafe { inb(ATA_STATUS) };
@@ -163,7 +169,9 @@ pub fn init() -> bool {
 
     // Read and discard 256 words of identify data
     for _ in 0..256 {
-        unsafe { inw(ATA_DATA); }
+        unsafe {
+            inw(ATA_DATA);
+        }
     }
 
     true
@@ -190,7 +198,9 @@ pub fn read_sectors(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), &'static 
     select_drive_lba(lba, count);
 
     // Send READ SECTORS command
-    unsafe { outb(ATA_COMMAND, ATA_CMD_READ_SECTORS); }
+    unsafe {
+        outb(ATA_COMMAND, ATA_CMD_READ_SECTORS);
+    }
     ata_delay();
 
     for sector in 0..count as usize {
@@ -227,21 +237,26 @@ pub fn write_sectors(lba: u32, count: u8, buf: &[u8]) -> Result<(), &'static str
     select_drive_lba(lba, count);
 
     // Send WRITE SECTORS command
-    unsafe { outb(ATA_COMMAND, ATA_CMD_WRITE_SECTORS); }
+    unsafe {
+        outb(ATA_COMMAND, ATA_CMD_WRITE_SECTORS);
+    }
     ata_delay();
 
     for sector in 0..count as usize {
         wait_drq()?;
         let offset = sector * SECTOR_SIZE;
         for i in 0..256 {
-            let word = (buf[offset + i * 2] as u16)
-                | ((buf[offset + i * 2 + 1] as u16) << 8);
-            unsafe { outw(ATA_DATA, word); }
+            let word = (buf[offset + i * 2] as u16) | ((buf[offset + i * 2 + 1] as u16) << 8);
+            unsafe {
+                outw(ATA_DATA, word);
+            }
         }
     }
 
     // Flush the write cache
-    unsafe { outb(ATA_COMMAND, ATA_CMD_CACHE_FLUSH); }
+    unsafe {
+        outb(ATA_COMMAND, ATA_CMD_CACHE_FLUSH);
+    }
     wait_not_busy();
 
     Ok(())

@@ -6,7 +6,9 @@
 //! CAP_STATE_WRITE capability. An agent always has implicit access to
 //! its own private keyspace.
 
-use crate::agent::{KeyspaceId, MAX_AGENTS, E_INVALID_ARG, E_NOT_FOUND, E_QUOTA_EXCEEDED, E_PAYLOAD_TOO_LARGE};
+use crate::agent::{
+    KeyspaceId, E_INVALID_ARG, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE, E_QUOTA_EXCEEDED, MAX_AGENTS,
+};
 use crate::merkle::{self, MerkleHash};
 
 const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
@@ -425,7 +427,7 @@ pub fn compact_keyspace_history(keyspace_id: KeyspaceId, keep: u8) -> bool {
 /// The keyspace version is advanced exactly once per committed transaction.
 pub struct StateTransaction {
     pub keyspace_id: KeyspaceId,
-    pub mutations: [(u64, [u8; MAX_VALUE_SIZE], usize); 8],  // (key, value, len)
+    pub mutations: [(u64, [u8; MAX_VALUE_SIZE], usize); 8], // (key, value, len)
     pub mutation_count: u8,
     pub tx_id: u64,
     pub committed: bool,
@@ -682,7 +684,8 @@ pub fn load_large_value(keyspace: KeyspaceId, buf: &mut [u8]) -> usize {
         return 0;
     }
 
-    let total_len = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let total_len =
+        u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
     let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
 
     if total_len == 0 || chunk_count == 0 || total_len > buf.len() {
@@ -730,7 +733,10 @@ const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; // 65
 // bytes, just like a normal keyspace entry.
 
 /// Maximum number of entries in the base image store.
-const BASE_IMAGE_MAX_ENTRIES: usize = 4096;
+///
+/// For 22 MB files stored in 256-byte chunks we need ~90K entries.
+/// We use a power-of-two size for efficient hash-table indexing.
+const BASE_IMAGE_MAX_ENTRIES: usize = 131072; // 128K slots — holds up to ~32 MB
 
 struct BaseImageEntry {
     key: u64,
@@ -754,41 +760,58 @@ impl BaseImageEntry {
 static mut BASE_IMAGE_STORE: [BaseImageEntry; BASE_IMAGE_MAX_ENTRIES] =
     [const { BaseImageEntry::empty() }; BASE_IMAGE_MAX_ENTRIES];
 
-/// Read a value from the base image store.
+/// Hash a u64 key to a slot index (Fibonacci hashing).
+#[inline]
+fn base_image_hash(key: u64) -> usize {
+    // Multiply by golden-ratio constant, take top bits
+    let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> (64 - 17)) as usize // 17 bits = 131072 slots
+}
+
+/// Read a value from the base image store (hash-table lookup).
 fn base_image_get(key: u64) -> Option<&'static [u8]> {
     unsafe {
-        for entry in BASE_IMAGE_STORE.iter() {
-            if entry.active && entry.key == key {
+        let mask = BASE_IMAGE_MAX_ENTRIES - 1; // power-of-two
+        let mut idx = base_image_hash(key) & mask;
+        for _ in 0..BASE_IMAGE_MAX_ENTRIES {
+            let entry = &BASE_IMAGE_STORE[idx];
+            if !entry.active {
+                return None; // empty slot means key not present
+            }
+            if entry.key == key {
                 return Some(&entry.value[..entry.len]);
             }
+            idx = (idx + 1) & mask;
         }
         None
     }
 }
 
-/// Write a value to the base image store.
+/// Write a value to the base image store (hash-table with linear probing).
 fn base_image_put(key: u64, value: &[u8]) -> Result<(), i64> {
     if value.len() > MAX_VALUE_SIZE {
         return Err(E_PAYLOAD_TOO_LARGE);
     }
     unsafe {
-        // Update existing entry
-        for entry in BASE_IMAGE_STORE.iter_mut() {
+        let mask = BASE_IMAGE_MAX_ENTRIES - 1;
+        let mut idx = base_image_hash(key) & mask;
+        for _ in 0..BASE_IMAGE_MAX_ENTRIES {
+            let entry = &mut BASE_IMAGE_STORE[idx];
             if entry.active && entry.key == key {
+                // Update existing entry
                 entry.value[..value.len()].copy_from_slice(value);
                 entry.len = value.len();
                 return Ok(());
             }
-        }
-        // Find free slot
-        for entry in BASE_IMAGE_STORE.iter_mut() {
             if !entry.active {
+                // Insert into empty slot
                 entry.key = key;
                 entry.value[..value.len()].copy_from_slice(value);
                 entry.len = value.len();
                 entry.active = true;
                 return Ok(());
             }
+            idx = (idx + 1) & mask;
         }
         Err(E_QUOTA_EXCEEDED)
     }
@@ -850,7 +873,8 @@ fn load_large_value_base_image(base_key: u64, buf: &mut [u8]) -> usize {
         return 0;
     }
 
-    let total_len = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let total_len =
+        u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
     let chunk_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
 
     if total_len == 0 || chunk_count == 0 || total_len > buf.len() {
@@ -933,7 +957,11 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
             for c in 0..chunk_count {
                 let cs = c * MAX_VALUE_SIZE;
                 let ce = (cs + MAX_VALUE_SIZE).min(segment_data.len());
-                put(keyspace, segment_key.wrapping_add(1).wrapping_add(c as u64), &segment_data[cs..ce])?;
+                put(
+                    keyspace,
+                    segment_key.wrapping_add(1).wrapping_add(c as u64),
+                    &segment_data[cs..ce],
+                )?;
             }
         }
     }
@@ -966,7 +994,8 @@ pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -
         return 0;
     }
 
-    let total_size = u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
+    let total_size =
+        u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize;
     let segment_count = u16::from_le_bytes([meta_buf[4], meta_buf[5]]) as usize;
 
     if total_size == 0 || segment_count == 0 || total_size > buf.len() {
@@ -989,7 +1018,12 @@ pub fn load_multi_segment(keyspace: KeyspaceId, base_key: u64, buf: &mut [u8]) -
             if seg_meta_len < 6 {
                 return 0;
             }
-            let seg_total = u32::from_le_bytes([seg_meta_buf[0], seg_meta_buf[1], seg_meta_buf[2], seg_meta_buf[3]]) as usize;
+            let seg_total = u32::from_le_bytes([
+                seg_meta_buf[0],
+                seg_meta_buf[1],
+                seg_meta_buf[2],
+                seg_meta_buf[3],
+            ]) as usize;
             let seg_chunks = u16::from_le_bytes([seg_meta_buf[4], seg_meta_buf[5]]) as usize;
             if seg_total == 0 || seg_chunks == 0 || seg_total > segment_size {
                 return 0;
@@ -1032,4 +1066,3 @@ pub fn install_base_image_file(path: &[u8], data: &[u8]) -> Result<(), i64> {
     let key = crate::linux_compat::vfs::sha256_key(path);
     store_multi_segment(BASE_IMAGE_KEYSPACE, key, data)
 }
-

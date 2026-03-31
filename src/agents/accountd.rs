@@ -7,8 +7,8 @@
 //!   Request:  [op=0x01, agent_id: u16] -> query consumption for agent
 //!   Response: [status: u8, energy_consumed: u64]
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 const OP_QUERY: u8 = 0x01;
@@ -26,7 +26,8 @@ pub extern "C" fn accountd_entry() -> ! {
             my_mailbox,
             recv_buf.as_mut_ptr() as u64,
             recv_buf.len() as u64,
-            0, 0,
+            0,
+            0,
         );
 
         if len > 0 {
@@ -37,7 +38,11 @@ pub extern "C" fn accountd_entry() -> ! {
                         if msg_len >= 3 {
                             let target_id = u16::from_le_bytes([recv_buf[1], recv_buf[2]]);
                             let consumed = crate::cost::get_cumulative(target_id);
-                            serial_println!("[ACCOUNTD] Agent {} consumed {} energy", target_id, consumed);
+                            serial_println!(
+                                "[ACCOUNTD] Agent {} consumed {} energy",
+                                target_id,
+                                consumed
+                            );
                         }
                     }
                     OP_QUERY_ALL => {
@@ -45,7 +50,11 @@ pub extern "C" fn accountd_entry() -> ! {
                         for id in 0..MAX_AGENTS as AgentId {
                             let consumed = crate::cost::get_cumulative(id);
                             if consumed > 0 {
-                                serial_println!("[ACCOUNTD] Agent {}: {} energy consumed", id, consumed);
+                                serial_println!(
+                                    "[ACCOUNTD] Agent {}: {} energy consumed",
+                                    id,
+                                    consumed
+                                );
                             }
                         }
                     }

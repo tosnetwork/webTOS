@@ -19,8 +19,8 @@
 //! HTTP request as a UDP payload and polls for a response; if none
 //! arrives within the timeout window it returns 504 (Gateway Timeout).
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 const OP_REQUEST: u8 = 0x01;
@@ -93,8 +93,9 @@ fn send_test_packet(mac: [u8; 6]) {
 
     // Ethernet header
     packet[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst MAC (broadcast)
-    packet[6..12].copy_from_slice(&mac);   // src MAC
-    packet[12] = 0x08; packet[13] = 0x00;  // EtherType: IPv4
+    packet[6..12].copy_from_slice(&mac); // src MAC
+    packet[12] = 0x08;
+    packet[13] = 0x00; // EtherType: IPv4
 
     // IPv4 header (minimal, no options)
     packet[14] = 0x45; // version=4, IHL=5 (20 bytes)
@@ -103,11 +104,11 @@ fn send_test_packet(mac: [u8; 6]) {
     packet[16..18].copy_from_slice(&total_len.to_be_bytes());
     packet[18..20].copy_from_slice(&[0x00, 0x01]); // identification
     packet[20..22].copy_from_slice(&[0x40, 0x00]); // flags=DF + fragment offset=0
-    packet[22] = 64;  // TTL
-    packet[23] = 17;  // protocol: UDP
+    packet[22] = 64; // TTL
+    packet[23] = 17; // protocol: UDP
     packet[24..26].copy_from_slice(&[0x00, 0x00]); // checksum (0 = skip)
     packet[26..30].copy_from_slice(&SRC_IP); // src IP
-    packet[30..34].copy_from_slice(&[10, 0, 2, 2]);  // dst IP (QEMU gateway)
+    packet[30..34].copy_from_slice(&[10, 0, 2, 2]); // dst IP (QEMU gateway)
 
     // UDP header
     let src_port: u16 = SRC_PORT;
@@ -163,21 +164,33 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut octets = [0u8; 4];
     let mut idx = 0usize;
     for part in s.split('.') {
-        if idx >= 4 { return None; }
+        if idx >= 4 {
+            return None;
+        }
         octets[idx] = parse_u8(part)?;
         idx += 1;
     }
-    if idx == 4 { Some(octets) } else { None }
+    if idx == 4 {
+        Some(octets)
+    } else {
+        None
+    }
 }
 
 /// Parse a string as u8 without pulling in the full fmt/parse machinery.
 fn parse_u8(s: &str) -> Option<u8> {
     let mut val: u16 = 0;
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     for &b in s.as_bytes() {
-        if b < b'0' || b > b'9' { return None; }
+        if b < b'0' || b > b'9' {
+            return None;
+        }
         val = val * 10 + (b - b'0') as u16;
-        if val > 255 { return None; }
+        if val > 255 {
+            return None;
+        }
     }
     Some(val as u8)
 }
@@ -185,24 +198,24 @@ fn parse_u8(s: &str) -> Option<u8> {
 /// Parse a string as u16 without pulling in the full fmt/parse machinery.
 fn parse_u16(s: &str) -> Option<u16> {
     let mut val: u32 = 0;
-    if s.is_empty() { return None; }
+    if s.is_empty() {
+        return None;
+    }
     for &b in s.as_bytes() {
-        if b < b'0' || b > b'9' { return None; }
+        if b < b'0' || b > b'9' {
+            return None;
+        }
         val = val * 10 + (b - b'0') as u32;
-        if val > 65535 { return None; }
+        if val > 65535 {
+            return None;
+        }
     }
     Some(val as u16)
 }
 
 /// Build an HTTP/1.1 request string into `buf`. Returns the number of
 /// bytes written, or 0 if the buffer is too small.
-fn build_http_request(
-    buf: &mut [u8],
-    method: &str,
-    host: &str,
-    path: &str,
-    body: &[u8],
-) -> usize {
+fn build_http_request(buf: &mut [u8], method: &str, host: &str, path: &str, body: &[u8]) -> usize {
     let mut pos = 0usize;
 
     // Request line: "GET /path HTTP/1.1\r\n"
@@ -227,7 +240,9 @@ fn build_http_request(
         pos += copy_str(&mut buf[pos..], "Content-Length: ");
         let mut num_buf = [0u8; 8];
         let num_len = fmt_usize(body.len(), &mut num_buf);
-        if pos + num_len > buf.len() { return 0; }
+        if pos + num_len > buf.len() {
+            return 0;
+        }
         buf[pos..pos + num_len].copy_from_slice(&num_buf[..num_len]);
         pos += num_len;
         pos += copy_str(&mut buf[pos..], "\r\n");
@@ -238,7 +253,9 @@ fn build_http_request(
 
     // Body
     if !body.is_empty() {
-        if pos + body.len() > buf.len() { return 0; }
+        if pos + body.len() > buf.len() {
+            return 0;
+        }
         buf[pos..pos + body.len()].copy_from_slice(body);
         pos += body.len();
     }
@@ -257,7 +274,9 @@ fn copy_str(dst: &mut [u8], s: &str) -> usize {
 /// Format a usize as decimal ASCII into a buffer. Returns the number of digits.
 fn fmt_usize(mut val: usize, buf: &mut [u8]) -> usize {
     if val == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; }
+        if !buf.is_empty() {
+            buf[0] = b'0';
+        }
         return 1;
     }
     let mut tmp = [0u8; 20];
@@ -281,7 +300,9 @@ fn fmt_usize(mut val: usize, buf: &mut [u8]) -> usize {
 ///
 /// `status`: 0x00 = success, 0x01 = error
 fn build_response(buf: &mut [u8], status: u8, code: u16, body: &[u8]) -> usize {
-    if buf.len() < 5 { return 0; }
+    if buf.len() < 5 {
+        return 0;
+    }
     let body_len = body.len().min(buf.len() - 5);
     buf[0] = status;
     buf[1..3].copy_from_slice(&code.to_le_bytes());
@@ -294,13 +315,16 @@ fn build_response(buf: &mut [u8], status: u8, code: u16, body: &[u8]) -> usize {
 
 /// Send a response back to the requesting agent via its mailbox.
 fn send_reply(reply_mailbox: u64, response: &[u8], response_len: usize) {
-    if response_len == 0 { return; }
+    if response_len == 0 {
+        return;
+    }
     let _ret = syscall::syscall(
         SYS_SEND,
         reply_mailbox,
         response[..response_len].as_ptr() as u64,
         response_len as u64,
-        0, 0,
+        0,
+        0,
     );
 }
 
@@ -321,15 +345,19 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
     let url_len = u16::from_le_bytes([msg[3], msg[4]]) as usize;
 
     let method_str = match method {
-        METHOD_GET  => "GET",
+        METHOD_GET => "GET",
         METHOD_POST => "POST",
-        0x03        => "PUT",
-        0x04        => "DELETE",
-        _           => "UNKNOWN",
+        0x03 => "PUT",
+        0x04 => "DELETE",
+        _ => "UNKNOWN",
     };
 
     if msg_len < 5 + url_len {
-        serial_println!("[NETD] Request truncated: need {} url bytes, have {}", url_len, msg_len - 5);
+        serial_println!(
+            "[NETD] Request truncated: need {} url bytes, have {}",
+            url_len,
+            msg_len - 5
+        );
         return;
     }
 
@@ -352,8 +380,13 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
 
     let nic_info = detect_nic();
     let nic_name = nic_info.unwrap_or("none");
-    serial_println!("[NETD] Request: {} {} (NIC: {}, reply_mb: {})",
-        method_str, url_str, nic_name, reply_mailbox);
+    serial_println!(
+        "[NETD] Request: {} {} (NIC: {}, reply_mb: {})",
+        method_str,
+        url_str,
+        nic_name,
+        reply_mailbox
+    );
 
     // No NIC available — return 503
     if nic_info.is_none() {
@@ -365,7 +398,9 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
         crate::event::emit(
             crate::sched::current(),
             crate::event::EventType::Custom,
-            method as u64, url_len as u64, 503,
+            method as u64,
+            url_len as u64,
+            503,
         );
 
         send_reply(reply_mailbox, &resp, resp_len);
@@ -390,7 +425,13 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
     let host_len = fmt_ipv4(&dst_ip, &mut host_buf);
     let host_str = core::str::from_utf8(&host_buf[..host_len]).unwrap_or("0.0.0.0");
 
-    serial_println!("[NETD] Resolved: {}:{}{} (method={})", host_str, dst_port, path, method_str);
+    serial_println!(
+        "[NETD] Resolved: {}:{}{} (method={})",
+        host_str,
+        dst_port,
+        path,
+        method_str
+    );
 
     // Build HTTP/1.1 request
     let mut http_buf = [0u8; 1400];
@@ -407,13 +448,25 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
     serial_println!("[NETD] Sending HTTP request via UDP ({} bytes)", http_len);
 
     // Send as UDP datagram using crate::net::send_udp
-    let src = crate::net::UdpEndpoint { ip: SRC_IP, port: SRC_PORT };
-    let dst = crate::net::UdpEndpoint { ip: dst_ip, port: dst_port };
+    let src = crate::net::UdpEndpoint {
+        ip: SRC_IP,
+        port: SRC_PORT,
+    };
+    let dst = crate::net::UdpEndpoint {
+        ip: dst_ip,
+        port: dst_port,
+    };
 
     match crate::net::send_udp(&src, &dst, &http_buf[..http_len]) {
         Ok(()) => {
-            serial_println!("[NETD] UDP packet sent to {}.{}.{}.{}:{}",
-                dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port);
+            serial_println!(
+                "[NETD] UDP packet sent to {}.{}.{}.{}:{}",
+                dst_ip[0],
+                dst_ip[1],
+                dst_ip[2],
+                dst_ip[3],
+                dst_port
+            );
         }
         Err(e) => {
             serial_println!("[NETD] Send failed: {}", e);
@@ -424,7 +477,9 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
             crate::event::emit(
                 crate::sched::current(),
                 crate::event::EventType::Custom,
-                method as u64, url_len as u64, 502,
+                method as u64,
+                url_len as u64,
+                502,
             );
 
             send_reply(reply_mailbox, &resp, resp_len);
@@ -447,7 +502,9 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
             crate::event::emit(
                 crate::sched::current(),
                 crate::event::EventType::Custom,
-                method as u64, url_len as u64, 200,
+                method as u64,
+                url_len as u64,
+                200,
             );
 
             send_reply(reply_mailbox, &resp, resp_len);
@@ -466,7 +523,9 @@ fn handle_http_request(msg: &[u8], msg_len: usize) {
         crate::event::emit(
             crate::sched::current(),
             crate::event::EventType::Custom,
-            method as u64, url_len as u64, 504,
+            method as u64,
+            url_len as u64,
+            504,
         );
 
         send_reply(reply_mailbox, &resp, resp_len);
@@ -478,7 +537,10 @@ fn fmt_ipv4(ip: &[u8; 4], buf: &mut [u8]) -> usize {
     let mut pos = 0;
     for (i, &octet) in ip.iter().enumerate() {
         if i > 0 {
-            if pos < buf.len() { buf[pos] = b'.'; pos += 1; }
+            if pos < buf.len() {
+                buf[pos] = b'.';
+                pos += 1;
+            }
         }
         let mut num_buf = [0u8; 8];
         let n = fmt_usize(octet as usize, &mut num_buf);
@@ -500,21 +562,27 @@ fn handle_external_message(msg: &[u8]) {
     let req = match ExternalRequest::parse(msg) {
         Some(r) => r,
         None => {
-            serial_println!("[NETD] External request: failed to parse ({} bytes)", msg.len());
+            serial_println!(
+                "[NETD] External request: failed to parse ({} bytes)",
+                msg.len()
+            );
             return;
         }
     };
 
     serial_println!(
         "[NETD] External request id={} type={:?}",
-        req.request_id, req.request_type,
+        req.request_id,
+        req.request_type,
     );
 
     let resp = crate::tcp_interface::handle_request(&req);
 
     serial_println!(
         "[NETD] External response id={} status={:?} output_len={}",
-        resp.request_id, resp.status, resp.output_len,
+        resp.request_id,
+        resp.status,
+        resp.output_len,
     );
 
     // Serialize the response and send it back via the network.
@@ -526,12 +594,8 @@ fn handle_external_message(msg: &[u8]) {
     }
 
     match send_raw(&resp_buf[..resp_len]) {
-        Ok(()) => serial_println!(
-            "[NETD] External response sent ({} bytes)", resp_len
-        ),
-        Err(e) => serial_println!(
-            "[NETD] External response send failed: {}", e
-        ),
+        Ok(()) => serial_println!("[NETD] External response sent ({} bytes)", resp_len),
+        Err(e) => serial_println!("[NETD] External response send failed: {}", e),
     }
 }
 
@@ -545,7 +609,12 @@ pub extern "C" fn netd_entry() -> ! {
             serial_println!(
                 "[NETD] NIC available: {} (MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
                 nic_name,
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5]
             );
 
             // Send a test packet to prove network I/O works
@@ -560,7 +629,9 @@ pub extern "C" fn netd_entry() -> ! {
             }
         }
         None => {
-            serial_println!("[NETD] No NIC detected; HTTP requests will return 503 (no NIC available)");
+            serial_println!(
+                "[NETD] No NIC detected; HTTP requests will return 503 (no NIC available)"
+            );
         }
     }
 
@@ -569,10 +640,12 @@ pub extern "C" fn netd_entry() -> ! {
 
     loop {
         let len = syscall::syscall(
-            SYS_RECV, my_mailbox,
+            SYS_RECV,
+            my_mailbox,
             recv_buf.as_mut_ptr() as u64,
             recv_buf.len() as u64,
-            0, 0,
+            0,
+            0,
         );
 
         if len > 0 {

@@ -40,9 +40,9 @@ impl RegionDescriptor {
 #[repr(C)]
 pub struct RegionMessage {
     pub region_id: u32,
-    pub offset: u32,   // offset within region (for chunked transfers)
-    pub length: u32,   // length of data at offset
-    pub flags: u32,    // 0x01 = first chunk, 0x02 = last chunk
+    pub offset: u32, // offset within region (for chunked transfers)
+    pub length: u32, // length of data at offset
+    pub flags: u32,  // 0x01 = first chunk, 0x02 = last chunk
 }
 
 // Global region table
@@ -51,7 +51,9 @@ static mut NEXT_REGION_ID: u32 = 1;
 
 /// Allocate a shared memory region
 pub fn allocate_region(owner: AgentId, size: usize) -> Option<u32> {
-    if size == 0 || size > MAX_REGION_SIZE { return None; }
+    if size == 0 || size > MAX_REGION_SIZE {
+        return None;
+    }
 
     // Find free slot
     unsafe {
@@ -80,8 +82,13 @@ pub fn allocate_region(owner: AgentId, size: usize) -> Option<u32> {
                     active: true,
                 };
 
-                serial_println!("[LARGE_MSG] Region {} allocated: phys={:#x} size={} owner={}",
-                    id, phys_addr, size.min(4096), owner);
+                serial_println!(
+                    "[LARGE_MSG] Region {} allocated: phys={:#x} size={} owner={}",
+                    id,
+                    phys_addr,
+                    size.min(4096),
+                    owner
+                );
 
                 return Some(id);
             }
@@ -123,7 +130,9 @@ pub fn get_region(region_id: u32) -> Option<RegionDescriptor> {
 /// Write data to a shared region (kernel-side, used by the owner agent)
 pub fn write_region(region_id: u32, offset: usize, data: &[u8]) -> Result<(), ()> {
     let region = get_region(region_id).ok_or(())?;
-    if offset + data.len() > region.size { return Err(()); }
+    if offset + data.len() > region.size {
+        return Err(());
+    }
 
     unsafe {
         let dst = (region.phys_addr as *mut u8).add(offset);

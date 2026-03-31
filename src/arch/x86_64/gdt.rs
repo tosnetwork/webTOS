@@ -145,11 +145,11 @@ pub fn init() {
         TSS.rsp0 = rsp0_top;
 
         // Build GDT entries
-        GDT[0] = GdtEntry::null();                     // 0x00: null
-        GDT[1] = GdtEntry::code_segment(0x9A);         // 0x08: kernel code
-        GDT[2] = GdtEntry::data_segment(0x92);         // 0x10: kernel data
-        GDT[3] = GdtEntry::data_segment(0xF2);         // 0x18: user data
-        GDT[4] = GdtEntry::code_segment(0xFA);         // 0x20: user code
+        GDT[0] = GdtEntry::null(); // 0x00: null
+        GDT[1] = GdtEntry::code_segment(0x9A); // 0x08: kernel code
+        GDT[2] = GdtEntry::data_segment(0x92); // 0x10: kernel data
+        GDT[3] = GdtEntry::data_segment(0xF2); // 0x18: user data
+        GDT[4] = GdtEntry::code_segment(0xFA); // 0x20: user code
 
         // TSS descriptor (occupies entries 5 and 6)
         let tss_addr = &TSS as *const Tss as u64;
@@ -219,8 +219,12 @@ pub fn init() {
         );
     }
 
-    serial_println!("[gdt] GDT loaded: kernel CS=0x{:02x} DS=0x{:02x}, TSS at 0x{:02x}",
-        KERNEL_CS, KERNEL_DS, TSS_SELECTOR);
+    serial_println!(
+        "[gdt] GDT loaded: kernel CS=0x{:02x} DS=0x{:02x}, TSS at 0x{:02x}",
+        KERNEL_CS,
+        KERNEL_DS,
+        TSS_SELECTOR
+    );
 }
 
 /// Update TSS.rsp0 to the given stack top address.

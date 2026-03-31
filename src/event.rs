@@ -7,8 +7,8 @@
 //! Later stages will write to a structured ring buffer for programmatic
 //! consumption and checkpoint/replay support.
 
-use crate::serial_println;
 use crate::agent::AgentId;
+use crate::serial_println;
 
 // ─── Event types ────────────────────────────────────────────────────────────
 
@@ -125,7 +125,9 @@ pub fn get_sequence() -> u64 {
 /// Used by replay to restore sequence state from a checkpoint.
 pub fn set_sequence(val: u64) {
     // Safety: single-core, no preemption during event access
-    unsafe { EVENT_SEQUENCE = val; }
+    unsafe {
+        EVENT_SEQUENCE = val;
+    }
 }
 
 // ─── Core emit function ─────────────────────────────────────────────────────
@@ -144,7 +146,13 @@ pub fn emit(agent_id: AgentId, event_type: EventType, arg0: u64, arg1: u64, stat
 
         serial_println!(
             "[EVENT seq={} tick={} agent={} type={} arg0={} arg1={} status={}]",
-            seq, t, agent_id, event_type.as_str(), arg0, arg1, status
+            seq,
+            t,
+            agent_id,
+            event_type.as_str(),
+            arg0,
+            arg1,
+            status
         );
 
         // Also push to in-kernel ring buffer for high-throughput consumption
@@ -194,12 +202,24 @@ pub fn agent_faulted(agent_id: AgentId, fault_code: u64) {
 
 /// Emit a mailbox send event.
 pub fn mailbox_send(sender_id: AgentId, target_mailbox: u16, payload_len: u64) {
-    emit(sender_id, EventType::MailboxSend, target_mailbox as u64, payload_len, 0);
+    emit(
+        sender_id,
+        EventType::MailboxSend,
+        target_mailbox as u64,
+        payload_len,
+        0,
+    );
 }
 
 /// Emit a mailbox receive event.
 pub fn mailbox_recv(agent_id: AgentId, mailbox_id: u16, msg_len: u64) {
-    emit(agent_id, EventType::MailboxRecv, mailbox_id as u64, msg_len, 0);
+    emit(
+        agent_id,
+        EventType::MailboxRecv,
+        mailbox_id as u64,
+        msg_len,
+        0,
+    );
 }
 
 /// Emit a capability grant event.
@@ -259,12 +279,22 @@ pub fn energy_granted(from_id: AgentId, to_id: AgentId, amount: u64) {
 
 /// Emit a mailbox pressure event when a mailbox exceeds 75% capacity.
 pub fn mailbox_pressure(mailbox_id: u16, current_count: u64, capacity: u64) {
-    emit(mailbox_id as crate::agent::AgentId, EventType::MailboxPressure,
-        current_count, capacity, 0);
+    emit(
+        mailbox_id as crate::agent::AgentId,
+        EventType::MailboxPressure,
+        current_count,
+        capacity,
+        0,
+    );
 }
 
 /// Emit a child-adopted event when an orphan is reparented to a new parent.
 pub fn child_adopted(child_id: AgentId, new_parent: AgentId, old_parent: AgentId) {
-    emit(child_id, EventType::ChildAdopted, new_parent as u64, old_parent as u64, 0);
+    emit(
+        child_id,
+        EventType::ChildAdopted,
+        new_parent as u64,
+        old_parent as u64,
+        0,
+    );
 }
-
