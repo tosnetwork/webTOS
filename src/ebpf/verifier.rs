@@ -55,9 +55,7 @@ fn is_cond_jump_op(op: u8) -> bool {
 fn validate_jump_target(pc: usize, program_len: usize, off: i16) -> Result<usize, EbpfError> {
     let target = pc as i64 + 1 + off as i64;
     if target < 0 || target as usize >= program_len {
-        return Err(EbpfError::VerificationFailed(
-            "jump target out of bounds",
-        ));
+        return Err(EbpfError::VerificationFailed("jump target out of bounds"));
     }
 
     let target = target as usize;
@@ -159,8 +157,9 @@ pub fn verify(program: &[Insn]) -> Result<(), EbpfError> {
         }
 
         if is_ldx_class(opcode) {
-            validate_writable_dst(dst)
-                .map_err(|_| EbpfError::VerificationFailed("invalid or read-only destination register"))?;
+            validate_writable_dst(dst).map_err(|_| {
+                EbpfError::VerificationFailed("invalid or read-only destination register")
+            })?;
             validate_reg_range(src)?;
             continue;
         }

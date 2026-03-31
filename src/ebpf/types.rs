@@ -76,9 +76,9 @@ pub const BPF_JSLT: u8 = 0xC0;
 pub const BPF_JSLE: u8 = 0xD0;
 
 // Memory sizes (opcode & 0x18 for LD/ST classes)
-pub const BPF_W: u8 = 0x00;  // 32-bit
-pub const BPF_H: u8 = 0x08;  // 16-bit
-pub const BPF_B: u8 = 0x10;  // 8-bit
+pub const BPF_W: u8 = 0x00; // 32-bit
+pub const BPF_H: u8 = 0x08; // 16-bit
+pub const BPF_B: u8 = 0x10; // 8-bit
 pub const BPF_DW: u8 = 0x18; // 64-bit
 
 pub const BPF_MEM: u8 = 0x60;

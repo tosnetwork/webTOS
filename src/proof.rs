@@ -8,10 +8,10 @@
 //! The final hash is the proof. A verifier with the same checkpoint and events
 //! recomputes the chain and checks if the result matches.
 
-use crate::serial_println;
 #[allow(unused_imports)]
 use crate::agent::{AgentId, MAX_AGENTS};
 use crate::merkle::{self, MerkleHash};
+use crate::serial_println;
 extern crate alloc;
 
 /// An execution proof: a hash-chain over checkpoint state + event sequence
@@ -34,13 +34,16 @@ pub struct ExecutionProof {
 #[derive(Debug)]
 pub enum ProofResult {
     Valid,
-    Invalid { expected: MerkleHash, got: MerkleHash },
+    Invalid {
+        expected: MerkleHash,
+        got: MerkleHash,
+    },
     NoCheckpoint,
 }
 
 // ─── SHA-256 hash helpers ────────────────────────────────────────────────
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 fn hash_bytes(data: &[u8]) -> MerkleHash {
     let mut hasher = Sha256::new();
@@ -64,7 +67,14 @@ fn chain_hash(left: &MerkleHash, right: &MerkleHash) -> MerkleHash {
 
 /// Hash an event into a MerkleHash for chaining
 #[allow(dead_code)]
-fn hash_event(seq: u64, tick: u64, agent_id: u16, event_type: u16, arg0: u64, arg1: u64) -> MerkleHash {
+fn hash_event(
+    seq: u64,
+    tick: u64,
+    agent_id: u16,
+    event_type: u16,
+    arg0: u64,
+    arg1: u64,
+) -> MerkleHash {
     let mut data = [0u8; 40];
     data[0..8].copy_from_slice(&seq.to_le_bytes());
     data[8..16].copy_from_slice(&tick.to_le_bytes());
@@ -109,9 +119,15 @@ pub fn generate_proof() -> ExecutionProof {
         end_seq: seq,
     };
 
-    serial_println!("[PROOF] Generated: tick={} events={} hash={:02x}{:02x}{:02x}{:02x}...",
-        tick, seq,
-        proof_hash[0], proof_hash[1], proof_hash[2], proof_hash[3]);
+    serial_println!(
+        "[PROOF] Generated: tick={} events={} hash={:02x}{:02x}{:02x}{:02x}...",
+        tick,
+        seq,
+        proof_hash[0],
+        proof_hash[1],
+        proof_hash[2],
+        proof_hash[3]
+    );
 
     proof
 }
@@ -144,11 +160,24 @@ pub fn verify_proof(proof: &ExecutionProof) -> ProofResult {
         ProofResult::Valid
     } else {
         serial_println!("[PROOF] Verification: INVALID");
-        serial_println!("[PROOF]   expected: {:02x}{:02x}{:02x}{:02x}...",
-            proof.proof_hash[0], proof.proof_hash[1], proof.proof_hash[2], proof.proof_hash[3]);
-        serial_println!("[PROOF]   computed: {:02x}{:02x}{:02x}{:02x}...",
-            computed[0], computed[1], computed[2], computed[3]);
-        ProofResult::Invalid { expected: proof.proof_hash, got: computed }
+        serial_println!(
+            "[PROOF]   expected: {:02x}{:02x}{:02x}{:02x}...",
+            proof.proof_hash[0],
+            proof.proof_hash[1],
+            proof.proof_hash[2],
+            proof.proof_hash[3]
+        );
+        serial_println!(
+            "[PROOF]   computed: {:02x}{:02x}{:02x}{:02x}...",
+            computed[0],
+            computed[1],
+            computed[2],
+            computed[3]
+        );
+        ProofResult::Invalid {
+            expected: proof.proof_hash,
+            got: computed,
+        }
     }
 }
 
@@ -316,7 +345,10 @@ pub fn generate_historical_proof(
 
 /// Helper: find the entry index for a key in a keyspace and generate a
 /// Merkle proof for that leaf.
-fn find_entry_and_prove(keyspace: crate::agent::KeyspaceId, key: u64) -> Option<merkle::MerkleProof> {
+fn find_entry_and_prove(
+    keyspace: crate::agent::KeyspaceId,
+    key: u64,
+) -> Option<merkle::MerkleProof> {
     // Look up the key's actual index in the keyspace entry array.
     // This index corresponds directly to the Merkle tree leaf index.
     let entry_index = crate::state::find_entry_index(keyspace, key)?;
@@ -330,9 +362,21 @@ pub fn print_proof(proof: &ExecutionProof) {
     serial_println!("╠══════════════════════════════════════════════╣");
     serial_println!("║ Checkpoint tick: {:>25}  ║", proof.checkpoint_tick);
     serial_println!("║ Event count:     {:>25}  ║", proof.event_count);
-    serial_println!("║ Seq range:       {:>12} - {:<12} ║", proof.start_seq, proof.end_seq);
-    serial_println!("║ Proof hash:      {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
-        proof.proof_hash[0], proof.proof_hash[1], proof.proof_hash[2], proof.proof_hash[3],
-        proof.proof_hash[4], proof.proof_hash[5], proof.proof_hash[6], proof.proof_hash[7]);
+    serial_println!(
+        "║ Seq range:       {:>12} - {:<12} ║",
+        proof.start_seq,
+        proof.end_seq
+    );
+    serial_println!(
+        "║ Proof hash:      {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
+        proof.proof_hash[0],
+        proof.proof_hash[1],
+        proof.proof_hash[2],
+        proof.proof_hash[3],
+        proof.proof_hash[4],
+        proof.proof_hash[5],
+        proof.proof_hash[6],
+        proof.proof_hash[7]
+    );
     serial_println!("╚══════════════════════════════════════════════╝");
 }

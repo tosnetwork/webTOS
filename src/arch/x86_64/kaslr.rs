@@ -27,8 +27,8 @@
 //!    jumping to Rust code.
 //! This is tracked as a future enhancement in the Yellow Paper.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use crate::serial_println;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Raw TSC entropy captured during `init()`.
 ///
@@ -60,9 +60,15 @@ pub fn init() {
 
     // Log only the bottom 16 bits — enough to confirm randomisation without
     // leaking the full entropy value (which would help an attacker).
-    serial_println!("[kaslr] entropy seeded from RDTSC (low 16 bits: {:#06x})", mixed & 0xFFFF);
-    serial_println!("[kaslr] heap ASLR: skip {} frames; stack ASLR: +{} bytes per agent",
-        heap_skip_frames(), stack_offset());
+    serial_println!(
+        "[kaslr] entropy seeded from RDTSC (low 16 bits: {:#06x})",
+        mixed & 0xFFFF
+    );
+    serial_println!(
+        "[kaslr] heap ASLR: skip {} frames; stack ASLR: +{} bytes per agent",
+        heap_skip_frames(),
+        stack_offset()
+    );
 }
 
 /// Number of physical frames the frame allocator should skip after the kernel.

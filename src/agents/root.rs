@@ -8,8 +8,8 @@
 //! In later stages, it will supervise child agents, handle faults, and
 //! manage resource allocation.
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 /// Root agent entry point.
@@ -24,13 +24,16 @@ pub extern "C" fn root_entry() -> ! {
     // Done in root agent (not init) to avoid boot stack overflow.
     {
         static HELLO_ELF: &[u8] = include_bytes!("../../test_data/test_syscalls.elf");
-        serial_println!("[ROOT] Loading Linux ELF test binary ({} bytes)...", HELLO_ELF.len());
+        serial_println!(
+            "[ROOT] Loading Linux ELF test binary ({} bytes)...",
+            HELLO_ELF.len()
+        );
         match crate::agent_loader::spawn_from_image(
             1, // root_id
             HELLO_ELF,
             crate::agent::RuntimeKind::LinuxCompat,
-            1_000_000,  // generous energy for syscall test suite
-            256,        // memory quota for mmap tests
+            1_000_000, // generous energy for syscall test suite
+            256,       // memory quota for mmap tests
         ) {
             Ok(id) => serial_println!("[ROOT] Linux ELF agent created: id={} (LinuxCompat)", id),
             Err(e) => serial_println!("[ROOT] Linux ELF load failed: error {}", e),
@@ -75,7 +78,10 @@ pub extern "C" fn root_entry() -> ! {
                         non_zero += 1;
                     }
                 }
-                serial_println!("[ROOT] \u{2713} Merkle roots loaded: {} non-zero keyspaces", non_zero);
+                serial_println!(
+                    "[ROOT] \u{2713} Merkle roots loaded: {} non-zero keyspaces",
+                    non_zero
+                );
 
                 // Run replay divergence check
                 serial_println!("[ROOT] Running Merkle divergence check...");

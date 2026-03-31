@@ -85,9 +85,7 @@ pub fn handle_host_call(
     let func = resolve_import(instance.module(), import_idx);
 
     match func {
-        HostFunc::SysYield => {
-            Ok(Some(Value::I32(0)))
-        }
+        HostFunc::SysYield => Ok(Some(Value::I32(0))),
 
         HostFunc::SysSend => {
             let _mailbox_id = args[0].as_i32();
@@ -109,7 +107,9 @@ pub fn handle_host_call(
             let ptr = args[1].as_i32() as usize;
             let capacity = args[2].as_i32() as usize;
 
-            let end = ptr.checked_add(capacity).ok_or(WasmError::MemoryOutOfBounds)?;
+            let end = ptr
+                .checked_add(capacity)
+                .ok_or(WasmError::MemoryOutOfBounds)?;
             let mem_size = instance.get_memory_size(0).unwrap_or(0);
             if end > mem_size {
                 return Err(WasmError::MemoryOutOfBounds);
@@ -123,9 +123,7 @@ pub fn handle_host_call(
             Ok(Some(Value::I32(args[0].as_i32())))
         }
 
-        HostFunc::SysEnergyGet => {
-            Ok(Some(Value::I64(instance.get_fuel() as i64)))
-        }
+        HostFunc::SysEnergyGet => Ok(Some(Value::I64(instance.get_fuel() as i64))),
 
         HostFunc::Log => {
             let ptr = args[0].as_i32() as usize;
@@ -142,8 +140,6 @@ pub fn handle_host_call(
             Ok(None)
         }
 
-        HostFunc::Unknown => {
-            Err(WasmError::ImportNotFound(import_idx))
-        }
+        HostFunc::Unknown => Err(WasmError::ImportNotFound(import_idx)),
     }
 }

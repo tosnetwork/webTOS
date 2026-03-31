@@ -40,8 +40,12 @@ impl BlockDevice for AtaDevice {
         }
         crate::arch::x86_64::ata::write_sectors(lba as u32, count as u8, buf)
     }
-    fn sector_size(&self) -> usize { 512 }
-    fn name(&self) -> &'static str { "ATA PIO" }
+    fn sector_size(&self) -> usize {
+        512
+    }
+    fn name(&self) -> &'static str {
+        "ATA PIO"
+    }
     fn is_available(&self) -> bool {
         crate::arch::x86_64::ata::init()
     }
@@ -57,8 +61,12 @@ impl BlockDevice for NvmeDevice {
     fn write(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), &'static str> {
         crate::arch::x86_64::nvme::write_sectors(lba, count, buf)
     }
-    fn sector_size(&self) -> usize { 512 }
-    fn name(&self) -> &'static str { "NVMe" }
+    fn sector_size(&self) -> usize {
+        512
+    }
+    fn name(&self) -> &'static str {
+        "NVMe"
+    }
     fn is_available(&self) -> bool {
         crate::arch::x86_64::nvme::is_initialized()
     }

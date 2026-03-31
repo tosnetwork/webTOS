@@ -244,5 +244,9 @@ impl KernelAllocator {
 
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
-    panic!("kernel heap allocation failed: size={}, align={}", layout.size(), layout.align());
+    panic!(
+        "kernel heap allocation failed: size={}, align={}",
+        layout.size(),
+        layout.align()
+    );
 }

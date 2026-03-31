@@ -8,49 +8,49 @@
 
 extern crate alloc;
 
-pub mod arch;
-mod heap;
-mod panic;
-mod logger;
 mod agent;
-mod mailbox;
-mod capability;
-mod energy;
-mod event;
-mod state;
-mod persist;
-mod sched;
-mod syscall;
-mod trap;
-mod init;
-mod agents;
-mod ebpf;
-mod wasm;
-mod loader;
 mod agent_loader;
-mod sync;
-mod deterministic;
-mod cost;
-mod merkle;
-mod checkpoint;
-mod replay;
-mod large_msg;
-mod smp;
-mod net;
-mod node;
-mod ringbuf;
-mod block;
-mod proof;
+mod agents;
+pub mod arch;
 mod attestation;
-mod policy;
-mod crypto;
-mod receipts;
-pub mod metrics;
+mod block;
+mod capability;
+mod checkpoint;
 mod contract;
 mod contract_call;
-pub mod package;
-pub mod tcp_interface;
+mod cost;
+mod crypto;
+mod deterministic;
+mod ebpf;
+mod energy;
+mod event;
+mod heap;
+mod init;
+mod large_msg;
 pub mod linux_compat;
+mod loader;
+mod logger;
+mod mailbox;
+mod merkle;
+pub mod metrics;
+mod net;
+mod node;
+pub mod package;
+mod panic;
+mod persist;
+mod policy;
+mod proof;
+mod receipts;
+mod replay;
+mod ringbuf;
+mod sched;
+mod smp;
+mod state;
+mod sync;
+mod syscall;
+pub mod tcp_interface;
+mod trap;
+mod wasm;
 
 /// Kernel entry point, called from boot.asm after long mode transition.
 #[no_mangle]
@@ -81,13 +81,20 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
                         bi.fb_stride,
                         bi.fb_pixel_format,
                     );
-                    serial_println!("[OK] Framebuffer console: {}x{} @ 0x{:x}",
-                        bi.fb_width, bi.fb_height, bi.fb_addr);
+                    serial_println!(
+                        "[OK] Framebuffer console: {}x{} @ 0x{:x}",
+                        bi.fb_width,
+                        bi.fb_height,
+                        bi.fb_addr
+                    );
                 }
             }
         }
         _ => {
-            serial_println!("[WARN] Unknown boot magic: 0x{:x}, continuing", multiboot_magic);
+            serial_println!(
+                "[WARN] Unknown boot magic: 0x{:x}, continuing",
+                multiboot_magic
+            );
         }
     }
     serial_println!("ATOS v0.1 - AI-native Operating System");
@@ -150,7 +157,9 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
 
     // Disable interrupts during agent creation and subsystem init to prevent
     // the timer from preempting into agents before sched::start() is called.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
 
     // 7. Create agents and set up the system
     init::init();
@@ -172,6 +181,8 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     // Should not reach here
     serial_println!("[ATOS] Scheduler returned - halting");
     loop {
-        unsafe { core::arch::asm!("hlt"); }
+        unsafe {
+            core::arch::asm!("hlt");
+        }
     }
 }

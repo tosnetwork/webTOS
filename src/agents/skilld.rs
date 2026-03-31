@@ -9,8 +9,8 @@
 //!   UNINSTALL: [op=0x02, skill_mailbox: u16]
 //!   LIST: [op=0x03]
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 const OP_INSTALL: u8 = 0x01;
@@ -44,7 +44,8 @@ pub extern "C" fn skilld_entry() -> ! {
             my_mailbox,
             recv_buf.as_mut_ptr() as u64,
             recv_buf.len() as u64,
-            0, 0,
+            0,
+            0,
         );
 
         if len > 0 {
@@ -64,19 +65,20 @@ pub extern "C" fn skilld_entry() -> ! {
 }
 
 fn handle_install(recv_buf: &[u8], msg_len: usize) {
-    if msg_len < 4 { return; }
+    if msg_len < 4 {
+        return;
+    }
 
     let name_len = recv_buf[1] as usize;
-    if msg_len < 2 + name_len + 2 { return; }
+    if msg_len < 2 + name_len + 2 {
+        return;
+    }
 
     let mut name = [0u8; 32];
     let copy_len = name_len.min(32);
     name[..copy_len].copy_from_slice(&recv_buf[2..2 + copy_len]);
 
-    let wasm_len = u16::from_le_bytes([
-        recv_buf[2 + name_len],
-        recv_buf[3 + name_len],
-    ]) as usize;
+    let wasm_len = u16::from_le_bytes([recv_buf[2 + name_len], recv_buf[3 + name_len]]) as usize;
 
     let wasm_start = 4 + name_len;
     if msg_len < wasm_start + wasm_len {
@@ -85,14 +87,21 @@ fn handle_install(recv_buf: &[u8], msg_len: usize) {
     }
 
     let name_str = core::str::from_utf8(&name[..copy_len]).unwrap_or("<invalid>");
-    serial_println!("[SKILLD] Install request: name='{}' wasm_size={} bytes", name_str, wasm_len);
+    serial_println!(
+        "[SKILLD] Install request: name='{}' wasm_size={} bytes",
+        name_str,
+        wasm_len
+    );
 
     // Validate WASM module
     let wasm_bytes = &recv_buf[wasm_start..wasm_start + wasm_len];
     match crate::wasm::decoder::decode(wasm_bytes) {
         Ok(module) => {
-            serial_println!("[SKILLD] WASM module validated: {} functions, {} exports",
-                module.get_functions().len(), module.get_exports().len());
+            serial_println!(
+                "[SKILLD] WASM module validated: {} functions, {} exports",
+                module.get_functions().len(),
+                module.get_exports().len()
+            );
 
             // Register the skill
             unsafe {
@@ -106,7 +115,11 @@ fn handle_install(recv_buf: &[u8], msg_len: usize) {
                         active: true,
                     });
                     SKILL_COUNT += 1;
-                    serial_println!("[SKILLD] Skill '{}' registered (index {})", name_str, SKILL_COUNT - 1);
+                    serial_println!(
+                        "[SKILLD] Skill '{}' registered (index {})",
+                        name_str,
+                        SKILL_COUNT - 1
+                    );
                 } else {
                     serial_println!("[SKILLD] Skill registry full");
                 }
@@ -119,7 +132,9 @@ fn handle_install(recv_buf: &[u8], msg_len: usize) {
 }
 
 fn handle_uninstall(recv_buf: &[u8], msg_len: usize) {
-    if msg_len < 3 { return; }
+    if msg_len < 3 {
+        return;
+    }
     let skill_idx = u16::from_le_bytes([recv_buf[1], recv_buf[2]]) as usize;
 
     unsafe {
@@ -139,8 +154,13 @@ fn handle_list() {
         for i in 0..SKILL_COUNT {
             if let Some(ref entry) = SKILL_REGISTRY[i] {
                 let name = core::str::from_utf8(&entry.name[..entry.name_len]).unwrap_or("?");
-                serial_println!("[SKILLD]   [{}] '{}' active={} parent={}",
-                    i, name, entry.active, entry.parent_id);
+                serial_println!(
+                    "[SKILLD]   [{}] '{}' active={} parent={}",
+                    i,
+                    name,
+                    entry.active,
+                    entry.parent_id
+                );
             }
         }
     }

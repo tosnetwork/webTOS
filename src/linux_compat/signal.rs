@@ -5,7 +5,7 @@
 //! and rt_sigprocmask during initialization.
 
 use crate::linux_compat::constants::*;
-use crate::linux_compat::state::MAX_LINUX_AGENTS;
+use crate::linux_compat::state::{self, MAX_LINUX_AGENTS};
 use crate::serial_println;
 
 // ── Signal constants ───────────────────────────────────────────────────────
@@ -248,6 +248,97 @@ pub fn sys_rt_sigprocmask(
     }
 
     0
+}
+
+// ── Signal delivery ───────────────────────────────────────────────────────
+
+// Signals whose default action is to terminate the process.
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+
+// Signal numbers for well-known signals.
+const SIGKILL: u32 = 9;
+const SIGSEGV: u32 = 11;
+const SIGCHLD: u32 = 17;
+const SIGSTOP: u32 = 19;
+const SIGURG: u32 = 23;
+const SIGWINCH: u32 = 28;
+
+/// Returns true if the default action for `signum` is to ignore the signal.
+fn default_action_is_ignore(signum: u32) -> bool {
+    matches!(signum, SIGCHLD | SIGURG | SIGWINCH)
+}
+
+/// Look up the registered handler address for a given signal on an agent.
+/// Returns SIG_DFL (0) if no handler has been registered.
+fn get_signal_handler(agent_id: u16, signum: u32) -> u64 {
+    let idx = agent_id as usize;
+    if idx >= MAX_LINUX_AGENTS || signum < 1 || signum > 64 {
+        return SIG_DFL;
+    }
+    unsafe {
+        let s = &SIGNAL_STATES[idx];
+        if !s.active {
+            return SIG_DFL;
+        }
+        s.actions[(signum - 1) as usize].handler
+    }
+}
+
+/// Deliver all pending signals for an agent.
+///
+/// Called at syscall-return boundary to ensure deterministic delivery.
+/// For now, user-space handler invocation (pushing a signal frame and
+/// redirecting RIP) is deferred -- handlers are logged and the signal
+/// is cleared.  SIG_DFL terminate actions do terminate the agent.
+pub fn deliver_pending_signals(agent_id: u16) {
+    // Process signals one at a time, lowest number first.
+    loop {
+        let signum = match state::has_pending_signal(agent_id) {
+            Some(s) => s,
+            None => break,
+        };
+
+        let handler = get_signal_handler(agent_id, signum);
+
+        if handler == SIG_IGN {
+            // Explicitly ignored -- clear and continue.
+            state::clear_signal(agent_id, signum);
+            continue;
+        }
+
+        if handler == SIG_DFL {
+            // Default action.
+            if default_action_is_ignore(signum) {
+                // Default-ignore signals (SIGCHLD, SIGURG, SIGWINCH).
+                state::clear_signal(agent_id, signum);
+                continue;
+            }
+            // Default action for most other signals is terminate.
+            serial_println!(
+                "[signal] agent {} terminated by SIG{} (default action)",
+                agent_id,
+                signum
+            );
+            state::clear_signal(agent_id, signum);
+            // Terminate the agent.
+            crate::sched::remove_from_run_queue(agent_id);
+            crate::agent::terminate_agent(agent_id, crate::agent::AgentStatus::Exited);
+            crate::sched::yield_current();
+            return; // unreachable in practice
+        }
+
+        // User-registered handler.
+        // Full delivery would push a signal frame on the user stack and
+        // redirect RIP to the handler.  For now, log and clear.
+        serial_println!(
+            "[signal] agent {}: signal {} has handler {:#x} (delivery deferred)",
+            agent_id,
+            signum,
+            handler
+        );
+        state::clear_signal(agent_id, signum);
+    }
 }
 
 /// rt_sigreturn(2) -- Return from signal handler.

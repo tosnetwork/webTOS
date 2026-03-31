@@ -4,8 +4,8 @@
 //! replies with "pong". Demonstrates the responder side of mailbox IPC,
 //! capability enforcement (needs CAP_SEND_MAILBOX:2), and cooperative scheduling.
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 use crate::syscall;
 
 /// Pong agent entry point.
@@ -48,7 +48,11 @@ pub extern "C" fn pong_entry() -> ! {
                 0,
                 0,
             );
-            serial_println!("[PONG] Sent pong to mailbox {}, result={}", ping_mailbox, result);
+            serial_println!(
+                "[PONG] Sent pong to mailbox {}, result={}",
+                ping_mailbox,
+                result
+            );
         }
 
         // Yield to let other agents run

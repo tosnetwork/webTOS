@@ -9,8 +9,8 @@
 //!   QUERY_ENTRY  (0x03): [op, index: u32 LE] -> returns entry fields
 //!   DUMP_ALL     (0x04): [op] -> prints all entries to serial
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 
 const OP_LOG_EVENT: u8 = 0x01;
 const OP_QUERY_COUNT: u8 = 0x02;
@@ -76,7 +76,10 @@ pub fn get_audit_entry(idx: usize) -> Option<AuditEntry> {
 
 /// Authority audit service entry point.
 pub fn auditd_main() {
-    serial_println!("[AUDITD] Authority audit service started (log capacity: {})", AUDIT_LOG_CAPACITY);
+    serial_println!(
+        "[AUDITD] Authority audit service started (log capacity: {})",
+        AUDIT_LOG_CAPACITY
+    );
 
     loop {
         match crate::mailbox::recv_message(AUDITD_ID, AUDITD_MAILBOX) {
@@ -113,8 +116,8 @@ fn handle_log_event(payload: &[u8], msg_len: usize) {
     }
 
     let tick = u64::from_le_bytes([
-        payload[1], payload[2], payload[3], payload[4],
-        payload[5], payload[6], payload[7], payload[8],
+        payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+        payload[8],
     ]);
     let agent_id = u16::from_le_bytes([payload[9], payload[10]]);
     let event_type = payload[11];
@@ -126,7 +129,12 @@ fn handle_log_event(payload: &[u8], msg_len: usize) {
     let count = unsafe { AUDIT_COUNT };
     serial_println!(
         "[AUDITD] Logged event: tick={} agent={} type={} target={} cap={} (total: {})",
-        tick, agent_id, event_type, target_id, cap_type, count
+        tick,
+        agent_id,
+        event_type,
+        target_id,
+        cap_type,
+        count
     );
 }
 
@@ -184,7 +192,12 @@ fn handle_dump_all() {
             };
             serial_println!(
                 "[AUDITD]   [{}] tick={} agent={} {} target={} cap={}",
-                i, entry.tick, entry.agent_id, type_str, entry.target_id, entry.capability_type
+                i,
+                entry.tick,
+                entry.agent_id,
+                type_str,
+                entry.target_id,
+                entry.capability_type
             );
         }
     }

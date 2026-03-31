@@ -22,16 +22,8 @@ fn ticks_to_timespec() -> (u64, u64) {
 #[inline]
 unsafe fn write_timespec(ptr: u64, sec: u64, nsec: u64) {
     let p = ptr as *mut u8;
-    core::ptr::copy_nonoverlapping(
-        &(sec as i64) as *const i64 as *const u8,
-        p,
-        8,
-    );
-    core::ptr::copy_nonoverlapping(
-        &(nsec as i64) as *const i64 as *const u8,
-        p.add(8),
-        8,
-    );
+    core::ptr::copy_nonoverlapping(&(sec as i64) as *const i64 as *const u8, p, 8);
+    core::ptr::copy_nonoverlapping(&(nsec as i64) as *const i64 as *const u8, p.add(8), 8);
 }
 
 /// Read a timespec { tv_sec: i64, tv_nsec: i64 } from the given user pointer.
@@ -132,16 +124,8 @@ pub fn sys_gettimeofday(_agent_id: u16, tv_ptr: u64, tz_ptr: u64) -> i64 {
         let usec = nsec / 1000;
         unsafe {
             let p = tv_ptr as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                &(sec as i64) as *const i64 as *const u8,
-                p,
-                8,
-            );
-            core::ptr::copy_nonoverlapping(
-                &(usec as i64) as *const i64 as *const u8,
-                p.add(8),
-                8,
-            );
+            core::ptr::copy_nonoverlapping(&(sec as i64) as *const i64 as *const u8, p, 8);
+            core::ptr::copy_nonoverlapping(&(usec as i64) as *const i64 as *const u8, p.add(8), 8);
         }
     }
     if tz_ptr != 0 {
@@ -149,16 +133,8 @@ pub fn sys_gettimeofday(_agent_id: u16, tv_ptr: u64, tz_ptr: u64) -> i64 {
         unsafe {
             let p = tz_ptr as *mut u8;
             let zero: i32 = 0;
-            core::ptr::copy_nonoverlapping(
-                &zero as *const i32 as *const u8,
-                p,
-                4,
-            );
-            core::ptr::copy_nonoverlapping(
-                &zero as *const i32 as *const u8,
-                p.add(4),
-                4,
-            );
+            core::ptr::copy_nonoverlapping(&zero as *const i32 as *const u8, p, 4);
+            core::ptr::copy_nonoverlapping(&zero as *const i32 as *const u8, p.add(4), 4);
         }
     }
     0

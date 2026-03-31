@@ -26,23 +26,33 @@ static mut METRICS: SystemMetrics = SystemMetrics {
 };
 
 pub fn increment_syscall_count() {
-    unsafe { METRICS.total_syscalls += 1; }
+    unsafe {
+        METRICS.total_syscalls += 1;
+    }
 }
 
 pub fn increment_agent_spawned() {
-    unsafe { METRICS.total_agents_spawned += 1; }
+    unsafe {
+        METRICS.total_agents_spawned += 1;
+    }
 }
 
 pub fn increment_agent_exited() {
-    unsafe { METRICS.total_agents_exited += 1; }
+    unsafe {
+        METRICS.total_agents_exited += 1;
+    }
 }
 
 pub fn increment_messages_sent() {
-    unsafe { METRICS.total_messages_sent += 1; }
+    unsafe {
+        METRICS.total_messages_sent += 1;
+    }
 }
 
 pub fn increment_energy_consumed(amount: u64) {
-    unsafe { METRICS.total_energy_consumed += amount; }
+    unsafe {
+        METRICS.total_energy_consumed += amount;
+    }
 }
 
 pub fn get_metrics() -> &'static SystemMetrics {
@@ -50,5 +60,7 @@ pub fn get_metrics() -> &'static SystemMetrics {
 }
 
 pub fn increment_uptime() {
-    unsafe { METRICS.uptime_ticks += 1; }
+    unsafe {
+        METRICS.uptime_ticks += 1;
+    }
 }

@@ -6,12 +6,12 @@
 
 extern crate alloc;
 
-use crate::serial_println;
 use crate::agent::*;
-use crate::syscall;
-use crate::wasm;
 use crate::contract_call;
 use crate::mailbox;
+use crate::serial_println;
+use crate::syscall;
+use crate::wasm;
 
 /// Maximum size of a deployed WASM contract binary (64 KB).
 const MAX_WASM_CODE_SIZE: usize = 65536;
@@ -64,31 +64,22 @@ static WASM_BINARY: &[u8] = &[
     // ── WASM header ──────────────────────────────────────────────
     0x00, 0x61, 0x73, 0x6D, // magic: \0asm
     0x01, 0x00, 0x00, 0x00, // version: 1
-
     // ── Type section (id=1, size=4) ──────────────────────────────
     0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-
     // ── Import section (id=2, size=17) ───────────────────────────
-    0x02, 0x11, 0x01,
-    0x03, 0x61, 0x6F, 0x73, // module: "atos" (note: 3 bytes = "aos")
+    0x02, 0x11, 0x01, 0x03, 0x61, 0x6F, 0x73, // module: "atos" (note: 3 bytes = "aos")
     0x09, 0x73, 0x79, 0x73, 0x5F, 0x79, 0x69, 0x65, 0x6C, 0x64, // field: "sys_yield"
     0x00, 0x00,
-
     // ── Function section (id=3, size=2) ──────────────────────────
     0x03, 0x02, 0x01, 0x00,
-
     // ── Export section (id=7, size=7) ─────────────────────────────
-    0x07, 0x07, 0x01,
-    0x03, 0x72, 0x75, 0x6E, // name: "run"
+    0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6E, // name: "run"
     0x00, 0x01,
-
     // ── Code section (id=10, size=11) ────────────────────────────
-    0x0A, 0x0B, 0x01,
-    0x09, 0x00,
-    0x03, 0x40,             // loop (void)
-    0x10, 0x00,             // call 0 (sys_yield)
-    0x0C, 0x00,             // br 0
-    0x0B, 0x0B,             // end loop, end func
+    0x0A, 0x0B, 0x01, 0x09, 0x00, 0x03, 0x40, // loop (void)
+    0x10, 0x00, // call 0 (sys_yield)
+    0x0C, 0x00, // br 0
+    0x0B, 0x0B, // end loop, end func
 ];
 
 // ─── Response serialisation ─────────────────────────────────────────────────
@@ -146,8 +137,7 @@ fn run_wasm_function(
                 result = instance.resume(ret_val);
             }
 
-            wasm::runtime::ExecResult::Ok
-            | wasm::runtime::ExecResult::Returned(_) => {
+            wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {
                 let consumed = initial_fuel.saturating_sub(instance.get_fuel());
                 return (consumed, contract_call::STATUS_SUCCESS);
             }
@@ -229,7 +219,8 @@ pub extern "C" fn wasm_agent_entry() -> ! {
     if wasm_code_len > 0 {
         serial_println!(
             "[WASM_AGENT] Agent {} loaded {} bytes of WASM from keyspace (chunked)",
-            agent_id, wasm_code_len
+            agent_id,
+            wasm_code_len
         );
     } else {
         serial_println!(
@@ -273,19 +264,35 @@ pub extern "C" fn wasm_agent_entry() -> ! {
     let mut instance = match wasm::runtime::WasmInstance::new(module, DEFAULT_FUEL) {
         Ok(inst) => inst,
         Err(e) => {
-            serial_println!("[WASM_AGENT] Agent {} instantiation failed: {:?}", agent_id, e);
-            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+            serial_println!(
+                "[WASM_AGENT] Agent {} instantiation failed: {:?}",
+                agent_id,
+                e
+            );
+            loop {
+                syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+            }
         }
     };
-    serial_println!("[WASM_AGENT] Agent {} instance created with {} fuel", agent_id, DEFAULT_FUEL);
+    serial_println!(
+        "[WASM_AGENT] Agent {} instance created with {} fuel",
+        agent_id,
+        DEFAULT_FUEL
+    );
 
     // ── Phase 2: Run start function if present ──────────────────────────
 
     match instance.run_start() {
         wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
         wasm::runtime::ExecResult::Trap(e) => {
-            serial_println!("[WASM_AGENT] Agent {} start function trapped: {:?}", agent_id, e);
-            loop { syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0); }
+            serial_println!(
+                "[WASM_AGENT] Agent {} start function trapped: {:?}",
+                agent_id,
+                e
+            );
+            loop {
+                syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+            }
         }
         _ => {}
     }
@@ -314,7 +321,8 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 // Re-enqueue so message isn't lost.
                 serial_println!(
                     "[WASM_AGENT] Agent {} received non-call message ({} bytes), re-enqueuing",
-                    agent_id, payload_len
+                    agent_id,
+                    payload_len
                 );
                 mailbox::send_message(agent_id, agent_id as u16, &msg.payload[..payload_len]).ok();
                 continue;
@@ -323,7 +331,10 @@ pub extern "C" fn wasm_agent_entry() -> ! {
 
         serial_println!(
             "[WASM_AGENT] Agent {} received call: selector=0x{:08X}, input_len={}, caller={}",
-            agent_id, call_req.selector, call_req.input_len, call_req.caller_agent
+            agent_id,
+            call_req.selector,
+            call_req.input_len,
+            call_req.caller_agent
         );
 
         // 2b. Resolve the call export per-request using the selector.
@@ -332,16 +343,16 @@ pub extern "C" fn wasm_agent_entry() -> ! {
             None => {
                 serial_println!(
                     "[WASM_AGENT] Agent {} has no export matching selector 0x{:08X}",
-                    agent_id, call_req.selector
+                    agent_id,
+                    call_req.selector
                 );
                 // Send an error response back to the caller.
-                let response = contract_call::build_response(
-                    contract_call::STATUS_ERROR, 0, &[],
-                );
+                let response = contract_call::build_response(contract_call::STATUS_ERROR, 0, &[]);
                 let mut resp_buf = [0u8; 256];
                 let resp_len = serialise_response(&response, &mut resp_buf);
                 if resp_len > 0 {
-                    mailbox::send_message(agent_id, call_req.caller_agent, &resp_buf[..resp_len]).ok();
+                    mailbox::send_message(agent_id, call_req.caller_agent, &resp_buf[..resp_len])
+                        .ok();
                 }
                 continue;
             }
@@ -383,7 +394,8 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 // Read the first 4 bytes as a little-endian u32 output length marker,
                 // then the actual output follows at offset 4.
                 if mem.len() >= 4 {
-                    let declared_len = u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]) as usize;
+                    let declared_len =
+                        u32::from_le_bytes([mem[0], mem[1], mem[2], mem[3]]) as usize;
                     output_len = declared_len.min(243).min(mem.len().saturating_sub(4));
                     if output_len > 0 {
                         output[..output_len].copy_from_slice(&mem[4..4 + output_len]);
@@ -393,10 +405,7 @@ pub extern "C" fn wasm_agent_entry() -> ! {
         }
 
         // 6b. Record input/output commitment hashes for receipt generation.
-        record_io_hashes(
-            &call_req.input[..input_len],
-            &output[..output_len],
-        );
+        record_io_hashes(&call_req.input[..input_len], &output[..output_len]);
 
         // 7. Build the response.
         let response = contract_call::build_response(status, energy_used, &output[..output_len]);
@@ -417,7 +426,9 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 Err(e) => {
                     serial_println!(
                         "[WASM_AGENT] Agent {} failed to send response to {}: err={}",
-                        agent_id, call_req.caller_agent, e
+                        agent_id,
+                        call_req.caller_agent,
+                        e
                     );
                 }
             }
@@ -435,14 +446,21 @@ pub extern "C" fn wasm_agent_entry() -> ! {
 /// This preserves backward compatibility: the fallback binary has a "run" export
 /// that loops calling sys_yield, which is driven through the host-call loop.
 fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> ! {
-    serial_println!("[WASM_AGENT] Agent {} running fallback test binary", agent_id);
+    serial_println!(
+        "[WASM_AGENT] Agent {} running fallback test binary",
+        agent_id
+    );
 
     // Find the "run" export.
     let run_idx = match module.find_export_func(b"run") {
         Some(idx) => idx,
         None => {
             serial_println!("[WASM_AGENT] Fallback binary missing 'run' export");
-            loop { unsafe { core::arch::asm!("hlt"); } }
+            loop {
+                unsafe {
+                    core::arch::asm!("hlt");
+                }
+            }
         }
     };
 
@@ -451,7 +469,11 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
         Ok(inst) => inst,
         Err(e) => {
             serial_println!("[WASM_AGENT] Fallback instantiation trapped: {:?}", e);
-            loop { unsafe { core::arch::asm!("hlt"); } }
+            loop {
+                unsafe {
+                    core::arch::asm!("hlt");
+                }
+            }
         }
     };
 
@@ -460,7 +482,11 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
         wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
         wasm::runtime::ExecResult::Trap(e) => {
             serial_println!("[WASM_AGENT] Fallback start function trapped: {:?}", e);
-            loop { unsafe { core::arch::asm!("hlt"); } }
+            loop {
+                unsafe {
+                    core::arch::asm!("hlt");
+                }
+            }
         }
         _ => {}
     }
@@ -476,7 +502,9 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
                 if host_calls % 1000 == 1 {
                     serial_println!(
                         "[WASM_AGENT] Agent {} host call #{} (import {})",
-                        agent_id, host_calls, import_idx
+                        agent_id,
+                        host_calls,
+                        import_idx
                     );
                 }
 
@@ -496,11 +524,11 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
                 result = instance.resume(ret_val);
             }
 
-            wasm::runtime::ExecResult::Ok
-            | wasm::runtime::ExecResult::Returned(_) => {
+            wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {
                 serial_println!(
                     "[WASM_AGENT] Agent {} fallback completed after {} host calls",
-                    agent_id, host_calls
+                    agent_id,
+                    host_calls
                 );
                 break;
             }
@@ -508,7 +536,8 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
             wasm::runtime::ExecResult::OutOfFuel => {
                 serial_println!(
                     "[WASM_AGENT] Agent {} out of fuel after {} host calls",
-                    agent_id, host_calls
+                    agent_id,
+                    host_calls
                 );
                 break;
             }
@@ -519,13 +548,20 @@ fn run_fallback_agent(module: wasm::decoder::WasmModule, agent_id: AgentId) -> !
             }
 
             wasm::runtime::ExecResult::Exception(tag, _) => {
-                serial_println!("[WASM_AGENT] Agent {} uncaught exception (tag {})", agent_id, tag);
+                serial_println!(
+                    "[WASM_AGENT] Agent {} uncaught exception (tag {})",
+                    agent_id,
+                    tag
+                );
                 break;
             }
         }
     }
 
-    serial_println!("[WASM_AGENT] Agent {} fallback execution complete, yielding forever", agent_id);
+    serial_println!(
+        "[WASM_AGENT] Agent {} fallback execution complete, yielding forever",
+        agent_id
+    );
     loop {
         syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
     }

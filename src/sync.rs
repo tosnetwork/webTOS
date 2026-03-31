@@ -20,7 +20,9 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 #[inline(always)]
 fn read_rflags() -> u64 {
     let flags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem)); }
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem));
+    }
     flags
 }
 
@@ -36,29 +38,41 @@ impl<T> SpinLock<T> {
         // Save interrupt state and disable interrupts
         let flags = read_rflags();
         let irq_was_enabled = flags & (1 << 9) != 0;
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+        }
 
         // Spin until we acquire the lock
-        while self.locked.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
 
-        SpinLockGuard { lock: self, irq_was_enabled }
+        SpinLockGuard {
+            lock: self,
+            irq_was_enabled,
+        }
     }
 
     /// Acquire the lock WITHOUT disabling/restoring interrupts.
     /// The caller is responsible for managing interrupt state.
     /// Use this when the caller already has cli/sti brackets.
     pub fn lock_raw(&self) -> SpinLockGuard<T> {
-        while self.locked.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
 
-        SpinLockGuard { lock: self, irq_was_enabled: false }
+        SpinLockGuard {
+            lock: self,
+            irq_was_enabled: false,
+        }
     }
 }
 
@@ -85,7 +99,9 @@ impl<'a, T> Drop for SpinLockGuard<'a, T> {
         self.lock.locked.store(false, Ordering::Release);
         // Only restore interrupts if they were enabled before we acquired the lock
         if self.irq_was_enabled {
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
         }
     }
 }

@@ -5,19 +5,19 @@
 //!
 //! QEMU: -device nvme,drive=d0,serial=atos-nvme -drive file=disk.img,id=d0,format=raw,if=none
 
-use crate::serial_println;
 use super::paging;
+use crate::serial_println;
 
 // ─── NVMe Controller Registers (MMIO offsets from BAR0) ─────────────────
 
-const REG_CAP: u64 = 0x00;      // Controller Capabilities
+const REG_CAP: u64 = 0x00; // Controller Capabilities
 #[allow(dead_code)]
-const REG_VS: u64 = 0x08;       // Version
-const REG_CC: u64 = 0x14;       // Controller Configuration
-const REG_CSTS: u64 = 0x1C;     // Controller Status
-const REG_AQA: u64 = 0x24;      // Admin Queue Attributes
-const REG_ASQ: u64 = 0x28;      // Admin Submission Queue Base
-const REG_ACQ: u64 = 0x30;      // Admin Completion Queue Base
+const REG_VS: u64 = 0x08; // Version
+const REG_CC: u64 = 0x14; // Controller Configuration
+const REG_CSTS: u64 = 0x1C; // Controller Status
+const REG_AQA: u64 = 0x24; // Admin Queue Attributes
+const REG_ASQ: u64 = 0x28; // Admin Submission Queue Base
+const REG_ACQ: u64 = 0x30; // Admin Completion Queue Base
 
 // ─── NVMe Command Opcodes ───────────────────────────────────────────────
 
@@ -40,8 +40,8 @@ pub struct NvmeCommand {
     pub command_id: u16,
     pub nsid: u32,
     pub reserved: [u64; 2],
-    pub prp1: u64,       // Physical Region Page 1
-    pub prp2: u64,       // Physical Region Page 2 or PRP list
+    pub prp1: u64, // Physical Region Page 1
+    pub prp2: u64, // Physical Region Page 2 or PRP list
     pub cdw10: u32,
     pub cdw11: u32,
     pub cdw12: u32,
@@ -62,14 +62,14 @@ pub struct NvmeCompletion {
     pub sq_head: u16,
     pub sq_id: u16,
     pub command_id: u16,
-    pub status: u16,     // Phase bit in bit 0, status in bits 1-15
+    pub status: u16, // Phase bit in bit 0, status in bits 1-15
 }
 
 // ─── NVMe Controller State ──────────────────────────────────────────────
 
 /// NVMe controller state
 pub struct NvmeController {
-    pub bar0: u64,           // MMIO base address
+    pub bar0: u64, // MMIO base address
     pub initialized: bool,
     pub doorbell_stride: u32,
     pub max_queue_entries: u16,
@@ -165,8 +165,14 @@ fn find_nvme_pci() -> Option<(u32, u32, u32)> {
                     // NVMe: class=0x01 (Mass Storage), subclass=0x08 (NVM Express)
                     if class_code == 0x01 && subclass == 0x08 {
                         let device_id = ((id >> 16) & 0xFFFF) as u16;
-                        serial_println!("[NVMe] Found at PCI {:02x}:{:02x}.{} vendor={:#06x} device={:#06x}",
-                            bus, dev, func, vendor, device_id);
+                        serial_println!(
+                            "[NVMe] Found at PCI {:02x}:{:02x}.{} vendor={:#06x} device={:#06x}",
+                            bus,
+                            dev,
+                            func,
+                            vendor,
+                            device_id
+                        );
                         return Some((bus, dev, func));
                     }
 
@@ -244,8 +250,13 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     let dstrd = ((cap >> 32) & 0xF) as u32; // Doorbell Stride (2^(2+dstrd))
     let version = read_reg32(REG_VS);
 
-    serial_println!("[NVMe] CAP={:#018x} MQES={} DSTRD={} VS={:#010x}",
-        cap, mqes, dstrd, version);
+    serial_println!(
+        "[NVMe] CAP={:#018x} MQES={} DSTRD={} VS={:#010x}",
+        cap,
+        mqes,
+        dstrd,
+        version
+    );
 
     NVME.doorbell_stride = 4 << dstrd;
     NVME.max_queue_entries = mqes;
@@ -271,14 +282,20 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     // 1. Allocate Admin Submission Queue (ASQ) — 64 entries x 64 bytes = 4KB
     let asq_phys = match paging::alloc_frame() {
         Some(f) => f,
-        None => { serial_println!("[NVMe] Failed to allocate ASQ frame"); return false; }
+        None => {
+            serial_println!("[NVMe] Failed to allocate ASQ frame");
+            return false;
+        }
     };
     core::ptr::write_bytes(asq_phys as *mut u8, 0, 4096);
 
     // 2. Allocate Admin Completion Queue (ACQ) — 64 entries x 16 bytes = 1KB (4KB frame)
     let acq_phys = match paging::alloc_frame() {
         Some(f) => f,
-        None => { serial_println!("[NVMe] Failed to allocate ACQ frame"); return false; }
+        None => {
+            serial_println!("[NVMe] Failed to allocate ACQ frame");
+            return false;
+        }
     };
     core::ptr::write_bytes(acq_phys as *mut u8, 0, 4096);
 
@@ -317,7 +334,10 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     // 7. Create IO Completion Queue (queue ID=1) via admin command
     let io_cq_phys = match paging::alloc_frame() {
         Some(f) => f,
-        None => { serial_println!("[NVMe] Failed to allocate IO CQ frame"); return false; }
+        None => {
+            serial_println!("[NVMe] Failed to allocate IO CQ frame");
+            return false;
+        }
     };
     core::ptr::write_bytes(io_cq_phys as *mut u8, 0, 4096);
 
@@ -331,18 +351,27 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
         prp2: 0,
         cdw10: (63 << 16) | 1, // size=63 (0-indexed) | QID=1
         cdw11: 1,              // physically contiguous
-        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+        cdw12: 0,
+        cdw13: 0,
+        cdw14: 0,
+        cdw15: 0,
     };
     submit_admin_cmd(&create_cq);
     match poll_admin_completion(10) {
         Ok(_) => serial_println!("[NVMe] IO Completion Queue created"),
-        Err(e) => { serial_println!("[NVMe] Create IO CQ failed: {}", e); return false; }
+        Err(e) => {
+            serial_println!("[NVMe] Create IO CQ failed: {}", e);
+            return false;
+        }
     }
 
     // 8. Create IO Submission Queue (queue ID=1, CQ ID=1) via admin command
     let io_sq_phys = match paging::alloc_frame() {
         Some(f) => f,
-        None => { serial_println!("[NVMe] Failed to allocate IO SQ frame"); return false; }
+        None => {
+            serial_println!("[NVMe] Failed to allocate IO SQ frame");
+            return false;
+        }
     };
     core::ptr::write_bytes(io_sq_phys as *mut u8, 0, 4096);
 
@@ -356,12 +385,18 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
         prp2: 0,
         cdw10: (63 << 16) | 1, // size=63 (0-indexed) | QID=1
         cdw11: (1 << 16) | 1,  // CQID=1 | physically contiguous
-        cdw12: 0, cdw13: 0, cdw14: 0, cdw15: 0,
+        cdw12: 0,
+        cdw13: 0,
+        cdw14: 0,
+        cdw15: 0,
     };
     submit_admin_cmd(&create_sq);
     match poll_admin_completion(11) {
         Ok(_) => serial_println!("[NVMe] IO Submission Queue created"),
-        Err(e) => { serial_println!("[NVMe] Create IO SQ failed: {}", e); return false; }
+        Err(e) => {
+            serial_println!("[NVMe] Create IO SQ failed: {}", e);
+            return false;
+        }
     }
 
     NVME.io_sq = io_sq_phys;

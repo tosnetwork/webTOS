@@ -15,7 +15,9 @@ pub struct UdpEndpoint {
 
 /// Craft a UDP packet and send via the available network driver
 pub fn send_udp(src: &UdpEndpoint, dst: &UdpEndpoint, payload: &[u8]) -> Result<(), &'static str> {
-    if payload.len() > 1400 { return Err("payload too large for single UDP packet"); }
+    if payload.len() > 1400 {
+        return Err("payload too large for single UDP packet");
+    }
 
     let mut packet = [0u8; 1514]; // max Ethernet frame
     let total_len = 14 + 20 + 8 + payload.len(); // eth + ip + udp + payload
@@ -24,7 +26,8 @@ pub fn send_udp(src: &UdpEndpoint, dst: &UdpEndpoint, payload: &[u8]) -> Result<
     let mac = get_mac();
     packet[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst
     packet[6..12].copy_from_slice(&mac); // src
-    packet[12] = 0x08; packet[13] = 0x00; // IPv4
+    packet[12] = 0x08;
+    packet[13] = 0x00; // IPv4
 
     // IPv4 header
     packet[14] = 0x45; // version + IHL
@@ -66,13 +69,19 @@ pub fn recv_udp(buf: &mut [u8]) -> Option<(UdpEndpoint, usize)> {
         0
     };
 
-    if frame_len < 42 { return None; } // too small for eth+ip+udp
+    if frame_len < 42 {
+        return None;
+    } // too small for eth+ip+udp
 
     // Check EtherType = IPv4
-    if frame[12] != 0x08 || frame[13] != 0x00 { return None; }
+    if frame[12] != 0x08 || frame[13] != 0x00 {
+        return None;
+    }
 
     // Check protocol = UDP
-    if frame[23] != 17 { return None; }
+    if frame[23] != 17 {
+        return None;
+    }
 
     let src = UdpEndpoint {
         ip: [frame[26], frame[27], frame[28], frame[29]],

@@ -5,7 +5,7 @@
 
 use crate::event::Event;
 
-const RING_SIZE: usize = 1024;  // 1024 events, ~56 KB
+const RING_SIZE: usize = 1024; // 1024 events, ~56 KB
 
 pub struct EventRing {
     buffer: [Option<Event>; RING_SIZE],
@@ -70,7 +70,9 @@ static mut EVENT_RING: EventRing = EventRing::new();
 
 /// Push an event to the kernel ring buffer.
 pub fn ring_push(event: Event) {
-    unsafe { EVENT_RING.push(event); }
+    unsafe {
+        EVENT_RING.push(event);
+    }
 }
 
 /// Pop an event from the kernel ring buffer.

@@ -9,11 +9,11 @@
 //!   Sectors 1..N:   CheckpointAgent entries (one per sector)
 //!   Sectors N+1..M: Merkle roots (packed, 16 bytes each)
 
-use crate::serial_println;
 use crate::agent::*;
 use crate::block::StorageDevice;
-use crate::merkle;
 use crate::capability::Capability;
+use crate::merkle;
+use crate::serial_println;
 extern crate alloc;
 use alloc::vec::Vec;
 
@@ -23,14 +23,14 @@ const CHECKPOINT_START_SECTOR: u32 = 2048;
 /// Checkpoint header (serialized to disk, padded to 512 bytes)
 #[repr(C)]
 pub struct CheckpointHeader {
-    pub magic: u32,           // 0x41545343 = "ATSC"
-    pub version: u32,         // format version = 1
+    pub magic: u32,   // 0x41545343 = "ATSC"
+    pub version: u32, // format version = 1
     pub tick: u64,
     pub event_sequence: u64,
     pub agent_count: u16,
     pub merkle_root_count: u16,
-    pub total_size: u64,      // total bytes written (header + agents + merkle)
-    // padding to 512 bytes is implicit (we write a full sector)
+    pub total_size: u64, // total bytes written (header + agents + merkle)
+                         // padding to 512 bytes is implicit (we write a full sector)
 }
 
 /// Saved agent state within a checkpoint (fits in one 512-byte sector)
@@ -41,7 +41,7 @@ pub struct CheckpointAgent {
     pub mode: u8,
     pub energy_budget: u64,
     pub context: AgentContext, // 152 bytes (19 × u64)
-    // total: 2 + 1 + 1 + 8 + 152 = 164 bytes, fits in 512-byte sector
+                               // total: 2 + 1 + 1 + 8 + 152 = 164 bytes, fits in 512-byte sector
 }
 
 /// I/O trace entry for replay
@@ -49,7 +49,7 @@ pub struct CheckpointAgent {
 #[derive(Clone, Copy)]
 pub struct TraceEntry {
     pub tick: u64,
-    pub event_type: u8,   // 0=timer, 1=disk_read, 2=disk_write, 3=net_recv
+    pub event_type: u8, // 0=timer, 1=disk_read, 2=disk_write, 3=net_recv
     pub agent_id: AgentId,
     pub data_len: u16,
 }
@@ -84,15 +84,22 @@ pub fn enable_tracing() {
 pub fn disable_tracing() {
     unsafe {
         TRACE_ENABLED = false;
-        serial_println!("[CHECKPOINT] I/O tracing disabled ({} entries)", TRACE_COUNT);
+        serial_println!(
+            "[CHECKPOINT] I/O tracing disabled ({} entries)",
+            TRACE_COUNT
+        );
     }
 }
 
 /// Record a trace entry (called from I/O paths)
 pub fn record_trace(tick: u64, event_type: u8, agent_id: AgentId) {
     unsafe {
-        if !TRACE_ENABLED { return; }
-        if TRACE_COUNT >= MAX_TRACE_ENTRIES { return; }
+        if !TRACE_ENABLED {
+            return;
+        }
+        if TRACE_COUNT >= MAX_TRACE_ENTRIES {
+            return;
+        }
         TRACE_LOG[TRACE_COUNT] = Some(TraceEntry {
             tick,
             event_type,
@@ -193,7 +200,10 @@ pub fn save_to_disk() -> bool {
     let copy_len = header_bytes.len().min(SECTOR_SIZE);
     sector_buf[..copy_len].copy_from_slice(&header_bytes[..copy_len]);
 
-    if device.write(CHECKPOINT_START_SECTOR as u64, 1, &sector_buf).is_err() {
+    if device
+        .write(CHECKPOINT_START_SECTOR as u64, 1, &sector_buf)
+        .is_err()
+    {
         serial_println!("[CHECKPOINT] Failed to write header");
         return false;
     }
@@ -246,7 +256,10 @@ pub fn load_header_from_disk() -> Option<CheckpointHeader> {
 
     const SECTOR_SIZE: usize = 512;
     let mut sector_buf = [0u8; SECTOR_SIZE];
-    if device.read(CHECKPOINT_START_SECTOR as u64, 1, &mut sector_buf).is_err() {
+    if device
+        .read(CHECKPOINT_START_SECTOR as u64, 1, &mut sector_buf)
+        .is_err()
+    {
         return None;
     }
 
@@ -257,13 +270,14 @@ pub fn load_header_from_disk() -> Option<CheckpointHeader> {
     }
 
     // Deserialize header
-    let header = unsafe {
-        core::ptr::read(sector_buf.as_ptr() as *const CheckpointHeader)
-    };
+    let header = unsafe { core::ptr::read(sector_buf.as_ptr() as *const CheckpointHeader) };
 
     serial_println!(
         "[CHECKPOINT] Found on disk: tick={} event_seq={} agents={} merkle_roots={}",
-        header.tick, header.event_sequence, header.agent_count, header.merkle_root_count
+        header.tick,
+        header.event_sequence,
+        header.agent_count,
+        header.merkle_root_count
     );
 
     Some(header)
@@ -277,7 +291,9 @@ pub fn take_checkpoint() -> CheckpointHeader {
 
     let mut agent_count = 0u16;
     for_each_agent_mut(|agent| {
-        if agent.active { agent_count += 1; }
+        if agent.active {
+            agent_count += 1;
+        }
         true
     });
 
@@ -293,7 +309,9 @@ pub fn take_checkpoint() -> CheckpointHeader {
 
     serial_println!(
         "[CHECKPOINT] Captured (in-memory): tick={} event_seq={} agents={}",
-        tick, event_seq, agent_count
+        tick,
+        event_seq,
+        agent_count
     );
 
     header
@@ -312,12 +330,12 @@ pub fn load_agents_from_disk(header: &CheckpointHeader) -> [Option<CheckpointAge
     };
 
     for i in 0..header.agent_count as usize {
-        if i >= MAX_AGENTS { break; }
+        if i >= MAX_AGENTS {
+            break;
+        }
         let sector = CHECKPOINT_START_SECTOR + 1 + i as u32;
         if device.read(sector as u64, 1, &mut sector_buf).is_ok() {
-            let agent = unsafe {
-                core::ptr::read(sector_buf.as_ptr() as *const CheckpointAgent)
-            };
+            let agent = unsafe { core::ptr::read(sector_buf.as_ptr() as *const CheckpointAgent) };
             agents[i] = Some(agent);
         }
     }
@@ -381,7 +399,7 @@ impl PortableCheckpoint {
         pc.source_node = crate::node::get_node_id();
         pc.runtime_class = match agent.mode {
             crate::agent::AgentMode::Kernel => 0,
-            crate::agent::AgentMode::User   => 1,
+            crate::agent::AgentMode::User => 1,
         };
         pc.energy_remaining = agent.energy_budget;
 
@@ -404,12 +422,11 @@ impl PortableCheckpoint {
         let mut off = 0usize;
         for i in 0..agent.cap_count {
             if let Some(ref cap) = agent.capabilities[i] {
-                if off + cap_size > pc.authority_context.len() { break; }
+                if off + cap_size > pc.authority_context.len() {
+                    break;
+                }
                 let cap_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        cap as *const Capability as *const u8,
-                        cap_size,
-                    )
+                    core::slice::from_raw_parts(cap as *const Capability as *const u8, cap_size)
                 };
                 pc.authority_context[off..off + cap_size].copy_from_slice(cap_bytes);
                 off += cap_size;
@@ -419,7 +436,9 @@ impl PortableCheckpoint {
 
         serial_println!(
             "[CHECKPOINT] PortableCheckpoint: agent={} data_len={} auth_len={}",
-            agent_id, pc.checkpoint_len, pc.authority_len
+            agent_id,
+            pc.checkpoint_len,
+            pc.authority_len
         );
 
         Some(pc)
@@ -507,7 +526,10 @@ pub fn serialize_agent(agent_id: AgentId) -> Option<Vec<u8>> {
 
     serial_println!(
         "[CHECKPOINT] serialize_agent: id={} caps={} state_entries={} total_bytes={}",
-        agent_id, cap_count, entry_count, buf.len()
+        agent_id,
+        cap_count,
+        entry_count,
+        buf.len()
     );
 
     Some(buf)
@@ -520,17 +542,23 @@ pub fn serialize_agent(agent_id: AgentId) -> Option<Vec<u8>> {
 /// state keyspace. Its parent is set to `ROOT_AGENT_ID`. Returns the new
 /// `AgentId` on success, or `None` on malformed data.
 pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
-    if data.len() < 4 { return None; }
+    if data.len() < 4 {
+        return None;
+    }
 
     // Check magic
     let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic != AGENT_MAGIC { return None; }
+    if magic != AGENT_MAGIC {
+        return None;
+    }
 
     let mut pos = 4usize;
 
     macro_rules! need {
         ($n:expr) => {{
-            if pos + $n > data.len() { return None; }
+            if pos + $n > data.len() {
+                return None;
+            }
             let s = &data[pos..pos + $n];
             pos += $n;
             s
@@ -548,9 +576,8 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
     // CPU context
     let ctx_size = core::mem::size_of::<AgentContext>();
     let ctx_bytes = need!(ctx_size);
-    let context: AgentContext = unsafe {
-        core::ptr::read(ctx_bytes.as_ptr() as *const AgentContext)
-    };
+    let context: AgentContext =
+        unsafe { core::ptr::read(ctx_bytes.as_ptr() as *const AgentContext) };
 
     // Capabilities
     let cap_count_bytes = need!(2);
@@ -562,9 +589,7 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
     let actual_caps = cap_count.min(MAX_CAPABILITIES_PER_AGENT);
     for i in 0..actual_caps {
         let cap_bytes = need!(cap_size);
-        let cap: Capability = unsafe {
-            core::ptr::read(cap_bytes.as_ptr() as *const Capability)
-        };
+        let cap: Capability = unsafe { core::ptr::read(cap_bytes.as_ptr() as *const Capability) };
         caps[i] = Some(cap);
     }
 
@@ -577,7 +602,8 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
         context.rsp,
         energy,
         256, // default memory quota (pages)
-    ).ok()?;
+    )
+    .ok()?;
 
     // Patch in the full context and capabilities.
     if let Some(agent) = crate::agent::get_agent_mut(new_id) {
@@ -604,14 +630,18 @@ pub fn deserialize_agent(data: &[u8]) -> Option<AgentId> {
         let key = u64::from_le_bytes(key_bytes.try_into().ok()?);
         let len_bytes = need!(2);
         let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
-        if len > MAX_VALUE_SIZE { return None; }
+        if len > MAX_VALUE_SIZE {
+            return None;
+        }
         let val_bytes = need!(len);
         let _ = crate::state::state_put(new_id, key, val_bytes);
     }
 
     serial_println!(
         "[CHECKPOINT] deserialize_agent: new_id={} caps={} state_entries={}",
-        new_id, actual_caps, entry_count
+        new_id,
+        actual_caps,
+        entry_count
     );
 
     Some(new_id)
@@ -626,7 +656,10 @@ pub fn load_merkle_from_disk(header: &CheckpointHeader) -> [crate::merkle::Merkl
 
     if let Some(device) = StorageDevice::detect() {
         let merkle_sector = CHECKPOINT_START_SECTOR + 1 + header.agent_count as u32;
-        if device.read(merkle_sector as u64, 1, &mut sector_buf).is_ok() {
+        if device
+            .read(merkle_sector as u64, 1, &mut sector_buf)
+            .is_ok()
+        {
             for i in 0..MAX_AGENTS.min(32) {
                 roots[i].copy_from_slice(&sector_buf[i * 16..(i + 1) * 16]);
             }

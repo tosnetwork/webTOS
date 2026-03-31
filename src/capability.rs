@@ -5,8 +5,8 @@
 //! Capabilities support grant (subset only), use-counting, and wildcard targets.
 
 use crate::agent::{
-    AgentId, CAP_TARGET_WILDCARD,
-    MAX_CAPABILITIES_PER_AGENT, E_NO_CAP, E_QUOTA_EXCEEDED, E_INVALID_ARG, E_NOT_FOUND,
+    AgentId, CAP_TARGET_WILDCARD, E_INVALID_ARG, E_NOT_FOUND, E_NO_CAP, E_QUOTA_EXCEEDED,
+    MAX_CAPABILITIES_PER_AGENT,
 };
 
 // ─── Capability types ───────────────────────────────────────────────────────
@@ -30,9 +30,9 @@ pub enum CapType {
 #[repr(C)]
 pub struct Capability {
     pub cap_type: CapType,
-    pub target: u16,        // target resource id, or CAP_TARGET_WILDCARD
+    pub target: u16, // target resource id, or CAP_TARGET_WILDCARD
     pub flags: u16,
-    pub use_limit: u32,     // 0 = unlimited
+    pub use_limit: u32, // 0 = unlimited
     pub use_count: u32,
     /// Node that issued this capability (0 = local / unset).
     pub node_id: u32,
@@ -96,7 +96,6 @@ impl Capability {
         self.cap_type == parent_cap.cap_type
             && (parent_cap.target == CAP_TARGET_WILDCARD || self.target == parent_cap.target)
     }
-
 }
 
 // ─── Agent capability queries ───────────────────────────────────────────────
@@ -198,7 +197,12 @@ pub fn grant_cap(from_id: AgentId, to_id: AgentId, cap: Capability) -> Result<()
 ///
 /// The revoking agent must be the parent of the target agent.
 /// Finds and removes the first matching capability from the child's array.
-pub fn revoke_cap(from_id: AgentId, to_id: AgentId, cap_type: CapType, cap_target: u16) -> Result<(), i64> {
+pub fn revoke_cap(
+    from_id: AgentId,
+    to_id: AgentId,
+    cap_type: CapType,
+    cap_target: u16,
+) -> Result<(), i64> {
     // Verify target is a direct child of the revoking agent
     if !crate::agent::is_child_of(to_id, from_id) {
         return Err(E_INVALID_ARG);

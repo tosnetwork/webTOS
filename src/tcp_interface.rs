@@ -5,7 +5,7 @@
 //! All structures are fixed-size and `no_std`-compatible.
 
 use crate::agent::{KeyspaceId, CAP_TARGET_WILDCARD, ROOT_AGENT_ID};
-use crate::capability::{Capability, CapType};
+use crate::capability::{CapType, Capability};
 
 // ─── Magic & version ───────────────────────────────────────────────────────
 
@@ -125,8 +125,7 @@ impl ExternalRequest {
         }
 
         let request_id = u64::from_le_bytes([
-            buf[5], buf[6], buf[7], buf[8],
-            buf[9], buf[10], buf[11], buf[12],
+            buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
         ]);
 
         let request_type = RequestType::from_u8(buf[13])?;
@@ -315,8 +314,8 @@ impl ExternalResponse {
 pub fn handle_request(req: &ExternalRequest) -> ExternalResponse {
     match req.request_type {
         RequestType::Deploy => handle_deploy(req),
-        RequestType::Call   => handle_call(req),
-        RequestType::Query  => handle_query(req),
+        RequestType::Call => handle_call(req),
+        RequestType::Query => handle_query(req),
         RequestType::Submit => handle_submit(req),
         RequestType::GetReceipt => handle_get_receipt(req),
         RequestType::GetProof => handle_get_proof(req),
@@ -416,7 +415,11 @@ fn handle_deploy(req: &ExternalRequest) -> ExternalResponse {
         deployer: ROOT_AGENT_ID,
         deploy_tick: crate::arch::x86_64::timer::get_ticks(),
         status: ContractStatus::Deployed,
-        entry_points: [EntryPoint { name: [0u8; 32], name_len: 0, selector: 0 }; MAX_ENTRY_POINTS],
+        entry_points: [EntryPoint {
+            name: [0u8; 32],
+            name_len: 0,
+            selector: 0,
+        }; MAX_ENTRY_POINTS],
         entry_point_count: 0,
     };
 
@@ -477,7 +480,7 @@ fn handle_call(req: &ExternalRequest) -> ExternalResponse {
 
     // Build a ContractCallRequest with the calldata.
     let call_req = contract_call::build_request(
-        ROOT_AGENT_ID,   // external calls enter through the root agent
+        ROOT_AGENT_ID, // external calls enter through the root agent
         selector,
         req.energy_limit,
         &req.input[..req.input_len as usize],
@@ -549,10 +552,14 @@ fn handle_query(req: &ExternalRequest) -> ExternalResponse {
         return resp;
     }
     let key = u64::from_le_bytes([
-        req.entry_point[0], req.entry_point[1],
-        req.entry_point[2], req.entry_point[3],
-        req.entry_point[4], req.entry_point[5],
-        req.entry_point[6], req.entry_point[7],
+        req.entry_point[0],
+        req.entry_point[1],
+        req.entry_point[2],
+        req.entry_point[3],
+        req.entry_point[4],
+        req.entry_point[5],
+        req.entry_point[6],
+        req.entry_point[7],
     ]);
 
     // Read from the keyspace.

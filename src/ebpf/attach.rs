@@ -3,8 +3,8 @@
 //! Programs are loaded, verified, attached to hook points, and executed
 //! when the corresponding kernel event occurs.
 
-use super::types::*;
 use super::runtime::EbpfVm;
+use super::types::*;
 use super::verifier;
 use crate::sync::SpinLock;
 
@@ -34,7 +34,7 @@ pub struct AttachedProgram {
     pub len: usize,
     pub attach_point: AttachPoint,
     pub active: bool,
-    pub priority: u8,  // lower value = higher priority, default 128
+    pub priority: u8, // lower value = higher priority, default 128
 }
 
 const MAX_ATTACHED: usize = 16;
@@ -55,7 +55,12 @@ pub fn attach(program: &[Insn], point: AttachPoint, priority: u8) -> Result<usiz
     for i in 0..MAX_ATTACHED {
         if programs[i].is_none() {
             let mut attached = AttachedProgram {
-                program: [Insn { opcode: 0, regs: 0, off: 0, imm: 0 }; MAX_INSNS],
+                program: [Insn {
+                    opcode: 0,
+                    regs: 0,
+                    off: 0,
+                    imm: 0,
+                }; MAX_INSNS],
                 len: program.len(),
                 attach_point: point,
                 active: true,
@@ -148,7 +153,12 @@ pub fn replace(index: usize, new_program: &[Insn]) -> Result<(), EbpfError> {
         Some(ref mut prog) => {
             // Clear and copy new bytecode
             for i in 0..MAX_INSNS {
-                prog.program[i] = Insn { opcode: 0, regs: 0, off: 0, imm: 0 };
+                prog.program[i] = Insn {
+                    opcode: 0,
+                    regs: 0,
+                    off: 0,
+                    imm: 0,
+                };
             }
             for j in 0..new_program.len() {
                 prog.program[j] = new_program[j];

@@ -3,25 +3,25 @@
 // Provides GDT, IDT, serial I/O, paging, timer, and context switching
 // for the ATOS kernel running on x86_64 (QEMU target).
 
+pub mod acpi;
+pub mod ata;
+pub mod context;
+pub mod e1000;
+pub mod framebuffer;
 pub mod gdt;
 pub mod idt;
-pub mod serial;
-pub mod paging;
-pub mod timer;
-pub mod context;
-pub mod syscall_msr;
-pub mod ata;
-pub mod acpi;
-pub mod lapic;
-pub mod pci;
-pub mod virtio_net;
-pub mod e1000;
-pub mod nvme;
-pub mod security;
 pub mod kaslr;
-pub mod framebuffer;
+pub mod lapic;
+pub mod nvme;
+pub mod paging;
+pub mod pci;
+pub mod security;
+pub mod serial;
+pub mod syscall_msr;
+pub mod timer;
 #[allow(dead_code)]
 pub mod tpm;
+pub mod virtio_net;
 
 pub use serial::{serial_print, serial_println};
 

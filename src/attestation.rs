@@ -15,12 +15,12 @@
 //! (boot config) values, extend a PCR with the measurement data, and
 //! carry a 64-byte Ed25519 signature.
 
-use crate::serial_println;
 use crate::crypto;
+use crate::serial_println;
 
 /// Produce a 32-byte SHA-256 hash over `data`.
 fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
     let result = hasher.finalize();
@@ -244,30 +244,60 @@ pub fn verify_report(report: &AttestationReport, secret: &[u8; 32]) -> bool {
 /// Print an attestation report to the serial console.
 pub fn print_report(report: &AttestationReport) {
     let m = &report.measurement;
-    let mode = if report.is_tpm_backed { "TPM + Ed25519" } else { "Fallback (keyed-hash)" };
+    let mode = if report.is_tpm_backed {
+        "TPM + Ed25519"
+    } else {
+        "Fallback (keyed-hash)"
+    };
     serial_println!("╔══════════════════════════════════════════════╗");
     serial_println!("║         ATTESTATION REPORT                  ║");
     serial_println!("╠══════════════════════════════════════════════╣");
     serial_println!("║ Mode:           {:>25}  ║", mode);
     serial_println!("║ Tick:           {:>25}  ║", m.tick);
     serial_println!("║ Active agents:  {:>25}  ║", m.agent_count);
-    serial_println!("║ Kernel hash:    {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
-        m.kernel_hash[0], m.kernel_hash[1], m.kernel_hash[2], m.kernel_hash[3],
-        m.kernel_hash[4], m.kernel_hash[5], m.kernel_hash[6], m.kernel_hash[7]);
-    serial_println!("║ Config hash:    {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
-        m.boot_config_hash[0], m.boot_config_hash[1],
-        m.boot_config_hash[2], m.boot_config_hash[3],
-        m.boot_config_hash[4], m.boot_config_hash[5],
-        m.boot_config_hash[6], m.boot_config_hash[7]);
-    serial_println!("║ Proof hash:     {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
-        report.proof_hash[0], report.proof_hash[1],
-        report.proof_hash[2], report.proof_hash[3],
-        report.proof_hash[4], report.proof_hash[5],
-        report.proof_hash[6], report.proof_hash[7]);
-    serial_println!("║ Signature:      {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
-        report.signature[0], report.signature[1],
-        report.signature[2], report.signature[3],
-        report.signature[4], report.signature[5],
-        report.signature[6], report.signature[7]);
+    serial_println!(
+        "║ Kernel hash:    {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
+        m.kernel_hash[0],
+        m.kernel_hash[1],
+        m.kernel_hash[2],
+        m.kernel_hash[3],
+        m.kernel_hash[4],
+        m.kernel_hash[5],
+        m.kernel_hash[6],
+        m.kernel_hash[7]
+    );
+    serial_println!(
+        "║ Config hash:    {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
+        m.boot_config_hash[0],
+        m.boot_config_hash[1],
+        m.boot_config_hash[2],
+        m.boot_config_hash[3],
+        m.boot_config_hash[4],
+        m.boot_config_hash[5],
+        m.boot_config_hash[6],
+        m.boot_config_hash[7]
+    );
+    serial_println!(
+        "║ Proof hash:     {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
+        report.proof_hash[0],
+        report.proof_hash[1],
+        report.proof_hash[2],
+        report.proof_hash[3],
+        report.proof_hash[4],
+        report.proof_hash[5],
+        report.proof_hash[6],
+        report.proof_hash[7]
+    );
+    serial_println!(
+        "║ Signature:      {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}...       ║",
+        report.signature[0],
+        report.signature[1],
+        report.signature[2],
+        report.signature[3],
+        report.signature[4],
+        report.signature[5],
+        report.signature[6],
+        report.signature[7]
+    );
     serial_println!("╚══════════════════════════════════════════════╝");
 }

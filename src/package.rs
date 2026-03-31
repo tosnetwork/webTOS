@@ -48,7 +48,7 @@ impl PackageManifest {
 
     /// Verify code hash matches actual code (SHA-256).
     pub fn verify_code_hash(&self, code: &[u8]) -> bool {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = Sha256::digest(code);
         let mut computed = [0u8; 32];
         computed.copy_from_slice(&hash);
@@ -135,9 +135,12 @@ pub fn parse_package(data: &[u8]) -> Option<Package> {
 
     // Parse code section
     let code_off = 4 + manifest_size;
-    let code_size =
-        u32::from_le_bytes([data[code_off], data[code_off + 1], data[code_off + 2], data[code_off + 3]])
-            as usize;
+    let code_size = u32::from_le_bytes([
+        data[code_off],
+        data[code_off + 1],
+        data[code_off + 2],
+        data[code_off + 3],
+    ]) as usize;
     let code_start = code_off + 4;
     if data.len() < code_start + code_size {
         return None;
@@ -163,7 +166,8 @@ pub fn parse_package(data: &[u8]) -> Option<Package> {
 const MAX_PACKAGES: usize = 32;
 
 /// Package registry (installed packages).
-static mut PACKAGE_REGISTRY: [Option<PackageManifest>; MAX_PACKAGES] = [const { None }; MAX_PACKAGES];
+static mut PACKAGE_REGISTRY: [Option<PackageManifest>; MAX_PACKAGES] =
+    [const { None }; MAX_PACKAGES];
 static mut PACKAGE_COUNT: usize = 0;
 
 /// Install a package manifest into the registry.

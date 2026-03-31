@@ -5,7 +5,7 @@
 //! read-only base image keyspace, while `/app/` and all other paths
 //! resolve to the agent's own private keyspace.
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Base image keyspace ID (system-level, shared read-only).
 ///
@@ -30,8 +30,7 @@ pub enum SpecialFile {
 pub fn sha256_key(data: &[u8]) -> u64 {
     let hash = Sha256::digest(data);
     u64::from_le_bytes([
-        hash[0], hash[1], hash[2], hash[3],
-        hash[4], hash[5], hash[6], hash[7],
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ])
 }
 
@@ -111,7 +110,6 @@ fn sha256_key_prefixed(prefix: &[u8], suffix: &[u8]) -> u64 {
     hasher.update(suffix);
     let hash = hasher.finalize();
     u64::from_le_bytes([
-        hash[0], hash[1], hash[2], hash[3],
-        hash[4], hash[5], hash[6], hash[7],
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ])
 }

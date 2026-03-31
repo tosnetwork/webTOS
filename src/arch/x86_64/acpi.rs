@@ -18,7 +18,7 @@ pub struct AcpiInfo {
 /// RSDP (Root System Description Pointer) v1
 #[repr(C, packed)]
 struct Rsdp {
-    signature: [u8; 8],     // "RSD PTR "
+    signature: [u8; 8], // "RSD PTR "
     checksum: u8,
     oem_id: [u8; 6],
     revision: u8,
@@ -61,7 +61,7 @@ struct MadtLocalApic {
     header: MadtEntryHeader,
     processor_id: u8,
     apic_id: u8,
-    flags: u32,             // bit 0 = processor enabled
+    flags: u32, // bit 0 = processor enabled
 }
 
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
@@ -75,7 +75,11 @@ pub fn init() -> Option<AcpiInfo> {
     let rsdp = find_rsdp()?;
 
     let rsdt_addr = unsafe { core::ptr::addr_of!((*rsdp).rsdt_address).read_unaligned() };
-    serial_println!("[ACPI] RSDP found at {:p}, RSDT at {:#x}", rsdp as *const _, rsdt_addr);
+    serial_println!(
+        "[ACPI] RSDP found at {:p}, RSDT at {:#x}",
+        rsdp as *const _,
+        rsdt_addr
+    );
 
     // 2. Parse RSDT to find MADT
     let madt = find_madt(rsdt_addr as u64)?;
@@ -90,7 +94,8 @@ pub fn init() -> Option<AcpiInfo> {
         cpu_apic_ids: [0; MAX_CPUS],
     };
 
-    let madt_length = unsafe { core::ptr::addr_of!((*madt).header.length).read_unaligned() } as usize;
+    let madt_length =
+        unsafe { core::ptr::addr_of!((*madt).header.length).read_unaligned() } as usize;
     let madt_base = madt as *const MadtHeader as usize;
     let entries_start = madt_base + core::mem::size_of::<MadtHeader>();
     let entries_end = madt_base + madt_length;
@@ -104,7 +109,8 @@ pub fn init() -> Option<AcpiInfo> {
             let lapic_entry = unsafe { &*(offset as *const MadtLocalApic) };
             let flags = unsafe { core::ptr::addr_of!((*lapic_entry).flags).read_unaligned() };
 
-            if flags & 1 != 0 { // Processor enabled
+            if flags & 1 != 0 {
+                // Processor enabled
                 if (info.cpu_count as usize) < MAX_CPUS {
                     info.cpu_apic_ids[info.cpu_count as usize] = lapic_entry.apic_id;
                     info.cpu_count += 1;
@@ -112,13 +118,17 @@ pub fn init() -> Option<AcpiInfo> {
             }
         }
 
-        if entry.length == 0 { break; } // prevent infinite loop
+        if entry.length == 0 {
+            break;
+        } // prevent infinite loop
         offset += entry.length as usize;
     }
 
-    serial_println!("[ACPI] Found {} CPU(s): APIC IDs {:?}",
+    serial_println!(
+        "[ACPI] Found {} CPU(s): APIC IDs {:?}",
         info.cpu_count,
-        &info.cpu_apic_ids[..info.cpu_count as usize]);
+        &info.cpu_apic_ids[..info.cpu_count as usize]
+    );
 
     Some(info)
 }
@@ -167,7 +177,7 @@ fn find_madt(rsdt_addr: u64) -> Option<&'static MadtHeader> {
     let entries = unsafe {
         core::slice::from_raw_parts(
             (rsdt_addr as usize + header_size) as *const u32,
-            entry_count
+            entry_count,
         )
     };
 

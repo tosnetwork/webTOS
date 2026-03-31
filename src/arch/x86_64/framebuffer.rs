@@ -29,10 +29,10 @@ struct FbState {
     addr: u64,
     width: u32,
     height: u32,
-    stride: u32,     // pixels per scan line
+    stride: u32,       // pixels per scan line
     pixel_format: u32, // 0=RGBX, 1=BGRX
-    cols: u32,        // text columns (width / 8)
-    rows: u32,        // text rows (height / 16)
+    cols: u32,         // text columns (width / 8)
+    rows: u32,         // text rows (height / 16)
     cursor_col: u32,
     cursor_row: u32,
 }
