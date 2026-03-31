@@ -13,9 +13,6 @@ use crate::serial_println;
 use crate::syscall;
 use crate::wasm;
 
-/// Maximum size of a deployed WASM contract binary (64 KB).
-const MAX_WASM_CODE_SIZE: usize = 65536;
-
 // ─── Input/output commitment tracking ──────────────────────────────────────
 
 /// Last input hash computed during contract call execution.
@@ -162,6 +159,54 @@ fn run_wasm_function(
     }
 }
 
+/// Load and instantiate the deployed WASM module for this agent on demand.
+///
+/// Returning `Ok(None)` means there is no deployed module in the agent keyspace.
+fn load_deployed_instance(
+    agent_id: AgentId,
+) -> Result<Option<wasm::runtime::WasmInstance>, &'static str> {
+    let wasm_code_size = crate::state::query_large_value_size(agent_id);
+    if wasm_code_size == 0 {
+        return Ok(None);
+    }
+
+    let mut wasm_code_buf = alloc::vec![0u8; wasm_code_size];
+    let wasm_code_len = crate::state::load_large_value(agent_id, &mut wasm_code_buf);
+    if wasm_code_len == 0 {
+        return Err("missing or corrupt WASM payload");
+    }
+
+    serial_println!(
+        "[WASM_AGENT] Agent {} loaded {} bytes of WASM from keyspace (chunked)",
+        agent_id,
+        wasm_code_len
+    );
+
+    let module = wasm::decoder::decode(&wasm_code_buf[..wasm_code_len]).map_err(|_| "decode")?;
+    serial_println!(
+        "[WASM_AGENT] Module decoded: {} functions, {} imports, {} exports",
+        module.get_functions().len(),
+        module.get_imports().len(),
+        module.get_exports().len()
+    );
+
+    let mut instance =
+        wasm::runtime::WasmInstance::new(module, DEFAULT_FUEL).map_err(|_| "instantiate")?;
+    serial_println!(
+        "[WASM_AGENT] Agent {} instance created with {} fuel",
+        agent_id,
+        DEFAULT_FUEL
+    );
+
+    match instance.run_start() {
+        wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
+        wasm::runtime::ExecResult::Trap(_) => return Err("start trap"),
+        _ => {}
+    }
+
+    Ok(Some(instance))
+}
+
 // ─── Export function resolution ─────────────────────────────────────────────
 
 /// Try to find an exported function suitable for handling a contract call.
@@ -207,100 +252,12 @@ pub extern "C" fn wasm_agent_entry() -> ! {
     let agent_id = crate::sched::current();
     serial_println!("[WASM_AGENT] Agent {} started", agent_id);
 
-    // ── Phase 1: Load WASM code ─────────────────────────────────────────
-
-    // Try to read deployed WASM bytecode from this agent's keyspace using
-    // chunked large value storage.  We heap-allocate the buffer because 64 KB
-    // is too large for a kernel stack frame.
-    let mut wasm_code_buf = alloc::vec![0u8; MAX_WASM_CODE_SIZE];
-    let wasm_code_len = crate::state::load_large_value(agent_id, &mut wasm_code_buf);
-
-    let is_fallback = wasm_code_len == 0;
-    if wasm_code_len > 0 {
-        serial_println!(
-            "[WASM_AGENT] Agent {} loaded {} bytes of WASM from keyspace (chunked)",
-            agent_id,
-            wasm_code_len
-        );
-    } else {
-        serial_println!(
-            "[WASM_AGENT] Agent {} has no deployed WASM, using fallback binary",
-            agent_id
-        );
-    }
-
-    let wasm_bytes: &[u8] = if !is_fallback {
-        &wasm_code_buf[..wasm_code_len]
-    } else {
-        WASM_BINARY
-    };
-
-    // Decode the WASM binary.
-    let module = match wasm::decoder::decode(wasm_bytes) {
-        Ok(m) => {
-            serial_println!(
-                "[WASM_AGENT] Module decoded: {} functions, {} imports, {} exports",
-                m.get_functions().len(),
-                m.get_imports().len(),
-                m.get_exports().len()
-            );
-            m
-        }
-        Err(e) => {
-            serial_println!("[WASM_AGENT] Failed to decode WASM: {:?}", e);
-            syscall::syscall(SYS_EXIT, 1, 0, 0, 0, 0);
-            loop {} // unreachable
-        }
-    };
-
-    // If using the fallback binary, run the old test-agent logic (no mailbox loop).
-    if is_fallback {
-        run_fallback_agent(module, agent_id);
-    }
-
-    // ── For deployed contracts: instantiate and enter message loop ───────
-
-    // Create the WASM instance. We reuse it across calls.
-    let mut instance = match wasm::runtime::WasmInstance::new(module, DEFAULT_FUEL) {
-        Ok(inst) => inst,
-        Err(e) => {
-            serial_println!(
-                "[WASM_AGENT] Agent {} instantiation failed: {:?}",
-                agent_id,
-                e
-            );
-            loop {
-                syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
-            }
-        }
-    };
-    serial_println!(
-        "[WASM_AGENT] Agent {} instance created with {} fuel",
-        agent_id,
-        DEFAULT_FUEL
-    );
-
-    // ── Phase 2: Run start function if present ──────────────────────────
-
-    match instance.run_start() {
-        wasm::runtime::ExecResult::Ok | wasm::runtime::ExecResult::Returned(_) => {}
-        wasm::runtime::ExecResult::Trap(e) => {
-            serial_println!(
-                "[WASM_AGENT] Agent {} start function trapped: {:?}",
-                agent_id,
-                e
-            );
-            loop {
-                syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
-            }
-        }
-        _ => {}
-    }
-
     // ── Phase 3: Message processing loop ────────────────────────────────
 
     serial_println!("[WASM_AGENT] Agent {} entering message loop", agent_id);
     let mailbox_id = agent_id; // Stage-1: mailbox_id == agent_id
+    let mut instance: Option<wasm::runtime::WasmInstance> = None;
+    let mut missing_contract_logged = false;
 
     loop {
         // 1. Try to receive a message from own mailbox (non-blocking).
@@ -328,6 +285,50 @@ pub extern "C" fn wasm_agent_entry() -> ! {
                 continue;
             }
         };
+
+        if instance.is_none() {
+            match load_deployed_instance(agent_id) {
+                Ok(Some(inst)) => instance = Some(inst),
+                Ok(None) => {
+                    if !missing_contract_logged {
+                        serial_println!(
+                            "[WASM_AGENT] Agent {} idle: no deployed WASM available",
+                            agent_id
+                        );
+                        missing_contract_logged = true;
+                    }
+                    let response =
+                        contract_call::build_response(contract_call::STATUS_ERROR, 0, &[]);
+                    let mut resp_buf = [0u8; 256];
+                    let resp_len = serialise_response(&response, &mut resp_buf);
+                    if resp_len > 0 {
+                        mailbox::send_message(agent_id, call_req.caller_agent, &resp_buf[..resp_len])
+                            .ok();
+                    }
+                    syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+                    continue;
+                }
+                Err(reason) => {
+                    serial_println!(
+                        "[WASM_AGENT] Agent {} failed to load deployed module: {}",
+                        agent_id,
+                        reason
+                    );
+                    let response =
+                        contract_call::build_response(contract_call::STATUS_ERROR, 0, &[]);
+                    let mut resp_buf = [0u8; 256];
+                    let resp_len = serialise_response(&response, &mut resp_buf);
+                    if resp_len > 0 {
+                        mailbox::send_message(agent_id, call_req.caller_agent, &resp_buf[..resp_len])
+                            .ok();
+                    }
+                    syscall::syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+                    continue;
+                }
+            }
+        }
+
+        let instance = instance.as_mut().unwrap();
 
         serial_println!(
             "[WASM_AGENT] Agent {} received call: selector=0x{:08X}, input_len={}, caller={}",
@@ -376,7 +377,7 @@ pub extern "C" fn wasm_agent_entry() -> ! {
         // 5. Execute the WASM function.
         //    Pass input length as an i32 argument so the contract knows the size.
         let (energy_used, status) = run_wasm_function(
-            &mut instance,
+            instance,
             call_idx,
             &[wasm::types::Value::I32(input_len as i32)],
             fuel,

@@ -269,14 +269,16 @@ pub fn init_with_bar0(bar0: u64) -> bool {
         let _ = read_reg(REG_ICR); // Clear pending
 
         // Allocate RX descriptor ring
-        let rx_ring_phys = paging::alloc_frame().expect("e1000 RX ring");
+        let rx_ring_phys = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+            .expect("e1000 RX ring");
         core::ptr::write_bytes(rx_ring_phys as *mut u8, 0, 4096);
         E1000_DEV.rx_descs = rx_ring_phys;
 
         // Allocate RX buffers and fill descriptors
         let rx_ring = rx_ring_phys as *mut RxDesc;
         for i in 0..QUEUE_SIZE {
-            let buf = paging::alloc_frame().expect("e1000 RX buffer");
+            let buf = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+                .expect("e1000 RX buffer");
             core::ptr::write_bytes(buf as *mut u8, 0, 4096);
             E1000_DEV.rx_buffers[i] = buf;
             (*rx_ring.add(i)).addr = buf;
@@ -292,13 +294,15 @@ pub fn init_with_bar0(bar0: u64) -> bool {
         write_reg(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_4096 | RCTL_SECRC);
 
         // Allocate TX descriptor ring
-        let tx_ring_phys = paging::alloc_frame().expect("e1000 TX ring");
+        let tx_ring_phys = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+            .expect("e1000 TX ring");
         core::ptr::write_bytes(tx_ring_phys as *mut u8, 0, 4096);
         E1000_DEV.tx_descs = tx_ring_phys;
 
         // Allocate TX buffers
         for i in 0..QUEUE_SIZE {
-            let buf = paging::alloc_frame().expect("e1000 TX buffer");
+            let buf = paging::alloc_frame_with_kind(paging::FrameKind::Device)
+                .expect("e1000 TX buffer");
             core::ptr::write_bytes(buf as *mut u8, 0, 4096);
             E1000_DEV.tx_buffers[i] = buf;
         }

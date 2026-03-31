@@ -127,10 +127,11 @@ pub enum AgentMode {
     User = 1,
 }
 
-// Ring-3 agents can enter deep syscall exit paths that materialize
-// proof/replay/checkpoint bundles on the kernel stack. 16 KiB is not
-// enough for those frames and corrupts adjacent per-agent kernel stacks.
-pub const KERNEL_STACK_SIZE: usize = 65536;
+// Ring-3 agents can enter deep dynamic-loader, futex, and JVM teardown paths
+// that materialize substantially larger kernel stack frames than the earlier
+// syscall regression suite. 64 KiB is sufficient for the small tests but not
+// for real Java thread shutdown, which was corrupting adjacent agent contexts.
+pub const KERNEL_STACK_SIZE: usize = 256 * 1024;
 
 // User-mode agents reserve a Linux-like 128 KiB stack window so the
 // reported RLIMIT_STACK matches the bytes actually mapped.
@@ -159,7 +160,7 @@ pub enum AgentStatus {
 /// The full implementation lives in `crate::arch::x86_64::context`.
 /// This placeholder is used when the arch layer is not yet available.
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct AgentContext {
     pub rsp: u64,
     pub rip: u64,
@@ -180,6 +181,10 @@ pub struct AgentContext {
     pub r15: u64,
     pub rflags: u64,
     pub cr3: u64,
+    /// Padding so the FXSAVE area starts on a 16-byte boundary.
+    pub _fpu_pad: u64,
+    /// Per-agent x87/SSE state saved by the scheduler.
+    pub fpu_state: [u8; 512],
 }
 
 impl AgentContext {
@@ -205,6 +210,8 @@ impl AgentContext {
             r15: 0,
             rflags: 0,
             cr3: 0,
+            _fpu_pad: 0,
+            fpu_state: [0; 512],
         }
     }
 
@@ -340,6 +347,20 @@ pub fn get_agent(id: AgentId) -> Option<&'static Agent> {
     }
 }
 
+/// Get an immutable reference to an agent by ID, including inactive slots.
+pub fn get_agent_any_state(id: AgentId) -> Option<&'static Agent> {
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(agent) = slot {
+                if agent.id == id {
+                    return Some(agent);
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Get a mutable reference to an agent by ID.
 pub fn get_agent_mut(id: AgentId) -> Option<&'static mut Agent> {
     // Safety: single-core, no preemption during table access
@@ -362,9 +383,12 @@ pub fn get_agent_mut(id: AgentId) -> Option<&'static mut Agent> {
 pub fn terminate_agent(id: AgentId, status: AgentStatus) {
     // Safety: single-core, no preemption during table access
     unsafe {
+        crate::linux_compat::process::prepare_agent_termination(id);
+
         // First, collect children to terminate (avoid borrow conflicts)
         let mut children: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
         let mut child_count = 0;
+        let mut destroy_cr3: u64 = 0;
 
         for slot in AGENT_TABLE.iter() {
             if let Some(agent) = slot {
@@ -397,11 +421,45 @@ pub fn terminate_agent(id: AgentId, status: AgentStatus) {
         for slot in AGENT_TABLE.iter_mut() {
             if let Some(agent) = slot {
                 if agent.id == id && agent.active {
+                    destroy_cr3 = agent.context.cr3;
                     agent.status = status;
                     agent.active = false;
-                    return;
+                    agent.context.cr3 = 0;
+                    break;
                 }
             }
+        }
+
+        if destroy_cr3 != 0 {
+            let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
+        }
+    }
+}
+
+/// Terminate an agent without reparenting or touching its children.
+///
+/// This is used for Linux thread-group teardown where the caller handles the
+/// full group membership explicitly and must avoid orphaning siblings to root.
+pub fn terminate_agent_no_reparent(id: AgentId, status: AgentStatus) {
+    unsafe {
+        crate::linux_compat::process::prepare_agent_termination(id);
+
+        let mut destroy_cr3: u64 = 0;
+
+        for slot in AGENT_TABLE.iter_mut() {
+            if let Some(agent) = slot {
+                if agent.id == id && agent.active {
+                    destroy_cr3 = agent.context.cr3;
+                    agent.status = status;
+                    agent.active = false;
+                    agent.context.cr3 = 0;
+                    break;
+                }
+            }
+        }
+
+        if destroy_cr3 != 0 {
+            let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
         }
     }
 }
@@ -483,6 +541,7 @@ pub fn reap_agent(id: AgentId) {
         for slot in AGENT_TABLE.iter_mut() {
             if let Some(agent) = slot {
                 if agent.id == id && !agent.active {
+                    agent.context.cr3 = 0;
                     *slot = None;
                     return;
                 }

@@ -14,7 +14,7 @@
 ;   3. Zeroes BSS section (using physical addresses, before paging)
 ;   4. Checks for CPUID and long mode support
 ;   5. Sets up page tables with DUAL mapping:
-;      - Identity map: PML4[0] → 0-512MB (for MMIO, ACPI, AP trampoline)
+;      - Identity map: PML4[0] → 0-1GB (for RAM, MMIO, ACPI, AP trampoline)
 ;      - Higher-half:  PML4[511] → same physical memory at 0xFFFFFFFF80000000+
 ;   6. Enables PAE, long mode, and paging
 ;   7. Loads a 64-bit GDT and far-jumps to 64-bit code
@@ -150,7 +150,7 @@ _start:
 ;
 ; Identity mapping (preserved for MMIO, ACPI, AP trampoline):
 ;   PML4[0]   → pdpt_table
-;   PDPT[0]   → pd_table     (256 × 2MB huge pages = 512 MB)
+;   PDPT[0]   → pd_table     (512 × 2MB huge pages = 1 GB)
 ;   PDPT[3]   → 1GB huge page at 3GB (LAPIC at 0xFEE00000)
 ;
 ; Higher-half mapping (kernel code/data/BSS runs here):
@@ -182,14 +182,14 @@ _start:
     or eax, 0x3              ; Present | Writable
     mov [pdpt_table], eax
 
-    ; Map 256 × 2MB pages (= 512 MB) for RAM + ACPI tables
+    ; Map 512 × 2MB pages (= 1 GB) for RAM + ACPI tables
     mov ecx, 0              ; counter
     mov eax, 0x83            ; Present | Writable | Huge, physical addr = 0
 .map_page:
     mov [pd_table + ecx * 8], eax
     add eax, 0x200000        ; next 2MB
     inc ecx
-    cmp ecx, 256
+    cmp ecx, 512
     jb .map_page
 
     ; PDPT[3] → 1GB huge page at 3GB (LAPIC at 0xFEE00000)

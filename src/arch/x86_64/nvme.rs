@@ -280,7 +280,7 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     serial_println!("[NVMe] Controller disabled, ready for configuration");
 
     // 1. Allocate Admin Submission Queue (ASQ) — 64 entries x 64 bytes = 4KB
-    let asq_phys = match paging::alloc_frame() {
+    let asq_phys = match paging::alloc_frame_with_kind(paging::FrameKind::Device) {
         Some(f) => f,
         None => {
             serial_println!("[NVMe] Failed to allocate ASQ frame");
@@ -290,7 +290,7 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     core::ptr::write_bytes(asq_phys as *mut u8, 0, 4096);
 
     // 2. Allocate Admin Completion Queue (ACQ) — 64 entries x 16 bytes = 1KB (4KB frame)
-    let acq_phys = match paging::alloc_frame() {
+    let acq_phys = match paging::alloc_frame_with_kind(paging::FrameKind::Device) {
         Some(f) => f,
         None => {
             serial_println!("[NVMe] Failed to allocate ACQ frame");
@@ -332,7 +332,7 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     NVME.cq_phase = true;
 
     // 7. Create IO Completion Queue (queue ID=1) via admin command
-    let io_cq_phys = match paging::alloc_frame() {
+    let io_cq_phys = match paging::alloc_frame_with_kind(paging::FrameKind::Device) {
         Some(f) => f,
         None => {
             serial_println!("[NVMe] Failed to allocate IO CQ frame");
@@ -366,7 +366,7 @@ unsafe fn init_controller(bar0_mmio: u64) -> bool {
     }
 
     // 8. Create IO Submission Queue (queue ID=1, CQ ID=1) via admin command
-    let io_sq_phys = match paging::alloc_frame() {
+    let io_sq_phys = match paging::alloc_frame_with_kind(paging::FrameKind::Device) {
         Some(f) => f,
         None => {
             serial_println!("[NVMe] Failed to allocate IO SQ frame");

@@ -1,33 +1,51 @@
-//! ATOS x86_64 Paging - Simple Frame Allocator
+//! ATOS x86_64 Paging and Frame Allocation
 //!
-//! Provides a basic bitmap frame allocator for physical 4KB pages.
+//! Provides page-table management together with a buddy-backed physical frame
+//! allocator for 4 KiB pages.
 //! Boot.asm sets up dual mapping: identity (PML4[0]) + higher-half
 //! (PML4[511]). Kernel code runs at KERNEL_VMA (0xFFFFFFFF80000000+)
 //! but physical memory remains accessible via the identity mapping.
 
-use super::kaslr;
+use super::{frame_alloc, frame_meta, kaslr};
 use crate::serial_println;
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::SpinLock;
 
 /// Page/frame size: 4 KiB.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Maximum physical memory managed (128 MB).
-const MAX_MEMORY: usize = 128 * 1024 * 1024;
+/// Maximum physical memory managed (1 GiB).
+///
+/// The boot page tables already provide a 1 GiB identity mapping
+/// (512 × 2 MiB huge pages under PML4[0]), so the frame allocator can
+/// safely manage the full window without needing extra early mappings.
+const MAX_MEMORY: usize = frame_alloc::MAX_MEMORY;
 
-/// Total number of frames in the managed region.
-const MAX_FRAMES: usize = MAX_MEMORY / PAGE_SIZE;
+/// Conservative fallback when the boot loader did not report RAM size.
+const DEFAULT_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
-/// Number of u64 bitmap entries needed (each covers 64 frames).
-const BITMAP_SIZE: usize = (MAX_FRAMES + 63) / 64;
+const MAX_TRACKED_ADDRESS_SPACES: usize = 128;
 
-// Bitmap: bit set = frame is allocated, bit clear = frame is free.
-// Safety: single-core access in Stage-1.
-static mut BITMAP: [u64; BITMAP_SIZE] = [0u64; BITMAP_SIZE];
+pub use frame_meta::FrameKind;
 
-// Next frame index to check (simple bump hint for fast allocation).
-// Initialized to 0; set properly in init().
-static NEXT_FREE: AtomicU64 = AtomicU64::new(0);
+#[derive(Clone, Copy)]
+struct AddressSpaceRef {
+    root: u64,
+    refs: u16,
+    active: bool,
+}
+
+impl AddressSpaceRef {
+    const fn empty() -> Self {
+        Self {
+            root: 0,
+            refs: 0,
+            active: false,
+        }
+    }
+}
+
+static ADDRESS_SPACE_REFS: SpinLock<[AddressSpaceRef; MAX_TRACKED_ADDRESS_SPACES]> =
+    SpinLock::new([const { AddressSpaceRef::empty() }; MAX_TRACKED_ADDRESS_SPACES]);
 
 extern "C" {
     static __kernel_end: u8;
@@ -37,6 +55,23 @@ extern "C" {
 /// Kernel code/data/BSS is linked at KERNEL_VMA + physical offset.
 /// Physical memory remains accessible via the identity mapping (PML4[0]).
 pub const KERNEL_VMA_OFFSET: usize = 0xFFFF_FFFF_8000_0000;
+
+/// Translate a physical address in the boot-mapped 0..1 GiB window into the
+/// higher-half alias that remains valid in every address space.
+#[inline]
+pub const fn phys_to_virt(phys: u64) -> usize {
+    KERNEL_VMA_OFFSET + phys as usize
+}
+
+#[inline]
+const fn phys_to_const_ptr<T>(phys: u64) -> *const T {
+    phys_to_virt(phys) as *const T
+}
+
+#[inline]
+const fn phys_to_mut_ptr<T>(phys: u64) -> *mut T {
+    phys_to_virt(phys) as *mut T
+}
 
 /// UEFI boot-info header placed at physical 0x7000 by the UEFI stub.
 ///
@@ -94,7 +129,7 @@ const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 /// bit-set = allocated).
 ///
 /// Frames below `__kernel_end` are always reserved regardless of what the
-/// firmware reported. The managed window is capped at `MAX_MEMORY` (128 MB).
+/// firmware reported. The managed window is capped at `MAX_MEMORY` (512 MB).
 ///
 /// # Arguments
 /// * `mmap_ptr`  – physical address of the first EFI_MEMORY_DESCRIPTOR
@@ -128,16 +163,8 @@ pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
         return;
     }
 
-    // Start with the bitmap fully set (all frames allocated/reserved).
-    // We will clear bits only for frames that are EfiConventionalMemory.
-    unsafe {
-        for word in BITMAP.iter_mut() {
-            *word = !0u64; // all bits set = all frames reserved
-        }
-    }
-
     let desc_count = mmap_size / desc_size;
-    let mut available_frames: usize = 0;
+    let mut highest_frame_seen = kernel_reserved_frames;
 
     for i in 0..desc_count {
         let desc_ptr = (mmap_ptr as usize + i * desc_size) as *const EfiMemoryDescriptor;
@@ -148,35 +175,40 @@ pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
             continue;
         }
 
-        // Mark conventional memory frames as free (clear the bits)
         let region_start = desc.physical_start as usize;
         let region_pages = desc.number_of_pages as usize;
 
-        for p in 0..region_pages {
-            let frame = region_start / PAGE_SIZE + p;
+        let region_start_frame = region_start / PAGE_SIZE;
+        let region_end_frame = region_start_frame
+            .saturating_add(region_pages)
+            .min(frame_alloc::MAX_FRAMES);
+        highest_frame_seen = highest_frame_seen.max(region_end_frame);
+    }
 
-            // Skip frames below kernel end
-            if frame < kernel_reserved_frames {
-                continue;
-            }
+    let managed_frames = highest_frame_seen.max(kernel_reserved_frames);
+    frame_alloc::init_empty(managed_frames);
+    frame_meta::init(managed_frames);
 
-            // Cap at MAX_MEMORY
-            if frame >= MAX_FRAMES {
-                break;
-            }
+    for i in 0..desc_count {
+        let desc_ptr = (mmap_ptr as usize + i * desc_size) as *const EfiMemoryDescriptor;
+        let desc = unsafe { &*desc_ptr };
 
-            // Clear bit → frame is free
-            let word = frame / 64;
-            let bit = frame % 64;
-            unsafe {
-                BITMAP[word] &= !(1u64 << bit);
-            }
-            available_frames += 1;
+        if desc.type_ != EFI_CONVENTIONAL_MEMORY {
+            continue;
+        }
+
+        let region_start = desc.physical_start as usize / PAGE_SIZE;
+        let region_end = region_start
+            .saturating_add(desc.number_of_pages as usize)
+            .min(managed_frames);
+        let free_start = region_start.max(kernel_reserved_frames);
+        if free_start < region_end {
+            frame_alloc::add_free_range(free_start, region_end);
+            frame_meta::mark_free_range(free_start, region_end);
         }
     }
 
-    // Set NEXT_FREE to first frame after kernel
-    NEXT_FREE.store(kernel_reserved_frames as u64, Ordering::Relaxed);
+    let available_frames = frame_alloc::free_frames();
 
     serial_println!(
         "[paging] UEFI mmap: {} descriptors parsed, {} frames available ({} MB), kernel reserved {} frames ({} KB)",
@@ -196,6 +228,10 @@ pub fn init_from_uefi_mmap(mmap_ptr: u64, mmap_size: usize, desc_size: usize) {
 /// .bss contain large static arrays (AGENT_TABLE, KEYSPACES, LINUX_STATES,
 /// BASE_IMAGE_STORE, etc.) that occupy megabytes of physical memory.
 pub fn init() {
+    init_with_memory_limit(DEFAULT_MEMORY_LIMIT);
+}
+
+pub fn init_with_memory_limit(total_memory_bytes: usize) {
     // __kernel_end is a linker symbol but doesn't account for all loaded
     // segments. Compute the actual kernel end from the highest BSS address.
     // The last BSS section ends at __bss_end, but initialized statics in
@@ -213,78 +249,57 @@ pub fn init() {
     // Conservative: reserve 16 MB to cover kernel + BSS + stack + headroom.
     let kernel_end = core::cmp::max(kernel_end_linker, 16 * 1024 * 1024);
 
-    let reserved_frames = (kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
-
-    unsafe {
-        for i in 0..reserved_frames {
-            let word = i / 64;
-            let bit = i % 64;
-            BITMAP[word] |= 1u64 << bit;
-        }
-    }
+    let managed_bytes = total_memory_bytes.clamp(PAGE_SIZE, MAX_MEMORY);
+    let managed_frames = managed_bytes / PAGE_SIZE;
+    let reserved_frames = ((kernel_end + PAGE_SIZE - 1) / PAGE_SIZE).min(managed_frames);
 
     // Apply heap ASLR: skip a random number of frames after the kernel image
     // so that the first heap allocation lands at a non-deterministic address.
     // kaslr::heap_skip_frames() returns 0 if kaslr::init() has not yet been
     // called (entropy = 0), which is safe but non-random.
     let skip = kaslr::heap_skip_frames();
-    let first_free = reserved_frames + skip;
+    let first_free = (reserved_frames + skip).min(managed_frames);
 
-    // Mark the skipped frames as allocated so they are never handed out.
-    // This wastes at most 63 × 4 KiB = 252 KiB, an acceptable trade-off.
-    for i in reserved_frames..first_free {
-        if i < MAX_FRAMES {
-            let word = i / 64;
-            let bit = i % 64;
-            unsafe {
-                BITMAP[word] |= 1u64 << bit;
-            }
-        }
+    frame_alloc::init_empty(managed_frames);
+    frame_meta::init(managed_frames);
+    if first_free < managed_frames {
+        frame_alloc::add_free_range(first_free, managed_frames);
+        frame_meta::mark_free_range(first_free, managed_frames);
     }
 
-    NEXT_FREE.store(first_free as u64, Ordering::Relaxed);
-
-    let available = MAX_FRAMES.saturating_sub(first_free);
-    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB), kernel reserved {} frames ({} KB), heap ASLR skip {} frames",
+    let available = frame_alloc::free_frames();
+    serial_println!("[paging] Frame allocator initialized: {} frames available ({} MB), kernel reserved {} frames ({} KB), heap ASLR skip {} frames, managed RAM {} MB",
         available,
         available * PAGE_SIZE / (1024 * 1024),
         reserved_frames,
         reserved_frames * PAGE_SIZE / 1024,
-        skip);
+        skip,
+        managed_bytes / (1024 * 1024));
 }
 
 /// Allocate a single 4KB physical frame.
 ///
 /// Returns the physical address of the frame, or None if out of memory.
 pub fn alloc_frame() -> Option<u64> {
-    let start = NEXT_FREE.load(Ordering::Relaxed) as usize;
+    alloc_frame_with_kind(FrameKind::Unknown)
+}
 
-    unsafe {
-        // Search from hint forward
-        for i in start..MAX_FRAMES {
-            let word = i / 64;
-            let bit = i % 64;
-            if BITMAP[word] & (1u64 << bit) == 0 {
-                // Found a free frame -- mark it allocated
-                BITMAP[word] |= 1u64 << bit;
-                NEXT_FREE.store((i + 1) as u64, Ordering::Relaxed);
-                return Some((i * PAGE_SIZE) as u64);
-            }
-        }
+/// Allocate a single 4KB frame and classify it with the supplied kind.
+pub fn alloc_frame_with_kind(kind: FrameKind) -> Option<u64> {
+    let frame = frame_alloc::alloc_frame()?;
+    let _ = frame_meta::on_alloc(frame, kind);
+    Some(frame)
+}
 
-        // Wrap around and search from frame 1 to start
-        for i in 1..start {
-            let word = i / 64;
-            let bit = i % 64;
-            if BITMAP[word] & (1u64 << bit) == 0 {
-                BITMAP[word] |= 1u64 << bit;
-                NEXT_FREE.store((i + 1) as u64, Ordering::Relaxed);
-                return Some((i * PAGE_SIZE) as u64);
-            }
-        }
+/// Allocate an exact contiguous range of frames and classify them with the
+/// supplied kind.
+pub fn alloc_contiguous_frames_with_kind(num_pages: usize, kind: FrameKind) -> Option<u64> {
+    if num_pages == 0 {
+        return None;
     }
-
-    None // Out of memory
+    let base = frame_alloc::alloc_contiguous(num_pages)?;
+    let _ = frame_meta::on_alloc_range(base, num_pages, kind);
+    Some(base)
 }
 
 /// Free a previously allocated 4KB physical frame.
@@ -293,20 +308,51 @@ pub fn alloc_frame() -> Option<u64> {
 /// The address must have been returned by `alloc_frame()` and must not
 /// be freed more than once.
 pub fn dealloc_frame(addr: u64) {
-    let frame = addr as usize / PAGE_SIZE;
-    if frame >= MAX_FRAMES {
-        return;
+    let _ = release_frame(addr);
+}
+
+/// Increase the reference count on a managed physical frame.
+pub fn retain_frame(addr: u64) -> bool {
+    frame_meta::retain(addr)
+}
+
+/// Release a managed physical frame.
+///
+/// Returns `true` if the frame metadata was updated. When the last reference
+/// is dropped the backing page is returned to the buddy allocator.
+pub fn release_frame(addr: u64) -> bool {
+    match frame_meta::release(addr) {
+        frame_meta::ReleaseResult::FreeNow => {
+            frame_alloc::dealloc_frame(addr);
+            true
+        }
+        frame_meta::ReleaseResult::StillReferenced(_) => true,
+        frame_meta::ReleaseResult::AlreadyFree | frame_meta::ReleaseResult::Unmanaged => false,
     }
-    let word = frame / 64;
-    let bit = frame % 64;
-    unsafe {
-        BITMAP[word] &= !(1u64 << bit);
+}
+
+/// Release an exact contiguous range of frames that are not expected to be
+/// shared.
+pub fn release_contiguous_frames(addr: u64, num_pages: usize) -> bool {
+    if num_pages == 0 {
+        return false;
     }
-    // Update hint if this frame is earlier
-    let current = NEXT_FREE.load(Ordering::Relaxed) as usize;
-    if frame < current {
-        NEXT_FREE.store(frame as u64, Ordering::Relaxed);
-    }
+
+    let start_frame = (addr as usize) / PAGE_SIZE;
+    let end_frame = start_frame.saturating_add(num_pages);
+    frame_meta::mark_free_range(start_frame, end_frame);
+    frame_alloc::dealloc_contiguous(addr, num_pages);
+    true
+}
+
+/// Update the classification for a managed frame.
+pub fn set_frame_kind(addr: u64, kind: FrameKind) -> bool {
+    frame_meta::set_kind(addr, kind)
+}
+
+/// Return the current reference count for a managed frame.
+pub fn frame_refcount(addr: u64) -> u16 {
+    frame_meta::refcount(addr)
 }
 
 /// Read the current value of CR3 (page table base register).
@@ -338,21 +384,28 @@ pub const PTE_NX: u64 = 1 << 63;
 /// Page table levels
 const PT_LEVELS: usize = 4; // PML4 -> PDPT -> PD -> PT
 
-/// Create a new independent page table hierarchy for an agent.
-///
-/// Allocates fresh PML4, PDPT, and PD frames. The kernel's identity-mapped
-/// 2MB huge pages are copied into the new PD as supervisor-only entries.
-/// This ensures that map_page() on the new address space does NOT modify
-/// the boot page tables (which are shared by the kernel).
-pub fn create_address_space() -> Option<u64> {
+fn create_address_space_inner(copy_low_identity: bool) -> Option<u64> {
     // 1. Allocate fresh frames for PML4, PDPT, and PD
-    let pml4_phys = alloc_frame()?;
-    let pdpt_phys = alloc_frame()?;
-    let pd_phys = alloc_frame()?;
+    let pml4_phys = alloc_frame_with_kind(FrameKind::PageTable)?;
+    let pdpt_phys = match alloc_frame_with_kind(FrameKind::PageTable) {
+        Some(frame) => frame,
+        None => {
+            let _ = release_frame(pml4_phys);
+            return None;
+        }
+    };
+    let pd_phys = match alloc_frame_with_kind(FrameKind::PageTable) {
+        Some(frame) => frame,
+        None => {
+            let _ = release_frame(pdpt_phys);
+            let _ = release_frame(pml4_phys);
+            return None;
+        }
+    };
 
-    let pml4 = pml4_phys as *mut u64;
-    let pdpt = pdpt_phys as *mut u64;
-    let pd = pd_phys as *mut u64;
+    let pml4 = phys_to_mut_ptr::<u64>(pml4_phys);
+    let pdpt = phys_to_mut_ptr::<u64>(pdpt_phys);
+    let pd = phys_to_mut_ptr::<u64>(pd_phys);
 
     unsafe {
         // 2. Zero all three tables
@@ -360,71 +413,200 @@ pub fn create_address_space() -> Option<u64> {
         core::ptr::write_bytes(pdpt, 0, PAGE_SIZE / 8);
         core::ptr::write_bytes(pd, 0, PAGE_SIZE / 8);
 
-        // 3. Copy PD entries (2MB huge pages) from the boot page tables.
-        //    This gives the new address space the same kernel identity mapping
-        //    but in an INDEPENDENT PD that can be modified without affecting boot.
-        //    Keep these entries supervisor-only: ring 3 code must not be able
-        //    to reach low physical memory through the identity alias.
-        let current_cr3 = read_cr3();
-        let boot_pml4 = current_cr3 as *const u64;
-        let boot_pml4_0 = core::ptr::read_volatile(boot_pml4);
-        if boot_pml4_0 & PTE_PRESENT != 0 {
-            let boot_pdpt = (boot_pml4_0 & 0x000F_FFFF_FFFF_F000) as *const u64;
-            let boot_pdpt_0 = core::ptr::read_volatile(boot_pdpt);
-            if boot_pdpt_0 & PTE_PRESENT != 0 {
-                let boot_pd = (boot_pdpt_0 & 0x000F_FFFF_FFFF_F000) as *const u64;
-                // Copy all 512 PD entries (2MB huge pages for kernel identity mapping)
-                for i in 0..512 {
-                    let entry = core::ptr::read_volatile(boot_pd.add(i));
-                    core::ptr::write_volatile(pd.add(i), entry & !PTE_USER);
+        // 3. Optionally copy the low 1 GiB supervisor-only identity window.
+        // Linux-compat address spaces intentionally leave this range empty so
+        // low-address ET_EXEC binaries can be mapped at their link-time VAs.
+        if copy_low_identity {
+            let current_cr3 = read_cr3();
+            let boot_pml4 = phys_to_const_ptr::<u64>(current_cr3);
+            let boot_pml4_0 = core::ptr::read_volatile(boot_pml4);
+            if boot_pml4_0 & PTE_PRESENT != 0 {
+                let boot_pdpt = phys_to_const_ptr::<u64>(boot_pml4_0 & 0x000F_FFFF_FFFF_F000);
+                let boot_pdpt_0 = core::ptr::read_volatile(boot_pdpt);
+                if boot_pdpt_0 & PTE_PRESENT != 0 {
+                    let boot_pd =
+                        phys_to_const_ptr::<u64>(boot_pdpt_0 & 0x000F_FFFF_FFFF_F000);
+                    for i in 0..512 {
+                        let entry = core::ptr::read_volatile(boot_pd.add(i));
+                        core::ptr::write_volatile(pd.add(i), entry & !PTE_USER);
+                    }
                 }
             }
         }
 
-        // 4. Wire up: PML4[0] → new PDPT, PDPT[0] → new PD.
-        // PML4[0] stays user-visible because user mappings at 1GB+ live under
-        // this slot. PDPT[0] itself is supervisor-only so the low identity
-        // alias remains inaccessible from ring 3.
+        // 4. Wire up PML4[0] → new PDPT. Low-address Linux mappings and the
+        // deterministic mmap region both live under this slot.
         core::ptr::write_volatile(pml4, pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
-        core::ptr::write_volatile(pdpt, pd_phys | PTE_PRESENT | PTE_WRITABLE);
+        core::ptr::write_volatile(
+            pdpt,
+            pd_phys
+                | PTE_PRESENT
+                | PTE_WRITABLE
+                | if copy_low_identity { 0 } else { PTE_USER },
+        );
 
         // 5. Copy PML4[511] — higher-half kernel mapping (supervisor-only, shared)
         // This ensures the kernel remains accessible in the agent's address space.
+        let current_cr3 = read_cr3();
+        let boot_pml4 = phys_to_const_ptr::<u64>(current_cr3);
         let boot_pml4_511 = core::ptr::read_volatile(boot_pml4.add(511));
         if boot_pml4_511 & PTE_PRESENT != 0 {
             core::ptr::write_volatile(pml4.add(511), boot_pml4_511);
         }
     }
 
+    if !track_address_space(pml4_phys) {
+        destroy_address_space(pml4_phys);
+        return None;
+    }
+
     Some(pml4_phys)
+}
+
+/// Create a new independent page table hierarchy for a native/ATOS agent.
+///
+/// This preserves the historical low 1 GiB identity window.
+pub fn create_address_space() -> Option<u64> {
+    create_address_space_inner(true)
+}
+
+/// Create a Linux-compat address space with no pre-populated low identity
+/// mapping so user-space can legally occupy low virtual addresses.
+pub fn create_linux_address_space() -> Option<u64> {
+    create_address_space_inner(false)
+}
+
+fn track_address_space(pml4_phys: u64) -> bool {
+    let mut refs = ADDRESS_SPACE_REFS.lock();
+
+    for entry in refs.iter_mut() {
+        if entry.active && entry.root == pml4_phys {
+            entry.refs = entry.refs.saturating_add(1);
+            return true;
+        }
+    }
+
+    for entry in refs.iter_mut() {
+        if !entry.active {
+            *entry = AddressSpaceRef {
+                root: pml4_phys,
+                refs: 1,
+                active: true,
+            };
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Increment the reference count for a tracked user address space.
+///
+/// Returns `true` if the address space was tracked and retained. Returns
+/// `false` for untracked roots such as the boot kernel CR3.
+pub fn retain_address_space(pml4_phys: u64) -> bool {
+    if pml4_phys == 0 {
+        return false;
+    }
+
+    let mut refs = ADDRESS_SPACE_REFS.lock();
+    for entry in refs.iter_mut() {
+        if entry.active && entry.root == pml4_phys {
+            entry.refs = entry.refs.saturating_add(1);
+            return true;
+        }
+    }
+    false
+}
+
+/// Release one reference to a tracked user address space.
+///
+/// When the last reference is dropped, the page tables are destroyed.
+/// Returns `true` if the root was tracked, `false` otherwise.
+pub fn release_address_space(pml4_phys: u64) -> bool {
+    if pml4_phys == 0 {
+        return false;
+    }
+
+    let mut destroy = false;
+    {
+        let mut refs = ADDRESS_SPACE_REFS.lock();
+        for entry in refs.iter_mut() {
+            if entry.active && entry.root == pml4_phys {
+                if entry.refs > 1 {
+                    entry.refs -= 1;
+                } else {
+                    *entry = AddressSpaceRef::empty();
+                    destroy = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if destroy {
+        destroy_address_space(pml4_phys);
+        return true;
+    }
+
+    let refs = ADDRESS_SPACE_REFS.lock();
+    refs.iter().any(|entry| entry.active && entry.root == pml4_phys)
+}
+
+/// Translate a virtual address in `pml4_phys` into the higher-half alias of
+/// the backing physical byte, if the mapping exists.
+pub fn translate_virt(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+    let page_off = vaddr & (PAGE_SIZE as u64 - 1);
+
+    unsafe {
+        let pml4 = phys_to_const_ptr::<u64>(pml4_phys);
+        let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
+        if pml4e & PTE_PRESENT == 0 {
+            return None;
+        }
+
+        let pdpt = phys_to_const_ptr::<u64>(pml4e & 0x000F_FFFF_FFFF_F000);
+        let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
+        if pdpte & PTE_PRESENT == 0 {
+            return None;
+        }
+
+        let pd = phys_to_const_ptr::<u64>(pdpte & 0x000F_FFFF_FFFF_F000);
+        let pde = core::ptr::read_volatile(pd.add(pd_idx));
+        if pde & PTE_PRESENT == 0 {
+            return None;
+        }
+
+        if pde & PTE_HUGE != 0 {
+            let base = pde & 0x000F_FFFF_FFE0_0000;
+            return Some(base + (vaddr & 0x1F_FFFF));
+        }
+
+        let pt = phys_to_const_ptr::<u64>(pde & 0x000F_FFFF_FFFF_F000);
+        let pte = core::ptr::read_volatile(pt.add(pt_idx));
+        if pte & PTE_PRESENT == 0 {
+            return None;
+        }
+
+        Some((pte & 0x000F_FFFF_FFFF_F000) + page_off)
+    }
 }
 
 /// Destroy an agent's address space.
 /// Frees the PML4 and all page table frames allocated for user-space mappings.
 /// Does NOT free the kernel mappings (those are shared).
 pub fn destroy_address_space(pml4_phys: u64) {
-    let pml4 = pml4_phys as *const u64;
+    let pml4 = phys_to_const_ptr::<u64>(pml4_phys);
     unsafe {
-        // 1. Free PML4[0]'s PDPT and PD (allocated per-agent in create_address_space).
-        //    We free only the PDPT and PD frames — NOT the huge page entries
-        //    (those map shared physical memory, not allocated page tables).
-        let pml4_0 = core::ptr::read_volatile(pml4);
-        if pml4_0 & PTE_PRESENT != 0 {
-            let pdpt_phys = pml4_0 & 0x000F_FFFF_FFFF_F000;
-            let pdpt = pdpt_phys as *const u64;
-            let pdpt_0 = core::ptr::read_volatile(pdpt);
-            if pdpt_0 & PTE_PRESENT != 0 {
-                // Free PD frame (contains huge page entries, not sub-tables)
-                let pd_phys = pdpt_0 & 0x000F_FFFF_FFFF_F000;
-                dealloc_frame(pd_phys);
-            }
-            // Free PDPT frame
-            dealloc_frame(pdpt_phys);
-        }
-
-        // 2. Free user-space entries (PML4[4..256] — may have page tables
-        //    allocated by map_page for user code/stack)
-        for i in 4..256 {
+        // Free every lower-half PML4 entry. All ATOS user mappings currently
+        // live under the low canonical half, including the per-agent copy of
+        // PML4[0] that carries the 1 GiB identity window plus any user PTs we
+        // allocate under it.
+        for i in 0..256 {
             let pml4e = core::ptr::read_volatile(pml4.add(i));
             if pml4e & PTE_PRESENT != 0 {
                 let pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
@@ -432,16 +614,16 @@ pub fn destroy_address_space(pml4_phys: u64) {
             }
         }
 
-        // 3. PML4[511] is the shared higher-half kernel mapping — do NOT free.
+        // PML4[511] is the shared higher-half kernel mapping — do NOT free.
     }
 
-    dealloc_frame(pml4_phys);
+    let _ = release_frame(pml4_phys);
 }
 
 /// Recursively free page table frames at a given level.
 /// level 3 = PDPT, 2 = PD, 1 = PT
 unsafe fn free_page_table_level(table_phys: u64, level: usize) {
-    let table = table_phys as *const u64;
+    let table = phys_to_const_ptr::<u64>(table_phys);
 
     if level > 1 {
         for i in 0..512 {
@@ -453,7 +635,7 @@ unsafe fn free_page_table_level(table_phys: u64, level: usize) {
         }
     }
 
-    dealloc_frame(table_phys);
+    let _ = release_frame(table_phys);
 }
 
 /// Map a stack or data page — always sets PTE_NX (No-Execute).
@@ -463,7 +645,12 @@ unsafe fn free_page_table_level(table_phys: u64, level: usize) {
 /// regardless of what is passed in `flags`, so callers cannot accidentally
 /// create a writable-and-executable data page.
 pub fn map_data_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
-    map_page(pml4_phys, virt_addr, phys_addr, flags | PTE_NX)
+    let nx = if crate::arch::x86_64::security::nx_active() {
+        PTE_NX
+    } else {
+        0
+    };
+    map_page(pml4_phys, virt_addr, phys_addr, flags | nx)
 }
 
 /// Map a code page — explicitly clears PTE_NX so the page is executable.
@@ -478,39 +665,49 @@ pub fn map_code_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64)
     map_page(pml4_phys, virt_addr, phys_addr, flags & !PTE_NX)
 }
 
-/// Map a single 4KB page in an agent's address space.
-/// Creates intermediate page table levels as needed.
+/// Update a leaf PTE with the exact caller-provided flags.
 ///
-/// Prefer `map_data_page` / `map_code_page` over this function to ensure
-/// the correct NX policy is applied automatically.
-pub fn map_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
+/// Unlike `map_page`, this helper does not force `PTE_PRESENT` on the final
+/// mapping. It is used for cases like `mprotect(PROT_NONE)` where the leaf
+/// entry must remain non-present while retaining the physical frame pointer.
+pub fn set_page_mapping(
+    pml4_phys: u64,
+    virt_addr: u64,
+    phys_addr: u64,
+    flags: u64,
+) -> Result<(), ()> {
     let pml4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((virt_addr >> 30) & 0x1FF) as usize;
     let pd_idx = ((virt_addr >> 21) & 0x1FF) as usize;
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
 
     unsafe {
-        // Walk PML4 -> PDPT
-        let pml4 = pml4_phys as *mut u64;
-        let pdpt_phys = ensure_table_entry(pml4, pml4_idx, flags)?;
+        let pml4 = phys_to_mut_ptr::<u64>(pml4_phys);
+        let pdpt_phys = ensure_table_entry(pml4, pml4_idx, flags | PTE_PRESENT)?;
 
-        // Walk PDPT -> PD
-        let pdpt = pdpt_phys as *mut u64;
-        let pd_phys = ensure_table_entry(pdpt, pdpt_idx, flags)?;
+        let pdpt = phys_to_mut_ptr::<u64>(pdpt_phys);
+        let pd_phys = ensure_table_entry(pdpt, pdpt_idx, flags | PTE_PRESENT)?;
 
-        // Walk PD -> PT
-        let pd = pd_phys as *mut u64;
-        let pt_phys = ensure_table_entry(pd, pd_idx, flags)?;
+        let pd = phys_to_mut_ptr::<u64>(pd_phys);
+        let pt_phys = ensure_table_entry(pd, pd_idx, flags | PTE_PRESENT)?;
 
-        // Set PT entry
-        let pt = pt_phys as *mut u64;
+        let pt = phys_to_mut_ptr::<u64>(pt_phys);
         core::ptr::write_volatile(
             pt.add(pt_idx),
-            (phys_addr & 0x000F_FFFF_FFFF_F000) | flags | PTE_PRESENT,
+            (phys_addr & 0x000F_FFFF_FFFF_F000) | flags,
         );
     }
 
     Ok(())
+}
+
+/// Map a single 4KB page in an agent's address space.
+/// Creates intermediate page table levels as needed.
+///
+/// Prefer `map_data_page` / `map_code_page` over this function to ensure
+/// the correct NX policy is applied automatically.
+pub fn map_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> Result<(), ()> {
+    set_page_mapping(pml4_phys, virt_addr, phys_addr, flags | PTE_PRESENT)
 }
 
 /// Ensure a page table entry exists at the given index.
@@ -519,6 +716,12 @@ pub fn map_page(pml4_phys: u64, virt_addr: u64, phys_addr: u64, flags: u64) -> R
 unsafe fn ensure_table_entry(table: *mut u64, index: usize, flags: u64) -> Result<u64, ()> {
     let entry = core::ptr::read_volatile(table.add(index));
     if entry & PTE_PRESENT != 0 {
+        if entry & PTE_HUGE != 0 {
+            // Do not treat an existing 1 GiB / 2 MiB huge mapping as a
+            // next-level page table. Callers that want to map inside such a
+            // range must split the huge page first.
+            return Err(());
+        }
         // Entry exists, return the physical address of the next table
         // Update flags (e.g., add USER bit if needed)
         let phys = entry & 0x000F_FFFF_FFFF_F000;
@@ -527,9 +730,9 @@ unsafe fn ensure_table_entry(table: *mut u64, index: usize, flags: u64) -> Resul
         Ok(phys)
     } else {
         // Allocate a new frame for the next-level table
-        let new_frame = alloc_frame().ok_or(())?;
+        let new_frame = alloc_frame_with_kind(FrameKind::PageTable).ok_or(())?;
         // Zero the new frame
-        core::ptr::write_bytes(new_frame as *mut u8, 0, PAGE_SIZE);
+        core::ptr::write_bytes(phys_to_mut_ptr::<u8>(new_frame), 0, PAGE_SIZE);
         // Set the entry
         core::ptr::write_volatile(
             table.add(index),
@@ -548,25 +751,25 @@ pub fn unmap_page(pml4_phys: u64, virt_addr: u64) {
     let pt_idx = ((virt_addr >> 12) & 0x1FF) as usize;
 
     unsafe {
-        let pml4 = pml4_phys as *const u64;
+        let pml4 = phys_to_const_ptr::<u64>(pml4_phys);
         let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
         if pml4e & PTE_PRESENT == 0 {
             return;
         }
 
-        let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt = phys_to_const_ptr::<u64>(pml4e & 0x000F_FFFF_FFFF_F000);
         let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
         if pdpte & PTE_PRESENT == 0 {
             return;
         }
 
-        let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd = phys_to_const_ptr::<u64>(pdpte & 0x000F_FFFF_FFFF_F000);
         let pde = core::ptr::read_volatile(pd.add(pd_idx));
         if pde & PTE_PRESENT == 0 {
             return;
         }
 
-        let pt = (pde & 0x000F_FFFF_FFFF_F000) as *mut u64;
+        let pt = phys_to_mut_ptr::<u64>(pde & 0x000F_FFFF_FFFF_F000);
         core::ptr::write_volatile(pt.add(pt_idx), 0);
 
         // Invalidate TLB for this address

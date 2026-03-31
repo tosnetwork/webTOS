@@ -1,7 +1,7 @@
 //! Virtual Filesystem for Linux Compatibility Layer
 //!
 //! Maps Linux file paths to ATOS keyspace keys. Paths under `/lib/`,
-//! `/usr/lib/`, `/jdk/`, and `/etc/ld.so.cache` resolve to the shared
+//! `/usr/lib/`, `/jdk/`, and `/etc/` resolve to the shared
 //! read-only base image keyspace, while `/app/` and all other paths
 //! resolve to the agent's own private keyspace.
 
@@ -66,6 +66,10 @@ pub fn classify_base_image_path(path: &[u8]) -> Option<(BaseImageNamespace, &[u8
         return Some((BaseImageNamespace::Etc, b"ld.so.cache"));
     }
 
+    if starts_with(path, b"/etc/") {
+        return Some((BaseImageNamespace::Etc, &path[5..]));
+    }
+
     if starts_with(path, b"/lib/") {
         return Some((BaseImageNamespace::Lib, &path[5..]));
     }
@@ -101,7 +105,7 @@ pub fn classify_base_image_path(path: &[u8]) -> Option<(BaseImageNamespace, &[u8
 /// | `/usr/lib/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:lib/" + filename)` |
 /// | `/usr/bin/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:usrbin/" + relative)` |
 /// | `/jdk/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:jdk/" + relative)` |
-/// | `/etc/ld.so.cache` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:ld.so.cache")` |
+/// | `/etc/*` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:etc/" + relative)` |
 /// | `/app/` | `agent_id` | `sha256_key(path)` |
 /// | everything else | `agent_id` | `sha256_key(path)` |
 pub fn resolve_path(agent_id: u16, path: &[u8]) -> (u16, u64) {
@@ -109,7 +113,13 @@ pub fn resolve_path(agent_id: u16, path: &[u8]) -> (u16, u64) {
         let key = match namespace {
             BaseImageNamespace::Lib => sha256_key_prefixed(b"base:lib/", relative),
             BaseImageNamespace::Jdk => sha256_key_prefixed(b"base:jdk/", relative),
-            BaseImageNamespace::Etc => sha256_key(b"base:ld.so.cache"),
+            BaseImageNamespace::Etc => {
+                if relative == b"ld.so.cache" {
+                    sha256_key(b"base:ld.so.cache")
+                } else {
+                    sha256_key_prefixed(b"base:etc/", relative)
+                }
+            }
             BaseImageNamespace::UsrBin => sha256_key_prefixed(b"base:usrbin/", relative),
         };
         return (BASE_IMAGE_KEYSPACE, key);

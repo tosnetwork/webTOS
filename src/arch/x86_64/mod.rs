@@ -8,6 +8,8 @@ pub mod ata;
 pub mod context;
 pub mod e1000;
 pub mod framebuffer;
+pub(crate) mod frame_alloc;
+pub(crate) mod frame_meta;
 pub mod gdt;
 pub mod idt;
 pub mod kaslr;

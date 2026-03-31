@@ -731,27 +731,13 @@ fn handle_memory_syscall(caller_id: u16, num: u64, a1: u64, a2: u64) -> Option<i
                 return Some(E_QUOTA_EXCEEDED);
             }
 
-            // Allocate frames
-            let mut first_addr: u64 = 0;
-            let mut allocated: u32 = 0;
-
-            for i in 0..num_pages {
-                match paging::alloc_frame() {
-                    Some(addr) => {
-                        if i == 0 {
-                            first_addr = addr;
-                        }
-                        allocated += 1;
-                    }
-                    None => {
-                        // Roll back any frames we already allocated
-                        for j in 0..allocated {
-                            paging::dealloc_frame(first_addr + (j as u64) * 4096);
-                        }
-                        return Some(E_QUOTA_EXCEEDED);
-                    }
-                }
-            }
+            let first_addr = match paging::alloc_contiguous_frames_with_kind(
+                num_pages as usize,
+                paging::FrameKind::Anon,
+            ) {
+                Some(addr) => addr,
+                None => return Some(E_QUOTA_EXCEEDED),
+            };
 
             // Update agent's memory usage
             if let Some(agent) = get_agent_mut(caller_id) {
@@ -778,10 +764,7 @@ fn handle_memory_syscall(caller_id: u16, num: u64, a1: u64, a2: u64) -> Option<i
                 return Some(E_INVALID_ARG);
             }
 
-            // Deallocate frames
-            for i in 0..num_pages {
-                paging::dealloc_frame(vaddr + (i as u64) * 4096);
-            }
+            let _ = paging::release_contiguous_frames(vaddr, num_pages as usize);
 
             // Decrement agent's memory usage
             if let Some(agent) = get_agent_mut(caller_id) {
@@ -914,8 +897,11 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64, _a6: u
             match create_agent(Some(caller_id), entry, stack_top, energy_budget, mem_quota) {
                 Ok(new_id) => {
                     // Set cr3 to current page table so the new agent can run
+                    let current_cr3 = read_cr3_safe();
+                    let _ = crate::arch::x86_64::paging::retain_address_space(current_cr3);
                     if let Some(agent) = get_agent_mut(new_id) {
-                        agent.context.cr3 = read_cr3_safe();
+                        agent.stack_bottom = sched::stack_bottom_from_top(stack_top);
+                        agent.context.cr3 = current_cr3;
                     }
                     // Create mailbox and keyspace for the new agent
                     mailbox::create_mailbox(new_id as MailboxId, new_id).ok();

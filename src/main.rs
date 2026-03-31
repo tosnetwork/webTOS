@@ -127,6 +127,22 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
             serial_println!("[WARN] UEFI BootInfo magic/fields invalid, using default init()");
             arch::x86_64::paging::init();
         }
+    } else if multiboot_magic == MULTIBOOT_MAGIC && multiboot_info != 0 {
+        let info_ptr = multiboot_info as *const u32;
+        let flags = unsafe { core::ptr::read_unaligned(info_ptr) };
+        if flags & (1 << 0) != 0 {
+            let mem_upper_kib = unsafe { core::ptr::read_unaligned(info_ptr.add(2)) };
+            let total_bytes = 1024usize * 1024usize + (mem_upper_kib as usize) * 1024usize;
+            serial_println!(
+                "[paging] Multiboot mem_upper={} KiB (total {} MiB)",
+                mem_upper_kib,
+                total_bytes / (1024 * 1024)
+            );
+            arch::x86_64::paging::init_with_memory_limit(total_bytes);
+        } else {
+            serial_println!("[WARN] Multiboot meminfo missing, using default init()");
+            arch::x86_64::paging::init();
+        }
     } else {
         arch::x86_64::paging::init();
     }

@@ -22,6 +22,8 @@ extern syscall_handler
 section .data
 global CURRENT_KERNEL_RSP
 CURRENT_KERNEL_RSP: dq 0
+global CURRENT_SYSCALL_FRAME
+CURRENT_SYSCALL_FRAME: dq 0
 
 section .text
 
@@ -42,6 +44,16 @@ syscall_entry:
     push rcx        ; user RIP
     push r11        ; user RFLAGS
 
+    ; Save user caller-saved registers that the syscall/sysret ABI expects
+    ; to survive across the kernel entry/exit path. Only RAX is special:
+    ; it carries the syscall return value back to user mode.
+    push rdi
+    push rsi
+    push rdx
+    push r8
+    push r9
+    push r10
+
     ; Save callee-saved registers
     push rbx
     push rbp
@@ -49,6 +61,12 @@ syscall_entry:
     push r13
     push r14
     push r15
+
+    ; Preserve the user's SIMD/FPU state across the kernel call path.
+    ; Linux user space assumes SYSCALL does not clobber XMM/FPU registers.
+    sub rsp, 512
+    fxsave [rsp]
+    mov [rel CURRENT_SYSCALL_FRAME], rsp
 
     ; Remap: syscall ABI -> System V ABI.
     ; Rust handler signature is:
@@ -66,7 +84,10 @@ syscall_entry:
     mov [rsp], r11
     call syscall_handler
     add rsp, 16
-    mov r10, rax    ; preserve syscall return value across stack restoration
+
+    mov qword [rel CURRENT_SYSCALL_FRAME], 0
+    fxrstor [rsp]
+    add rsp, 512
 
     ; Restore callee-saved registers (reverse order)
     pop r15
@@ -76,16 +97,23 @@ syscall_entry:
     pop rbp
     pop rbx
 
+    ; Restore the user caller-saved register set expected by SYSRET.
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rsi
+    pop rdi
+
     ; Restore user return context
     pop r11         ; user RFLAGS
     pop rcx         ; user RIP
 
     ; Restore user RSP and reset CURRENT_KERNEL_RSP back to the kernel
     ; stack top saved on entry.
-    pop rax         ; user RSP
+    pop rdx         ; user RSP
     pop qword [rel CURRENT_KERNEL_RSP]
-    mov rsp, rax
-    mov rax, r10
+    mov rsp, rdx
 
     ; Return to ring 3
     o64 sysret

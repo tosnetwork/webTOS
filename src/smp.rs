@@ -76,9 +76,13 @@ pub fn boot_aps(acpi_info: &AcpiInfo) {
         }
 
         // Allocate a stack for this AP (two 4K frames = 8 KiB)
-        let stack_phys = crate::arch::x86_64::paging::alloc_frame()
+        let stack_phys = crate::arch::x86_64::paging::alloc_frame_with_kind(
+            crate::arch::x86_64::paging::FrameKind::KernelHeap,
+        )
             .expect("Failed to allocate AP stack frame 1");
-        let stack_phys2 = crate::arch::x86_64::paging::alloc_frame()
+        let stack_phys2 = crate::arch::x86_64::paging::alloc_frame_with_kind(
+            crate::arch::x86_64::paging::FrameKind::KernelHeap,
+        )
             .expect("Failed to allocate AP stack frame 2");
         // Use the higher of the two frames as stack top (stack grows down)
         let stack_top = if stack_phys2 > stack_phys {

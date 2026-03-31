@@ -63,7 +63,9 @@ pub fn allocate_region(owner: AgentId, size: usize) -> Option<u32> {
                 let phys_addr;
 
                 // Allocate contiguous frames (best effort)
-                if let Some(addr) = crate::arch::x86_64::paging::alloc_frame() {
+                if let Some(addr) = crate::arch::x86_64::paging::alloc_frame_with_kind(
+                    crate::arch::x86_64::paging::FrameKind::KernelHeap,
+                ) {
                     phys_addr = addr;
                     // For multi-page regions, allocate more frames
                     // (simplified: only single-page regions for now)
@@ -104,7 +106,7 @@ pub fn free_region(region_id: u32, requester: AgentId) -> bool {
         for i in 0..MAX_REGIONS {
             if REGIONS[i].active && REGIONS[i].id == region_id {
                 if REGIONS[i].owner == requester {
-                    crate::arch::x86_64::paging::dealloc_frame(REGIONS[i].phys_addr);
+                    let _ = crate::arch::x86_64::paging::release_frame(REGIONS[i].phys_addr);
                     REGIONS[i].active = false;
                     return true;
                 }

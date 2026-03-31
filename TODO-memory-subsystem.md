@@ -1,0 +1,136 @@
+# Memory Subsystem Migration Plan
+
+This document tracks the staged migration of ATOS memory management toward a
+more scalable design while preserving ATOS-specific determinism and syscall
+structure.
+
+## Goals
+
+- Keep ATOS architecture ownership and deterministic policies.
+- Replace the current bitmap frame allocator with a buddy allocator.
+- Add per-frame metadata and reference counting.
+- Replace the current linked-list kernel heap allocator with slab-based
+  allocation for small objects.
+- Cleanly separate Linux VMA policy from low-level page table operations.
+
+## Phase 0: Lock External Interfaces
+
+Keep the current public paging API stable while swapping internal
+implementations:
+
+- `paging::alloc_frame()`
+- `paging::dealloc_frame()`
+- `paging::map_page()`
+- `paging::unmap_page()`
+- `paging::retain_address_space()`
+- `paging::release_address_space()`
+
+## Phase 1: Replace Bitmap Frame Allocation
+
+Status: completed
+
+Target:
+
+- Introduce a buddy-based physical frame allocator.
+- Preserve the existing `paging::*` allocation entry points.
+- Keep UEFI memory map parsing and current boot flow working.
+
+Expected work:
+
+- Add `src/arch/x86_64/frame_alloc.rs`.
+- Route `paging::init_from_uefi_mmap()`, `paging::init_with_memory_limit()`,
+  `paging::alloc_frame()`, and `paging::dealloc_frame()` through the new
+  allocator.
+- Keep current page table code unchanged above the allocation layer.
+
+Validation:
+
+- Kernel builds successfully.
+- Syscall regression still passes.
+- Dynamic musl hello still boots.
+- Java smoke remains functional.
+
+## Phase 2: Add Per-Frame Metadata and Refcounts
+
+Status: completed
+
+Target:
+
+- Track each physical frame with side metadata.
+- Add frame reference counting independent from address-space reference
+  tracking.
+
+Expected work:
+
+- Add `src/arch/x86_64/frame_meta.rs`.
+- Track at least:
+  - `refcount`
+  - `kind` (`Free`, `Anon`, `File`, `PageTable`, `KernelHeap`, `Device`)
+- Convert direct frame frees in Linux VM and page-table code into
+  `retain/release` style operations.
+
+Validation:
+
+- Shared address spaces do not free backing pages early.
+- Lazy file-backed mappings do not double free pages.
+
+## Phase 3: Replace Kernel Heap with Slab Allocation
+
+Status: in progress
+
+Target:
+
+- Keep the global allocator entry point.
+- Use slab caches for small objects and page-backed allocation for larger
+  objects.
+
+Expected work:
+
+- Rewrite `src/heap.rs` behind the same `#[global_allocator]` entry point.
+- Introduce size classes:
+  - `8`, `16`, `32`, `64`, `128`, `256`, `512`, `1024`, `2048`
+- Route larger allocations directly to the page allocator.
+
+Current progress:
+
+- Replaced the old linked-list free-list allocator with page-backed slab
+  caches for the configured size classes.
+- Large allocations now use contiguous frame allocation with allocator-local
+  headers for aligned deallocation.
+- Short QEMU boot and Java smoke still advance with the slab allocator enabled.
+
+Validation:
+
+- Frequent `Vec`, `Box`, `String`, and `BTreeMap` allocations remain stable.
+- Kernel heap fragmentation is reduced.
+
+## Phase 4: Split VMA Policy from Page Table Operations
+
+Target:
+
+- Separate Linux VMA bookkeeping from low-level PTE mutation.
+
+Expected work:
+
+- Add `src/arch/x86_64/page_table.rs`.
+- Keep Linux VMA policy in `src/linux_compat/memory.rs`.
+- Move low-level page walking, map/unmap, and protect logic into a dedicated
+  page-table backend.
+
+Validation:
+
+- `mmap`, `munmap`, `mprotect`, and page fault handling all flow through VMA
+  policy first.
+- Python, Node, and Java runtime smoke tests continue to advance.
+
+## Source References
+
+Reference implementations to study during migration:
+
+- Asterinas buddy allocator:
+  - `~/asterinas/osdk/deps/frame-allocator/src/`
+- Asterinas slab allocator:
+  - `~/asterinas/osdk/deps/heap-allocator/src/`
+- Moss VMA and mmap flow:
+  - `~/moss/src/memory/mmap.rs`
+  - `~/moss/libkernel/src/memory/proc_vm/memory_map/mod.rs`

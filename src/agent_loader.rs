@@ -18,8 +18,12 @@ use crate::serial_println;
 use crate::state;
 use crate::wasm;
 
-/// Maximum agent image size: 4 MB (1024 pages).
-const MAX_IMAGE_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum agent image size.
+///
+/// Modern distro-provided PIE executables such as `/usr/bin/python3` and
+/// `/usr/bin/node` are often well above 4 MiB, so the Linux-compat loading
+/// path needs a materially larger ceiling than the earlier toy binaries.
+const MAX_IMAGE_SIZE: usize = 128 * 1024 * 1024;
 
 /// Maximum number of dynamically loaded WASM modules.
 const MAX_WASM_MODULES: usize = MAX_AGENTS;
@@ -38,26 +42,36 @@ static mut WASM_MODULES: [Option<wasm::decoder::WasmModule>; MAX_WASM_MODULES] =
 static mut WASM_RUNTIME_CLASSES: [wasm::types::RuntimeClass; MAX_WASM_MODULES] =
     [wasm::types::RuntimeClass::ProofGrade; MAX_WASM_MODULES];
 
+pub const fn max_linux_image_size() -> usize {
+    MAX_IMAGE_SIZE
+}
+
 fn translate_agent_vaddr(agent_cr3: u64, vaddr: u64) -> Option<u64> {
+    let page_off = vaddr & (paging::PAGE_SIZE as u64 - 1);
+    let (page_base, _) = lookup_agent_page_base(agent_cr3, vaddr)?;
+    Some(page_base + page_off)
+}
+
+fn lookup_agent_page_base(agent_cr3: u64, vaddr: u64) -> Option<(u64, bool)> {
     let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
     unsafe {
-        let pml4 = agent_cr3 as *const u64;
+        let pml4 = paging::phys_to_virt(agent_cr3) as *const u64;
         let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
         if pml4e & paging::PTE_PRESENT == 0 {
             return None;
         }
 
-        let pdpt = (pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pdpt = paging::phys_to_virt(pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
         if pdpte & paging::PTE_PRESENT == 0 {
             return None;
         }
 
-        let pd = (pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pd = paging::phys_to_virt(pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pde = core::ptr::read_volatile(pd.add(pd_idx));
         if pde & paging::PTE_PRESENT == 0 {
             return None;
@@ -65,16 +79,17 @@ fn translate_agent_vaddr(agent_cr3: u64, vaddr: u64) -> Option<u64> {
 
         if pde & paging::PTE_HUGE != 0 {
             let base = pde & 0x000F_FFFF_FFE0_0000;
-            return Some(base + (vaddr & 0x1F_FFFF));
+            let page_base = base + (vaddr & 0x1F_F000);
+            return Some((page_base, true));
         }
 
-        let pt = (pde & 0x000F_FFFF_FFFF_F000) as *const u64;
+        let pt = paging::phys_to_virt(pde & 0x000F_FFFF_FFFF_F000) as *const u64;
         let pte = core::ptr::read_volatile(pt.add(pt_idx));
         if pte & paging::PTE_PRESENT == 0 {
             return None;
         }
 
-        Some((pte & 0x000F_FFFF_FFFF_F000) + (vaddr & (paging::PAGE_SIZE as u64 - 1)))
+        Some((pte & 0x000F_FFFF_FFFF_F000, false))
     }
 }
 
@@ -92,7 +107,7 @@ fn write_agent_user_bytes(agent_cr3: u64, user_vaddr: u64, data: &[u8]) -> Resul
         unsafe {
             core::ptr::copy_nonoverlapping(
                 data.as_ptr().add(written),
-                phys as *mut u8,
+                paging::phys_to_virt(phys) as *mut u8,
                 chunk_len,
             );
         }
@@ -107,7 +122,21 @@ fn write_agent_user_u64(agent_cr3: u64, user_vaddr: u64, value: u64) -> Result<(
     write_agent_user_bytes(agent_cr3, user_vaddr, &value.to_ne_bytes())
 }
 
-fn loaded_file_vaddr(elf_info: &crate::loader::ElfInfo, file_offset: u64, size: u64) -> Option<u64> {
+fn read_agent_user_u64(agent_cr3: u64, user_vaddr: u64) -> Option<u64> {
+    let phys = translate_agent_vaddr(agent_cr3, user_vaddr)?;
+    Some(unsafe { core::ptr::read_unaligned(paging::phys_to_virt(phys) as *const u64) })
+}
+
+fn read_agent_user_u32(agent_cr3: u64, user_vaddr: u64) -> Option<u32> {
+    let phys = translate_agent_vaddr(agent_cr3, user_vaddr)?;
+    Some(unsafe { core::ptr::read_unaligned(paging::phys_to_virt(phys) as *const u32) })
+}
+
+fn loaded_file_vaddr(
+    elf_info: &crate::loader::ElfInfo,
+    file_offset: u64,
+    size: u64,
+) -> Option<u64> {
     let end = file_offset.checked_add(size)?;
 
     for seg in elf_info.segments[..elf_info.segment_count]
@@ -126,13 +155,69 @@ fn loaded_file_vaddr(elf_info: &crate::loader::ElfInfo, file_offset: u64, size: 
     None
 }
 
+fn loaded_file_offset(
+    elf_info: &crate::loader::ElfInfo,
+    vaddr: u64,
+    size: u64,
+) -> Option<usize> {
+    let end = vaddr.checked_add(size)?;
+
+    for seg in elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|seg| seg.as_ref())
+    {
+        let seg_vaddr_start = seg.vaddr;
+        let seg_vaddr_end = seg.vaddr.checked_add(seg.file_size)?;
+        if vaddr >= seg_vaddr_start && end <= seg_vaddr_end {
+            let rel = vaddr.checked_sub(seg_vaddr_start)?;
+            let file_off = seg.file_offset.checked_add(rel)?;
+            return usize::try_from(file_off).ok();
+        }
+    }
+
+    None
+}
+
+fn find_dynamic_tag_in_image(
+    elf_info: &crate::loader::ElfInfo,
+    image: &[u8],
+    wanted_tag: u64,
+) -> Option<u64> {
+    if elf_info.dynamic_vaddr == 0 || elf_info.dynamic_size < 16 {
+        return None;
+    }
+
+    let dyn_off = loaded_file_offset(elf_info, elf_info.dynamic_vaddr, elf_info.dynamic_size)?;
+    let dyn_size = usize::try_from(elf_info.dynamic_size).ok()?;
+    if dyn_off.checked_add(dyn_size)? > image.len() {
+        return None;
+    }
+
+    let mut off = dyn_off;
+    let end = dyn_off + dyn_size;
+    while off + 16 <= end {
+        let tag = u64::from_le_bytes(image[off..off + 8].try_into().ok()?);
+        let val = u64::from_le_bytes(image[off + 8..off + 16].try_into().ok()?);
+        if tag == wanted_tag {
+            return Some(val);
+        }
+        if tag == 0 {
+            break;
+        }
+        off += 16;
+    }
+
+    None
+}
+
 fn map_user_stack_region(agent_cr3: u64, user_stack_base: u64) -> Result<u64, i64> {
     debug_assert_eq!(USER_STACK_SIZE % paging::PAGE_SIZE, 0);
 
     for page_idx in 0..(USER_STACK_SIZE / paging::PAGE_SIZE) {
-        let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
+        let phys = paging::alloc_frame_with_kind(paging::FrameKind::Anon)
+            .ok_or(E_QUOTA_EXCEEDED)?;
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
+            core::ptr::write_bytes(paging::phys_to_virt(phys) as *mut u8, 0, paging::PAGE_SIZE);
         }
         paging::map_page(
             agent_cr3,
@@ -146,17 +231,42 @@ fn map_user_stack_region(agent_cr3: u64, user_stack_base: u64) -> Result<u64, i6
     Ok(user_stack_base + USER_STACK_SIZE as u64)
 }
 
-fn map_segment_pages(
-    agent_cr3: u64,
-    seg: &crate::loader::LoadSegment,
-) -> Result<(), i64> {
+#[inline]
+fn page_align_up_u64(value: u64) -> u64 {
+    let page_mask = paging::PAGE_SIZE as u64 - 1;
+    (value + page_mask) & !page_mask
+}
+
+fn initial_linux_brk(elf_info: &crate::loader::ElfInfo) -> u64 {
+    let mut brk = 0u64;
+
+    for seg in elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|seg| seg.as_ref())
+    {
+        if seg.flags & 0x2 == 0 {
+            continue;
+        }
+        brk = brk.max(seg.vaddr.saturating_add(seg.mem_size));
+    }
+
+    if brk == 0 {
+        for seg in elf_info.segments[..elf_info.segment_count]
+            .iter()
+            .filter_map(|seg| seg.as_ref())
+        {
+            brk = brk.max(seg.vaddr.saturating_add(seg.mem_size));
+        }
+    }
+
+    page_align_up_u64(brk)
+}
+
+fn map_segment_pages(agent_cr3: u64, seg: &crate::loader::LoadSegment) -> Result<(), i64> {
     let page_mask = paging::PAGE_SIZE as u64 - 1;
     let seg_page_base = seg.vaddr & !page_mask;
     let page_bias = seg.vaddr & page_mask;
-    let total_map_len = seg
-        .mem_size
-        .checked_add(page_bias)
-        .ok_or(E_INVALID_ARG)?;
+    let total_map_len = seg.mem_size.checked_add(page_bias).ok_or(E_INVALID_ARG)?;
 
     let pages_needed = pages_for_bytes(total_map_len).ok_or(E_INVALID_ARG)?;
     let is_write = seg.flags & 0x2 != 0;
@@ -172,11 +282,25 @@ fn map_segment_pages(
         let vaddr = seg_page_base
             .checked_add(page_offset)
             .ok_or(E_INVALID_ARG)?;
-        let phys = paging::alloc_frame().ok_or(E_QUOTA_EXCEEDED)?;
+        if let Some((phys_base, is_huge)) = lookup_agent_page_base(agent_cr3, vaddr) {
+            if !is_huge {
+                paging::map_page(agent_cr3, vaddr, phys_base, flags)
+                    .map_err(|_| E_QUOTA_EXCEEDED)?;
+                paging::invlpg(vaddr);
+                continue;
+            }
+        }
+        let frame_kind = if is_write {
+            paging::FrameKind::Anon
+        } else {
+            paging::FrameKind::File
+        };
+        let phys = paging::alloc_frame_with_kind(frame_kind).ok_or(E_QUOTA_EXCEEDED)?;
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, paging::PAGE_SIZE);
+            core::ptr::write_bytes(paging::phys_to_virt(phys) as *mut u8, 0, paging::PAGE_SIZE);
         }
         paging::map_page(agent_cr3, vaddr, phys, flags).map_err(|_| E_QUOTA_EXCEEDED)?;
+        paging::invlpg(vaddr);
     }
 
     Ok(())
@@ -223,6 +347,55 @@ fn load_segments_into_address_space(
     }
 
     Ok(highest_end)
+}
+
+fn min_load_vaddr(elf_info: &crate::loader::ElfInfo) -> u64 {
+    elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .map(|s| s.vaddr)
+        .min()
+        .unwrap_or(0)
+}
+
+fn non_relocatable_needs_low_mapping(elf_info: &crate::loader::ElfInfo) -> bool {
+    let page_mask = paging::PAGE_SIZE as u64 - 1;
+
+    for seg in elf_info.segments[..elf_info.segment_count]
+        .iter()
+        .filter_map(|s| s.as_ref())
+    {
+        if seg.vaddr >= USER_CODE_VADDR {
+            continue;
+        }
+
+        let page_bias = seg.vaddr & page_mask;
+        let total_map_len = match seg.mem_size.checked_add(page_bias) {
+            Some(len) => len,
+            None => return true,
+        };
+        let page_footprint = page_align_up_u64(total_map_len);
+        let header_stub = seg.flags == 0x4 && page_footprint <= paging::PAGE_SIZE as u64;
+
+        if !header_stub {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn validate_non_relocatable_layout(elf_info: &crate::loader::ElfInfo, label: &[u8]) -> Result<(), i64> {
+    if !elf_info.is_relocatable && non_relocatable_needs_low_mapping(elf_info) {
+        serial_println!(
+            "[AGENT_LOADER] FATAL: non-relocatable ELF {:?} needs low vaddr {:#x}, but ATOS currently reserves 0..{:#x} for the identity map",
+            core::str::from_utf8(label).unwrap_or("?"),
+            min_load_vaddr(elf_info),
+            USER_CODE_VADDR
+        );
+        return Err(E_BAD_IMAGE);
+    }
+    Ok(())
 }
 
 /// Spawn a new agent from an in-memory binary image.
@@ -298,14 +471,21 @@ fn spawn_native_elf(
 ) -> Result<AgentId, i64> {
     // 1. Parse ELF
     let mut elf_info = crate::loader::parse_elf64(image).map_err(|_| E_BAD_IMAGE)?;
+    validate_non_relocatable_layout(&elf_info, b"<native-elf>")?;
 
-    // 1b. Handle dynamically-linked binaries (ET_DYN / PT_INTERP)
+    // 1b. Handle dynamically-linked binaries. Only ET_DYN images receive a
+    // deterministic load bias; ET_EXEC binaries with PT_INTERP must stay at
+    // their link-time virtual addresses.
     if elf_info.is_dynamic {
         // Extract interpreter path for diagnostics
         if elf_info.interp_len > 0 && elf_info.interp_offset + elf_info.interp_len <= image.len() {
-            let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+            let interp_bytes =
+                &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
             // Trim trailing NUL
-            let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+            let interp_end = interp_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(interp_bytes.len());
             if interp_end > 0 {
                 // Log the interpreter path (up to 64 bytes to avoid overflow)
                 let display_len = interp_end.min(64);
@@ -317,35 +497,33 @@ fn spawn_native_elf(
             }
         }
 
-        // For ET_DYN, segment vaddrs are relative offsets. Apply a load bias
-        // so the binary is placed at a deterministic user-space address.
-        if elf_info.load_bias == 0 {
-            // Use USER_CODE_VADDR as the base for PIE binaries whose
-            // segments start near vaddr 0.
-            let min_vaddr = elf_info.segments[..elf_info.segment_count]
-                .iter()
-                .filter_map(|s| s.as_ref())
-                .map(|s| s.vaddr)
-                .min()
-                .unwrap_or(0);
-            if min_vaddr < USER_CODE_VADDR {
-                elf_info.load_bias = USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+        if elf_info.is_relocatable {
+            // For ET_DYN, segment vaddrs are relative offsets. Apply a load bias
+            // so the binary is placed at a deterministic user-space address.
+            if elf_info.load_bias == 0 {
+                // Use USER_CODE_VADDR as the base for PIE binaries whose
+                // segments start near vaddr 0.
+                let min_vaddr = min_load_vaddr(&elf_info);
+                if min_vaddr < USER_CODE_VADDR {
+                    elf_info.load_bias =
+                        USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+                }
             }
-        }
 
-        // Apply load bias to entry point and all segment vaddrs
-        elf_info.entry_point = elf_info.entry_point.wrapping_add(elf_info.load_bias);
-        for i in 0..elf_info.segment_count {
-            if let Some(ref mut seg) = elf_info.segments[i] {
-                seg.vaddr = seg.vaddr.wrapping_add(elf_info.load_bias);
+            // Apply load bias to entry point and all segment vaddrs
+            elf_info.entry_point = elf_info.entry_point.wrapping_add(elf_info.load_bias);
+            for i in 0..elf_info.segment_count {
+                if let Some(ref mut seg) = elf_info.segments[i] {
+                    seg.vaddr = seg.vaddr.wrapping_add(elf_info.load_bias);
+                }
             }
-        }
 
-        serial_println!(
-            "[AGENT_LOADER] Dynamic ELF: load_bias={:#x}, entry={:#x}",
-            elf_info.load_bias,
-            elf_info.entry_point
-        );
+            serial_println!(
+                "[AGENT_LOADER] Dynamic ELF: load_bias={:#x}, entry={:#x}",
+                elf_info.load_bias,
+                elf_info.entry_point
+            );
+        }
     }
 
     // 2. Create isolated address space
@@ -369,18 +547,37 @@ fn spawn_native_elf(
 
     let final_entry = if elf_info.is_dynamic && elf_info.interp_len > 0 {
         // Extract interpreter path
-        let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
-        let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+        let interp_bytes =
+            &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+        let interp_end = interp_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(interp_bytes.len());
         let interp_path = &interp_bytes[..interp_end];
 
         // Resolve interpreter path via VFS → base image keyspace
         let (interp_ks, interp_key) = crate::linux_compat::vfs::resolve_path(0, interp_path);
 
-        // Load interpreter bytes from keyspace
-        let mut interp_buf = alloc::vec![0u8; 2 * 1024 * 1024]; // 2MB max for ld-linux
-        let interp_len = crate::state::load_multi_segment(interp_ks, interp_key, &mut interp_buf);
+        let mut interp_owned = None;
+        let interp_image: &[u8] = if interp_ks == crate::state::BASE_IMAGE_KEYSPACE {
+            match crate::base_image::find_by_key(interp_key) {
+                Some(entry) => entry.data,
+                None => &[],
+            }
+        } else {
+            let interp_size = crate::state::query_file_size(interp_ks, interp_key);
+            if interp_size == 0 {
+                &[]
+            } else {
+                let mut buf = alloc::vec![0u8; interp_size];
+                let loaded = crate::state::load_multi_segment(interp_ks, interp_key, &mut buf);
+                buf.truncate(loaded);
+                interp_owned = Some(buf);
+                interp_owned.as_ref().unwrap().as_slice()
+            }
+        };
 
-        if interp_len == 0 {
+        if interp_image.is_empty() {
             // Interpreter not found in base image — fall back to main entry
             serial_println!(
                 "[AGENT_LOADER] Interpreter not in base image, using main entry {:#x}",
@@ -390,11 +587,11 @@ fn spawn_native_elf(
         } else {
             serial_println!(
                 "[AGENT_LOADER] Loaded interpreter ({} bytes) from keyspace",
-                interp_len
+                interp_image.len()
             );
 
             // Parse interpreter ELF
-            match crate::loader::parse_elf64(&interp_buf[..interp_len]) {
+            match crate::loader::parse_elf64(interp_image) {
                 Ok(mut interp_elf) => {
                     // Apply load bias: place interpreter at INTERP_BASE_VADDR
                     let interp_min_vaddr = interp_elf.segments[..interp_elf.segment_count]
@@ -403,7 +600,8 @@ fn spawn_native_elf(
                         .map(|s| s.vaddr)
                         .min()
                         .unwrap_or(0);
-                    let bias = INTERP_BASE_VADDR - (interp_min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+                    let bias =
+                        INTERP_BASE_VADDR - (interp_min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
                     interp_base = bias;
 
                     interp_elf.entry_point = interp_elf.entry_point.wrapping_add(bias);
@@ -415,7 +613,7 @@ fn spawn_native_elf(
 
                     interp_highest_end = load_segments_into_address_space(
                         agent_cr3,
-                        &interp_buf[..interp_len],
+                        interp_image,
                         &interp_elf,
                         USER_CODE_VADDR as u64,
                     )?;
@@ -482,14 +680,14 @@ fn spawn_native_elf(
         let phdr_addr = main_phdr_vaddr.ok_or(E_BAD_IMAGE)?;
 
         let auxv: [(u64, u64); 8] = [
-            (9,  main_entry),          // AT_ENTRY: main program entry
-            (7,  interp_base),         // AT_BASE: interpreter base address
-            (3,  phdr_addr),           // AT_PHDR: program header table address
-            (4,  elf_info.phdr_entry_size as u64), // AT_PHENT: size of phdr entry
-            (5,  elf_info.phdr_count as u64), // AT_PHNUM: number of phdr entries
-            (6,  paging::PAGE_SIZE as u64), // AT_PAGESZ
-            (25, auxv_base + 128),     // AT_RANDOM: pointer to 16 "random" bytes
-            (0,  0),                   // AT_NULL: terminator
+            (9, main_entry),                      // AT_ENTRY: main program entry
+            (7, interp_base),                     // AT_BASE: interpreter base address
+            (3, phdr_addr),                       // AT_PHDR: program header table address
+            (4, elf_info.phdr_entry_size as u64), // AT_PHENT: size of phdr entry
+            (5, elf_info.phdr_count as u64),      // AT_PHNUM: number of phdr entries
+            (6, paging::PAGE_SIZE as u64),        // AT_PAGESZ
+            (25, auxv_base + 128),                // AT_RANDOM: pointer to 16 "random" bytes
+            (0, 0),                               // AT_NULL: terminator
         ];
 
         write_agent_user_u64(agent_cr3, auxv_base, 0)?;
@@ -531,6 +729,7 @@ fn spawn_native_elf(
     if let Some(agent) = get_agent_mut(agent_id) {
         agent.mode = AgentMode::User;
         agent.kernel_stack_top = k_stack_top;
+        agent.stack_bottom = sched::stack_bottom_from_top(k_stack_top);
         agent.context = new_user_context(entry, initial_rsp, k_stack_top);
         agent.context.cr3 = agent_cr3;
     }
@@ -604,22 +803,22 @@ pub fn spawn_linux_agent_with_env(
     }
 
     // Default exe_path
-    let exe = if exe_path.is_empty() { b"/app/unknown" as &[u8] } else { exe_path };
+    let exe = if exe_path.is_empty() {
+        b"/app/unknown" as &[u8]
+    } else {
+        exe_path
+    };
 
     // 1. Parse ELF
     let mut elf_info = crate::loader::parse_elf64(image).map_err(|_| E_BAD_IMAGE)?;
-
-    // 1b. Handle dynamically-linked binaries (ET_DYN / PT_INTERP)
-    if elf_info.is_dynamic {
+    // 1b. Only ET_DYN main images receive a deterministic load bias.
+    // ET_EXEC binaries with PT_INTERP must stay at their link-time vaddrs.
+    if elf_info.is_relocatable {
         if elf_info.load_bias == 0 {
-            let min_vaddr = elf_info.segments[..elf_info.segment_count]
-                .iter()
-                .filter_map(|s| s.as_ref())
-                .map(|s| s.vaddr)
-                .min()
-                .unwrap_or(0);
+            let min_vaddr = min_load_vaddr(&elf_info);
             if min_vaddr < USER_CODE_VADDR {
-                elf_info.load_bias = USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+                elf_info.load_bias =
+                    USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
             }
         }
         elf_info.entry_point = elf_info.entry_point.wrapping_add(elf_info.load_bias);
@@ -628,17 +827,50 @@ pub fn spawn_linux_agent_with_env(
                 seg.vaddr = seg.vaddr.wrapping_add(elf_info.load_bias);
             }
         }
+        if elf_info.dynamic_vaddr != 0 {
+            elf_info.dynamic_vaddr = elf_info.dynamic_vaddr.wrapping_add(elf_info.load_bias);
+        }
         serial_println!(
             "[AGENT_LOADER] Linux dynamic ELF: load_bias={:#x}, entry={:#x}",
-            elf_info.load_bias, elf_info.entry_point
+            elf_info.load_bias,
+            elf_info.entry_point
         );
     }
 
     // 2. Create isolated address space
-    let agent_cr3 = paging::create_address_space().ok_or(E_QUOTA_EXCEEDED)?;
+    let agent_cr3 = paging::create_linux_address_space().ok_or(E_QUOTA_EXCEEDED)?;
 
-    // 3. Load each segment
-    let _ = load_segments_into_address_space(agent_cr3, image, &elf_info, USER_CODE_VADDR as u64)?;
+    // 3. Load each segment. Linux-compat binaries may legally occupy low
+    // user virtual addresses (for example ET_EXEC at 0x400000).
+    let _ = load_segments_into_address_space(agent_cr3, image, &elf_info, 0)?;
+    let initial_brk = initial_linux_brk(&elf_info);
+
+    if exe_path == b"/usr/bin/python3" && elf_info.load_bias == USER_CODE_VADDR {
+        for off in [
+            0x1b060_u64,
+            0x1b078,
+            0x1b090,
+            0x4fc20,
+            0x69108,
+            0x69120,
+            0x69138,
+            0x69150,
+            0x515d0,
+            0x515e8,
+            0x51600,
+        ] {
+            let a = read_agent_user_u64(agent_cr3, USER_CODE_VADDR + off).unwrap_or(u64::MAX);
+            let b = read_agent_user_u64(agent_cr3, USER_CODE_VADDR + off + 8).unwrap_or(u64::MAX);
+            let c = read_agent_user_u64(agent_cr3, USER_CODE_VADDR + off + 16).unwrap_or(u64::MAX);
+            serial_println!(
+                "[PYDBG] main-rela off={:#x} val0={:#x} val1={:#x} val2={:#x}",
+                off,
+                a,
+                b,
+                c
+            );
+        }
+    }
 
     // 3b. Load interpreter if dynamic
     const INTERP_BASE_VADDR: u64 = 0x7F00_0000;
@@ -650,8 +882,12 @@ pub fn spawn_linux_agent_with_env(
     let mut interp_highest_end: u64 = 0;
 
     let final_entry = if elf_info.is_dynamic && elf_info.interp_len > 0 {
-        let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
-        let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+        let interp_bytes =
+            &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+        let interp_end = interp_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(interp_bytes.len());
         let interp_path = &interp_bytes[..interp_end];
 
         serial_println!(
@@ -660,10 +896,26 @@ pub fn spawn_linux_agent_with_env(
         );
 
         let (interp_ks, interp_key) = crate::linux_compat::vfs::resolve_path(0, interp_path);
-        let mut interp_buf = alloc::vec![0u8; 2 * 1024 * 1024];
-        let interp_len = crate::state::load_multi_segment(interp_ks, interp_key, &mut interp_buf);
+        let mut interp_owned = None;
+        let interp_image: &[u8] = if interp_ks == crate::state::BASE_IMAGE_KEYSPACE {
+            match crate::base_image::find_by_key(interp_key) {
+                Some(entry) => entry.data,
+                None => &[],
+            }
+        } else {
+            let interp_size = crate::state::query_file_size(interp_ks, interp_key);
+            if interp_size == 0 {
+                &[]
+            } else {
+                let mut buf = alloc::vec![0u8; interp_size];
+                let loaded = crate::state::load_multi_segment(interp_ks, interp_key, &mut buf);
+                buf.truncate(loaded);
+                interp_owned = Some(buf);
+                interp_owned.as_ref().unwrap().as_slice()
+            }
+        };
 
-        if interp_len == 0 {
+        if interp_image.is_empty() {
             // HARD ERROR: interpreter required but not installed
             serial_println!(
                 "[AGENT_LOADER] FATAL: interpreter {:?} not found in base image — cannot start dynamic ELF",
@@ -674,11 +926,11 @@ pub fn spawn_linux_agent_with_env(
 
         serial_println!(
             "[AGENT_LOADER] Loaded interpreter ({} bytes), first 16: [{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x},{:#04x}]",
-            interp_len,
-            interp_buf[0], interp_buf[1], interp_buf[2], interp_buf[3],
-            interp_buf[4], interp_buf[5], interp_buf[6], interp_buf[7],
-            interp_buf[8], interp_buf[9], interp_buf[10], interp_buf[11],
-            interp_buf[12], interp_buf[13], interp_buf[14], interp_buf[15]
+            interp_image.len(),
+            interp_image[0], interp_image[1], interp_image[2], interp_image[3],
+            interp_image[4], interp_image[5], interp_image[6], interp_image[7],
+            interp_image[8], interp_image[9], interp_image[10], interp_image[11],
+            interp_image[12], interp_image[13], interp_image[14], interp_image[15]
         );
 
         // Also check what's actually at the key directly
@@ -690,9 +942,11 @@ pub fn spawn_linux_agent_with_env(
             );
         }
 
-        let mut interp_elf = crate::loader::parse_elf64(&interp_buf[..interp_len])
-            .map_err(|e| {
-                serial_println!("[AGENT_LOADER] FATAL: interpreter ELF parse failed: {:?}", e);
+        let mut interp_elf = crate::loader::parse_elf64(interp_image).map_err(|e| {
+                serial_println!(
+                    "[AGENT_LOADER] FATAL: interpreter ELF parse failed: {:?}",
+                    e
+                );
                 E_BAD_IMAGE
             })?;
 
@@ -706,6 +960,9 @@ pub fn spawn_linux_agent_with_env(
         interp_base = bias;
 
         interp_elf.entry_point = interp_elf.entry_point.wrapping_add(bias);
+        if interp_elf.dynamic_vaddr != 0 {
+            interp_elf.dynamic_vaddr = interp_elf.dynamic_vaddr.wrapping_add(bias);
+        }
         for i in 0..interp_elf.segment_count {
             if let Some(ref mut seg) = interp_elf.segments[i] {
                 seg.vaddr = seg.vaddr.wrapping_add(bias);
@@ -714,15 +971,67 @@ pub fn spawn_linux_agent_with_env(
 
         interp_highest_end = load_segments_into_address_space(
             agent_cr3,
-            &interp_buf[..interp_len],
+            interp_image,
             &interp_elf,
             USER_CODE_VADDR as u64,
         )?;
 
         serial_println!(
             "[AGENT_LOADER] Interpreter at base={:#x}, entry={:#x}",
-            interp_base, interp_elf.entry_point
+            interp_base,
+            interp_elf.entry_point
         );
+        if exe == b"/usr/bin/python3" && interp_elf.dynamic_vaddr != 0 && interp_elf.dynamic_size >= 16 {
+            serial_println!(
+                "[AGENT_LOADER] interp dynamic={:#x} dynsz={:#x}",
+                interp_elf.dynamic_vaddr,
+                interp_elf.dynamic_size
+            );
+            let dump_count = interp_elf.dynamic_size / 16;
+            for i in 0..dump_count.min(32) {
+                let entry_addr = interp_elf.dynamic_vaddr + i * 16;
+                let tag = read_agent_user_u64(agent_cr3, entry_addr).unwrap_or(u64::MAX);
+                let val = read_agent_user_u64(agent_cr3, entry_addr + 8).unwrap_or(u64::MAX);
+                serial_println!(
+                    "[AGENT_LOADER] interp dynamic[{}]: tag={:#x} val={:#x}",
+                    i,
+                    tag,
+                    val
+                );
+                if tag == 0 {
+                    break;
+                }
+            }
+
+            let rela_vaddr = find_dynamic_tag_in_image(&interp_elf, interp_image, 7)
+                .unwrap_or(0);
+            let relaent = find_dynamic_tag_in_image(&interp_elf, interp_image, 9)
+                .unwrap_or(0);
+            let relacount = find_dynamic_tag_in_image(&interp_elf, interp_image, 0x6fff_fff9)
+            .unwrap_or(0);
+            if rela_vaddr != 0 && relaent >= 24 {
+                serial_println!(
+                    "[AGENT_LOADER] interp rela={:#x} relaent={} relacount={}",
+                    interp_base + rela_vaddr,
+                    relaent,
+                    relacount
+                );
+                for idx in [0u64, 1, 2, relacount.saturating_sub(1), relacount] {
+                    let entry = interp_base + rela_vaddr + idx * relaent;
+                    let a = read_agent_user_u64(agent_cr3, entry).unwrap_or(u64::MAX);
+                    let b = read_agent_user_u64(agent_cr3, entry + 8).unwrap_or(u64::MAX);
+                    let c = read_agent_user_u64(agent_cr3, entry + 16).unwrap_or(u64::MAX);
+                    serial_println!(
+                        "[AGENT_LOADER] interp rela[{}]: off={:#x} val0={:#x} val1={:#x} val2={:#x}",
+                        idx,
+                        entry,
+                        a,
+                        b,
+                        c
+                    );
+                }
+            }
+        }
         interp_elf.entry_point
     } else if elf_info.is_dynamic && elf_info.interp_len == 0 {
         // Static-PIE: no interpreter needed, use main entry directly
@@ -731,13 +1040,60 @@ pub fn spawn_linux_agent_with_env(
         main_entry
     };
 
+    if exe == b"/usr/bin/python3" && elf_info.dynamic_vaddr != 0 && elf_info.dynamic_size >= 16 {
+        serial_println!(
+            "[AGENT_LOADER] python auxv main_entry={:#x} at_base={:#x} at_phdr={:#x} phnum={} phent={} dynamic={:#x} dynsz={:#x}",
+            main_entry,
+            interp_base,
+            main_phdr_vaddr.unwrap_or(0),
+            elf_info.phdr_count,
+            elf_info.phdr_entry_size,
+            elf_info.dynamic_vaddr,
+            elf_info.dynamic_size
+        );
+        let dump_count = elf_info.dynamic_size / 16;
+        for i in 0..dump_count {
+            let entry_addr = elf_info.dynamic_vaddr + i * 16;
+            let tag = read_agent_user_u64(agent_cr3, entry_addr).unwrap_or(u64::MAX);
+            let val = read_agent_user_u64(agent_cr3, entry_addr + 8).unwrap_or(u64::MAX);
+            serial_println!(
+                "[AGENT_LOADER] python dynamic[{}]: tag={:#x} val={:#x}",
+                i,
+                tag,
+                val
+            );
+            if tag == 0 {
+                break;
+            }
+        }
+        if let Some(phdr_addr) = main_phdr_vaddr {
+            for i in 0..elf_info.phdr_count as u64 {
+                let entry = phdr_addr + i * elf_info.phdr_entry_size as u64;
+                let p_type = read_agent_user_u32(agent_cr3, entry).unwrap_or(u32::MAX);
+                let p_flags = read_agent_user_u32(agent_cr3, entry + 4).unwrap_or(u32::MAX);
+                let p_offset = read_agent_user_u64(agent_cr3, entry + 8).unwrap_or(u64::MAX);
+                let p_vaddr = read_agent_user_u64(agent_cr3, entry + 16).unwrap_or(u64::MAX);
+                let p_filesz = read_agent_user_u64(agent_cr3, entry + 32).unwrap_or(u64::MAX);
+                let p_memsz = read_agent_user_u64(agent_cr3, entry + 40).unwrap_or(u64::MAX);
+                serial_println!(
+                    "[AGENT_LOADER] python phdr[{}]: type={:#x} flags={:#x} off={:#x} vaddr={:#x} filesz={:#x} memsz={:#x}",
+                    i,
+                    p_type,
+                    p_flags,
+                    p_offset,
+                    p_vaddr,
+                    p_filesz,
+                    p_memsz
+                );
+            }
+        }
+    }
+
     // 4. Allocate user stack above the highest loaded segment
     let mut highest_seg_end: u64 = USER_STACK_VADDR;
     for i in 0..elf_info.segment_count {
         if let Some(s) = &elf_info.segments[i] {
-            if s.vaddr >= USER_CODE_VADDR {
-                highest_seg_end = highest_seg_end.max(s.vaddr + s.mem_size);
-            }
+            highest_seg_end = highest_seg_end.max(s.vaddr + s.mem_size);
         }
     }
     if interp_highest_end > highest_seg_end {
@@ -766,11 +1122,7 @@ pub fn spawn_linux_agent_with_env(
     //        AT_NULL, 0
 
     // Default environment variables (minimal, deterministic)
-    let default_env_vars: [&[u8]; 3] = [
-        b"LANG=C",
-        b"HOME=/",
-        b"PATH=/usr/bin:/bin",
-    ];
+    let default_env_vars: [&[u8]; 3] = [b"LANG=C", b"HOME=/", b"PATH=/usr/bin:/bin"];
 
     // Build effective argv: if caller provided none, use exe_path as argv[0]
     let default_argv: [&[u8]; 1] = [exe];
@@ -795,12 +1147,15 @@ pub fn spawn_linux_agent_with_env(
     let argc = effective_argv.len();
     let envc = effective_envp.len();
     // auxv entries count (including AT_NULL)
-    let auxv_count = if elf_info.is_dynamic && interp_base > 0 { 12 } else { 7 };
-    let pointer_area_size: usize =
-        8                           // argc
+    let auxv_count = if elf_info.is_dynamic && interp_base > 0 {
+        12
+    } else {
+        7
+    };
+    let pointer_area_size: usize = 8                           // argc
         + (argc + 1) * 8           // argv ptrs + NULL
         + (envc + 1) * 8           // envp ptrs + NULL
-        + auxv_count * 16;         // auxv entries (type + value)
+        + auxv_count * 16; // auxv entries (type + value)
 
     let total_size = string_area_size + pointer_area_size;
     // Align to 16 bytes (x86_64 ABI)
@@ -885,27 +1240,27 @@ pub fn spawn_linux_agent_with_env(
 
     if elf_info.is_dynamic && interp_base > 0 {
         // Full auxv for dynamic linking
-        write_auxv(&mut wptr, agent_cr3, 3, phdr_addr)?;           // AT_PHDR
+        write_auxv(&mut wptr, agent_cr3, 3, phdr_addr)?; // AT_PHDR
         write_auxv(&mut wptr, agent_cr3, 4, elf_info.phdr_entry_size as u64)?; // AT_PHENT
         write_auxv(&mut wptr, agent_cr3, 5, elf_info.phdr_count as u64)?; // AT_PHNUM
         write_auxv(&mut wptr, agent_cr3, 6, paging::PAGE_SIZE as u64)?; // AT_PAGESZ
-        write_auxv(&mut wptr, agent_cr3, 7, interp_base)?;         // AT_BASE
-        write_auxv(&mut wptr, agent_cr3, 9, main_entry)?;          // AT_ENTRY
-        write_auxv(&mut wptr, agent_cr3, 11, 1000)?;               // AT_UID
-        write_auxv(&mut wptr, agent_cr3, 12, 1000)?;               // AT_EUID
-        write_auxv(&mut wptr, agent_cr3, 13, 1000)?;               // AT_GID
-        write_auxv(&mut wptr, agent_cr3, 14, 1000)?;               // AT_EGID
-        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?;     // AT_RANDOM
-        write_auxv(&mut wptr, agent_cr3, 0, 0)?;                   // AT_NULL
+        write_auxv(&mut wptr, agent_cr3, 7, interp_base)?; // AT_BASE
+        write_auxv(&mut wptr, agent_cr3, 9, main_entry)?; // AT_ENTRY
+        write_auxv(&mut wptr, agent_cr3, 11, 1000)?; // AT_UID
+        write_auxv(&mut wptr, agent_cr3, 12, 1000)?; // AT_EUID
+        write_auxv(&mut wptr, agent_cr3, 13, 1000)?; // AT_GID
+        write_auxv(&mut wptr, agent_cr3, 14, 1000)?; // AT_EGID
+        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?; // AT_RANDOM
+        write_auxv(&mut wptr, agent_cr3, 0, 0)?; // AT_NULL
     } else {
         // Minimal auxv for static binaries
         write_auxv(&mut wptr, agent_cr3, 6, paging::PAGE_SIZE as u64)?; // AT_PAGESZ
-        write_auxv(&mut wptr, agent_cr3, 11, 1000)?;               // AT_UID
-        write_auxv(&mut wptr, agent_cr3, 12, 1000)?;               // AT_EUID
-        write_auxv(&mut wptr, agent_cr3, 13, 1000)?;               // AT_GID
-        write_auxv(&mut wptr, agent_cr3, 14, 1000)?;               // AT_EGID
-        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?;     // AT_RANDOM
-        write_auxv(&mut wptr, agent_cr3, 0, 0)?;                   // AT_NULL
+        write_auxv(&mut wptr, agent_cr3, 11, 1000)?; // AT_UID
+        write_auxv(&mut wptr, agent_cr3, 12, 1000)?; // AT_EUID
+        write_auxv(&mut wptr, agent_cr3, 13, 1000)?; // AT_GID
+        write_auxv(&mut wptr, agent_cr3, 14, 1000)?; // AT_EGID
+        write_auxv(&mut wptr, agent_cr3, 25, at_random_addr)?; // AT_RANDOM
+        write_auxv(&mut wptr, agent_cr3, 0, 0)?; // AT_NULL
     }
 
     // 6. Allocate kernel stack
@@ -922,6 +1277,7 @@ pub fn spawn_linux_agent_with_env(
     if let Some(agent) = get_agent_mut(agent_id) {
         agent.mode = AgentMode::User;
         agent.kernel_stack_top = k_stack_top;
+        agent.stack_bottom = sched::stack_bottom_from_top(k_stack_top);
         agent.context = new_user_context(entry, initial_rsp, k_stack_top);
         agent.context.cr3 = agent_cr3;
     }
@@ -930,10 +1286,16 @@ pub fn spawn_linux_agent_with_env(
     finish_agent_setup(agent_id, caller_id)?;
     crate::linux_compat::state::init_state(agent_id);
     crate::linux_compat::state::set_exe_path(agent_id, exe);
+    if let Some(st) = crate::linux_compat::state::get_state_mut(agent_id) {
+        st.brk_current = initial_brk;
+    }
 
     serial_println!(
-        "[AGENT_LOADER] Spawned Linux agent {} (entry={:#x}, argc={}, exe={:?})",
-        agent_id, entry, argc,
+        "[AGENT_LOADER] Spawned Linux agent {} (entry={:#x}, argc={}, brk={:#x}, exe={:?})",
+        agent_id,
+        entry,
+        argc,
+        initial_brk,
         core::str::from_utf8(exe).unwrap_or("?")
     );
 
@@ -992,6 +1354,7 @@ fn spawn_wasm_with_class(
         unsafe {
             core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
         }
+        agent.stack_bottom = sched::stack_bottom_from_top(stack_top);
         agent.context.cr3 = cr3;
     }
 

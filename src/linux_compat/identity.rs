@@ -120,8 +120,8 @@ pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
     let ticks = crate::arch::x86_64::timer::get_ticks();
     let uptime = (ticks / 100) as i64;
 
-    // 128 MB total, report 64 MB free (conservative fixed value)
-    let totalram: u64 = 128 * 1024 * 1024;
+    // 512 MB total, report 256 MB free (conservative fixed value)
+    let totalram: u64 = 512 * 1024 * 1024;
     let freeram: u64 = 64 * 1024 * 1024;
     let procs: u16 = 1; // at least the current agent
 
@@ -142,6 +142,36 @@ pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
         let mem_unit: u32 = 1;
         core::ptr::copy_nonoverlapping(&mem_unit as *const u32 as *const u8, p.add(104), 4);
     }
+    0
+}
+
+// ── getcpu ─────────────────────────────────────────────────────────────────
+
+/// getcpu(unsigned *cpu, unsigned *node, void *tcache)
+///
+/// The result is inherently racy on Linux, so returning a deterministic
+/// single-CPU / single-node view is sufficient for runtime probing.
+/// `tcache` has been unused by Linux for years and is ignored here too.
+pub fn sys_getcpu(_agent_id: u16, cpu_ptr: u64, node_ptr: u64, _tcache: u64) -> i64 {
+    let cpu: u32 = 0;
+    let node: u32 = 0;
+
+    if cpu_ptr != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(&cpu as *const u32 as *const u8, cpu_ptr as *mut u8, 4);
+        }
+    }
+
+    if node_ptr != 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &node as *const u32 as *const u8,
+                node_ptr as *mut u8,
+                4,
+            );
+        }
+    }
+
     0
 }
 
@@ -187,6 +217,18 @@ unsafe fn rdmsr(msr: u32) -> u64 {
 /// ARCH_GET_FS (0x1003): get FS base
 /// ARCH_SET_GS (0x1001): set GS base
 /// ARCH_GET_GS (0x1004): get GS base
+pub fn restore_thread_pointer_bases(agent_id: u16) {
+    let (fs_base, gs_base) = match state::get_state(agent_id) {
+        Some(st) => (st.fs_base, st.gs_base),
+        None => (0, 0),
+    };
+
+    unsafe {
+        wrmsr(MSR_FS_BASE, fs_base);
+        wrmsr(MSR_GS_BASE, gs_base);
+    }
+}
+
 pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
@@ -215,7 +257,7 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
             0
         }
         ARCH_SET_GS => {
-            // Write the MSR; no persistent field for GS in state
+            st.gs_base = addr;
             unsafe {
                 wrmsr(MSR_GS_BASE, addr);
             }
@@ -225,7 +267,7 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
             if addr == 0 {
                 return -EFAULT;
             }
-            let val = unsafe { rdmsr(MSR_GS_BASE) };
+            let val = st.gs_base;
             unsafe {
                 core::ptr::copy_nonoverlapping(&val as *const u64 as *const u8, addr as *mut u8, 8);
             }
@@ -322,12 +364,10 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
 
 /// rseq(struct rseq *rseq, u32 rseq_len, int flags, u32 sig)
 ///
-/// Restartable sequences registration. ATOS does not support rseq
-/// acceleration, but returns 0 (success) because glibc and OpenJDK
-/// call this for every thread and expect it to succeed. The registered
-/// rseq struct is simply ignored — ATOS's deterministic scheduling
-/// makes rseq optimizations unnecessary.
+/// Restartable sequences registration. ATOS does not implement the kernel
+/// bookkeeping needed to make user-space rseq critical sections safe, so we
+/// must report it as unavailable and let libc fall back to non-rseq paths.
 #[allow(dead_code)]
 pub fn sys_rseq(_agent_id: u16, _rseq_ptr: u64, _rseq_len: u32, _flags: u32, _sig: u32) -> i64 {
-    0
+    -ENOSYS
 }

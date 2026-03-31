@@ -86,12 +86,25 @@ trap_common:
     push r15
 
     ; Pass pointer to TrapFrame (current RSP) as first argument.
-    ; Interrupts can arrive at arbitrary stack alignments, so align the
-    ; call frame explicitly before entering Rust code.
+    ; Keep a copy of the trap-frame pointer so we can restore the original
+    ; stack shape after the Rust handler returns.
     mov rdi, rsp
     mov rbx, rsp
+
+    ; Preserve the interrupted x87/SSE state across the Rust trap path.
+    ; Timer IRQs can arrive in the middle of libc/Python vectorized code,
+    ; and the kernel must not leak its own SIMD usage back into user mode.
+    ;
+    ; Reserve a full 512-byte FXSAVE area plus alignment slack, then align
+    ; the save slot explicitly because interrupts can arrive at arbitrary
+    ; stack alignments.
+    sub rsp, 528
     and rsp, -16
+    fxsave [rsp]
+
     call trap_handler_common
+
+    fxrstor [rsp]
     mov rsp, rbx
 
     ; Restore all general-purpose registers (reverse order)

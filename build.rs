@@ -55,10 +55,23 @@ fn main() {
 fn emit_base_image_manifest(manifest_dir: &str, out_dir: &str) {
     let manifest_dir_path = Path::new(manifest_dir);
     let generated_path = Path::new(out_dir).join("base_image_manifest.rs");
-    let manifest_paths = [
-        manifest_dir_path.join("base_image.manifest"),
-        manifest_dir_path.join("base_image.runtime.manifest"),
-    ];
+    println!("cargo:rerun-if-env-changed=ATOS_RUNTIME_MANIFEST");
+
+    let mut manifest_paths = vec![manifest_dir_path.join("base_image.manifest")];
+    let runtime_manifest = match env::var("ATOS_RUNTIME_MANIFEST") {
+        Ok(path) if !path.trim().is_empty() => {
+            let resolved = resolve_host_path(manifest_dir_path, path.trim());
+            if !resolved.exists() {
+                panic!(
+                    "ATOS_RUNTIME_MANIFEST points to missing file '{}'",
+                    resolved.display()
+                );
+            }
+            resolved
+        }
+        _ => manifest_dir_path.join("base_image.runtime.manifest"),
+    };
+    manifest_paths.push(runtime_manifest);
 
     let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
 
@@ -87,7 +100,11 @@ fn emit_base_image_manifest(manifest_dir: &str, out_dir: &str) {
     fs::write(&generated_path, generated).expect("failed to write base image manifest source");
 }
 
-fn load_manifest_entries(root: &Path, manifest_path: &Path, entries: &mut BTreeMap<String, PathBuf>) {
+fn load_manifest_entries(
+    root: &Path,
+    manifest_path: &Path,
+    entries: &mut BTreeMap<String, PathBuf>,
+) {
     let contents = fs::read_to_string(manifest_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {}", manifest_path.display(), e));
 
@@ -153,7 +170,11 @@ fn resolve_host_path(root: &Path, host_path: &str) -> PathBuf {
     })
 }
 
-fn collect_tree_entries(atos_prefix: &str, host_root: &Path, entries: &mut BTreeMap<String, PathBuf>) {
+fn collect_tree_entries(
+    atos_prefix: &str,
+    host_root: &Path,
+    entries: &mut BTreeMap<String, PathBuf>,
+) {
     if !host_root.is_dir() {
         panic!("tree source '{}' is not a directory", host_root.display());
     }
@@ -169,8 +190,11 @@ fn collect_tree_entries(atos_prefix: &str, host_root: &Path, entries: &mut BTree
             continue;
         }
 
-        for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {} failed: {}", dir.display(), e)) {
-            let entry = entry.unwrap_or_else(|e| panic!("directory entry error in {}: {}", dir.display(), e));
+        for entry in fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir {} failed: {}", dir.display(), e))
+        {
+            let entry = entry
+                .unwrap_or_else(|e| panic!("directory entry error in {}: {}", dir.display(), e));
             let path = entry.path();
 
             let metadata = fs::metadata(&path)
@@ -205,6 +229,9 @@ fn collect_tree_entries(atos_prefix: &str, host_root: &Path, entries: &mut BTree
 fn base_image_key(atos_path: &str) -> u64 {
     if atos_path == "/etc/ld.so.cache" {
         return sha256_key(b"base:ld.so.cache");
+    }
+    if let Some(relative) = atos_path.strip_prefix("/etc/") {
+        return sha256_key_prefixed(b"base:etc/", relative.as_bytes());
     }
     if let Some(relative) = atos_path.strip_prefix("/lib/") {
         return sha256_key_prefixed(b"base:lib/", relative.as_bytes());

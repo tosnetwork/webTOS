@@ -20,6 +20,8 @@ const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 /// Program header type: interpreter path
 const PT_INTERP: u32 = 3;
+/// Program header type: dynamic linking information
+const PT_DYNAMIC: u32 = 2;
 
 /// Maximum number of loadable segments
 const MAX_SEGMENTS: usize = 8;
@@ -61,8 +63,14 @@ pub struct ElfInfo {
     pub segments: [Option<LoadSegment>; MAX_SEGMENTS],
     /// Number of loadable segments
     pub segment_count: usize,
-    /// True if the binary is ET_DYN (position-independent / dynamically linked)
+    /// True if the binary uses dynamic linking machinery (PT_INTERP/PT_DYNAMIC).
     pub is_dynamic: bool,
+    /// True if the main image itself is relocatable (ET_DYN / PIE / shared object).
+    ///
+    /// ET_EXEC binaries may still be dynamically linked via PT_INTERP, but they
+    /// must be mapped at their link-time virtual addresses instead of receiving
+    /// an arbitrary load bias.
+    pub is_relocatable: bool,
     /// File offset of the PT_INTERP interpreter path (0 if none)
     pub interp_offset: usize,
     /// Length of the PT_INTERP interpreter path string (0 if none)
@@ -75,6 +83,10 @@ pub struct ElfInfo {
     pub phdr_entry_size: u16,
     /// Number of program header entries.
     pub phdr_count: u16,
+    /// Virtual address of the PT_DYNAMIC table (0 if none).
+    pub dynamic_vaddr: u64,
+    /// File size of the PT_DYNAMIC table.
+    pub dynamic_size: u64,
 }
 
 /// ELF64 file header (64 bytes)
@@ -143,7 +155,7 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         return Err(ElfError::NotExecutable);
     }
 
-    let is_dynamic = e_type == ET_DYN;
+    let is_relocatable = e_type == ET_DYN;
     if e_machine != EM_X86_64 {
         return Err(ElfError::NotX86_64);
     }
@@ -152,13 +164,16 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         entry_point: e_entry,
         segments: [const { None }; MAX_SEGMENTS],
         segment_count: 0,
-        is_dynamic,
+        is_dynamic: is_relocatable,
+        is_relocatable,
         interp_offset: 0,
         interp_len: 0,
         load_bias: 0,
         phdr_offset: e_phoff,
         phdr_entry_size: e_phentsize,
         phdr_count: e_phnum,
+        dynamic_vaddr: 0,
+        dynamic_size: 0,
     };
 
     // Parse program headers
@@ -183,6 +198,11 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
             info.is_dynamic = true;
             info.interp_offset = p_offset as usize;
             info.interp_len = p_filesz as usize;
+        }
+
+        if p_type == PT_DYNAMIC {
+            info.dynamic_vaddr = unsafe { core::ptr::addr_of!(phdr.p_vaddr).read_unaligned() };
+            info.dynamic_size = unsafe { core::ptr::addr_of!(phdr.p_filesz).read_unaligned() };
         }
 
         if p_type == PT_LOAD {

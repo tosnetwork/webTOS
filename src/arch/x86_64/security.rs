@@ -15,6 +15,10 @@ const CR4_SMEP: u64 = 1 << 20;
 
 /// CR4 bit 21: Supervisor Mode Access Prevention
 const CR4_SMAP: u64 = 1 << 21;
+/// CR4 bit 9: OS supports FXSAVE/FXRSTOR-managed SSE state.
+const CR4_OSFXSR: u64 = 1 << 9;
+/// CR4 bit 10: OS enables SIMD floating-point exceptions.
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
 
 /// IA32_EFER MSR index
 const MSR_EFER: u32 = 0xC000_0080;
@@ -46,6 +50,15 @@ const SPEC_CTRL_IBRS: u64 = 1 << 0;
 /// IA32_SPEC_CTRL bit 1: STIBP — single-thread indirect branch predictor
 const SPEC_CTRL_STIBP: u64 = 1 << 1;
 
+/// CR0 bit 1: monitor FWAIT with task-switched semantics
+const CR0_MP: u64 = 1 << 1;
+/// CR0 bit 2: FPU emulation. Must be clear for hardware x87/SSE.
+const CR0_EM: u64 = 1 << 2;
+/// CR0 bit 3: task switched. We use eager FPU save/restore, so keep it clear.
+const CR0_TS: u64 = 1 << 3;
+/// CR0 bit 5: native x87 error reporting
+const CR0_NE: u64 = 1 << 5;
+
 /// Global flag: true if IBRS is supported and should be used on context switch
 static mut IBRS_SUPPORTED: bool = false;
 
@@ -54,6 +67,8 @@ static mut STIBP_SUPPORTED: bool = false;
 
 /// Global flag: true if SMAP has actually been enabled in CR4.
 static mut SMAP_ACTIVE: bool = false;
+/// Global flag: true if NXE has actually been enabled in IA32_EFER.
+static mut NX_ACTIVE: bool = false;
 
 /// Check CPU feature support via CPUID.
 ///
@@ -121,6 +136,20 @@ fn read_cr4() -> u64 {
     val
 }
 
+/// Read the current value of CR0.
+#[inline]
+fn read_cr0() -> u64 {
+    let val: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr0",
+            out(reg) val,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    val
+}
+
 /// Write a new value to CR4.
 ///
 /// # Safety
@@ -129,6 +158,16 @@ fn read_cr4() -> u64 {
 unsafe fn write_cr4(val: u64) {
     core::arch::asm!(
         "mov cr4, {}",
+        in(reg) val,
+        options(nomem, nostack, preserves_flags),
+    );
+}
+
+/// Write a new value to CR0.
+#[inline]
+unsafe fn write_cr0(val: u64) {
+    core::arch::asm!(
+        "mov cr0, {}",
         in(reg) val,
         options(nomem, nostack, preserves_flags),
     );
@@ -192,6 +231,19 @@ pub fn enable_smap() {
     }
 }
 
+/// Enable the architectural support required for user-space x87/SSE execution.
+pub fn enable_fpu_simd() {
+    unsafe {
+        let cr0 = read_cr0();
+        write_cr0((cr0 | CR0_MP | CR0_NE) & !(CR0_EM | CR0_TS));
+
+        let cr4 = read_cr4();
+        write_cr4(cr4 | CR4_OSFXSR | CR4_OSXMMEXCPT);
+
+        core::arch::asm!("fninit", options(nomem, nostack));
+    }
+}
+
 /// Enable NX: sets the NXE bit in IA32_EFER (MSR 0xC000_0080, bit 11).
 ///
 /// This activates the No-Execute page attribute bit (PTE bit 63) globally.
@@ -200,7 +252,14 @@ pub fn enable_nx() {
     unsafe {
         let efer = rdmsr(MSR_EFER);
         wrmsr(MSR_EFER, efer | EFER_NXE);
+        NX_ACTIVE = true;
     }
+}
+
+/// Returns true if NX has actually been enabled on this CPU.
+#[inline]
+pub fn nx_active() -> bool {
+    unsafe { NX_ACTIVE }
 }
 
 /// Enable IBRS: set IA32_SPEC_CTRL bit 0.
@@ -315,6 +374,10 @@ pub fn init() {
     } else {
         serial_println!("[security] NX not supported by CPU, skipping");
     }
+
+    enable_fpu_simd();
+    crate::arch::x86_64::context::capture_initial_fpu_state();
+    serial_println!("[security] FPU/SSE (CR0/CR4) enabled");
 
     if smep_ok {
         enable_smep();

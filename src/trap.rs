@@ -71,6 +71,11 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                     core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
                 }
 
+                if crate::linux_compat::memory::handle_user_page_fault(agent_id, cr2, frame.error_code)
+                {
+                    return;
+                }
+
                 if let Some(slot) = crate::init::is_guard_region(cr2) {
                     serial_println!(
                         "[GUARD PAGE] Stack overflow detected! agent={} slot={} cr2={:#x} rip={:#x}",
@@ -83,6 +88,20 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                         frame.rsp, frame.rdi, frame.rsi, frame.r10
                     );
                 }
+            } else if vector == 13 {
+                serial_println!(
+                    "[TRAP] GP fault: agent={} error_code={:#x} rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rdx={:#x} r10={:#x} r11={:#x} r12={:#x}",
+                    agent_id,
+                    frame.error_code,
+                    frame.rip,
+                    frame.rsp,
+                    frame.rax,
+                    frame.rbx,
+                    frame.rdx,
+                    frame.r10,
+                    frame.r11,
+                    frame.r12
+                );
             } else {
                 serial_println!(
                     "[TRAP] Exception vector={} error_code={:#x} agent={} rip={:#x}",
