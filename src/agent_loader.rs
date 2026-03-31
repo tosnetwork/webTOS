@@ -136,7 +136,65 @@ fn spawn_native_elf(
     mem_quota: u32,
 ) -> Result<AgentId, i64> {
     // 1. Parse ELF
-    let elf_info = crate::loader::parse_elf64(image).map_err(|_| E_BAD_IMAGE)?;
+    let mut elf_info = crate::loader::parse_elf64(image).map_err(|_| E_BAD_IMAGE)?;
+
+    // 1b. Handle dynamically-linked binaries (ET_DYN / PT_INTERP)
+    if elf_info.is_dynamic {
+        // Extract interpreter path for diagnostics
+        if elf_info.interp_len > 0 && elf_info.interp_offset + elf_info.interp_len <= image.len() {
+            let interp_bytes = &image[elf_info.interp_offset..elf_info.interp_offset + elf_info.interp_len];
+            // Trim trailing NUL
+            let interp_end = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
+            if interp_end > 0 {
+                // Log the interpreter path (up to 64 bytes to avoid overflow)
+                let display_len = interp_end.min(64);
+                serial_println!(
+                    "[AGENT_LOADER] Dynamic ELF requests interpreter ({} bytes): {:?}",
+                    interp_end,
+                    core::str::from_utf8(&interp_bytes[..display_len]).unwrap_or("<non-utf8>")
+                );
+            }
+        }
+
+        // For ET_DYN, segment vaddrs are relative offsets. Apply a load bias
+        // so the binary is placed at a deterministic user-space address.
+        if elf_info.load_bias == 0 {
+            // Use USER_CODE_VADDR as the base for PIE binaries whose
+            // segments start near vaddr 0.
+            let min_vaddr = elf_info.segments[..elf_info.segment_count]
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.vaddr)
+                .min()
+                .unwrap_or(0);
+            if min_vaddr < USER_CODE_VADDR {
+                elf_info.load_bias = USER_CODE_VADDR - (min_vaddr & !(paging::PAGE_SIZE as u64 - 1));
+            }
+        }
+
+        // Apply load bias to entry point and all segment vaddrs
+        elf_info.entry_point = elf_info.entry_point.wrapping_add(elf_info.load_bias);
+        for i in 0..elf_info.segment_count {
+            if let Some(ref mut seg) = elf_info.segments[i] {
+                seg.vaddr = seg.vaddr.wrapping_add(elf_info.load_bias);
+            }
+        }
+
+        // TODO: Full dynamic linking support
+        // - Load the interpreter ELF (e.g. /lib64/ld-linux-x86-64.so.2) from VFS
+        // - Parse interpreter as a second ELF and load its segments at a
+        //   separate base address (e.g. 0x7F00_0000_0000)
+        // - Set entry point to the interpreter's entry point
+        // - Build an auxiliary vector (AT_PHDR, AT_PHENT, AT_PHNUM, AT_ENTRY,
+        //   AT_BASE) on the user stack so the interpreter can find the main binary
+        // For now, we load the main binary directly and use its own entry point.
+        // This works for static-PIE binaries (ET_DYN without actual shared libs).
+        serial_println!(
+            "[AGENT_LOADER] Dynamic ELF: load_bias={:#x}, entry={:#x} (interpreter loading not yet implemented)",
+            elf_info.load_bias,
+            elf_info.entry_point
+        );
+    }
 
     // 2. Create isolated address space
     let agent_cr3 = paging::create_address_space().ok_or(E_QUOTA_EXCEEDED)?;

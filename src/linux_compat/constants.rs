@@ -170,6 +170,7 @@ pub const ENOSYS: i64 = 38;
 pub const ECHILD: i64 = 10;
 pub const ENOTSOCK: i64 = 88;
 pub const EAFNOSUPPORT: i64 = 97;
+pub const ETIMEDOUT: i64 = 110;
 
 // ── O_* flags ───────────────────────────────────────────────────────────────
 pub const O_RDONLY: u32 = 0;

@@ -869,8 +869,10 @@ pub fn sys_ftruncate(agent_id: u16, fd: i32, length: u64) -> i64 {
 
 /// Device I/O control.
 ///
-/// Terminal ioctls on stdin/stdout/stderr return `-ENOTTY` so that
-/// `isatty()` reports false and programs use non-interactive mode.
+/// Terminal ioctls return `-ENOTTY` so that `isatty()` reports false
+/// and programs use non-interactive mode. TCGETS on any fd returns
+/// ENOTTY (matching Linux behavior for non-terminals); CPython and
+/// Java call ioctl(TCGETS) on regular file fds during startup.
 /// All other ioctls on regular fds return `-EINVAL`.
 pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
     let _ = arg;
@@ -879,9 +881,15 @@ pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
     const TIOCGWINSZ: u64 = 0x5413;
     const ENOTTY: i64 = 25;
 
-    // stdin / stdout / stderr → not a tty
+    // TCGETS on any fd returns ENOTTY — matches Linux behavior for non-terminals.
+    // CPython and Java call ioctl(TCGETS) on regular file fds during startup.
+    if cmd == TCGETS {
+        return -ENOTTY;
+    }
+
+    // stdin / stdout / stderr → not a tty for window-size queries too
     if fd == 0 || fd == 1 || fd == 2 {
-        if cmd == TCGETS || cmd == TIOCGWINSZ {
+        if cmd == TIOCGWINSZ {
             return -ENOTTY;
         }
     }

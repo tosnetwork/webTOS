@@ -989,7 +989,7 @@ pub fn sys_futex(
     uaddr: u64,
     op: u64,
     val: u64,
-    _timeout_or_val2: u64,
+    timeout_or_val2: u64,
     _uaddr2: u64,
 ) -> i64 {
     let cmd = (op as u32) & !(FUTEX_PRIVATE_FLAG);
@@ -1021,6 +1021,23 @@ pub fn sys_futex(
                 return -EAGAIN;
             }
 
+            // Step 2b: Parse timeout from user memory if provided.
+            // timeout_or_val2 is a pointer to struct timespec { tv_sec: i64, tv_nsec: i64 }.
+            // Convert to ATOS ticks at 100Hz: ticks = tv_sec * 100 + tv_nsec / 10_000_000.
+            let timeout_ticks: u64 = if timeout_or_val2 != 0 {
+                let ts_ptr = timeout_or_val2 as *const i64;
+                let tv_sec = unsafe { core::ptr::read_volatile(ts_ptr) } as u64;
+                let tv_nsec = unsafe { core::ptr::read_volatile(ts_ptr.add(1)) } as u64;
+                let ticks = tv_sec * 100 + tv_nsec / 10_000_000;
+                if ticks == 0 {
+                    // Immediate timeout: value matches but caller wants non-blocking check.
+                    return -ETIMEDOUT;
+                }
+                ticks
+            } else {
+                0 // No timeout -- block indefinitely.
+            };
+
             // Step 3: Add this agent to the futex wait queue.
             let added = unsafe {
                 let mut slot_found = false;
@@ -1044,6 +1061,79 @@ pub fn sys_futex(
                 serial_println!("[linux_compat] futex: wait queue full, agent={}", agent_id);
                 return -EAGAIN;
             }
+
+            if timeout_ticks > 0 {
+                // Timed wait: yield up to timeout_ticks times, checking
+                // whether we have been woken (removed from FUTEX_WAITERS)
+                // each iteration.
+                for _ in 0..timeout_ticks {
+                    // Block + yield one tick.
+                    if let Some(agent) = agent::get_agent_mut(agent_id) {
+                        agent.status = AgentStatus::BlockedRecv;
+                    }
+                    sched::remove_from_run_queue(agent_id);
+                    sched::yield_current();
+
+                    // Check if we were woken (our entry cleared by FUTEX_WAKE).
+                    let still_waiting = unsafe {
+                        let mut found = false;
+                        for i in 0..MAX_FUTEX_WAITERS {
+                            if FUTEX_WAITERS[i].active
+                                && FUTEX_WAITERS[i].agent_id == agent_id
+                                && FUTEX_WAITERS[i].futex_addr == uaddr
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    };
+
+                    if !still_waiting {
+                        // Woken normally by FUTEX_WAKE.
+                        return 0;
+                    }
+
+                    // Check if the futex value changed (spurious/value-change wakeup).
+                    let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                    if cur != val as u32 {
+                        // Value changed; remove ourselves from waiters and return.
+                        unsafe {
+                            for i in 0..MAX_FUTEX_WAITERS {
+                                if FUTEX_WAITERS[i].active
+                                    && FUTEX_WAITERS[i].agent_id == agent_id
+                                    && FUTEX_WAITERS[i].futex_addr == uaddr
+                                {
+                                    FUTEX_WAITERS[i].active = false;
+                                    break;
+                                }
+                            }
+                        }
+                        return 0;
+                    }
+                }
+
+                // Timeout expired -- remove ourselves from the wait queue.
+                unsafe {
+                    for i in 0..MAX_FUTEX_WAITERS {
+                        if FUTEX_WAITERS[i].active
+                            && FUTEX_WAITERS[i].agent_id == agent_id
+                            && FUTEX_WAITERS[i].futex_addr == uaddr
+                        {
+                            FUTEX_WAITERS[i].active = false;
+                            break;
+                        }
+                    }
+                }
+                // Re-add to run queue so the agent continues.
+                if let Some(agent) = agent::get_agent_mut(agent_id) {
+                    agent.status = AgentStatus::Ready;
+                }
+                sched::add_to_run_queue(agent_id);
+                return -ETIMEDOUT;
+            }
+
+            // Untimed wait: block indefinitely until woken by FUTEX_WAKE.
 
             // Step 4: Block the agent (set status to BlockedRecv).
             if let Some(agent) = agent::get_agent_mut(agent_id) {
@@ -1141,12 +1231,12 @@ pub fn sys_futex(
         FUTEX_REQUEUE => {
             // FUTEX_REQUEUE: wake `val` waiters on uaddr, then move up to
             // `val2` remaining waiters from uaddr to uaddr2.
-            // val2 is passed via _timeout_or_val2, uaddr2 via _uaddr2.
+            // val2 is passed via timeout_or_val2, uaddr2 via _uaddr2.
             if uaddr == 0 {
                 return -EFAULT;
             }
             let max_wake = val as usize;
-            let max_requeue = _timeout_or_val2 as usize;
+            let max_requeue = timeout_or_val2 as usize;
             let uaddr2 = _uaddr2;
 
             // Collect all waiters on uaddr, sorted by agent_id for determinism.
