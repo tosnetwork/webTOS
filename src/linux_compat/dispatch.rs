@@ -127,7 +127,7 @@ fn dispatch_process_syscall(
         SYS_SCHED_GETAFFINITY => process::sys_sched_getaffinity(agent_id, a1 as u32, a2, a3),
         SYS_GETRUSAGE => process::sys_getrusage(agent_id, a1 as i32, a2),
         SYS_CAPGET => process::sys_capget(agent_id, a1, a2),
-        SYS_FUTEX => 0,
+        SYS_FUTEX => process::sys_futex(agent_id, a1, a2, a3, a4, a5),
         _ => return None,
     };
     Some(result)

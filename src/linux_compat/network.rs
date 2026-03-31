@@ -95,6 +95,13 @@ fn replay_network_recv(agent_id: u16, buf_ptr: u64, count: u64) -> i64 {
     -EAGAIN
 }
 
+/// Address family constants.
+const AF_UNIX: i32 = 1;
+const AF_INET: i32 = 2;
+
+/// Sentinel keyspace_key indicating an AF_UNIX socket.
+const AF_UNIX_MARKER: u64 = 0xFFFF_FFFF;
+
 /// Netd's mailbox ID (agent 9).
 const NETD_MAILBOX: u16 = 9;
 
@@ -111,7 +118,7 @@ const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
 ///
 /// Allocates an fd with FdKind::Socket. The mailbox_id is set to the agent's
 /// own mailbox for now; actual netd proxy routing happens on connect().
-pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) -> i64 {
+pub fn sys_socket(agent_id: u16, domain: i32, _sock_type: i32, _protocol: i32) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
@@ -122,9 +129,12 @@ pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) 
         None => return -EMFILE,
     };
 
+    // AF_UNIX sockets get a marker so connect() can reject them gracefully
+    let key = if domain == AF_UNIX { AF_UNIX_MARKER } else { 0 };
+
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::Socket,
-        keyspace_key: 0,
+        keyspace_key: key,
         keyspace_id: 0,
         mailbox_id: agent_id, // will be updated on connect
         offset: 0,
@@ -142,13 +152,20 @@ pub fn sys_socket(agent_id: u16, _domain: i32, _sock_type: i32, _protocol: i32) 
 /// Stores the target address metadata in the fd entry.
 /// In a full implementation this would send a connect request to netd via mailbox.
 pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
+    const ECONNREFUSED: i64 = 111;
+
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
+        Some(entry) if entry.kind == FdKind::Socket => {
+            // AF_UNIX socket — nscd is never running on ATOS, refuse immediately
+            if entry.keyspace_key == AF_UNIX_MARKER {
+                return -ECONNREFUSED;
+            }
+        }
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
     }

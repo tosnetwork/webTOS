@@ -12,10 +12,14 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 /// ELF type: executable
 const ET_EXEC: u16 = 2;
+/// ELF type: shared object / position-independent executable
+const ET_DYN: u16 = 3;
 /// ELF machine: x86_64
 const EM_X86_64: u16 = 62;
 /// Program header type: loadable segment
 const PT_LOAD: u32 = 1;
+/// Program header type: interpreter path
+const PT_INTERP: u32 = 3;
 
 /// Maximum number of loadable segments
 const MAX_SEGMENTS: usize = 8;
@@ -57,6 +61,14 @@ pub struct ElfInfo {
     pub segments: [Option<LoadSegment>; MAX_SEGMENTS],
     /// Number of loadable segments
     pub segment_count: usize,
+    /// True if the binary is ET_DYN (position-independent / dynamically linked)
+    pub is_dynamic: bool,
+    /// File offset of the PT_INTERP interpreter path (0 if none)
+    pub interp_offset: usize,
+    /// Length of the PT_INTERP interpreter path string (0 if none)
+    pub interp_len: usize,
+    /// Load bias for ET_DYN binaries (0 for ET_EXEC)
+    pub load_bias: u64,
 }
 
 /// ELF64 file header (64 bytes)
@@ -121,9 +133,11 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
     let e_phentsize = unsafe { core::ptr::addr_of!(header.e_phentsize).read_unaligned() };
     let e_phnum = unsafe { core::ptr::addr_of!(header.e_phnum).read_unaligned() };
 
-    if e_type != ET_EXEC {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::NotExecutable);
     }
+
+    let is_dynamic = e_type == ET_DYN;
     if e_machine != EM_X86_64 {
         return Err(ElfError::NotX86_64);
     }
@@ -132,6 +146,10 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         entry_point: e_entry,
         segments: [const { None }; MAX_SEGMENTS],
         segment_count: 0,
+        is_dynamic,
+        interp_offset: 0,
+        interp_len: 0,
+        load_bias: 0,
     };
 
     // Parse program headers
@@ -144,6 +162,14 @@ pub fn parse_elf64(data: &[u8]) -> Result<ElfInfo, ElfError> {
         // Safety: we verified bounds above
         let phdr = unsafe { &*(data.as_ptr().add(ph_offset) as *const Elf64Phdr) };
         let p_type = unsafe { core::ptr::addr_of!(phdr.p_type).read_unaligned() };
+
+        if p_type == PT_INTERP {
+            let p_offset = unsafe { core::ptr::addr_of!(phdr.p_offset).read_unaligned() };
+            let p_filesz = unsafe { core::ptr::addr_of!(phdr.p_filesz).read_unaligned() };
+            info.is_dynamic = true;
+            info.interp_offset = p_offset as usize;
+            info.interp_len = p_filesz as usize;
+        }
 
         if p_type == PT_LOAD {
             if info.segment_count >= MAX_SEGMENTS {
