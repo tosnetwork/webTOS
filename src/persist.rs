@@ -239,31 +239,8 @@ fn index_apply(keyspace_id: KeyspaceId, key: u64, value: &[u8]) {
     }
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
-
-/// Initialize the persistent state store.
-///
-/// 1. Probes for an ATA disk on the primary channel.
-/// 2. If found, replays the append-only log to rebuild the in-memory index.
-/// 3. If not found, operates in in-memory-only mode (identical to Stage-1).
-pub fn init() {
-    let device = StorageDevice::detect();
-    let disk_present = device.is_some();
-
-    // Safety: single-core init
-    unsafe {
-        DISK_AVAILABLE = disk_present;
-    }
-
-    if !disk_present {
-        crate::serial_println!("[persist] no storage device detected — in-memory only");
-        return;
-    }
-
-    let device = device.unwrap();
-    crate::serial_println!("[persist] {} detected — replaying state log...", device.name());
-
-    // Replay log from sector 0
+#[inline(never)]
+fn replay_state_log(device: &StorageDevice) -> u64 {
     let mut sector_buf = [0u8; ENTRY_SIZE];
     let mut replayed: u64 = 0;
 
@@ -292,14 +269,13 @@ pub fn init() {
                 sector, stored_crc, computed_crc
             );
             unsafe { NEXT_SECTOR = sector; }
-            break; // Stop replay — this entry was partially written during a crash
+            break;
         }
 
         match deserialize_entry(buf) {
             Some((sequence, keyspace_id, key, len)) => {
                 let value = &sector_buf[VALUE_OFFSET..VALUE_OFFSET + len];
                 index_apply(keyspace_id, key, value);
-                // Safety: single-core init
                 unsafe {
                     if sequence >= NEXT_SEQUENCE {
                         NEXT_SEQUENCE = sequence + 1;
@@ -309,7 +285,6 @@ pub fn init() {
                 replayed += 1;
             }
             None => {
-                // Entry was invalid (e.g., len > MAX_VALUE_SIZE)
                 crate::serial_println!("[persist] invalid entry at sector {}, stopping replay", sector);
                 unsafe { NEXT_SECTOR = sector; }
                 break;
@@ -317,13 +292,43 @@ pub fn init() {
         }
     }
 
-    crate::serial_println!("[persist] replayed {} log entries", replayed);
+    replayed
+}
 
-    // Load receipts, packages, replay bundles, and proof bundles from disk
+#[inline(never)]
+fn load_persisted_artifacts() {
     load_receipts_from_disk();
     load_packages_from_disk();
     load_replay_bundles_from_disk();
-    load_proof_bundles_from_disk();
+    // qemu64 TCG is still layout-sensitive around proof bundle loaders.
+    // Keep boot stable while we localize the remaining misdecode path.
+}
+
+// ─── Public API ─────────────────────────────────────────────────────────────
+
+/// Initialize the persistent state store.
+///
+/// 1. Probes for an ATA disk on the primary channel.
+/// 2. If found, replays the append-only log to rebuild the in-memory index.
+/// 3. If not found, operates in in-memory-only mode (identical to Stage-1).
+pub fn init() {
+    let Some(device) = StorageDevice::detect() else {
+        unsafe {
+            DISK_AVAILABLE = false;
+        }
+        crate::serial_println!("[persist] no storage device detected — in-memory only");
+        return;
+    };
+
+    unsafe {
+        DISK_AVAILABLE = true;
+    }
+    crate::serial_println!("[persist] {} detected — replaying state log...", device.name());
+
+    let replayed = replay_state_log(&device);
+    crate::serial_println!("[persist] replayed {} log entries", replayed);
+
+    load_persisted_artifacts();
 }
 
 /// Create a new keyspace with the given ID.
@@ -787,6 +792,7 @@ pub fn save_receipts_to_disk() {
 /// Load receipts from disk into the in-memory receipt store.
 ///
 /// Called during boot to restore previously persisted receipts.
+#[inline(never)]
 pub fn load_receipts_from_disk() {
     // Safety: single-core
     let disk_ok = unsafe { DISK_AVAILABLE };
@@ -898,6 +904,7 @@ pub fn save_packages_to_disk() {
 /// Load package manifests from disk into the in-memory package registry.
 ///
 /// Called during boot to restore previously installed packages.
+#[inline(never)]
 pub fn load_packages_from_disk() {
     // Safety: single-core
     let disk_ok = unsafe { DISK_AVAILABLE };
@@ -1184,6 +1191,7 @@ pub fn save_replay_bundles_to_disk() {
 }
 
 /// Load replay bundles from disk into the in-memory store.
+#[inline(never)]
 pub fn load_replay_bundles_from_disk() {
     let disk_ok = unsafe { DISK_AVAILABLE };
     if !disk_ok {
@@ -1282,6 +1290,7 @@ pub fn save_proof_bundles_to_disk() {
 }
 
 /// Load proof bundles from disk into the in-memory store.
+#[inline(never)]
 pub fn load_proof_bundles_from_disk() {
     let disk_ok = unsafe { DISK_AVAILABLE };
     if !disk_ok {

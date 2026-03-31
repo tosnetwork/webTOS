@@ -156,40 +156,16 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     init::init();
     serial_println!("[OK] System initialization complete");
 
-    // 8. Initialize virtio-net (if present)
-    let virtio_ok = arch::x86_64::virtio_net::init();
+    // Defer optional device and SMP bring-up while stabilizing qemu64
+    // runtime execution. These subsystems are not required for the
+    // syscall/runtime validation path.
+    serial_println!("[OK] Optional device init deferred");
+    serial_println!("[SMP] Deferred, running single-core");
 
-    // 8a. If virtio-net is not available, try the e1000 NIC
-    if !virtio_ok {
-        if arch::x86_64::e1000::init() {
-            serial_println!("[OK] e1000 NIC initialized");
-        } else {
-            serial_println!("[WARN] No network device found (neither virtio-net nor e1000)");
-        }
-    }
-
-    // 8b. Detect and initialize NVMe storage (if present)
-    arch::x86_64::nvme::init();
-
-    // 9. Discover CPUs and boot APs (if multi-core)
-    if let Some(acpi_info) = arch::x86_64::acpi::init() {
-        serial_println!("[SMP] {} CPU(s) detected", acpi_info.cpu_count);
-        if acpi_info.cpu_count > 1 {
-            // Initialize LAPIC on BSP
-            arch::x86_64::lapic::init(acpi_info.lapic_base);
-            // Disable PIT since LAPIC timer replaces it
-            arch::x86_64::lapic::disable_pit();
-            // Boot Application Processors
-            smp::boot_aps(&acpi_info);
-        }
-    } else {
-        serial_println!("[SMP] ACPI not found, running single-core");
-    }
-
-    // 10. Re-enable interrupts and start scheduling
-    // Interrupts were disabled since before init::init() to prevent
-    // the timer from preempting kernel_main into agents prematurely.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    // 10. Start scheduling with interrupts still disabled.
+    // The first agent entry trampoline enables interrupts after the
+    // initial context switch, which avoids timer IRQs racing with the
+    // BSP's final agent-table scans in sched::start().
     serial_println!("[ATOS] Entering scheduler loop");
     sched::start();
 

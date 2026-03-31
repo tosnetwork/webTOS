@@ -358,6 +358,8 @@ pub fn create_address_space() -> Option<u64> {
         // 3. Copy PD entries (2MB huge pages) from the boot page tables.
         //    This gives the new address space the same kernel identity mapping
         //    but in an INDEPENDENT PD that can be modified without affecting boot.
+        //    Keep these entries supervisor-only: ring 3 code must not be able
+        //    to reach low physical memory through the identity alias.
         let current_cr3 = read_cr3();
         let boot_pml4 = current_cr3 as *const u64;
         let boot_pml4_0 = core::ptr::read_volatile(boot_pml4);
@@ -369,14 +371,17 @@ pub fn create_address_space() -> Option<u64> {
                 // Copy all 512 PD entries (2MB huge pages for kernel identity mapping)
                 for i in 0..512 {
                     let entry = core::ptr::read_volatile(boot_pd.add(i));
-                    core::ptr::write_volatile(pd.add(i), entry);
+                    core::ptr::write_volatile(pd.add(i), entry & !PTE_USER);
                 }
             }
         }
 
-        // 4. Wire up: PML4[0] → new PDPT, PDPT[0] → new PD
+        // 4. Wire up: PML4[0] → new PDPT, PDPT[0] → new PD.
+        // PML4[0] stays user-visible because user mappings at 1GB+ live under
+        // this slot. PDPT[0] itself is supervisor-only so the low identity
+        // alias remains inaccessible from ring 3.
         core::ptr::write_volatile(pml4, pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
-        core::ptr::write_volatile(pdpt, pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+        core::ptr::write_volatile(pdpt, pd_phys | PTE_PRESENT | PTE_WRITABLE);
 
         // 5. Copy PML4[511] — higher-half kernel mapping (supervisor-only, shared)
         // This ensures the kernel remains accessible in the agent's address space.

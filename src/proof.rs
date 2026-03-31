@@ -134,10 +134,10 @@ pub fn verify_proof(proof: &ExecutionProof) -> ProofResult {
     let seq = crate::event::get_sequence();
 
     let mut proof_data = [0u8; 48];
-    proof_data[0..16].copy_from_slice(&combined_root);
-    proof_data[16..24].copy_from_slice(&tick.to_le_bytes());
-    proof_data[24..32].copy_from_slice(&seq.to_le_bytes());
-    let computed = hash_bytes(&proof_data[..32]);
+    proof_data[0..32].copy_from_slice(&combined_root);
+    proof_data[32..40].copy_from_slice(&tick.to_le_bytes());
+    proof_data[40..48].copy_from_slice(&seq.to_le_bytes());
+    let computed = hash_bytes(&proof_data);
 
     if computed == proof.proof_hash {
         serial_println!("[PROOF] Verification: VALID");
@@ -166,21 +166,21 @@ const PROOF_VERSION: u8 = 1;
 pub fn verify_proof_standalone(proof: &ExecutionProof) -> bool {
     // Recompute: H(checkpoint_root || checkpoint_tick || event_count)
     let mut proof_data = [0u8; 48];
-    proof_data[0..16].copy_from_slice(&proof.checkpoint_root);
-    proof_data[16..24].copy_from_slice(&proof.checkpoint_tick.to_le_bytes());
-    proof_data[24..32].copy_from_slice(&proof.event_count.to_le_bytes());
-    let computed = hash_bytes(&proof_data[..32]);
+    proof_data[0..32].copy_from_slice(&proof.checkpoint_root);
+    proof_data[32..40].copy_from_slice(&proof.checkpoint_tick.to_le_bytes());
+    proof_data[40..48].copy_from_slice(&proof.event_count.to_le_bytes());
+    let computed = hash_bytes(&proof_data);
     computed == proof.proof_hash
 }
 
 /// Serialize a proof to a portable byte format.
 ///
 /// Format: [magic: 4B "ATSP"][version: 1B][tick: 8B][event_count: 4B]
-///         [checkpoint_root: 16B][proof_hash: 16B]
+///         [checkpoint_root: 32B][proof_hash: 32B]
 ///         [start_seq: 8B][end_seq: 8B]
 pub fn proof_to_bytes(proof: &ExecutionProof) -> alloc::vec::Vec<u8> {
-    // Total size: 4 + 1 + 8 + 4 + 16 + 16 + 8 + 8 = 65 bytes
-    let mut buf = alloc::vec::Vec::with_capacity(65);
+    // Total size: 4 + 1 + 8 + 4 + 32 + 32 + 8 + 8 = 97 bytes
+    let mut buf = alloc::vec::Vec::with_capacity(97);
 
     // magic
     buf.extend_from_slice(&PROOF_MAGIC);
@@ -190,9 +190,9 @@ pub fn proof_to_bytes(proof: &ExecutionProof) -> alloc::vec::Vec<u8> {
     buf.extend_from_slice(&proof.checkpoint_tick.to_le_bytes());
     // event_count truncated to u32 for the wire format
     buf.extend_from_slice(&(proof.event_count as u32).to_le_bytes());
-    // checkpoint_root (16B)
+    // checkpoint_root (32B)
     buf.extend_from_slice(&proof.checkpoint_root);
-    // proof_hash (16B)
+    // proof_hash (32B)
     buf.extend_from_slice(&proof.proof_hash);
     // start_seq (8B)
     buf.extend_from_slice(&proof.start_seq.to_le_bytes());
@@ -207,8 +207,8 @@ pub fn proof_to_bytes(proof: &ExecutionProof) -> alloc::vec::Vec<u8> {
 /// Returns `None` if the magic or version does not match, or if the buffer
 /// is too short.
 pub fn proof_from_bytes(data: &[u8]) -> Option<ExecutionProof> {
-    // Minimum size check: 4 + 1 + 8 + 4 + 16 + 16 + 8 + 8 = 65 bytes
-    if data.len() < 65 {
+    // Minimum size check: 4 + 1 + 8 + 4 + 32 + 32 + 8 + 8 = 97 bytes
+    if data.len() < 97 {
         return None;
     }
 
@@ -226,13 +226,13 @@ pub fn proof_from_bytes(data: &[u8]) -> Option<ExecutionProof> {
     let event_count = u32::from_le_bytes(data[13..17].try_into().ok()?) as u64;
 
     let mut checkpoint_root = [0u8; 32];
-    checkpoint_root.copy_from_slice(&data[17..33]);
+    checkpoint_root.copy_from_slice(&data[17..49]);
 
     let mut proof_hash = [0u8; 32];
-    proof_hash.copy_from_slice(&data[33..49]);
+    proof_hash.copy_from_slice(&data[49..81]);
 
-    let start_seq = u64::from_le_bytes(data[49..57].try_into().ok()?);
-    let end_seq = u64::from_le_bytes(data[57..65].try_into().ok()?);
+    let start_seq = u64::from_le_bytes(data[81..89].try_into().ok()?);
+    let end_seq = u64::from_le_bytes(data[89..97].try_into().ok()?);
 
     Some(ExecutionProof {
         checkpoint_tick,

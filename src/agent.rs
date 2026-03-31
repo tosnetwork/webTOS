@@ -127,7 +127,10 @@ pub enum AgentMode {
     User = 1,
 }
 
-pub const KERNEL_STACK_SIZE: usize = 16384;
+// Ring-3 agents can enter deep syscall exit paths that materialize
+// proof/replay/checkpoint bundles on the kernel stack. 16 KiB is not
+// enough for those frames and corrupts adjacent per-agent kernel stacks.
+pub const KERNEL_STACK_SIZE: usize = 65536;
 
 // ─── Agent status ───────────────────────────────────────────────────────────
 
@@ -256,7 +259,7 @@ impl Agent {
             id,
             parent_id,
             status: AgentStatus::Created,
-            context: AgentContext::new_kernel(entry, stack_top),
+            context: crate::arch::x86_64::context::new_kernel_context(entry, stack_top),
             mailbox_id: id, // Stage-1: 1:1 binding
             capabilities: [const { None }; MAX_CAPABILITIES_PER_AGENT],
             cap_count: 0,

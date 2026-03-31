@@ -387,7 +387,7 @@ impl PortableCheckpoint {
 
         // State root from Merkle tree (if available)
         if let Some(root) = crate::merkle::get_root(agent_id) {
-            pc.state_root[..16].copy_from_slice(&root);
+            pc.state_root.copy_from_slice(&root);
         }
 
         // Serialize full agent blob into checkpoint_data

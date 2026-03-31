@@ -8,8 +8,8 @@
 //! stack and call `trap_handler_common`. This module defines that frame
 //! layout and the common handler.
 
-use crate::serial_println;
 use crate::agent::*;
+use crate::serial_println;
 
 // ─── TrapFrame ──────────────────────────────────────────────────────────────
 
@@ -67,7 +67,9 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
             // Page fault (vector 14): check if faulting address is in a stack guard region
             if vector == 14 {
                 let cr2: u64;
-                unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); }
+                unsafe {
+                    core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+                }
 
                 if let Some(slot) = crate::init::is_guard_region(cr2) {
                     serial_println!(
@@ -77,25 +79,38 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                 } else {
                     serial_println!(
                         "[TRAP] Page fault: agent={} cr2={:#x} error_code={:#x} rip={:#x}",
-                        agent_id, cr2, frame.error_code, frame.rip
+                        agent_id,
+                        cr2,
+                        frame.error_code,
+                        frame.rip
                     );
                 }
             } else {
                 serial_println!(
                     "[TRAP] Exception vector={} error_code={:#x} agent={} rip={:#x}",
-                    vector, frame.error_code, agent_id, frame.rip
+                    vector,
+                    frame.error_code,
+                    agent_id,
+                    frame.rip
                 );
+            }
+
+            let linux_exit_stage = crate::syscall::linux_exit_debug_stage();
+            if linux_exit_stage != 0 {
+                serial_println!("[TRAP] linux_exit_stage={:#x}", linux_exit_stage);
             }
 
             if agent_id != IDLE_AGENT_ID {
                 // Fault the agent and reschedule
                 handle_agent_fault(agent_id, vector);
-                crate::sched::schedule();
+                crate::sched::switch_from_trap();
             } else {
                 // Fault in idle agent or kernel -- fatal
                 serial_println!("[TRAP] FATAL: exception in idle/kernel context, halting");
                 loop {
-                    unsafe { core::arch::asm!("hlt"); }
+                    unsafe {
+                        core::arch::asm!("hlt");
+                    }
                 }
             }
         }
@@ -110,11 +125,7 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                 crate::arch::x86_64::lapic::eoi();
             } else {
                 unsafe {
-                    core::arch::asm!(
-                        "mov al, 0x20",
-                        "out 0x20, al",
-                        options(nomem, nostack)
-                    );
+                    core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nomem, nostack));
                 }
             }
             // Energy accounting + preemptive reschedule
@@ -132,11 +143,7 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
                     options(nomem, nostack)
                 );
                 // Send EOI
-                core::arch::asm!(
-                    "mov al, 0x20",
-                    "out 0x20, al",
-                    options(nomem, nostack)
-                );
+                core::arch::asm!("mov al, 0x20", "out 0x20, al", options(nomem, nostack));
             }
         }
 
@@ -152,10 +159,7 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
 ///
 /// Marks the agent as Faulted and removes it from the run queue.
 pub fn handle_agent_fault(agent_id: AgentId, fault_type: u64) {
-    serial_println!(
-        "[TRAP] Agent {} faulted with type {}",
-        agent_id, fault_type
-    );
+    serial_println!("[TRAP] Agent {} faulted with type {}", agent_id, fault_type);
 
     terminate_agent(agent_id, AgentStatus::Faulted);
     crate::event::agent_faulted(agent_id, fault_type);

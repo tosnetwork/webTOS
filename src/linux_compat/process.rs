@@ -56,14 +56,14 @@ const WNOHANG: u64 = 1;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CloneArgs {
-    flags: u64,        // offset 0
-    pidfd: u64,        // offset 8
-    child_tid: u64,    // offset 16
-    parent_tid: u64,   // offset 24
-    exit_signal: u64,  // offset 32
-    stack: u64,        // offset 40
-    stack_size: u64,   // offset 48
-    tls: u64,          // offset 56
+    flags: u64,       // offset 0
+    pidfd: u64,       // offset 8
+    child_tid: u64,   // offset 16
+    parent_tid: u64,  // offset 24
+    exit_signal: u64, // offset 32
+    stack: u64,       // offset 40
+    stack_size: u64,  // offset 48
+    tls: u64,         // offset 56
 }
 
 const CLONE_ARGS_MIN_SIZE: u64 = 64;
@@ -243,12 +243,7 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
 /// execve(2) -- Replace current agent image.
 ///
 /// Not commonly needed after initial load. Returns -ENOSYS for now.
-pub fn sys_execve(
-    _agent_id: u16,
-    _pathname_ptr: u64,
-    _argv_ptr: u64,
-    _envp_ptr: u64,
-) -> i64 {
+pub fn sys_execve(_agent_id: u16, _pathname_ptr: u64, _argv_ptr: u64, _envp_ptr: u64) -> i64 {
     // Most programs don't execve after initial load in ATOS.
     // A full implementation would call crate::agent_loader::spawn_from_image().
     -ENOSYS
@@ -256,11 +251,8 @@ pub fn sys_execve(
 
 /// exit(2) -- Terminate the calling agent.
 pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
-    serial_println!(
-        "[linux_compat] exit: agent={} status={}",
-        agent_id,
-        status
-    );
+    crate::syscall::set_linux_exit_debug_stage(0xE210);
+    serial_println!("[linux_compat] exit: agent={} status={}", agent_id, status);
 
     // Clear child_tid if set (CLONE_CHILD_CLEARTID behavior).
     // The futex_wake on this address is done below after termination.
@@ -307,6 +299,7 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     }
 
     // This syscall never returns; the scheduler will pick the next agent.
+    crate::syscall::set_linux_exit_debug_stage(0xE230);
     sched::yield_current();
     0 // unreachable in practice
 }
@@ -316,6 +309,7 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
 /// In ATOS, a "thread group" is the parent agent and all its children.
 /// For simplicity, we just exit the calling agent (same as exit).
 pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
+    crate::syscall::set_linux_exit_debug_stage(0xE200);
     serial_println!(
         "[linux_compat] exit_group: agent={} status={}",
         agent_id,
@@ -372,14 +366,7 @@ pub fn sys_set_robust_list(agent_id: u16, head: u64, len: u64) -> i64 {
 /// prctl(2) -- Process control operations.
 ///
 /// Handles PR_SET_NAME and PR_GET_NAME; others return 0.
-pub fn sys_prctl(
-    agent_id: u16,
-    option: u32,
-    arg2: u64,
-    _arg3: u64,
-    _arg4: u64,
-    _arg5: u64,
-) -> i64 {
+pub fn sys_prctl(agent_id: u16, option: u32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     match option {
         PR_SET_NAME => {
             // arg2 points to a 16-byte name buffer.
@@ -428,12 +415,7 @@ pub fn sys_sched_yield(_agent_id: u16) -> i64 {
 ///
 /// Writes a bitmask with CPU 0 set. ATOS is deterministic so affinity
 /// is advisory only; we report a single CPU.
-pub fn sys_sched_getaffinity(
-    _agent_id: u16,
-    _pid: u32,
-    cpusetsize: u64,
-    mask_ptr: u64,
-) -> i64 {
+pub fn sys_sched_getaffinity(_agent_id: u16, _pid: u32, cpusetsize: u64, mask_ptr: u64) -> i64 {
     if mask_ptr == 0 {
         return -EFAULT;
     }
@@ -606,7 +588,11 @@ pub fn sys_clone(
         let fs_base = parent_state.fs_base;
         if let Some(child_state) = state::get_state_mut(child_id) {
             child_state.fd_table = fd_snapshot;
-            child_state.fs_base = if flags & CLONE_SETTLS != 0 { tls } else { fs_base };
+            child_state.fs_base = if flags & CLONE_SETTLS != 0 {
+                tls
+            } else {
+                fs_base
+            };
 
             if flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
                 unsafe {
@@ -648,13 +634,7 @@ pub fn sys_fork(agent_id: u16) -> i64 {
 ///
 /// Supports pid > 0 (specific child) and pid == -1 (any child).
 /// Blocks the parent until a child terminates unless WNOHANG is set.
-pub fn sys_wait4(
-    agent_id: u16,
-    pid: u64,
-    wstatus_ptr: u64,
-    options: u64,
-    rusage_ptr: u64,
-) -> i64 {
+pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage_ptr: u64) -> i64 {
     let pid_i32 = pid as i64 as i32;
 
     // Determine which child to wait for.
@@ -867,12 +847,7 @@ pub fn sys_uname(_agent_id: u16, buf_ptr: u64) -> i64 {
 }
 
 /// get_robust_list(2) -- Get robust futex list head.
-pub fn sys_get_robust_list(
-    agent_id: u16,
-    _pid: u64,
-    head_ptr: u64,
-    len_ptr: u64,
-) -> i64 {
+pub fn sys_get_robust_list(agent_id: u16, _pid: u64, head_ptr: u64, len_ptr: u64) -> i64 {
     if head_ptr == 0 || len_ptr == 0 {
         return -EFAULT;
     }
@@ -894,7 +869,7 @@ pub fn sys_get_robust_list(
 ///
 /// Handles ARCH_SET_FS (TLS base), ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS.
 pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
-    use crate::linux_compat::constants::{ARCH_SET_FS, ARCH_GET_FS, ARCH_SET_GS, ARCH_GET_GS};
+    use crate::linux_compat::constants::{ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS};
 
     match code as u64 {
         ARCH_SET_FS => {
@@ -946,9 +921,7 @@ pub fn sys_futex(
             }
 
             // Step 1: Read the current value at the futex address.
-            let current_val = unsafe {
-                core::ptr::read_volatile(uaddr as *const u32)
-            };
+            let current_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
 
             // Step 2: Spurious wakeup check -- if value changed, return -EAGAIN.
             if current_val != val as u32 {
@@ -1080,7 +1053,7 @@ pub fn sys_prlimit64(
         let (cur, max) = match resource {
             RLIMIT_NOFILE => (256u64, 256u64),
             RLIMIT_STACK => (8 * 1024 * 1024, 8 * 1024 * 1024), // 8 MiB
-            _ => (u64::MAX, u64::MAX), // RLIM_INFINITY
+            _ => (u64::MAX, u64::MAX),                          // RLIM_INFINITY
         };
         unsafe {
             let dst = old_limit_ptr as *mut u64;

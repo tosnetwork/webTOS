@@ -52,6 +52,9 @@ static mut IBRS_SUPPORTED: bool = false;
 /// Global flag: true if STIBP is supported
 static mut STIBP_SUPPORTED: bool = false;
 
+/// Global flag: true if SMAP has actually been enabled in CR4.
+static mut SMAP_ACTIVE: bool = false;
+
 /// Check CPU feature support via CPUID.
 ///
 /// Returns `(smep, smap, nx, ibrs, stibp)`.
@@ -185,6 +188,7 @@ pub fn enable_smap() {
     unsafe {
         let cr4 = read_cr4();
         write_cr4(cr4 | CR4_SMAP);
+        SMAP_ACTIVE = true;
     }
 }
 
@@ -262,7 +266,9 @@ pub fn ibrs_available() -> bool {
 /// Leaving AC set defeats SMAP protection.
 #[inline]
 pub unsafe fn stac() {
-    core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+    if SMAP_ACTIVE {
+        core::arch::asm!("stac", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Re-enable SMAP protection after a `stac()` window.
@@ -273,7 +279,9 @@ pub unsafe fn stac() {
 /// Must only be called after a matching `stac()`.
 #[inline]
 pub unsafe fn clac() {
-    core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+    if SMAP_ACTIVE {
+        core::arch::asm!("clac", options(nomem, nostack, preserves_flags));
+    }
 }
 
 /// Initialize all CPU security features.
@@ -308,8 +316,9 @@ pub fn init() {
     }
 
     if smap_ok {
-        enable_smap();
-        serial_println!("[security] SMAP (CR4.21) enabled");
+        // SMAP disabled for now: ELF loader and syscall paths need
+        // STAC/CLAC annotations before SMAP can be safely enabled.
+        serial_println!("[security] SMAP supported but disabled (needs STAC/CLAC audit)");
     } else {
         serial_println!("[security] SMAP not supported by CPU, skipping");
     }

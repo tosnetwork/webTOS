@@ -85,9 +85,14 @@ trap_common:
     push r14
     push r15
 
-    ; Pass pointer to TrapFrame (current RSP) as first argument
+    ; Pass pointer to TrapFrame (current RSP) as first argument.
+    ; Interrupts can arrive at arbitrary stack alignments, so align the
+    ; call frame explicitly before entering Rust code.
     mov rdi, rsp
+    mov rbx, rsp
+    and rsp, -16
     call trap_handler_common
+    mov rsp, rbx
 
     ; Restore all general-purpose registers (reverse order)
     pop r15
