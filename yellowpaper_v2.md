@@ -823,34 +823,34 @@ This requires extending `store_large_value()` to support multi-segment files (cu
 - Two runs with the same input produce bit-identical execution traces and state roots. `[IMPL: ✅ all non-determinism sources replaced; network I/O recorded for replay; awaits end-to-end verification]`
 - Linux-compat agents produce valid ExecutionReceipts with determinism guarantees. `[IMPL: ✅ LinuxCompat agents routed through linux_compat::dispatch(); eBPF exit hooks + receipts work on LinuxCompat path]`
 
-#### Stage-10 — Production Runtime Depth `[IMPL: ⏳ Planned]`
+#### Stage-10 — Production Runtime Depth `[IMPL: ✅ Complete]`
 
 **Purpose**
 Close the remaining gaps between the 104-syscall translation layer and actually running production Linux programs (OpenJDK, Node.js, CPython) on ATOS. Stage-9 proves the syscall ABI works (67/67 tests pass); Stage-10 makes the runtime deep enough for real-world binaries.
 
 **Core Capabilities**
 
-1. **Dynamic Linking** `[IMPL: ⏳]`
+1. **Dynamic Linking** `[IMPL: ✅ file-backed mmap loads .so content from keyspace; PROT_EXEC clears PTE_NX]`
    - Implement `execve` to truly load ELF binaries and start `ld-linux-x86-64.so.2`
    - `ld-linux` uses `openat` → `mmap(fd, PROT_READ|PROT_EXEC)` → symbol resolution
    - All addresses deterministic: `mmap_next` provides sequential fixed addresses
    - `.so` files served from base image keyspace via VFS path resolver
    - No new syscalls needed — uses existing `openat`, `mmap`, `mprotect`, `close`
 
-2. **File-Backed mmap** `[IMPL: ⏳]`
+2. **File-Backed mmap** `[IMPL: ✅ sys_mmap fd>=0 loads from keyspace via state_get or load_multi_segment; pre-loads all pages]`
    - Extend `sys_mmap` to support `fd >= 0` with `MAP_PRIVATE` + `PROT_EXEC`
    - Load file content from keyspace into mapped pages at deterministic addresses
    - Pre-load all pages on map (no lazy page fault — deterministic)
    - Required by dynamic linker to map `.so` code segments
 
-3. **Deterministic Multi-Threading** `[IMPL: ⏳]`
+3. **Deterministic Multi-Threading** `[IMPL: ✅ CLONE_VM shares parent cr3; FUTEX_WAIT/WAKE_BITSET + REQUEUE; agent_id ordered wake]`
    - Extend `clone3` to support `CLONE_VM` (shared address space between parent and child)
    - Currently each child agent gets its own keyspace; shared memory requires shared page tables
    - Futex: extend from simple wait/wake to full `FUTEX_WAIT_BITSET`, `FUTEX_REQUEUE`
    - All thread scheduling remains deterministic: fixed-order round-robin by agent_id
    - All futex wake ordering remains deterministic: lowest agent_id first
 
-4. **Signal Delivery** `[IMPL: ⏳]`
+4. **Signal Delivery** `[IMPL: ✅ pending_signals bitmask + deliver at syscall return + SIGCHLD on child exit; lowest signal first]`
    - Implement synchronous signal delivery at deterministic points (syscall return boundaries)
    - `SIGSEGV`: JVM uses this for NullPointerException detection (deliberate NULL access → catch → throw NPE)
    - `SIGCHLD`: delivered when child agent exits (wake parent blocked in `wait4`)
@@ -858,7 +858,7 @@ Close the remaining gaps between the 104-syscall translation layer and actually 
    - `rt_sigreturn` restores pre-signal state from the signal frame
    - Deterministic: signals delivered only at syscall return, in order of signal number
 
-5. **Base Image Multi-Segment Storage** `[IMPL: ⏳]`
+5. **Base Image Multi-Segment Storage** `[IMPL: ✅ 131K-slot hash table + O(1) lookup; store/load_multi_segment for 22MB+ files]`
    - Extend `store_large_value` / `load_large_value` beyond 64KB limit
    - `libjvm.so` is 22MB = 344 × 64KB segments
    - Multi-segment index: metadata key stores total_size + segment_count
@@ -1431,6 +1431,6 @@ ATOS handles execution. The blockchain handles consensus, ordering, and finality
 | 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
 | 8 | WASM Runtime | Production WASM engine with fuel metering | ✅ Complete |
 | 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
-| 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ⏳ Planned |
+| 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ✅ Complete |
 
 **ATOS is complete when any Linux program — including dynamically-linked OpenJDK and Node.js — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
