@@ -20,7 +20,15 @@ enum LinuxRuntimeSmokeFocus {
     All,
 }
 
-const LINUX_RUNTIME_SMOKE_FOCUS: LinuxRuntimeSmokeFocus = LinuxRuntimeSmokeFocus::Java;
+#[inline]
+fn linux_runtime_smoke_focus() -> LinuxRuntimeSmokeFocus {
+    match option_env!("ATOS_RUNTIME_SMOKE_FOCUS") {
+        Some("node") => LinuxRuntimeSmokeFocus::Node,
+        Some("python") => LinuxRuntimeSmokeFocus::Python,
+        Some("all") => LinuxRuntimeSmokeFocus::All,
+        _ => LinuxRuntimeSmokeFocus::Java,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JavaSmokeFocus {
@@ -28,69 +36,101 @@ enum JavaSmokeFocus {
     Hello,
     Fs,
     Jar,
+    Phase6,
     Full,
 }
 
-const JAVA_SMOKE_FOCUS: JavaSmokeFocus = JavaSmokeFocus::Jar;
+#[inline]
+fn java_smoke_focus() -> JavaSmokeFocus {
+    match option_env!("ATOS_JAVA_SMOKE_FOCUS") {
+        Some("version") => JavaSmokeFocus::Version,
+        Some("hello") => JavaSmokeFocus::Hello,
+        Some("fs") => JavaSmokeFocus::Fs,
+        Some("phase6") => JavaSmokeFocus::Phase6,
+        Some("full") => JavaSmokeFocus::Full,
+        _ => JavaSmokeFocus::Jar,
+    }
+}
 
 #[inline]
-const fn focus_runs_python() -> bool {
+fn focus_runs_python() -> bool {
     matches!(
-        LINUX_RUNTIME_SMOKE_FOCUS,
+        linux_runtime_smoke_focus(),
         LinuxRuntimeSmokeFocus::Python | LinuxRuntimeSmokeFocus::All
     )
 }
 
 #[inline]
-const fn focus_runs_node() -> bool {
+fn focus_runs_node() -> bool {
     matches!(
-        LINUX_RUNTIME_SMOKE_FOCUS,
+        linux_runtime_smoke_focus(),
         LinuxRuntimeSmokeFocus::Node | LinuxRuntimeSmokeFocus::All
     )
 }
 
 #[inline]
-const fn focus_runs_java() -> bool {
+fn focus_runs_java() -> bool {
     matches!(
-        LINUX_RUNTIME_SMOKE_FOCUS,
+        linux_runtime_smoke_focus(),
         LinuxRuntimeSmokeFocus::Java | LinuxRuntimeSmokeFocus::All
     )
 }
 
 #[inline]
-const fn java_focus_runs_version() -> bool {
-    matches!(JAVA_SMOKE_FOCUS, JavaSmokeFocus::Version | JavaSmokeFocus::Full)
+fn java_focus_runs_version() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Version | JavaSmokeFocus::Full
+    )
 }
 
 #[inline]
-const fn java_focus_runs_hello() -> bool {
-    matches!(JAVA_SMOKE_FOCUS, JavaSmokeFocus::Hello | JavaSmokeFocus::Full)
+fn java_focus_runs_hello() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Hello | JavaSmokeFocus::Full
+    )
 }
 
 #[inline]
-const fn java_focus_runs_fs() -> bool {
-    matches!(JAVA_SMOKE_FOCUS, JavaSmokeFocus::Fs | JavaSmokeFocus::Full)
+fn java_focus_runs_fs() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Fs | JavaSmokeFocus::Full
+    )
 }
 
 #[inline]
-const fn java_focus_runs_jar() -> bool {
-    matches!(JAVA_SMOKE_FOCUS, JavaSmokeFocus::Jar | JavaSmokeFocus::Full)
+fn java_focus_runs_jar() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Jar | JavaSmokeFocus::Phase6 | JavaSmokeFocus::Full
+    )
 }
 
 #[inline]
-const fn java_focus_label() -> &'static str {
-    match JAVA_SMOKE_FOCUS {
+fn java_focus_runs_phase6() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Phase6 | JavaSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn java_focus_label() -> &'static str {
+    match java_smoke_focus() {
         JavaSmokeFocus::Version => "version",
         JavaSmokeFocus::Hello => "hello",
         JavaSmokeFocus::Fs => "fs",
         JavaSmokeFocus::Jar => "jar",
+        JavaSmokeFocus::Phase6 => "phase6",
         JavaSmokeFocus::Full => "full",
     }
 }
 
 #[inline]
-const fn focus_label() -> &'static str {
-    match LINUX_RUNTIME_SMOKE_FOCUS {
+fn focus_label() -> &'static str {
+    match linux_runtime_smoke_focus() {
         LinuxRuntimeSmokeFocus::Java => "java",
         LinuxRuntimeSmokeFocus::Node => "node",
         LinuxRuntimeSmokeFocus::Python => "python",
@@ -123,13 +163,59 @@ fn spawn_node_smoke(root_id: u16) {
     match crate::agent_loader::spawn_linux_agent(
         root_id,
         NODE_EXECVE_ELF,
-        300_000,
+        10_000_000,
         16_384,
         b"/app/test_node_execve",
         &[b"/app/test_node_execve" as &[u8]],
     ) {
         Ok(id) => serial_println!("[ROOT] Node smoke test agent created: id={}", id),
         Err(e) => serial_println!("[ROOT] Node smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_node_child_smoke(root_id: u16) {
+    static NODE_CHILD_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_node_child_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Node child-process smoke test ({} bytes)...",
+        NODE_CHILD_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        NODE_CHILD_EXECVE_ELF,
+        50_000_000,
+        16_384,
+        b"/app/test_node_child_execve",
+        &[b"/app/test_node_child_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!(
+            "[ROOT] Node child-process smoke test agent created: id={}",
+            id
+        ),
+        Err(e) => serial_println!(
+            "[ROOT] Node child-process smoke test load failed: error {}",
+            e
+        ),
+    }
+}
+
+fn spawn_node_thread_smoke(root_id: u16) {
+    static NODE_THREAD_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_node_thread_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Node thread smoke test ({} bytes)...",
+        NODE_THREAD_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        NODE_THREAD_EXECVE_ELF,
+        500_000_000,
+        32_768,
+        b"/app/test_node_thread_execve",
+        &[b"/app/test_node_thread_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] Node thread smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] Node thread smoke test load failed: error {}", e),
     }
 }
 
@@ -149,6 +235,52 @@ fn spawn_java_smoke(root_id: u16) {
     ) {
         Ok(id) => serial_println!("[ROOT] Java smoke test agent created: id={}", id),
         Err(e) => serial_println!("[ROOT] Java smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_java_child_smoke(root_id: u16) {
+    static JAVA_CHILD_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_java_child_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Java child-process smoke test ({} bytes)...",
+        JAVA_CHILD_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        JAVA_CHILD_EXECVE_ELF,
+        50_000_000,
+        262_144,
+        b"/app/test_java_child_execve",
+        &[b"/app/test_java_child_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!(
+            "[ROOT] Java child-process smoke test agent created: id={}",
+            id
+        ),
+        Err(e) => serial_println!(
+            "[ROOT] Java child-process smoke test load failed: error {}",
+            e
+        ),
+    }
+}
+
+fn spawn_java_thread_smoke(root_id: u16) {
+    static JAVA_THREAD_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_java_thread_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Java thread smoke test ({} bytes)...",
+        JAVA_THREAD_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        JAVA_THREAD_EXECVE_ELF,
+        50_000_000,
+        262_144,
+        b"/app/test_java_thread_execve",
+        &[b"/app/test_java_thread_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] Java thread smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] Java thread smoke test load failed: error {}", e),
     }
 }
 
@@ -192,8 +324,7 @@ fn spawn_java_fs_smoke(root_id: u16) {
 }
 
 fn spawn_java_jar_smoke(root_id: u16) {
-    static JAVA_JAR_EXECVE_ELF: &[u8] =
-        include_bytes!("../../test_data/test_java_jar_execve.elf");
+    static JAVA_JAR_EXECVE_ELF: &[u8] = include_bytes!("../../test_data/test_java_jar_execve.elf");
     serial_println!(
         "[ROOT] Loading Java JAR smoke test ({} bytes)...",
         JAVA_JAR_EXECVE_ELF.len()
@@ -211,26 +342,169 @@ fn spawn_java_jar_smoke(root_id: u16) {
     }
 }
 
+fn spawn_signal_smoke(root_id: u16) {
+    static SIGNAL_SMOKE_ELF: &[u8] = include_bytes!("../../test_data/test_signal_smoke.elf");
+    serial_println!(
+        "[ROOT] Loading signal smoke test ({} bytes)...",
+        SIGNAL_SMOKE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        SIGNAL_SMOKE_ELF,
+        200_000,
+        512,
+        b"/app/test_signal_smoke",
+        &[b"/app/test_signal_smoke" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] signal smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] signal smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_python_child_smoke(root_id: u16) {
+    static PYTHON_CHILD_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_python_child_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Python child-process smoke test ({} bytes)...",
+        PYTHON_CHILD_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        PYTHON_CHILD_EXECVE_ELF,
+        300_000,
+        512,
+        b"/app/test_python_child_execve",
+        &[b"/app/test_python_child_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!(
+            "[ROOT] Python child-process smoke test agent created: id={}",
+            id
+        ),
+        Err(e) => serial_println!(
+            "[ROOT] Python child-process smoke test load failed: error {}",
+            e
+        ),
+    }
+}
+
+fn spawn_at_paths_smoke(root_id: u16) {
+    static AT_PATHS_ELF: &[u8] = include_bytes!("../../test_data/test_at_paths.elf");
+    serial_println!(
+        "[ROOT] Loading *at path smoke test ({} bytes)...",
+        AT_PATHS_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        AT_PATHS_ELF,
+        200_000,
+        512,
+        b"/app/test_at_paths",
+        &[b"/app/test_at_paths" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] *at path smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] *at path smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_ioctl_smoke(root_id: u16) {
+    static IOCTL_SMOKE_ELF: &[u8] = include_bytes!("../../test_data/test_ioctl_smoke.elf");
+    serial_println!(
+        "[ROOT] Loading ioctl smoke test ({} bytes)...",
+        IOCTL_SMOKE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        IOCTL_SMOKE_ELF,
+        200_000,
+        512,
+        b"/app/test_ioctl_smoke",
+        &[b"/app/test_ioctl_smoke" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] ioctl smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] ioctl smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_tls_clone_smoke(root_id: u16) {
+    static TLS_CLONE_SMOKE_ELF: &[u8] = include_bytes!("../../test_data/test_tls_clone.elf");
+    serial_println!(
+        "[ROOT] Loading TLS/clone smoke test ({} bytes)...",
+        TLS_CLONE_SMOKE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        TLS_CLONE_SMOKE_ELF,
+        300_000,
+        1024,
+        b"/app/test_tls_clone",
+        &[b"/app/test_tls_clone" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] TLS/clone smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] TLS/clone smoke test load failed: error {}", e),
+    }
+}
+
+fn spawn_mux_smoke(root_id: u16) {
+    static MUX_SMOKE_ELF: &[u8] = include_bytes!("../../test_data/test_mux_smoke.elf");
+    serial_println!(
+        "[ROOT] Loading mux smoke test ({} bytes)...",
+        MUX_SMOKE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        MUX_SMOKE_ELF,
+        200_000,
+        1024,
+        b"/app/test_mux_smoke",
+        &[b"/app/test_mux_smoke" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] mux smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] mux smoke test load failed: error {}", e),
+    }
+}
+
 /// Root agent entry point.
 ///
 /// Runs an infinite loop, periodically logging a tick count and yielding
 /// to allow other agents to execute.
 pub extern "C" fn root_entry() -> ! {
     serial_println!("[ROOT] Root agent started");
-    serial_println!(
-        "[ROOT] Linux runtime smoke focus: {}",
-        focus_label()
-    );
+    serial_println!("[ROOT] Linux runtime smoke focus: {}", focus_label());
+    crate::heap::run_smoke();
     if focus_runs_java() {
         serial_println!("[ROOT] Java smoke focus: {}", java_focus_label());
     }
+
+    // Load relative *at path smoke test
+    {
+        spawn_at_paths_smoke(1);
+        spawn_ioctl_smoke(1);
+        spawn_tls_clone_smoke(1);
+        spawn_mux_smoke(1);
+    }
     const TICK_LOG_INTERVAL: u64 = 100_000;
     const ENABLE_CHECKPOINT_SMOKE: bool = false;
+    const PYTHON_CHILD_SMOKE_DELAY_TICKS: u64 = 150_000;
     const NODE_SMOKE_DELAY_TICKS: u64 = 150_000;
+    const NODE_CHILD_SMOKE_DELAY_TICKS: u64 = 450_000;
+    const NODE_THREAD_SMOKE_DELAY_TICKS: u64 = 1_200_000;
     const JAVA_SMOKE_DELAY_TICKS: u64 = 300_000;
     const JAVA_HELLO_SMOKE_DELAY_TICKS: u64 = 450_000;
     const JAVA_FS_SMOKE_DELAY_TICKS: u64 = 600_000;
     const JAVA_JAR_SMOKE_DELAY_TICKS: u64 = 300_000;
+    const JAVA_CHILD_SMOKE_DELAY_TICKS: u64 = 750_000;
+    const JAVA_THREAD_SMOKE_DELAY_TICKS: u64 = 900_000;
+    let java_phase6_focus = matches!(java_smoke_focus(), JavaSmokeFocus::Phase6);
+    let java_child_smoke_delay_ticks = if java_phase6_focus {
+        450_000
+    } else {
+        JAVA_CHILD_SMOKE_DELAY_TICKS
+    };
+    let java_thread_smoke_delay_ticks = if java_phase6_focus {
+        600_000
+    } else {
+        JAVA_THREAD_SMOKE_DELAY_TICKS
+    };
 
     // ── Stage 9: Load Linux ELF test binary ────────────────────────────
     // Done in root agent (not init) to avoid boot stack overflow.
@@ -314,6 +588,8 @@ pub extern "C" fn root_entry() -> ! {
             Err(e) => serial_println!("[ROOT] execve smoke test load failed: error {}", e),
         }
 
+        spawn_signal_smoke(1);
+
         if focus_runs_python() && linux_path_exists(b"/usr/bin/python3") {
             static PYTHON_EXECVE_ELF: &[u8] =
                 include_bytes!("../../test_data/test_python_execve.elf");
@@ -332,6 +608,10 @@ pub extern "C" fn root_entry() -> ! {
                 Ok(id) => serial_println!("[ROOT] Python smoke test agent created: id={}", id),
                 Err(e) => serial_println!("[ROOT] Python smoke test load failed: error {}", e),
             }
+            serial_println!(
+                "[ROOT] Python child-process smoke test available; delaying until root tick {}",
+                PYTHON_CHILD_SMOKE_DELAY_TICKS
+            );
         } else if !focus_runs_python() {
             serial_println!("[ROOT] Python smoke test disabled by runtime focus");
         } else {
@@ -342,6 +622,14 @@ pub extern "C" fn root_entry() -> ! {
             serial_println!(
                 "[ROOT] Node runtime installed; delaying Node smoke test until root tick {}",
                 NODE_SMOKE_DELAY_TICKS
+            );
+            serial_println!(
+                "[ROOT] Node child-process smoke test available; delaying until root tick {}",
+                NODE_CHILD_SMOKE_DELAY_TICKS
+            );
+            serial_println!(
+                "[ROOT] Node thread smoke test available; delaying until root tick {}",
+                NODE_THREAD_SMOKE_DELAY_TICKS
             );
         } else if !focus_runs_node() {
             serial_println!("[ROOT] Node smoke test disabled by runtime focus");
@@ -380,6 +668,26 @@ pub extern "C" fn root_entry() -> ! {
             } else {
                 serial_println!("[ROOT] Java JAR smoke test disabled or payload missing");
             }
+            if java_focus_runs_phase6()
+                && linux_path_exists(b"/usr/lib/atos-tests/JavaChildSmoke.class")
+            {
+                serial_println!(
+                    "[ROOT] Java child-process smoke test available; delaying until root tick {}",
+                    java_child_smoke_delay_ticks
+                );
+            } else {
+                serial_println!("[ROOT] Java child-process smoke test disabled or payload missing");
+            }
+            if java_focus_runs_phase6()
+                && linux_path_exists(b"/usr/lib/atos-tests/JavaThreadSmoke.class")
+            {
+                serial_println!(
+                    "[ROOT] Java thread smoke test available; delaying until root tick {}",
+                    java_thread_smoke_delay_ticks
+                );
+            } else {
+                serial_println!("[ROOT] Java thread smoke test disabled or payload missing");
+            }
         } else if !focus_runs_java() {
             serial_println!("[ROOT] Java smoke test disabled by runtime focus");
         } else {
@@ -390,30 +698,42 @@ pub extern "C" fn root_entry() -> ! {
     let mut count: u64 = 0;
     let mut checkpoint_done = false;
     let node_runtime_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
-    let java_runtime_available =
-        focus_runs_java()
-            && java_focus_runs_version()
-            && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java");
-    let java_hello_available =
-        focus_runs_java()
-            && java_focus_runs_hello()
-            && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-            && linux_path_exists(b"/usr/lib/atos-tests/Hello.class");
-    let java_fs_available =
-        focus_runs_java()
-            && java_focus_runs_fs()
-            && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-            && linux_path_exists(b"/usr/lib/atos-tests/FsProbe.class");
-    let java_jar_available =
-        focus_runs_java()
-            && java_focus_runs_jar()
-            && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-            && linux_path_exists(b"/usr/lib/atos-tests/java-smoke.jar");
+    let python_child_available = focus_runs_python() && linux_path_exists(b"/usr/bin/python3");
+    let node_child_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
+    let node_thread_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
+    let java_runtime_available = focus_runs_java()
+        && java_focus_runs_version()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java");
+    let java_hello_available = focus_runs_java()
+        && java_focus_runs_hello()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/atos-tests/Hello.class");
+    let java_fs_available = focus_runs_java()
+        && java_focus_runs_fs()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/atos-tests/FsProbe.class");
+    let java_jar_available = focus_runs_java()
+        && java_focus_runs_jar()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/atos-tests/java-smoke.jar");
+    let java_child_available = focus_runs_java()
+        && java_focus_runs_phase6()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/atos-tests/JavaChildSmoke.class");
+    let java_thread_available = focus_runs_java()
+        && java_focus_runs_phase6()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/atos-tests/JavaThreadSmoke.class");
+    let mut python_child_smoke_launched = false;
     let mut node_smoke_launched = false;
+    let mut node_child_smoke_launched = false;
+    let mut node_thread_smoke_launched = false;
     let mut java_smoke_launched = false;
     let mut java_hello_smoke_launched = false;
     let mut java_fs_smoke_launched = false;
     let mut java_jar_smoke_launched = false;
+    let mut java_child_smoke_launched = false;
+    let mut java_thread_smoke_launched = false;
     loop {
         count += 1;
         reap_root_children(1);
@@ -421,9 +741,33 @@ pub extern "C" fn root_entry() -> ! {
             serial_println!("[ROOT] Root agent tick {}", count);
         }
 
+        if python_child_available
+            && !python_child_smoke_launched
+            && count >= PYTHON_CHILD_SMOKE_DELAY_TICKS
+        {
+            spawn_python_child_smoke(1);
+            python_child_smoke_launched = true;
+        }
+
         if node_runtime_available && !node_smoke_launched && count >= NODE_SMOKE_DELAY_TICKS {
             spawn_node_smoke(1);
             node_smoke_launched = true;
+        }
+
+        if node_child_available
+            && !node_child_smoke_launched
+            && count >= NODE_CHILD_SMOKE_DELAY_TICKS
+        {
+            spawn_node_child_smoke(1);
+            node_child_smoke_launched = true;
+        }
+
+        if node_thread_available
+            && !node_thread_smoke_launched
+            && count >= NODE_THREAD_SMOKE_DELAY_TICKS
+        {
+            spawn_node_thread_smoke(1);
+            node_thread_smoke_launched = true;
         }
 
         if java_runtime_available && !java_smoke_launched && count >= JAVA_SMOKE_DELAY_TICKS {
@@ -447,6 +791,22 @@ pub extern "C" fn root_entry() -> ! {
         if java_jar_available && !java_jar_smoke_launched && count >= JAVA_JAR_SMOKE_DELAY_TICKS {
             spawn_java_jar_smoke(1);
             java_jar_smoke_launched = true;
+        }
+
+        if java_child_available
+            && !java_child_smoke_launched
+            && count >= java_child_smoke_delay_ticks
+        {
+            spawn_java_child_smoke(1);
+            java_child_smoke_launched = true;
+        }
+
+        if java_thread_available
+            && !java_thread_smoke_launched
+            && count >= java_thread_smoke_delay_ticks
+        {
+            spawn_java_thread_smoke(1);
+            java_thread_smoke_launched = true;
         }
 
         // Trigger a checkpoint once at tick 500

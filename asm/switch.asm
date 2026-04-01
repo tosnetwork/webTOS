@@ -29,7 +29,7 @@
 ;   128     r15
 ;   136     rflags
 ;   144     cr3
-;   152     padding
+;   152     scratch / alignment
 ;   160     fxsave area (512 bytes, 16-byte aligned)
 ;
 ; For a cooperative context switch (called from Rust code), we only need
@@ -64,6 +64,7 @@ global context_switch
 %define CTX_R15     128
 %define CTX_RFLAGS  136
 %define CTX_CR3     144
+%define CTX_SCRATCH 152
 %define CTX_FX      160
 
 context_switch:
@@ -187,8 +188,8 @@ enter_user_mode:
 ; Conventions:
 ;   RSI = pointer to AgentContext (still live from context_switch)
 ;   CTX_RCX = saved user RIP
-;   CTX_R9  = child user RSP
 ;   CTX_R11 = saved user RFLAGS
+;   CTX_SCRATCH = child user RSP
 ;
 ; The remaining general-purpose fields carry the user's visible register
 ; state at the clone return point. Caller-saved registers are best-effort;
@@ -199,14 +200,14 @@ enter_user_clone_return:
     ; Build iretq frame to return directly into the cloned thread's
     ; post-syscall user continuation.
     push qword 0x1B                 ; SS (USER_DS)
-    push qword [rax + CTX_R9]       ; RSP (child user stack)
+    push qword [rax + CTX_SCRATCH]  ; RSP (child user stack)
     push qword [rax + CTX_R11]      ; RFLAGS
     push qword 0x23                 ; CS (USER_CS)
     push qword [rax + CTX_RCX]      ; RIP (saved user return address)
 
-    ; Restore user-visible registers. RCX/R11/RDX carry syscall-return
-    ; metadata, so they are intentionally not restored to their original
-    ; pre-syscall values.
+    ; Restore user-visible registers from the syscall snapshot. The child must
+    ; observe Linux syscall semantics: same register state as the parent at
+    ; clone return, except RAX=0.
     mov rbx, [rax + CTX_RBX]
     mov rbp, [rax + CTX_RBP]
     mov rdi, [rax + CTX_RDI]

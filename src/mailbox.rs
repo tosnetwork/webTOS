@@ -10,17 +10,28 @@ use crate::agent::{
 };
 use crate::capability::{agent_has_cap, agent_try_cap, CapType};
 
-/// Maximum number of mailboxes (supports multi-mailbox: more than one per agent).
-pub const MAX_MAILBOXES: usize = MAX_AGENTS;
+/// Maximum number of mailboxes.
+///
+/// IDs in the range `0..MAX_AGENTS` remain reserved for the per-agent
+/// primary mailbox binding. Additional slots above that range are used for
+/// Linux pipe/socketpair IPC channels.
+pub const MAX_MAILBOXES: usize = 512;
 
 /// Maximum number of agents that can be blocked waiting to send on a single mailbox.
 const MAX_BLOCKED_SENDERS: usize = MAX_AGENTS;
+/// Maximum number of agents that can be blocked waiting to read from a single
+/// fd-backed mailbox.
+const MAX_BLOCKED_READERS: usize = MAX_AGENTS;
 
 /// Tracks agents blocked waiting to send on each mailbox.
 ///
 /// Safety: single-core, no preemption during access in Stage-1.
 static mut BLOCKED_SENDERS: [[Option<AgentId>; MAX_BLOCKED_SENDERS]; MAX_MAILBOXES] =
     [[None; MAX_BLOCKED_SENDERS]; MAX_MAILBOXES];
+static mut BLOCKED_READERS: [[Option<AgentId>; MAX_BLOCKED_READERS]; MAX_MAILBOXES] =
+    [[None; MAX_BLOCKED_READERS]; MAX_MAILBOXES];
+static mut MAILBOX_READER_REFS: [u16; MAX_MAILBOXES] = [0; MAX_MAILBOXES];
+static mut MAILBOX_WRITER_REFS: [u16; MAX_MAILBOXES] = [0; MAX_MAILBOXES];
 
 // ─── Message ────────────────────────────────────────────────────────────────
 
@@ -132,6 +143,9 @@ pub fn create_mailbox(id: MailboxId, owner: AgentId) -> Result<(), i64> {
             return Err(E_INVALID_ARG);
         }
         MAILBOXES[idx] = Some(Mailbox::new(id, owner));
+        MAILBOX_READER_REFS[idx] = 0;
+        MAILBOX_WRITER_REFS[idx] = 0;
+        BLOCKED_READERS[idx] = [None; MAX_BLOCKED_READERS];
         Ok(())
     }
 }
@@ -148,13 +162,34 @@ pub fn send_message(
     target_mailbox: MailboxId,
     payload: &[u8],
 ) -> Result<(), i64> {
+    send_message_inner(sender_id, target_mailbox, payload, true)
+}
+
+/// Send a message via an already-authorized Linux fd path.
+///
+/// Linux pipe/socket file descriptors carry their own authority, so the
+/// compatibility layer bypasses mailbox capability checks after fd creation.
+pub fn send_message_via_fd(
+    sender_id: AgentId,
+    target_mailbox: MailboxId,
+    payload: &[u8],
+) -> Result<(), i64> {
+    send_message_inner(sender_id, target_mailbox, payload, false)
+}
+
+fn send_message_inner(
+    sender_id: AgentId,
+    target_mailbox: MailboxId,
+    payload: &[u8],
+    check_cap: bool,
+) -> Result<(), i64> {
     // Check payload size
     if payload.len() > MAX_MESSAGE_PAYLOAD {
         return Err(E_PAYLOAD_TOO_LARGE);
     }
 
     // Check capability: sender needs CAP_SEND_MAILBOX for the target mailbox
-    if !agent_try_cap(sender_id, CapType::SendMailbox, target_mailbox) {
+    if check_cap && !agent_try_cap(sender_id, CapType::SendMailbox, target_mailbox) {
         crate::event::cap_denied(
             sender_id,
             CapType::SendMailbox as u64,
@@ -183,9 +218,14 @@ pub fn send_message(
         let msg = Message::new(sender_id, tick, payload);
         mailbox.enqueue(msg)?;
 
-        // A successful send makes data available immediately. Wake the
-        // mailbox owner if it is currently blocked in SYS_RECV.
-        crate::sched::unblock(mailbox.owner);
+        // A successful send makes data available immediately. Prefer waking a
+        // concrete fd reader that is blocked on this mailbox; fall back to the
+        // mailbox owner for the native SYS_RECV path.
+        if let Some(blocked_id) = try_unblock_reader(target_mailbox) {
+            crate::sched::unblock(blocked_id);
+        } else {
+            crate::sched::unblock(mailbox.owner);
+        }
 
         // Check for backpressure: emit MAILBOX_PRESSURE if > 75% full
         let count = mailbox.count;
@@ -207,8 +247,21 @@ pub fn send_message(
 /// Returns `Err(E_NOT_FOUND)` if the mailbox is empty (caller handles blocking).
 /// Returns `Err(E_NO_CAP)` if the agent lacks permission.
 pub fn recv_message(agent_id: AgentId, mailbox_id: MailboxId) -> Result<Message, i64> {
+    recv_message_inner(agent_id, mailbox_id, true)
+}
+
+/// Receive a message via an already-authorized Linux fd path.
+pub fn recv_message_via_fd(agent_id: AgentId, mailbox_id: MailboxId) -> Result<Message, i64> {
+    recv_message_inner(agent_id, mailbox_id, false)
+}
+
+fn recv_message_inner(
+    agent_id: AgentId,
+    mailbox_id: MailboxId,
+    check_cap: bool,
+) -> Result<Message, i64> {
     // Check capability: implicit for own mailbox, otherwise needs CAP_RECV_MAILBOX
-    if agent_id != mailbox_id {
+    if check_cap && agent_id != mailbox_id {
         if !agent_has_cap(agent_id, CapType::RecvMailbox, mailbox_id) {
             crate::event::cap_denied(agent_id, CapType::RecvMailbox as u64, mailbox_id as u64);
             return Err(E_NO_CAP);
@@ -249,6 +302,10 @@ pub fn destroy_mailbox(id: MailboxId) {
         let idx = id as usize;
         if idx < MAX_MAILBOXES {
             MAILBOXES[idx] = None;
+            MAILBOX_READER_REFS[idx] = 0;
+            MAILBOX_WRITER_REFS[idx] = 0;
+            BLOCKED_SENDERS[idx] = [None; MAX_BLOCKED_SENDERS];
+            BLOCKED_READERS[idx] = [None; MAX_BLOCKED_READERS];
         }
     }
 }
@@ -272,6 +329,70 @@ pub fn get_mailbox_owner(id: MailboxId) -> Option<AgentId> {
     get_mailbox(id).map(|m| m.owner)
 }
 
+pub fn retain_reader_fd(id: MailboxId) {
+    unsafe {
+        let idx = id as usize;
+        if idx >= MAX_MAILBOXES || MAILBOXES[idx].is_none() {
+            return;
+        }
+        MAILBOX_READER_REFS[idx] = MAILBOX_READER_REFS[idx].saturating_add(1);
+    }
+}
+
+pub fn retain_writer_fd(id: MailboxId) {
+    unsafe {
+        let idx = id as usize;
+        if idx >= MAX_MAILBOXES || MAILBOXES[idx].is_none() {
+            return;
+        }
+        MAILBOX_WRITER_REFS[idx] = MAILBOX_WRITER_REFS[idx].saturating_add(1);
+    }
+}
+
+pub fn release_reader_fd(id: MailboxId) {
+    unsafe {
+        let idx = id as usize;
+        if idx >= MAX_MAILBOXES || MAILBOXES[idx].is_none() {
+            return;
+        }
+        MAILBOX_READER_REFS[idx] = MAILBOX_READER_REFS[idx].saturating_sub(1);
+        if idx >= MAX_AGENTS && MAILBOX_READER_REFS[idx] == 0 && MAILBOX_WRITER_REFS[idx] == 0 {
+            destroy_mailbox(id);
+        }
+    }
+}
+
+pub fn release_writer_fd(id: MailboxId) {
+    unsafe {
+        let idx = id as usize;
+        if idx >= MAX_MAILBOXES || MAILBOXES[idx].is_none() {
+            return;
+        }
+        MAILBOX_WRITER_REFS[idx] = MAILBOX_WRITER_REFS[idx].saturating_sub(1);
+        try_unblock_all_readers(id);
+        if let Some(mailbox) = MAILBOXES[idx].as_ref() {
+            crate::sched::unblock(mailbox.owner);
+        }
+        if idx >= MAX_AGENTS && MAILBOX_READER_REFS[idx] == 0 && MAILBOX_WRITER_REFS[idx] == 0 {
+            destroy_mailbox(id);
+        }
+    }
+}
+
+pub fn mailbox_has_writers(id: MailboxId) -> bool {
+    unsafe {
+        let idx = id as usize;
+        idx < MAX_MAILBOXES && MAILBOXES[idx].is_some() && MAILBOX_WRITER_REFS[idx] > 0
+    }
+}
+
+pub fn mailbox_fd_read_ready(id: MailboxId) -> bool {
+    match get_mailbox(id) {
+        Some(mailbox) => !mailbox.is_empty() || !mailbox_has_writers(id),
+        None => true,
+    }
+}
+
 /// Register an agent as blocked waiting to send on a mailbox.
 ///
 /// Called when sys_send_blocking encounters a full mailbox.
@@ -284,6 +405,40 @@ pub fn add_blocked_sender(mailbox_id: MailboxId, agent_id: AgentId) {
         for slot in BLOCKED_SENDERS[idx].iter_mut() {
             if slot.is_none() {
                 *slot = Some(agent_id);
+                return;
+            }
+        }
+    }
+}
+
+/// Register an agent as blocked waiting to read from an fd-backed mailbox.
+pub fn add_blocked_reader(mailbox_id: MailboxId, agent_id: AgentId) {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_MAILBOXES {
+            return;
+        }
+        for slot in BLOCKED_READERS[idx].iter_mut() {
+            if *slot == Some(agent_id) {
+                return;
+            }
+            if slot.is_none() {
+                *slot = Some(agent_id);
+                return;
+            }
+        }
+    }
+}
+
+fn remove_blocked_reader(mailbox_id: MailboxId, agent_id: AgentId) {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_MAILBOXES {
+            return;
+        }
+        for slot in BLOCKED_READERS[idx].iter_mut() {
+            if *slot == Some(agent_id) {
+                *slot = None;
                 return;
             }
         }
@@ -333,6 +488,52 @@ pub fn try_unblock_sender(mailbox_id: MailboxId) -> Option<AgentId> {
     }
 }
 
+/// Try to unblock one fd reader waiting on a mailbox.
+///
+/// Returns the lowest agent id among still-blocked readers for deterministic
+/// wake ordering.
+pub fn try_unblock_reader(mailbox_id: MailboxId) -> Option<AgentId> {
+    unsafe {
+        let idx = mailbox_id as usize;
+        if idx >= MAX_MAILBOXES {
+            return None;
+        }
+
+        let mut best: Option<AgentId> = None;
+        for slot in BLOCKED_READERS[idx].iter_mut() {
+            let Some(agent_id) = *slot else {
+                continue;
+            };
+            let still_blocked = crate::agent::get_agent(agent_id)
+                .map(|agent| agent.status == AgentStatus::BlockedRecv)
+                .unwrap_or(false);
+            if !still_blocked {
+                *slot = None;
+                continue;
+            }
+            if best.map(|current| agent_id < current).unwrap_or(true) {
+                best = Some(agent_id);
+            }
+        }
+
+        if let Some(agent_id) = best {
+            remove_blocked_reader(mailbox_id, agent_id);
+            Some(agent_id)
+        } else {
+            None
+        }
+    }
+}
+
+/// Unblock every reader waiting on a mailbox.
+///
+/// Used when the last writer goes away so blocked readers can observe EOF.
+pub fn try_unblock_all_readers(mailbox_id: MailboxId) {
+    while let Some(agent_id) = try_unblock_reader(mailbox_id) {
+        crate::sched::unblock(agent_id);
+    }
+}
+
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 /// Get the current tick count.
@@ -351,6 +552,22 @@ fn get_current_tick() -> Tick {
 pub fn find_free_mailbox_id() -> Option<MailboxId> {
     unsafe {
         for i in 0..MAX_MAILBOXES {
+            if MAILBOXES[i].is_none() {
+                return Some(i as MailboxId);
+            }
+        }
+        None
+    }
+}
+
+/// Find the next available auxiliary mailbox ID.
+///
+/// These slots are reserved for IPC objects such as Linux pipes and
+/// socketpairs so they do not collide with the per-agent primary mailbox
+/// namespace.
+pub fn find_free_aux_mailbox_id() -> Option<MailboxId> {
+    unsafe {
+        for i in MAX_AGENTS..MAX_MAILBOXES {
             if MAILBOXES[i].is_none() {
                 return Some(i as MailboxId);
             }

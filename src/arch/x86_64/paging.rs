@@ -364,6 +364,18 @@ pub fn read_cr3() -> u64 {
     cr3
 }
 
+/// Load a new page-table root into CR3.
+#[inline]
+pub fn write_cr3(pml4_phys: u64) {
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) pml4_phys,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 // ─── Per-agent page table management ─────────────────────────────────────
 
 /// Page table entry flags

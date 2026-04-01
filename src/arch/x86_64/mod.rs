@@ -16,6 +16,7 @@ pub mod kaslr;
 pub mod lapic;
 pub mod nvme;
 pub mod paging;
+pub mod page_table;
 pub mod pci;
 pub mod security;
 pub mod serial;
