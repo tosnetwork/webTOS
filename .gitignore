@@ -2,3 +2,4 @@
 **/target/
 Cargo.lock
 base_image.runtime.manifest
+.codex/
