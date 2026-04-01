@@ -93,7 +93,7 @@ brew install nasm qemu
 ### Build & Run
 
 ```bash
-git clone https://gitlab.com/atos-im/tos.git
+git clone https://github.com/tosnetwork/tos.git
 cd tos
 make run
 ```
