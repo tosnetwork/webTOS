@@ -130,7 +130,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     } else if multiboot_magic == MULTIBOOT_MAGIC && multiboot_info != 0 {
         let info_ptr = multiboot_info as *const u32;
         let flags = unsafe { core::ptr::read_unaligned(info_ptr) };
-        if flags & (1 << 0) != 0 {
+        if flags & (1 << 1) != 0 {
             let mem_upper_kib = unsafe { core::ptr::read_unaligned(info_ptr.add(2)) };
             let total_bytes = 1024usize * 1024usize + (mem_upper_kib as usize) * 1024usize;
             serial_println!(

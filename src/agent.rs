@@ -13,7 +13,7 @@ pub type Tick = u64;
 pub type EnergyUnit = u64;
 pub type KeyspaceId = u16;
 
-pub const MAX_AGENTS: usize = 64;
+pub const MAX_AGENTS: usize = 128;
 pub const IDLE_AGENT_ID: AgentId = 0;
 pub const ROOT_AGENT_ID: AgentId = 1;
 pub const MAX_MAILBOX_CAPACITY: usize = 16;
@@ -181,8 +181,8 @@ pub struct AgentContext {
     pub r15: u64,
     pub rflags: u64,
     pub cr3: u64,
-    /// Padding so the FXSAVE area starts on a 16-byte boundary.
-    pub _fpu_pad: u64,
+    /// Scratch slot used by arch trampolines.
+    pub scratch: u64,
     /// Per-agent x87/SSE state saved by the scheduler.
     pub fpu_state: [u8; 512],
 }
@@ -210,7 +210,7 @@ impl AgentContext {
             r15: 0,
             rflags: 0,
             cr3: 0,
-            _fpu_pad: 0,
+            scratch: 0,
             fpu_state: [0; 512],
         }
     }
@@ -245,6 +245,7 @@ pub struct Agent {
     pub mode: AgentMode,
     pub kernel_stack_top: u64,
     pub stack_bottom: u64, // address of stack guard canary (lowest stack address)
+    pub saved_syscall_frame: u64,
     pub active: bool,      // whether this slot is in use
     pub priority: AgentPriority,
     // Stage 9: receipt state roots – snapshot of keyspace root at agent creation
@@ -280,6 +281,7 @@ impl Agent {
             mode: AgentMode::Kernel,
             kernel_stack_top: 0,
             stack_bottom: 0,
+            saved_syscall_frame: 0,
             active: true,
             priority: AgentPriority::Normal,
             initial_state_root: [0u8; 32],
@@ -293,6 +295,43 @@ impl Agent {
 // Safety: single-core, no preemption during table access in Stage-1.
 static mut AGENT_TABLE: [Option<Agent>; MAX_AGENTS] = [const { None }; MAX_AGENTS];
 static mut NEXT_AGENT_ID: AgentId = 0;
+
+#[inline]
+fn is_linux_child_group_leader(agent: &Agent) -> bool {
+    match crate::linux_compat::state::get_state(agent.id) {
+        Some(st) => st.thread_group_leader == agent.id,
+        None => true,
+    }
+}
+
+fn linux_group_has_other_active_members(agent: &Agent) -> bool {
+    let Some(st) = crate::linux_compat::state::get_state(agent.id) else {
+        return false;
+    };
+    let group_pid = st.pid;
+
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(other) = slot {
+                if other.id == agent.id || !other.active {
+                    continue;
+                }
+                if let Some(other_st) = crate::linux_compat::state::get_state(other.id) {
+                    if other_st.pid == group_pid {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+#[inline]
+fn is_waitable_linux_child(agent: &Agent) -> bool {
+    is_linux_child_group_leader(agent) && !linux_group_has_other_active_members(agent)
+}
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -490,6 +529,7 @@ pub fn find_terminated_child(
                 if !agent.active
                     && agent.parent_id == Some(parent_id)
                     && (agent.status == AgentStatus::Exited || agent.status == AgentStatus::Faulted)
+                    && is_waitable_linux_child(agent)
                 {
                     if specific_pid > 0 {
                         if agent.id == specific_pid as AgentId {
@@ -525,7 +565,10 @@ pub fn is_child_of_any_state(child_id: AgentId, parent_id: AgentId) -> bool {
     unsafe {
         for slot in AGENT_TABLE.iter() {
             if let Some(agent) = slot {
-                if agent.id == child_id && agent.parent_id == Some(parent_id) {
+                if agent.id == child_id
+                    && agent.parent_id == Some(parent_id)
+                    && is_linux_child_group_leader(agent)
+                {
                     return true;
                 }
             }
@@ -542,11 +585,50 @@ pub fn reap_agent(id: AgentId) {
             if let Some(agent) = slot {
                 if agent.id == id && !agent.active {
                     agent.context.cr3 = 0;
+                    crate::linux_compat::state::remove_state(id);
                     *slot = None;
                     return;
                 }
             }
         }
+    }
+}
+
+/// Collect all agent IDs currently present in the agent table, including
+/// inactive/exited entries that still occupy a slot until reap.
+///
+/// This is the safe enumeration primitive for Linux thread-group logic.
+/// Agent IDs are monotonically increasing and are not bounded by `MAX_AGENTS`,
+/// so callers must not scan `0..MAX_AGENTS` and treat that as a tid range.
+pub fn collect_agent_ids_any_state(ids: &mut [Option<AgentId>; MAX_AGENTS]) -> usize {
+    let mut count = 0usize;
+    unsafe {
+        for slot in AGENT_TABLE.iter() {
+            if let Some(agent) = slot {
+                if count < ids.len() {
+                    ids[count] = Some(agent.id);
+                    count += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Reap a terminated agent immediately when it is not Linux-waitable.
+///
+/// This is used for CLONE_THREAD-style worker tasks that should disappear once
+/// they exit, rather than remaining in the global agent table until an
+/// external wait/reap path observes them.
+pub fn auto_reap_if_unwaitable(id: AgentId) {
+    let should_reap = match get_agent_any_state(id) {
+        Some(agent) => !agent.active && !is_waitable_linux_child(agent),
+        None => false,
+    };
+    if should_reap {
+        reap_agent(id);
     }
 }
 

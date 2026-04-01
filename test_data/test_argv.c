@@ -48,6 +48,15 @@ static void print_num(u64 n) {
     sys_write(1, rev, i);
 }
 
+static int streq(const char *a, const char *b) {
+    u64 i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) return 0;
+        i++;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
 static int pass_count = 0;
 static int fail_count = 0;
 
@@ -159,20 +168,44 @@ void _start(void) {
     int found_pagesz = 0;
     int found_random = 0;
     int found_uid = 0;
+    int found_entry = 0;
+    int found_execfn = 0;
+    int found_platform = 0;
+    int found_hwcap = 0;
+    int found_hwcap2 = 0;
+    int found_clktck = 0;
     u64 pagesz_val = 0;
+    u64 clktck_val = 0;
+    char *execfn = (char *)0;
+    char *platform = (char *)0;
 
     u64 *aux = p;
     while (aux[0] != 0) { /* AT_NULL = 0 */
+        if (aux[0] == 15) { found_platform = 1; platform = (char *)aux[1]; }
+        if (aux[0] == 16) { found_hwcap = 1; }
+        if (aux[0] == 17) { found_clktck = 1; clktck_val = aux[1]; }
         if (aux[0] == 6) { found_pagesz = 1; pagesz_val = aux[1]; }
         if (aux[0] == 25) { found_random = 1; }
+        if (aux[0] == 26) { found_hwcap2 = 1; }
         if (aux[0] == 11) { found_uid = 1; }
+        if (aux[0] == 9) { found_entry = 1; }
+        if (aux[0] == 31) { found_execfn = 1; execfn = (char *)aux[1]; }
         aux += 2;
     }
 
     check("auxv has AT_PAGESZ", found_pagesz);
     check("AT_PAGESZ == 4096", pagesz_val == 4096);
+    check("auxv has AT_PLATFORM", found_platform);
+    check("AT_PLATFORM == x86_64", platform != (char *)0 && streq(platform, "x86_64"));
+    check("auxv has AT_HWCAP", found_hwcap);
+    check("auxv has AT_HWCAP2", found_hwcap2);
+    check("auxv has AT_CLKTCK", found_clktck);
+    check("AT_CLKTCK == 100", clktck_val == 100);
     check("auxv has AT_RANDOM", found_random);
     check("auxv has AT_UID", found_uid);
+    check("auxv has AT_ENTRY", found_entry);
+    check("auxv has AT_EXECFN", found_execfn);
+    check("AT_EXECFN matches exe path", execfn != (char *)0 && streq(execfn, "/app/test_argv"));
 
     /* Summary */
     print("\n=== Results: ");

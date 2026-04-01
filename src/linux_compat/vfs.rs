@@ -23,6 +23,20 @@ pub enum SpecialFile {
     Urandom,
     /// `/proc/self/exe` — returns the agent binary path.
     ProcSelfExe,
+    /// `/proc/self/maps` — synthetic VMA listing.
+    ProcSelfMaps,
+    /// `/proc/self/cgroup` — synthetic cgroup membership.
+    ProcSelfCgroup,
+    /// `/proc/meminfo` — synthetic memory summary.
+    ProcMeminfo,
+    /// `/proc/version_signature` — distro-style version probe.
+    ProcVersionSignature,
+    /// `/sys/devices/system/cpu/online` — synthetic online CPU range.
+    SysCpuOnline,
+    /// `/sys/fs/cgroup/memory.max` — synthetic cgroup memory ceiling.
+    SysCgroupMemoryMax,
+    /// `/sys/fs/cgroup/memory.high` — synthetic cgroup memory high watermark.
+    SysCgroupMemoryHigh,
 }
 
 /// Logical namespaces inside the shared base image keyspace.
@@ -51,6 +65,20 @@ pub fn is_special_path(path: &[u8]) -> Option<SpecialFile> {
         Some(SpecialFile::Urandom)
     } else if path == b"/proc/self/exe" {
         Some(SpecialFile::ProcSelfExe)
+    } else if path == b"/proc/self/maps" {
+        Some(SpecialFile::ProcSelfMaps)
+    } else if path == b"/proc/self/cgroup" {
+        Some(SpecialFile::ProcSelfCgroup)
+    } else if path == b"/proc/meminfo" {
+        Some(SpecialFile::ProcMeminfo)
+    } else if path == b"/proc/version_signature" {
+        Some(SpecialFile::ProcVersionSignature)
+    } else if path == b"/sys/devices/system/cpu/online" {
+        Some(SpecialFile::SysCpuOnline)
+    } else if path == b"/sys/fs/cgroup/memory.max" {
+        Some(SpecialFile::SysCgroupMemoryMax)
+    } else if path == b"/sys/fs/cgroup/memory.high" {
+        Some(SpecialFile::SysCgroupMemoryHigh)
     } else {
         None
     }

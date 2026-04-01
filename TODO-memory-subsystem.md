@@ -13,7 +13,17 @@ structure.
   allocation for small objects.
 - Cleanly separate Linux VMA policy from low-level page table operations.
 
+## Status Summary
+
+- Phase 0: completed
+- Phase 1: completed
+- Phase 2: completed
+- Phase 3: completed
+- Phase 4: completed
+
 ## Phase 0: Lock External Interfaces
+
+Status: completed
 
 Keep the current public paging API stable while swapping internal
 implementations:
@@ -76,7 +86,7 @@ Validation:
 
 ## Phase 3: Replace Kernel Heap with Slab Allocation
 
-Status: in progress
+Status: completed
 
 Target:
 
@@ -97,6 +107,11 @@ Current progress:
   caches for the configured size classes.
 - Large allocations now use contiguous frame allocation with allocator-local
   headers for aligned deallocation.
+- Added allocator-native `alloc_zeroed` and `realloc` handling so common
+  collection growth patterns can stay in-place when they remain within the
+  same slab class or large allocation span.
+- Added a boot-time kernel heap smoke that exercises `Box`, `Vec`, `String`,
+  and `BTreeMap` allocation patterns.
 - Short QEMU boot and Java smoke still advance with the slab allocator enabled.
 
 Validation:
@@ -105,6 +120,8 @@ Validation:
 - Kernel heap fragmentation is reduced.
 
 ## Phase 4: Split VMA Policy from Page Table Operations
+
+Status: completed
 
 Target:
 
@@ -116,6 +133,21 @@ Expected work:
 - Keep Linux VMA policy in `src/linux_compat/memory.rs`.
 - Move low-level page walking, map/unmap, and protect logic into a dedicated
   page-table backend.
+
+Current progress:
+
+- Added `src/arch/x86_64/page_table.rs` as the low-level x86_64 page-table
+  backend for raw leaf walking, address translation, and leaf remap/unmap
+  operations.
+- Removed Linux-specific page-table walk helpers from
+  `src/linux_compat/memory.rs` so that file/anon VMA policy stays separate
+  from raw PTE traversal.
+- Routed page fault fill, `munmap`, `mprotect`, `brk`, and `madvise` through
+  the page-table backend while keeping VMA ownership and protection policy in
+  `src/linux_compat/memory.rs`.
+- Reused the same page-table backend in `src/agent_loader.rs` and
+  `src/linux_compat/process.rs` so user-memory copies and loader stack setup no
+  longer maintain their own ad-hoc page-table walkers.
 
 Validation:
 

@@ -8,6 +8,126 @@ use super::constants::*;
 use super::state::{self, FdEntry, FdKind};
 use crate::agent::MAX_MESSAGE_PAYLOAD;
 
+const O_ACCMODE: u32 = 3;
+const SOL_SOCKET: u64 = 1;
+const SO_TYPE: u64 = 3;
+const SO_PROTOCOL: u64 = 38;
+const SO_DOMAIN: u64 = 39;
+const SOCK_TYPE_MASK: u64 = 0xf;
+const SOCK_STREAM: u32 = 1;
+
+fn agent_cr3(agent_id: u16) -> Option<u64> {
+    crate::agent::get_agent(agent_id)
+        .map(|agent| agent.context.cr3)
+        .filter(|cr3| *cr3 != 0)
+}
+
+fn ensure_user_range_mapped(agent_id: u16, user_addr: u64, len: usize, write: bool) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if len == 0 {
+        return true;
+    }
+
+    let start = user_addr & !(crate::arch::x86_64::paging::PAGE_SIZE as u64 - 1);
+    let end_addr = user_addr.saturating_add(len.saturating_sub(1) as u64);
+    let end = end_addr & !(crate::arch::x86_64::paging::PAGE_SIZE as u64 - 1);
+    let mut page = start;
+    let fault_code = if write { 0x2 } else { 0x0 };
+
+    loop {
+        if crate::arch::x86_64::page_table::translate_user_vaddr(cr3, page).is_none()
+            && !crate::linux_compat::memory::handle_user_page_fault(agent_id, page, fault_code)
+        {
+            return false;
+        }
+        if page == end {
+            break;
+        }
+        page = page.saturating_add(crate::arch::x86_64::paging::PAGE_SIZE as u64);
+    }
+
+    true
+}
+
+fn copy_to_user(agent_id: u16, user_addr: u64, src: &[u8]) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if !ensure_user_range_mapped(agent_id, user_addr, src.len(), true) {
+        return false;
+    }
+    crate::arch::x86_64::page_table::copy_to_user(cr3, user_addr, src)
+}
+
+fn copy_from_user(agent_id: u16, user_addr: u64, dst: &mut [u8]) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if !ensure_user_range_mapped(agent_id, user_addr, dst.len(), false) {
+        return false;
+    }
+    crate::arch::x86_64::page_table::copy_from_user(cr3, user_addr, dst)
+}
+
+fn read_user_u64(agent_id: u16, user_addr: u64) -> Option<u64> {
+    let mut bytes = [0u8; 8];
+    copy_from_user(agent_id, user_addr, &mut bytes).then(|| u64::from_ne_bytes(bytes))
+}
+
+fn read_user_u32(agent_id: u16, user_addr: u64) -> Option<u32> {
+    let mut bytes = [0u8; 4];
+    copy_from_user(agent_id, user_addr, &mut bytes).then(|| u32::from_ne_bytes(bytes))
+}
+
+fn read_user_u16(agent_id: u16, user_addr: u64) -> Option<u16> {
+    let mut bytes = [0u8; 2];
+    copy_from_user(agent_id, user_addr, &mut bytes).then(|| u16::from_ne_bytes(bytes))
+}
+
+fn read_msghdr_first_iov(agent_id: u16, msg_ptr: u64) -> Result<Option<(u64, u64)>, i64> {
+    let Some(iov_ptr) = read_user_u64(agent_id, msg_ptr + 16) else {
+        return Err(-EFAULT);
+    };
+    let Some(iov_len) = read_user_u64(agent_id, msg_ptr + 24) else {
+        return Err(-EFAULT);
+    };
+    if iov_len == 0 || iov_ptr == 0 {
+        return Ok(None);
+    }
+
+    let Some(iov_base) = read_user_u64(agent_id, iov_ptr) else {
+        return Err(-EFAULT);
+    };
+    let Some(iov_buf_len) = read_user_u64(agent_id, iov_ptr + 8) else {
+        return Err(-EFAULT);
+    };
+    Ok(Some((iov_base, iov_buf_len)))
+}
+
+fn fd_access_mode(flags: u32) -> u32 {
+    flags & O_ACCMODE
+}
+
+fn fd_allows_read(kind: FdKind, flags: u32) -> bool {
+    match kind {
+        FdKind::Directory => true,
+        FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_WRONLY,
+        FdKind::Socket | FdKind::EventFd => true,
+        FdKind::Epoll => false,
+    }
+}
+
+fn fd_allows_write(kind: FdKind, flags: u32) -> bool {
+    match kind {
+        FdKind::Directory => false,
+        FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_RDONLY,
+        FdKind::Socket | FdKind::EventFd => true,
+        FdKind::Epoll => false,
+    }
+}
+
 // ── Network I/O replay buffer ─────────────────────────────────────────────
 
 const MAX_NET_IO_LOG: usize = 256;
@@ -84,7 +204,9 @@ fn replay_network_recv(agent_id: u16, buf_ptr: u64, count: u64) -> i64 {
             let entry = &mut NET_IO_LOG[i];
             if entry.active && !entry.is_send && entry.agent_id == agent_id {
                 let copy_len = (entry.len as usize).min(count as usize);
-                core::ptr::copy_nonoverlapping(entry.data.as_ptr(), buf_ptr as *mut u8, copy_len);
+                if !copy_to_user(agent_id, buf_ptr, &entry.data[..copy_len]) {
+                    return -EFAULT;
+                }
                 // Mark consumed so it won't be replayed again
                 entry.active = false;
                 return copy_len as i64;
@@ -102,15 +224,41 @@ const AF_INET: i32 = 2;
 /// Sentinel keyspace_key indicating an AF_UNIX socket.
 const AF_UNIX_MARKER: u64 = 0xFFFF_FFFF;
 
+fn write_sockaddr_to_user(
+    agent_id: u16,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    addr_bytes: &[u8],
+) -> i64 {
+    if addr_ptr == 0 || addrlen_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let Some(user_len) = read_user_u32(agent_id, addrlen_ptr) else {
+        return -EFAULT;
+    };
+    let copy_len = (user_len as usize).min(addr_bytes.len());
+    if copy_len > 0 && !copy_to_user(agent_id, addr_ptr, &addr_bytes[..copy_len]) {
+        return -EFAULT;
+    }
+    if !copy_to_user(agent_id, addrlen_ptr, &(addr_bytes.len() as u32).to_ne_bytes()) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// Marker for local socketpair byte-stream endpoints.
+const SOCKETPAIR_STREAM_MARKER: u64 = super::constants::SOCKETPAIR_STREAM_MARKER;
+
 /// Netd's mailbox ID (agent 9).
 const NETD_MAILBOX: u16 = 9;
 
 /// Socket fd flag: listening (set by listen()).
 const FD_FLAG_LISTENING: u32 = 0x0100_0000;
 /// Socket fd flag: shutdown read side.
-const FD_FLAG_SHUT_RD: u32 = 0x0200_0000;
+pub const FD_FLAG_SHUT_RD: u32 = 0x0200_0000;
 /// Socket fd flag: shutdown write side.
-const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
+pub const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
 
 // ── socket ─────────────────────────────────────────────────────────────────
 
@@ -119,7 +267,7 @@ const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
 /// Allocates an fd with FdKind::Socket. The mailbox_id is set to the agent's
 /// own mailbox for now; actual netd proxy routing happens on connect().
 pub fn sys_socket(agent_id: u16, domain: i32, _sock_type: i32, _protocol: i32) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -138,7 +286,7 @@ pub fn sys_socket(agent_id: u16, domain: i32, _sock_type: i32, _protocol: i32) -
         keyspace_id: 0,
         mailbox_id: agent_id, // will be updated on connect
         offset: 0,
-        flags: 0,
+        flags: O_RDWR | (_sock_type as u32 & (O_NONBLOCK | O_CLOEXEC)),
         active: true,
     });
 
@@ -154,7 +302,7 @@ pub fn sys_socket(agent_id: u16, domain: i32, _sock_type: i32, _protocol: i32) -
 pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
     const ECONNREFUSED: i64 = 111;
 
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -175,15 +323,14 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
     }
 
     // Read sockaddr_in from user memory: family(u16) + port(u16) + ip(u32)
-    let (port, ip) = unsafe {
-        let p = addr_ptr as *const u8;
-        // sin_family at offset 0 (u16) — we don't validate, just skip
-        // sin_port at offset 2 (u16, network byte order / big-endian)
-        let port = u16::from_be_bytes([*p.add(2), *p.add(3)]);
-        // sin_addr at offset 4 (u32, network byte order)
-        let ip = u32::from_be_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)]);
-        (port, ip)
+    let Some(port_raw) = read_user_u16(agent_id, addr_ptr + 2) else {
+        return -EFAULT;
     };
+    let Some(ip_raw) = read_user_u32(agent_id, addr_ptr + 4) else {
+        return -EFAULT;
+    };
+    let port = u16::from_be(port_raw);
+    let ip = u32::from_be(ip_raw);
 
     // Pack ip:port into keyspace_key — ip in upper 32 bits, port in lower 16
     let packed = ((ip as u64) << 16) | (port as u64);
@@ -199,7 +346,7 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
 
 /// accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -242,7 +389,7 @@ pub fn sys_sendto(
     _dest_addr: u64,
     _addrlen: u64,
 ) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -259,7 +406,10 @@ pub fn sys_sendto(
 
     // Read user data
     let data_len = (len as usize).min(MAX_MESSAGE_PAYLOAD - 32);
-    let data = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, data_len) };
+    let mut data = [0u8; MAX_MESSAGE_PAYLOAD];
+    if !copy_from_user(agent_id, buf_ptr, &mut data[..data_len]) {
+        return -EFAULT;
+    }
 
     // Build URL from packed ip:port in keyspace_key
     let port = (packed_addr & 0xFFFF) as u16;
@@ -306,7 +456,7 @@ pub fn sys_sendto(
         pos += 1;
         msg[pos] = body_len_bytes[1];
         pos += 1; // body_len
-        msg[pos..pos + data_len].copy_from_slice(data);
+        msg[pos..pos + data_len].copy_from_slice(&data[..data_len]);
         pos += data_len; // body
     }
 
@@ -319,7 +469,7 @@ pub fn sys_sendto(
         crate::checkpoint::TRACE_NET_SEND,
         agent_id,
     );
-    record_network_io(agent_id, data, true);
+    record_network_io(agent_id, &data[..data_len], true);
 
     data_len as i64
 }
@@ -338,7 +488,7 @@ pub fn sys_recvfrom(
     _addrlen_ptr: u64,
 ) -> i64 {
     let fd_flags = {
-        let st = match state::get_state(agent_id) {
+        let st = match state::get_files_state(agent_id) {
             Some(s) => s,
             None => return -EBADF,
         };
@@ -365,7 +515,9 @@ pub fn sys_recvfrom(
             let payload_len = msg.len as usize;
             let copy_len = payload_len.min(len as usize);
             unsafe {
-                core::ptr::copy_nonoverlapping(msg.payload.as_ptr(), buf_ptr as *mut u8, copy_len);
+                        if !copy_to_user(agent_id, buf_ptr, &msg.payload[..copy_len]) {
+                            return -EFAULT;
+                        }
             }
             // Record the received data for replay determinism
             crate::checkpoint::record_trace(
@@ -387,12 +539,8 @@ pub fn sys_recvfrom(
                 Ok(msg) => {
                     let payload_len = msg.len as usize;
                     let copy_len = payload_len.min(len as usize);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            msg.payload.as_ptr(),
-                            buf_ptr as *mut u8,
-                            copy_len,
-                        );
+                    if !copy_to_user(agent_id, buf_ptr, &msg.payload[..copy_len]) {
+                        return -EFAULT;
                     }
                     // Record the received data for replay determinism
                     crate::checkpoint::record_trace(
@@ -425,21 +573,12 @@ pub fn sys_sendmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
     //   msg_iov:        *iovec      (offset 16, 8 bytes)
     //   msg_iovlen:     size_t      (offset 24, 8 bytes)
     // struct iovec: { iov_base: *void (8), iov_len: size_t (8) }
-    unsafe {
-        let p = msg_ptr as *const u8;
-        let iov_ptr = core::ptr::read_unaligned(p.add(16) as *const u64);
-        let iov_len = core::ptr::read_unaligned(p.add(24) as *const u64);
-
-        if iov_len == 0 || iov_ptr == 0 {
-            return 0;
+    match read_msghdr_first_iov(agent_id, msg_ptr) {
+        Ok(Some((iov_base, iov_buf_len))) => {
+            sys_sendto(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
         }
-
-        // Read first iovec
-        let iov = iov_ptr as *const u8;
-        let iov_base = core::ptr::read_unaligned(iov as *const u64);
-        let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
-
-        sys_sendto(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
+        Ok(None) => 0,
+        Err(err) => err,
     }
 }
 
@@ -452,20 +591,12 @@ pub fn sys_recvmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
     }
 
     // Extract first iovec from msghdr (same layout as sendmsg)
-    unsafe {
-        let p = msg_ptr as *const u8;
-        let iov_ptr = core::ptr::read_unaligned(p.add(16) as *const u64);
-        let iov_len = core::ptr::read_unaligned(p.add(24) as *const u64);
-
-        if iov_len == 0 || iov_ptr == 0 {
-            return 0;
+    match read_msghdr_first_iov(agent_id, msg_ptr) {
+        Ok(Some((iov_base, iov_buf_len))) => {
+            sys_recvfrom(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
         }
-
-        let iov = iov_ptr as *const u8;
-        let iov_base = core::ptr::read_unaligned(iov as *const u64);
-        let iov_buf_len = core::ptr::read_unaligned(iov.add(8) as *const u64);
-
-        sys_recvfrom(agent_id, sockfd, iov_base, iov_buf_len, flags, 0, 0)
+        Ok(None) => 0,
+        Err(err) => err,
     }
 }
 
@@ -475,7 +606,7 @@ pub fn sys_recvmsg(agent_id: u16, sockfd: i32, msg_ptr: u64, flags: u64) -> i64 
 ///
 /// how: 0 = SHUT_RD, 1 = SHUT_WR, 2 = SHUT_RDWR
 pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -503,7 +634,7 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
 ///
 /// Stores the bind port in the fd's keyspace_key field.
 pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -519,10 +650,10 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64
     }
 
     // Read sin_port from sockaddr_in (offset 2, network byte order)
-    let port = unsafe {
-        let p = addr_ptr as *const u8;
-        u16::from_be_bytes([*p.add(2), *p.add(3)])
+    let Some(port_raw) = read_user_u16(agent_id, addr_ptr + 2) else {
+        return -EFAULT;
     };
+    let port = u16::from_be(port_raw);
 
     let entry = st.get_fd_mut(sockfd).unwrap();
     entry.keyspace_key = port as u64;
@@ -536,7 +667,7 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64
 ///
 /// Marks the socket fd as listening.
 pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -559,39 +690,27 @@ pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
 ///
 /// Returns a zeroed sockaddr_in (AF_INET, port 0, addr 0.0.0.0).
 pub fn sys_getsockname(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u64) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
 
     match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
+        Some(entry) if entry.kind == FdKind::Socket => {
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER || entry.keyspace_key == AF_UNIX_MARKER {
+                let addr = (AF_UNIX as u16).to_ne_bytes();
+                return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
+            }
+        }
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
     }
 
-    if addr_ptr == 0 || addrlen_ptr == 0 {
-        return -EFAULT;
-    }
-
     // Write a minimal sockaddr_in: AF_INET (2), port 0, addr 0.0.0.0
     // struct sockaddr_in is 16 bytes
-    unsafe {
-        let p = addr_ptr as *mut u8;
-        core::ptr::write_bytes(p, 0, 16);
-        // sa_family = AF_INET = 2 (u16 at offset 0)
-        let af_inet: u16 = 2;
-        core::ptr::copy_nonoverlapping(&af_inet as *const u16 as *const u8, p, 2);
-        // Write addrlen = 16
-        let addrlen: u32 = 16;
-        core::ptr::copy_nonoverlapping(
-            &addrlen as *const u32 as *const u8,
-            addrlen_ptr as *mut u8,
-            4,
-        );
-    }
-
-    0
+    let mut addr = [0u8; 16];
+    addr[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr)
 }
 
 // ── getpeername ─────────────────────────────────────────────────────────────
@@ -616,10 +735,22 @@ pub fn sys_socketpair(
         return -EFAULT;
     }
 
-    let st = match state::get_state_mut(agent_id) {
+    let ab = match state::alloc_pipe() {
+        Some(handle) => handle,
+        None => return -ENOSPC,
+    };
+    let ba = match state::alloc_pipe() {
+        Some(handle) => handle,
+        None => {
+            return -ENOSPC;
+        }
+    };
+
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
+    let fd_flags = O_RDWR | (_sock_type as u32 & (O_NONBLOCK | O_CLOEXEC));
 
     let fd0 = match st.alloc_fd() {
         Some(f) => f,
@@ -627,35 +758,55 @@ pub fn sys_socketpair(
     };
     st.fd_table[fd0] = Some(FdEntry {
         kind: FdKind::Socket,
-        keyspace_key: 0,
-        keyspace_id: 0,
-        mailbox_id: agent_id,
+        keyspace_key: SOCKETPAIR_STREAM_MARKER,
+        keyspace_id: ab,
+        mailbox_id: ba,
         offset: 0,
-        flags: 0,
+        flags: fd_flags,
         active: true,
     });
+    if let Some(entry) = st.fd_table[fd0].as_ref() {
+        state::retain_fd_resources(entry);
+    }
 
     let fd1 = match st.alloc_fd() {
         Some(f) => f,
         None => {
-            st.fd_table[fd0] = None;
+            st.close_fd(fd0 as i32);
             return -EMFILE;
         }
     };
     st.fd_table[fd1] = Some(FdEntry {
         kind: FdKind::Socket,
-        keyspace_key: 0,
-        keyspace_id: 0,
-        mailbox_id: agent_id,
+        keyspace_key: SOCKETPAIR_STREAM_MARKER,
+        keyspace_id: ba,
+        mailbox_id: ab,
         offset: 0,
-        flags: 0,
+        flags: fd_flags,
         active: true,
     });
+    if let Some(entry) = st.fd_table[fd1].as_ref() {
+        state::retain_fd_resources(entry);
+    }
 
-    unsafe {
-        let p = sv_ptr as *mut i32;
-        core::ptr::write(p, fd0 as i32);
-        core::ptr::write(p.add(1), fd1 as i32);
+    let mut sv = [0u8; 8];
+    sv[0..4].copy_from_slice(&(fd0 as i32).to_ne_bytes());
+    sv[4..8].copy_from_slice(&(fd1 as i32).to_ne_bytes());
+    if !copy_to_user(agent_id, sv_ptr, &sv) {
+        st.close_fd(fd0 as i32);
+        st.close_fd(fd1 as i32);
+        return -EFAULT;
+    }
+
+    if state::trace_runtime_agent(agent_id) {
+        crate::serial_println!(
+            "[RTDBG] socketpair agent={} fds=({}, {}) ab={} ba={}",
+            agent_id,
+            fd0,
+            fd1,
+            ab,
+            ba
+        );
     }
 
     0
@@ -672,7 +823,7 @@ pub fn sys_setsockopt(
     _optval_ptr: u64,
     _optlen: u64,
 ) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -698,25 +849,50 @@ pub fn sys_getsockopt(
     optval_ptr: u64,
     optlen_ptr: u64,
 ) -> i64 {
-    let st = match state::get_state(agent_id) {
+    let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
 
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
+    let entry = match st.get_fd(sockfd) {
+        Some(entry) if entry.kind == FdKind::Socket => entry,
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
-    }
+    };
 
     if optval_ptr != 0 && optlen_ptr != 0 {
-        // Read the optlen, write zeroed data
-        unsafe {
-            let len_ptr = optlen_ptr as *mut u32;
-            let len = core::ptr::read(len_ptr) as usize;
-            if len > 0 && len <= 128 {
-                core::ptr::write_bytes(optval_ptr as *mut u8, 0, len);
+        let Some(user_len) = read_user_u32(agent_id, optlen_ptr) else {
+            return -EFAULT;
+        };
+        let mut value = [0u8; 4];
+        let value_len = match (_level, _optname) {
+            (SOL_SOCKET, SO_TYPE) => {
+                value.copy_from_slice(&SOCK_STREAM.to_ne_bytes());
+                4usize
             }
+            (SOL_SOCKET, SO_DOMAIN) => {
+                let domain = if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                    || entry.keyspace_key == AF_UNIX_MARKER
+                {
+                    AF_UNIX as u32
+                } else {
+                    AF_INET as u32
+                };
+                value.copy_from_slice(&domain.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_PROTOCOL) => {
+                value.copy_from_slice(&0u32.to_ne_bytes());
+                4usize
+            }
+            _ => 4usize,
+        };
+        let copy_len = (user_len as usize).min(value_len);
+        if copy_len > 0 && !copy_to_user(agent_id, optval_ptr, &value[..copy_len]) {
+            return -EFAULT;
+        }
+        if !copy_to_user(agent_id, optlen_ptr, &(value_len as u32).to_ne_bytes()) {
+            return -EFAULT;
         }
     }
 
@@ -734,9 +910,20 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
         return -EFAULT;
     }
 
-    let st = match state::get_state_mut(agent_id) {
+    let mailbox_id = match crate::mailbox::find_free_aux_mailbox_id() {
+        Some(id) => id,
+        None => return -ENOSPC,
+    };
+    if crate::mailbox::create_mailbox(mailbox_id, agent_id).is_err() {
+        return -ENOSPC;
+    }
+
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
-        None => return -EBADF,
+        None => {
+            crate::mailbox::destroy_mailbox(mailbox_id);
+            return -EBADF;
+        }
     };
 
     // Allocate read end
@@ -747,8 +934,8 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
     st.fd_table[read_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
-        keyspace_id: 0,
-        mailbox_id: agent_id,
+        keyspace_id: mailbox_id,
+        mailbox_id,
         offset: 0,
         flags: flags as u32,
         active: true,
@@ -759,23 +946,28 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
         Some(f) => f,
         None => {
             st.fd_table[read_fd] = None;
+            crate::mailbox::destroy_mailbox(mailbox_id);
             return -EMFILE;
         }
     };
     st.fd_table[write_fd] = Some(FdEntry {
         kind: FdKind::Pipe,
         keyspace_key: 0,
-        keyspace_id: 0,
-        mailbox_id: agent_id,
+        keyspace_id: mailbox_id,
+        mailbox_id,
         offset: 0,
         flags: flags as u32,
         active: true,
     });
 
-    unsafe {
-        let p = pipefd_ptr as *mut i32;
-        core::ptr::write(p, read_fd as i32);
-        core::ptr::write(p.add(1), write_fd as i32);
+    let mut pipefd = [0u8; 8];
+    pipefd[0..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
+    pipefd[4..8].copy_from_slice(&(write_fd as i32).to_ne_bytes());
+    if !copy_to_user(agent_id, pipefd_ptr, &pipefd) {
+        st.fd_table[read_fd] = None;
+        st.fd_table[write_fd] = None;
+        crate::mailbox::destroy_mailbox(mailbox_id);
+        return -EFAULT;
     }
 
     0
@@ -788,9 +980,14 @@ pub fn sys_pipe2(agent_id: u16, pipefd_ptr: u64, flags: i32) -> i64 {
 /// Creates an fd backed by a u64 counter. The initial value is stored
 /// in the keyspace_key field of the fd entry.
 pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
-    let st = match state::get_state_mut(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
+    };
+
+    let handle = match state::alloc_eventfd(initval as u64) {
+        Some(handle) => handle,
+        None => return -EMFILE,
     };
 
     let fd = match st.alloc_fd() {
@@ -800,7 +997,7 @@ pub fn sys_eventfd2(agent_id: u16, initval: u32, flags: i32) -> i64 {
 
     st.fd_table[fd] = Some(FdEntry {
         kind: FdKind::EventFd,
-        keyspace_key: initval as u64, // counter value stored here
+        keyspace_key: handle as u64,
         keyspace_id: 0,
         mailbox_id: 0,
         offset: 0,

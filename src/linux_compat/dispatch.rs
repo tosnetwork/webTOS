@@ -12,7 +12,30 @@ use super::process;
 use super::signal;
 use super::state;
 use super::time;
+use crate::agent::{self, AgentStatus};
+use crate::sched;
 use crate::serial_println;
+
+fn has_other_ready_thread_group_member(agent_id: u16) -> bool {
+    let Some(current_state) = state::get_state(agent_id) else {
+        return false;
+    };
+    let pid = current_state.pid;
+    let mut found = false;
+    agent::for_each_agent_mut(|agent| {
+        if agent.id != agent_id
+            && agent.status == AgentStatus::Ready
+            && state::get_state(agent.id)
+                .map(|st| st.pid == pid)
+                .unwrap_or(false)
+        {
+            found = true;
+            return false;
+        }
+        true
+    });
+    found
+}
 
 #[inline(never)]
 fn dispatch_file_syscall(
@@ -45,6 +68,7 @@ fn dispatch_file_syscall(
         SYS_SELECT => fs::sys_select(agent_id, a1, a2, a3, a4, a5),
         SYS_DUP => fs::sys_dup(agent_id, a1 as i32),
         SYS_DUP2 => fs::sys_dup2(agent_id, a1 as i32, a2 as i32),
+        SYS_DUP3 => fs::sys_dup3(agent_id, a1 as i32, a2 as i32, a3 as u32),
         SYS_FCNTL => fs::sys_fcntl(agent_id, a1 as i32, a2 as u32, a3),
         SYS_FLOCK => fs::sys_flock(agent_id, a1 as i32, a2 as u32),
         SYS_FSYNC => fs::sys_fsync(agent_id, a1 as i32),
@@ -112,6 +136,7 @@ fn dispatch_process_syscall(
         SYS_CLONE => process::sys_clone(agent_id, a1, a2, a3, a4, a5),
         SYS_CLONE3 => process::sys_clone3(agent_id, a1, a2),
         SYS_FORK => process::sys_fork(agent_id),
+        SYS_VFORK => process::sys_vfork(agent_id),
         SYS_EXECVE => process::sys_execve(agent_id, a1, a2, a3),
         SYS_WAIT4 => process::sys_wait4(agent_id, a1, a2, a3, a4),
         SYS_KILL => process::sys_kill(agent_id, a1 as i32, a2 as i32),
@@ -146,6 +171,8 @@ fn dispatch_signal_syscall(
         SYS_RT_SIGACTION => signal::sys_rt_sigaction(agent_id, a1, a2, a3, a4),
         SYS_RT_SIGPROCMASK => signal::sys_rt_sigprocmask(agent_id, a1, a2, a3, a4),
         SYS_RT_SIGRETURN => signal::sys_rt_sigreturn(agent_id),
+        SYS_RT_SIGPENDING => signal::sys_rt_sigpending(agent_id, a1, a2),
+        SYS_SIGALTSTACK => signal::sys_sigaltstack(agent_id, a1, a2),
         _ => return None,
     };
     Some(result)
@@ -326,7 +353,7 @@ pub fn dispatch(
 
     // Check and deliver pending signals at syscall return boundary
     // (deterministic: always checked at the same point).
-    signal::deliver_pending_signals(agent_id);
+    let result = signal::deliver_pending_signals(agent_id, result);
 
     if trace_python {
         serial_println!(
@@ -335,6 +362,15 @@ pub fn dispatch(
             num,
             result
         );
+    }
+
+    // Keep Linux thread groups making forward progress even though ATOS does
+    // not do unsafe trap-time preemption. This is the deterministic analogue
+    // of the scheduler fairness Asterinas gets from real wait/wake scheduling:
+    // once a futex/eventfd wake marks another thread Ready, yield at the next
+    // syscall boundary so busy notifier threads do not monopolize the CPU.
+    if has_other_ready_thread_group_member(agent_id) {
+        sched::yield_current();
     }
 
     result

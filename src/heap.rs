@@ -5,11 +5,16 @@
 //! entry point unchanged while reducing fragmentation and linear free-list
 //! scans in the hot path.
 
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr;
 
 use crate::arch::x86_64::paging;
+use crate::serial_println;
 
 const PAGE_SIZE: usize = 4096;
 const MIN_ALIGN: usize = 8;
@@ -42,6 +47,11 @@ struct LargeAllocHeader {
     magic: u32,
     pages: u32,
     base: u64,
+}
+
+#[derive(Clone, Copy)]
+struct LargeAllocInfo {
+    usable_size: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -93,10 +103,14 @@ impl KernelAllocator {
     }
 
     #[inline]
-    fn slab_class_index(layout: Layout) -> Option<usize> {
-        let size = layout.size().max(1);
-        let need = size.max(layout.align()).max(MIN_ALIGN);
+    fn slab_class_index_for(size: usize, align: usize) -> Option<usize> {
+        let need = size.max(1).max(align).max(MIN_ALIGN);
         SLAB_CLASSES.iter().position(|&slot_size| slot_size >= need)
+    }
+
+    #[inline]
+    fn slab_class_index(layout: Layout) -> Option<usize> {
+        Self::slab_class_index_for(layout.size(), layout.align())
     }
 
     #[inline]
@@ -278,15 +292,43 @@ impl KernelAllocator {
         debug_assert_eq!((*header).magic, LARGE_MAGIC);
         let _ = paging::release_contiguous_frames((*header).base, (*header).pages as usize);
     }
+
+    unsafe fn large_alloc_info(&self, ptr: *mut u8) -> Option<LargeAllocInfo> {
+        let header_size = core::mem::size_of::<LargeAllocHeader>();
+        let header = (ptr as usize).checked_sub(header_size)? as *const LargeAllocHeader;
+        if (*header).magic != LARGE_MAGIC {
+            return None;
+        }
+
+        let base = (*header).base;
+        let pages = (*header).pages as usize;
+        let usable_size = pages
+            .checked_mul(PAGE_SIZE)?
+            .checked_sub((ptr as usize).checked_sub(base as usize)?)?;
+        Some(LargeAllocInfo { usable_size })
+    }
+
+    #[inline]
+    unsafe fn alloc_inner(&self, layout: Layout) -> *mut u8 {
+        match Self::slab_class_index(layout) {
+            Some(class_index) => self.alloc_small(class_index),
+            None => self.alloc_large(layout),
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc_inner(&self, ptr: *mut u8, layout: Layout) {
+        match Self::slab_class_index(layout) {
+            Some(class_index) => self.dealloc_small(ptr, class_index),
+            None => self.dealloc_large(ptr),
+        }
+    }
 }
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let was_enabled = cli();
-        let ptr = match Self::slab_class_index(layout) {
-            Some(class_index) => self.alloc_small(class_index),
-            None => self.alloc_large(layout),
-        };
+        let ptr = self.alloc_inner(layout);
         restore_interrupts(was_enabled);
         ptr
     }
@@ -297,12 +339,99 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         let was_enabled = cli();
-        match Self::slab_class_index(layout) {
-            Some(class_index) => self.dealloc_small(ptr, class_index),
-            None => self.dealloc_large(ptr),
-        }
+        self.dealloc_inner(ptr, layout);
         restore_interrupts(was_enabled);
     }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let was_enabled = cli();
+        let ptr = self.alloc_inner(layout);
+        if !ptr.is_null() {
+            ptr.write_bytes(0, layout.size());
+        }
+        restore_interrupts(was_enabled);
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            if let Ok(new_layout) = Layout::from_size_align(new_size.max(1), layout.align()) {
+                return self.alloc(new_layout);
+            }
+            return ptr::null_mut();
+        }
+
+        let new_layout = match Layout::from_size_align(new_size.max(1), layout.align()) {
+            Ok(layout) => layout,
+            Err(_) => return ptr::null_mut(),
+        };
+
+        let was_enabled = cli();
+        let old_class = Self::slab_class_index(layout);
+        let new_class = Self::slab_class_index(new_layout);
+
+        if old_class.is_some() && old_class == new_class {
+            restore_interrupts(was_enabled);
+            return ptr;
+        }
+
+        if old_class.is_none()
+            && new_class.is_none()
+            && self
+                .large_alloc_info(ptr)
+                .map(|info| info.usable_size >= new_size)
+                .unwrap_or(false)
+        {
+            restore_interrupts(was_enabled);
+            return ptr;
+        }
+
+        let new_ptr = self.alloc_inner(new_layout);
+        if new_ptr.is_null() {
+            restore_interrupts(was_enabled);
+            return ptr::null_mut();
+        }
+
+        ptr::copy_nonoverlapping(ptr, new_ptr, core::cmp::min(layout.size(), new_size));
+        self.dealloc_inner(ptr, layout);
+        restore_interrupts(was_enabled);
+        new_ptr
+    }
+}
+
+pub fn run_smoke() {
+    let boxed = Box::new([0x5Au8; 64]);
+    assert_eq!(boxed[0], 0x5A);
+    assert_eq!(boxed[63], 0x5A);
+
+    let mut vec = Vec::with_capacity(32);
+    for i in 0..8192u32 {
+        vec.push((i & 0xff) as u8);
+    }
+    assert_eq!(vec.len(), 8192);
+    assert_eq!(vec[0], 0);
+    assert_eq!(vec[4097], 1);
+
+    let mut text = String::new();
+    for _ in 0..128 {
+        text.push_str("atos");
+    }
+    assert_eq!(text.len(), 512);
+    assert!(text.starts_with("atos"));
+
+    let mut map = BTreeMap::new();
+    for i in 0..256u32 {
+        map.insert(i, i * i);
+    }
+    assert_eq!(map.get(&17), Some(&289));
+    assert_eq!(map.get(&255), Some(&(255 * 255)));
+
+    drop(map);
+    drop(text);
+    drop(vec);
+    drop(boxed);
+
+    serial_println!("[HEAP] allocator smoke passed");
 }
 
 #[alloc_error_handler]

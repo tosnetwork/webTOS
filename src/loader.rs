@@ -55,7 +55,7 @@ pub struct LoadSegment {
 }
 
 /// Parsed ELF64 binary information
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ElfInfo {
     /// Entry point virtual address
     pub entry_point: u64,

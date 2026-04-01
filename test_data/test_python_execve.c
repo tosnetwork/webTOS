@@ -5,7 +5,7 @@
  *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 -o test_python_execve.elf test_python_execve.c
  *
  * This binary performs:
- *   execve("/usr/bin/python3", ["python3", "-S", "-c", "print(1)"], envp)
+ *   execve("/usr/bin/python3", ["python3", "-c", "print(1)"], envp)
  *
  * Success is observed if Python prints "1" and exits cleanly.
  */
@@ -77,17 +77,16 @@ static void print_num(i64 n) {
 
 void _start(void) {
     static char path[] = "/usr/bin/python3";
-    static char arg1[] = "-S";
-    static char arg2[] = "-c";
-    static char arg3[] = "print(1)";
+    static char arg1[] = "-c";
+    static char arg2[] = "print(1)";
     static char env0[] = "PYTHONHOME=/usr";
     static char env1[] = "PYTHONDONTWRITEBYTECODE=1";
     static char env2[] = "PYTHONNOUSERSITE=1";
     static char env3[] = "LANG=C";
-    static char *argv[] = { path, arg1, arg2, arg3, 0 };
+    static char *argv[] = { path, arg1, arg2, 0 };
     static char *envp[] = { env0, env1, env2, env3, 0 };
 
-    print("[PYTHON] launching /usr/bin/python3 -S -c print(1)\n");
+    print("[PYTHON] launching /usr/bin/python3 -c print(1)\n");
     i64 ret = sys_execve(path, argv, envp);
     print("[PYTHON] execve returned ");
     print_num(ret);

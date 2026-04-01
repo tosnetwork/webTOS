@@ -23,6 +23,10 @@ pub const SYS_BRK: u64 = 12;
 pub const SYS_RT_SIGACTION: u64 = 13;
 pub const SYS_RT_SIGPROCMASK: u64 = 14;
 pub const SYS_RT_SIGRETURN: u64 = 15;
+pub const SYS_RT_SIGPENDING: u64 = 127;
+
+// Marker for local AF_UNIX/socketpair byte-stream endpoints.
+pub const SOCKETPAIR_STREAM_MARKER: u64 = 0xFFFF_FFFE;
 
 // ── I/O control ─────────────────────────────────────────────────────────────
 pub const SYS_IOCTL: u64 = 16;
@@ -76,6 +80,7 @@ pub const SYS_GETSOCKOPT: u64 = 55;
 // ── Process control ─────────────────────────────────────────────────────────
 pub const SYS_CLONE: u64 = 56;
 pub const SYS_FORK: u64 = 57;
+pub const SYS_VFORK: u64 = 58;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT4: u64 = 61;
@@ -128,6 +133,7 @@ pub const SYS_GET_ROBUST_LIST: u64 = 274;
 // ── Eventfd / pipe2 / epoll_create1 ─────────────────────────────────────────
 pub const SYS_EVENTFD2: u64 = 290;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
+pub const SYS_DUP3: u64 = 292;
 pub const SYS_PIPE2: u64 = 293;
 
 // ── System info / process ───────────────────────────────────────────────────
@@ -135,6 +141,7 @@ pub const SYS_GETRUSAGE: u64 = 98;
 pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_CAPGET: u64 = 125;
+pub const SYS_SIGALTSTACK: u64 = 131;
 pub const SYS_PRCTL: u64 = 157;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
@@ -174,6 +181,7 @@ pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EMFILE: i64 = 24;
+pub const EPIPE: i64 = 32;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
 pub const ECHILD: i64 = 10;

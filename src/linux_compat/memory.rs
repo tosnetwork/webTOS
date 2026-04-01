@@ -8,12 +8,13 @@
 
 extern crate alloc;
 
-use super::constants::{EFAULT, EINVAL, ENOMEM};
+use super::constants::{EBADF, EEXIST, EINVAL, ENOMEM};
 use super::state::{self, get_state, get_state_mut, LinuxAgentState, VmaEntry, VmaKind};
 use crate::agent;
+use crate::arch::x86_64::page_table;
 use crate::arch::x86_64::paging::{
-    self, alloc_frame_with_kind, invlpg, release_frame, set_page_mapping, unmap_page, FrameKind,
-    PAGE_SIZE, PTE_NX, PTE_PRESENT, PTE_USER, PTE_WRITABLE,
+    self, alloc_frame_with_kind, release_frame, FrameKind, PAGE_SIZE, PTE_NX, PTE_PRESENT,
+    PTE_USER, PTE_WRITABLE,
 };
 // ── mmap flag constants ────────────────────────────────────────────────────
 
@@ -21,11 +22,7 @@ const MAP_SHARED: u32 = 0x01;
 const MAP_PRIVATE: u32 = 0x02;
 const MAP_FIXED: u32 = 0x10;
 const MAP_ANONYMOUS: u32 = 0x20;
-
-/// Software-only PTE bit used to mark a reserved anonymous PROT_NONE VMA.
-///
-/// x86_64 leaves bits 9-11 available to software in leaf PTEs.
-const PTE_SOFT_RESERVED: u64 = 1 << 9;
+const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 
 // ── mprotect / mmap prot constants ─────────────────────────────────────────
 
@@ -111,6 +108,9 @@ fn insert_vma(state: &mut LinuxAgentState, mut vma: VmaEntry) -> Result<(), i64>
     if vma.len == 0 {
         return Err(-EINVAL);
     }
+    if !range_is_free(state, vma.start, vma.len) {
+        return Err(-EINVAL);
+    }
     if try_merge_vma(state, &vma) {
         return Ok(());
     }
@@ -122,8 +122,34 @@ fn insert_vma(state: &mut LinuxAgentState, mut vma: VmaEntry) -> Result<(), i64>
     Ok(())
 }
 
+pub fn install_initial_vma(agent_id: u16, vma: VmaEntry) -> Result<(), i64> {
+    let vm_owner = vm_owner_agent_id(agent_id);
+    let state = get_state_mut(vm_owner).ok_or(-EINVAL)?;
+    insert_vma(state, vma)?;
+    if super::state::trace_runtime_agent(agent_id) {
+        debug_dump_vmas(agent_id, state, "initial");
+    }
+    Ok(())
+}
+
 fn free_vma_slots(state: &LinuxAgentState) -> usize {
     state.vmas.iter().filter(|vma| !vma.active).count()
+}
+
+fn ranges_overlap(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
+    start_a < end_b && start_b < end_a
+}
+
+fn range_is_free(state: &LinuxAgentState, start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    for vma in state.vmas.iter().filter(|vma| vma.active) {
+        if ranges_overlap(start, end, vma.start, vma.end()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn same_vma_shape(a: &VmaEntry, b: &VmaEntry) -> bool {
@@ -200,7 +226,9 @@ fn clone_vma_piece(src: &VmaEntry, start: u64, end: u64, prot: u32) -> VmaEntry 
     piece.len = end.saturating_sub(start);
     piece.prot = prot;
     if piece.kind == VmaKind::File {
-        piece.file_offset = src.file_offset.saturating_add(start.saturating_sub(src.start));
+        piece.file_offset = src
+            .file_offset
+            .saturating_add(start.saturating_sub(src.start));
     }
     piece
 }
@@ -235,7 +263,10 @@ fn remove_vma_range(state: &mut LinuxAgentState, start: u64, len: u64) -> Result
             }
             (true, true) => {
                 state.vmas[i] = clone_vma_piece(&vma, vma.start, overlap_start, vma.prot);
-                insert_vma(state, clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot))?;
+                insert_vma(
+                    state,
+                    clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot),
+                )?;
             }
         }
     }
@@ -243,7 +274,12 @@ fn remove_vma_range(state: &mut LinuxAgentState, start: u64, len: u64) -> Result
     Ok(())
 }
 
-fn protect_vma_range(state: &mut LinuxAgentState, start: u64, len: u64, prot: u32) -> Result<(), i64> {
+fn protect_vma_range(
+    state: &mut LinuxAgentState,
+    start: u64,
+    len: u64,
+    prot: u32,
+) -> Result<(), i64> {
     let end = start.checked_add(len).ok_or(-EINVAL)?;
     for i in 0..state::MAX_VMAS {
         let vma = state.vmas[i];
@@ -265,14 +301,91 @@ fn protect_vma_range(state: &mut LinuxAgentState, start: u64, len: u64, prot: u3
 
         state.vmas[i] = clone_vma_piece(&vma, overlap_start, overlap_end, prot);
         if has_left {
-            insert_vma(state, clone_vma_piece(&vma, vma.start, overlap_start, vma.prot))?;
+            insert_vma(
+                state,
+                clone_vma_piece(&vma, vma.start, overlap_start, vma.prot),
+            )?;
         }
         if has_right {
-            insert_vma(state, clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot))?;
+            insert_vma(
+                state,
+                clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot),
+            )?;
         }
     }
     merge_adjacent_vmas(state);
     Ok(())
+}
+
+fn range_fully_covered(state: &LinuxAgentState, start: u64, len: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    let mut cursor = start;
+    while cursor < end {
+        let Some(idx) = state.find_vma_index(cursor) else {
+            return false;
+        };
+        let vma = state.vmas[idx];
+        if !vma.active || vma.end() <= cursor {
+            return false;
+        }
+        cursor = core::cmp::min(vma.end(), end);
+    }
+    true
+}
+
+fn validate_vma_invariants(state: &LinuxAgentState) -> bool {
+    for i in 0..state::MAX_VMAS {
+        let left = state.vmas[i];
+        if !left.active {
+            continue;
+        }
+        if left.len == 0 || left.end() <= left.start {
+            return false;
+        }
+        for j in (i + 1)..state::MAX_VMAS {
+            let right = state.vmas[j];
+            if !right.active {
+                continue;
+            }
+            if ranges_overlap(left.start, left.end(), right.start, right.end()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn debug_dump_vmas(agent_id: u16, state: &LinuxAgentState, label: &str) {
+    if !super::state::trace_runtime_agent(agent_id) {
+        return;
+    }
+    crate::serial_println!(
+        "[PYDBG] vmas agent={} label={} ok={} mmap_next={:#x}",
+        agent_id,
+        label,
+        validate_vma_invariants(state),
+        state.mmap_next
+    );
+    for (idx, vma) in state.vmas.iter().enumerate() {
+        if !vma.active {
+            continue;
+        }
+        crate::serial_println!(
+            "[PYDBG] vma[{}] [{:#x},{:#x}) len={:#x} prot={:#x} flags={:#x} kind={:?} ks={} key={:#x} off={:#x}",
+            idx,
+            vma.start,
+            vma.end(),
+            vma.len,
+            vma.prot,
+            vma.flags,
+            vma.kind,
+            vma.keyspace_id,
+            vma.keyspace_key,
+            vma.file_offset
+        );
+    }
 }
 
 fn read_file_slice(keyspace: u16, key: u64, offset: usize, dst: &mut [u8]) -> usize {
@@ -355,7 +468,7 @@ pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -
     }
 
     let page_vaddr = fault_addr & !(PAGE_SIZE as u64 - 1);
-    if read_pte_phys(cr3, page_vaddr).is_some() {
+    if page_table::mapped_phys(cr3, page_vaddr).is_some() {
         if trace_python {
             crate::serial_println!(
                 "[PYDBG] page-fault-miss agent={} addr={:#x} err={:#x} reason=already-mapped page={:#x}",
@@ -389,18 +502,19 @@ pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -
         }
     };
     unsafe {
-        zero_frame(frame);
+        page_table::zero_frame(frame);
     }
 
     if vma.kind == VmaKind::File {
         let page_offset = page_vaddr.saturating_sub(vma.start) as usize;
         let file_offset = vma.file_offset as usize + page_offset;
-        let page =
-            unsafe { core::slice::from_raw_parts_mut(paging::phys_to_virt(frame) as *mut u8, PAGE_SIZE) };
+        let page = unsafe {
+            core::slice::from_raw_parts_mut(paging::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
+        };
         let _ = read_file_slice(vma.keyspace_id, vma.keyspace_key, file_offset, page);
     }
 
-    if set_page_mapping(cr3, page_vaddr, frame, prot_to_pte_flags(vma.prot)).is_err() {
+    if page_table::map_leaf(cr3, page_vaddr, frame, prot_to_pte_flags(vma.prot)).is_err() {
         let _ = release_frame(frame);
         if trace_python {
             crate::serial_println!(
@@ -413,7 +527,7 @@ pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -
         }
         return false;
     }
-    invlpg(page_vaddr);
+    page_table::invalidate(page_vaddr);
     if trace_python {
         crate::serial_println!(
             "[PYDBG] page-fault-fill agent={} addr={:#x} err={:#x} page={:#x} prot={:#x} kind={:?}",
@@ -428,52 +542,12 @@ pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -
     true
 }
 
-/// Zero a physical frame via its identity-mapped address.
-///
-/// Safety: the frame must be a valid allocated physical page accessible
-/// through the identity mapping.
-unsafe fn zero_frame(phys: u64) {
-    let ptr = paging::phys_to_virt(phys) as *mut u8;
-    core::ptr::write_bytes(ptr, 0, PAGE_SIZE);
-}
-
-fn translate_user_vaddr(agent_cr3: u64, vaddr: u64) -> Option<u64> {
-    let page_off = vaddr & (PAGE_SIZE as u64 - 1);
-    let page_base = read_pte_phys(agent_cr3, vaddr)?;
-    Some(page_base + page_off)
-}
-
-fn write_mapped_bytes(cr3: u64, user_vaddr: u64, data: &[u8]) -> Result<(), i64> {
-    let mut written = 0usize;
-
-    while written < data.len() {
-        let vaddr = user_vaddr.checked_add(written as u64).ok_or(-EINVAL)?;
-        let phys = translate_user_vaddr(cr3, vaddr).ok_or(-EINVAL)?;
-        let page_off = (vaddr as usize) & (PAGE_SIZE - 1);
-        let chunk_len = (data.len() - written).min(PAGE_SIZE - page_off);
-
-        unsafe {
-            let src = data.as_ptr().add(written);
-            let dst = paging::phys_to_virt(phys) as *mut u8;
-            for i in 0..chunk_len {
-                core::ptr::write(dst.add(i), core::ptr::read(src.add(i)));
-            }
-        }
-
-        written += chunk_len;
-    }
-
-    Ok(())
-}
-
-fn read_mapped_u64(cr3: u64, vaddr: u64) -> Option<u64> {
-    let phys = translate_user_vaddr(cr3, vaddr)?;
-    Some(unsafe { core::ptr::read_unaligned(paging::phys_to_virt(phys) as *const u64) })
-}
-
 fn file_vaddr_to_offset(elf: &crate::loader::ElfInfo, vaddr: u64, size: u64) -> Option<usize> {
     let end = vaddr.checked_add(size)?;
-    for seg in elf.segments[..elf.segment_count].iter().filter_map(|seg| seg.as_ref()) {
+    for seg in elf.segments[..elf.segment_count]
+        .iter()
+        .filter_map(|seg| seg.as_ref())
+    {
         let seg_start = seg.vaddr;
         let seg_end = seg.vaddr.checked_add(seg.file_size)?;
         if vaddr >= seg_start && end <= seg_end {
@@ -520,7 +594,10 @@ fn dynamic_segment_runtime_base(
         return None;
     }
     let page_mask = PAGE_SIZE as u64 - 1;
-    for seg in elf.segments[..elf.segment_count].iter().filter_map(|seg| seg.as_ref()) {
+    for seg in elf.segments[..elf.segment_count]
+        .iter()
+        .filter_map(|seg| seg.as_ref())
+    {
         let seg_end = seg.vaddr.checked_add(seg.mem_size)?;
         if elf.dynamic_vaddr >= seg.vaddr && elf.dynamic_vaddr < seg_end {
             let aligned_off = seg.file_offset & !page_mask;
@@ -553,8 +630,8 @@ fn debug_dump_mapped_dynamic(agent_id: u16, cr3: u64, key: u64, base: u64, image
     let dump_count = (elf.dynamic_size / 16).min(32);
     for i in 0..dump_count {
         let entry = runtime_dyn + i * 16;
-        let tag = read_mapped_u64(cr3, entry).unwrap_or(u64::MAX);
-        let val = read_mapped_u64(cr3, entry + 8).unwrap_or(u64::MAX);
+        let tag = page_table::read_user_u64(cr3, entry).unwrap_or(u64::MAX);
+        let val = page_table::read_user_u64(cr3, entry + 8).unwrap_or(u64::MAX);
         crate::serial_println!(
             "[PYDBG] elf-dynamic[{}] key={:#x} tag={:#x} val={:#x}",
             i,
@@ -588,8 +665,8 @@ fn debug_dump_runtime_dynamic(agent_id: u16, cr3: u64, key: u64, base: u64, imag
     let dump_count = (elf.dynamic_size / 16).min(32);
     for i in 0..dump_count {
         let entry = runtime_dyn + i * 16;
-        let tag = read_mapped_u64(cr3, entry).unwrap_or(u64::MAX);
-        let val = read_mapped_u64(cr3, entry + 8).unwrap_or(u64::MAX);
+        let tag = page_table::read_user_u64(cr3, entry).unwrap_or(u64::MAX);
+        let val = page_table::read_user_u64(cr3, entry + 8).unwrap_or(u64::MAX);
         crate::serial_println!(
             "[PYDBG] runtime-dynamic[{}] agent={} key={:#x} tag={:#x} val={:#x}",
             i,
@@ -665,7 +742,7 @@ fn debug_dump_file_dynamic(agent_id: u16, key: u64, image: &[u8]) {
 fn debug_dump_page_bytes(agent_id: u16, cr3: u64, label: &str, vaddr: u64) {
     let mut words = [0u64; 4];
     for (idx, slot) in words.iter_mut().enumerate() {
-        *slot = read_mapped_u64(cr3, vaddr + (idx as u64) * 8).unwrap_or(u64::MAX);
+        *slot = page_table::read_user_u64(cr3, vaddr + (idx as u64) * 8).unwrap_or(u64::MAX);
     }
     crate::serial_println!(
         "[PYDBG] {} agent={} vaddr={:#x} qwords={:#x} {:#x} {:#x} {:#x}",
@@ -726,9 +803,9 @@ fn debug_dump_mapped_rela(agent_id: u16, cr3: u64, key: u64, base: u64, image: &
 
     for idx in slots[..slot_count].iter().copied() {
         let entry = runtime_rela + idx * relaent;
-        let a = read_mapped_u64(cr3, entry).unwrap_or(u64::MAX);
-        let b = read_mapped_u64(cr3, entry + 8).unwrap_or(u64::MAX);
-        let c = read_mapped_u64(cr3, entry + 16).unwrap_or(u64::MAX);
+        let a = page_table::read_user_u64(cr3, entry).unwrap_or(u64::MAX);
+        let b = page_table::read_user_u64(cr3, entry + 8).unwrap_or(u64::MAX);
+        let c = page_table::read_user_u64(cr3, entry + 16).unwrap_or(u64::MAX);
         crate::serial_println!(
             "[PYDBG] elf-rela[{}] agent={} key={:#x} off={:#x} val0={:#x} val1={:#x} val2={:#x}",
             idx,
@@ -764,17 +841,29 @@ pub fn sys_mmap(
     if length == 0 {
         return -EINVAL;
     }
+    if offset & (PAGE_SIZE as u64 - 1) != 0 {
+        return -EINVAL;
+    }
+    let share_mode = flags & (MAP_SHARED | MAP_PRIVATE);
+    if share_mode == 0 || share_mode == (MAP_SHARED | MAP_PRIVATE) {
+        return -EINVAL;
+    }
+    if flags & MAP_FIXED != 0 && flags & MAP_FIXED_NOREPLACE != 0 {
+        return -EINVAL;
+    }
 
     let file_backing = if fd >= 0 && (flags & MAP_ANONYMOUS == 0) {
-        let st = match get_state(agent_id) {
+        let st = match super::state::get_files_state(agent_id) {
             Some(s) => s,
             None => return -EINVAL,
         };
         let entry = match st.get_fd(fd) {
             Some(e) => *e,
-            None => return -EFAULT,
+            None => return -EBADF,
         };
         Some((entry.keyspace_id, entry.keyspace_key))
+    } else if flags & MAP_ANONYMOUS == 0 {
+        return -EBADF;
     } else {
         None
     };
@@ -788,10 +877,13 @@ pub fn sys_mmap(
     let aligned_len = page_align_up(length);
 
     // Determine the virtual address for the mapping
-    let vaddr = if addr != 0 && (flags & MAP_FIXED != 0) {
-        // MAP_FIXED: use the exact requested address (must be page-aligned)
+    let vaddr = if addr != 0 && (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0) {
+        // MAP_FIXED / MAP_FIXED_NOREPLACE: use the exact requested address.
         if addr & (PAGE_SIZE as u64 - 1) != 0 {
             return -EINVAL;
+        }
+        if flags & MAP_FIXED_NOREPLACE != 0 && !range_is_free(state, addr, aligned_len) {
+            return -EEXIST;
         }
         addr
     } else {
@@ -860,8 +952,12 @@ pub fn sys_mmap(
         );
     }
 
-    if insert_vma(state, vma).is_err() {
-        return -ENOMEM;
+    if let Err(err) = insert_vma(state, vma) {
+        return err;
+    }
+
+    if trace_python {
+        debug_dump_vmas(agent_id, state, "mmap");
     }
 
     if trace_python {
@@ -893,6 +989,9 @@ pub fn sys_munmap(agent_id: u16, addr: u64, length: u64) -> i64 {
         if let Err(err) = remove_vma_range(state, addr, aligned_len) {
             return err;
         }
+        if super::state::trace_runtime_agent(agent_id) {
+            debug_dump_vmas(agent_id, state, "munmap");
+        }
     }
 
     for i in 0..num_pages {
@@ -900,9 +999,9 @@ pub fn sys_munmap(agent_id: u16, addr: u64, length: u64) -> i64 {
 
         // Recover the backing frame even for PROT_NONE mappings where the
         // leaf PTE is intentionally non-present.
-        if let Some(pte) = read_leaf_pte(cr3, page_vaddr) {
-            let phys = pte & 0x000F_FFFF_FFFF_F000;
-            unmap_page(cr3, page_vaddr);
+        if let Some(pte) = page_table::leaf_pte(cr3, page_vaddr) {
+            let phys = pte.phys_addr();
+            page_table::unmap_leaf(cr3, page_vaddr);
             if phys != 0 {
                 let _ = release_frame(phys);
             }
@@ -936,8 +1035,14 @@ pub fn sys_mprotect(agent_id: u16, addr: u64, length: u64, prot: u32) -> i64 {
 
     let vm_owner = vm_owner_agent_id(agent_id);
     if let Some(state) = get_state_mut(vm_owner) {
+        if !range_fully_covered(state, addr, aligned_len) {
+            return -ENOMEM;
+        }
         if let Err(err) = protect_vma_range(state, addr, aligned_len, prot) {
             return err;
+        }
+        if trace_python {
+            debug_dump_vmas(agent_id, state, "mprotect");
         }
     }
 
@@ -947,26 +1052,21 @@ pub fn sys_mprotect(agent_id: u16, addr: u64, length: u64, prot: u32) -> i64 {
         // Walk the page table to find the leaf PTE and update its flags.
         // PROT_NONE leaves are intentionally non-present, so we must recover
         // the frame pointer from the raw PTE instead of requiring PTE_PRESENT.
-        if let Some(pte) = read_leaf_pte(cr3, page_vaddr) {
-            let phys = pte & 0x000F_FFFF_FFFF_F000;
-            if phys == 0 && (pte & PTE_SOFT_RESERVED != 0) {
+        if let Some(pte) = page_table::leaf_pte(cr3, page_vaddr) {
+            let phys = pte.phys_addr();
+            if phys == 0 && pte.is_soft_reserved() {
                 if prot == PROT_NONE {
-                    let _ = set_page_mapping(cr3, page_vaddr, 0, PTE_USER | PTE_SOFT_RESERVED);
+                    let _ = page_table::map_reserved_leaf(cr3, page_vaddr);
                 } else {
-                    let frame = match alloc_frame_with_kind(FrameKind::Anon) {
-                        Some(f) => f,
-                        None => return -ENOMEM,
-                    };
-                    unsafe {
-                        zero_frame(frame);
-                    }
-                    let _ = set_page_mapping(cr3, page_vaddr, frame, new_flags);
+                    // Restore lazy fault behavior for PROT_NONE pages instead of
+                    // materializing an anonymous frame here.
+                    page_table::unmap_leaf(cr3, page_vaddr);
                 }
             } else {
                 // Re-map the page with new flags (overwrites the existing PTE)
-                let _ = set_page_mapping(cr3, page_vaddr, phys, new_flags);
+                let _ = page_table::map_leaf(cr3, page_vaddr, phys, new_flags);
             }
-            invlpg(page_vaddr);
+            page_table::invalidate(page_vaddr);
         }
         // If the page is not mapped, silently skip (matches Linux behavior)
     }
@@ -1034,15 +1134,32 @@ pub fn sys_brk(agent_id: u16, new_brk: u64) -> i64 {
             };
 
             unsafe {
-                zero_frame(frame);
+                page_table::zero_frame(frame);
             }
 
-            if set_page_mapping(cr3, page, frame, pte_flags).is_err() {
+            if page_table::map_leaf(cr3, page, frame, pte_flags).is_err() {
                 let _ = release_frame(frame);
                 return state.brk_current as i64;
             }
 
             page += PAGE_SIZE as u64;
+        }
+
+        if end_page > start_page {
+            let heap_vma = VmaEntry {
+                active: true,
+                start: start_page,
+                len: end_page - start_page,
+                prot: PROT_READ | PROT_WRITE,
+                flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                kind: VmaKind::Anonymous,
+                keyspace_id: 0,
+                keyspace_key: 0,
+                file_offset: 0,
+            };
+            if insert_vma(state, heap_vma).is_err() {
+                return state.brk_current as i64;
+            }
         }
 
         state.brk_current = new_brk;
@@ -1053,11 +1170,17 @@ pub fn sys_brk(agent_id: u16, new_brk: u64) -> i64 {
 
         let mut page = start_page;
         while page < end_page {
-            if let Some(phys) = read_pte_phys(cr3, page) {
-                unmap_page(cr3, page);
+            if let Some(phys) = page_table::mapped_phys(cr3, page) {
+                page_table::unmap_leaf(cr3, page);
                 let _ = release_frame(phys);
             }
             page += PAGE_SIZE as u64;
+        }
+
+        if end_page > start_page
+            && remove_vma_range(state, start_page, end_page - start_page).is_err()
+        {
+            return state.brk_current as i64;
         }
 
         state.brk_current = new_brk;
@@ -1080,89 +1203,35 @@ pub fn sys_madvise(agent_id: u16, addr: u64, length: u64, advice: u32) -> i64 {
         return -EINVAL;
     }
 
+    let aligned_len = page_align_up(length);
+    let vm_owner = vm_owner_agent_id(agent_id);
+    if let Some(state) = get_state(vm_owner) {
+        if !range_fully_covered(state, addr, aligned_len) {
+            return -ENOMEM;
+        }
+    }
+
     if advice == MADV_DONTNEED {
         let cr3 = match get_agent_cr3(agent_id) {
             Some(c) => c,
             None => return -EINVAL,
         };
 
-        let aligned_len = page_align_up(length);
         let num_pages = (aligned_len / PAGE_SIZE as u64) as usize;
 
         for i in 0..num_pages {
             let page_vaddr = addr + (i as u64) * (PAGE_SIZE as u64);
 
-            if let Some(phys) = read_pte_phys(cr3, page_vaddr) {
+            if let Some(phys) = page_table::mapped_phys(cr3, page_vaddr) {
                 // Zero the physical frame but leave the mapping in place
                 unsafe {
-                    zero_frame(phys);
+                    page_table::zero_frame(phys);
                 }
-                invlpg(page_vaddr);
+                page_table::invalidate(page_vaddr);
             }
         }
     }
     // All other advice values: no-op, return success
 
     0
-}
-
-// ── Page table walk helper ─────────────────────────────────────────────────
-
-/// Walk the four-level page table to extract the physical address from
-/// a leaf PTE for a given virtual address.
-///
-/// Returns `Some(physical_address)` if the page is mapped, `None` otherwise.
-fn read_pte_phys(pml4_phys: u64, vaddr: u64) -> Option<u64> {
-    let pte = read_leaf_pte(pml4_phys, vaddr)?;
-    if pte & PTE_PRESENT == 0 {
-        return None;
-    }
-    Some(pte & 0x000F_FFFF_FFFF_F000)
-}
-
-/// Walk the page tables and return the raw leaf PTE value.
-///
-/// Unlike `read_pte_phys`, this still succeeds for PROT_NONE mappings where
-/// the leaf keeps a physical frame pointer but clears PTE_PRESENT, or for
-/// anonymous reserve-only mappings marked with `PTE_SOFT_RESERVED`.
-fn read_leaf_pte(pml4_phys: u64, vaddr: u64) -> Option<u64> {
-    let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
-
-    unsafe {
-        let pml4 = paging::phys_to_virt(pml4_phys) as *const u64;
-        let pml4e = core::ptr::read_volatile(pml4.add(pml4_idx));
-        if pml4e & PTE_PRESENT == 0 {
-            return None;
-        }
-
-        let pdpt = paging::phys_to_virt(pml4e & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pdpte = core::ptr::read_volatile(pdpt.add(pdpt_idx));
-        if pdpte & PTE_PRESENT == 0 {
-            return None;
-        }
-
-        let pd = paging::phys_to_virt(pdpte & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pde = core::ptr::read_volatile(pd.add(pd_idx));
-        if pde & PTE_PRESENT == 0 {
-            return None;
-        }
-
-        // Check for 2MB huge page
-        if pde & paging::PTE_HUGE != 0 {
-            let base = pde & 0x000F_FFFF_FFE0_0000; // 2MB aligned
-            let page_offset = vaddr & 0x1F_FFFF;
-            return Some(base + page_offset);
-        }
-
-        let pt = paging::phys_to_virt(pde & 0x000F_FFFF_FFFF_F000) as *const u64;
-        let pte = core::ptr::read_volatile(pt.add(pt_idx));
-        if pte & 0x000F_FFFF_FFFF_F000 == 0 && (pte & PTE_SOFT_RESERVED == 0) {
-            return None;
-        }
-
-        Some(pte)
-    }
 }

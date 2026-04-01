@@ -16,5 +16,10 @@
 /usr/bin/hello_dynamic = test_data/hello_dynamic.elf
 /usr/lib/atos-tests/Hello.class = test_data/Hello.class
 /usr/lib/atos-tests/FsProbe.class = test_data/FsProbe.class
+/usr/lib/atos-tests/JavaChildSmoke.class = test_data/JavaChildSmoke.class
+/usr/lib/atos-tests/JavaThreadSmoke.class = test_data/JavaThreadSmoke.class
 /usr/lib/atos-tests/java-smoke.jar = test_data/java-smoke.jar
+/usr/lib/atos-tests/python_child_smoke.py = test_data/python_child_smoke.py
+/usr/lib/atos-tests/node_child_smoke.js = test_data/node_child_smoke.js
+/usr/lib/atos-tests/node_thread_smoke.js = test_data/node_thread_smoke.js
 /usr/lib/atos-tests/payload.txt = test_data/payload.txt

@@ -15,6 +15,7 @@ use crate::sync::SpinLock;
 
 extern "C" {
     static mut CURRENT_KERNEL_RSP: u64;
+    static mut CURRENT_SYSCALL_FRAME: u64;
 }
 
 /// Maximum run queue size (same as MAX_AGENTS).
@@ -37,7 +38,7 @@ struct AlignedSpawnStacks<const SIZE: usize, const COUNT: usize> {
 static mut SPAWN_STACKS: AlignedSpawnStacks<SPAWN_STACK_SIZE, MAX_AGENTS> = AlignedSpawnStacks {
     stacks: [[0u8; SPAWN_STACK_SIZE]; MAX_AGENTS],
 };
-static mut NEXT_STACK_SLOT: usize = 4;
+static mut SPAWN_STACK_IN_USE: [bool; MAX_AGENTS] = [false; MAX_AGENTS];
 
 #[inline]
 unsafe fn write_guard_pair(bottom: *mut u64) {
@@ -102,25 +103,67 @@ fn set_current(id: AgentId) {
     }
 }
 
-fn prepare_user_entry(agent: &Agent) {
-    gdt::set_tss_rsp0(agent.kernel_stack_top);
-    unsafe {
-        CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+fn prepare_user_entry(agent_id: AgentId) {
+    if let Some(agent) = get_agent_mut(agent_id) {
+        gdt::set_tss_rsp0(agent.kernel_stack_top);
+        unsafe {
+            CURRENT_KERNEL_RSP = agent.kernel_stack_top;
+            CURRENT_SYSCALL_FRAME = agent.saved_syscall_frame;
+        }
+        agent.saved_syscall_frame = 0;
+        crate::linux_compat::identity::restore_thread_pointer_bases(agent.id);
     }
-    crate::linux_compat::identity::restore_thread_pointer_bases(agent.id);
+}
+
+fn save_user_syscall_frame(agent_id: AgentId) {
+    let saved = unsafe { CURRENT_SYSCALL_FRAME };
+    if let Some(agent) = get_agent_mut(agent_id) {
+        if agent.mode == AgentMode::User {
+            agent.saved_syscall_frame = saved;
+        }
+    }
+    unsafe {
+        CURRENT_SYSCALL_FRAME = 0;
+    }
 }
 
 /// Allocate a stack for a dynamically spawned agent.
 pub fn allocate_agent_stack() -> u64 {
     unsafe {
-        if NEXT_STACK_SLOT >= MAX_AGENTS {
-            return 0;
+        for slot in 4..MAX_AGENTS {
+            if SPAWN_STACK_IN_USE[slot] {
+                continue;
+            }
+            SPAWN_STACK_IN_USE[slot] = true;
+            let ptr = SPAWN_STACKS.stacks[slot].as_ptr();
+            write_guard_pair(ptr as *mut u64);
+            return ((ptr as u64) + SPAWN_STACK_SIZE as u64) & !0xF;
         }
-        let slot = NEXT_STACK_SLOT;
-        NEXT_STACK_SLOT += 1;
-        let ptr = SPAWN_STACKS.stacks[slot].as_ptr();
-        write_guard_pair(ptr as *mut u64);
-        ((ptr as u64) + SPAWN_STACK_SIZE as u64) & !0xF
+        0
+    }
+}
+
+/// Return a dynamically spawned agent stack back to the reusable pool.
+pub fn free_agent_stack(stack_top: u64) {
+    if stack_top == 0 {
+        return;
+    }
+
+    unsafe {
+        let base = SPAWN_STACKS.stacks.as_ptr() as u64;
+        let end = base + (SPAWN_STACK_SIZE as u64 * MAX_AGENTS as u64);
+        let bottom = stack_top.saturating_sub(SPAWN_STACK_SIZE as u64);
+        if bottom < base || bottom >= end {
+            return;
+        }
+        let offset = bottom - base;
+        if !offset.is_multiple_of(SPAWN_STACK_SIZE as u64) {
+            return;
+        }
+        let slot = (offset / SPAWN_STACK_SIZE as u64) as usize;
+        if slot >= 4 && slot < MAX_AGENTS {
+            SPAWN_STACK_IN_USE[slot] = false;
+        }
     }
 }
 
@@ -334,9 +377,11 @@ pub fn schedule() {
     set_current(next_id);
 
     // For ring 3 agents: update TSS.rsp0
+    save_user_syscall_frame(old_id);
+
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
-            prepare_user_entry(agent);
+            prepare_user_entry(next_id);
         }
     }
 
@@ -406,9 +451,11 @@ pub fn switch_from_trap() -> ! {
 
     set_current(next_id);
 
+    save_user_syscall_frame(old_id);
+
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
-            prepare_user_entry(agent);
+            prepare_user_entry(next_id);
         }
     }
 
@@ -451,6 +498,7 @@ pub fn switch_without_current() -> ! {
     if !check_stack_guard(old_id) {
         crate::event::agent_faulted(old_id, 0xFF);
     }
+    crate::agent::auto_reap_if_unwaitable(old_id);
 
     let next_id = select_next_ready_agent();
 
@@ -462,9 +510,13 @@ pub fn switch_without_current() -> ! {
 
     set_current(next_id);
 
+    unsafe {
+        CURRENT_SYSCALL_FRAME = 0;
+    }
+
     if let Some(agent) = get_agent(next_id) {
         if agent.mode == AgentMode::User {
-            prepare_user_entry(agent);
+            prepare_user_entry(next_id);
         }
     }
 
@@ -520,11 +572,14 @@ pub fn start() {
     let new_ctx = {
         let agent = get_agent_mut(first_id).expect("First agent not found");
         agent.status = AgentStatus::Running;
-        if agent.mode == AgentMode::User {
-            prepare_user_entry(agent);
-        }
         &agent.context as *const AgentContext
     };
+
+    if let Some(agent) = get_agent(first_id) {
+        if agent.mode == AgentMode::User {
+            prepare_user_entry(first_id);
+        }
+    }
 
     serial_println!("[SCHED] Context switching to first agent: id={}", first_id);
 

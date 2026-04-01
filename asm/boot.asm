@@ -53,7 +53,7 @@ _start:
 
     ; Save Multiboot magic and info pointer to callee-saved registers
     mov ebp, eax            ; Multiboot magic -> ebp
-    ; ebx already holds multiboot info pointer
+    mov esi, ebx            ; Multiboot info pointer -> esi
 
     ; --- Zero BSS section (using PHYSICAL addresses, before paging) ---
     ; BSS is linked at high VMA but loaded at low LMA. We zero the
@@ -253,11 +253,11 @@ bits 64
     mov rsp, __stack_top
 
     ; Call kernel_main(multiboot_magic: u32, multiboot_info: u64)
-    ; Restore saved Multiboot values from ebp and ebx
+    ; Restore saved Multiboot values from ebp and esi.
+    ; EBX was clobbered by the CPUID probes in 32-bit mode.
     xor rdi, rdi
     mov edi, ebp             ; multiboot_magic (zero-extended to 64-bit)
-    xor rsi, rsi
-    mov esi, ebx             ; multiboot_info (zero-extended to 64-bit)
+    mov esi, esi             ; multiboot_info (zero-extended to 64-bit)
 
     ; Jump to kernel_main at its HIGHER-HALF virtual address.
     ; This is the moment we leave the identity-mapped world — from here

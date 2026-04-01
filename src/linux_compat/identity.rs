@@ -6,28 +6,95 @@
 use super::constants::*;
 use super::state;
 use crate::agent::USER_STACK_SIZE;
+use crate::arch::x86_64::page_table;
 use sha2::{Digest, Sha256};
+
+#[inline]
+fn current_uid(agent_id: u16) -> u32 {
+    state::get_state(agent_id).map(|st| st.uid).unwrap_or(1000)
+}
+
+#[inline]
+fn current_gid(agent_id: u16) -> u32 {
+    state::get_state(agent_id).map(|st| st.gid).unwrap_or(1000)
+}
+
+#[inline]
+fn agent_cr3(agent_id: u16) -> Option<u64> {
+    crate::agent::get_agent(agent_id)
+        .map(|agent| agent.context.cr3)
+        .filter(|cr3| *cr3 != 0)
+}
+
+fn ensure_user_range_mapped(agent_id: u16, user_addr: u64, len: usize, write: bool) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if len == 0 {
+        return true;
+    }
+
+    let start = user_addr & !(crate::arch::x86_64::paging::PAGE_SIZE as u64 - 1);
+    let end_addr = user_addr.saturating_add(len.saturating_sub(1) as u64);
+    let end = end_addr & !(crate::arch::x86_64::paging::PAGE_SIZE as u64 - 1);
+    let mut page = start;
+    let fault_code = if write { 0x2 } else { 0x0 };
+
+    loop {
+        if page_table::translate_user_vaddr(cr3, page).is_none()
+            && !crate::linux_compat::memory::handle_user_page_fault(agent_id, page, fault_code)
+        {
+            return false;
+        }
+        if page == end {
+            break;
+        }
+        page = page.saturating_add(crate::arch::x86_64::paging::PAGE_SIZE as u64);
+    }
+
+    true
+}
+
+fn copy_from_user(agent_id: u16, user_addr: u64, dst: &mut [u8]) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if !ensure_user_range_mapped(agent_id, user_addr, dst.len(), false) {
+        return false;
+    }
+    page_table::copy_from_user(cr3, user_addr, dst)
+}
+
+fn copy_to_user(agent_id: u16, user_addr: u64, src: &[u8]) -> bool {
+    let Some(cr3) = agent_cr3(agent_id) else {
+        return false;
+    };
+    if !ensure_user_range_mapped(agent_id, user_addr, src.len(), true) {
+        return false;
+    }
+    page_table::copy_to_user(cr3, user_addr, src)
+}
 
 // ── Simple identity getters ────────────────────────────────────────────────
 
-/// getuid() -> 1000
-pub fn sys_getuid(_agent_id: u16) -> i64 {
-    1000
+/// getuid() -> deterministic Linux uid
+pub fn sys_getuid(agent_id: u16) -> i64 {
+    current_uid(agent_id) as i64
 }
 
-/// getgid() -> 1000
-pub fn sys_getgid(_agent_id: u16) -> i64 {
-    1000
+/// getgid() -> deterministic Linux gid
+pub fn sys_getgid(agent_id: u16) -> i64 {
+    current_gid(agent_id) as i64
 }
 
-/// geteuid() -> 1000
-pub fn sys_geteuid(_agent_id: u16) -> i64 {
-    1000
+/// geteuid() -> deterministic Linux uid
+pub fn sys_geteuid(agent_id: u16) -> i64 {
+    current_uid(agent_id) as i64
 }
 
-/// getegid() -> 1000
-pub fn sys_getegid(_agent_id: u16) -> i64 {
-    1000
+/// getegid() -> deterministic Linux gid
+pub fn sys_getegid(agent_id: u16) -> i64 {
+    current_gid(agent_id) as i64
 }
 
 /// setpgid(pid, pgid) -> 0 (no-op)
@@ -44,23 +111,22 @@ pub fn sys_getpgid(agent_id: u16, pid: u64) -> i64 {
     }
 }
 
-/// getgroups(size, list) -> 1 group (gid 1000), or count if size == 0
-pub fn sys_getgroups(_agent_id: u16, size: u64, list_ptr: u64) -> i64 {
+/// getgroups(size, list) -> 1 deterministic supplementary group.
+pub fn sys_getgroups(agent_id: u16, size: u64, list_ptr: u64) -> i64 {
     if size == 0 {
         return 1; // one supplementary group
     }
     if list_ptr == 0 {
         return -EFAULT;
     }
-    // Write single gid_t (u32) = 1000
-    unsafe {
-        let val: u32 = 1000;
-        core::ptr::copy_nonoverlapping(&val as *const u32 as *const u8, list_ptr as *mut u8, 4);
+    let val = current_gid(agent_id).to_ne_bytes();
+    if !copy_to_user(agent_id, list_ptr, &val) {
+        return -EFAULT;
     }
     1
 }
 
-/// setgroups(size, list) -> 0 (no-op, we always report gid 1000)
+/// setgroups(size, list) -> 0 (no-op, we always report the deterministic gid)
 pub fn sys_setgroups(_agent_id: u16, _size: u64, _list_ptr: u64) -> i64 {
     0
 }
@@ -68,28 +134,29 @@ pub fn sys_setgroups(_agent_id: u16, _size: u64, _list_ptr: u64) -> i64 {
 // ── uname ──────────────────────────────────────────────────────────────────
 
 /// Helper: write a null-terminated string into a fixed-size utsname field (65 bytes).
-unsafe fn write_utsname_field(ptr: *mut u8, s: &[u8]) {
+fn write_utsname_field(buf: &mut [u8], offset: usize, s: &[u8]) {
     let len = if s.len() > 64 { 64 } else { s.len() };
-    core::ptr::write_bytes(ptr, 0, 65); // zero the field first
-    core::ptr::copy_nonoverlapping(s.as_ptr(), ptr, len);
+    buf[offset..offset + 65].fill(0);
+    buf[offset..offset + len].copy_from_slice(&s[..len]);
 }
 
 /// uname(struct utsname *buf)
 ///
 /// Linux utsname: 6 fields of 65 bytes each = 390 bytes.
 /// Fields: sysname, nodename, release, version, machine, domainname.
-pub fn sys_uname(_agent_id: u16, buf_ptr: u64) -> i64 {
+pub fn sys_uname(agent_id: u16, buf_ptr: u64) -> i64 {
     if buf_ptr == 0 {
         return -EFAULT;
     }
-    unsafe {
-        let p = buf_ptr as *mut u8;
-        write_utsname_field(p, b"Linux"); // sysname
-        write_utsname_field(p.add(65), b"atos"); // nodename
-        write_utsname_field(p.add(130), b"5.15.0-atos"); // release
-        write_utsname_field(p.add(195), b"#1 SMP ATOS"); // version
-        write_utsname_field(p.add(260), b"x86_64"); // machine
-        write_utsname_field(p.add(325), b"(none)"); // domainname
+    let mut uts = [0u8; 390];
+    write_utsname_field(&mut uts, 0, b"Linux");
+    write_utsname_field(&mut uts, 65, b"atos");
+    write_utsname_field(&mut uts, 130, b"5.15.0-atos");
+    write_utsname_field(&mut uts, 195, b"#1 SMP ATOS");
+    write_utsname_field(&mut uts, 260, b"x86_64");
+    write_utsname_field(&mut uts, 325, b"(none)");
+    if !copy_to_user(agent_id, buf_ptr, &uts) {
+        return -EFAULT;
     }
     0
 }
@@ -112,7 +179,7 @@ pub fn sys_uname(_agent_id: u16, buf_ptr: u64) -> i64 {
 ///   offset 88: u64  totalhigh
 ///   offset 96: u64  freehigh
 ///   offset 104: u32 mem_unit
-pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
+pub fn sys_sysinfo(agent_id: u16, info_ptr: u64) -> i64 {
     if info_ptr == 0 {
         return -EFAULT;
     }
@@ -125,22 +192,14 @@ pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
     let freeram: u64 = 64 * 1024 * 1024;
     let procs: u16 = 1; // at least the current agent
 
-    unsafe {
-        let p = info_ptr as *mut u8;
-        // Zero the whole struct first
-        core::ptr::write_bytes(p, 0, 112);
-
-        // uptime
-        core::ptr::copy_nonoverlapping(&uptime as *const i64 as *const u8, p, 8);
-        // totalram at offset 32
-        core::ptr::copy_nonoverlapping(&totalram as *const u64 as *const u8, p.add(32), 8);
-        // freeram at offset 40
-        core::ptr::copy_nonoverlapping(&freeram as *const u64 as *const u8, p.add(40), 8);
-        // procs at offset 80
-        core::ptr::copy_nonoverlapping(&procs as *const u16 as *const u8, p.add(80), 2);
-        // mem_unit at offset 104
-        let mem_unit: u32 = 1;
-        core::ptr::copy_nonoverlapping(&mem_unit as *const u32 as *const u8, p.add(104), 4);
+    let mut info = [0u8; 112];
+    info[0..8].copy_from_slice(&uptime.to_ne_bytes());
+    info[32..40].copy_from_slice(&totalram.to_ne_bytes());
+    info[40..48].copy_from_slice(&freeram.to_ne_bytes());
+    info[80..82].copy_from_slice(&procs.to_ne_bytes());
+    info[104..108].copy_from_slice(&1u32.to_ne_bytes());
+    if !copy_to_user(agent_id, info_ptr, &info) {
+        return -EFAULT;
     }
     0
 }
@@ -152,24 +211,16 @@ pub fn sys_sysinfo(_agent_id: u16, info_ptr: u64) -> i64 {
 /// The result is inherently racy on Linux, so returning a deterministic
 /// single-CPU / single-node view is sufficient for runtime probing.
 /// `tcache` has been unused by Linux for years and is ignored here too.
-pub fn sys_getcpu(_agent_id: u16, cpu_ptr: u64, node_ptr: u64, _tcache: u64) -> i64 {
+pub fn sys_getcpu(agent_id: u16, cpu_ptr: u64, node_ptr: u64, _tcache: u64) -> i64 {
     let cpu: u32 = 0;
     let node: u32 = 0;
 
-    if cpu_ptr != 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(&cpu as *const u32 as *const u8, cpu_ptr as *mut u8, 4);
-        }
+    if cpu_ptr != 0 && !copy_to_user(agent_id, cpu_ptr, &cpu.to_ne_bytes()) {
+        return -EFAULT;
     }
 
-    if node_ptr != 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &node as *const u32 as *const u8,
-                node_ptr as *mut u8,
-                4,
-            );
-        }
+    if node_ptr != 0 && !copy_to_user(agent_id, node_ptr, &node.to_ne_bytes()) {
+        return -EFAULT;
     }
 
     0
@@ -229,6 +280,12 @@ pub fn restore_thread_pointer_bases(agent_id: u16) {
     }
 }
 
+#[inline]
+fn is_valid_user_thread_pointer_base(addr: u64) -> bool {
+    // Linux x86_64 user-space TLS bases must stay in the lower canonical half.
+    addr < 0x0000_8000_0000_0000
+}
+
 pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
     let st = match state::get_state_mut(agent_id) {
         Some(s) => s,
@@ -237,6 +294,9 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
 
     match code as u64 {
         ARCH_SET_FS => {
+            if !is_valid_user_thread_pointer_base(addr) {
+                return -EINVAL;
+            }
             st.fs_base = addr;
             unsafe {
                 wrmsr(MSR_FS_BASE, addr);
@@ -247,16 +307,15 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
             if addr == 0 {
                 return -EFAULT;
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    &st.fs_base as *const u64 as *const u8,
-                    addr as *mut u8,
-                    8,
-                );
+            if !copy_to_user(agent_id, addr, &st.fs_base.to_ne_bytes()) {
+                return -EFAULT;
             }
             0
         }
         ARCH_SET_GS => {
+            if !is_valid_user_thread_pointer_base(addr) {
+                return -EINVAL;
+            }
             st.gs_base = addr;
             unsafe {
                 wrmsr(MSR_GS_BASE, addr);
@@ -267,9 +326,8 @@ pub fn sys_arch_prctl(agent_id: u16, code: i32, addr: u64) -> i64 {
             if addr == 0 {
                 return -EFAULT;
             }
-            let val = st.gs_base;
-            unsafe {
-                core::ptr::copy_nonoverlapping(&val as *const u64 as *const u8, addr as *mut u8, 8);
+            if !copy_to_user(agent_id, addr, &st.gs_base.to_ne_bytes()) {
+                return -EFAULT;
             }
             0
         }
@@ -289,10 +347,10 @@ const RLIM_INFINITY: u64 = !0; // 0xFFFFFFFFFFFFFFFF
 ///
 /// rlimit64 struct: { rlim_cur: u64, rlim_max: u64 } = 16 bytes
 pub fn sys_prlimit64(
-    _agent_id: u16,
+    agent_id: u16,
     _pid: u64,
     resource: u64,
-    _new_limit_ptr: u64,
+    new_limit_ptr: u64,
     old_limit_ptr: u64,
 ) -> i64 {
     // Determine the limit values for this resource
@@ -302,12 +360,20 @@ pub fn sys_prlimit64(
         _ => (RLIM_INFINITY, RLIM_INFINITY),
     };
 
+    if new_limit_ptr != 0 {
+        let mut new_limit = [0u8; 16];
+        if !copy_from_user(agent_id, new_limit_ptr, &mut new_limit) {
+            return -EFAULT;
+        }
+    }
+
     // Write old limit if requested
     if old_limit_ptr != 0 {
-        unsafe {
-            let p = old_limit_ptr as *mut u8;
-            core::ptr::copy_nonoverlapping(&cur as *const u64 as *const u8, p, 8);
-            core::ptr::copy_nonoverlapping(&max as *const u64 as *const u8, p.add(8), 8);
+        let mut limit = [0u8; 16];
+        limit[0..8].copy_from_slice(&cur.to_ne_bytes());
+        limit[8..16].copy_from_slice(&max.to_ne_bytes());
+        if !copy_to_user(agent_id, old_limit_ptr, &limit) {
+            return -EFAULT;
         }
     }
 
@@ -335,7 +401,6 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
     };
 
     let mut written: u64 = 0;
-    let dst = buf_ptr as *mut u8;
 
     while written < buflen {
         // Generate 32 bytes of PRNG output via SHA-256
@@ -351,8 +416,8 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
         // Copy to user buffer
         let remaining = (buflen - written) as usize;
         let chunk = if remaining > 32 { 32 } else { remaining };
-        unsafe {
-            core::ptr::copy_nonoverlapping(hash.as_ptr(), dst.add(written as usize), chunk);
+        if !copy_to_user(agent_id, buf_ptr + written, &hash[..chunk]) {
+            return -EFAULT;
         }
         written += chunk as u64;
     }
