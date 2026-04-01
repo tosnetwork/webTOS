@@ -1,4 +1,4 @@
-; ATOS AP Bootstrap Trampoline
+; TOS AP Bootstrap Trampoline
 ;
 ; Entered by Application Processors (APs) in 16-bit real mode after
 ; receiving a Startup IPI (SIPI) from the BSP. Transitions through

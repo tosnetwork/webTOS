@@ -1,4 +1,4 @@
-; ATOS Boot Assembly — Higher-Half Kernel
+; TOS Boot Assembly — Higher-Half Kernel
 ;
 ; Entry point: _start (called by Multiboot-compliant loader)
 ;

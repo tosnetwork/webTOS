@@ -1,11 +1,11 @@
-# ATOS WASM Runtime Specification
+# TOS WASM Runtime Specification
 
 **Version:** 2.1 (SIMD + Relaxed SIMD Complete)
 **Status:** Implementation Reference
 **Companion to:** Yellow Paper §24.3.1
 **Last Updated:** 2026-03-24
 
-> This document is the normative specification for the ATOS WASM runtime. The yellow paper provides architectural context and roadmap; this document provides the complete opcode support matrix, runtime class policy, host function ABI, limits, and implementation contract.
+> This document is the normative specification for the TOS WASM runtime. The yellow paper provides architectural context and roadmap; this document provides the complete opcode support matrix, runtime class policy, host function ABI, limits, and implementation contract.
 
 ---
 
@@ -18,13 +18,13 @@
 - [5. Instruction Set](#5-instruction-set)
 - [6. Memory Model](#6-memory-model)
 - [7. Function Calls and Control Flow](#7-function-calls-and-control-flow)
-- [8. Host Functions (ATOS Syscall Bridge)](#8-host-functions-atos-syscall-bridge)
+- [8. Host Functions (TOS Syscall Bridge)](#8-host-functions-tos-syscall-bridge)
 - [9. Fuel Metering](#9-fuel-metering)
 - [10. Instance Lifecycle](#10-instance-lifecycle)
 - [11. Agent Loading Path](#11-agent-loading-path)
 - [12. Implementation Limits](#12-implementation-limits)
 - [13. Error Types](#13-error-types)
-- [14. SDK (atos-wasm-sdk)](#14-sdk-atos-wasm-sdk)
+- [14. SDK (tos-wasm-sdk)](#14-sdk-tos-wasm-sdk)
 - [15. Differences from Standard WASM MVP](#15-differences-from-standard-wasm-mvp)
 - [16. Future Extensions](#16-future-extensions)
 - [Appendix A. Source File Map](#appendix-a-source-file-map)
@@ -33,19 +33,19 @@
 
 ## 1. Overview
 
-The ATOS WASM runtime is the primary sandboxed execution backend for ATOS agents. It provides portable execution with fine-grained memory safety and fuel-based metering.
+The TOS WASM runtime is the primary sandboxed execution backend for TOS agents. It provides portable execution with fine-grained memory safety and fuel-based metering.
 
 WASM is an `AgentRuntime` (unlike eBPF-lite, which is the policy layer). WASM agents are scheduled by the kernel, communicate via mailboxes, and consume energy budgets — they are first-class agents.
 
 **Design goals:**
 
 - **Per-agent determinism policy** via RuntimeClass — agents choose their trust level
-- Fuel-bounded execution mapped to ATOS energy accounting
+- Fuel-bounded execution mapped to TOS energy accounting
 - Sandboxed memory (linear memory, bounds-checked on every access)
 - Syscall bridging via host function imports (not direct kernel calls)
 - Interpreter-only in Stage-2/3 (no JIT)
 
-**Why WASM for ATOS:**
+**Why WASM for TOS:**
 
 The yellowpaper §25.2.4 states: *"Full instruction-level determinism is only guaranteed for WASM agents (fuel-counted). Native agents have deterministic scheduling order but may produce different results per tick depending on CPU microarchitecture."* For maximum replay and proof guarantees, production agents should prefer WASM with ProofGrade RuntimeClass.
 
@@ -55,7 +55,7 @@ The yellowpaper §25.2.4 states: *"Full instruction-level determinism is only gu
 
 ## 2. Runtime Class Model
 
-ATOS does **not** impose a single determinism policy on all agents. Different agents have different needs — a settlement agent must be provably deterministic, while an AI inference agent needs floating-point. The RuntimeClass system resolves this.
+TOS does **not** impose a single determinism policy on all agents. Different agents have different needs — a settlement agent must be provably deterministic, while an AI inference agent needs floating-point. The RuntimeClass system resolves this.
 
 ### 2.1 RuntimeClass enum
 
@@ -67,7 +67,7 @@ pub enum RuntimeClass {
 }
 ```
 
-Default is **BestEffort** — agents get full WASM features out of the box. Agents that need verifiable execution explicitly opt in to ProofGrade. This is "open by default, restrict when needed" — the same principle as ATOS's capability model but applied to execution features.
+Default is **BestEffort** — agents get full WASM features out of the box. Agents that need verifiable execution explicitly opt in to ProofGrade. This is "open by default, restrict when needed" — the same principle as TOS's capability model but applied to execution features.
 
 RuntimeClass is a **per-instance** property of `WasmInstance`, not a global compile-time flag. The same WASM module can be loaded under different classes by different agents.
 
@@ -619,9 +619,9 @@ BlockFrame {
 
 ---
 
-## 8. Host Functions (ATOS Syscall Bridge)
+## 8. Host Functions (TOS Syscall Bridge)
 
-WASM agents invoke ATOS syscalls by importing host functions from the `"atos"` module. The runtime bridges these to kernel syscalls.
+WASM agents invoke TOS syscalls by importing host functions from the `"tos"` module. The runtime bridges these to kernel syscalls.
 
 ### 8.1 Host function table
 
@@ -668,7 +668,7 @@ If a WASM module imports a function not in the table above, `handle_host_call` r
 Every instruction executed costs **1 fuel unit**. Fuel is decremented in `step()` before opcode dispatch.
 
 ```text
-1 WASM instruction = 1 fuel = 1 ATOS energy unit
+1 WASM instruction = 1 fuel = 1 TOS energy unit
 ```
 
 This applies identically across all RuntimeClasses — ProofGrade, ReplayGrade, and BestEffort agents all consume fuel at the same rate.
@@ -729,11 +729,11 @@ instance.resume(value)         // resume after host call
 
 The agent loader searches for an entry point in this priority order:
 
-1. `"run"` — ATOS convention (preferred for SDK agents)
+1. `"run"` — TOS convention (preferred for SDK agents)
 2. `"_start"` — WASI / standard WASM convention
 3. `"main"` — C/Rust convention
 
-The first one found is used. This allows standard `rustc --target wasm32-unknown-unknown` compiled programs to run without requiring the ATOS SDK.
+The first one found is used. This allows standard `rustc --target wasm32-unknown-unknown` compiled programs to run without requiring the TOS SDK.
 
 `[IMPL: ✅ runtime.rs — WasmInstance with runtime_class, ExecResult, call_func/resume/run/run_start]`
 
@@ -846,23 +846,23 @@ Limits are aligned with WASM spec defaults. Actual memory usage is gated by the 
 
 ---
 
-## 14. SDK (atos-wasm-sdk)
+## 14. SDK (tos-wasm-sdk)
 
-The `atos-wasm-sdk` Rust crate provides **optional** safe wrappers for writing WASM agents. The SDK is not required — any `no_std` Rust program compiled with `rustc --target wasm32-unknown-unknown` that exports `run`, `_start`, or `main` can run on ATOS directly. The SDK simply makes it more convenient to interact with ATOS host functions.
+The `tos-wasm-sdk` Rust crate provides **optional** safe wrappers for writing WASM agents. The SDK is not required — any `no_std` Rust program compiled with `rustc --target wasm32-unknown-unknown` that exports `run`, `_start`, or `main` can run on TOS directly. The SDK simply makes it more convenient to interact with TOS host functions.
 
 ### 14.1 Usage
 
 ```rust
 #![no_std]
 #![no_main]
-use atos_wasm_sdk::*;
+use tos_wasm_sdk::*;
 
 #[no_mangle]
 pub extern "C" fn run() {
     log_str("Hello from WASM agent!");
     let msg = b"hello";
     send(3, msg);
-    loop { atos_yield(); }
+    loop { tos_yield(); }
 }
 ```
 
@@ -874,7 +874,7 @@ Deploy with RuntimeClass: `sys_spawn_image(wasm_bytes, len, 1 | (1 << 8), energy
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `atos_yield()` | `() → i32` | Yield timeslice |
+| `tos_yield()` | `() → i32` | Yield timeslice |
 | `send(mailbox_id, payload)` | `(u16, &[u8]) → i32` | Send message |
 | `recv(mailbox_id, buf)` | `(u16, &mut [u8]) → i32` | Receive message |
 | `exit(code)` | `(i32) → !` | Terminate agent |
@@ -884,7 +884,7 @@ Deploy with RuntimeClass: `sys_spawn_image(wasm_bytes, len, 1 | (1 << 8), energy
 
 ### 14.3 Host import declarations
 
-The SDK declares imports using `#[link(wasm_import_module = "atos")]`:
+The SDK declares imports using `#[link(wasm_import_module = "tos")]`:
 
 ```rust
 extern "C" {
@@ -897,7 +897,7 @@ extern "C" {
 }
 ```
 
-`[IMPL: ✅ sdk/atos-wasm-sdk/src/lib.rs + examples/hello.rs]`
+`[IMPL: ✅ sdk/tos-wasm-sdk/src/lib.rs + examples/hello.rs]`
 
 ---
 
@@ -916,9 +916,9 @@ extern "C" {
 
 ### 15.2 Limits (aligned with WASM spec defaults)
 
-ATOS limits are aligned with the WASM spec to ensure compatibility with standard WASM toolchain output. Actual resource usage is controlled per-agent by `mem_quota` and `energy_budget`.
+TOS limits are aligned with the WASM spec to ensure compatibility with standard WASM toolchain output. Actual resource usage is controlled per-agent by `mem_quota` and `energy_budget`.
 
-| Resource | Standard WASM | ATOS | Spec default |
+| Resource | Standard WASM | TOS | Spec default |
 |----------|--------------|------|-------|
 | Max memory | 4 GiB (65,536 pages) | **4 GiB** (65,536 pages) | unlimited (by Store) |
 | Max functions | Unlimited | **10,000** | 10,000 |
@@ -934,7 +934,7 @@ ATOS limits are aligned with the WASM spec to ensure compatibility with standard
 
 ### 15.3 Extensions beyond MVP
 
-| Feature | Standard MVP | ATOS | Source |
+| Feature | Standard MVP | TOS | Source |
 |---------|-------------|------|--------|
 | Sign extension ops | Post-MVP proposal | ✅ | Useful for integer conversions |
 | Tail calls | Post-MVP proposal | ✅ | Useful for agent loop patterns |
@@ -946,7 +946,7 @@ ATOS limits are aligned with the WASM spec to ensure compatibility with standard
 
 ### 15.4 Behavioral differences
 
-| Behavior | Standard WASM | ATOS |
+| Behavior | Standard WASM | TOS |
 |----------|--------------|------|
 | Division by zero | Trap | Trap (same) |
 | Integer overflow on div | Trap (i32.div_s MIN/-1) | Trap with `IntegerOverflow` (same) |
@@ -1006,7 +1006,7 @@ All limits have been raised to support standard compiler output (see §12). No f
 | `src/wasm/host.rs` | ~177 | Host function resolver (N-th func import scan), 6 syscall bridges |
 | `src/agents/wasm_agent.rs` | ~209 | Demo WASM agent with hand-crafted binary |
 | `src/agent_loader.rs` | ~472 | Agent loading: spawn_from_image_with_class, multi-entry-point support |
-| `sdk/atos-wasm-sdk/src/lib.rs` | ~92 | Agent SDK (optional): safe host function wrappers |
+| `sdk/tos-wasm-sdk/src/lib.rs` | ~92 | Agent SDK (optional): safe host function wrappers |
 | **Total** | **~5,212** | |
 
 ### Implementation Progress

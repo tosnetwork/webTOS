@@ -1,4 +1,4 @@
-//! ATOS Virtio-Net Driver (Legacy PCI I/O)
+//! TOS Virtio-Net Driver (Legacy PCI I/O)
 //!
 //! Minimal virtio-net driver for QEMU. Uses legacy (0.9.5) virtio
 //! interface via PCI I/O ports. Supports basic packet send/receive

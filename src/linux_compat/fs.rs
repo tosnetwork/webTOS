@@ -1,8 +1,8 @@
 //! File-system related Linux syscall implementations.
 //!
-//! Translates Linux file I/O syscalls into ATOS keyspace state operations.
+//! Translates Linux file I/O syscalls into TOS keyspace state operations.
 //! Files are backed by the agent's private keyspace; pipes and sockets map
-//! to ATOS mailbox IPC.
+//! to TOS mailbox IPC.
 
 use super::constants::*;
 use super::state::{self, FdEntry, FdKind, LinuxAgentState, MAX_FDS, MAX_PATH};

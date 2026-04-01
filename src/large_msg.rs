@@ -1,4 +1,4 @@
-//! ATOS Large Message Support
+//! TOS Large Message Support
 //!
 //! Enables agents to exchange data larger than the 256-byte mailbox
 //! payload limit. The sender allocates a shared memory region, writes

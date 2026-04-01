@@ -1,0 +1,13 @@
+[package]
+name = "tos-wasm-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "TOS WASM Agent SDK — write WASM agents for TOS in Rust"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+lto = true

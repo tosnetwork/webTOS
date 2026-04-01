@@ -150,9 +150,9 @@ pub fn sys_uname(agent_id: u16, buf_ptr: u64) -> i64 {
     }
     let mut uts = [0u8; 390];
     write_utsname_field(&mut uts, 0, b"Linux");
-    write_utsname_field(&mut uts, 65, b"atos");
-    write_utsname_field(&mut uts, 130, b"5.15.0-atos");
-    write_utsname_field(&mut uts, 195, b"#1 SMP ATOS");
+    write_utsname_field(&mut uts, 65, b"tos");
+    write_utsname_field(&mut uts, 130, b"5.15.0-tos");
+    write_utsname_field(&mut uts, 195, b"#1 SMP TOS");
     write_utsname_field(&mut uts, 260, b"x86_64");
     write_utsname_field(&mut uts, 325, b"(none)");
     if !copy_to_user(agent_id, buf_ptr, &uts) {
@@ -429,7 +429,7 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
 
 /// rseq(struct rseq *rseq, u32 rseq_len, int flags, u32 sig)
 ///
-/// Restartable sequences registration. ATOS does not implement the kernel
+/// Restartable sequences registration. TOS does not implement the kernel
 /// bookkeeping needed to make user-space rseq critical sections safe, so we
 /// must report it as unavailable and let libc fall back to non-rseq paths.
 #[allow(dead_code)]

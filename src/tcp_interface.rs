@@ -1,4 +1,4 @@
-//! ATOS TCP External Interface Protocol (Yellow Paper §28)
+//! TOS TCP External Interface Protocol (Yellow Paper §28)
 //!
 //! Defines the binary wire protocol for external clients to submit requests
 //! (deploy, call, query, submit) and receive responses over a TCP connection.
@@ -9,7 +9,7 @@ use crate::capability::{CapType, Capability};
 
 // ─── Magic & version ───────────────────────────────────────────────────────
 
-/// Wire protocol magic bytes: "ATSR" (ATOS Request).
+/// Wire protocol magic bytes: "ATSR" (TOS Request).
 const MAGIC: [u8; 4] = [0x41, 0x54, 0x53, 0x52];
 
 /// Current protocol version.

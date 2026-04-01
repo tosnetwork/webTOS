@@ -6,9 +6,9 @@
  *
  * Runs:
  *   execve("/usr/lib/jvm/java-11-openjdk-amd64/bin/java",
- *          ["java", "-Xshare:off", "-XX:-UsePerfData", "-cp", "/usr/lib/atos-tests", "FsProbe"], envp)
+ *          ["java", "-Xshare:off", "-XX:-UsePerfData", "-cp", "/usr/lib/tos-tests", "FsProbe"], envp)
  *
- * Success is observed if the VM prints ATOS-JAVA-FS markers and exits cleanly.
+ * Success is observed if the VM prints TOS-JAVA-FS markers and exits cleanly.
  */
 
 typedef unsigned long size_t;
@@ -88,7 +88,7 @@ void _start(void) {
     static char arg1[] = "-Xshare:off";
     static char arg2[] = "-XX:-UsePerfData";
     static char arg3[] = "-cp";
-    static char arg4[] = "/usr/lib/atos-tests";
+    static char arg4[] = "/usr/lib/tos-tests";
     static char arg5[] = "FsProbe";
     static char env0[] = "JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64";
     static char env1[] = "LANG=C";
@@ -98,7 +98,7 @@ void _start(void) {
     static char *argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, 0};
     static char *envp[] = {env0, env1, env2, env3, env4, 0};
 
-    print("[JAVA] launching java -Xshare:off -XX:-UsePerfData -cp /usr/lib/atos-tests FsProbe\n");
+    print("[JAVA] launching java -Xshare:off -XX:-UsePerfData -cp /usr/lib/tos-tests FsProbe\n");
     long ret = sys_execve(path, argv, envp);
     print("[JAVA] execve returned ");
     print_num(ret);

@@ -1,4 +1,4 @@
-//! ATOS accountd — Energy Accounting Reporter
+//! TOS accountd — Energy Accounting Reporter
 //!
 //! System agent that exposes per-agent cumulative energy consumption.
 //! External systems query accountd via mailbox for billing data.

@@ -1,4 +1,4 @@
-//! ATOS Checkpoint & Replay
+//! TOS Checkpoint & Replay
 //!
 //! Captures execution state and serializes it to disk via ATA PIO.
 //! Checkpoint includes: agent contexts, energy counters, scheduler state,

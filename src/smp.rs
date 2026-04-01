@@ -1,4 +1,4 @@
-//! ATOS SMP Bootstrap
+//! TOS SMP Bootstrap
 //!
 //! Orchestrates Application Processor (AP) startup via INIT+SIPI IPI sequence.
 //! APs execute the trampoline code, enter long mode, and call ap_entry().

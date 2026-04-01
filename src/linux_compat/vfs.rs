@@ -1,6 +1,6 @@
 //! Virtual Filesystem for Linux Compatibility Layer
 //!
-//! Maps Linux file paths to ATOS keyspace keys. Paths under `/lib/`,
+//! Maps Linux file paths to TOS keyspace keys. Paths under `/lib/`,
 //! `/usr/lib/`, `/jdk/`, and `/etc/` resolve to the shared
 //! read-only base image keyspace, while `/app/` and all other paths
 //! resolve to the agent's own private keyspace.

@@ -5,7 +5,7 @@
  *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 -o test_node_thread_execve.elf test_node_thread_execve.c
  *
  * Runs:
- *   execve("/usr/bin/node", ["node", "--max-old-space-size=8", "/usr/lib/atos-tests/node_thread_smoke.js"], envp)
+ *   execve("/usr/bin/node", ["node", "--max-old-space-size=8", "/usr/lib/tos-tests/node_thread_smoke.js"], envp)
  */
 
 typedef unsigned long u64;
@@ -75,7 +75,7 @@ static void print_num(i64 n) {
 void _start(void) {
     static char path[] = "/usr/bin/node";
     static char arg1[] = "--max-old-space-size=8";
-    static char arg2[] = "/usr/lib/atos-tests/node_thread_smoke.js";
+    static char arg2[] = "/usr/lib/tos-tests/node_thread_smoke.js";
     static char env0[] = "LANG=C";
     static char *argv[] = {path, arg1, arg2, 0};
     static char *envp[] = {env0, 0};

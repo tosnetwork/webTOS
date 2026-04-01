@@ -1,4 +1,4 @@
-//! ATOS Root Agent
+//! TOS Root Agent
 //!
 //! The root agent is the system supervisor. It holds wildcard capabilities
 //! for all capability types, enabling it to delegate narrowed capabilities
@@ -22,7 +22,7 @@ enum LinuxRuntimeSmokeFocus {
 
 #[inline]
 fn linux_runtime_smoke_focus() -> LinuxRuntimeSmokeFocus {
-    match option_env!("ATOS_RUNTIME_SMOKE_FOCUS") {
+    match option_env!("TOS_RUNTIME_SMOKE_FOCUS") {
         Some("node") => LinuxRuntimeSmokeFocus::Node,
         Some("python") => LinuxRuntimeSmokeFocus::Python,
         Some("all") => LinuxRuntimeSmokeFocus::All,
@@ -42,7 +42,7 @@ enum JavaSmokeFocus {
 
 #[inline]
 fn java_smoke_focus() -> JavaSmokeFocus {
-    match option_env!("ATOS_JAVA_SMOKE_FOCUS") {
+    match option_env!("TOS_JAVA_SMOKE_FOCUS") {
         Some("version") => JavaSmokeFocus::Version,
         Some("hello") => JavaSmokeFocus::Hello,
         Some("fs") => JavaSmokeFocus::Fs,
@@ -644,7 +644,7 @@ pub extern "C" fn root_entry() -> ! {
                     JAVA_SMOKE_DELAY_TICKS
                 );
             }
-            if java_focus_runs_hello() && linux_path_exists(b"/usr/lib/atos-tests/Hello.class") {
+            if java_focus_runs_hello() && linux_path_exists(b"/usr/lib/tos-tests/Hello.class") {
                 serial_println!(
                     "[ROOT] Java Hello smoke test available; delaying until root tick {}",
                     JAVA_HELLO_SMOKE_DELAY_TICKS
@@ -652,7 +652,7 @@ pub extern "C" fn root_entry() -> ! {
             } else {
                 serial_println!("[ROOT] Java Hello smoke test disabled or payload missing");
             }
-            if java_focus_runs_fs() && linux_path_exists(b"/usr/lib/atos-tests/FsProbe.class") {
+            if java_focus_runs_fs() && linux_path_exists(b"/usr/lib/tos-tests/FsProbe.class") {
                 serial_println!(
                     "[ROOT] Java FS smoke test available; delaying until root tick {}",
                     JAVA_FS_SMOKE_DELAY_TICKS
@@ -660,7 +660,7 @@ pub extern "C" fn root_entry() -> ! {
             } else {
                 serial_println!("[ROOT] Java FS smoke test disabled or payload missing");
             }
-            if java_focus_runs_jar() && linux_path_exists(b"/usr/lib/atos-tests/java-smoke.jar") {
+            if java_focus_runs_jar() && linux_path_exists(b"/usr/lib/tos-tests/java-smoke.jar") {
                 serial_println!(
                     "[ROOT] Java JAR smoke test available; delaying until root tick {}",
                     JAVA_JAR_SMOKE_DELAY_TICKS
@@ -669,7 +669,7 @@ pub extern "C" fn root_entry() -> ! {
                 serial_println!("[ROOT] Java JAR smoke test disabled or payload missing");
             }
             if java_focus_runs_phase6()
-                && linux_path_exists(b"/usr/lib/atos-tests/JavaChildSmoke.class")
+                && linux_path_exists(b"/usr/lib/tos-tests/JavaChildSmoke.class")
             {
                 serial_println!(
                     "[ROOT] Java child-process smoke test available; delaying until root tick {}",
@@ -679,7 +679,7 @@ pub extern "C" fn root_entry() -> ! {
                 serial_println!("[ROOT] Java child-process smoke test disabled or payload missing");
             }
             if java_focus_runs_phase6()
-                && linux_path_exists(b"/usr/lib/atos-tests/JavaThreadSmoke.class")
+                && linux_path_exists(b"/usr/lib/tos-tests/JavaThreadSmoke.class")
             {
                 serial_println!(
                     "[ROOT] Java thread smoke test available; delaying until root tick {}",
@@ -707,23 +707,23 @@ pub extern "C" fn root_entry() -> ! {
     let java_hello_available = focus_runs_java()
         && java_focus_runs_hello()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-        && linux_path_exists(b"/usr/lib/atos-tests/Hello.class");
+        && linux_path_exists(b"/usr/lib/tos-tests/Hello.class");
     let java_fs_available = focus_runs_java()
         && java_focus_runs_fs()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-        && linux_path_exists(b"/usr/lib/atos-tests/FsProbe.class");
+        && linux_path_exists(b"/usr/lib/tos-tests/FsProbe.class");
     let java_jar_available = focus_runs_java()
         && java_focus_runs_jar()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-        && linux_path_exists(b"/usr/lib/atos-tests/java-smoke.jar");
+        && linux_path_exists(b"/usr/lib/tos-tests/java-smoke.jar");
     let java_child_available = focus_runs_java()
         && java_focus_runs_phase6()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-        && linux_path_exists(b"/usr/lib/atos-tests/JavaChildSmoke.class");
+        && linux_path_exists(b"/usr/lib/tos-tests/JavaChildSmoke.class");
     let java_thread_available = focus_runs_java()
         && java_focus_runs_phase6()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-        && linux_path_exists(b"/usr/lib/atos-tests/JavaThreadSmoke.class");
+        && linux_path_exists(b"/usr/lib/tos-tests/JavaThreadSmoke.class");
     let mut python_child_smoke_launched = false;
     let mut node_smoke_launched = false;
     let mut node_child_smoke_launched = false;

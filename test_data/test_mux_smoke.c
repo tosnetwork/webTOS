@@ -195,7 +195,7 @@ void _start(void) {
 
     enum { EPOLL_CTL_ADD = 1 };
 
-    print("=== ATOS mux smoke test ===\n");
+    print("=== TOS mux smoke test ===\n");
 
     check("pipe(NULL) -> EFAULT", sys_pipe((int *)0) == -EFAULT);
     check("pipe2(unsupported flags) -> EINVAL", sys_pipe2(pipefd, 0x4) == -EINVAL);

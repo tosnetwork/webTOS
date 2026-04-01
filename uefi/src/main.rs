@@ -1,6 +1,6 @@
-//! ATOS UEFI Boot Loader
+//! TOS UEFI Boot Loader
 //!
-//! Minimal UEFI application that loads the ATOS kernel, sets up
+//! Minimal UEFI application that loads the TOS kernel, sets up
 //! higher-half page tables, exits UEFI boot services, and jumps
 //! to kernel_main. Follows Linux's EFI stub approach.
 //!
@@ -16,9 +16,9 @@ mod elf;
 
 use uefi_types::*;
 
-/// Embed the ATOS kernel ELF binary at compile time.
+/// Embed the TOS kernel ELF binary at compile time.
 /// The kernel must be built first (`cargo build --release` in root).
-static KERNEL_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-none/release/atos");
+static KERNEL_ELF: &[u8] = include_bytes!("../../target/x86_64-unknown-tos/release/tos");
 
 /// Magic number passed to kernel_main to indicate UEFI boot.
 const UEFI_MAGIC: u32 = 0xAE51_0EF1;
@@ -129,7 +129,7 @@ pub extern "efiapi" fn efi_main(
 ) -> EfiStatus {
     // 1. Initialize serial for debug output
     serial::init();
-    serial::println("[UEFI] ATOS UEFI boot loader starting");
+    serial::println("[UEFI] TOS UEFI boot loader starting");
 
     let bs = unsafe { &*(*system_table).boot_services };
 

@@ -1,4 +1,4 @@
-//! ATOS kernel heap allocator.
+//! TOS kernel heap allocator.
 //!
 //! Small allocations use page-backed slab caches. Larger allocations fall back
 //! to contiguous frame allocation. This keeps the external `#[global_allocator]`
@@ -414,10 +414,10 @@ pub fn run_smoke() {
 
     let mut text = String::new();
     for _ in 0..128 {
-        text.push_str("atos");
+        text.push_str("tos");
     }
     assert_eq!(text.len(), 512);
-    assert!(text.starts_with("atos"));
+    assert!(text.starts_with("tos"));
 
     let mut map = BTreeMap::new();
     for i in 0..256u32 {

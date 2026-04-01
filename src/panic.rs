@@ -1,4 +1,4 @@
-//! ATOS Kernel Panic Handler
+//! TOS Kernel Panic Handler
 //!
 //! On unrecoverable error: flush state to disk (best-effort), log to serial, halt.
 

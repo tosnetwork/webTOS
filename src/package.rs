@@ -1,4 +1,4 @@
-//! ATOS Package Format — Stage 7
+//! TOS Package Format — Stage 7
 //!
 //! Defines the `.tos` package format for agent distribution.
 //! A package contains a manifest (metadata, capabilities, signature)

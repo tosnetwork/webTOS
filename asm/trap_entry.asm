@@ -1,4 +1,4 @@
-; ATOS trap_entry.asm - interrupt/exception entry stubs
+; TOS trap_entry.asm - interrupt/exception entry stubs
 ;
 ; Provides assembly entry points for CPU exceptions and hardware interrupts.
 ; Each stub pushes a uniform stack frame (vector number + error code) and

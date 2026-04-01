@@ -1,4 +1,4 @@
-//! ATOS Inter-Contract Call Model
+//! TOS Inter-Contract Call Model
 //!
 //! Implements caller-pays energy semantics for contract-to-contract invocations
 //! via mailbox message passing. The calling contract sends a `ContractCallRequest`

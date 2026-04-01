@@ -1,4 +1,4 @@
-//! ATOS Agent Loader
+//! TOS Agent Loader
 //!
 //! Loads agent binaries (ELF64 or WASM) from memory or disk and spawns
 //! them as running agents. Connects existing components: loader.rs (ELF
@@ -434,7 +434,7 @@ fn non_relocatable_needs_low_mapping(elf_info: &crate::loader::ElfInfo) -> bool 
 fn validate_non_relocatable_layout(elf_info: &crate::loader::ElfInfo, label: &[u8]) -> Result<(), i64> {
     if !elf_info.is_relocatable && non_relocatable_needs_low_mapping(elf_info) {
         serial_println!(
-            "[AGENT_LOADER] FATAL: non-relocatable ELF {:?} needs low vaddr {:#x}, but ATOS currently reserves 0..{:#x} for the identity map",
+            "[AGENT_LOADER] FATAL: non-relocatable ELF {:?} needs low vaddr {:#x}, but TOS currently reserves 0..{:#x} for the identity map",
             core::str::from_utf8(label).unwrap_or("?"),
             min_load_vaddr(elf_info),
             USER_CODE_VADDR

@@ -1,4 +1,4 @@
-//! ATOS ACPI Table Parser
+//! TOS ACPI Table Parser
 //!
 //! Parses RSDP, RSDT, and MADT tables to discover the Local APIC base
 //! address and enumerate CPU cores for SMP bootstrap.

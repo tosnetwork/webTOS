@@ -43,7 +43,7 @@ pub struct EntryPoint {
 pub struct ContractEntry {
     /// Content hash of the contract code (the contract's identity).
     pub id: ContractId,
-    /// The ATOS agent ID running this contract.
+    /// The TOS agent ID running this contract.
     pub agent_id: u16,
     /// Mailbox ID for receiving invocation messages.
     pub mailbox_id: u16,

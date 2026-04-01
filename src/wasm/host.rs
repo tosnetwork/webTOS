@@ -1,4 +1,4 @@
-//! Host function bindings — bridges WASM imports to ATOS syscalls.
+//! Host function bindings — bridges WASM imports to TOS syscalls.
 //!
 //! When a WASM module calls an imported function, the interpreter pauses
 //! and returns a `HostCall` result. This module provides the logic to
@@ -10,7 +10,7 @@ use crate::wasm::types::*;
 
 // ─── Well-known import names ────────────────────────────────────────────────
 
-const MOD_ATOS: &[u8] = b"atos";
+const MOD_TOS: &[u8] = b"tos";
 
 const FN_SYS_YIELD: &[u8] = b"sys_yield";
 const FN_SYS_SEND: &[u8] = b"sys_send";
@@ -54,7 +54,7 @@ pub fn resolve_import(module: &WasmModule, func_idx: u32) -> HostFunc {
     let mod_name = module.get_name(imp.module_name_offset, imp.module_name_len);
     let field_name = module.get_name(imp.field_name_offset, imp.field_name_len);
 
-    if mod_name != MOD_ATOS {
+    if mod_name != MOD_TOS {
         return HostFunc::Unknown;
     }
 

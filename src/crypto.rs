@@ -1,4 +1,4 @@
-//! Cryptographic primitives for ATOS.
+//! Cryptographic primitives for TOS.
 //! Uses Ed25519 (via ed25519-dalek) with RDRAND hardware RNG.
 
 extern crate alloc;

@@ -1,11 +1,11 @@
 /*
- * hello_dynamic.c — Minimal dynamically-linked test for ATOS
+ * hello_dynamic.c — Minimal dynamically-linked test for TOS
  *
  * Build with musl:
  *   musl-gcc -o hello_dynamic.elf hello_dynamic.c
  *
  * This creates a dynamically-linked ELF with PT_INTERP = /lib/ld-musl-x86_64.so.1.
- * The ATOS agent loader resolves the interpreter via VFS and loads it from
+ * The TOS agent loader resolves the interpreter via VFS and loads it from
  * BASE_IMAGE_KEYSPACE.
  */
 #include <unistd.h>

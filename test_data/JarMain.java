@@ -12,6 +12,6 @@ final class JarMain {
         }
 
         String payload = new String(data, StandardCharsets.UTF_8).trim();
-        System.out.println("ATOS-JAVA-JAR payload=" + payload);
+        System.out.println("TOS-JAVA-JAR payload=" + payload);
     }
 }

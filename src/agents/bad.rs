@@ -1,4 +1,4 @@
-//! ATOS Bad Agent (Demo 2: Capability Denial)
+//! TOS Bad Agent (Demo 2: Capability Denial)
 //!
 //! This agent deliberately attempts to send a message to a mailbox it
 //! does NOT have CAP_SEND_MAILBOX for. The kernel must deny the request,

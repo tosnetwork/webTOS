@@ -1,0 +1,10 @@
+[package]
+name = "tos-ebpf-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "TOS eBPF-lite SDK — assembler, verifier, and disassembler for TOS eBPF policy programs"
+license = "MIT"
+
+[[bin]]
+name = "tos-ebpf"
+path = "src/main.rs"

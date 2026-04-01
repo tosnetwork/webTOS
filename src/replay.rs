@@ -1,4 +1,4 @@
-//! ATOS Checkpoint Replay & Execution Diffing
+//! TOS Checkpoint Replay & Execution Diffing
 //!
 //! Loads a checkpoint from disk, enables deterministic scheduling,
 //! and compares Merkle state roots after execution to detect divergence.
@@ -262,7 +262,7 @@ pub fn check_divergence() -> DiffReport {
 /// 4. The checkpoint data is non-empty
 ///
 /// This is a structural verification only. Full replay re-execution requires
-/// running a second ATOS instance with deterministic scheduling.
+/// running a second TOS instance with deterministic scheduling.
 pub fn verify_replay_bundle(
     bundle: &crate::receipts::ReplayBundle,
     receipt: &crate::receipts::ExecutionReceipt,

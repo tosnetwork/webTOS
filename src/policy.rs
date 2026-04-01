@@ -1,4 +1,4 @@
-//! ATOS Policy Bundle (Yellow Paper Stage 5 — Trusted Authority Plane)
+//! TOS Policy Bundle (Yellow Paper Stage 5 — Trusted Authority Plane)
 //!
 //! Defines fixed-size policy bundles for `no_std` environments. A policy
 //! bundle groups up to 16 rules that govern capability access decisions.

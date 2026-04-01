@@ -1,4 +1,4 @@
-//! Remote Attestation for ATOS
+//! Remote Attestation for TOS
 //!
 //! Provides kernel measurement and attestation report generation.
 //! When a TPM 2.0 CRB is available, measurements use hardware PCR values

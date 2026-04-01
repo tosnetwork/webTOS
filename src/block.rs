@@ -1,4 +1,4 @@
-//! ATOS Block Device Abstraction
+//! TOS Block Device Abstraction
 //!
 //! Provides a common interface for block storage drivers (ATA PIO, NVMe).
 //! The persist and checkpoint modules use this trait for disk I/O.

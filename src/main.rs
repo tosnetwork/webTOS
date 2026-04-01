@@ -1,4 +1,4 @@
-//! ATOS Stage-1 Kernel Entry Point
+//! TOS Stage-1 Kernel Entry Point
 //!
 //! Rust entry point called by boot.asm after transitioning to 64-bit long mode.
 
@@ -65,10 +65,10 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
 
     match multiboot_magic {
         MULTIBOOT_MAGIC => {
-            serial_println!("ATOS boot ok (Multiboot)");
+            serial_println!("TOS boot ok (Multiboot)");
         }
         UEFI_MAGIC => {
-            serial_println!("ATOS boot ok (UEFI)");
+            serial_println!("TOS boot ok (UEFI)");
 
             // Initialize framebuffer console if UEFI GOP provided FB info
             if multiboot_info != 0 {
@@ -98,7 +98,7 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
             );
         }
     }
-    serial_println!("ATOS v0.1 - AI-native Operating System");
+    serial_println!("TOS v0.1 - AI-native Operating System");
 
     // 3. Initialize architecture (GDT, IDT, timer)
     arch::x86_64::init();
@@ -192,11 +192,11 @@ pub extern "C" fn kernel_main(multiboot_magic: u32, multiboot_info: u64) -> ! {
     // The first agent entry trampoline enables interrupts after the
     // initial context switch, which avoids timer IRQs racing with the
     // BSP's final agent-table scans in sched::start().
-    serial_println!("[ATOS] Entering scheduler loop");
+    serial_println!("[TOS] Entering scheduler loop");
     sched::start();
 
     // Should not reach here
-    serial_println!("[ATOS] Scheduler returned - halting");
+    serial_println!("[TOS] Scheduler returned - halting");
     loop {
         unsafe {
             core::arch::asm!("hlt");

@@ -1,4 +1,4 @@
-//! ATOS Syscall Dispatcher
+//! TOS Syscall Dispatcher
 //!
 //! Provides the syscall entry point for agents. In Stage-1, agents call
 //! `syscall::syscall()` directly as a Rust function call (no privilege
@@ -833,7 +833,7 @@ fn syscall_inner(num: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64, _a6: u
 
     // ── LinuxCompat ABI routing ──────────────────────────────────────────
     // If this agent has a LinuxAgentState initialized, route to the Linux
-    // compat dispatcher instead of the ATOS native dispatcher.
+    // compat dispatcher instead of the TOS native dispatcher.
     if crate::linux_compat::state::get_state(caller_id).is_some() {
         return handle_linux_compat_syscall(caller_id, num, a1, a2, a3, _a4, _a5, _a6);
     }

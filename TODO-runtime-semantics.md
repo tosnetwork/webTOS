@@ -3,12 +3,12 @@
 This document tracks the second migration batch after
 `TODO-memory-subsystem.md`. The first batch stabilized the allocator, frame
 metadata, and page-table backend. This batch focuses on Linux runtime semantics
-needed to reach the yellow paper Stage-10 goal with a mature ATOS-native code
+needed to reach the yellow paper Stage-10 goal with a mature TOS-native code
 structure.
 
 ## Goals
 
-- Keep ATOS ownership of scheduler policy, syscall routing, and deterministic
+- Keep TOS ownership of scheduler policy, syscall routing, and deterministic
   behavior.
 - Replace the current `execve` spawn-and-exit approximation with a true
   process-image replacement model.
@@ -36,7 +36,7 @@ structure.
 - The Linux compatibility layer can already boot dynamic smoke tests and the
   Java JAR smoke path.
 - `clone3`, futex ordering, and deterministic scheduling are present, but some
-  semantics still follow an ATOS-local approximation rather than a true Linux
+  semantics still follow an TOS-local approximation rather than a true Linux
   process model.
 - `execve` currently replaces the process by spawning a new Linux agent and
   terminating the caller, which is sufficient for smoke tests but not for full
@@ -62,7 +62,7 @@ Expected work:
 - Close only descriptors marked `FD_CLOEXEC`.
 - Reset signal dispositions and other `execve`-reset state in a deterministic
   way.
-- Keep ATOS deterministic policy for address selection and runtime ordering.
+- Keep TOS deterministic policy for address selection and runtime ordering.
 
 Validation:
 
@@ -70,7 +70,7 @@ Validation:
 - `java -jar ...` and `python3 -c ...` continue working after replacing the
   current process image rather than spawning a new agent.
 - Child-process users (`ProcessBuilder`, `subprocess`, `child_process`) no
-  longer depend on ATOS-specific replacement behavior.
+  longer depend on TOS-specific replacement behavior.
 
 Completion notes:
 
@@ -96,7 +96,7 @@ Target:
 
 - Bring `clone3` behavior closer to Linux for `CLONE_VM`, `CLONE_FILES`,
   `CLONE_SIGHAND`, `CLONE_THREAD`, and exit-group semantics.
-- Make shared process state explicit instead of inferring it from local ATOS
+- Make shared process state explicit instead of inferring it from local TOS
   shortcuts.
 
 Expected work:
@@ -141,7 +141,7 @@ Status: completed
 
 Target:
 
-- Extend ATOS signal handling from “minimal runtime support” to a stable Linux
+- Extend TOS signal handling from “minimal runtime support” to a stable Linux
   compatibility model for common runtimes.
 
 Expected work:
@@ -256,11 +256,11 @@ Validation:
 - `python3 -c 'print(1)'`
 - `node -e 'console.log(1)'`
 - `java -version`
-- `java -jar /usr/lib/atos-tests/java-smoke.jar`
+- `java -jar /usr/lib/tos-tests/java-smoke.jar`
 
 Phase 5 close-out:
 
-- `java -jar /usr/lib/atos-tests/java-smoke.jar` passes with
+- `java -jar /usr/lib/tos-tests/java-smoke.jar` passes with
   `base_image.runtime.manifest`.
 - `python3 -c 'print(1)'` passes with
   `base_image.runtime.python.manifest`.
@@ -308,7 +308,7 @@ Progress notes:
   compatibility layer now exposes deterministic `FIOCLEX`, `FIONCLEX`,
   `FIONBIO`, and `FIONREAD` semantics for the file and pipe/socket shapes used
   by current smoke tests.
-- Linux pipe/socket file descriptors now bypass ATOS mailbox capability checks
+- Linux pipe/socket file descriptors now bypass TOS mailbox capability checks
   after fd creation, so fd-based I/O semantics are no longer blocked by the
   native capability model once a compatibility-layer fd is already open.
 - `open("/proc/self/exe")` now follows the procfs symlink target by default,
@@ -380,7 +380,7 @@ Progress notes:
   coverage. It checks `sigpending(NULL) -> -EFAULT`, `sigaction` old-action
   reads, `SIGKILL` rejection, blocked-mask reporting, `SA_NODEFER`
   re-entrant delivery, and `SA_RESETHAND` disposition reset. It currently
-  reaches `ATOS-SIGNAL-OK` and exits cleanly in the standard Java-focused QEMU
+  reaches `TOS-SIGNAL-OK` and exits cleanly in the standard Java-focused QEMU
   regression run.
 - The signal path now also carries a minimal `sigaltstack` + `SA_ONSTACK`
   implementation. Alternate signal stacks are per-thread, reset on `execve`,
@@ -421,7 +421,7 @@ Validation:
 - `python3 -c 'print(1)'`
 - `node -e 'console.log(1)'`
 - `java -version`
-- `java -jar /usr/lib/atos-tests/java-smoke.jar`
+- `java -jar /usr/lib/tos-tests/java-smoke.jar`
 - Runtime child-process and multi-threaded smoke tests pass in QEMU without new
   traps or kernel panics.
 

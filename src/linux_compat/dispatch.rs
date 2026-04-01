@@ -1,6 +1,6 @@
 //! Main Linux syscall dispatcher.
 //!
-//! Routes Linux x86_64 syscall numbers to the appropriate ATOS handlers.
+//! Routes Linux x86_64 syscall numbers to the appropriate TOS handlers.
 
 use super::constants::*;
 use super::epoll;
@@ -364,7 +364,7 @@ pub fn dispatch(
         );
     }
 
-    // Keep Linux thread groups making forward progress even though ATOS does
+    // Keep Linux thread groups making forward progress even though TOS does
     // not do unsafe trap-time preemption. This is the deterministic analogue
     // of the scheduler fairness Asterinas gets from real wait/wake scheduling:
     // once a futex/eventfd wake marks another thread Ready, yield at the next

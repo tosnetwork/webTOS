@@ -3,20 +3,20 @@
 **Status:** Design Document
 **Companion to:** Yellow Paper §27.10 (Stage-12)
 
-> This document describes how to implement a Linux syscall translation layer for ATOS, enabling unmodified Linux x86_64 ELF binaries to run on ATOS. The translation layer intercepts Linux syscalls and maps them to ATOS primitives — files become keyspace entries, sockets become netd mailbox sessions, threads become child agents, and processes become spawned agents.
+> This document describes how to implement a Linux syscall translation layer for TOS, enabling unmodified Linux x86_64 ELF binaries to run on TOS. The translation layer intercepts Linux syscalls and maps them to TOS primitives — files become keyspace entries, sockets become netd mailbox sessions, threads become child agents, and processes become spawned agents.
 
 ---
 
 ## 1. Motivation
 
-Porting language runtimes one-by-one (WASM, Ristretto) gives the best ATOS integration but only covers a few languages. A Linux syscall compatibility layer covers **everything at once**:
+Porting language runtimes one-by-one (WASM, Ristretto) gives the best TOS integration but only covers a few languages. A Linux syscall compatibility layer covers **everything at once**:
 
 | Approach | Effort | Coverage |
 |----------|--------|----------|
 | Port each runtime individually | ~3,000 lines × N runtimes | Only ported languages |
 | Linux syscall compat layer | ~8,000 lines, one-time | **Any Linux x86_64 binary** |
 
-With the compat layer, Node.js, Python (CPython), Go, GCC, curl, and any statically-linked Linux program runs on ATOS without modification.
+With the compat layer, Node.js, Python (CPython), Go, GCC, curl, and any statically-linked Linux program runs on TOS without modification.
 
 ## 2. Architecture
 
@@ -27,28 +27,28 @@ With the compat layer, Node.js, Python (CPython), Go, GCC, curl, and any statica
 ├──────────────────────────────────────────┤
 │  Linux Syscall Translation Layer         │
 │  intercepts SYSCALL instruction          │
-│  translates Linux ABI → ATOS primitives  │
+│  translates Linux ABI → TOS primitives  │
 ├──────────────────────────────────────────┤
-│  ATOS Kernel                             │
+│  TOS Kernel                             │
 │  mailbox | capability | keyspace | netd  │
 └──────────────────────────────────────────┘
 ```
 
 ### 2.1 Interception Mechanism
 
-Linux x86_64 programs invoke syscalls via the `SYSCALL` instruction with the syscall number in `rax`. ATOS already handles `SYSCALL` via `syscall_entry.asm` → `syscall_handler()`. The compat layer adds a second dispatch path:
+Linux x86_64 programs invoke syscalls via the `SYSCALL` instruction with the syscall number in `rax`. TOS already handles `SYSCALL` via `syscall_entry.asm` → `syscall_handler()`. The compat layer adds a second dispatch path:
 
 ```rust
 pub fn syscall_handler(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
     if agent_is_linux_compat(current_agent()) {
         linux_compat::dispatch(num, a1, a2, a3, a4, a5)
     } else {
-        syscall::syscall(num, a1, a2, a3, a4, a5)  // native ATOS syscall
+        syscall::syscall(num, a1, a2, a3, a4, a5)  // native TOS syscall
     }
 }
 ```
 
-Each agent is tagged at spawn time as either `ATOS-native` or `Linux-compat`. The tag determines which syscall ABI is used.
+Each agent is tagged at spawn time as either `TOS-native` or `Linux-compat`. The tag determines which syscall ABI is used.
 
 ### 2.2 Per-Agent Virtual OS State
 
@@ -73,10 +73,10 @@ struct LinuxAgentState {
 
 The minimum set to boot a statically-linked ELF binary:
 
-| Linux syscall | # | ATOS translation |
+| Linux syscall | # | TOS translation |
 |--------------|---|-----------------|
 | `mmap` | 9 | `sys_mmap` with virtual address tracking |
-| `mprotect` | 10 | No-op (ATOS manages page permissions at kernel level) |
+| `mprotect` | 10 | No-op (TOS manages page permissions at kernel level) |
 | `munmap` | 11 | `sys_munmap` |
 | `brk` | 12 | Bump allocator on mmap'd region |
 | `write(1/2, ...)` | 1 | fd 1,2 → serial log |
@@ -85,7 +85,7 @@ The minimum set to boot a statically-linked ELF binary:
 | `exit_group` | 231 | `sys_exit` |
 | `arch_prctl` | 158 | Set FS base via MSR (for TLS) |
 | `set_tid_address` | 218 | Store address, return agent_id |
-| `uname` | 63 | Return `{sysname: "ATOS", release: "0.1", machine: "x86_64"}` |
+| `uname` | 63 | Return `{sysname: "TOS", release: "0.1", machine: "x86_64"}` |
 | `getpid` | 39 | Return agent_id |
 | `getppid` | 110 | Return parent agent_id |
 | `getuid/geteuid` | 102/107 | Return 1000 |
@@ -97,7 +97,7 @@ The minimum set to boot a statically-linked ELF binary:
 
 ### 3.2 Phase 2: File I/O (~40 syscalls cumulative)
 
-| Linux syscall | # | ATOS translation |
+| Linux syscall | # | TOS translation |
 |--------------|---|-----------------|
 | `openat` | 257 | Hash path → keyspace key; allocate fd |
 | `open` | 2 | Delegate to openat(AT_FDCWD, ...) |
@@ -125,7 +125,7 @@ The minimum set to boot a statically-linked ELF binary:
 
 ### 3.3 Phase 3: Network + epoll (~60 syscalls cumulative)
 
-| Linux syscall | # | ATOS translation |
+| Linux syscall | # | TOS translation |
 |--------------|---|-----------------|
 | `socket` | 41 | Create netd session → virtual fd |
 | `connect` | 42 | Send connect request to netd mailbox |
@@ -146,7 +146,7 @@ The minimum set to boot a statically-linked ELF binary:
 
 **epoll implementation strategy:**
 
-The key challenge. ATOS mailboxes are per-agent, not per-fd. The epoll translation maps multiple virtual fds to mailbox watches:
+The key challenge. TOS mailboxes are per-agent, not per-fd. The epoll translation maps multiple virtual fds to mailbox watches:
 
 ```
 epoll_ctl(ADD, socket_fd_5) → watch netd session 5's response mailbox
@@ -160,7 +160,7 @@ This is not zero-cost — polling multiple mailboxes is less efficient than Linu
 
 ### 3.4 Phase 4: Threads + Dynamic Linking (~80 syscalls cumulative)
 
-| Linux syscall | # | ATOS translation |
+| Linux syscall | # | TOS translation |
 |--------------|---|-----------------|
 | `clone` (thread) | 56 | `sys_spawn` child agent with shared keyspace |
 | `clone3` | 435 | Same, extended flags |
@@ -177,13 +177,13 @@ This is not zero-cost — polling multiple mailboxes is less efficient than Linu
 
 **Dynamic linking support:**
 
-Requires bundling `ld-linux-x86-64.so.2` and libc in ATOS's agent storage. The ELF loader resolves the interpreter path and loads it first. The compat layer must support `open` + `mmap` for the loader to map shared libraries.
+Requires bundling `ld-linux-x86-64.so.2` and libc in TOS's agent storage. The ELF loader resolves the interpreter path and loads it first. The compat layer must support `open` + `mmap` for the loader to map shared libraries.
 
 Alternative: require static linking (`-static`). This eliminates the dynamic linker requirement entirely. Most programs can be statically compiled.
 
 ## 4. Virtual File System Layout
 
-Linux programs expect a filesystem. ATOS provides one virtually via keyspace:
+Linux programs expect a filesystem. TOS provides one virtually via keyspace:
 
 ```
 /proc/self/pid          → agent_id
@@ -195,7 +195,7 @@ Linux programs expect a filesystem. ATOS provides one virtually via keyspace:
 /dev/stderr             → fd 2 → serial log
 /tmp/                   → temporary keyspace (auto-cleaned)
 /home/agent/            → agent's persistent keyspace
-/etc/hostname           → "atos"
+/etc/hostname           → "tos"
 /etc/resolv.conf        → "nameserver 8.8.8.8" (netd resolves)
 ```
 
@@ -224,7 +224,7 @@ src/
 ```rust
 // New RuntimeKind variant
 pub enum RuntimeKind {
-    Native,       // ATOS-native syscall ABI
+    Native,       // TOS-native syscall ABI
     Wasm,         // WASM interpreter
     LinuxCompat,  // Linux syscall translation
 }
@@ -254,21 +254,21 @@ Based on WSL1 precedent (70-75% native Linux performance):
 | CPU-bound computation | ~0% | No translation needed for pure computation |
 | File I/O | ~30-50% | Keyspace is in-memory, but path hashing + fd lookup adds overhead |
 | Network I/O | ~50-100% | Every socket op goes through netd mailbox round-trip |
-| Process creation | ~200-300% | ATOS agent spawn is heavier than Linux fork |
+| Process creation | ~200-300% | TOS agent spawn is heavier than Linux fork |
 | epoll / event loop | ~50-100% | Mailbox polling vs kernel-level epoll |
 
 For AI agent workloads (mostly compute + HTTP calls), overall performance should be **60-80% of native Linux**. This is acceptable for a compatibility layer.
 
-## 7. What Linux Programs Get on ATOS
+## 7. What Linux Programs Get on TOS
 
-Unmodified Linux binaries automatically gain ATOS properties:
+Unmodified Linux binaries automatically gain TOS properties:
 
-| ATOS Feature | How it applies to Linux binaries |
+| TOS Feature | How it applies to Linux binaries |
 |-------------|--------------------------------|
 | Capability isolation | Linux binary can only access resources its agent has capabilities for |
-| Energy metering | Timer-tick preemption charges energy like any ATOS agent |
+| Energy metering | Timer-tick preemption charges energy like any TOS agent |
 | eBPF policy | All translated syscalls pass through eBPF attachment points |
-| Audit log | Every translated syscall produces an ATOS audit event |
+| Audit log | Every translated syscall produces an TOS audit event |
 | Checkpoint | Agent state (including LinuxAgentState) can be checkpointed |
 | Migration | Checkpoint + transfer + resume on another node |
 
@@ -276,10 +276,10 @@ Unmodified Linux binaries automatically gain ATOS properties:
 
 | Limitation | Reason | Workaround |
 |-----------|--------|-----------|
-| No raw device access (`/dev/sda`) | ATOS has no block device passthrough | Use netd for network, keyspace for storage |
-| No shared memory (`shmget`, `shm_open`) | ATOS agents share nothing | Use mailbox for IPC |
-| No `ptrace` | Debugging requires ATOS-native tools | Use ATOS event log |
-| No X11/Wayland | ATOS is headless | Not applicable for agent workloads |
+| No raw device access (`/dev/sda`) | TOS has no block device passthrough | Use netd for network, keyspace for storage |
+| No shared memory (`shmget`, `shm_open`) | TOS agents share nothing | Use mailbox for IPC |
+| No `ptrace` | Debugging requires TOS-native tools | Use TOS event log |
+| No X11/Wayland | TOS is headless | Not applicable for agent workloads |
 | `fork()` without `exec()` is limited | Agent spawn ≠ process copy | Most programs use fork+exec pattern |
 | No `/proc` filesystem (full) | Only `/proc/self/*` simulated | Sufficient for most programs |
 
@@ -288,11 +288,11 @@ Unmodified Linux binaries automatically gain ATOS properties:
 Stage-11 (native runtime ports) and Stage-12 (Linux compat) are complementary:
 
 ```
-Native ports (Stage-11):     Better ATOS integration, direct mailbox/capability access
-Linux compat (Stage-12):     Broader coverage, run anything, less ATOS-native
+Native ports (Stage-11):     Better TOS integration, direct mailbox/capability access
+Linux compat (Stage-12):     Broader coverage, run anything, less TOS-native
 
 Recommended combination:
-  System agents      → Native Rust (ATOS syscalls)
+  System agents      → Native Rust (TOS syscalls)
   AI agent runtimes  → Stage-11 ports (WASM engine, Ristretto)
   Long-tail tools    → Stage-12 Linux compat (curl, git, gcc, npm, pip, ...)
 ```
@@ -313,4 +313,4 @@ Recommended combination:
 | **WSL1** (Windows) | Kernel driver translates Linux → NT | ~200 | 70-75% native |
 | **Darling** (macOS) | Translates Linux → Darwin/XNU | ~150 | ~60% native |
 | **gVisor** (Google) | User-space kernel reimplements Linux syscalls | ~200+ | 50-90% native |
-| **ATOS** (proposed) | Translates Linux → ATOS agents/mailboxes | ~80 | est. 60-80% native |
+| **TOS** (proposed) | Translates Linux → TOS agents/mailboxes | ~80 | est. 60-80% native |

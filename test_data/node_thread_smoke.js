@@ -25,11 +25,11 @@ function finish() {
   }
 
   if (total !== expected) {
-    console.log(`ATOS-NODE-THREAD-FAIL total=${total} expected=${expected}`);
+    console.log(`TOS-NODE-THREAD-FAIL total=${total} expected=${expected}`);
     process.exit(1);
   }
 
-  console.log(`ATOS-NODE-THREAD-OK total=${total}`);
+  console.log(`TOS-NODE-THREAD-OK total=${total}`);
 }
 
 for (let id = 0; id < workers; id++) {
@@ -57,13 +57,13 @@ parentPort.postMessage(local);
   });
   worker.on('error', (err) => {
     failed = true;
-    console.log(`ATOS-NODE-THREAD-FAIL error=${(err && err.message) || err}`);
+    console.log(`TOS-NODE-THREAD-FAIL error=${(err && err.message) || err}`);
     process.exit(1);
   });
   worker.on('exit', (code) => {
     if (code !== 0) {
       failed = true;
-      console.log(`ATOS-NODE-THREAD-FAIL exit=${code}`);
+      console.log(`TOS-NODE-THREAD-FAIL exit=${code}`);
       process.exit(1);
     }
     finish();

@@ -125,7 +125,7 @@ void _start(void) {
     unsigned char statx_buf[256];
     i64 stat_ret = -1;
 
-    print("=== ATOS *at path test ===\n");
+    print("=== TOS *at path test ===\n");
 
     i64 procfd = sys_openat(AT_FDCWD, proc_self, O_RDONLY | O_DIRECTORY, 0);
     check("openat(/proc/self, O_DIRECTORY)", procfd >= 0);

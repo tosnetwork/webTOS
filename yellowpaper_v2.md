@@ -1,9 +1,9 @@
-# ATOS Yellow Paper v2
+# TOS Yellow Paper v2
 
 **Version:** Draft v2.0
 **Status:** Engineering Yellow Paper
 **Language:** English
-**Purpose:** Implementation reference for building ATOS — a hardware-level deterministic execution VM.
+**Purpose:** Implementation reference for building TOS — a hardware-level deterministic execution VM.
 
 > **Implementation Status (Stage-1):** All Phase 0–6 objectives are complete. See `[IMPL]` markers throughout this document for per-item status. Last verified: 2026-03-22.
 
@@ -11,15 +11,15 @@
 
 ## Abstract
 
-ATOS is a **hardware-level deterministic execution virtual machine**. It runs directly on x86_64 hardware (or QEMU), providing isolated, metered, verifiable execution for smart contracts, JVM programs, and WASM modules — without relying on any host operating system.
+TOS is a **hardware-level deterministic execution virtual machine**. It runs directly on x86_64 hardware (or QEMU), providing isolated, metered, verifiable execution for smart contracts, JVM programs, and WASM modules — without relying on any host operating system.
 
-ATOS is **not** an operating system in the traditional sense. It is a bare-metal execution substrate comparable to:
+TOS is **not** an operating system in the traditional sense. It is a bare-metal execution substrate comparable to:
 
 * **EVM** — but running on real hardware instead of inside a blockchain node process
 * **JVM** — but with deterministic execution, energy metering, and cryptographic state proofs
 * **A hardware security module** — but programmable, auditable, and verifiable
 
-The core promise of ATOS is:
+The core promise of TOS is:
 
 > **Submit code and input. Get deterministic output, a state transition, an energy bill, and a cryptographic proof. The execution environment is isolated, metered, and leaves no pollution between runs.**
 
@@ -37,10 +37,10 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 
 ### Terminology
 
-* **ATOS** — the full system.
-* **ATOS-0** — the privileged kernel substrate: boot, memory, traps, syscalls, scheduling, mailbox IPC, capability enforcement, energy accounting, audit.
-* **ATOS-1** — the runtime host layer: WASM engine, deterministic Linux compatibility layer.
-* **ATOS-2** — the contract and system-service layer: deployed contracts, stated, policyd, netd.
+* **TOS** — the full system.
+* **TOS-0** — the privileged kernel substrate: boot, memory, traps, syscalls, scheduling, mailbox IPC, capability enforcement, energy accounting, audit.
+* **TOS-1** — the runtime host layer: WASM engine, deterministic Linux compatibility layer.
+* **TOS-2** — the contract and system-service layer: deployed contracts, stated, policyd, netd.
 
 ---
 
@@ -59,9 +59,9 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 
 ### Core Principle
 
-ATOS is **not** a desktop operating system, not a POSIX clone, and not a Linux replacement.
+TOS is **not** a desktop operating system, not a POSIX clone, and not a Linux replacement.
 
-ATOS is a **hardware-level deterministic execution VM** for smart contracts, verifiable computation, and metered workloads.
+TOS is a **hardware-level deterministic execution VM** for smart contracts, verifiable computation, and metered workloads.
 
 Its first-class concepts are:
 
@@ -74,26 +74,26 @@ Its first-class concepts are:
 - checkpoints and replay (deterministic verification)
 - external TCP interface (communication with the outside world)
 
-### What ATOS Replaces
+### What TOS Replaces
 
-| Traditional VM | ATOS Equivalent | Advantage |
+| Traditional VM | TOS Equivalent | Advantage |
 |---|---|---|
-| EVM (Ethereum) | ATOS with WASM/JVM runtimes | Runs on hardware, not inside a process; multi-language; richer state model |
-| JVM (on Linux) | ATOS with Linux compat layer | Runs unmodified OpenJDK deterministically via syscall translation |
-| Docker/VM isolation | ATOS per-contract page tables | Hardware-enforced isolation at the page table level, not process-level |
-| Gas metering (EVM) | ATOS energy budget | Unified across WASM, JVM, native; tick-based preemption, no per-opcode overhead |
+| EVM (Ethereum) | TOS with WASM/JVM runtimes | Runs on hardware, not inside a process; multi-language; richer state model |
+| JVM (on Linux) | TOS with Linux compat layer | Runs unmodified OpenJDK deterministically via syscall translation |
+| Docker/VM isolation | TOS per-contract page tables | Hardware-enforced isolation at the page table level, not process-level |
+| Gas metering (EVM) | TOS energy budget | Unified across WASM, JVM, native; tick-based preemption, no per-opcode overhead |
 
 ### The Execution Model
 
 ```text
-                        ATOS EXECUTION MODEL
+                        TOS EXECUTION MODEL
 
   External System                                    External System
        │                                                  ▲
        │ TCP: submit transaction                          │ TCP: result + receipt
        ▼                                                  │
 +----------------------------------------------------------------------+
-|  ATOS-2  Contract / Service Layer                                    |
+|  TOS-2  Contract / Service Layer                                    |
 |  deployed contracts | stated | policyd | netd                       |
 |                                                                      |
 |  Contract A ──mailbox──→ Contract B ──mailbox──→ Contract C          |
@@ -106,7 +106,7 @@ Its first-class concepts are:
                                 | syscall / trap / yield
                                 ▼
 +----------------------------------------------------------------------+
-|  ATOS-1  Runtime Host                                                |
+|  TOS-1  Runtime Host                                                |
 |  WASM engine | Linux compat layer | native runtime                  |
 |  load → execute → meter → syscall_bridge → snapshot                 |
 +-------------------------------+--------------------------------------+
@@ -114,7 +114,7 @@ Its first-class concepts are:
                                 | energy accounting + capability check
                                 ▼
 +----------------------------------------------------------------------+
-|  ATOS-0  Kernel                                                      |
+|  TOS-0  Kernel                                                      |
 |  scheduler | mailbox IPC | capability enforcement | eBPF-lite        |
 |  energy meter | state + Merkle | checkpoint | audit trail            |
 +-------------------------------+--------------------------------------+
@@ -130,8 +130,8 @@ Its first-class concepts are:
 
 | Stage | Title | Main Outcome |
 |---|---|---|
-| 1 | Minimal Kernel Prototype | ATOS boots and runs core contract primitives |
-| 2 | Isolation + Runtime Foundation | ATOS gains ring-3 isolation, WASM, eBPF-lite, persistent state |
+| 1 | Minimal Kernel Prototype | TOS boots and runs core contract primitives |
+| 2 | Isolation + Runtime Foundation | TOS gains ring-3 isolation, WASM, eBPF-lite, persistent state |
 | 3 | Deterministic Execution Layer | Deterministic scheduling, replay, Merkle state, energy cost model |
 | 4 | Hardware + External Interface | Real hardware direction, TCP external interface, SDK tooling |
 | 5 | Contract Persistent State | Versioned keyspaces, atomic transactions, Merkle proofs, crash recovery |
@@ -146,7 +146,7 @@ Its first-class concepts are:
 #### Stage-1 — Minimal Kernel Prototype `[IMPL: ✅ Complete]`
 
 **Purpose**
-Prove that the minimal ATOS execution substrate is alive.
+Prove that the minimal TOS execution substrate is alive.
 
 **Core Capabilities**
 - boot in QEMU
@@ -162,7 +162,7 @@ Prove that the minimal ATOS execution substrate is alive.
 - serial audit logs
 
 **Success Condition**
-ATOS boots, creates multiple contracts, supports mailbox communication, enforces capabilities, and logs events.
+TOS boots, creates multiple contracts, supports mailbox communication, enforces capabilities, and logs events.
 
 #### Stage-2 — Isolation + Runtime Foundation `[IMPL: ✅ Complete]`
 
@@ -181,7 +181,7 @@ Turn the prototype into a real execution substrate with sandboxed runtimes.
 - first system agents (stated, policyd) `[IMPL: ✅ agents/stated.rs, policyd.rs]`
 
 **Success Condition**
-ATOS can run isolated contracts, execute WASM workloads, persist state, and restore from checkpoints.
+TOS can run isolated contracts, execute WASM workloads, persist state, and restore from checkpoints.
 
 #### Stage-3 — Deterministic Execution Layer `[IMPL: ✅ Complete]`
 
@@ -204,22 +204,22 @@ WASM contracts execute with full determinism. Native contracts execute with sche
 #### Stage-4 — Hardware + External Interface `[IMPL: ✅ Complete]`
 
 **Purpose**
-Move beyond QEMU-only and expose ATOS to external systems via TCP.
+Move beyond QEMU-only and expose TOS to external systems via TCP.
 
 **Core Capabilities**
 - UEFI boot direction for real hardware `[IMPL: ⚠️ detection + mmap parsing]`
 - PCI enumeration, NVMe storage, real NIC (e1000) `[IMPL: ✅ pci.rs, nvme.rs, e1000.rs]`
 - **TCP external interface**: accept transaction submissions, return results + receipts `[IMPL: ✅ tcp_interface.rs]`
 - developer SDKs (Rust agent SDK, WASM SDK, eBPF-lite SDK) `[IMPL: ⚠️ atp CLI exists]`
-- CLI tools (atos-build, atos-deploy, atos-replay, atos-inspect) `[IMPL: ⚠️ atp covers build/sign/verify/inspect]`
+- CLI tools (tos-build, tos-deploy, tos-replay, tos-inspect) `[IMPL: ⚠️ atp covers build/sign/verify/inspect]`
 - execution proof generation (hash-chain over checkpoint + events) `[IMPL: ✅ proof.rs]`
 - remote attestation foundation (TPM stub) `[IMPL: ✅ tpm.rs + attestation.rs]`
-- `x86_64-unknown-atos` custom Rust target `[IMPL: ✅]`
-- ATOS WASM engine `[IMPL: ✅]`
+- `x86_64-unknown-tos` custom Rust target `[IMPL: ✅]`
+- TOS WASM engine `[IMPL: ✅]`
 
 **Key Addition — TCP External Interface**
 
-This is a critical new component. ATOS must expose a TCP listener that external systems use to:
+This is a critical new component. TOS must expose a TCP listener that external systems use to:
 
 1. **Submit transactions**: send contract code + input data + energy budget
 2. **Deploy contracts**: install a signed contract package for persistent execution
@@ -269,7 +269,7 @@ Response {
 ```
 
 **Success Condition**
-ATOS runs on real hardware. External systems can submit transactions, deploy contracts, call contracts, and verify execution via TCP.
+TOS runs on real hardware. External systems can submit transactions, deploy contracts, call contracts, and verify execution via TCP.
 
 #### Stage-5 — Contract Persistent State `[IMPL: ✅ Complete]`
 
@@ -346,7 +346,7 @@ Make every execution produce a portable, cryptographically verifiable receipt.
 - **ExecutionReceipt**: canonical receipt with contract identity, runtime class, input/output commitments, state roots, energy used, and Ed25519 signature `[IMPL: ✅ receipts.rs — input/output commitments computed via SHA-256, receipt_id via SHA-256, signed with Ed25519]`
 - **Replay Bundle**: checkpoint + execution transcript + I/O trace (for full re-execution verification) `[IMPL: ✅ receipts.rs ReplayBundle — auto-generated on agent exit, persisted to disk, retrievable via TCP GetReplay]`
 - **Proof Bundle**: compact Merkle proofs and state commitments (for fast verification without replay) `[IMPL: ✅ receipts.rs ProofBundle — real SHA-256 Merkle sibling hashes, root recomputation verification, persisted to disk, retrievable via TCP GetProof]`
-- **TPM measured boot**: prove the ATOS VM is running unmodified code (TPM 2.0 CRB + PCR extend/read) `[IMPL: ✅ tpm.rs — PCR0 (kernel) + PCR1 (boot config) extended during boot]`
+- **TPM measured boot**: prove the TOS VM is running unmodified code (TPM 2.0 CRB + PCR extend/read) `[IMPL: ✅ tpm.rs — PCR0 (kernel) + PCR1 (boot config) extended during boot]`
 - **Attestation report**: signed measurement of kernel hash + boot config + policy bundle `[IMPL: ✅ attestation.rs — Ed25519 or keyed-hash, integrated into receipt flow via trace_commitment]`
 
 **ExecutionReceipt Specification**
@@ -359,7 +359,7 @@ ExecutionReceipt {
     contract_id: Hash256,       // deployed contract identity
     execution_id: Hash256,      // this specific invocation
     caller_id: Hash256,         // who initiated the call (external or contract)
-    node_id: NodeId,            // which ATOS instance
+    node_id: NodeId,            // which TOS instance
 
     runtime_class: RuntimeClass,  // ProofGradeWasm, ReplayGradeNative
     code_hash: Hash256,           // exact contract code hash
@@ -383,7 +383,7 @@ ExecutionReceipt {
 **Verification Model**
 
 ```text
-Execution on ATOS VM
+Execution on TOS VM
         │
         ▼
 ExecutionReceipt (portable artifact)
@@ -403,7 +403,7 @@ ExecutionReceipt (portable artifact)
 ```
 
 **Success Condition**
-Every contract execution produces an ExecutionReceipt. External verifiers can validate receipts via replay or compact proofs. TPM attestation proves the ATOS VM is running trusted code.
+Every contract execution produces an ExecutionReceipt. External verifiers can validate receipts via replay or compact proofs. TPM attestation proves the TOS VM is running trusted code.
 
 #### Stage-8 — WASM Runtime `[IMPL: ✅ Complete]`
 
@@ -414,23 +414,23 @@ Provide a production-grade WASM execution engine as the primary contract runtime
 
 The self-built WASM interpreter provides:
 - 100% WASM MVP spec compliance
-- Built-in fuel metering (1 WASM fuel = 1 ATOS energy)
-- Type-safe host bindings for ATOS syscalls
-- `#![no_std]` — runs as native ATOS agent
+- Built-in fuel metering (1 WASM fuel = 1 TOS energy)
+- Type-safe host bindings for TOS syscalls
+- `#![no_std]` — runs as native TOS agent
 - Deterministic execution (ideal for verifiable computation)
 - 64 KB chunked code loading from keyspace
 - Per-request selector-based export dispatch
 - Differentiated error status (SUCCESS / REVERT / OUT_OF_ENERGY / ERROR)
 
-Any language that compiles to WASM runs on ATOS: Rust, C, C++, Go, Zig, AssemblyScript, Python (via wasm target), Java (via TeaVM/CheerpJ), Kotlin, Swift, C#, and others.
+Any language that compiles to WASM runs on TOS: Rust, C, C++, Go, Zig, AssemblyScript, Python (via wasm target), Java (via TeaVM/CheerpJ), Kotlin, Swift, C#, and others.
 
 **Success Condition**
-Any WASM module runs on ATOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
+Any WASM module runs on TOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
 
 #### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ✅ Complete — 104 syscalls, 67/67 tests pass in QEMU]`
 
 **Purpose**
-Run any unmodified Linux x86_64 program on ATOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, ATOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
+Run any unmodified Linux x86_64 program on TOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, TOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
 
 **Core Idea**
 
@@ -438,12 +438,12 @@ Run any unmodified Linux x86_64 program on ATOS with **deterministic execution g
 Unmodified Linux ELF64 binary (OpenJDK, Node.js, CPython, Go, curl, etc.)
   ↓
 Linux SYSCALL instruction (rax = Linux syscall number)
-  ↓ intercepted by ATOS syscall_entry.asm
+  ↓ intercepted by TOS syscall_entry.asm
 ┌────────────────────────────────────────────────────────────┐
 │  Deterministic Linux Compatibility Layer                   │
 │                                                            │
 │  Every non-deterministic Linux syscall is replaced with    │
-│  a deterministic ATOS equivalent:                          │
+│  a deterministic TOS equivalent:                          │
 │                                                            │
 │  Time    → logical tick clock (not wall clock)             │
 │  Random  → deterministic PRNG (seed = agent_id ⊕ tick)    │
@@ -455,20 +455,20 @@ Linux SYSCALL instruction (rax = Linux syscall number)
 │  Network → netd proxy with I/O trace logging               │
 └────────────────────────────────────────────────────────────┘
   ↓
-ATOS kernel (scheduler, mailbox, capability, energy, Merkle state)
+TOS kernel (scheduler, mailbox, capability, energy, Merkle state)
 ```
 
 **Why This Matters**
 
-ATOS is a deterministic execution VM. Programs compiled to WASM already run deterministically. But many important programs (OpenJDK, Node.js, CPython, Go binaries) are distributed as native Linux x86_64 ELF binaries, not WASM. This stage enables those programs to run on ATOS **without modification and without sacrificing determinism**.
+TOS is a deterministic execution VM. Programs compiled to WASM already run deterministically. But many important programs (OpenJDK, Node.js, CPython, Go binaries) are distributed as native Linux x86_64 ELF binaries, not WASM. This stage enables those programs to run on TOS **without modification and without sacrificing determinism**.
 
-The key insight is that non-determinism in Linux programs comes from a small number of syscall-level sources. By controlling the syscall boundary, ATOS can make any Linux program deterministic — the program cannot tell the difference, but its execution becomes fully reproducible.
+The key insight is that non-determinism in Linux programs comes from a small number of syscall-level sources. By controlling the syscall boundary, TOS can make any Linux program deterministic — the program cannot tell the difference, but its execution becomes fully reproducible.
 
 **Non-Determinism Sources and Deterministic Replacements** `[IMPL: ✅ All replacements implemented in linux_compat/]`
 
-| Linux Syscall | Non-Determinism Source | ATOS Deterministic Replacement |
+| Linux Syscall | Non-Determinism Source | TOS Deterministic Replacement |
 |--------------|----------------------|-------------------------------|
-| `gettimeofday` / `clock_gettime` | Wall clock time varies | Return ATOS tick count (logical clock, monotonic, reproducible) |
+| `gettimeofday` / `clock_gettime` | Wall clock time varies | Return TOS tick count (logical clock, monotonic, reproducible) |
 | `getrandom` / `read(/dev/urandom)` | True hardware randomness | Deterministic PRNG: `SHA-256(agent_id ∥ tick ∥ counter)` |
 | `clone` (thread creation) | OS thread scheduling is non-deterministic | Create child agent; deterministic scheduler enforces fixed execution order |
 | `futex(WAIT/WAKE)` | Lock contention resolution is non-deterministic | Grant to lowest waiting agent_id first (total order) |
@@ -484,7 +484,7 @@ The key insight is that non-determinism in Linux programs comes from a small num
 Each agent is tagged at spawn time with a `RuntimeKind`:
 
 ```text
-RuntimeKind::Native      = 0   // ATOS-native syscall ABI
+RuntimeKind::Native      = 0   // TOS-native syscall ABI
 RuntimeKind::Wasm        = 1   // WASM execution via interpreter
 RuntimeKind::LinuxCompat = 2   // Linux syscall ABI (deterministic translation)
 ```
@@ -496,7 +496,7 @@ fn syscall_handler(num: u64, a1-a5: u64) -> i64 {
     if agent_runtime_kind(current) == LinuxCompat {
         linux_compat::dispatch(num, a1, a2, a3, a4, a5)  // Linux ABI
     } else {
-        syscall::syscall(num, a1, a2, a3, a4, a5)         // ATOS ABI
+        syscall::syscall(num, a1, a2, a3, a4, a5)         // TOS ABI
     }
 }
 ```
@@ -523,7 +523,7 @@ LinuxAgentState {
 
 This is the hardest and most important part. OpenJDK, Node.js (libuv), and Go all create OS threads via `clone()`.
 
-ATOS maps threads to child agents with deterministic scheduling:
+TOS maps threads to child agents with deterministic scheduling:
 
 ```text
 Linux thread model (non-deterministic):
@@ -531,7 +531,7 @@ Linux thread model (non-deterministic):
   Lock contention resolved by OS (random winner)
   → Different runs may produce different results
 
-ATOS deterministic thread model:
+TOS deterministic thread model:
   Thread A → Child Agent A (agent_id = N)
   Thread B → Child Agent B (agent_id = N+1)
 
@@ -548,11 +548,11 @@ ATOS deterministic thread model:
 
 **Syscall Translation Map**
 
-The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js v24, and CPython 3.10 execution with `strace -f -c`. This is the complete set required to run all three runtimes on ATOS. The "Used By" column indicates which runtimes require each syscall (J = OpenJDK, N = Node.js, P = CPython).
+The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js v24, and CPython 3.10 execution with `strace -f -c`. This is the complete set required to run all three runtimes on TOS. The "Used By" column indicates which runtimes require each syscall (J = OpenJDK, N = Node.js, P = CPython).
 
 *Phase 1 — Boot (~18 syscalls)*
 
-| Linux # | Name | ATOS Translation | Used By |
+| Linux # | Name | TOS Translation | Used By |
 |---------|------|-----------------|---------|
 | 0 | `read` | Keyspace `state_get` (files) or mailbox recv (pipes/sockets) | J N P |
 | 1 | `write` | Keyspace `state_put` (files) or serial output (stdout/stderr) | J N P |
@@ -564,7 +564,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 | 15 | `rt_sigreturn` | Restore pre-signal register state from stack frame | J |
 | 21 | `access` | Check keyspace key existence, return 0 or -ENOENT | J N P |
 | 59 | `execve` | `sys_spawn_image` — load ELF binary into new agent | J N P |
-| 63 | `uname` | Return fixed struct: sysname="ATOS", release="1.0", machine="x86_64" | J |
+| 63 | `uname` | Return fixed struct: sysname="TOS", release="1.0", machine="x86_64" | J |
 | 99 | `sysinfo` | Return fixed values: totalram from frame allocator, uptime from tick | J N P |
 | 102 | `getuid` | Return fixed uid (1000) | J N P |
 | 104 | `getgid` | Return fixed gid (1000) | N P |
@@ -575,7 +575,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 
 *Phase 2 — File I/O (~20 syscalls)*
 
-| Linux # | Name | ATOS Translation | Used By |
+| Linux # | Name | TOS Translation | Used By |
 |---------|------|-----------------|---------|
 | 5 | `fstat` | Return stat struct from fd metadata (size from keyspace value len) | N |
 | 8 | `lseek` | Update fd offset in fd_table (SEEK_SET/CUR/END) | J P |
@@ -598,7 +598,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 
 *Phase 3 — Network + epoll (~12 syscalls)*
 
-| Linux # | Name | ATOS Translation | Used By |
+| Linux # | Name | TOS Translation | Used By |
 |---------|------|-----------------|---------|
 | 28 | `madvise` | No-op success (MADV_DONTNEED clears pages; others ignored) | J N |
 | 39 | `getpid` | Return agent_id (deterministic) | J N |
@@ -615,7 +615,7 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 
 *Phase 4 — Threads + synchronization (~12 syscalls)*
 
-| Linux # | Name | ATOS Translation | Used By |
+| Linux # | Name | TOS Translation | Used By |
 |---------|------|-----------------|---------|
 | 24 | `sched_yield` | `sys_yield` — yield to deterministic scheduler | J |
 | 98 | `getrusage` | Return energy_used as ru_utime; tick count as wall time | J |
@@ -635,14 +635,14 @@ The following 62 syscalls were identified by tracing actual OpenJDK 11, Node.js 
 
 **Legacy syscalls** (supported for older binaries but not observed in strace):
 
-| Linux # | Name | ATOS Translation |
+| Linux # | Name | TOS Translation |
 |---------|------|-----------------|
 | 2 | `open` | Redirect to `openat(AT_FDCWD, path, ...)` |
 | 20 | `writev` | Scatter-gather write to fd (concatenate iovecs) |
 | 56 | `clone` | Redirect to `clone3` path |
 | 60 | `exit` | `sys_exit` |
-| 96 | `gettimeofday` | Return ATOS tick as seconds + microseconds |
-| 228 | `clock_gettime` | Return ATOS tick as timespec |
+| 96 | `gettimeofday` | Return TOS tick as seconds + microseconds |
+| 228 | `clock_gettime` | Return TOS tick as timespec |
 | 231 | `exit_group` | `sys_exit` for all child agents |
 | 232 | `epoll_create` | Redirect to `epoll_create1(0)` |
 | 233 | `epoll_ctl` | Add/remove fd from epoll watch set |
@@ -676,7 +676,7 @@ This produces output that appears random to the program but is fully reproducibl
 
 **I/O Trace for Network Determinism** `[IMPL: ✅ sendto/recvfrom record to NET_IO_LOG (256 entries); replay mode reads from log instead of network; TRACE_NET_SEND/RECV in checkpoint]`
 
-Network I/O is inherently non-deterministic (data arrives at unpredictable times). ATOS handles this via I/O tracing:
+Network I/O is inherently non-deterministic (data arrives at unpredictable times). TOS handles this via I/O tracing:
 
 ```text
 First execution:
@@ -714,7 +714,7 @@ libjvm.so                      ← JVM core (22 MB — largest)
 └── libzip.so                  ← ZIP/JAR handling
 ```
 
-These `.so` files must be accessible through the virtual filesystem. ATOS solves this with a **base image** model:
+These `.so` files must be accessible through the virtual filesystem. TOS solves this with a **base image** model:
 
 **1. Base Image Pre-Installation**
 
@@ -768,7 +768,7 @@ The existing 62 syscalls fully cover this flow. No new syscalls are needed — `
 
 **4. /etc/ld.so.cache and Library Search**
 
-The dynamic linker normally reads `/etc/ld.so.cache` to find library locations. ATOS provides a deterministic version:
+The dynamic linker normally reads `/etc/ld.so.cache` to find library locations. TOS provides a deterministic version:
 
 ```text
 Virtual /etc/ld.so.cache:
@@ -790,7 +790,7 @@ TCP Deploy request:
   input = Hello.jar contents
   base_image = "base-java"
 
-ATOS:
+TOS:
   1. Store Hello.jar in agent keyspace ("app/Hello.jar")
   2. Create agent with RuntimeKind::LinuxCompat
   3. Link agent to base image keyspace (read-only access)
@@ -814,19 +814,19 @@ libjvm.so (22 MB) storage:
 This requires extending `store_large_value()` to support multi-segment files (currently limited to 64 KB). The extension is backward-compatible — files under 64 KB continue to use single-segment storage.
 
 **Success Condition**
-- OpenJDK runs Java programs on ATOS with deterministic execution via the Linux compatibility layer. `[IMPL: ✅ syscall routing + base image + VFS all implemented; awaits end-to-end testing with real JDK binary]`
+- OpenJDK runs Java programs on TOS with deterministic execution via the Linux compatibility layer. `[IMPL: ✅ syscall routing + base image + VFS all implemented; awaits end-to-end testing with real JDK binary]`
 - Dynamic linking works: `ld-linux` loads `.so` files from keyspace-backed virtual filesystem. `[IMPL: ✅ vfs.rs resolves /lib/ paths to base image keyspace; multi-segment storage handles 22MB libjvm.so]`
 - Base images are pre-installed once; user applications deploy as lightweight packages. `[IMPL: ✅ install_base_image_file() stores to BASE_IMAGE_STORE; Deploy sets up agent with app keyspace]`
 - `curl https://example.com` fetches data through netd with I/O trace logging. `[IMPL: ✅ sendto proxies to netd + records TRACE_NET_SEND; recvfrom records TRACE_NET_RECV; replay reads from log]`
 - A Go multi-threaded HTTP server handles concurrent requests via child agent threads with deterministic scheduling. `[IMPL: ✅ clone3 creates child agent + deterministic scheduler; futex wait queue with agent_id ordering; awaits end-to-end testing]`
-- A Node.js program runs on ATOS with deterministic event loop ordering. `[IMPL: ✅ epoll/poll/select all deterministic (ascending fd order); io_uring returns -ENOSYS (Node falls back to epoll)]`
+- A Node.js program runs on TOS with deterministic event loop ordering. `[IMPL: ✅ epoll/poll/select all deterministic (ascending fd order); io_uring returns -ENOSYS (Node falls back to epoll)]`
 - Two runs with the same input produce bit-identical execution traces and state roots. `[IMPL: ✅ all non-determinism sources replaced; network I/O recorded for replay; awaits end-to-end verification]`
 - Linux-compat agents produce valid ExecutionReceipts with determinism guarantees. `[IMPL: ✅ LinuxCompat agents routed through linux_compat::dispatch(); eBPF exit hooks + receipts work on LinuxCompat path]`
 
 #### Stage-10 — Production Runtime Depth `[IMPL: ✅ Complete]`
 
 **Purpose**
-Close the remaining gaps between the 104-syscall translation layer and actually running production Linux programs (OpenJDK, Node.js, CPython) on ATOS. Stage-9 proves the syscall ABI works (67/67 tests pass); Stage-10 makes the runtime deep enough for real-world binaries.
+Close the remaining gaps between the 104-syscall translation layer and actually running production Linux programs (OpenJDK, Node.js, CPython) on TOS. Stage-9 proves the syscall ABI works (67/67 tests pass); Stage-10 makes the runtime deep enough for real-world binaries.
 
 **Core Capabilities**
 
@@ -884,47 +884,47 @@ All Stage-10 features maintain determinism:
 | File mmap | Page fault timing | Pre-load all pages on mmap (no lazy faulting) |
 
 **Success Condition**
-- A statically-linked OpenJDK JVM runs `Hello.class` on ATOS with deterministic output.
+- A statically-linked OpenJDK JVM runs `Hello.class` on TOS with deterministic output.
 - A dynamically-linked OpenJDK JVM loads `libjvm.so` via `ld-linux` from base image keyspace and runs `Hello.class`.
 - JVM thread creation (`clone3` + shared memory) works with deterministic scheduling.
 - JVM NullPointerException detection via `SIGSEGV` handler works.
 - Node.js runs a simple HTTP handler with deterministic event loop.
 - Two runs with identical input produce bit-identical execution traces.
 
-### The Three Eras of ATOS
+### The Three Eras of TOS
 
 #### Era I — Execution Foundation (Stage-1 to Stage-4)
 
-ATOS proves that it can execute contracts on hardware.
+TOS proves that it can execute contracts on hardware.
 
 Focus: kernel, isolation, runtime, state, hardware, external TCP interface.
 
 #### Era II — Production Execution (Stage-5 to Stage-8)
 
-ATOS becomes a production-grade verifiable execution platform.
+TOS becomes a production-grade verifiable execution platform.
 
 Focus: durable state, contract lifecycle, verifiable execution, WASM runtime.
 
 #### Era III — Universal Deterministic Execution (Stage-9 to Stage-10)
 
-Any Linux program runs on ATOS with deterministic guarantees.
+Any Linux program runs on TOS with deterministic guarantees.
 
 Stage-9: syscall translation layer (104 syscalls, 67/67 tests pass).
 Stage-10: runtime depth for real-world binaries (dynamic linking, threads, signals).
 
 ### One-Sentence Definition
 
-**ATOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program, including dynamically-linked runtimes like OpenJDK and Node.js, can run on ATOS with deterministic guarantees through the 104-syscall Linux compatibility layer.**
+**TOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program, including dynamically-linked runtimes like OpenJDK and Node.js, can run on TOS with deterministic guarantees through the 104-syscall Linux compatibility layer.**
 
 ---
 
 ## Part I — Foundations and Stage-1 Scope
 
-## 0. Preface: ATOS First Principles / Original Intent
+## 0. Preface: TOS First Principles / Original Intent
 
-ATOS began from a simple premise: deterministic, metered, verifiable computation should run directly on hardware — not inside a process on a general-purpose operating system, and not limited to a single instruction set like EVM bytecode.
+TOS began from a simple premise: deterministic, metered, verifiable computation should run directly on hardware — not inside a process on a general-purpose operating system, and not limited to a single instruction set like EVM bytecode.
 
-The original intent of ATOS is:
+The original intent of TOS is:
 
 * to provide a **hardware-level execution VM**, not a general-purpose operating system
 * to make **authority explicit** through capabilities and policy, rather than ambient privilege
@@ -933,7 +933,7 @@ The original intent of ATOS is:
 * to support **multiple execution formats** (WASM, JVM, native) under one unified metering and verification model
 * to validate this model first in **QEMU**, then expand to real hardware
 
-In practical terms, ATOS is centered on:
+In practical terms, TOS is centered on:
 
 * contracts (agents)
 * mailboxes (inter-contract calls and external communication)
@@ -965,9 +965,9 @@ Current execution VMs (EVM, JVM, WASM runtimes) run **inside** a host operating 
 * verification requires trusting the host OS, the runtime process, and the operator
 * the host OS provides a massive attack surface that is irrelevant to the computation
 
-### 1.2 The ATOS Approach
+### 1.2 The TOS Approach
 
-ATOS eliminates the host OS entirely. The execution VM **is** the operating system:
+TOS eliminates the host OS entirely. The execution VM **is** the operating system:
 
 * isolation is enforced by **hardware page tables** (x86_64 ring-3 / ring-0 separation)
 * metering is unified across all runtimes via **timer-tick preemption** (no per-opcode overhead)
@@ -976,7 +976,7 @@ ATOS eliminates the host OS entirely. The execution VM **is** the operating syst
 
 ### 1.3 Comparison
 
-| Property | EVM | JVM (on Linux) | ATOS |
+| Property | EVM | JVM (on Linux) | TOS |
 |----------|-----|----------------|------|
 | Isolation | EVM sandbox | OS process | Hardware page tables |
 | Metering | Per-opcode gas | None (wall-clock) | Timer-tick energy (unified) |
@@ -993,7 +993,7 @@ ATOS eliminates the host OS entirely. The execution VM **is** the operating syst
 
 ### 2.1 Execution VM, not operating system
 
-ATOS is not designed to replace Linux, Windows, or macOS. It is designed as:
+TOS is not designed to replace Linux, Windows, or macOS. It is designed as:
 
 * a deterministic execution substrate for smart contracts
 * a hardware-level VM for verifiable computation
@@ -1017,7 +1017,7 @@ Higher-level services (state persistence, policy enforcement, networking, contra
 
 ### 2.3 Determinism over convenience
 
-ATOS must prefer predictable, replayable behavior over convenience. Every source of non-determinism must be either eliminated or traced for replay.
+TOS must prefer predictable, replayable behavior over convenience. Every source of non-determinism must be either eliminated or traced for replay.
 
 ### 2.4 Explicit authority
 
@@ -1025,7 +1025,7 @@ Nothing is accessible by default. Every meaningful action must be backed by a ca
 
 ### 2.5 Contracts and mailboxes, not files and sockets
 
-The primary concepts of ATOS are:
+The primary concepts of TOS are:
 
 * contract (agent)
 * mailbox (IPC and inter-contract calls)
@@ -1045,7 +1045,7 @@ Not:
 
 ## 3. Scope of Stage-1
 
-The first implementation target of ATOS is intentionally narrow.
+The first implementation target of TOS is intentionally narrow.
 
 ### 3.1 Target platform
 
@@ -1086,9 +1086,9 @@ The first implementation target of ATOS is intentionally narrow.
 
 ### 4.1 Layer naming
 
-* **ATOS-0** — privileged kernel substrate
-* **ATOS-1** — runtime host layer (WASM, JVM, native)
-* **ATOS-2** — contract and system-service layer
+* **TOS-0** — privileged kernel substrate
+* **TOS-1** — runtime host layer (WASM, JVM, native)
+* **TOS-2** — contract and system-service layer
 
 ### 4.2 Logical architecture
 
@@ -1096,13 +1096,13 @@ The first implementation target of ATOS is intentionally narrow.
 +---------------------------------------------------+
 |         External Systems (via TCP)                |
 +---------------------------------------------------+
-| ATOS-2 Contract / Service Layer                    |
+| TOS-2 Contract / Service Layer                    |
 | deployed contracts | stated | policyd | netd      |
 +---------------------------------------------------+
-| ATOS-1 Runtime Host                                |
+| TOS-1 Runtime Host                                |
 | WASM engine | Ristretto JVM | native              |
 +---------------------------------------------------+
-| ATOS-0 Kernel                                      |
+| TOS-0 Kernel                                      |
 | sched | mailbox | capability | state | audit      |
 | energy | syscall | checkpoint | Merkle            |
 +---------------------------------------------------+
@@ -1117,14 +1117,14 @@ The first implementation target of ATOS is intentionally narrow.
 
 Stage-1 realizes only a thin slice of the full stack:
 
-* ATOS-0 is the primary focus
-* ATOS-1 collapses to built-in native execution
-* ATOS-2 contains only minimal bootstrap and test contracts
+* TOS-0 is the primary focus
+* TOS-1 collapses to built-in native execution
+* TOS-2 contains only minimal bootstrap and test contracts
 * External TCP interface is deferred
 
-### 4.4 ATOS Genesis
+### 4.4 TOS Genesis
 
-ATOS requires a trusted starting point at system bring-up:
+TOS requires a trusted starting point at system bring-up:
 
 * **authority**: the root identity and initial capability set
 * **execution budget**: the initial energy pool from which contract budgets are delegated
@@ -1132,7 +1132,7 @@ ATOS requires a trusted starting point at system bring-up:
 * **policy**: the initial eBPF-lite policy bundle
 * **state**: the initial keyspace configuration
 
-In Stage-1, ATOS Genesis is implicit and compiled into the boot path. Later stages may externalize this into an explicit signed genesis profile.
+In Stage-1, TOS Genesis is implicit and compiled into the boot path. Later stages may externalize this into an explicit signed genesis profile.
 
 ---
 
@@ -1140,7 +1140,7 @@ In Stage-1, ATOS Genesis is implicit and compiled into the boot path. Later stag
 
 ### 5.1 Contract (Agent)
 
-A **contract** is the primary execution unit in ATOS. It replaces the traditional concept of a process or a smart contract account.
+A **contract** is the primary execution unit in TOS. It replaces the traditional concept of a process or a smart contract account.
 
 ```text
 Contract {
@@ -1214,7 +1214,7 @@ A **keyspace** replaces file semantics. Each contract has a private keyspace (ke
 
 ### 5.5 Energy Budget
 
-Every contract runs under an execution budget. This is the ATOS equivalent of gas:
+Every contract runs under an execution budget. This is the TOS equivalent of gas:
 
 * timer ticks decrement energy for running contracts
 * syscalls have fixed energy costs
@@ -1235,7 +1235,7 @@ Every meaningful execution produces an ExecutionReceipt containing:
 
 ### 5.7 Audit Trail
 
-ATOS emits structured events for every significant action:
+TOS emits structured events for every significant action:
 
 * contract creation/termination
 * mailbox send/receive
@@ -1246,15 +1246,15 @@ ATOS emits structured events for every significant action:
 
 ---
 
-## 6. Why ATOS Must Be Written from Scratch
+## 6. Why TOS Must Be Written from Scratch
 
 ### 6.1 Why not use a host OS
 
-If ATOS runs inside Linux, verification depends on trusting Linux — a 30M+ line codebase. ATOS eliminates this dependency by being the only software between the hardware and the contracts.
+If TOS runs inside Linux, verification depends on trusting Linux — a 30M+ line codebase. TOS eliminates this dependency by being the only software between the hardware and the contracts.
 
 ### 6.2 Why not modify an existing VM
 
-EVM is limited to one instruction set. JVM has no built-in metering or state proofs. WASM runtimes lack hardware-level isolation. ATOS combines the best properties of all three under one unified kernel.
+EVM is limited to one instruction set. JVM has no built-in metering or state proofs. WASM runtimes lack hardware-level isolation. TOS combines the best properties of all three under one unified kernel.
 
 ### 6.3 Why first run in a virtual machine
 
@@ -1292,7 +1292,7 @@ The following specifications from the original yellow paper remain in force:
 
 ## 8. What Was Removed from v1
 
-The following components from yellowpaper v1 are **out of scope** for the ATOS VM:
+The following components from yellowpaper v1 are **out of scope** for the TOS VM:
 
 | Removed | Reason |
 |---------|--------|
@@ -1300,9 +1300,9 @@ The following components from yellowpaper v1 are **out of scope** for the ATOS V
 | **authd revocation service** (v1 Stage-5) | No long-lived delegation chains to revoke. |
 | **Signed capability leases** (v1 Stage-5) | Capabilities are granted per-deployment, not leased with expiry. |
 | **Encrypted keyspaces** (v1 Stage-6) | Contract storage is capability-gated, not encrypted. If needed, contracts encrypt their own data. |
-| **Cross-node state replication** (v1 Stage-6) | ATOS is a single-instance VM, not a distributed system. |
+| **Cross-node state replication** (v1 Stage-6) | TOS is a single-instance VM, not a distributed system. |
 | **Distributed execution fabric** (v1 Stage-8) | routerd, membership_d, placement_d, failover_d — all removed. Single instance. |
-| **billingd / quotad** (v1 Stage-9) | Billing is an external concern. ATOS reports energy usage in receipts; external systems handle billing. |
+| **billingd / quotad** (v1 Stage-9) | Billing is an external concern. TOS reports energy usage in receipts; external systems handle billing. |
 | **Appliance-grade operations** (v1 Stage-10) | admind, upgraded, observabilityd, fleet management, multi-tenant, OTA — not needed for a VM. |
 | **RustPython** (v1 Stage-11) | RustPython is not mature enough. Python compiles to WASM or runs via Linux compat layer. |
 | **Ristretto JVM** (v1 Stage-11) | Replaced by Linux compat layer — unmodified OpenJDK runs deterministically via syscall translation. |
@@ -1360,7 +1360,7 @@ The following components from yellowpaper v1 are **out of scope** for the ATOS V
 
 ## 28. Long-Term Vision
 
-ATOS evolves from a minimal kernel into a hardware-level execution VM that external systems can trust.
+TOS evolves from a minimal kernel into a hardware-level execution VM that external systems can trust.
 
 ```text
 +---------------------------------------------------+
@@ -1368,39 +1368,39 @@ ATOS evolves from a minimal kernel into a hardware-level execution VM that exter
 +---------------------------------------------------+
 |    Contracts (WASM / JVM / Native)                |
 +---------------------------------------------------+
-|    ATOS Runtime (scheduler, IPC, caps, metering)  |
+|    TOS Runtime (scheduler, IPC, caps, metering)  |
 +---------------------------------------------------+
-|    ATOS Kernel (mm, trap, syscall, Merkle, audit) |
+|    TOS Kernel (mm, trap, syscall, Merkle, audit) |
 +---------------------------------------------------+
 |    Hardware / QEMU                                |
 +---------------------------------------------------+
 ```
 
-### 28.1 What ATOS Is
+### 28.1 What TOS Is
 
 * A hardware-level deterministic execution VM
 * A bare-metal substrate for smart contracts and verifiable computation
 * A multi-runtime platform (WASM, JVM, native) with unified metering
 * A system where every execution is isolated, metered, and produces a verifiable receipt
 
-### 28.2 What ATOS Is Not
+### 28.2 What TOS Is Not
 
 * A desktop operating system
 * A Linux replacement
 * A general-purpose computing platform
-* A distributed consensus system (ATOS is the execution layer; consensus is external)
-* A blockchain (ATOS can be used by blockchains as an execution engine)
+* A distributed consensus system (TOS is the execution layer; consensus is external)
+* A blockchain (TOS can be used by blockchains as an execution engine)
 
 ### 28.3 Relationship to Blockchain
 
-ATOS is not a blockchain. It is the **execution layer** that a blockchain (or any external system) can use:
+TOS is not a blockchain. It is the **execution layer** that a blockchain (or any external system) can use:
 
 ```text
 Blockchain / Coordinator
     │
     │ "Execute this contract with this input"
     ▼
-ATOS VM (bare metal)
+TOS VM (bare metal)
     │
     │ "Here is the output, state root, energy used, and proof"
     ▼
@@ -1410,11 +1410,11 @@ Blockchain / Coordinator
     ▼
 ```
 
-ATOS handles execution. The blockchain handles consensus, ordering, and finality. This separation allows ATOS to be used by any consensus mechanism — not just one blockchain.
+TOS handles execution. The blockchain handles consensus, ordering, and finality. This separation allows TOS to be used by any consensus mechanism — not just one blockchain.
 
 ### 28.4 Integration Reference: Execute-then-Verify Model
 
-ATOS is designed to be embedded as the execution engine of a larger coordination system (e.g., a blockchain L1, an L2 rollup, or an AI-agent orchestrator). This section describes the canonical integration pattern.
+TOS is designed to be embedded as the execution engine of a larger coordination system (e.g., a blockchain L1, an L2 rollup, or an AI-agent orchestrator). This section describes the canonical integration pattern.
 
 #### 28.4.1 Architecture: Execute-then-Verify
 
@@ -1424,7 +1424,7 @@ ATOS is designed to be embedded as the execution engine of a larger coordination
                            │ 1. Submit: code + input + energy_budget
                            ▼
                    ┌───────────────┐
-                   │   ATOS VM     │
+                   │   TOS VM     │
                    │  runs program │
                    │  actual: 50K  │
                    └───────┬───────┘
@@ -1447,7 +1447,7 @@ ATOS is designed to be embedded as the execution engine of a larger coordination
      - receipt_hash   - receipt_hash   - receipt_hash
 ```
 
-Only the **executor** runs an ATOS VM instance. All other nodes verify the `ExecutionReceipt` cryptographically — no re-execution required.
+Only the **executor** runs an TOS VM instance. All other nodes verify the `ExecutionReceipt` cryptographically — no re-execution required.
 
 #### 28.4.2 Energy Billing Model
 
@@ -1455,7 +1455,7 @@ The coordinator charges the caller `energy_budget` (the pre-declared maximum), n
 
 ```text
 Caller declares:   energy_budget = 100,000
-ATOS executes:     energy_used   =  50,000
+TOS executes:     energy_used   =  50,000
 Coordinator deducts:               100,000  (the budget, not the actual)
 ```
 
@@ -1463,7 +1463,7 @@ Coordinator deducts:               100,000  (the budget, not the actual)
 
 - **Simplicity**: no dispute over actual consumption; the caller pre-commits to a ceiling.
 - **No re-execution needed**: verifiers do not need to re-run the program to confirm `energy_used`; they only verify the receipt signature and state root.
-- **Analogous to Ethereum gasLimit**: the caller sets a maximum; unused gas is conceptually "burned" (or in some designs, refunded — that is a coordinator policy, not an ATOS concern).
+- **Analogous to Ethereum gasLimit**: the caller sets a maximum; unused gas is conceptually "burned" (or in some designs, refunded — that is a coordinator policy, not an TOS concern).
 
 The `ExecutionReceipt` records both values:
 
@@ -1476,7 +1476,7 @@ ExecutionReceipt {
 }
 ```
 
-The coordinator may choose to refund `energy_budget - energy_used` to the caller as a policy decision. ATOS itself is agnostic — it reports both values and the coordinator decides the billing rule.
+The coordinator may choose to refund `energy_budget - energy_used` to the caller as a policy decision. TOS itself is agnostic — it reports both values and the coordinator decides the billing rule.
 
 #### 28.4.3 Verification Without Re-Execution
 
@@ -1486,7 +1486,7 @@ Verifier nodes validate an execution result using only the `ExecutionReceipt`:
 2. **State root check**: confirm the `final_state_root` is a valid SHA-256 Merkle root (optionally verify inclusion proofs for specific keys via the `ProofBundle`).
 3. **Receipt hash check**: recompute `SHA-256(receipt fields)` and compare with `receipt_id`.
 
-All three checks are **O(1)** — no ATOS VM instance is needed on verifier nodes.
+All three checks are **O(1)** — no TOS VM instance is needed on verifier nodes.
 
 #### 28.4.4 Non-Deterministic Runtimes (JVM, CPython)
 
@@ -1495,7 +1495,7 @@ Programs running under the Linux compatibility layer (e.g., OpenJDK, Node.js, CP
 - **Garbage collection timing**: GC trigger points depend on heap allocation patterns.
 - **JIT compilation thresholds**: the number of interpreted invocations before JIT fires varies with thread interleaving.
 
-ATOS mitigates these at the syscall boundary (deterministic scheduling, deterministic PRNG, logical clock), but cannot eliminate non-determinism that originates entirely within the guest program's internal state machine.
+TOS mitigates these at the syscall boundary (deterministic scheduling, deterministic PRNG, logical clock), but cannot eliminate non-determinism that originates entirely within the guest program's internal state machine.
 
 **Consequence**: two runs of the same Java program with the same input may consume different `energy_used` values due to GC/JIT variance, even though both produce the **same output and same final state**.
 
@@ -1517,7 +1517,7 @@ For programs that require **exact energy determinism**, use the WASM runtime (`P
 
 #### 28.4.5 Coordinator Integration API
 
-The coordinator communicates with ATOS via the TCP external interface (Stage-4):
+The coordinator communicates with TOS via the TCP external interface (Stage-4):
 
 **Submit execution:**
 ```text
@@ -1556,24 +1556,24 @@ Request { request_type: GetProof (6), ... }
 
 ### 28.5 Package Distribution Model
 
-ATOS is a sealed execution environment. It does **not** compile code, host registries, or download packages. All compilation and packaging happens on the developer's own machine. ATOS only receives pre-built binaries, executes them, and produces receipts.
+TOS is a sealed execution environment. It does **not** compile code, host registries, or download packages. All compilation and packaging happens on the developer's own machine. TOS only receives pre-built binaries, executes them, and produces receipts.
 
 #### 28.5.1 Two Package Categories
 
-ATOS distinguishes two categories of packages with separate namespaces, distribution paths, and lifecycle rules.
+TOS distinguishes two categories of packages with separate namespaces, distribution paths, and lifecycle rules.
 
 **Runtime Packages** (e.g., OpenJDK, CPython, Node.js, libc):
 
 | Aspect | Description |
 |--------|-------------|
 | Examples | `openjdk-21`, `python-3.12`, `node-22`, `musl-libc` |
-| Built by | Runtime vendor or ATOS team |
-| Built where | Developer/CI machine (never inside ATOS VM) |
+| Built by | Runtime vendor or TOS team |
+| Built where | Developer/CI machine (never inside TOS VM) |
 | Size | Tens of MB to hundreds of MB |
 | Installed to | Base image keyspace (shared, available to all contracts) |
 | Update frequency | Low (follows upstream release cadence) |
-| Registry path | `atos.im/runtimes/` |
-| Review | Signed by ATOS team; users verify before installing |
+| Registry path | `tos.im/runtimes/` |
+| Review | Signed by TOS team; users verify before installing |
 
 **Contract Packages** (e.g., token.tos, dex.tos):
 
@@ -1581,18 +1581,18 @@ ATOS distinguishes two categories of packages with separate namespaces, distribu
 |--------|-------------|
 | Examples | `token-1.0.0.tos`, `dex-2.1.0.tos` |
 | Built by | Contract developer |
-| Built where | Developer's own machine (never inside ATOS VM) |
+| Built where | Developer's own machine (never inside TOS VM) |
 | Size | Kilobytes to a few MB |
 | Installed to | Contract keyspace (per-contract, isolated) |
 | Update frequency | High (business iteration) |
-| Registry path | `atos.im/contracts/` |
+| Registry path | `tos.im/contracts/` |
 | Review | Community-published; consumers verify signature before installing |
 
 #### 28.5.2 Distribution Architecture
 
 ```text
 ┌──────────────────────────────────────────────────────┐
-│  atos.im Registry (external web service)             │
+│  tos.im Registry (external web service)             │
 │                                                      │
 │  /runtimes/openjdk-21.tar.gz                         │
 │  /runtimes/python-3.12.tar.gz                        │
@@ -1622,7 +1622,7 @@ ATOS distinguishes two categories of packages with separate namespaces, distribu
             │ TCP: Deploy / Call
             ▼
 ┌───────────────────────┐
-│  ATOS VM              │
+│  TOS VM              │
 │  (bare metal / QEMU)  │
 │                       │
 │  Receives binaries    │
@@ -1642,12 +1642,12 @@ ATOS distinguishes two categories of packages with separate namespaces, distribu
 **Runtime installation (operator-side):**
 
 ```text
-1. Operator downloads runtime from atos.im (or builds from source)
+1. Operator downloads runtime from tos.im (or builds from source)
 2. Operator verifies signature: atp verify openjdk-21.tar.gz
-3. Operator installs to ATOS base image:
+3. Operator installs to TOS base image:
    → TCP Deploy with runtime files
-   → ATOS stores in BASE_IMAGE_KEYSPACE
-   → Available to all contracts on this ATOS instance
+   → TOS stores in BASE_IMAGE_KEYSPACE
+   → Available to all contracts on this TOS instance
 4. Upgrade: same flow, new version replaces old
 ```
 
@@ -1658,31 +1658,31 @@ ATOS distinguishes two categories of packages with separate namespaces, distribu
 2. Developer compiles: cargo build --target wasm32 (or gcc, javac, etc.)
 3. Developer packages: atp build --input contract.wasm
 4. Developer signs: atp sign contract.tos --key developer.key
-5. Developer publishes: atp publish contract.tos --registry atos.im
-6. Consumer downloads: atp install contract --from atos.im
+5. Developer publishes: atp publish contract.tos --registry tos.im
+6. Consumer downloads: atp install contract --from tos.im
 7. Consumer verifies: atp verify contract.tos --pubkey developer.pub
-8. Consumer deploys to ATOS: TCP Deploy → contract registered
+8. Consumer deploys to TOS: TCP Deploy → contract registered
 9. Anyone calls: TCP Call → execute → receipt
 ```
 
-#### 28.5.4 What ATOS Does Not Do
+#### 28.5.4 What TOS Does Not Do
 
-- ATOS does **not** compile source code inside the VM
-- ATOS does **not** run a package registry service
-- ATOS does **not** download packages from the internet
-- ATOS does **not** mix runtime packages with contract packages
+- TOS does **not** compile source code inside the VM
+- TOS does **not** run a package registry service
+- TOS does **not** download packages from the internet
+- TOS does **not** mix runtime packages with contract packages
 - Runtime packages and contract packages live in separate keyspaces and have separate trust models
 
-ATOS is a **sealed execution environment**: pre-built binaries go in, deterministic results and cryptographic receipts come out.
+TOS is a **sealed execution environment**: pre-built binaries go in, deterministic results and cryptographic receipts come out.
 
-#### 28.5.5 Registry API (atos.im — External Service)
+#### 28.5.5 Registry API (tos.im — External Service)
 
-The registry at `atos.im` is an ordinary HTTP service, **not** part of the ATOS kernel:
+The registry at `tos.im` is an ordinary HTTP service, **not** part of the TOS kernel:
 
 ```text
 GET  /api/v1/runtimes                          List available runtimes
 GET  /api/v1/runtimes/{name}/{version}         Download runtime archive
-PUT  /api/v1/runtimes/{name}/{version}         Upload runtime (ATOS team only)
+PUT  /api/v1/runtimes/{name}/{version}         Upload runtime (TOS team only)
 
 GET  /api/v1/contracts                         List published contracts
 GET  /api/v1/contracts?q={query}               Search contracts
@@ -1699,7 +1699,7 @@ Each `.tos` package contains:
 
 #### 28.5.6 Licensing
 
-Runtime packages bundled by the ATOS project or distributed via `atos.im` must comply with their upstream licenses:
+Runtime packages bundled by the TOS project or distributed via `tos.im` must comply with their upstream licenses:
 
 | Runtime | License | Bundling Obligation |
 |---------|---------|---------------------|
@@ -1713,7 +1713,7 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 
 ### 28.6 Closing Statement
 
-> ATOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
+> TOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
 
 ---
 
@@ -1732,4 +1732,4 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 | 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
 | 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ✅ Complete |
 
-**ATOS is complete when any Linux program — including dynamically-linked OpenJDK and Node.js — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
+**TOS is complete when any Linux program — including dynamically-linked OpenJDK and Node.js — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**

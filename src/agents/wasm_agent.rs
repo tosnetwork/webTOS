@@ -1,4 +1,4 @@
-//! ATOS WASM Contract Execution Agent
+//! TOS WASM Contract Execution Agent
 //!
 //! A kernel-mode agent that loads deployed WASM bytecode from keyspace storage
 //! and processes incoming contract call requests via mailbox IPC. Falls back to
@@ -50,7 +50,7 @@ const DEFAULT_FUEL: u64 = 100_000;
 ///
 /// Module structure:
 ///   - Type section:   1 func type `() -> ()`
-///   - Import section: 1 import `"atos"."sys_yield"` as func (type 0)
+///   - Import section: 1 import `"tos"."sys_yield"` as func (type 0)
 ///   - Function section: 1 local function (type 0)
 ///   - Export section:   export `"run"` as function index 1
 ///   - Code section:     function body = `loop { call 0; br 0; } end`
@@ -64,7 +64,7 @@ static WASM_BINARY: &[u8] = &[
     // ── Type section (id=1, size=4) ──────────────────────────────
     0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
     // ── Import section (id=2, size=17) ───────────────────────────
-    0x02, 0x11, 0x01, 0x03, 0x61, 0x6F, 0x73, // module: "atos" (note: 3 bytes = "aos")
+    0x02, 0x11, 0x01, 0x03, 0x61, 0x6F, 0x73, // module: "tos" (note: 3 bytes = "aos")
     0x09, 0x73, 0x79, 0x73, 0x5F, 0x79, 0x69, 0x65, 0x6C, 0x64, // field: "sys_yield"
     0x00, 0x00,
     // ── Function section (id=3, size=2) ──────────────────────────

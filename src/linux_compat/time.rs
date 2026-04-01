@@ -1,11 +1,11 @@
 //! Deterministic time syscalls.
 //!
-//! All time values are derived from the ATOS tick counter (100 Hz / 10ms per tick)
+//! All time values are derived from the TOS tick counter (100 Hz / 10ms per tick)
 //! to ensure deterministic replay across all nodes.
 
 use super::constants::*;
 
-/// Helper: convert ATOS ticks to (seconds, nanoseconds).
+/// Helper: convert TOS ticks to (seconds, nanoseconds).
 #[inline]
 fn ticks_to_timespec() -> (u64, u64) {
     let ticks = crate::arch::x86_64::timer::get_ticks();

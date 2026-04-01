@@ -1,6 +1,6 @@
 //! Process-related Linux syscall implementations.
 //!
-//! Maps Linux process/thread primitives onto ATOS deterministic agents.
+//! Maps Linux process/thread primitives onto TOS deterministic agents.
 //! clone3 is the critical syscall: it creates a child agent that shares the
 //! parent's keyspace and gets a deterministic, sequential agent_id.
 
@@ -16,7 +16,7 @@ use crate::linux_compat::constants::*;
 use crate::linux_compat::state::{self, VmaEntry, VmaKind, MAX_FDS, MAX_LINUX_AGENTS};
 use crate::sched;
 use crate::serial_println;
-// ── ATOS utsname constants ─────────────────────────────────────────────────
+// ── TOS utsname constants ─────────────────────────────────────────────────
 
 const UTSNAME_LENGTH: usize = 65;
 
@@ -1155,7 +1155,7 @@ static mut AGENT_NAMES: [[u8; 16]; MAX_LINUX_AGENTS] = [[0u8; 16]; MAX_LINUX_AGE
 /// clone3(2) -- Create a new thread/agent deterministically.
 ///
 /// This is the most important Linux-compat syscall. It maps Linux threads
-/// to ATOS child agents with deterministic, sequential agent IDs.
+/// to TOS child agents with deterministic, sequential agent IDs.
 ///
 /// 1. Parse clone_args from user memory
 /// 2. Create child agent via agent::create_agent()
@@ -1584,7 +1584,7 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     }
 
     // Raise SIGCHLD on the parent leader thread. Linux treats SIGCHLD as
-    // process-directed, but for ATOS we keep it deterministic by targeting the
+    // process-directed, but for TOS we keep it deterministic by targeting the
     // parent leader directly; this matches runtime expectations for
     // child-process reaping paths such as Node's spawnSync.
     if let Some(pid) = parent_id {
@@ -1742,7 +1742,7 @@ pub fn sys_sched_yield(_agent_id: u16) -> i64 {
 
 /// sched_getaffinity(2) -- Get CPU affinity mask.
 ///
-/// Writes a bitmask with CPU 0 set. ATOS is deterministic so affinity
+/// Writes a bitmask with CPU 0 set. TOS is deterministic so affinity
 /// is advisory only; we report a single CPU.
 pub fn sys_sched_getaffinity(_agent_id: u16, _pid: u32, cpusetsize: u64, mask_ptr: u64) -> i64 {
     if mask_ptr == 0 {
@@ -1802,7 +1802,7 @@ pub fn sys_getrusage(agent_id: u16, _who: i32, usage_ptr: u64) -> i64 {
 
 /// capget(2) -- Get Linux capabilities.
 ///
-/// ATOS does not implement Linux capabilities. Write empty data.
+/// TOS does not implement Linux capabilities. Write empty data.
 pub fn sys_capget(_agent_id: u16, hdrp: u64, datap: u64) -> i64 {
     if hdrp == 0 {
         return -EFAULT;
@@ -1953,7 +1953,7 @@ pub fn sys_clone(
 
 /// fork(2) -- Create child process (full copy).
 ///
-/// In ATOS, fork maps to clone with default flags.
+/// In TOS, fork maps to clone with default flags.
 pub fn sys_fork(agent_id: u16) -> i64 {
     sys_clone(agent_id, 0, 0, 0, 0, 0)
 }
@@ -2205,7 +2205,7 @@ pub fn sys_kill(_agent_id: u16, pid: i32, sig: i32) -> i64 {
 
 /// tgkill(2) -- Send a signal to a specific thread.
 ///
-/// ATOS currently models one Linux thread per agent, so `pid` and `tid`
+/// TOS currently models one Linux thread per agent, so `pid` and `tid`
 /// both resolve to the target agent's Linux pid. The signal is queued and
 /// will be delivered at the next syscall-return boundary.
 pub fn sys_tgkill(_agent_id: u16, pid: i32, tid: i32, sig: i32) -> i64 {
@@ -2249,9 +2249,9 @@ pub fn sys_uname(agent_id: u16, buf_ptr: u64) -> i64 {
     // sysname, nodename, release, version, machine, domainname.
     let mut utsname = [0u8; UTSNAME_LENGTH * 6];
     utsname[..5].copy_from_slice(b"Linux");
-    utsname[UTSNAME_LENGTH..UTSNAME_LENGTH + 4].copy_from_slice(b"atos");
-    utsname[UTSNAME_LENGTH * 2..UTSNAME_LENGTH * 2 + 10].copy_from_slice(b"6.1.0-atos");
-    utsname[UTSNAME_LENGTH * 3..UTSNAME_LENGTH * 3 + 11].copy_from_slice(b"#1 SMP ATOS");
+    utsname[UTSNAME_LENGTH..UTSNAME_LENGTH + 4].copy_from_slice(b"tos");
+    utsname[UTSNAME_LENGTH * 2..UTSNAME_LENGTH * 2 + 10].copy_from_slice(b"6.1.0-tos");
+    utsname[UTSNAME_LENGTH * 3..UTSNAME_LENGTH * 3 + 11].copy_from_slice(b"#1 SMP TOS");
     utsname[UTSNAME_LENGTH * 4..UTSNAME_LENGTH * 4 + 6].copy_from_slice(b"x86_64");
     utsname[UTSNAME_LENGTH * 5..UTSNAME_LENGTH * 5 + 6].copy_from_slice(b"(none)");
     if !copy_to_user(agent_id, buf_ptr, &utsname) {
