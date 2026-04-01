@@ -1,4 +1,4 @@
-# TOS Yellow Paper v2
+# TOS Yellow Paper
 
 **Version:** Draft v2.0
 **Status:** Engineering Yellow Paper

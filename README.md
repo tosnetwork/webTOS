@@ -13,9 +13,11 @@
 
 ## What is TOS?
 
-TOS is an **agent-first operating system** — no processes, no filesystem, no root user. All computation is an Agent. All authority is a Capability. All execution is provable.
+TOS is an **agent-first operating system kernel**. Its native model is built around Agents, Capabilities, Mailboxes, Keyspaces, energy budgets, and replayable receipts rather than ambient root authority and POSIX-first process semantics.
 
 Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. TOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
+
+This repository now contains both the native TOS model and a substantial **Linux compatibility layer** used to boot and validate stock Linux ELF workloads such as OpenJDK, Node.js, and Python.
 
 | Traditional OS | TOS |
 |----------------|------|
@@ -30,17 +32,18 @@ Modern operating systems were designed for human-operated computing. Their core 
 
 ### Agents Are Everything
 
-Every piece of running code is an Agent. There are three runtimes, each for a different role:
+TOS currently has three agent/runtime paths plus one kernel policy layer:
 
-- **Native x86_64** — high-performance system services (state manager, policy engine, network broker)
+- **Native x86_64** — high-performance system services and native agents using the TOS syscall ABI directly
 - **WASM** — portable, sandboxed user agents with fuel metering and three execution grades (BestEffort, ReplayGrade, ProofGrade)
+- **Linux-compat** — stock Linux ELF programs running through the translated Linux syscall ABI
 - **eBPF-lite** — kernel-resident policy programs that intercept syscalls, mailbox messages, agent spawns, and timer ticks in real time
 
-Agents communicate through **mailboxes** (no shared memory), forming a message-driven microkernel architecture.
+Native and WASM agents communicate through **mailboxes**, forming the message-driven core architecture. Linux-compat adds Linux process/thread, VMA, futex, fd, and dynamic-loader semantics on top of the same kernel.
 
 ### Capabilities, Not Permissions
 
-There is no superuser. Authority is a concrete Capability token — `SendMailbox(3)`, `AgentSpawn`, `PolicyLoad`, `Network`. Capabilities can only be **delegated from parent to child, and only as a subset** — never enlarged, never created from nothing. Each capability carries a cryptographic signature, verifiable even across nodes.
+There is no superuser in the native TOS model. Authority is a concrete Capability record — `SendMailbox(3)`, `AgentSpawn`, `PolicyLoad`, `Network`. Capabilities can only be **delegated from parent to child, and only as a subset** — never enlarged, never created from nothing.
 
 ### Provable Execution
 
@@ -57,13 +60,13 @@ You can outsource computation to an untrusted node, then verify the result is co
 
 Every Agent has an **energy budget**. Every instruction, every syscall, every message costs energy. Energy is exhausted — agent suspends. Parents transfer energy to children. This isn't a limitation — it's the foundation for **metering, billing, and economic accountability**. CPU time becomes a priced, transferable, auditable resource.
 
-### Distributed and Migratable
+### Checkpointable Today, Distributed Later
 
-Agents don't know which physical node their peers are on. Mailbox messages are automatically routed across nodes (via kernel UDP with signed capability verification). Agents can be **migrated** between nodes — checkpoint on node A, transfer state, resume on node B.
+The tree already includes **portable checkpoints** and minimal kernel UDP primitives. Broader cross-node mailbox routing and live agent migration are still roadmap work, not the default shipped execution path in the current repository.
 
 ### Skills as Deployable Artifacts
 
-Developers write WASM agents, sign them, publish to a registry. Users install skills through a standard protocol — the system validates signatures, enforces capability subsets, applies eBPF policy, and spawns the skill as a sandboxed child agent. Skills can be upgraded, rolled back, and uninstalled. If the parent dies, its skills are cascade-terminated — no orphan processes, ever.
+Developers can package agents as signed `.tos` artifacts and install them through the in-tree package/skill path. Signature, install, rollback, and lifecycle scaffolding exist in the repo today; the larger registry/distribution story is still evolving.
 
 ### The Analogy
 
@@ -83,7 +86,8 @@ If Linux is a shared factory where anyone can walk in and use any machine, TOS i
 sudo apt install nasm qemu-system-x86 binutils
 
 # macOS
-brew install nasm qemu
+brew install nasm qemu binutils
+export PATH="$(brew --prefix binutils)/libexec/gnubin:$PATH"
 ```
 
 ### Build & Run
@@ -103,10 +107,13 @@ Base-image payloads are declared through manifest files, not hardcoded in
 kernel Rust source:
 
 - `base_image.manifest` for repo-tracked payloads
-- `base_image.runtime.manifest` for host-specific runtime bundles
+- `base_image.runtime.manifest` for the default runtime profile embedded by the build
+- `base_image.runtime.python.manifest` and `base_image.runtime.node.manifest` as alternate repo-tracked runtime profiles
 
-The build script embeds both manifests automatically when present. To
-generate a host-specific runtime manifest for Python, Node.js, or OpenJDK:
+The build script always embeds `base_image.manifest` plus either
+`base_image.runtime.manifest` or the manifest pointed to by
+`TOS_RUNTIME_MANIFEST`. To generate a host-specific runtime manifest for
+Python, Node.js, or OpenJDK:
 
 ```bash
 python3 tools/generate_runtime_manifest.py
@@ -116,7 +123,7 @@ That script emits `base_image.runtime.manifest` with explicit file and tree
 entries for the selected runtimes and their shared-library dependencies.
 
 To build against an alternate runtime bundle without overwriting the repo's
-default manifest, point Cargo at a different manifest file:
+default profile, point Cargo at a different manifest file:
 
 ```bash
 python3 tools/generate_runtime_manifest.py \
@@ -125,6 +132,16 @@ python3 tools/generate_runtime_manifest.py \
   --java-home traced
 
 TOS_RUNTIME_MANIFEST=/tmp/tos-java.manifest make run
+```
+
+The repo also ships end-to-end runtime validation harnesses for the current
+Linux-compat bring-up work:
+
+```bash
+tools/phase5_runtime_validation.sh --profile java
+tools/phase5_runtime_validation.sh --profile python
+tools/phase5_runtime_validation.sh --profile node
+tools/phase6_runtime_matrix.sh
 ```
 
 You will see agents booting, communicating via mailboxes, and enforcing policies:
@@ -154,7 +171,7 @@ make build       # Build release binary only
 make clean       # Remove build artifacts
 make debug-run   # Build debug + launch QEMU with GDB stub (-s -S)
 make uefi-run    # Boot via UEFI (QEMU + OVMF firmware)
-make test        # Single-node test with SMP + disk + network
+make test        # Single-node smoke with disk + network
 ```
 
 ## Developer SDK
@@ -166,13 +183,18 @@ cd sdk/tos-sdk && cargo build --target x86_64-unknown-none
 # WASM agent (wasm32)
 cd sdk/tos-wasm-sdk && cargo build --target wasm32-unknown-unknown --release
 
+# eBPF-lite policy tooling
+cd sdk/tos-ebpf-sdk && cargo build --release
+
 # CLI tools (build, deploy, inspect, replay, verify)
 cd sdk/tos-cli && cargo build --release
 ```
 
 ## Learn More
 
-- **[Yellow Paper](yellowpaper.md)** — full engineering specification, syscall ABI, architecture details, and 10-stage roadmap
+- **[Yellow Paper](yellowpaper.md)** — current engineering specification, syscall ABI, architecture details, and staged roadmap
+- **[Linux Compatibility Notes](LinuxCompat.md)** — Linux syscall translation model and runtime bring-up notes
+- **[WASM Runtime Spec](WASM-runtime-spec.md)** — WASM execution model, RuntimeClass semantics, and host ABI
 - **[eBPF-lite Spec](eBPF-lite-spec.md)** — policy runtime specification (instruction set, helpers, maps, attachment points)
 
 ## License

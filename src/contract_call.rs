@@ -5,7 +5,7 @@
 //! to the target contract's mailbox; the target processes it and (asynchronously)
 //! returns a `ContractCallResponse` through the caller's mailbox.
 //!
-//! See yellowpaper_v2.md for the full specification.
+//! See yellowpaper.md for the full specification.
 
 use crate::agent::{AgentId, E_INVALID_ARG, E_NOT_FOUND, E_NO_CAP};
 use crate::capability::{agent_has_cap, CapType};
