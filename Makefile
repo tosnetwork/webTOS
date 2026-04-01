@@ -1,9 +1,10 @@
-.PHONY: build run release clean debug test test-crossnode
+.PHONY: build run release clean debug test test-crossnode test-disk
 
 KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
 KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
 KERNEL_ELF32 = target/tos_32.elf
 QEMU_MEMORY ?= 512M
+TEST_DISK ?= /tmp/tos_test.img
 
 build:
 	cargo build --release
@@ -20,12 +21,15 @@ debug-run: debug-build
 	qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown -s -S &
 	@echo "GDB: target remote :1234"
 
-test: build
+test-disk:
+	./tools/create_test_disk.sh "$(TEST_DISK)"
+
+test: build test-disk
 	@echo "Running single-node test..."
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
 	timeout 8 qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) \
 		-device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
-		-drive file=/tmp/tos_test.img,format=raw,if=ide \
+		-drive file=$(TEST_DISK),format=raw,if=ide \
 		-no-reboot -no-shutdown 2>&1 | head -50
 
 test-crossnode:

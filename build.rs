@@ -196,9 +196,21 @@ fn collect_tree_entries(
             let entry = entry
                 .unwrap_or_else(|e| panic!("directory entry error in {}: {}", dir.display(), e));
             let path = entry.path();
-
-            let metadata = fs::metadata(&path)
-                .unwrap_or_else(|e| panic!("metadata failed for {}: {}", path.display(), e));
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => match fs::metadata(&path) {
+                    Ok(target_meta) => target_meta,
+                    Err(err) => {
+                        eprintln!(
+                            "cargo:warning=skipping dangling symlink in base-image tree: {} ({})",
+                            path.display(),
+                            err
+                        );
+                        continue;
+                    }
+                },
+                Ok(meta) => meta,
+                Err(e) => panic!("metadata failed for {}: {}", path.display(), e),
+            };
 
             if metadata.is_dir() {
                 stack.push(path);

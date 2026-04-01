@@ -78,6 +78,24 @@ def add_file(entries: OrderedDict[str, str], tos_path: str, host_path: Path) -> 
     entries[tos_path] = str(host_path.resolve())
 
 
+def add_ldd_closure(entries: OrderedDict[str, str], seeds: list[Path]) -> None:
+    seen: set[Path] = set()
+    queue: list[Path] = [seed.resolve() for seed in seeds if seed.exists()]
+
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+
+        for tos_path, host_path in parse_ldd(current):
+            resolved = host_path.resolve()
+            if tos_path not in entries:
+                add_file(entries, tos_path, resolved)
+            if resolved not in seen:
+                queue.append(resolved)
+
+
 def trace_python_files(python_bin: Path, stdlib: Path) -> list[tuple[str, Path]]:
     with tempfile.NamedTemporaryFile(prefix="tos-python-trace-", delete=False) as trace_file:
         trace_path = Path(trace_file.name)
@@ -186,10 +204,11 @@ def trace_java_files(java_bin: Path, home: Path) -> list[tuple[str, Path]]:
     return list(results.items())
 
 
-def add_java_core_libs(files: OrderedDict[str, str], home: Path) -> None:
+def add_java_core_libs(files: OrderedDict[str, str], home: Path) -> list[Path]:
     # `java -version` is too shallow to discover all JNI libraries needed by
     # common workloads. Keep a tiny allowlist for runtime-critical libraries
     # that later smokes rely on.
+    added: list[Path] = []
     for rel in (
         "lib/libjava.so",
         "lib/libverify.so",
@@ -197,11 +216,14 @@ def add_java_core_libs(files: OrderedDict[str, str], home: Path) -> None:
         "lib/libzip.so",
         "lib/libnio.so",
         "lib/libnet.so",
+        "lib/server/libjvm.so",
     ):
         candidate = home / rel
-        tos_path = f"{home.as_posix()}/{rel}"
         if candidate.is_file():
+            tos_path = f"{home.as_posix()}/{rel}"
             add_file(files, tos_path, candidate)
+            added.append(candidate)
+    return added
 
 
 def main() -> int:
@@ -263,11 +285,11 @@ def main() -> int:
     if "java" in runtimes:
         java_bin = resolve_executable(args.java)
         add_file(files, java_bin.as_posix(), java_bin)
-        for tos_path, host_path in parse_ldd(java_bin):
-            add_file(files, tos_path, host_path)
 
         home = java_home(java_bin)
-        add_java_core_libs(files, home)
+        java_seed_paths = [java_bin]
+        java_seed_paths.extend(add_java_core_libs(files, home))
+        add_ldd_closure(files, java_seed_paths)
         if args.java_home == "full":
             trees[f"@tree {home.as_posix()}"] = home.as_posix()
             etc_dir = Path("/etc/java-11-openjdk")

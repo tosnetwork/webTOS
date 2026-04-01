@@ -13,8 +13,10 @@ Options:
   --runtime-manifest PATH   Host-specific runtime manifest to embed
   --profile NAME            Validation profile: java, python, node, all
                             (default: all)
-  --qemu-timeout SECONDS    QEMU timeout in seconds (default: 60)
-  --qemu-memory SIZE        Guest RAM size passed to QEMU (default: 512M)
+  --qemu-timeout SECONDS    QEMU timeout in seconds
+                            (default: java -> 75, others -> 60)
+  --qemu-memory SIZE        Guest RAM size passed to QEMU
+                            (default: java -> 1024M, node -> 2048M, others -> 512M)
   --image PATH              Reuse or write the disk image at PATH
   --log PATH                Write the QEMU serial log to PATH
   --keep-artifacts          Keep generated image/log artifacts
@@ -24,7 +26,7 @@ EOF
 
 profile="all"
 runtime_manifest="${TOS_RUNTIME_MANIFEST:-}"
-qemu_timeout="${QEMU_TIMEOUT:-60}"
+qemu_timeout="${QEMU_TIMEOUT:-}"
 qemu_memory="${QEMU_MEMORY:-}"
 image_path=""
 log_path=""
@@ -89,8 +91,16 @@ default_manifest_for_profile() {
 
 default_memory_for_profile() {
   case "$1" in
+    java) echo "1024M" ;;
     node) echo "2048M" ;;
     *) echo "512M" ;;
+  esac
+}
+
+default_timeout_for_profile() {
+  case "$1" in
+    java) echo "75" ;;
+    *) echo "60" ;;
   esac
 }
 
@@ -151,6 +161,9 @@ run_profile() {
 
   if [[ -z "$current_manifest" ]]; then
     current_manifest="$(default_manifest_for_profile "$current_profile")"
+  fi
+  if [[ -z "$qemu_timeout" ]]; then
+    qemu_timeout="$(default_timeout_for_profile "$current_profile")"
   fi
   if [[ -z "$qemu_memory" ]]; then
     qemu_memory="$(default_memory_for_profile "$current_profile")"

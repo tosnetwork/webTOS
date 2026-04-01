@@ -416,7 +416,7 @@ pub fn run_smoke() {
     for _ in 0..128 {
         text.push_str("tos");
     }
-    assert_eq!(text.len(), 512);
+    assert_eq!(text.len(), 384);
     assert!(text.starts_with("tos"));
 
     let mut map = BTreeMap::new();

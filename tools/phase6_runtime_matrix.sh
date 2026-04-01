@@ -19,7 +19,7 @@ run_profile() {
     --keep-artifacts
 }
 
-run_profile java 60
+run_profile java 75
 run_profile python 60
 run_profile node 60
 

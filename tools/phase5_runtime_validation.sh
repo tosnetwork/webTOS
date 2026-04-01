@@ -136,6 +136,7 @@ cd "$repo_root"
 
 kernel_elf64="target/x86_64-unknown-tos/release/tos"
 kernel_elf32="target/tos_32.elf"
+base_test_image="${TOS_BASE_TEST_IMG:-/tmp/tos_test.img}"
 default_image="/tmp/tos_phase5_runtime.img"
 default_log="/tmp/tos_phase5_runtime.log"
 
@@ -165,12 +166,11 @@ if [[ "$build_only" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ! -f /tmp/tos_test.img ]]; then
-  echo "missing base disk image: /tmp/tos_test.img" >&2
-  exit 1
+if [[ ! -f "$base_test_image" ]]; then
+  tools/create_test_disk.sh "$base_test_image"
 fi
 
-cp /tmp/tos_test.img "$image_path"
+cp "$base_test_image" "$image_path"
 
 qemu_exit=0
 timeout "$qemu_timeout" \
