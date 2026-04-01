@@ -164,18 +164,19 @@ impl KernelAllocator {
         class_index: usize,
     ) -> Option<*mut SlabPage> {
         let slot_size = SLAB_CLASSES[class_index];
-        let base = paging::alloc_frame_with_kind(paging::FrameKind::KernelHeap)? as usize;
+        let base_phys = paging::alloc_frame_with_kind(paging::FrameKind::KernelHeap)?;
+        let base = paging::phys_to_virt(base_phys);
         let slab = base as *mut SlabPage;
         let slot_offset = align_up(core::mem::size_of::<SlabPage>(), slot_size);
 
         if slot_offset >= PAGE_SIZE {
-            let _ = paging::release_frame(base as u64);
+            let _ = paging::release_frame(base_phys);
             return None;
         }
 
         let capacity = (PAGE_SIZE - slot_offset) / slot_size;
         if capacity == 0 || capacity > u16::MAX as usize {
-            let _ = paging::release_frame(base as u64);
+            let _ = paging::release_frame(base_phys);
             return None;
         }
 
@@ -245,7 +246,7 @@ impl KernelAllocator {
                 let _ = self.remove_partial(classes, class_index, slab);
             }
             (*slab).magic = 0;
-            let _ = paging::release_frame(slab_base as u64);
+            let _ = paging::release_frame(paging::virt_to_phys(slab_base));
             return;
         }
 
@@ -271,17 +272,20 @@ impl KernelAllocator {
         };
 
         let pages = align_up(total, PAGE_SIZE) / PAGE_SIZE;
-        let base = match paging::alloc_contiguous_frames_with_kind(pages, paging::FrameKind::KernelHeap)
-        {
+        let base_phys = match paging::alloc_contiguous_frames_with_kind(
+            pages,
+            paging::FrameKind::KernelHeap,
+        ) {
             Some(base) => base,
             None => return ptr::null_mut(),
         };
+        let base = paging::phys_to_virt(base_phys);
 
-        let payload = align_up(base as usize + header_size, align);
+        let payload = align_up(base + header_size, align);
         let header = (payload - header_size) as *mut LargeAllocHeader;
         (*header).magic = LARGE_MAGIC;
         (*header).pages = pages as u32;
-        (*header).base = base;
+        (*header).base = base_phys;
         payload as *mut u8
     }
 
@@ -300,11 +304,11 @@ impl KernelAllocator {
             return None;
         }
 
-        let base = (*header).base;
+        let base = paging::phys_to_virt((*header).base);
         let pages = (*header).pages as usize;
         let usable_size = pages
             .checked_mul(PAGE_SIZE)?
-            .checked_sub((ptr as usize).checked_sub(base as usize)?)?;
+            .checked_sub((ptr as usize).checked_sub(base)?)?;
         Some(LargeAllocInfo { usable_size })
     }
 

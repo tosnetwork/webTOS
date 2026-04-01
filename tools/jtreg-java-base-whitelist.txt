@@ -1,0 +1,29 @@
+# TOS OpenJDK 11 first-pass jtreg whitelist
+#
+# Purpose:
+#   This is the first practical jtreg subset for TOS. It targets the closest
+#   JDK 11 equivalent to the old non-UI rt.jar core surface: java.base-heavy
+#   tests, with java.desktop and shell/native-heavy areas excluded.
+#
+# Intended jtreg style:
+#   -othervm -a -noshell -ignore:quiet
+#   -javaoptions:-Xshare:off -javaoptions:-XX:-UsePerfData
+#
+# Primary directories to try first:
+test/jdk/java/lang
+test/jdk/java/io
+test/jdk/java/nio
+test/jdk/java/nio/file
+test/jdk/java/util
+test/jdk/java/util/concurrent
+test/jdk/java/util/zip
+# Keep java.net for a later phase. The first guest-side smoke stays on
+# non-network java.base areas until NIC/DNS behavior is closer to Linux.
+
+# Explicitly out of first scope:
+# - test/jdk/java/awt
+# - test/jdk/javax/swing
+# - test/jdk/javax/imageio
+# - shell tests
+# - GUI/headful tests
+# - native toolchain dependent tests

@@ -12,8 +12,8 @@ final class FsProbe {
             }
         }
 
-        byte[] passwd = Files.readAllBytes(Path.of("/etc/passwd"));
-        String firstLine = new String(passwd, StandardCharsets.UTF_8).split("\n", 2)[0];
+        byte[] sample = Files.readAllBytes(Path.of("/usr/lib/tos-tests/payload.txt"));
+        String firstLine = new String(sample, StandardCharsets.UTF_8).split("\n", 2)[0];
 
         System.out.println("TOS-JAVA-FS count=" + count);
         System.out.println("TOS-JAVA-FS first=" + firstLine);

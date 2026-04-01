@@ -73,6 +73,8 @@ impl SigActionEntry {
 
 /// Complete signal state for one agent.
 struct SignalState {
+    /// Owning Linux agent ID for this slot.
+    agent_id: u16,
     /// Registered signal actions (indexed by signal number - 1).
     actions: [SigActionEntry; MAX_SIGNALS],
     /// Current signal mask (blocked signals).
@@ -84,6 +86,7 @@ struct SignalState {
 impl SignalState {
     const fn empty() -> Self {
         SignalState {
+            agent_id: 0,
             actions: [SigActionEntry::default(); MAX_SIGNALS],
             blocked_mask: 0,
             active: false,
@@ -91,15 +94,49 @@ impl SignalState {
     }
 }
 
-/// Global signal state table, indexed by agent_id.
+/// Global signal state table, indexed by active Linux-agent slots rather than
+/// raw agent IDs. Agent IDs are monotonically increasing and can exceed the
+/// fixed slot count, so callers must never use `agent_id as usize` here.
 /// Safety: single-core kernel, interrupts disabled during syscall handling.
 static mut SIGNAL_STATES: [SignalState; MAX_LINUX_AGENTS] =
     [const { SignalState::empty() }; MAX_LINUX_AGENTS];
 
 #[inline]
 fn signal_state_idx(agent_id: u16) -> Option<usize> {
-    let idx = agent_id as usize;
-    (idx < MAX_LINUX_AGENTS).then_some(idx)
+    unsafe {
+        for (idx, state) in SIGNAL_STATES.iter().enumerate() {
+            if state.active && state.agent_id == agent_id {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn find_free_signal_state_idx() -> Option<usize> {
+    unsafe {
+        for (idx, state) in SIGNAL_STATES.iter().enumerate() {
+            if !state.active {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn ensure_signal_state_idx(agent_id: u16) -> Option<usize> {
+    if let Some(idx) = signal_state_idx(agent_id) {
+        return Some(idx);
+    }
+    let idx = find_free_signal_state_idx()?;
+    unsafe {
+        SIGNAL_STATES[idx] = SignalState::empty();
+        SIGNAL_STATES[idx].agent_id = agent_id;
+        SIGNAL_STATES[idx].active = true;
+    }
+    Some(idx)
 }
 
 #[inline]
@@ -360,12 +397,22 @@ fn use_alternate_signal_stack(agent_id: u16, action_flags: u64, rsp: u64) -> Opt
 /// Initialize signal state for a newly created agent.
 /// Called from process::sys_clone3 or state::init_state.
 pub fn init_signal_state(agent_id: u16) {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
+        return;
+    };
+    unsafe {
+        SIGNAL_STATES[idx] = SignalState::empty();
+        SIGNAL_STATES[idx].agent_id = agent_id;
+        SIGNAL_STATES[idx].active = true;
+    }
+}
+
+pub fn remove_signal_state(agent_id: u16) {
     let Some(idx) = signal_state_idx(agent_id) else {
         return;
     };
     unsafe {
         SIGNAL_STATES[idx] = SignalState::empty();
-        SIGNAL_STATES[idx].active = true;
     }
 }
 
@@ -375,17 +422,20 @@ pub fn inherit_signal_state_for_clone(parent_id: u16, child_id: u16, share_handl
             return;
         };
         let parent_state = &SIGNAL_STATES[parent_idx];
-        let owner_idx = sighand_owner(parent_id);
+        let Some(owner_idx) = signal_state_idx(state::sighand_owner(parent_id)) else {
+            return;
+        };
         let owner_actions = SIGNAL_STATES[owner_idx].actions;
         (owner_idx, owner_actions, parent_state.blocked_mask)
     };
 
-    let Some(child_idx) = signal_state_idx(child_id) else {
+    let Some(child_idx) = ensure_signal_state_idx(child_id) else {
         return;
     };
 
     unsafe {
         SIGNAL_STATES[child_idx] = SignalState::empty();
+        SIGNAL_STATES[child_idx].agent_id = child_id;
         SIGNAL_STATES[child_idx].active = true;
         SIGNAL_STATES[child_idx].blocked_mask = parent_mask;
         if share_handlers {
@@ -397,19 +447,23 @@ pub fn inherit_signal_state_for_clone(parent_id: u16, child_id: u16, share_handl
 }
 
 pub fn reset_signal_state_for_exec(agent_id: u16) {
-    let Some(idx) = signal_state_idx(agent_id) else {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
         return;
     };
 
     let ignored_actions = unsafe {
-        let owner_idx = sighand_owner(agent_id);
-        SIGNAL_STATES[owner_idx]
-            .actions
-            .map(|entry| if entry.handler == SIG_IGN { SIG_IGN } else { SIG_DFL })
+        signal_state_idx(state::sighand_owner(agent_id))
+            .map(|owner_idx| {
+                SIGNAL_STATES[owner_idx]
+                    .actions
+                    .map(|entry| if entry.handler == SIG_IGN { SIG_IGN } else { SIG_DFL })
+            })
+            .unwrap_or([SIG_DFL; MAX_SIGNALS])
     };
 
     unsafe {
         SIGNAL_STATES[idx] = SignalState::empty();
+        SIGNAL_STATES[idx].agent_id = agent_id;
         SIGNAL_STATES[idx].active = true;
         for (slot, handler) in SIGNAL_STATES[idx]
             .actions
@@ -533,16 +587,11 @@ fn reset_sigaction(agent_id: u16, signum: u32) {
     if !(1..=64).contains(&signum) {
         return;
     }
-    let owner = sighand_owner(agent_id);
-    if owner >= MAX_LINUX_AGENTS {
+    let Some(owner_idx) = ensure_signal_state_idx(state::sighand_owner(agent_id)) else {
         return;
-    }
+    };
     unsafe {
-        let state = &mut SIGNAL_STATES[owner];
-        if !state.active {
-            *state = SignalState::empty();
-            state.active = true;
-        }
+        let state = &mut SIGNAL_STATES[owner_idx];
         state.actions[(signum - 1) as usize] = SigActionEntry::default();
     }
 }
@@ -591,15 +640,11 @@ fn install_user_signal_frame(
         return Err(-EFAULT);
     }
 
-    let Some(idx) = signal_state_idx(agent_id) else {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
         return Err(-EINVAL);
     };
     unsafe {
         let state = &mut SIGNAL_STATES[idx];
-        if !state.active {
-            *state = SignalState::empty();
-            state.active = true;
-        }
         state.blocked_mask = frame.saved_blocked_mask | action.mask;
         if action.flags & SA_NODEFER == 0 {
             state.blocked_mask |= 1u64 << (signum - 1);
@@ -660,23 +705,17 @@ pub fn sys_rt_sigaction(
         return -EINVAL;
     }
 
-    let Some(idx) = signal_state_idx(agent_id) else {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
         return -EINVAL;
     };
     let sig_idx = (signum - 1) as usize;
 
     unsafe {
         let mask_state = &mut SIGNAL_STATES[idx];
-        if !mask_state.active {
-            *mask_state = SignalState::empty();
-            mask_state.active = true;
-        }
-        let action_owner = sighand_owner(agent_id);
+        let Some(action_owner) = ensure_signal_state_idx(state::sighand_owner(agent_id)) else {
+            return -EINVAL;
+        };
         let state = &mut SIGNAL_STATES[action_owner];
-        if !state.active {
-            *state = SignalState::empty();
-            state.active = true;
-        }
 
         // If oldact_ptr is set, write the current action there.
         if oldact_ptr != 0 {
@@ -744,16 +783,12 @@ pub fn sys_rt_sigprocmask(
         return -EINVAL;
     }
 
-    let Some(idx) = signal_state_idx(agent_id) else {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
         return -EINVAL;
     };
 
     unsafe {
         let state = &mut SIGNAL_STATES[idx];
-        if !state.active {
-            *state = SignalState::empty();
-            state.active = true;
-        }
         let old_mask = state.blocked_mask;
 
         // Write current mask to oldset if requested.
@@ -907,15 +942,14 @@ fn default_action_is_ignore(signum: u32) -> bool {
 /// Look up the registered handler address for a given signal on an agent.
 /// Returns SIG_DFL (0) if no handler has been registered.
 fn get_sigaction(agent_id: u16, signum: u32) -> SigActionEntry {
-    let idx = sighand_owner(agent_id);
-    if idx >= MAX_LINUX_AGENTS || signum < 1 || signum > 64 {
+    if signum < 1 || signum > 64 {
         return SigActionEntry::default();
     }
+    let Some(idx) = signal_state_idx(state::sighand_owner(agent_id)) else {
+        return SigActionEntry::default();
+    };
     unsafe {
         let s = &SIGNAL_STATES[idx];
-        if !s.active {
-            return SigActionEntry::default();
-        }
         s.actions[(signum - 1) as usize]
     }
 }
@@ -1010,15 +1044,11 @@ fn restore_from_user_signal_frame(agent_id: u16) -> Result<i64, i64> {
         return Err(-EINVAL);
     }
 
-    let Some(idx) = signal_state_idx(agent_id) else {
+    let Some(idx) = ensure_signal_state_idx(agent_id) else {
         return Err(-EINVAL);
     };
     unsafe {
         let state = &mut SIGNAL_STATES[idx];
-        if !state.active {
-            *state = SignalState::empty();
-            state.active = true;
-        }
         state.blocked_mask = frame.saved_blocked_mask;
         state.blocked_mask &= !((1u64 << 8) | (1u64 << 18));
     }

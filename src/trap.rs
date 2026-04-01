@@ -11,6 +11,17 @@
 use crate::agent::*;
 use crate::serial_println;
 
+#[inline]
+fn linux_fatal_signal_for_exception(vector: u64) -> i32 {
+    match vector {
+        0 => 8,   // SIGFPE
+        6 => 4,   // SIGILL
+        7 => 7,   // SIGBUS
+        13 | 14 => 11, // SIGSEGV
+        _ => 11, // Default to SIGSEGV for other fatal user exceptions.
+    }
+}
+
 // ─── TrapFrame ──────────────────────────────────────────────────────────────
 
 /// Uniform trap/interrupt stack frame, matching the layout pushed by
@@ -118,9 +129,21 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
             }
 
             if agent_id != IDLE_AGENT_ID {
-                // Fault the agent and reschedule
-                handle_agent_fault(agent_id, vector);
-                crate::sched::switch_from_trap();
+                if crate::linux_compat::state::get_state(agent_id).is_some() {
+                    let signum = linux_fatal_signal_for_exception(vector);
+                    serial_println!(
+                        "[TRAP] linux agent {} exception {} -> SIG{} / exit_group",
+                        agent_id,
+                        vector,
+                        signum
+                    );
+                    let _ = crate::linux_compat::process::sys_exit_group(agent_id, 128 + signum);
+                    crate::sched::switch_from_trap();
+                } else {
+                    // Fault the agent and reschedule
+                    handle_agent_fault(agent_id, vector);
+                    crate::sched::switch_from_trap();
+                }
             } else {
                 // Fault in idle agent or kernel -- fatal
                 serial_println!("[TRAP] FATAL: exception in idle/kernel context, halting");

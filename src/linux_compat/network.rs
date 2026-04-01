@@ -389,6 +389,8 @@ pub fn sys_sendto(
     _dest_addr: u64,
     _addrlen: u64,
 ) -> i64 {
+    const ENETUNREACH: i64 = 101;
+
     let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
@@ -402,6 +404,13 @@ pub fn sys_sendto(
 
     if buf_ptr == 0 || len == 0 {
         return 0;
+    }
+
+    // TOS does not currently expose a Linux-visible loopback/NIC data path.
+    // Failing fast is closer to Linux semantics than pretending the datagram
+    // was queued successfully and then stalling userspace on netd retries.
+    if !crate::net::nic_available() {
+        return -ENETUNREACH;
     }
 
     // Read user data
@@ -460,8 +469,9 @@ pub fn sys_sendto(
         pos += data_len; // body
     }
 
-    // Send to netd's mailbox
-    let _ = crate::mailbox::send_message(agent_id, NETD_MAILBOX, &msg[..pos]);
+    // Linux-compat networking uses netd as a kernel-managed service hop.
+    // This path must not require the caller to hold a native mailbox cap.
+    let _ = crate::mailbox::send_message_via_fd(agent_id, NETD_MAILBOX, &msg[..pos]);
 
     // Record trace entry for deterministic replay
     crate::checkpoint::record_trace(

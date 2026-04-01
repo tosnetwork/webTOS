@@ -14,6 +14,7 @@ pub const MAX_DIRECTORY_HANDLES: usize = 64;
 pub const MAX_VMAS: usize = 1024;
 pub const MAX_EVENTFDS: usize = 256;
 pub const MAX_PIPES: usize = 256;
+pub const MAX_MUTABLE_PATHS: usize = 1024;
 pub const PIPE_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_MMAP_BASE: u64 = 0x1_0000_0000;
 const O_ACCMODE: u32 = 3;
@@ -63,6 +64,27 @@ pub struct DirectoryHandle {
     pub active: bool,
     pub path: [u8; MAX_PATH],
     pub path_len: u16,
+}
+
+#[derive(Clone, Copy)]
+pub struct MutablePathEntry {
+    pub active: bool,
+    pub owner: u16,
+    pub is_dir: bool,
+    pub path_len: u16,
+    pub path: [u8; MAX_PATH],
+}
+
+impl MutablePathEntry {
+    pub const fn empty() -> Self {
+        MutablePathEntry {
+            active: false,
+            owner: 0,
+            is_dir: false,
+            path_len: 0,
+            path: [0u8; MAX_PATH],
+        }
+    }
 }
 
 impl DirectoryHandle {
@@ -208,6 +230,7 @@ pub struct LinuxAgentState {
     pub vm_space_owner: u16, // Linux agent that owns the shared VM metadata
     pub pid: u32,            // thread-group ID (tgid)
     pub thread_group_leader: u16,
+    pub fs_owner: u16,
     pub files_owner: u16,
     pub sighand_owner: u16,
     pub uid: u32,             // = 1000
@@ -276,6 +299,7 @@ impl LinuxAgentState {
             vm_space_owner: agent_id,
             pid: agent_id as u32,
             thread_group_leader: agent_id,
+            fs_owner: agent_id,
             files_owner: agent_id,
             sighand_owner: agent_id,
             uid: 1000,
@@ -522,6 +546,8 @@ static mut LINUX_STATES: [Option<LinuxStateSlot>; MAX_LINUX_AGENTS] =
 static mut EVENTFD_OBJECTS: [EventFdObject; MAX_EVENTFDS] =
     [const { EventFdObject::empty() }; MAX_EVENTFDS];
 static mut PIPE_OBJECTS: [PipeObject; MAX_PIPES] = [const { PipeObject::empty() }; MAX_PIPES];
+static mut MUTABLE_PATHS: [MutablePathEntry; MAX_MUTABLE_PATHS] =
+    [const { MutablePathEntry::empty() }; MAX_MUTABLE_PATHS];
 
 #[inline]
 fn find_state_slot(agent_id: u16) -> Option<usize> {
@@ -562,6 +588,124 @@ pub fn get_state_mut(agent_id: u16) -> Option<&'static mut LinuxAgentState> {
 }
 
 #[inline]
+pub fn fs_owner(agent_id: u16) -> u16 {
+    get_state(agent_id)
+        .map(|st| st.fs_owner)
+        .unwrap_or(agent_id)
+}
+
+fn clear_owned_mutable_paths(owner: u16) {
+    unsafe {
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if entry.active && entry.owner == owner {
+                *entry = MutablePathEntry::empty();
+            }
+        }
+    }
+}
+
+fn has_other_active_fs_members(owner: u16) -> bool {
+    unsafe {
+        for slot in LINUX_STATES.iter() {
+            let Some(entry) = slot else {
+                continue;
+            };
+            if entry.state.active && entry.state.fs_owner == owner {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn record_mutable_path(agent_id: u16, path: &[u8], is_dir: bool) -> bool {
+    let owner = fs_owner(agent_id);
+    let copy_len = path.len().min(MAX_PATH);
+
+    unsafe {
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if !entry.active {
+                continue;
+            }
+            if entry.owner == owner
+                && entry.path_len as usize == copy_len
+                && entry.path[..copy_len] == path[..copy_len]
+            {
+                entry.is_dir = is_dir;
+                return true;
+            }
+        }
+
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if entry.active {
+                continue;
+            }
+            *entry = MutablePathEntry::empty();
+            entry.active = true;
+            entry.owner = owner;
+            entry.is_dir = is_dir;
+            entry.path_len = copy_len as u16;
+            entry.path[..copy_len].copy_from_slice(&path[..copy_len]);
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn lookup_mutable_path(agent_id: u16, path: &[u8]) -> Option<bool> {
+    let owner = fs_owner(agent_id);
+    let cmp_len = path.len().min(MAX_PATH);
+    unsafe {
+        for entry in MUTABLE_PATHS.iter() {
+            if !entry.active || entry.owner != owner {
+                continue;
+            }
+            if entry.path_len as usize == cmp_len && entry.path[..cmp_len] == path[..cmp_len] {
+                return Some(entry.is_dir);
+            }
+        }
+    }
+    None
+}
+
+pub fn remove_mutable_path(agent_id: u16, path: &[u8]) {
+    let owner = fs_owner(agent_id);
+    let cmp_len = path.len().min(MAX_PATH);
+    unsafe {
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if !entry.active || entry.owner != owner {
+                continue;
+            }
+            if entry.path_len as usize == cmp_len && entry.path[..cmp_len] == path[..cmp_len] {
+                *entry = MutablePathEntry::empty();
+                return;
+            }
+        }
+    }
+}
+
+pub fn iter_mutable_paths<F>(agent_id: u16, mut f: F) -> usize
+where
+    F: FnMut(&[u8], bool) -> bool,
+{
+    let owner = fs_owner(agent_id);
+    let mut count = 0usize;
+    unsafe {
+        for entry in MUTABLE_PATHS.iter() {
+            if !entry.active || entry.owner != owner {
+                continue;
+            }
+            count += 1;
+            if !f(&entry.path[..entry.path_len as usize], entry.is_dir) {
+                break;
+            }
+        }
+    }
+    count
+}
+
+#[inline]
 pub fn files_owner(agent_id: u16) -> u16 {
     get_state(agent_id)
         .map(|st| st.files_owner)
@@ -589,6 +733,7 @@ pub fn sighand_owner(agent_id: u16) -> u16 {
 
 /// Initialize (or reinitialize) the Linux compat state for a given agent.
 pub fn init_state(agent_id: u16) {
+    clear_owned_mutable_paths(agent_id);
     if let Some(idx) = find_state_slot(agent_id).or_else(find_free_state_slot) {
         unsafe {
             LINUX_STATES[idx] = Some(LinuxStateSlot {
@@ -617,10 +762,15 @@ pub fn init_state(agent_id: u16) {
 
 /// Remove the Linux compat state slot for a reaped agent.
 pub fn remove_state(agent_id: u16) {
+    let owner = fs_owner(agent_id);
     if let Some(idx) = find_state_slot(agent_id) {
         unsafe {
             LINUX_STATES[idx] = None;
         }
+    }
+    super::signal::remove_signal_state(agent_id);
+    if owner != 0 && !has_other_active_fs_members(owner) {
+        clear_owned_mutable_paths(owner);
     }
 }
 
@@ -1198,6 +1348,7 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
     let files_owner = files_owner(agent_id);
     let shared_files = get_state(files_owner)
         .map(|owner| (owner.fd_table, owner.dir_handles, owner.epoll_instances));
+    let fs_owner = fs_owner(agent_id);
 
     let Some(st) = get_state_mut(agent_id) else {
         return;
@@ -1220,6 +1371,7 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
     st.brk_current = initial_brk;
     st.mmap_next = DEFAULT_MMAP_BASE;
     st.vm_space_owner = agent_id;
+    st.fs_owner = fs_owner;
     st.files_owner = agent_id;
     st.sighand_owner = agent_id;
     st.robust_list_head = 0;
@@ -1255,9 +1407,13 @@ pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
 
 /// Return true if detailed Linux runtime tracing should be enabled for this agent.
 pub fn trace_runtime_agent(agent_id: u16) -> bool {
+    if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") && trace_java_agent(agent_id) {
+        return false;
+    }
     exe_path_eq(agent_id, b"/app/hello_dynamic")
         || exe_path_eq(agent_id, b"/usr/bin/hello_dynamic")
         || exe_path_eq(agent_id, b"/usr/bin/node")
+        || trace_java_agent(agent_id)
         || get_state(agent_id)
             .map(|st| {
                 st.vfork_parent != 0

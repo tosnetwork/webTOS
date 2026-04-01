@@ -11,7 +11,7 @@ use crate::agent::{
 };
 use crate::merkle::{self, MerkleHash};
 
-const MAX_ENTRIES_PER_KEYSPACE: usize = 320;
+const MAX_ENTRIES_PER_KEYSPACE: usize = 2048;
 pub const MAX_VALUE_SIZE: usize = 256;
 
 // ─── State entry ────────────────────────────────────────────────────────────
@@ -1145,12 +1145,45 @@ pub fn query_multi_segment_size(keyspace: KeyspaceId, base_key: u64) -> usize {
         }
     };
 
-    if meta_len < 6 {
+    if meta_len != 6 {
         // Not a multi-segment value — could be a plain value
         return 0;
     }
 
-    u32::from_le_bytes([meta_buf[0], meta_buf[1], meta_buf[2], meta_buf[3]]) as usize
+    match parse_multi_segment_header(keyspace, base_key, &meta_buf[..meta_len], meta_len) {
+        Some((total, _)) => total,
+        None => 0,
+    }
+}
+
+pub fn parse_multi_segment_header(
+    keyspace: KeyspaceId,
+    base_key: u64,
+    value: &[u8],
+    value_len: usize,
+) -> Option<(usize, usize)> {
+    if value_len != 6 {
+        return None;
+    }
+
+    let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
+    if total <= MAX_VALUE_SIZE || segment_count == 0 {
+        return None;
+    }
+
+    let first_segment_key = base_key.wrapping_add(1);
+    let first_segment_exists = if keyspace == BASE_IMAGE_KEYSPACE {
+        base_image_state_get(first_segment_key).is_some()
+    } else {
+        state_get(keyspace, first_segment_key).is_some()
+    };
+
+    if !first_segment_exists {
+        return None;
+    }
+
+    Some((total, segment_count))
 }
 
 /// Query the total size of a file in a keyspace.
@@ -1258,13 +1291,7 @@ pub fn load_file_range(keyspace: KeyspaceId, base_key: u64, offset: usize, buf: 
         None => return 0,
     };
 
-    let maybe_multi_segment = if value_len == 6 {
-        let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
-        let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
-        segment_count > 0 && total > MAX_VALUE_SIZE
-    } else {
-        false
-    };
+    let maybe_multi_segment = parse_multi_segment_header(keyspace, base_key, &value[..value_len], value_len).is_some();
 
     if !maybe_multi_segment {
         if offset >= value_len {
@@ -1275,9 +1302,12 @@ pub fn load_file_range(keyspace: KeyspaceId, base_key: u64, offset: usize, buf: 
         return copy_len;
     }
 
-    let total_size = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
-    let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
-    if total_size == 0 || segment_count == 0 || offset >= total_size {
+    let Some((total_size, segment_count)) =
+        parse_multi_segment_header(keyspace, base_key, &value[..value_len], value_len)
+    else {
+        return 0;
+    };
+    if offset >= total_size {
         return 0;
     }
 

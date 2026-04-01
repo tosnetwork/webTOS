@@ -4,6 +4,7 @@
 //! Files are backed by the agent's private keyspace; pipes and sockets map
 //! to TOS mailbox IPC.
 
+use alloc::vec::Vec;
 use super::constants::*;
 use super::state::{self, FdEntry, FdKind, LinuxAgentState, MAX_FDS, MAX_PATH};
 use core::fmt::{self, Write};
@@ -30,7 +31,11 @@ const F_SETFL: u32 = 4;
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_EACCESS: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
+const RENAME_NOREPLACE: u32 = 0x1;
+const RENAME_EXCHANGE: u32 = 0x2;
+const RENAME_WHITEOUT: u32 = 0x4;
 
 // ── Limits ─────────────────────────────────────────────────────────────────
 
@@ -39,7 +44,8 @@ const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
-const MAX_DIRENTS_COLLECT: usize = 64;
+const MAX_DIRENT_NAME: usize = 128;
+const MAX_DIRENTS_COLLECT: usize = 256;
 const ESPIPE: i64 = 29;
 const S_IFIFO: u32 = 0x1000;
 const S_IFCHR: u32 = 0x2000;
@@ -53,6 +59,11 @@ const MODE_REG_0644: u32 = S_IFREG | 0o644;
 const MODE_CHR_0666: u32 = S_IFCHR | 0o666;
 const MODE_LNK_0777: u32 = S_IFLNK | 0o777;
 const MODE_SOCK_0777: u32 = S_IFSOCK | 0o777;
+const TMPFS_MAGIC: u64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+const SYSFS_MAGIC: u64 = 0x6265_6572;
+const DEVTMPFS_MAGIC: u64 = 0x0000_1373;
+const EXT4_SUPER_MAGIC: u64 = 0x0000_ef53;
 const PROC_SELF_CGROUP_CONTENT: &[u8] = b"0::/\n";
 const PROC_MEMINFO_CONTENT: &[u8] = b"MemTotal:        524288 kB\nMemFree:         262144 kB\nMemAvailable:    262144 kB\nSwapTotal:            0 kB\nSwapFree:             0 kB\n";
 const PROC_VERSION_SIGNATURE_CONTENT: &[u8] = b"Ubuntu 6.8.0-106.106~22.04.1-generic 6.8.12\n";
@@ -359,16 +370,29 @@ fn read_file_data(
         return read_special_file_data(agent_id, special, offset, buf_ptr, count);
     }
 
+    // Embedded base-image files are stored as whole byte blobs in the kernel
+    // image. Large ones synthesize a 6-byte size/count header for `state_get`,
+    // but regular file I/O must expose the actual file contents, not that
+    // storage metadata.
+    if keyspace == super::vfs::BASE_IMAGE_KEYSPACE {
+        if let Some(entry) = crate::base_image::find_by_key(key) {
+            if offset >= entry.data.len() {
+                return Ok(0);
+            }
+            let to_copy = count.min(entry.data.len() - offset);
+            if !write_user_mem(agent_id, buf_ptr, &entry.data[offset..offset + to_copy]) {
+                return Err(-EFAULT);
+            }
+            return Ok(to_copy);
+        }
+    }
+
     // Try small value first
     if let Some((value, value_len)) = crate::state::state_get(keyspace, key) {
-        // Check if this looks like multi-segment metadata (6 bytes with valid header)
-        if value_len == 6 {
-            let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
-            let seg_count = u16::from_le_bytes([value[4], value[5]]) as usize;
-            if seg_count > 0 && total > 0 && total > MAX_VALUE_SIZE {
-                // This is multi-segment metadata — load via multi-segment path
-                return read_multi_segment_at(agent_id, keyspace, key, offset, buf_ptr, count);
-            }
+        if crate::state::parse_multi_segment_header(keyspace, key, &value[..value_len], value_len)
+            .is_some()
+        {
+            return read_multi_segment_at(agent_id, keyspace, key, offset, buf_ptr, count);
         }
         // Plain small value
         if offset >= value_len {
@@ -382,6 +406,95 @@ fn read_file_data(
         return Ok(to_copy);
     }
     Ok(0)
+}
+
+fn load_regular_file_data(keyspace: u16, key: u64) -> Vec<u8> {
+    if keyspace == super::vfs::BASE_IMAGE_KEYSPACE {
+        if let Some(entry) = crate::base_image::find_by_key(key) {
+            let mut data = Vec::with_capacity(entry.data.len());
+            data.extend_from_slice(entry.data);
+            return data;
+        }
+    }
+
+    if let Some((value, value_len)) = crate::state::state_get(keyspace, key) {
+        if crate::state::parse_multi_segment_header(keyspace, key, &value[..value_len], value_len)
+            .is_none()
+        {
+            let mut data = Vec::with_capacity(value_len);
+            data.extend_from_slice(&value[..value_len]);
+            return data;
+        }
+    }
+
+    let size = crate::state::query_file_size(keyspace, key);
+    if size == 0 {
+        return Vec::new();
+    }
+
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0);
+    let loaded = crate::state::load_file_range(keyspace, key, 0, &mut data);
+    data.truncate(loaded);
+    data
+}
+
+fn store_regular_file_data(keyspace: u16, key: u64, data: &[u8]) -> Result<(), i64> {
+    if data.len() <= MAX_VALUE_SIZE {
+        crate::state::state_put(keyspace, key, data)
+    } else {
+        crate::state::store_multi_segment(keyspace, key, data)
+    }
+}
+
+fn log_regular_file_store_failure(agent_id: u16, keyspace: u16, key: u64, data_len: usize, err: i64) {
+    if state::trace_runtime_agent(agent_id) {
+        let entry_count = crate::state::iter_entries(keyspace, |_, _| true);
+        crate::serial_println!(
+            "[RTDBG] file-store-fail agent={} ks={} key={:#x} len={} err={} entries={}",
+            agent_id,
+            keyspace,
+            key,
+            data_len,
+            err,
+            entry_count
+        );
+    }
+}
+
+fn write_regular_file_data(
+    agent_id: u16,
+    keyspace: u16,
+    key: u64,
+    current_offset: u64,
+    flags: u32,
+    buf_ptr: u64,
+    count: usize,
+) -> Result<(usize, u64), i64> {
+    let mut incoming = Vec::with_capacity(count);
+    incoming.resize(count, 0);
+    if count > 0 && !read_user_mem(agent_id, buf_ptr, &mut incoming, count) {
+        return Err(-EFAULT);
+    }
+
+    let mut file_data = load_regular_file_data(keyspace, key);
+    let write_offset = if (flags & O_APPEND) != 0 {
+        file_data.len()
+    } else {
+        current_offset as usize
+    };
+    let write_end = write_offset.checked_add(count).ok_or(-EINVAL)?;
+
+    if file_data.len() < write_end {
+        file_data.resize(write_end, 0);
+    }
+    file_data[write_offset..write_end].copy_from_slice(&incoming);
+
+    if let Err(err) = store_regular_file_data(keyspace, key, &file_data) {
+        log_regular_file_store_failure(agent_id, keyspace, key, file_data.len(), err);
+        return Err(-ENOSPC);
+    }
+    Ok((count, write_end as u64))
 }
 
 /// Read from a multi-segment file at a given offset into user memory.
@@ -687,11 +800,174 @@ fn metadata_for_path(agent_id: u16, path: &[u8], flags: u32) -> Result<LinuxStat
         return Ok(metadata_for_special(agent_id, special));
     }
 
-    if is_directory_path(path) {
+    if is_directory_path(agent_id, path) {
         return Ok(metadata_for_directory(agent_id, path_to_key(path)));
     }
 
     metadata_for_regular_lookup(agent_id, path)
+}
+
+#[inline]
+fn path_is_same_or_child(path: &[u8], base: &[u8]) -> bool {
+    path == base || (path.len() > base.len() && path.starts_with(base) && path[base.len()] == b'/')
+}
+
+fn renamed_path(old_base: &[u8], new_base: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+    if !path_is_same_or_child(path, old_base) {
+        return None;
+    }
+
+    let suffix = if path == old_base {
+        &[][..]
+    } else {
+        &path[old_base.len()..]
+    };
+    if new_base.len() + suffix.len() > MAX_PATH {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(new_base.len() + suffix.len());
+    out.extend_from_slice(new_base);
+    out.extend_from_slice(suffix);
+    Some(out)
+}
+
+#[derive(Clone, Copy)]
+struct LinuxStatFsMeta {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: u64,
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+}
+
+fn fill_statfs_from_meta(agent_id: u16, ptr: u64, meta: LinuxStatFsMeta) -> bool {
+    let mut buf = [0u8; 120];
+    buf[0..8].copy_from_slice(&meta.f_type.to_le_bytes());
+    buf[8..16].copy_from_slice(&meta.f_bsize.to_le_bytes());
+    buf[16..24].copy_from_slice(&meta.f_blocks.to_le_bytes());
+    buf[24..32].copy_from_slice(&meta.f_bfree.to_le_bytes());
+    buf[32..40].copy_from_slice(&meta.f_bavail.to_le_bytes());
+    buf[40..48].copy_from_slice(&meta.f_files.to_le_bytes());
+    buf[48..56].copy_from_slice(&meta.f_ffree.to_le_bytes());
+    buf[56..64].copy_from_slice(&meta.f_fsid.to_le_bytes());
+    buf[64..72].copy_from_slice(&meta.f_namelen.to_le_bytes());
+    buf[72..80].copy_from_slice(&meta.f_frsize.to_le_bytes());
+    buf[80..88].copy_from_slice(&meta.f_flags.to_le_bytes());
+    write_user_mem(agent_id, ptr, &buf)
+}
+
+fn statfs_for_magic(magic: u64, fsid: u64, read_only: bool) -> LinuxStatFsMeta {
+    LinuxStatFsMeta {
+        f_type: magic,
+        f_bsize: 4096,
+        f_blocks: 262_144,
+        f_bfree: 131_072,
+        f_bavail: 131_072,
+        f_files: 131_072,
+        f_ffree: 65_536,
+        f_fsid: fsid,
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: if read_only { 1 } else { 0 },
+    }
+}
+
+fn statfs_for_special(special: super::vfs::SpecialFile) -> LinuxStatFsMeta {
+    match special {
+        super::vfs::SpecialFile::Null | super::vfs::SpecialFile::Urandom => {
+            statfs_for_magic(DEVTMPFS_MAGIC, 0x6465_7600, false)
+        }
+        super::vfs::SpecialFile::ProcSelfExe
+        | super::vfs::SpecialFile::ProcSelfMaps
+        | super::vfs::SpecialFile::ProcSelfCgroup
+        | super::vfs::SpecialFile::ProcMeminfo
+        | super::vfs::SpecialFile::ProcVersionSignature => {
+            statfs_for_magic(PROC_SUPER_MAGIC, 0x7072_6f63, true)
+        }
+        super::vfs::SpecialFile::SysCpuOnline
+        | super::vfs::SpecialFile::SysCgroupMemoryMax
+        | super::vfs::SpecialFile::SysCgroupMemoryHigh => {
+            statfs_for_magic(SYSFS_MAGIC, 0x7379_7373, true)
+        }
+    }
+}
+
+fn statfs_for_path(agent_id: u16, path: &[u8]) -> Result<LinuxStatFsMeta, i64> {
+    if let Some(special) = super::vfs::is_special_path(path) {
+        return Ok(statfs_for_special(special));
+    }
+
+    if path.starts_with(b"/proc") {
+        return Ok(statfs_for_magic(PROC_SUPER_MAGIC, 0x7072_6f63, true));
+    }
+    if path.starts_with(b"/sys") {
+        return Ok(statfs_for_magic(SYSFS_MAGIC, 0x7379_7373, true));
+    }
+    if path.starts_with(b"/dev") {
+        return Ok(statfs_for_magic(DEVTMPFS_MAGIC, 0x6465_7600, false));
+    }
+    if super::vfs::classify_base_image_path(path).is_some() {
+        return Ok(statfs_for_magic(EXT4_SUPER_MAGIC, 0x6261_7365, true));
+    }
+
+    if is_directory_path(agent_id, path) {
+        return Ok(statfs_for_magic(TMPFS_MAGIC, state::fs_owner(agent_id) as u64, false));
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+    if crate::state::query_file_size(ks, key) == 0 && crate::state::state_get(ks, key).is_none() {
+        return Err(-ENOENT);
+    }
+
+    Ok(statfs_for_magic(
+        if ks == super::vfs::BASE_IMAGE_KEYSPACE {
+            EXT4_SUPER_MAGIC
+        } else {
+            TMPFS_MAGIC
+        },
+        ks as u64,
+        ks == super::vfs::BASE_IMAGE_KEYSPACE,
+    ))
+}
+
+fn statfs_for_fd(agent_id: u16, entry: &FdEntry) -> LinuxStatFsMeta {
+    if let Some(special) = special_file_for_fd(entry) {
+        return statfs_for_special(special);
+    }
+
+    match entry.kind {
+        FdKind::Directory => {
+            if let Some(st) = state::get_files_state(agent_id) {
+                if let Some(handle) = st.get_directory_handle(entry.keyspace_key as u16) {
+                    if let Ok(meta) =
+                        statfs_for_path(agent_id, &handle.path[..handle.path_len as usize])
+                    {
+                        return meta;
+                    }
+                }
+            }
+            statfs_for_magic(TMPFS_MAGIC, state::fs_owner(agent_id) as u64, false)
+        }
+        FdKind::File => statfs_for_magic(
+            if entry.keyspace_id == super::vfs::BASE_IMAGE_KEYSPACE {
+                EXT4_SUPER_MAGIC
+            } else {
+                TMPFS_MAGIC
+            },
+            entry.keyspace_id as u64,
+            entry.keyspace_id == super::vfs::BASE_IMAGE_KEYSPACE,
+        ),
+        FdKind::Pipe | FdKind::EventFd => statfs_for_magic(TMPFS_MAGIC, 0x7069_7065, false),
+        FdKind::Socket => statfs_for_magic(TMPFS_MAGIC, 0x736f_636b, false),
+        FdKind::Epoll => statfs_for_magic(TMPFS_MAGIC, 0x6570_6f6c, false),
+    }
 }
 
 fn resolve_open_path<'a>(
@@ -1162,15 +1438,35 @@ fn base_image_directory_exists(path: &[u8]) -> bool {
     found
 }
 
+fn mutable_directory_exists(agent_id: u16, path: &[u8]) -> bool {
+    matches!(state::lookup_mutable_path(agent_id, path), Some(true))
+}
+
+fn mutable_parent_exists(agent_id: u16, path: &[u8]) -> bool {
+    if path == b"/" {
+        return true;
+    }
+
+    let Some(last_slash) = path.iter().rposition(|&b| b == b'/') else {
+        return false;
+    };
+
+    if last_slash == 0 {
+        return true;
+    }
+
+    is_directory_path(agent_id, &path[..last_slash])
+}
+
 fn push_dir_entry(
-    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    names: &mut [[u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT],
     lens: &mut [u16; MAX_DIRENTS_COLLECT],
     dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
     count: &mut usize,
     name: &[u8],
     d_type: u8,
 ) {
-    if name.is_empty() || name.len() >= MAX_PATH || *count >= MAX_DIRENTS_COLLECT {
+    if name.is_empty() || name.len() >= MAX_DIRENT_NAME || *count >= MAX_DIRENTS_COLLECT {
         return;
     }
 
@@ -1191,7 +1487,7 @@ fn push_dir_entry(
 
 fn collect_base_image_children(
     dir_path: &[u8],
-    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    names: &mut [[u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT],
     lens: &mut [u16; MAX_DIRENTS_COLLECT],
     dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
     count: &mut usize,
@@ -1260,10 +1556,55 @@ fn collect_base_image_children(
     });
 }
 
+fn collect_mutable_children(
+    agent_id: u16,
+    dir_path: &[u8],
+    names: &mut [[u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT],
+    lens: &mut [u16; MAX_DIRENTS_COLLECT],
+    dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
+    count: &mut usize,
+) {
+    state::iter_mutable_paths(agent_id, |path, is_dir| {
+        if path == dir_path || path.len() <= dir_path.len() {
+            return true;
+        }
+
+        let remainder = if dir_path == b"/" {
+            if path[0] != b'/' {
+                return true;
+            }
+            &path[1..]
+        } else {
+            if &path[..dir_path.len()] != dir_path || path[dir_path.len()] != b'/' {
+                return true;
+            }
+            &path[dir_path.len() + 1..]
+        };
+
+        if remainder.is_empty() {
+            return true;
+        }
+
+        if let Some(pos) = remainder.iter().position(|&b| b == b'/') {
+            push_dir_entry(names, lens, dtypes, count, &remainder[..pos], DT_DIR);
+        } else {
+            push_dir_entry(
+                names,
+                lens,
+                dtypes,
+                count,
+                remainder,
+                if is_dir { DT_DIR } else { DT_REG },
+            );
+        }
+        true
+    });
+}
+
 fn collect_directory_entries(
     agent_id: u16,
     dir_path: &[u8],
-    names: &mut [[u8; MAX_PATH]; MAX_DIRENTS_COLLECT],
+    names: &mut [[u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT],
     lens: &mut [u16; MAX_DIRENTS_COLLECT],
     dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
 ) -> usize {
@@ -1344,6 +1685,7 @@ fn collect_directory_entries(
     }
 
     collect_base_image_children(dir_path, names, lens, dtypes, &mut count);
+    collect_mutable_children(agent_id, dir_path, names, lens, dtypes, &mut count);
     count
 }
 
@@ -1700,20 +2042,14 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
             if !fd_allows_write(kind, flags) {
                 return -EBADF;
             }
-            let to_write = cnt.min(MAX_VALUE_SIZE);
-            let mut value = [0u8; MAX_VALUE_SIZE];
-            if !read_user_mem(agent_id, buf_ptr, &mut value, to_write) {
-                return -EFAULT;
-            }
-            match crate::state::state_put(ks, key, &value[..to_write]) {
-                Ok(()) => {
-                    // Advance fd offset
+            match write_regular_file_data(agent_id, ks, key, entry.offset, flags, buf_ptr, cnt) {
+                Ok((written, next_offset)) => {
                     if let Some(e) = st.get_fd_mut(fd) {
-                        e.offset += to_write as u64;
+                        e.offset = next_offset;
                     }
-                    to_write as i64
+                    written as i64
                 }
-                Err(_) => -ENOSPC,
+                Err(err) => err,
             }
         }
         FdKind::Pipe => {
@@ -1976,7 +2312,7 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
 
     // Check if it's a directory open (for getdents64)
     let is_dir = (flags & O_DIRECTORY) != 0;
-    let directory_target = is_directory_path(open_path);
+    let directory_target = is_directory_path(agent_id, open_path);
 
     let (keyspace_id, key) = super::vfs::resolve_path(agent_id, open_path);
 
@@ -2000,6 +2336,20 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
 
     // If not creating and not a special path and not a directory,
     // verify the file actually exists in the keyspace
+    if (flags & O_CREAT) != 0 && !directory_target && !mutable_parent_exists(agent_id, open_path) {
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] openat-exit agent={} ret={} path={:?} ks={} key={:#x}",
+                agent_id,
+                -ENOENT,
+                core::str::from_utf8(open_path).unwrap_or("?"),
+                keyspace_id,
+                key
+            );
+        }
+        return -ENOENT;
+    }
+
     if (flags & O_CREAT) == 0 && !is_special && !directory_target {
         let size = crate::state::query_file_size(keyspace_id, key);
         if size == 0 {
@@ -2054,6 +2404,25 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
             flags,
             active: true,
         });
+    }
+
+    if !directory_target && !is_special && (flags & O_TRUNC) != 0 && fd_access_mode(flags) != O_RDONLY
+    {
+        if let Err(err) = store_regular_file_data(keyspace_id, key, &[]) {
+            log_regular_file_store_failure(agent_id, keyspace_id, key, 0, err);
+            let _ = st.close_fd(fd_idx as i32);
+            return -ENOSPC;
+        }
+    }
+
+    if !directory_target
+        && !is_special
+        && keyspace_id != super::vfs::BASE_IMAGE_KEYSPACE
+        && (flags & O_CREAT) != 0
+        && !state::record_mutable_path(agent_id, open_path, false)
+    {
+        let _ = st.close_fd(fd_idx as i32);
+        return -ENOSPC;
     }
 
     if trace_python {
@@ -2221,7 +2590,7 @@ pub fn sys_newfstatat(
 }
 
 /// Check if a path is a known directory.
-fn is_directory_path(path: &[u8]) -> bool {
+fn is_directory_path(agent_id: u16, path: &[u8]) -> bool {
     matches!(
         path,
         b"." | b"/"
@@ -2247,6 +2616,7 @@ fn is_directory_path(path: &[u8]) -> bool {
             | b"/var"
             | b"/var/run"
     ) || base_image_directory_exists(path)
+        || mutable_directory_exists(agent_id, path)
 }
 
 /// Fill a stat buf with S_IFDIR mode.
@@ -2375,7 +2745,7 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
         return 0;
     }
 
-    if is_directory_path(path) {
+    if is_directory_path(agent_id, path) {
         if trace_python {
             crate::serial_println!("[PYDBG] access-exit agent={} ret=0 dir=true", agent_id);
         }
@@ -2401,6 +2771,85 @@ pub fn sys_access(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
         );
     }
     ret
+}
+
+fn access_path_at(agent_id: u16, dirfd: i32, path: &[u8], mode: u32, flags: u32) -> i64 {
+    let _ = mode; // permissions are not modeled yet
+    let unsupported = flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH);
+    if unsupported != 0 {
+        return -EINVAL;
+    }
+
+    if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return -ENOENT;
+        }
+        if dirfd == AT_FDCWD {
+            return 0;
+        }
+        let Some(st) = state::get_files_state(agent_id) else {
+            return -EBADF;
+        };
+        return match st.get_fd(dirfd) {
+            Some(entry) if entry.active => 0,
+            _ => -EBADF,
+        };
+    }
+
+    if super::vfs::is_special_path(path).is_some() || is_directory_path(agent_id, path) {
+        return 0;
+    }
+
+    match metadata_for_path(agent_id, path, flags) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
+}
+
+pub fn sys_faccessat(agent_id: u16, dirfd: i32, pathname_ptr: u64, mode: u32) -> i64 {
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = if path_len == 0 {
+        &[][..]
+    } else {
+        match resolve_path_at(agent_id, dirfd, &path_buf[..path_len], &mut norm_buf) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    };
+
+    access_path_at(agent_id, dirfd, path, mode, 0)
+}
+
+pub fn sys_faccessat2(
+    agent_id: u16,
+    dirfd: i32,
+    pathname_ptr: u64,
+    mode: u32,
+    flags: u32,
+) -> i64 {
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = if path_len == 0 {
+        &[][..]
+    } else {
+        match resolve_path_at(agent_id, dirfd, &path_buf[..path_len], &mut norm_buf) {
+            Ok(path) => path,
+            Err(err) => return err,
+        }
+    };
+
+    access_path_at(agent_id, dirfd, path, mode, flags)
 }
 
 // ── sys_readlink ───────────────────────────────────────────────────────────
@@ -2566,6 +3015,51 @@ fn fill_statx_buf(ptr: u64, file_size: u64, st_dev: u64, st_ino: u64) {
     let _ = (ptr, file_size, st_dev, st_ino);
 }
 
+// ── sys_statfs / sys_fstatfs ──────────────────────────────────────────────
+
+pub fn sys_statfs(agent_id: u16, pathname_ptr: u64, statfs_ptr: u64) -> i64 {
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if path_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = match resolve_path_at(agent_id, AT_FDCWD, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let meta = match statfs_for_path(agent_id, path) {
+        Ok(meta) => meta,
+        Err(err) => return err,
+    };
+
+    if !fill_statfs_from_meta(agent_id, statfs_ptr, meta) {
+        return -EFAULT;
+    }
+    0
+}
+
+pub fn sys_fstatfs(agent_id: u16, fd: i32, statfs_ptr: u64) -> i64 {
+    let st = match state::get_files_state(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
+    };
+    let entry = match st.get_fd(fd) {
+        Some(e) if e.active => e,
+        _ => return -EBADF,
+    };
+    let meta = statfs_for_fd(agent_id, entry);
+    if !fill_statfs_from_meta(agent_id, statfs_ptr, meta) {
+        return -EFAULT;
+    }
+    0
+}
+
 // ── sys_getdents64 ─────────────────────────────────────────────────────────
 
 /// Read directory entries.
@@ -2601,7 +3095,7 @@ pub fn sys_getdents64(agent_id: u16, fd: i32, dirp_ptr: u64, count: u64) -> i64 
     let path_len = dir_handle.path_len as usize;
     path[..path_len].copy_from_slice(&dir_handle.path[..path_len]);
 
-    let mut child_names = [[0u8; MAX_PATH]; MAX_DIRENTS_COLLECT];
+    let mut child_names = [[0u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT];
     let mut child_lens = [0u16; MAX_DIRENTS_COLLECT];
     let mut child_dtypes = [0u8; MAX_DIRENTS_COLLECT];
     let child_count = collect_directory_entries(
@@ -2612,7 +3106,7 @@ pub fn sys_getdents64(agent_id: u16, fd: i32, dirp_ptr: u64, count: u64) -> i64 
         &mut child_dtypes,
     );
 
-    let mut names = [[0u8; MAX_PATH]; MAX_DIRENTS_COLLECT];
+    let mut names = [[0u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT];
     let mut lens = [0u16; MAX_DIRENTS_COLLECT];
     let mut dtypes = [0u8; MAX_DIRENTS_COLLECT];
     let mut total_entries = 0usize;
@@ -2836,6 +3330,188 @@ pub fn sys_dup3(agent_id: u16, oldfd: i32, newfd: i32, flags: u32) -> i64 {
 /// The pathname is hashed to a keyspace key and the corresponding entry
 /// is marked inactive.  Returns 0 on success or `-ENOENT` if the key
 /// did not exist.
+fn rename_regular_file(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
+    let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_path);
+    if crate::state::query_file_size(old_ks, old_key) == 0
+        && crate::state::state_get(old_ks, old_key).is_none()
+    {
+        return -ENOENT;
+    }
+
+    let data = load_regular_file_data(old_ks, old_key);
+    let (new_ks, new_key) = super::vfs::resolve_path(agent_id, new_path);
+    if let Err(err) = store_regular_file_data(new_ks, new_key, &data) {
+        log_regular_file_store_failure(agent_id, new_ks, new_key, data.len(), err);
+        return -ENOSPC;
+    }
+
+    let _ = crate::state::state_delete(old_ks, old_key);
+    state::remove_mutable_path(agent_id, old_path);
+    let _ = state::record_mutable_path(agent_id, new_path, false);
+    0
+}
+
+fn rename_directory_tree(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
+    let mut entries: Vec<(Vec<u8>, bool)> = Vec::new();
+    state::iter_mutable_paths(agent_id, |path, is_dir| {
+        if path_is_same_or_child(path, old_path) {
+            entries.push((path.to_vec(), is_dir));
+        }
+        true
+    });
+
+    if entries.is_empty() {
+        return -ENOENT;
+    }
+
+    let mut files_to_copy: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut new_entries: Vec<(Vec<u8>, bool)> = Vec::new();
+
+    for (path, is_dir) in &entries {
+        let Some(new_entry_path) = renamed_path(old_path, new_path, path) else {
+            return -EINVAL;
+        };
+        if *is_dir {
+            new_entries.push((new_entry_path, true));
+        } else {
+            files_to_copy.push((path.clone(), new_entry_path.clone()));
+            new_entries.push((new_entry_path, false));
+        }
+    }
+
+    for (old_file, new_file) in &files_to_copy {
+        let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_file);
+        let data = load_regular_file_data(old_ks, old_key);
+        let (new_ks, new_key) = super::vfs::resolve_path(agent_id, new_file);
+        if let Err(err) = store_regular_file_data(new_ks, new_key, &data) {
+            log_regular_file_store_failure(agent_id, new_ks, new_key, data.len(), err);
+            return -ENOSPC;
+        }
+    }
+
+    for (old_file, _) in &files_to_copy {
+        let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_file);
+        let _ = crate::state::state_delete(old_ks, old_key);
+    }
+
+    for (old_entry, _) in &entries {
+        state::remove_mutable_path(agent_id, old_entry);
+    }
+    for (new_entry, is_dir) in &new_entries {
+        if !state::record_mutable_path(agent_id, new_entry, *is_dir) {
+            return -ENOSPC;
+        }
+    }
+
+    0
+}
+
+pub fn sys_renameat2(
+    agent_id: u16,
+    olddirfd: i32,
+    oldpath_ptr: u64,
+    newdirfd: i32,
+    newpath_ptr: u64,
+    flags: u32,
+) -> i64 {
+    if flags & (RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
+        return -EINVAL;
+    }
+
+    let mut old_buf = [0u8; MAX_PATH];
+    let old_len = match read_pathname(agent_id, oldpath_ptr, &mut old_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if old_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut new_buf = [0u8; MAX_PATH];
+    let new_len = match read_pathname(agent_id, newpath_ptr, &mut new_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if new_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut old_norm = [0u8; MAX_PATH];
+    let old_path = match resolve_path_at(agent_id, olddirfd, &old_buf[..old_len], &mut old_norm) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let mut new_norm = [0u8; MAX_PATH];
+    let new_path = match resolve_path_at(agent_id, newdirfd, &new_buf[..new_len], &mut new_norm) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if old_path == new_path {
+        return 0;
+    }
+
+    if super::vfs::classify_base_image_path(old_path).is_some()
+        || super::vfs::classify_base_image_path(new_path).is_some()
+        || super::vfs::is_special_path(old_path).is_some()
+        || super::vfs::is_special_path(new_path).is_some()
+    {
+        return -EROFS;
+    }
+
+    if !mutable_parent_exists(agent_id, new_path) {
+        return -ENOENT;
+    }
+
+    let old_is_dir = matches!(state::lookup_mutable_path(agent_id, old_path), Some(true));
+    if old_is_dir && path_is_same_or_child(new_path, old_path) {
+        return -EINVAL;
+    }
+    let old_exists = if old_is_dir {
+        true
+    } else {
+        let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_path);
+        crate::state::query_file_size(old_ks, old_key) > 0 || crate::state::state_get(old_ks, old_key).is_some()
+    };
+    if !old_exists {
+        return -ENOENT;
+    }
+
+    let new_is_dir = is_directory_path(agent_id, new_path);
+    if old_is_dir && new_is_dir {
+        if state::lookup_mutable_path(agent_id, new_path).is_some() {
+            return -EEXIST;
+        }
+    } else if old_is_dir && !new_is_dir {
+        let (new_ks, new_key) = super::vfs::resolve_path(agent_id, new_path);
+        if crate::state::query_file_size(new_ks, new_key) > 0 || crate::state::state_get(new_ks, new_key).is_some() {
+            return -ENOTDIR;
+        }
+    } else if !old_is_dir && new_is_dir {
+        return -EISDIR;
+    }
+
+    if old_is_dir {
+        return rename_directory_tree(agent_id, old_path, new_path);
+    }
+
+    rename_regular_file(agent_id, old_path, new_path)
+}
+
+pub fn sys_renameat(
+    agent_id: u16,
+    olddirfd: i32,
+    oldpath_ptr: u64,
+    newdirfd: i32,
+    newpath_ptr: u64,
+) -> i64 {
+    sys_renameat2(agent_id, olddirfd, oldpath_ptr, newdirfd, newpath_ptr, 0)
+}
+
+pub fn sys_rename(agent_id: u16, oldpath_ptr: u64, newpath_ptr: u64) -> i64 {
+    sys_renameat2(agent_id, AT_FDCWD, oldpath_ptr, AT_FDCWD, newpath_ptr, 0)
+}
+
 pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
     let mut path_buf = [0u8; MAX_PATH];
     let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
@@ -2846,9 +3522,18 @@ pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
         return -ENOENT;
     }
 
-    let key = path_to_key(&path_buf[..path_len]);
-    match crate::state::state_delete(agent_id, key) {
-        Ok(()) => 0,
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = match resolve_path_at(agent_id, AT_FDCWD, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+    match crate::state::state_delete(ks, key) {
+        Ok(()) => {
+            state::remove_mutable_path(agent_id, path);
+            0
+        }
         Err(_) => -ENOENT,
     }
 }
@@ -2857,9 +3542,7 @@ pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
 
 /// Create a directory.
 ///
-/// Directories are virtual in Stage-1.  Always returns 0 (success).
 pub fn sys_mkdir(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
-    let _ = agent_id;
     let _ = mode;
 
     let mut path_buf = [0u8; MAX_PATH];
@@ -2870,7 +3553,32 @@ pub fn sys_mkdir(agent_id: u16, pathname_ptr: u64, mode: u32) -> i64 {
     if path_len == 0 {
         return -ENOENT;
     }
-    0
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = match resolve_path_at(agent_id, AT_FDCWD, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if super::vfs::classify_base_image_path(path).is_some()
+        || super::vfs::is_special_path(path).is_some()
+    {
+        return -EROFS;
+    }
+
+    if is_directory_path(agent_id, path) {
+        return -EEXIST;
+    }
+
+    if !mutable_parent_exists(agent_id, path) {
+        return -ENOENT;
+    }
+
+    if state::record_mutable_path(agent_id, path, true) {
+        0
+    } else {
+        -ENOSPC
+    }
 }
 
 // ── sys_fchdir ─────────────────────────────────────────────────────────────
@@ -3007,30 +3715,19 @@ pub fn sys_ftruncate(agent_id: u16, fd: i32, length: u64) -> i64 {
 
     let key = entry.keyspace_key;
     let ks = entry.keyspace_id;
+    let new_len = length as usize;
+    let mut file_data = load_regular_file_data(ks, key);
+    if file_data.len() > new_len {
+        file_data.truncate(new_len);
+    } else if file_data.len() < new_len {
+        file_data.resize(new_len, 0);
+    }
 
-    if length == 0 {
-        match crate::state::state_put(ks, key, &[]) {
-            Ok(()) => 0,
-            Err(_) => -ENOSPC,
-        }
-    } else {
-        match crate::state::state_get(ks, key) {
-            Some((value, value_len)) => {
-                let new_len = (length as usize).min(value_len);
-                match crate::state::state_put(ks, key, &value[..new_len]) {
-                    Ok(()) => 0,
-                    Err(_) => -ENOSPC,
-                }
-            }
-            None => {
-                // File doesn't exist; create zero-filled content.
-                let zeros = [0u8; MAX_VALUE_SIZE];
-                let new_len = (length as usize).min(MAX_VALUE_SIZE);
-                match crate::state::state_put(ks, key, &zeros[..new_len]) {
-                    Ok(()) => 0,
-                    Err(_) => -ENOSPC,
-                }
-            }
+    match store_regular_file_data(ks, key, &file_data) {
+        Ok(()) => 0,
+        Err(err) => {
+            log_regular_file_store_failure(agent_id, ks, key, file_data.len(), err);
+            -ENOSPC
         }
     }
 }
@@ -3282,17 +3979,17 @@ pub fn sys_pwrite64(agent_id: u16, fd: i32, buf_ptr: u64, count: u64, offset: u6
         return -EINVAL;
     }
 
-    // Read user data and store to keyspace (offset is informational;
-    // keyspace values are treated as blobs).
-    let _ = offset;
-    let to_write = (count as usize).min(MAX_VALUE_SIZE);
-    let mut value = [0u8; MAX_VALUE_SIZE];
-    if !read_user_mem(agent_id, buf_ptr, &mut value, to_write) {
-        return -EFAULT;
-    }
-    match crate::state::state_put(entry.keyspace_id, entry.keyspace_key, &value[..to_write]) {
-        Ok(()) => to_write as i64,
-        Err(_) => -ENOSPC,
+    match write_regular_file_data(
+        agent_id,
+        entry.keyspace_id,
+        entry.keyspace_key,
+        offset,
+        entry.flags & !O_APPEND,
+        buf_ptr,
+        count as usize,
+    ) {
+        Ok((written, _)) => written as i64,
+        Err(err) => err,
     }
 }
 
@@ -3626,9 +4323,12 @@ pub fn sys_chdir(agent_id: u16, path_ptr: u64) -> i64 {
     }
 
     let mut norm_buf = [0u8; MAX_PATH];
-    let path = normalized_path(&path_buf[..path_len], &mut norm_buf);
+    let path = match resolve_path_at(agent_id, AT_FDCWD, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
 
-    if !is_directory_path(path) {
+    if !is_directory_path(agent_id, path) {
         return -ENOTDIR;
     }
 

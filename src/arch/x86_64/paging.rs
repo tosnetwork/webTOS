@@ -63,6 +63,13 @@ pub const fn phys_to_virt(phys: u64) -> usize {
     KERNEL_VMA_OFFSET + phys as usize
 }
 
+/// Translate a higher-half direct-map kernel virtual address back to a
+/// physical address.
+#[inline]
+pub const fn virt_to_phys(virt: usize) -> u64 {
+    (virt - KERNEL_VMA_OFFSET) as u64
+}
+
 #[inline]
 const fn phys_to_const_ptr<T>(phys: u64) -> *const T {
     phys_to_virt(phys) as *const T
@@ -643,6 +650,19 @@ unsafe fn free_page_table_level(table_phys: u64, level: usize) {
             if entry & PTE_PRESENT != 0 && entry & PTE_HUGE == 0 {
                 let next_phys = entry & 0x000F_FFFF_FFFF_F000;
                 free_page_table_level(next_phys, level - 1);
+            }
+        }
+    } else {
+        // PT level: reclaim backing 4 KiB user frames before dropping the page
+        // table itself. Shared address spaces are reference-counted at the CR3
+        // level, so we only reach this path once the last owner exits.
+        for i in 0..512 {
+            let entry = core::ptr::read_volatile(table.add(i));
+            if entry & PTE_PRESENT != 0 {
+                let phys = entry & 0x000F_FFFF_FFFF_F000;
+                if phys != 0 {
+                    let _ = release_frame(phys);
+                }
             }
         }
     }

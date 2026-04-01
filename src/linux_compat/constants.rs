@@ -93,6 +93,8 @@ pub const SYS_FLOCK: u64 = 73;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
+pub const SYS_FCHDIR: u64 = 81;
+pub const SYS_RENAME: u64 = 82;
 pub const SYS_MKDIR: u64 = 83;
 pub const SYS_READLINK: u64 = 89;
 
@@ -142,6 +144,8 @@ pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_GETTIMEOFDAY: u64 = 96;
 pub const SYS_CAPGET: u64 = 125;
 pub const SYS_SIGALTSTACK: u64 = 131;
+pub const SYS_STATFS: u64 = 137;
+pub const SYS_FSTATFS: u64 = 138;
 pub const SYS_PRCTL: u64 = 157;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
@@ -149,20 +153,23 @@ pub const SYS_GETCPU: u64 = 309;
 
 // ── Misc ────────────────────────────────────────────────────────────────────
 pub const SYS_FTRUNCATE: u64 = 77;
-pub const SYS_FCHDIR: u64 = 81;
 pub const SYS_UNLINK: u64 = 87;
 pub const SYS_OPENAT: u64 = 257;
 pub const SYS_NEWFSTATAT: u64 = 262;
+pub const SYS_RENAMEAT: u64 = 264;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_READLINKAT: u64 = 267;
+pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
 pub const SYS_PRLIMIT64: u64 = 302;
+pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_STATX: u64 = 332;
 pub const SYS_RSEQ: u64 = 334;
 pub const SYS_IO_URING_SETUP: u64 = 425;
 pub const SYS_IO_URING_ENTER: u64 = 426;
 pub const SYS_CLONE3: u64 = 435;
+pub const SYS_FACCESSAT2: u64 = 439;
 
 // ── Linux errno values ──────────────────────────────────────────────────────
 pub const EPERM: i64 = 1;
@@ -181,6 +188,7 @@ pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EMFILE: i64 = 24;
+pub const EROFS: i64 = 30;
 pub const EPIPE: i64 = 32;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;

@@ -584,8 +584,12 @@ pub fn reap_agent(id: AgentId) {
         for slot in AGENT_TABLE.iter_mut() {
             if let Some(agent) = slot {
                 if agent.id == id && !agent.active {
+                    let stack_top = agent.kernel_stack_top;
                     agent.context.cr3 = 0;
+                    agent.kernel_stack_top = 0;
+                    agent.stack_bottom = 0;
                     crate::linux_compat::state::remove_state(id);
+                    crate::sched::free_agent_stack(stack_top);
                     *slot = None;
                     return;
                 }

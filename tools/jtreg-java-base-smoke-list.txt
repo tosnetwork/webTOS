@@ -1,0 +1,8 @@
+# TOS guest-side OpenJDK 11 jtreg smoke subset
+#
+# These tests have been validated with jtreg 7.3.1+1 on the host and are used
+# by test_data/test_java_jtreg_execve.c for the first in-guest jtreg bring-up.
+
+test/jdk/java/lang/String/Chars.java
+test/jdk/java/io/File/IsAbsolute.java
+test/jdk/java/util/zip/ZipEntry/Constructor.java

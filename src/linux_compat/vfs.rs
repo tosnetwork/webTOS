@@ -2,8 +2,8 @@
 //!
 //! Maps Linux file paths to TOS keyspace keys. Paths under `/lib/`,
 //! `/usr/lib/`, `/jdk/`, and `/etc/` resolve to the shared
-//! read-only base image keyspace, while `/app/` and all other paths
-//! resolve to the agent's own private keyspace.
+//! read-only base image keyspace, while `/app/` and all other mutable paths
+//! resolve to the current Linux process keyspace.
 
 use sha2::{Digest, Sha256};
 
@@ -134,8 +134,8 @@ pub fn classify_base_image_path(path: &[u8]) -> Option<(BaseImageNamespace, &[u8
 /// | `/usr/bin/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:usrbin/" + relative)` |
 /// | `/jdk/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:jdk/" + relative)` |
 /// | `/etc/*` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:etc/" + relative)` |
-/// | `/app/` | `agent_id` | `sha256_key(path)` |
-/// | everything else | `agent_id` | `sha256_key(path)` |
+/// | `/app/` | current Linux process keyspace | `sha256_key(path)` |
+/// | everything else | current Linux process keyspace | `sha256_key(path)` |
 pub fn resolve_path(agent_id: u16, path: &[u8]) -> (u16, u64) {
     if let Some((namespace, relative)) = classify_base_image_path(path) {
         let key = match namespace {
@@ -153,8 +153,11 @@ pub fn resolve_path(agent_id: u16, path: &[u8]) -> (u16, u64) {
         return (BASE_IMAGE_KEYSPACE, key);
     }
 
-    // /app/ and everything else → agent's own keyspace
-    (agent_id, sha256_key(path))
+    // Mutable Linux paths are scoped to a process-family filesystem owner
+    // rather than the individual agent slot. This keeps fork/vfork children
+    // on the same synthetic filesystem view while still isolating unrelated
+    // top-level launches from each other.
+    (super::state::fs_owner(agent_id), sha256_key(path))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────

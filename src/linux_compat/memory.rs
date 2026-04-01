@@ -405,7 +405,9 @@ fn fault_access_allowed(vma: &VmaEntry, error_code: u64) -> bool {
 }
 
 pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -> bool {
-    let trace_python = super::state::trace_runtime_agent(agent_id);
+    let trace_python = super::state::trace_runtime_agent(agent_id)
+        || (option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
+            && super::state::trace_java_agent(agent_id));
     let cr3 = match get_agent_cr3(agent_id) {
         Some(c) => c,
         None => {

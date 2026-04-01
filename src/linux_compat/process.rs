@@ -80,7 +80,25 @@ static mut FUTEX_WAITERS: [FutexWaiter; MAX_FUTEX_WAITERS] =
 
 const FUTEX_WAIT_NONE: i64 = i64::MIN;
 
-static mut FUTEX_WAIT_RESULTS: [i64; MAX_AGENTS] = [FUTEX_WAIT_NONE; MAX_AGENTS];
+#[derive(Clone, Copy)]
+struct FutexWaitResultSlot {
+    agent_id: u16,
+    result: i64,
+    active: bool,
+}
+
+impl FutexWaitResultSlot {
+    const fn empty() -> Self {
+        Self {
+            agent_id: 0,
+            result: FUTEX_WAIT_NONE,
+            active: false,
+        }
+    }
+}
+
+static mut FUTEX_WAIT_RESULTS: [FutexWaitResultSlot; MAX_AGENTS] =
+    [const { FutexWaitResultSlot::empty() }; MAX_AGENTS];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -97,24 +115,55 @@ struct RobustListHead {
 }
 
 #[inline]
-fn set_futex_wait_result(agent_id: u16, result: i64) {
-    let idx = agent_id as usize;
-    if idx < MAX_AGENTS {
-        unsafe {
-            FUTEX_WAIT_RESULTS[idx] = result;
+fn futex_wait_result_slot(agent_id: u16) -> Option<usize> {
+    unsafe {
+        for (idx, slot) in FUTEX_WAIT_RESULTS.iter().enumerate() {
+            if slot.active && slot.agent_id == agent_id {
+                return Some(idx);
+            }
         }
+    }
+    None
+}
+
+#[inline]
+fn ensure_futex_wait_result_slot(agent_id: u16) -> Option<usize> {
+    if let Some(idx) = futex_wait_result_slot(agent_id) {
+        return Some(idx);
+    }
+    unsafe {
+        for (idx, slot) in FUTEX_WAIT_RESULTS.iter_mut().enumerate() {
+            if !slot.active {
+                *slot = FutexWaitResultSlot {
+                    agent_id,
+                    result: FUTEX_WAIT_NONE,
+                    active: true,
+                };
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn set_futex_wait_result(agent_id: u16, result: i64) {
+    let Some(idx) = ensure_futex_wait_result_slot(agent_id) else {
+        return;
+    };
+    unsafe {
+        FUTEX_WAIT_RESULTS[idx].result = result;
     }
 }
 
 #[inline]
 fn take_futex_wait_result(agent_id: u16) -> i64 {
-    let idx = agent_id as usize;
-    if idx >= MAX_AGENTS {
+    let Some(idx) = futex_wait_result_slot(agent_id) else {
         return 0;
-    }
+    };
     unsafe {
-        let result = FUTEX_WAIT_RESULTS[idx];
-        FUTEX_WAIT_RESULTS[idx] = FUTEX_WAIT_NONE;
+        let result = FUTEX_WAIT_RESULTS[idx].result;
+        FUTEX_WAIT_RESULTS[idx].result = FUTEX_WAIT_NONE;
         if result == FUTEX_WAIT_NONE {
             0
         } else {
@@ -125,15 +174,102 @@ fn take_futex_wait_result(agent_id: u16) -> i64 {
 
 #[inline]
 fn clear_futex_wait_state(agent_id: u16) {
-    let idx = agent_id as usize;
-    if idx < MAX_AGENTS {
-        unsafe {
-            FUTEX_WAIT_RESULTS[idx] = FUTEX_WAIT_NONE;
-            for waiter in FUTEX_WAITERS.iter_mut() {
-                if waiter.active && waiter.agent_id == agent_id {
-                    waiter.active = false;
-                }
+    unsafe {
+        if let Some(idx) = futex_wait_result_slot(agent_id) {
+            FUTEX_WAIT_RESULTS[idx] = FutexWaitResultSlot::empty();
+        }
+        for waiter in FUTEX_WAITERS.iter_mut() {
+            if waiter.active && waiter.agent_id == agent_id {
+                waiter.active = false;
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AgentNameSlot {
+    agent_id: u16,
+    name: [u8; 16],
+    active: bool,
+}
+
+impl AgentNameSlot {
+    const fn empty() -> Self {
+        Self {
+            agent_id: 0,
+            name: [0u8; 16],
+            active: false,
+        }
+    }
+}
+
+#[inline]
+fn agent_name_slot(agent_id: u16) -> Option<usize> {
+    unsafe {
+        for (idx, slot) in AGENT_NAMES.iter().enumerate() {
+            if slot.active && slot.agent_id == agent_id {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn ensure_agent_name_slot(agent_id: u16) -> Option<usize> {
+    if let Some(idx) = agent_name_slot(agent_id) {
+        return Some(idx);
+    }
+    unsafe {
+        for (idx, slot) in AGENT_NAMES.iter_mut().enumerate() {
+            if !slot.active {
+                *slot = AgentNameSlot {
+                    agent_id,
+                    name: [0u8; 16],
+                    active: true,
+                };
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+#[inline]
+fn clear_agent_name(agent_id: u16) {
+    unsafe {
+        if let Some(idx) = agent_name_slot(agent_id) {
+            AGENT_NAMES[idx] = AgentNameSlot::empty();
+        }
+    }
+}
+
+#[inline]
+fn read_agent_name(agent_id: u16) -> [u8; 16] {
+    unsafe {
+        agent_name_slot(agent_id)
+            .map(|idx| AGENT_NAMES[idx].name)
+            .unwrap_or([0u8; 16])
+    }
+}
+
+#[inline]
+fn write_agent_name(agent_id: u16, name: [u8; 16]) -> bool {
+    let Some(idx) = ensure_agent_name_slot(agent_id) else {
+        return false;
+    };
+    unsafe {
+        AGENT_NAMES[idx].name = name;
+    }
+    true
+}
+
+#[inline]
+pub fn clear_process_metadata(agent_id: u16) {
+    clear_agent_name(agent_id);
+    if let Some(idx) = futex_wait_result_slot(agent_id) {
+        unsafe {
+            FUTEX_WAIT_RESULTS[idx] = FutexWaitResultSlot::empty();
         }
     }
 }
@@ -336,6 +472,7 @@ fn wake_robust_list(agent_id: u16, head_ptr: u64) {
 /// cleaned up independently from the shared address-space lifetime.
 pub fn prepare_agent_termination(agent_id: u16) {
     clear_futex_wait_state(agent_id);
+    clear_process_metadata(agent_id);
 
     let (clear_child_tid, robust_list_head, files_owner, fd_table) =
         match state::get_state_mut(agent_id) {
@@ -800,6 +937,7 @@ fn inherit_linux_state_for_clone(
     let mmap_next = unsafe { (*parent_state).mmap_next };
     let vm_space_owner = unsafe { (*parent_state).vm_space_owner };
     let thread_group_leader = unsafe { (*parent_state).thread_group_leader };
+    let fs_owner = unsafe { (*parent_state).fs_owner };
     let sighand_owner = unsafe { (*parent_state).sighand_owner };
     let uid = unsafe { (*parent_state).uid };
     let gid = unsafe { (*parent_state).gid };
@@ -829,6 +967,11 @@ fn inherit_linux_state_for_clone(
         } else {
             child_id
         };
+        // Mutable Linux paths are process-family scoped in TOS. This keeps
+        // fork/vfork children on the same synthetic filesystem view, which is
+        // required for runtimes like jtreg that create workdirs in the parent
+        // and immediately `chdir` into them from the child before exec.
+        child_state.fs_owner = fs_owner;
         child_state.files_owner = if flags & CLONE_FILES != 0 {
             files_owner
         } else {
@@ -1071,12 +1214,20 @@ fn trace_runtime_agent(agent_id: u16) -> bool {
 }
 
 #[inline]
+fn trace_jtreg_java_agent(agent_id: u16) -> bool {
+    option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") && state::trace_java_agent(agent_id)
+}
+
+#[inline]
 fn trace_node_futex_agent(agent_id: u16) -> bool {
     state::exe_path_eq(agent_id, b"/usr/bin/node")
 }
 
 #[inline]
 fn trace_java_futex_agent(agent_id: u16) -> bool {
+    if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") {
+        return false;
+    }
     state::trace_java_agent(agent_id)
 }
 
@@ -1148,7 +1299,8 @@ const PR_GET_NAME: u32 = 16;
 // ── Per-agent metadata (names, etc.) ───────────────────────────────────────
 
 /// Agent names set via prctl(PR_SET_NAME).
-static mut AGENT_NAMES: [[u8; 16]; MAX_LINUX_AGENTS] = [[0u8; 16]; MAX_LINUX_AGENTS];
+static mut AGENT_NAMES: [AgentNameSlot; MAX_LINUX_AGENTS] =
+    [const { AgentNameSlot::empty() }; MAX_LINUX_AGENTS];
 
 // ── Syscall implementations ────────────────────────────────────────────────
 
@@ -1217,7 +1369,8 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
     } else {
         frame.user_rsp
     };
-    if trace_runtime_agent(agent_id) {
+    let trace_clone = trace_runtime_agent(agent_id) || trace_jtreg_java_agent(agent_id);
+    if trace_clone {
         serial_println!(
             "[RTDBG] clone3-enter agent={} flags={:#x} stack={:#x} stack_size={:#x} child_rsp={:#x} tls={:#x} ptid={:#x} ctid={:#x} exit_signal={:#x}",
             agent_id,
@@ -1295,7 +1448,7 @@ pub fn sys_clone3(agent_id: u16, cl_args_ptr: u64, size: u64) -> i64 {
         let _ = write_user_u32(child_id, args.child_tid, child_id as u32);
     }
 
-    if trace_runtime_agent(agent_id) {
+    if trace_clone {
         serial_println!(
             "[RTDBG] clone3-child parent={} child={} cr3={:#x} kernel_stack_top={:#x} kernel_stack_bottom={:#x}",
             agent_id,
@@ -1456,6 +1609,43 @@ fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: 
     let mut envp_refs: [&[u8]; 32] = [b"" as &[u8]; 32];
     for i in 0..envc {
         envp_refs[i] = &envp_bufs[i][..envp_lens[i]];
+    }
+
+    if path.ends_with(b"/java") || path.ends_with(b"/javac") {
+        let mut test_name = None;
+        let mut main_wrapper = false;
+        let mut jtreg_jar = false;
+        let mut last_arg = None;
+        for arg in &argv_refs[..argc] {
+            if arg.is_empty() {
+                continue;
+            }
+            last_arg = Some(*arg);
+            if arg.starts_with(b"-Dtest.name=") || arg.starts_with(b"-J-Dtest.name=") {
+                test_name = Some(*arg);
+            }
+            if *arg == b"com.sun.javatest.regtest.agent.MainWrapper" {
+                main_wrapper = true;
+            }
+            if *arg == b"/jdk/jtreg/lib/jtreg.jar" {
+                jtreg_jar = true;
+            }
+        }
+        if test_name.is_some() || main_wrapper || jtreg_jar {
+            serial_println!(
+                "[execve-jtreg] agent={} exe={:?} argc={} test={:?} main_wrapper={} last={:?}",
+                agent_id,
+                core::str::from_utf8(path).unwrap_or("?"),
+                argc,
+                test_name
+                    .map(|v| core::str::from_utf8(v).unwrap_or("?"))
+                    .unwrap_or("-"),
+                main_wrapper,
+                last_arg
+                    .map(|v| core::str::from_utf8(v).unwrap_or("?"))
+                    .unwrap_or("-")
+            );
+        }
     }
 
     match crate::agent_loader::prepare_linux_agent_image(
@@ -1700,16 +1890,12 @@ pub fn sys_prctl(agent_id: u16, option: u32, arg2: u64, _arg3: u64, _arg4: u64, 
             if arg2 == 0 {
                 return -EFAULT;
             }
-            let idx = agent_id as usize;
-            if idx >= MAX_LINUX_AGENTS {
-                return -EINVAL;
-            }
             let mut name = [0u8; 16];
             if !copy_from_user(agent_id, arg2, &mut name) {
                 return -EFAULT;
             }
-            unsafe {
-                AGENT_NAMES[idx] = name;
+            if !write_agent_name(agent_id, name) {
+                return -ENOMEM;
             }
             0
         }
@@ -1717,11 +1903,7 @@ pub fn sys_prctl(agent_id: u16, option: u32, arg2: u64, _arg3: u64, _arg4: u64, 
             if arg2 == 0 {
                 return -EFAULT;
             }
-            let idx = agent_id as usize;
-            if idx >= MAX_LINUX_AGENTS {
-                return -EINVAL;
-            }
-            let name = unsafe { AGENT_NAMES[idx] };
+            let name = read_agent_name(agent_id);
             if !copy_to_user(agent_id, arg2, &name) {
                 return -EFAULT;
             }

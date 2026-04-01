@@ -138,10 +138,32 @@ The repo also ships end-to-end runtime validation harnesses for the current
 Linux-compat bring-up work:
 
 ```bash
+tools/java_runtime_validation.sh
+tools/prepare_jtreg_assets.sh
+tools/jtreg_java_base_smoke.sh
 tools/phase5_runtime_validation.sh --profile java
 tools/phase5_runtime_validation.sh --profile python
 tools/phase5_runtime_validation.sh --profile node
 tools/phase6_runtime_matrix.sh
+```
+
+For future OpenJDK `jtreg` bring-up work, the repo also includes a first-pass
+TOS whitelist for the non-UI `java.base`-heavy subset. The initial guest-side
+smoke currently uses `-othervm` instead of `-agentvm`, because TOS does not yet
+provide the localhost socket semantics that jtreg's agent VM pool expects:
+
+```bash
+cat tools/jtreg-java-base-whitelist.txt
+```
+
+There is also a guest-side jtreg launcher path for that whitelist. Start from
+the preparation script, which downloads `jtreg 7.3.1+1`, sparse-clones the
+OpenJDK 11 test tree, and writes a ready-to-use
+`base_image.runtime.jtreg.manifest`:
+
+```bash
+tools/prepare_jtreg_assets.sh
+tools/jtreg_java_base_smoke.sh
 ```
 
 You will see agents booting, communicating via mailboxes, and enforcing policies:
