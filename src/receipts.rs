@@ -1,4 +1,4 @@
-//! ATOS Execution Receipt Model (Yellow Paper §27.6.3)
+//! TOS Execution Receipt Model (Yellow Paper §27.6.3)
 //!
 //! An ExecutionReceipt ties agent execution to verifiable evidence. Receipts
 //! are emitted when agents exit or explicitly via syscall, and stored in a

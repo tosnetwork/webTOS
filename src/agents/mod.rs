@@ -1,4 +1,4 @@
-//! ATOS Test Agents
+//! TOS Test Agents
 //!
 //! Built-in agents compiled directly into the kernel image for Stage-1.
 //! These serve as the initial test workload to validate scheduling,

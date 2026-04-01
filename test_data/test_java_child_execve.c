@@ -7,7 +7,7 @@
  * Runs:
  *   execve("/usr/lib/jvm/java-11-openjdk-amd64/bin/java",
  *          ["java", "-Xshare:off", "-XX:-UsePerfData", "-cp",
- *           "/usr/lib/atos-tests", "JavaChildSmoke"], envp)
+ *           "/usr/lib/tos-tests", "JavaChildSmoke"], envp)
  */
 
 typedef unsigned long size_t;
@@ -79,7 +79,7 @@ void _start(void) {
     static char arg1[] = "-Xshare:off";
     static char arg2[] = "-XX:-UsePerfData";
     static char arg3[] = "-cp";
-    static char arg4[] = "/usr/lib/atos-tests";
+    static char arg4[] = "/usr/lib/tos-tests";
     static char arg5[] = "JavaChildSmoke";
     static char env0[] = "JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64";
     static char env1[] = "LANG=C";

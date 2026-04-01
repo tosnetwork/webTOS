@@ -1,6 +1,6 @@
-# ATOS Smart Contract Example
+# TOS Smart Contract Example
 
-This document walks through a complete example of writing, building, deploying, and calling a smart contract on ATOS. It is **not** a specification or recommendation — it is one possible approach using the existing ATOS infrastructure.
+This document walks through a complete example of writing, building, deploying, and calling a smart contract on TOS. It is **not** a specification or recommendation — it is one possible approach using the existing TOS infrastructure.
 
 ## Example: A Token Contract
 
@@ -10,21 +10,21 @@ This document walks through a complete example of writing, building, deploying, 
 // src/lib.rs
 // Compile: cargo build --target wasm32-unknown-unknown --release
 
-/// Read a u64 from the ATOS keyspace.
+/// Read a u64 from the TOS keyspace.
 fn state_get(key: u64) -> u64 {
     let mut buf = [0u8; 8];
     unsafe {
-        // ATOS host call: sys_state_get(key, buf_ptr, buf_len)
+        // TOS host call: sys_state_get(key, buf_ptr, buf_len)
         core::arch::wasm32::unreachable(); // placeholder — real SDK provides this
     }
     u64::from_le_bytes(buf)
 }
 
-/// Write a u64 to the ATOS keyspace.
+/// Write a u64 to the TOS keyspace.
 fn state_put(key: u64, value: u64) {
     let bytes = value.to_le_bytes();
     unsafe {
-        // ATOS host call: sys_state_put(key, buf_ptr, buf_len)
+        // TOS host call: sys_state_put(key, buf_ptr, buf_len)
         core::arch::wasm32::unreachable(); // placeholder
     }
 }
@@ -41,7 +41,7 @@ fn state_put(key: u64, value: u64) {
 /// The WASM export name "transfer" maps to selector SHA-256("transfer")[:4].
 #[no_mangle]
 pub extern "C" fn transfer(input_len: i32) -> i32 {
-    // Input is pre-written to linear memory at offset 0 by the ATOS runtime.
+    // Input is pre-written to linear memory at offset 0 by the TOS runtime.
     let mem = unsafe { core::slice::from_raw_parts(0 as *const u8, input_len as usize) };
 
     let caller_key = u64::from_le_bytes(mem[0..8].try_into().unwrap());
@@ -107,7 +107,7 @@ atp sign token.tos
 
 ### 3. Deploy
 
-Send a TCP request to the ATOS VM:
+Send a TCP request to the TOS VM:
 
 ```
 Request {
@@ -120,7 +120,7 @@ Request {
 }
 ```
 
-ATOS returns:
+TOS returns:
 
 ```
 Response {
@@ -142,7 +142,7 @@ The `contract_id` (SHA-256 of the code) is used for all subsequent calls.
 Request {
     request_type: Call (2),
     contract_id: <from deploy response>,
-    entry_point: "transfer",           // ATOS computes selector = SHA-256("transfer")[:4]
+    entry_point: "transfer",           // TOS computes selector = SHA-256("transfer")[:4]
     input: [
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // caller key = 1
         0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // recipient key = 2
@@ -153,7 +153,7 @@ Request {
 }
 ```
 
-ATOS returns:
+TOS returns:
 
 ```
 Response {
@@ -218,7 +218,7 @@ The energy for Contract B's execution is deducted from Contract A's budget (call
 
 ### 7. Optional: Manifest File
 
-A `manifest.toml` can document the contract interface for client tooling. It is not required by ATOS — it is a convenience for developers.
+A `manifest.toml` can document the contract interface for client tooling. It is not required by TOS — it is a convenience for developers.
 
 ```toml
 [contract]
@@ -267,7 +267,7 @@ The same logic can be written as a Linux C program instead of WASM:
 ```c
 // token.c — compile with: gcc -nostdlib -static -o token token.c
 void _start() {
-    // Read input from keyspace key 0xFFFF (pre-loaded by ATOS)
+    // Read input from keyspace key 0xFFFF (pre-loaded by TOS)
     // Parse function selector from first 4 bytes
     // Dispatch to transfer() or balance_of()
     // Write output to keyspace

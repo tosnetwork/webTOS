@@ -1,10 +1,10 @@
-# ATOS eBPF-lite Specification
+# TOS eBPF-lite Specification
 
 **Version:** 2.0 (Stage-3)
 **Status:** Implementation Complete
 **Companion to:** Yellow Paper §24.3.2
 
-> This document is the normative specification for the ATOS eBPF-lite policy runtime. The yellow paper provides architectural context and roadmap; this document provides the complete ABI, instruction set, and implementation contract.
+> This document is the normative specification for the TOS eBPF-lite policy runtime. The yellow paper provides architectural context and roadmap; this document provides the complete ABI, instruction set, and implementation contract.
 
 ---
 
@@ -34,7 +34,7 @@
 
 ## 1. Overview
 
-eBPF-lite is the policy execution layer of ATOS. It is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs **inside the kernel**, not in user mode.
+eBPF-lite is the policy execution layer of TOS. It is a restricted bytecode runtime for policy enforcement, event filtering, and validation rules. It runs **inside the kernel**, not in user mode.
 
 eBPF-lite is **not** an `AgentRuntime` (§24.3.0). It is kernel-resident and attachment-driven rather than agent-scheduled. It follows bounded-lifecycle principles: every program is statically verified for termination before loading, and every execution is bounded by an instruction counter.
 
@@ -123,7 +123,7 @@ src = (regs >> 4) & 0x0F
 | `r6`–`r9` | General purpose / callee-saved | Yes | Preserved | |
 | `r10` | Frame pointer | **Read-only** | Preserved | Points to stack top; enforced by verifier |
 
-> **Difference from standard eBPF:** In Linux eBPF, r1–r5 are **caller-saved** (clobbered after `call`). In ATOS eBPF-lite, r1–r5 are **preserved** across helper calls — only r0 is modified. This means programs that rely on r1–r5 values after a `call` will work on ATOS but may fail on Linux eBPF. Portable programs should treat r1–r5 as clobbered after `call` and save values to r6–r9 or the stack beforehand.
+> **Difference from standard eBPF:** In Linux eBPF, r1–r5 are **caller-saved** (clobbered after `call`). In TOS eBPF-lite, r1–r5 are **preserved** across helper calls — only r0 is modified. This means programs that rely on r1–r5 values after a `call` will work on TOS but may fail on Linux eBPF. Portable programs should treat r1–r5 as clobbered after `call` and save values to r6–r9 or the stack beforehand.
 
 ### 3.1 Entry state
 
@@ -585,7 +585,7 @@ All programs must pass static verification before loading. The verifier is a sin
 
 **No loops of any kind are permitted.** The verifier enforces a simplified DAG (directed acyclic graph) check by rejecting all backward jumps (`target_pc <= current_pc`). This guarantees termination statically without path simulation.
 
-This is more restrictive than Linux eBPF, which allows bounded loops (kernel 5.3+) via path-based complexity analysis. ATOS chooses simplicity and absolute termination guarantees over expressiveness.
+This is more restrictive than Linux eBPF, which allows bounded loops (kernel 5.3+) via path-based complexity analysis. TOS chooses simplicity and absolute termination guarantees over expressiveness.
 
 ### 10.3 What the verifier does NOT check
 
@@ -716,7 +716,7 @@ Loading, unloading, and replacing eBPF programs requires the `CAP_POLICY_LOAD` c
 
 ## 13. AEBF Binary Format
 
-The SDK compiles `.ebpf` text assembly into `.bin` files using the **AEBF** (ATOS eBPF) binary format. This is a simple, non-ELF format with an 8-byte header followed by raw instructions.
+The SDK compiles `.ebpf` text assembly into `.bin` files using the **AEBF** (TOS eBPF) binary format. This is a simple, non-ELF format with an 8-byte header followed by raw instructions.
 
 ### 13.1 Layout
 
@@ -745,13 +745,13 @@ Byte 4-7:  imm    (i32, little-endian)
 - Version must be `1` (future versions may extend the header)
 - `insn_count` determines how many 8-byte instruction records follow the header
 
-`[IMPL: ✅ sdk/atos-ebpf-sdk/src/binary.rs — write_binary() / read_binary()]`
+`[IMPL: ✅ sdk/tos-ebpf-sdk/src/binary.rs — write_binary() / read_binary()]`
 
 ---
 
 ## 14. SDK Assembly Syntax
 
-The `atos-ebpf-sdk` provides a text assembler (`atos-ebpf compile`) for writing eBPF-lite programs. Source files use the `.ebpf` extension by convention.
+The `tos-ebpf-sdk` provides a text assembler (`tos-ebpf compile`) for writing eBPF-lite programs. Source files use the `.ebpf` extension by convention.
 
 ### 14.1 General syntax
 
@@ -951,7 +951,7 @@ mov  r0, 1               ; 26:
 exit                     ; 27:
 ```
 
-`[IMPL: ✅ sdk/atos-ebpf-sdk/src/assembler.rs — full text assembler]`
+`[IMPL: ✅ sdk/tos-ebpf-sdk/src/assembler.rs — full text assembler]`
 
 ---
 
@@ -997,19 +997,19 @@ exit                     ; 27:
 
 ### 17.1 Missing opcodes
 
-| Feature | Linux eBPF | ATOS eBPF-lite | Impact |
+| Feature | Linux eBPF | TOS eBPF-lite | Impact |
 |---------|-----------|----------------|--------|
 | `ARSH` (arithmetic right shift) | ✅ | ✅ | — |
 | `JSGT/JSGE/JSLT/JSLE` (signed jumps) | ✅ | ✅ | — |
 | `JMP32` class (0x06) | ✅ | ❌ | No 32-bit branch optimization |
 | `BPF_LD_IMM64` (64-bit immediate load) | ✅ | ✅ | — |
-| `BPF_LD_ABS / BPF_LD_IND` | ✅ | ❌ | Packet direct access (N/A for ATOS) |
+| `BPF_LD_ABS / BPF_LD_IND` | ✅ | ❌ | Packet direct access (N/A for TOS) |
 | `BPF_ATOMIC` (XADD, XCHG, CMPXCHG) | ✅ | ❌ | No atomic operations (single-core) |
 | `BPF_END` (byte swap LE/BE) | ✅ | ❌ | No endian conversion |
 
 ### 17.2 Verifier differences
 
-| Aspect | Linux eBPF | ATOS eBPF-lite |
+| Aspect | Linux eBPF | TOS eBPF-lite |
 |--------|-----------|----------------|
 | Loop support | Bounded loops (5.3+) via path simulation | **No loops at all** (no backward jumps) |
 | Max instructions | 1,000,000 | **1024** |
@@ -1021,7 +1021,7 @@ exit                     ; 27:
 
 ### 17.3 Runtime differences
 
-| Aspect | Linux eBPF | ATOS eBPF-lite |
+| Aspect | Linux eBPF | TOS eBPF-lite |
 |--------|-----------|----------------|
 | Helper functions | 200+ | 14 |
 | Map types | 30+ | 2 (hash + array) |
@@ -1035,19 +1035,19 @@ exit                     ; 27:
 
 These differences are more subtle than missing opcodes — the bytecode is identical, but the runtime behavior differs:
 
-| Behavior | Standard Linux eBPF | ATOS eBPF-lite | Risk |
+| Behavior | Standard Linux eBPF | TOS eBPF-lite | Risk |
 |----------|-------------------|----------------|------|
-| **DIV by 0 (64-bit)** | `dst = 0` (silent) | `EbpfError::DivisionByZero` (terminates program) | Program that relies on div-by-zero returning 0 will be terminated on ATOS |
-| **MOD by 0 (64-bit)** | `dst = dst` (returns dividend) | `EbpfError::DivisionByZero` (terminates program) | Same — ATOS treats all zero-divisor cases as fatal |
+| **DIV by 0 (64-bit)** | `dst = 0` (silent) | `EbpfError::DivisionByZero` (terminates program) | Program that relies on div-by-zero returning 0 will be terminated on TOS |
+| **MOD by 0 (64-bit)** | `dst = dst` (returns dividend) | `EbpfError::DivisionByZero` (terminates program) | Same — TOS treats all zero-divisor cases as fatal |
 | **DIV by 0 (32-bit)** | `dst = 0` | `EbpfError::DivisionByZero` | Same |
 | **MOD by 0 (32-bit)** | `dst = dst` | `EbpfError::DivisionByZero` | Same |
-| **r1–r5 after `call`** | Clobbered (caller-saved) | **Preserved** | Programs using r1–r5 after call work on ATOS but break on Linux |
+| **r1–r5 after `call`** | Clobbered (caller-saved) | **Preserved** | Programs using r1–r5 after call work on TOS but break on Linux |
 
-The division-by-zero difference is a deliberate ATOS design choice: in a policy engine, silent corruption (returning 0 for a division) is worse than explicit failure. A program that divides by a potentially-zero value should guard with a `jeq` check before the `div`/`mod` instruction.
+The division-by-zero difference is a deliberate TOS design choice: in a policy engine, silent corruption (returning 0 for a division) is worse than explicit failure. A program that divides by a potentially-zero value should guard with a `jeq` check before the `div`/`mod` instruction.
 
 ### 17.5 Design rationale
 
-ATOS eBPF-lite intentionally does not aim for Linux eBPF compatibility. It borrows the bytecode encoding format for toolchain familiarity, but the runtime semantics serve a different purpose: **agent policy enforcement** rather than network/tracing programmability. The restricted feature set reflects ATOS's priorities of verifiable termination, minimal kernel complexity, and deterministic execution.
+TOS eBPF-lite intentionally does not aim for Linux eBPF compatibility. It borrows the bytecode encoding format for toolchain familiarity, but the runtime semantics serve a different purpose: **agent policy enforcement** rather than network/tracing programmability. The restricted feature set reflects TOS's priorities of verifiable termination, minimal kernel complexity, and deterministic execution.
 
 ---
 
@@ -1115,7 +1115,7 @@ All enhancements from Yellow Paper §25.2.7 and gap analysis have been implement
 | `src/capability.rs` | ~350 | Capability model including `PolicyLoad = 7` |
 | `src/event.rs` | ~240 | Audit subsystem including `EbpfPolicy = 22` event type |
 | `src/init.rs` | (lines 502–566) | Boot-time eBPF test programs |
-| `sdk/atos-ebpf-sdk/src/assembler.rs` | ~300 | Text-to-bytecode assembler |
-| `sdk/atos-ebpf-sdk/src/verifier.rs` | ~130 | Offline verifier (mirrors kernel) |
-| `sdk/atos-ebpf-sdk/src/disasm.rs` | ~100 | Bytecode disassembler |
-| `sdk/atos-ebpf-sdk/src/binary.rs` | ~80 | Binary serialization format |
+| `sdk/tos-ebpf-sdk/src/assembler.rs` | ~300 | Text-to-bytecode assembler |
+| `sdk/tos-ebpf-sdk/src/verifier.rs` | ~130 | Offline verifier (mirrors kernel) |
+| `sdk/tos-ebpf-sdk/src/disasm.rs` | ~100 | Bytecode disassembler |
+| `sdk/tos-ebpf-sdk/src/binary.rs` | ~80 | Binary serialization format |

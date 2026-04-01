@@ -1,6 +1,6 @@
 # Linux Runtime TODO / Task List
 
-Goal: move ATOS from "the syscall suite passes" to the shortest path that can genuinely start `java -version`, `node -e 'console.log(1)'`, and `python3 -c 'print(1)'`.
+Goal: move TOS from "the syscall suite passes" to the shortest path that can genuinely start `java -version`, `node -e 'console.log(1)'`, and `python3 -c 'print(1)'`.
 
 ## Completed Tasks
 

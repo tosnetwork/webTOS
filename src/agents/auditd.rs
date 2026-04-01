@@ -1,4 +1,4 @@
-//! ATOS auditd — Authority Audit Log Collection Agent (Stage 5)
+//! TOS auditd — Authority Audit Log Collection Agent (Stage 5)
 //!
 //! Collects AuthGrant/AuthDelegate/AuthRevoke/AuthRenew/AuthDeny events
 //! and maintains an in-memory audit log queryable via mailbox.

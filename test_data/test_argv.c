@@ -4,7 +4,7 @@
  * Build:
  *   gcc -nostdlib -static -Wl,-Ttext=0x40000000 -o test_argv.elf test_argv.c
  *
- * This runs on ATOS in LinuxCompat mode. All I/O via raw syscall.
+ * This runs on TOS in LinuxCompat mode. All I/O via raw syscall.
  */
 
 typedef unsigned long u64;
@@ -115,7 +115,7 @@ void _start(void) {
 
     u64 argc = stack[0];
 
-    print("=== ATOS argv/envp/auxv test ===\n");
+    print("=== TOS argv/envp/auxv test ===\n");
 
     /* Test 1: argc should be >= 1 */
     check("argc >= 1", argc >= 1);

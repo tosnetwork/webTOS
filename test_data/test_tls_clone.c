@@ -186,7 +186,7 @@ void _start(void) {
     u32 wstatus = 0;
     i64 self_tid = sys_gettid();
 
-    print("=== ATOS TLS/clone smoke test ===\n");
+    print("=== TOS TLS/clone smoke test ===\n");
 
     check("arch_prctl(SET_FS)", sys_arch_prctl(ARCH_SET_FS, parent_fs) == 0);
     check("arch_prctl(SET_GS)", sys_arch_prctl(ARCH_SET_GS, parent_gs) == 0);

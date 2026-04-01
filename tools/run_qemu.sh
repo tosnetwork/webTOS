@@ -1,8 +1,8 @@
 #!/bin/bash
-# Run ATOS kernel in QEMU with serial output to stdio
+# Run TOS kernel in QEMU with serial output to stdio
 set -e
 
-KERNEL="${1:-target/x86_64-unknown-none/debug/atos0}"
+KERNEL="${1:-target/x86_64-unknown-tos/debug/tos}"
 QEMU_MEMORY="${QEMU_MEMORY:-512M}"
 
 if [ ! -f "$KERNEL" ]; then

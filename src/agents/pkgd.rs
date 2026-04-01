@@ -1,4 +1,4 @@
-//! ATOS pkgd — Package Manager Agent
+//! TOS pkgd — Package Manager Agent
 //!
 //! System agent that manages the package lifecycle: install, uninstall,
 //! list, and upgrade `.tos` packages. Sits above skilld in the system

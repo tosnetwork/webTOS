@@ -1,4 +1,4 @@
-//! ATOS Capability Model
+//! TOS Capability Model
 //!
 //! Implements the capability-based authority system. No meaningful action
 //! succeeds unless the caller holds an appropriate capability.

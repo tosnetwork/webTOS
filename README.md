@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ATOS.png?v=2" alt="ATOS Logo" width="200">
+  <img src="TOS.png?v=2" alt="TOS Logo" width="200">
 </p>
 
 <p align="center">
@@ -15,13 +15,13 @@
 
 ---
 
-## What is ATOS?
+## What is TOS?
 
-ATOS is an **agent-first operating system** — no processes, no filesystem, no root user. All computation is an Agent. All authority is a Capability. All execution is provable.
+TOS is an **agent-first operating system** — no processes, no filesystem, no root user. All computation is an Agent. All authority is a Capability. All execution is provable.
 
-Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. ATOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
+Modern operating systems were designed for human-operated computing. Their core abstractions — files, shells, user IDs — served that era well. TOS starts from a different premise: **what would an OS look like if its primary users were AI agents?**
 
-| Traditional OS | ATOS |
+| Traditional OS | TOS |
 |----------------|------|
 | Processes and threads | **Agents** — autonomous units with energy budgets and parent-child hierarchy |
 | Files and filesystems | **Keyspaces** — per-agent key-value stores with Merkle proofs |
@@ -48,7 +48,7 @@ There is no superuser. Authority is a concrete Capability token — `SendMailbox
 
 ### Provable Execution
 
-This is what makes ATOS unique. In **ProofGrade** mode:
+This is what makes TOS unique. In **ProofGrade** mode:
 
 1. Start from a checkpoint
 2. Replay under a deterministic scheduler
@@ -71,7 +71,7 @@ Developers write WASM agents, sign them, publish to a registry. Users install sk
 
 ### The Analogy
 
-If Linux is a shared factory where anyone can walk in and use any machine, ATOS is a factory where **every worker operates in their own sealed chamber** — communicating only through message slots, powered by a metered energy supply, with a guard at every door checking credentials, watched by tamper-proof cameras. And any outsider can replay the footage to verify the work was done correctly.
+If Linux is a shared factory where anyone can walk in and use any machine, TOS is a factory where **every worker operates in their own sealed chamber** — communicating only through message slots, powered by a metered energy supply, with a guard at every door checking credentials, watched by tamper-proof cameras. And any outsider can replay the footage to verify the work was done correctly.
 
 ## Quickstart
 
@@ -93,8 +93,8 @@ brew install nasm qemu
 ### Build & Run
 
 ```bash
-git clone https://gitlab.com/atos-im/atos.git
-cd atos
+git clone https://gitlab.com/atos-im/tos.git
+cd tos
 make run
 ```
 
@@ -124,18 +124,18 @@ default manifest, point Cargo at a different manifest file:
 
 ```bash
 python3 tools/generate_runtime_manifest.py \
-  --output /tmp/atos-java.manifest \
+  --output /tmp/tos-java.manifest \
   --runtimes java \
   --java-home traced
 
-ATOS_RUNTIME_MANIFEST=/tmp/atos-java.manifest make run
+TOS_RUNTIME_MANIFEST=/tmp/tos-java.manifest make run
 ```
 
 You will see agents booting, communicating via mailboxes, and enforcing policies:
 
 ```
-ATOS boot ok
-ATOS v0.1 - AI-native Operating System
+TOS boot ok
+TOS v0.1 - AI-native Operating System
 [OK] Architecture initialized
 [OK] Scheduler initialized
 [EVENT seq=0 tick=0 agent=0 type=SYSTEM_BOOT arg0=0 arg1=0 status=0]
@@ -165,13 +165,13 @@ make test        # Single-node test with SMP + disk + network
 
 ```bash
 # Native agent (x86_64, #![no_std])
-cd sdk/atos-sdk && cargo build --target x86_64-unknown-none
+cd sdk/tos-sdk && cargo build --target x86_64-unknown-none
 
 # WASM agent (wasm32)
-cd sdk/atos-wasm-sdk && cargo build --target wasm32-unknown-unknown --release
+cd sdk/tos-wasm-sdk && cargo build --target wasm32-unknown-unknown --release
 
 # CLI tools (build, deploy, inspect, replay, verify)
-cd sdk/atos-cli && cargo build --release
+cd sdk/tos-cli && cargo build --release
 ```
 
 ## Learn More

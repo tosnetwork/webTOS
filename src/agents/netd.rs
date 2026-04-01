@@ -1,4 +1,4 @@
-//! ATOS netd — Network Broker Agent
+//! TOS netd — Network Broker Agent
 //!
 //! System agent that brokers all network access. Agents send HTTP-like
 //! requests via mailbox; netd validates, logs, and (when a network driver
@@ -87,7 +87,7 @@ fn get_mac() -> [u8; 6] {
 /// Build and send a test UDP packet:
 ///   Ethernet broadcast, IPv4, UDP
 ///   src=10.0.2.15:12345 -> dst=10.0.2.2:9999
-///   payload: b"ATOS NETD ALIVE"
+///   payload: b"TOS NETD ALIVE"
 fn send_test_packet(mac: [u8; 6]) {
     let mut packet = [0u8; 57]; // 14 (eth) + 20 (ip) + 8 (udp) + 15 (payload)
 
@@ -119,12 +119,12 @@ fn send_test_packet(mac: [u8; 6]) {
     packet[38..40].copy_from_slice(&udp_len.to_be_bytes());
     packet[40..42].copy_from_slice(&[0x00, 0x00]); // checksum (0 = skip)
 
-    // Payload: "ATOS NETD ALIVE"
-    packet[42..57].copy_from_slice(b"ATOS NETD ALIVE");
+    // Payload: "TOS NETD ALIVE"
+    packet[42..57].copy_from_slice(b"TOS NETD ALIVE");
 
     match send_raw(&packet) {
         Ok(()) => serial_println!(
-            "[NETD] Test packet sent! (UDP 10.0.2.15:12345 -> 10.0.2.2:9999, 'ATOS NETD ALIVE')"
+            "[NETD] Test packet sent! (UDP 10.0.2.15:12345 -> 10.0.2.2:9999, 'TOS NETD ALIVE')"
         ),
         Err(e) => serial_println!("[NETD] Test packet failed: {}", e),
     }
@@ -233,7 +233,7 @@ fn build_http_request(buf: &mut [u8], method: &str, host: &str, path: &str, body
     pos += copy_str(&mut buf[pos..], "Connection: close\r\n");
 
     // User-Agent
-    pos += copy_str(&mut buf[pos..], "User-Agent: ATOS-netd/1.0\r\n");
+    pos += copy_str(&mut buf[pos..], "User-Agent: TOS-netd/1.0\r\n");
 
     if !body.is_empty() {
         // Content-Length header

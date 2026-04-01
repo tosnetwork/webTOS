@@ -1,4 +1,4 @@
-//! ATOS Execution Proof
+//! TOS Execution Proof
 //!
 //! Generates and verifies cryptographic proofs that a specific event log
 //! was produced from a specific checkpoint state. Enables third-party

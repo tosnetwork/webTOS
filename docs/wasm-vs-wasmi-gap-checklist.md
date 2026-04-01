@@ -1,6 +1,6 @@
-# ATOS WASM vs wasmi: Gap Checklist
+# TOS WASM vs wasmi: Gap Checklist
 
-This document lists the remaining gaps between the current ATOS custom WASM implementation and a `wasmi`-grade library runtime.
+This document lists the remaining gaps between the current TOS custom WASM implementation and a `wasmi`-grade library runtime.
 
 The goal is not to replace the custom decoder / validator / executor path. The goal is to make the existing implementation comparable to `wasmi` in library quality, embeddability, engineering discipline, and release readiness.
 
@@ -16,7 +16,7 @@ The goal is not to replace the custom decoder / validator / executor path. The g
 
 To be "wasmi-grade", the project should be able to claim all of the following:
 
-- It can be consumed as a standalone Rust library, not only from inside ATOS.
+- It can be consumed as a standalone Rust library, not only from inside TOS.
 - It has a stable and documented embedding API.
 - It is warning-free under normal host builds without relying on subsystem-wide lint suppression.
 - It has strong unit, integration, spec, regression, and differential fuzz coverage.
@@ -28,7 +28,7 @@ To be "wasmi-grade", the project should be able to claim all of the following:
 - [ ] Define a user-facing API centered on concepts like `Engine`, `Module`, `Store`, `Instance`, and `Linker` or equivalent abstractions.
 - [ ] Stop exposing runtime internals as the primary integration surface.
 - [ ] Replace direct access to `WasmInstance` fields with typed methods and handle-based APIs.
-- [ ] Replace the ATOS-specific host import bridge with a generic host function registration and linking API.
+- [ ] Replace the TOS-specific host import bridge with a generic host function registration and linking API.
 - [ ] Separate user-facing error layers:
   - validation errors
   - instantiation/linking errors
@@ -136,7 +136,7 @@ To be "wasmi-grade", the project should be able to claim all of the following:
   - `std`
   - `no_std`
   - host-side test targets
-  - ATOS kernel integration target
+  - TOS kernel integration target
 - [ ] Add CI for:
   - formatting
   - clippy
@@ -162,7 +162,7 @@ To be "wasmi-grade", the project should be able to claim all of the following:
 
 ## Bottom Line
 
-Today, the ATOS WASM implementation is already a strong internal engine:
+Today, the TOS WASM implementation is already a strong internal engine:
 
 - correctness is strong
 - proposal coverage is ambitious

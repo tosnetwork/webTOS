@@ -1,12 +1,12 @@
 # Memory Subsystem Migration Plan
 
-This document tracks the staged migration of ATOS memory management toward a
-more scalable design while preserving ATOS-specific determinism and syscall
+This document tracks the staged migration of TOS memory management toward a
+more scalable design while preserving TOS-specific determinism and syscall
 structure.
 
 ## Goals
 
-- Keep ATOS architecture ownership and deterministic policies.
+- Keep TOS architecture ownership and deterministic policies.
 - Replace the current bitmap frame allocator with a buddy allocator.
 - Add per-frame metadata and reference counting.
 - Replace the current linked-list kernel heap allocator with slab-based

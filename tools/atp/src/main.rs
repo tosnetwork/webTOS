@@ -29,7 +29,7 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("atp - ATOS Package Tool");
+    println!("atp - TOS Package Tool");
     println!();
     println!("Usage: atp <command> [options]");
     println!();
@@ -382,6 +382,6 @@ fn cmd_inspect(args: &[String]) {
 
 fn cmd_list() {
     println!("Installed packages:");
-    println!("  (connect to ATOS kernel via pkgd to list installed packages)");
+    println!("  (connect to TOS kernel via pkgd to list installed packages)");
     println!("  (standalone listing not yet implemented)");
 }

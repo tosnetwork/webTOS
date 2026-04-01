@@ -9,7 +9,7 @@ Validate the Phase-5 Linux runtime path through the existing build/QEMU flow.
 
 Options:
   --runtime-manifest PATH   Host-specific runtime manifest to embed
-                            (default: $ATOS_RUNTIME_MANIFEST, otherwise
+                            (default: $TOS_RUNTIME_MANIFEST, otherwise
                             profile-specific defaults:
                             java -> base_image.runtime.manifest
                             python -> base_image.runtime.python.manifest
@@ -25,23 +25,23 @@ Options:
   -h, --help                Show this help
 
 The script expects the current repo layout and the existing single-node test
-image at /tmp/atos_test.img. It validates the runtime smoke markers that are
+image at /tmp/tos_test.img. It validates the runtime smoke markers that are
 already emitted by the root agent:
-  - Java:   [JAVA] launch line + ATOS-JAVA-JAR payload marker + clean exit
+  - Java:   [JAVA] launch line + TOS-JAVA-JAR payload marker + clean exit
   - Python: [PYTHON] launch line + runtime output "1" + clean exit
   - Node:   [NODE] launch line + runtime output "1" + clean exit
 
-Use ATOS_RUNTIME_MANIFEST to point the build at a chosen runtime manifest
+Use TOS_RUNTIME_MANIFEST to point the build at a chosen runtime manifest
 profile, or pass --runtime-manifest explicitly.
 EOF
 }
 
 profile="all"
-runtime_manifest="${ATOS_RUNTIME_MANIFEST:-}"
+runtime_manifest="${TOS_RUNTIME_MANIFEST:-}"
 qemu_timeout="${QEMU_TIMEOUT:-45}"
 qemu_memory="${QEMU_MEMORY:-512M}"
-runtime_focus="${ATOS_RUNTIME_SMOKE_FOCUS:-}"
-java_focus="${ATOS_JAVA_SMOKE_FOCUS:-}"
+runtime_focus="${TOS_RUNTIME_SMOKE_FOCUS:-}"
+java_focus="${TOS_JAVA_SMOKE_FOCUS:-}"
 image_path=""
 log_path=""
 build_only=0
@@ -134,10 +134,10 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-kernel_elf64="target/x86_64-unknown-atos/release/atos"
-kernel_elf32="target/atos_32.elf"
-default_image="/tmp/atos_phase5_runtime.img"
-default_log="/tmp/atos_phase5_runtime.log"
+kernel_elf64="target/x86_64-unknown-tos/release/tos"
+kernel_elf32="target/tos_32.elf"
+default_image="/tmp/tos_phase5_runtime.img"
+default_log="/tmp/tos_phase5_runtime.log"
 
 if [[ ! -f "$runtime_manifest" ]]; then
   echo "runtime manifest not found: $runtime_manifest" >&2
@@ -151,12 +151,12 @@ if [[ -z "$log_path" ]]; then
   log_path="$default_log"
 fi
 
-export ATOS_RUNTIME_MANIFEST="$runtime_manifest"
-export ATOS_RUNTIME_SMOKE_FOCUS="$runtime_focus"
-export ATOS_JAVA_SMOKE_FOCUS="$java_focus"
+export TOS_RUNTIME_MANIFEST="$runtime_manifest"
+export TOS_RUNTIME_SMOKE_FOCUS="$runtime_focus"
+export TOS_JAVA_SMOKE_FOCUS="$java_focus"
 
-echo "[phase5] build: ATOS_RUNTIME_MANIFEST=$ATOS_RUNTIME_MANIFEST ATOS_RUNTIME_SMOKE_FOCUS=$ATOS_RUNTIME_SMOKE_FOCUS ATOS_JAVA_SMOKE_FOCUS=$ATOS_JAVA_SMOKE_FOCUS"
-cargo build --release --target x86_64-unknown-atos.json
+echo "[phase5] build: TOS_RUNTIME_MANIFEST=$TOS_RUNTIME_MANIFEST TOS_RUNTIME_SMOKE_FOCUS=$TOS_RUNTIME_SMOKE_FOCUS TOS_JAVA_SMOKE_FOCUS=$TOS_JAVA_SMOKE_FOCUS"
+cargo build --release --target x86_64-unknown-tos.json
 
 objcopy -I elf64-x86-64 -O elf32-i386 "$kernel_elf64" "$kernel_elf32"
 
@@ -165,12 +165,12 @@ if [[ "$build_only" -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ! -f /tmp/atos_test.img ]]; then
-  echo "missing base disk image: /tmp/atos_test.img" >&2
+if [[ ! -f /tmp/tos_test.img ]]; then
+  echo "missing base disk image: /tmp/tos_test.img" >&2
   exit 1
 fi
 
-cp /tmp/atos_test.img "$image_path"
+cp /tmp/tos_test.img "$image_path"
 
 qemu_exit=0
 timeout "$qemu_timeout" \
@@ -268,11 +268,11 @@ PY
 }
 
 require_line '=== Results: 67 passed, 0 failed out of 62 syscalls ==='
-require_line 'ATOS-SIGNAL-OK'
+require_line 'TOS-SIGNAL-OK'
 
 case "$profile" in
   java)
-    require_line 'ATOS-JAVA-JAR payload=jar-ok'
+    require_line 'TOS-JAVA-JAR payload=jar-ok'
     require_line '\[linux_compat\] exit_group: agent=[0-9]+ status=0'
     ;;
   python)
@@ -291,7 +291,7 @@ case "$profile" in
     require_line_after '\[PYTHON\] launching /usr/bin/python3( -S)? -c print\(1\)' '^1$'
     require_line '\[NODE\] launching /usr/bin/node -e console\.log\(1\)'
     require_line_after '\[NODE\] launching /usr/bin/node -e console\.log\(1\)' '^1$'
-    require_line 'ATOS-JAVA-JAR payload=jar-ok'
+    require_line 'TOS-JAVA-JAR payload=jar-ok'
     require_line_after '\[NODE\] launching /usr/bin/node -e console\.log\(1\)' '\[linux_compat\] exit_group: agent=[0-9]+ status=0'
     require_no_line_after '\[NODE\] launching /usr/bin/node -e console\.log\(1\)' 'terminated by SIG|exit_group: agent=[0-9]+ status=134'
     ;;

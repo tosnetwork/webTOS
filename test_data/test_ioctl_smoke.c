@@ -139,7 +139,7 @@ void _start(void) {
     unsigned char stat_buf[144];
     u32 st_mode = 0;
 
-    print("=== ATOS ioctl smoke test ===\n");
+    print("=== TOS ioctl smoke test ===\n");
 
     i64 fd = sys_openat(AT_FDCWD, hello_path, O_RDONLY, 0);
     check("openat(/usr/bin/hello_dynamic)", fd >= 0);

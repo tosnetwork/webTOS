@@ -1,13 +1,13 @@
-//! ATOS Execution Receipt Verifier SDK
+//! TOS Execution Receipt Verifier SDK
 //!
-//! This library allows third parties to verify ATOS execution receipts
+//! This library allows third parties to verify TOS execution receipts
 //! without trusting the originating node.
 
 use sha2::{Sha256, Digest};
 
 pub type Hash256 = [u8; 32];
 
-/// Runtime class tags matching ATOS kernel's RuntimeClassTag.
+/// Runtime class tags matching TOS kernel's RuntimeClassTag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RuntimeClass {

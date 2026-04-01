@@ -1,8 +1,8 @@
 .PHONY: build run release clean debug test test-crossnode
 
-KERNEL_DEBUG = target/x86_64-unknown-atos/debug/atos
-KERNEL_RELEASE = target/x86_64-unknown-atos/release/atos
-KERNEL_ELF32 = target/atos_32.elf
+KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
+KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
+KERNEL_ELF32 = target/tos_32.elf
 QEMU_MEMORY ?= 512M
 
 build:
@@ -25,7 +25,7 @@ test: build
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
 	timeout 8 qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) \
 		-device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
-		-drive file=/tmp/atos_test.img,format=raw,if=ide \
+		-drive file=/tmp/tos_test.img,format=raw,if=ide \
 		-no-reboot -no-shutdown 2>&1 | head -50
 
 test-crossnode:
@@ -34,7 +34,7 @@ test-crossnode:
 # ─── UEFI targets ─────────────────────────────────────────────
 OVMF = /usr/share/ovmf/OVMF.fd
 ESP_DIR = target/esp
-UEFI_EFI = uefi/target/x86_64-unknown-uefi/release/atos-uefi.efi
+UEFI_EFI = uefi/target/x86_64-unknown-uefi/release/tos-uefi.efi
 
 uefi-build: build
 	cd uefi && cargo build --release
@@ -55,7 +55,7 @@ uefi-test: uefi-build
 		-serial stdio -display none -no-reboot -no-shutdown 2>&1 | head -40
 
 # ─── VirtualBox / USB disk image ──────────────────────────────
-UEFI_IMG = target/atos-uefi.img
+UEFI_IMG = target/tos-uefi.img
 
 uefi-img: uefi-build
 	@echo "Creating UEFI boot disk image..."

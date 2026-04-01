@@ -1,4 +1,4 @@
-//! ATOS Mailbox IPC
+//! TOS Mailbox IPC
 //!
 //! Implements bounded message queues for inter-agent communication.
 //! Each agent owns exactly one mailbox in Stage-1 (1:1 binding).

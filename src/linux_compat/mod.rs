@@ -1,5 +1,5 @@
 //! Deterministic Linux Syscall Compatibility Layer
-//! Translates Linux x86_64 syscalls to ATOS deterministic primitives.
+//! Translates Linux x86_64 syscalls to TOS deterministic primitives.
 
 pub mod constants;
 pub mod dispatch;

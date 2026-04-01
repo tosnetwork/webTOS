@@ -1,4 +1,4 @@
-//! ATOS x86_64 Timer (PIT)
+//! TOS x86_64 Timer (PIT)
 //!
 //! Programs the 8254 PIT channel 0 for periodic interrupts at ~100 Hz.
 //! Maintains a monotonic tick counter incremented by the timer ISR.

@@ -1,7 +1,7 @@
-// ATOS x86_64 Architecture Layer
+// TOS x86_64 Architecture Layer
 //
 // Provides GDT, IDT, serial I/O, paging, timer, and context switching
-// for the ATOS kernel running on x86_64 (QEMU target).
+// for the TOS kernel running on x86_64 (QEMU target).
 
 pub mod acpi;
 pub mod ata;

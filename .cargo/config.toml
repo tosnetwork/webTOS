@@ -1,11 +1,11 @@
 [build]
-target = "x86_64-unknown-atos.json"
+target = "x86_64-unknown-tos.json"
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
 
-[target.'cfg(target_os = "atos")']
+[target.'cfg(target_os = "tos")']
 runner = "qemu-system-x86_64 -serial stdio -display none -no-reboot -no-shutdown -kernel"
 rustflags = ["--cfg", "curve25519_dalek_backend=\"fiat\""]

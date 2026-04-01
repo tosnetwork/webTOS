@@ -1,4 +1,4 @@
-//! ATOS Persistent State Store
+//! TOS Persistent State Store
 //!
 //! Append-only log on disk with in-memory index for fast lookups.
 //! Each log entry: [sequence: u64, keyspace_id: u16, key: u64, len: u16,
@@ -6,7 +6,7 @@
 //!
 //! Falls back to in-memory-only storage when no disk is present.
 //!
-//! Reference: ATOS Yellow Paper §24.5.
+//! Reference: TOS Yellow Paper §24.5.
 
 use crate::agent::{
     KeyspaceId, E_INVALID_ARG, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE, E_QUOTA_EXCEEDED, MAX_AGENTS,
@@ -497,7 +497,7 @@ pub fn state_put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64
 // Sector  1153:          package header  (magic + count)
 // Sectors 1154..1185:    package data    (32 manifests x 1 sector each)
 
-const PERSIST_MAGIC: u32 = 0x41544F53; // "ATOS"
+const PERSIST_MAGIC: u32 = 0x41544F53; // "TOS"
 const RECEIPT_HEADER_SECTOR: u64 = 1024;
 const RECEIPT_DATA_START: u64 = 1025;
 const RECEIPT_SECTORS_EACH: u64 = 2; // each receipt spans 2 sectors (1024 bytes)

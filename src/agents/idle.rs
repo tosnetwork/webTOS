@@ -1,4 +1,4 @@
-//! ATOS Idle Agent
+//! TOS Idle Agent
 //!
 //! The idle agent runs when no other agent is in the Ready state.
 //! It executes an infinite HLT loop, allowing the CPU to enter a

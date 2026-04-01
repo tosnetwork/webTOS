@@ -1,8 +1,8 @@
 [package]
-name = "atos-verifier"
+name = "tos-verifier"
 version = "0.1.0"
 edition = "2021"
-description = "ATOS Execution Receipt verifier library"
+description = "TOS Execution Receipt verifier library"
 
 [workspace]
 
@@ -10,5 +10,5 @@ description = "ATOS Execution Receipt verifier library"
 sha2 = "0.10"
 
 [lib]
-name = "atos_verifier"
+name = "tos_verifier"
 path = "src/lib.rs"

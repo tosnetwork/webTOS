@@ -17,7 +17,7 @@ final class JavaThreadSmoke {
                 }
                 total.addAndGet(local);
                 done.countDown();
-            }, "atos-java-" + id);
+            }, "tos-java-" + id);
             thread.start();
         }
 
@@ -35,10 +35,10 @@ final class JavaThreadSmoke {
         long actual = total.get();
         if (actual != expected) {
             System.out.println(
-                    "ATOS-JAVA-THREAD-FAIL total=" + actual + " expected=" + expected);
+                    "TOS-JAVA-THREAD-FAIL total=" + actual + " expected=" + expected);
             System.exit(1);
         }
 
-        System.out.println("ATOS-JAVA-THREAD-OK total=" + actual);
+        System.out.println("TOS-JAVA-THREAD-OK total=" + actual);
     }
 }

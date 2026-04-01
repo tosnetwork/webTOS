@@ -1,4 +1,4 @@
-//! ATOS x86_64 Paging and Frame Allocation
+//! TOS x86_64 Paging and Frame Allocation
 //!
 //! Provides page-table management together with a buddy-backed physical frame
 //! allocator for 4 KiB pages.
@@ -475,7 +475,7 @@ fn create_address_space_inner(copy_low_identity: bool) -> Option<u64> {
     Some(pml4_phys)
 }
 
-/// Create a new independent page table hierarchy for a native/ATOS agent.
+/// Create a new independent page table hierarchy for a native/TOS agent.
 ///
 /// This preserves the historical low 1 GiB identity window.
 pub fn create_address_space() -> Option<u64> {
@@ -614,7 +614,7 @@ pub fn translate_virt(pml4_phys: u64, vaddr: u64) -> Option<u64> {
 pub fn destroy_address_space(pml4_phys: u64) {
     let pml4 = phys_to_const_ptr::<u64>(pml4_phys);
     unsafe {
-        // Free every lower-half PML4 entry. All ATOS user mappings currently
+        // Free every lower-half PML4 entry. All TOS user mappings currently
         // live under the low canonical half, including the per-agent copy of
         // PML4[0] that carries the 1 GiB identity window plus any user PTs we
         // allocate under it.

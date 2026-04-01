@@ -1,18 +1,18 @@
-# ATOS Package Manager — Design Document
+# TOS Package Manager — Design Document
 
 **Status:** Design Document
 **Companion to:** Yellow Paper §27.4 (Stage-7)
 **Depends on:** skilld agent, WASM engine integration, Ristretto integration
 
-> This document defines `atp` — the ATOS package manager. It plays the same role as `apt` on Debian or `cargo install` in Rust, but built on ATOS primitives: agents, capabilities, keyspaces, and cryptographic verification.
+> This document defines `atp` — the TOS package manager. It plays the same role as `apt` on Debian or `cargo install` in Rust, but built on TOS primitives: agents, capabilities, keyspaces, and cryptographic verification.
 
 ---
 
 ## 1. Why Not Just apt
 
-apt solves packaging for a shared-everything OS. ATOS is a shared-nothing OS. The problems are fundamentally different:
+apt solves packaging for a shared-everything OS. TOS is a shared-nothing OS. The problems are fundamentally different:
 
-| apt problem | ATOS non-problem |
+| apt problem | TOS non-problem |
 |-------------|-----------------|
 | Dependency resolution (libssl 1.1 vs 3.0) | Agents are self-contained, no shared libraries |
 | File conflicts (/usr/bin/python) | No filesystem, no path collisions |
@@ -20,11 +20,11 @@ apt solves packaging for a shared-everything OS. ATOS is a shared-nothing OS. Th
 | Partial upgrade leaving broken state | Atomic: new agent succeeds or old agent stays |
 | Rollback requires snapshot of entire system | Checkpoint single agent + its keyspace |
 
-ATOS needs a package manager not for dependency management, but for **lifecycle management**: install, upgrade, rollback, verify, and uninstall agents with signed provenance and capability control.
+TOS needs a package manager not for dependency management, but for **lifecycle management**: install, upgrade, rollback, verify, and uninstall agents with signed provenance and capability control.
 
 ## 2. Package Format: `.tos`
 
-An ATOS package is a simple archive containing a manifest and one or more binaries:
+An TOS package is a simple archive containing a manifest and one or more binaries:
 
 ```
 my-agent-1.2.0.tos
@@ -52,7 +52,7 @@ pubkey = "ed25519:AAAA..."         # public key for signature verification
 capabilities = ["Network", "StateWrite"]   # capabilities the agent needs
 energy = 100000                            # minimum energy budget to run
 memory_pages = 64                          # memory quota (pages)
-atos_version = ">=2.0"                     # minimum ATOS kernel version
+tos_version = ">=2.0"                     # minimum TOS kernel version
 
 [upgrade]
 from_versions = ["1.0.0", "1.1.0"]        # versions this can upgrade from
@@ -144,7 +144,7 @@ Uninstall:
 
 ## 4. CLI Tool: `atp`
 
-Runs on the developer's machine (Linux/macOS), communicates with ATOS via serial or network.
+Runs on the developer's machine (Linux/macOS), communicates with TOS via serial or network.
 
 ```bash
 # Build a package from source
@@ -155,7 +155,7 @@ atp build ./my-agent/
 atp sign my-agent-1.2.0.tos --key ~/.tos/signing-key.ed25519
 # → signature.ed25519 embedded in package
 
-# Install to a running ATOS instance
+# Install to a running TOS instance
 atp install my-agent-1.2.0.tos --target serial:/dev/ttyUSB0
 atp install my-agent-1.2.0.tos --target udp:192.168.1.100:9000
 
@@ -165,7 +165,7 @@ atp upgrade web-search --target udp:192.168.1.100:9000
 atp rollback web-search --target serial:/dev/ttyUSB0
 atp uninstall web-search --target serial:/dev/ttyUSB0
 
-# Verify a package offline (no ATOS instance needed)
+# Verify a package offline (no TOS instance needed)
 atp verify my-agent-1.2.0.tos --pubkey alice.pub
 ```
 
@@ -246,7 +246,7 @@ Registry is a simple content-addressed store:
 
 ## 7. Comparison with Linux Package Managers
 
-| Feature | apt (Debian) | atp (ATOS) |
+| Feature | apt (Debian) | atp (TOS) |
 |---------|-------------|-------------|
 | Dependency resolution | Complex (SAT solver) | **None needed** (self-contained agents) |
 | Shared libraries | Yes (DLL hell) | **No** (agents are isolated) |

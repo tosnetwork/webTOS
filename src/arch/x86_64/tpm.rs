@@ -1,4 +1,4 @@
-//! TPM 2.0 CRB (Command Response Buffer) driver for ATOS.
+//! TPM 2.0 CRB (Command Response Buffer) driver for TOS.
 //!
 //! Accesses the TPM via MMIO at the standard PC CRB address (0xFED40000).
 //! Supports PCR extend and read operations for measured boot.

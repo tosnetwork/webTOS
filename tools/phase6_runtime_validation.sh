@@ -23,7 +23,7 @@ EOF
 }
 
 profile="all"
-runtime_manifest="${ATOS_RUNTIME_MANIFEST:-}"
+runtime_manifest="${TOS_RUNTIME_MANIFEST:-}"
 qemu_timeout="${QEMU_TIMEOUT:-60}"
 qemu_memory="${QEMU_MEMORY:-}"
 image_path=""
@@ -122,19 +122,19 @@ validate_phase6_log() {
 
   case "$current_profile" in
     java)
-      require_line 'ATOS-JAVA-JAR payload=jar-ok' "$log"
-      require_line 'ATOS-JAVA-CHILD line=.* status=0' "$log"
-      require_line 'ATOS-JAVA-THREAD-OK total=[0-9]+' "$log"
+      require_line 'TOS-JAVA-JAR payload=jar-ok' "$log"
+      require_line 'TOS-JAVA-CHILD line=.* status=0' "$log"
+      require_line 'TOS-JAVA-THREAD-OK total=[0-9]+' "$log"
       ;;
     python)
       require_line '\[PYTHON\] launching python child-process smoke' "$log"
-      require_line 'ATOS-PY-CHILD exit=7 status=0' "$log"
+      require_line 'TOS-PY-CHILD exit=7 status=0' "$log"
       ;;
     node)
       require_line '\[NODE\] launching node child-process smoke' "$log"
-      require_line 'ATOS-NODE-CHILD stdout=7 status=0' "$log"
+      require_line 'TOS-NODE-CHILD stdout=7 status=0' "$log"
       require_line '\[NODE\] launching node thread smoke' "$log"
-      require_line 'ATOS-NODE-THREAD-OK total=[0-9]+' "$log"
+      require_line 'TOS-NODE-THREAD-OK total=[0-9]+' "$log"
       ;;
     *)
       echo "unknown profile: $current_profile" >&2
@@ -156,14 +156,14 @@ run_profile() {
     qemu_memory="$(default_memory_for_profile "$current_profile")"
   fi
   if [[ -z "$current_image" ]]; then
-    current_image="/tmp/atos_phase6_${current_profile}.img"
+    current_image="/tmp/tos_phase6_${current_profile}.img"
   fi
   if [[ -z "$current_log" ]]; then
-    current_log="/tmp/atos_phase6_${current_profile}.log"
+    current_log="/tmp/tos_phase6_${current_profile}.log"
   fi
 
   if [[ "$current_profile" == "java" ]]; then
-    ATOS_JAVA_SMOKE_FOCUS="${ATOS_JAVA_SMOKE_FOCUS:-phase6}" \
+    TOS_JAVA_SMOKE_FOCUS="${TOS_JAVA_SMOKE_FOCUS:-phase6}" \
       tools/phase5_runtime_validation.sh \
         --profile "$current_profile" \
         --runtime-manifest "$current_manifest" \

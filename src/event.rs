@@ -1,4 +1,4 @@
-//! ATOS Event Log / Audit Subsystem
+//! TOS Event Log / Audit Subsystem
 //!
 //! Emits structured audit events over serial output. Every significant
 //! kernel action produces an event with a monotonic sequence number.

@@ -1,6 +1,6 @@
 //! Signal-related Linux syscall implementations.
 //!
-//! In ATOS, signals are rarely delivered (no real SIGCHLD, SIGPIPE, etc.),
+//! In TOS, signals are rarely delivered (no real SIGCHLD, SIGPIPE, etc.),
 //! so this is mostly bookkeeping to satisfy programs that call rt_sigaction
 //! and rt_sigprocmask during initialization.
 
@@ -636,7 +636,7 @@ const SIGACTION_SIZE: usize = 32;
 
 /// rt_sigaction(2) -- Examine and change a signal action.
 ///
-/// For ATOS: signals are rarely delivered, so this is mostly bookkeeping.
+/// For TOS: signals are rarely delivered, so this is mostly bookkeeping.
 /// Programs call this during init to register handlers for SIGCHLD, SIGPIPE, etc.
 pub fn sys_rt_sigaction(
     agent_id: u16,
@@ -1032,7 +1032,7 @@ fn restore_from_user_signal_frame(agent_id: u16) -> Result<i64, i64> {
 
 /// rt_sigreturn(2) -- Return from signal handler.
 ///
-/// Restores the saved user context from the synthetic ATOS user-signal frame.
+/// Restores the saved user context from the synthetic TOS user-signal frame.
 pub fn sys_rt_sigreturn(agent_id: u16) -> i64 {
     match restore_from_user_signal_frame(agent_id) {
         Ok(saved_rax) => saved_rax,

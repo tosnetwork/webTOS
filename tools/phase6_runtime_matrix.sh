@@ -7,8 +7,8 @@ cd "$repo_root"
 run_profile() {
   local profile="$1"
   local timeout="${2:-60}"
-  local image="/tmp/atos_phase6_${profile}.img"
-  local log="/tmp/atos_phase6_${profile}.log"
+  local image="/tmp/tos_phase6_${profile}.img"
+  local log="/tmp/tos_phase6_${profile}.log"
 
   echo "[phase6-matrix] running profile=${profile} timeout=${timeout}s"
   tools/phase6_runtime_validation.sh \

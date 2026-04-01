@@ -2,7 +2,7 @@
 name = "atp"
 version = "0.1.0"
 edition = "2021"
-description = "ATOS Package Tool - build, sign, install, and manage .tos packages"
+description = "TOS Package Tool - build, sign, install, and manage .tos packages"
 
 [workspace]
 

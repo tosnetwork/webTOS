@@ -1,6 +1,6 @@
-# ATOS Use Cases
+# TOS Use Cases
 
-ATOS is a minimal trusted execution substrate for autonomous agents. It is not a general-purpose operating system. Its value comes from a unique combination of capabilities that no single existing platform provides together:
+TOS is a minimal trusted execution substrate for autonomous agents. It is not a general-purpose operating system. Its value comes from a unique combination of capabilities that no single existing platform provides together:
 
 - Deterministic execution with cryptographic receipts
 - Capability-based agent isolation
@@ -18,11 +18,11 @@ This document describes 13 application scenarios where these capabilities provid
 
 **Problem**: AI agents (LangChain, AutoGPT, custom models) run in opaque environments. Clients cannot verify what the agent actually did, whether it consumed the claimed resources, or whether the output is authentic.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 User → deploys AI agent as WASM package (.tos)
-ATOS → executes in ProofGrade mode (deterministic, no floats/SIMD)
+TOS → executes in ProofGrade mode (deterministic, no floats/SIMD)
      → generates ExecutionReceipt with:
        - code_hash (what ran)
        - input_commitment / output_commitment (what went in and came out)
@@ -32,11 +32,11 @@ ATOS → executes in ProofGrade mode (deterministic, no floats/SIMD)
 Third party → verifies receipt offline without re-executing
 ```
 
-**Example**: A legal tech company deploys an AI contract review agent. The client submits a 50-page contract as input. ATOS runs the agent in ProofGrade mode, producing a receipt that proves: the exact model version `code_hash=0xA3F2...` processed input `input_commitment=0x7B01...`, consumed 340,000 energy units, and produced output `output_commitment=0xE891...`. The client's auditor verifies the receipt with the verifier SDK — no need to re-run the model or trust the provider's infrastructure.
+**Example**: A legal tech company deploys an AI contract review agent. The client submits a 50-page contract as input. TOS runs the agent in ProofGrade mode, producing a receipt that proves: the exact model version `code_hash=0xA3F2...` processed input `input_commitment=0x7B01...`, consumed 340,000 energy units, and produced output `output_commitment=0xE891...`. The client's auditor verifies the receipt with the verifier SDK — no need to re-run the model or trust the provider's infrastructure.
 
 **Target users**: AI SaaS providers, enterprise AI automation, AI auditing platforms.
 
-**Key ATOS features used**: RuntimeClass (ProofGrade), ExecutionReceipt, Ed25519 signing, fuel metering.
+**Key TOS features used**: RuntimeClass (ProofGrade), ExecutionReceipt, Ed25519 signing, fuel metering.
 
 ---
 
@@ -44,23 +44,23 @@ Third party → verifies receipt offline without re-executing
 
 **Problem**: Decentralized compute networks (Akash, Golem, Flux) lack fine-grained, verifiable billing. Providers can overcharge; requesters can dispute without evidence.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
-Compute provider → runs ATOS nodes
+Compute provider → runs TOS nodes
 Requester → submits WASM workload + energy budget
-ATOS → executes with fuel metering
+TOS → executes with fuel metering
      → produces receipt (energy_used, pricing_class, state transition proof)
 Requester → verifies receipt, settles payment based on actual consumption
 ```
 
 No blockchain consensus needed for billing — the receipt itself is the verifiable invoice. Cheaper than Ethereum (no global re-execution), more trustworthy than AWS Lambda (cryptographic proof of execution).
 
-**Example**: A machine learning team submits a feature engineering WASM module to a compute marketplace. They pre-pay 1,000,000 energy units. The ATOS node executes the module, consuming 847,293 energy units. The receipt shows `energy_used=847293`, `pricing_class=2` (ProofGradeWasm). The quotad agent estimated 900,000 before execution — close to actual. The team pays only for 847,293 units. The billingd agent aggregates this into their monthly invoice, keyed by their `principal_id`.
+**Example**: A machine learning team submits a feature engineering WASM module to a compute marketplace. They pre-pay 1,000,000 energy units. The TOS node executes the module, consuming 847,293 energy units. The receipt shows `energy_used=847293`, `pricing_class=2` (ProofGradeWasm). The quotad agent estimated 900,000 before execution — close to actual. The team pays only for 847,293 units. The billingd agent aggregates this into their monthly invoice, keyed by their `principal_id`.
 
 **Target users**: Decentralized compute networks, pay-per-use AI inference, edge compute billing.
 
-**Key ATOS features used**: FuelCosts (dynamic metering), ExecutionReceipt, quotad (cost estimation), billingd (settlement).
+**Key TOS features used**: FuelCosts (dynamic metering), ExecutionReceipt, quotad (cost estimation), billingd (settlement).
 
 ---
 
@@ -68,12 +68,12 @@ No blockchain consensus needed for billing — the receipt itself is the verifia
 
 **Problem**: Financial and healthcare computation must prove it followed specific rules. Current systems rely on trust in the operator, not cryptographic evidence.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Regulator → defines policy bundle (eBPF rules + authority roots)
-Enterprise → runs regulated computation on ATOS
-ATOS → enforces policy at every capability check
+Enterprise → runs regulated computation on TOS
+TOS → enforces policy at every capability check
      → emits authority audit trail (AuthGrant/AuthDeny/AuthRevoke events)
      → generates receipt with policy_bundle_hash + policy_decision_commitment
 Regulator → verifies receipt + audit trail offline
@@ -81,11 +81,11 @@ Regulator → verifies receipt + audit trail offline
 
 The receipt proves: this code ran, under this policy, with this authority, producing this state change. No need to trust the operator's word.
 
-**Example**: A bank runs an anti-money-laundering (AML) screening agent on ATOS. The regulator provides a policy bundle that restricts the agent to: read-only access to the transaction keyspace, no network capability, 60-second execution timeout (energy limit). ATOS enforces these rules — the agent cannot `sys_send` because it lacks `SendMailbox` capability. After execution, the receipt includes `policy_bundle_hash=0x9C44...` and the auditd log shows exactly which capabilities were checked and whether each was granted or denied. The regulator's compliance tool verifies the receipt against the known-good policy hash.
+**Example**: A bank runs an anti-money-laundering (AML) screening agent on TOS. The regulator provides a policy bundle that restricts the agent to: read-only access to the transaction keyspace, no network capability, 60-second execution timeout (energy limit). TOS enforces these rules — the agent cannot `sys_send` because it lacks `SendMailbox` capability. After execution, the receipt includes `policy_bundle_hash=0x9C44...` and the auditd log shows exactly which capabilities were checked and whether each was granted or denied. The regulator's compliance tool verifies the receipt against the known-good policy hash.
 
 **Target users**: Financial institutions, healthcare data processing, government compliance systems.
 
-**Key ATOS features used**: PolicyBundle, authd/auditd, capability leases with expiry, receipt authority_commitment.
+**Key TOS features used**: PolicyBundle, authd/auditd, capability leases with expiry, receipt authority_commitment.
 
 ---
 
@@ -93,22 +93,22 @@ The receipt proves: this code ran, under this policy, with this authority, produ
 
 **Problem**: AI inference on edge devices (autonomous vehicles, IoT, defense) must prove the model ran correctly and was not tampered with. Edge devices cannot run full Linux + container stacks.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Cloud → packages AI model as signed .tos WASM package
-Edge device → boots ATOS (bare metal, no Linux, ~100KB kernel)
+Edge device → boots TOS (bare metal, no Linux, ~100KB kernel)
            → ProofGrade execution + generates receipt
 Cloud → verifies inference result authenticity via receipt
 ```
 
-ATOS boots in milliseconds on bare metal, runs WASM with deterministic execution, and produces a cryptographic receipt — all without an OS, container runtime, or network dependency.
+TOS boots in milliseconds on bare metal, runs WASM with deterministic execution, and produces a cryptographic receipt — all without an OS, container runtime, or network dependency.
 
-**Example**: An autonomous vehicle manufacturer deploys a pedestrian detection model on edge compute units inside each vehicle. The model is compiled to WASM, signed with Ed25519 (`atp build model.wasm -o detector.tos && atp sign detector.tos`), and installed via pkgd. Every inference run produces a receipt with `code_hash` matching the signed package. After an incident, the manufacturer can prove to regulators: "This exact model version ran, on an attested device (TPM PCR 0 = kernel hash), and produced this classification output at tick 47,291." The TPM measured boot chain proves the ATOS kernel itself was unmodified.
+**Example**: An autonomous vehicle manufacturer deploys a pedestrian detection model on edge compute units inside each vehicle. The model is compiled to WASM, signed with Ed25519 (`atp build model.wasm -o detector.tos && atp sign detector.tos`), and installed via pkgd. Every inference run produces a receipt with `code_hash` matching the signed package. After an incident, the manufacturer can prove to regulators: "This exact model version ran, on an attested device (TPM PCR 0 = kernel hash), and produced this classification output at tick 47,291." The TPM measured boot chain proves the TOS kernel itself was unmodified.
 
 **Target users**: Autonomous vehicle verification, IoT secure inference, aerospace/defense.
 
-**Key ATOS features used**: no_std bare-metal boot, wasbi (WASM engine), ProofGrade RuntimeClass, UEFI boot, TPM 2.0 measured boot, .tos signed packages.
+**Key TOS features used**: no_std bare-metal boot, wasbi (WASM engine), ProofGrade RuntimeClass, UEFI boot, TPM 2.0 measured boot, .tos signed packages.
 
 ---
 
@@ -116,12 +116,12 @@ ATOS boots in milliseconds on bare metal, runs WASM with deterministic execution
 
 **Problem**: Multiple parties need to compute on private data and share results, but neither party trusts the other's execution environment.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Party A → submits agent (processes A's private data in encrypted keyspace)
 Party B → submits agent (processes B's private data in encrypted keyspace)
-ATOS → executes both in isolated keyspaces (capability prevents cross-access)
+TOS → executes both in isolated keyspaces (capability prevents cross-access)
      → agents exchange results via mailbox (no direct memory access)
      → each party receives the other's ExecutionReceipt as evidence
      → neither party sees the other's raw data
@@ -129,11 +129,11 @@ ATOS → executes both in isolated keyspaces (capability prevents cross-access)
 
 Agent isolation (capability-scoped access) + encrypted keyspaces + receipts provide a lightweight multi-party computation framework without MPC protocols or TEE hardware.
 
-**Example**: Hospital A and Hospital B want to jointly train a disease prediction model without sharing patient records. Each hospital deploys an agent on ATOS that computes gradient updates from their local data (stored in their encrypted keyspace). The agents exchange only aggregated gradients via mailbox — never raw patient data. Each round produces two receipts. Hospital A can verify Hospital B's receipt to confirm: the correct model code ran (`code_hash`), the state changed as expected (`final_state_root`), and the computation consumed the agreed energy budget. Neither hospital can read the other's keyspace because neither holds the `StateRead` capability for the other's keyspace.
+**Example**: Hospital A and Hospital B want to jointly train a disease prediction model without sharing patient records. Each hospital deploys an agent on TOS that computes gradient updates from their local data (stored in their encrypted keyspace). The agents exchange only aggregated gradients via mailbox — never raw patient data. Each round produces two receipts. Hospital A can verify Hospital B's receipt to confirm: the correct model code ran (`code_hash`), the state changed as expected (`final_state_root`), and the computation consumed the agreed energy budget. Neither hospital can read the other's keyspace because neither holds the `StateRead` capability for the other's keyspace.
 
 **Target users**: Federated learning, cross-institutional data collaboration, privacy-preserving analytics.
 
-**Key ATOS features used**: Capability isolation, encrypted keyspaces, mailbox IPC, ExecutionReceipt.
+**Key TOS features used**: Capability isolation, encrypted keyspaces, mailbox IPC, ExecutionReceipt.
 
 ---
 
@@ -141,11 +141,11 @@ Agent isolation (capability-scoped access) + encrypted keyspaces + receipts prov
 
 **Problem**: Layer 1 blockchains cannot scale complex computation on-chain. Every validator re-executing every transaction is the bottleneck.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
-gtos L1 → submits complex computation to ATOS execution node
-ATOS → ProofGrade WASM execution
+gtos L1 → submits complex computation to TOS execution node
+TOS → ProofGrade WASM execution
      → generates ExecutionReceipt with:
        - initial_state_root (Merkle root before)
        - final_state_root (Merkle root after)
@@ -155,13 +155,13 @@ gtos → verifies receipt (fast: check signature + state roots)
      → on-chain: verify proof in O(1), no re-execution needed
 ```
 
-This is ATOS's most strategic use case. The ExecutionReceipt format is designed to feed directly into gtos's Halo 2 proving pipeline. ATOS provides the trusted execution; gtos provides the consensus and settlement.
+This is TOS's most strategic use case. The ExecutionReceipt format is designed to feed directly into gtos's Halo 2 proving pipeline. TOS provides the trusted execution; gtos provides the consensus and settlement.
 
-**Example**: A DeFi protocol on gtos needs to compute a complex portfolio rebalancing across 10,000 positions — too expensive for on-chain execution. The protocol submits the rebalancing logic as a WASM agent to an ATOS execution node. ATOS runs it in ProofGrade mode, recording every syscall in the transcript. The receipt shows `initial_state_root=0x1A2B...` → `final_state_root=0x5C6D...` with `energy_used=2,400,000`. The gtos node feeds the receipt + ReplayBundle into its Halo 2 prover (`tos-prover`), which generates a SNARK proof that the state transition is valid. On-chain, validators verify the 5KB proof in 2ms — no need to re-execute the 2.4M-instruction computation.
+**Example**: A DeFi protocol on gtos needs to compute a complex portfolio rebalancing across 10,000 positions — too expensive for on-chain execution. The protocol submits the rebalancing logic as a WASM agent to an TOS execution node. TOS runs it in ProofGrade mode, recording every syscall in the transcript. The receipt shows `initial_state_root=0x1A2B...` → `final_state_root=0x5C6D...` with `energy_used=2,400,000`. The gtos node feeds the receipt + ReplayBundle into its Halo 2 prover (`tos-prover`), which generates a SNARK proof that the state transition is valid. On-chain, validators verify the 5KB proof in 2ms — no need to re-execute the 2.4M-instruction computation.
 
 **Target users**: gtos / TOS Network, any L1/L2 needing verifiable off-chain execution.
 
-**Key ATOS features used**: ProofGrade WASM (wasbi), ExecutionReceipt, SHA-256 Merkle state roots, replay transcript, ReplayBundle/ProofBundle.
+**Key TOS features used**: ProofGrade WASM (wasbi), ExecutionReceipt, SHA-256 Merkle state roots, replay transcript, ReplayBundle/ProofBundle.
 
 ---
 
@@ -169,10 +169,10 @@ This is ATOS's most strategic use case. The ExecutionReceipt format is designed 
 
 **Problem**: Complex workflows require multiple agents cooperating across machines — but agents crash, machines fail, and state gets lost.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
-Orchestrator → spawns agents across ATOS nodes via routerd
+Orchestrator → spawns agents across TOS nodes via routerd
 Agent A (Node 1) → processes data, sends result to Agent B via cross-node mailbox
 Agent B (Node 2) → receives, processes, updates state
 Node 2 fails → failover_d detects via membership_d heartbeat timeout
@@ -186,7 +186,7 @@ Agent state, authority, and mailbox continuity survive node failures. The checkp
 
 **Target users**: Multi-agent AI systems, distributed workflow engines, resilient automation.
 
-**Key ATOS features used**: PortableCheckpoint, routerd (cross-node routing with Ed25519 verification), membership_d, failover_d, placement_d, SYS_SEND_REMOTE.
+**Key TOS features used**: PortableCheckpoint, routerd (cross-node routing with Ed25519 verification), membership_d, failover_d, placement_d, SYS_SEND_REMOTE.
 
 ---
 
@@ -194,7 +194,7 @@ Agent state, authority, and mailbox continuity survive node failures. The checkp
 
 **Problem**: Traditional systems use SSH/shell for remote administration, which grants broad access and is difficult to audit. Compromised SSH keys can lead to complete system takeover.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Operator → sends signed admin command via mailbox to admind
@@ -207,11 +207,11 @@ admind → verifies operator's principal_id + capability lease
 
 No shell, no SSH, no root login. Every admin action goes through authenticated, capability-checked, audited mailbox messages.
 
-**Example**: A cloud operator needs to check the health of an ATOS appliance and terminate a misbehaving agent. They send a `STATUS` (0x01) command to admind's mailbox using their Ed25519-signed principal credential. admind verifies the principal is active (not revoked), checks the capability lease hasn't expired, and returns system metrics: 12 agents running, 847M energy consumed, 3.2M syscalls processed. The operator then sends `AGENT_KILL` (0x03) for agent ID 7 — admind verifies the operator holds the `AgentTerminate` capability, terminates the agent, and emits an `AuthGrant` audit event. The entire interaction is recorded in auditd's log — who did what, when, under what authority.
+**Example**: A cloud operator needs to check the health of an TOS appliance and terminate a misbehaving agent. They send a `STATUS` (0x01) command to admind's mailbox using their Ed25519-signed principal credential. admind verifies the principal is active (not revoked), checks the capability lease hasn't expired, and returns system metrics: 12 agents running, 847M energy consumed, 3.2M syscalls processed. The operator then sends `AGENT_KILL` (0x03) for agent ID 7 — admind verifies the operator holds the `AgentTerminate` capability, terminates the agent, and emits an `AuthGrant` audit event. The entire interaction is recorded in auditd's log — who did what, when, under what authority.
 
 **Target users**: Cloud operators, managed service providers, security-conscious enterprises.
 
-**Key ATOS features used**: admind (mailbox-based administration), capability leases with expiry, authd/auditd, Ed25519 principal verification, no shell access.
+**Key TOS features used**: admind (mailbox-based administration), capability leases with expiry, authd/auditd, Ed25519 principal verification, no shell access.
 
 ---
 
@@ -219,10 +219,10 @@ No shell, no SSH, no root login. Every admin action goes through authenticated, 
 
 **Problem**: AI model training can be tampered with — poisoned data, modified hyperparameters, or swapped model checkpoints. Downstream consumers have no way to verify the training process was legitimate.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
-Training pipeline → each training step is an ATOS agent
+Training pipeline → each training step is an TOS agent
                   → each step produces a receipt with:
                     - code_hash (training code version)
                     - input_commitment (dataset hash)
@@ -232,11 +232,11 @@ Training pipeline → each training step is an ATOS agent
 Auditor → chains the receipts to verify: correct code + correct data → correct model
 ```
 
-**Example**: A pharmaceutical company trains a drug interaction prediction model. The training has 3 steps: data preprocessing, model training, and evaluation. Each step runs as a ProofGrade WASM agent on ATOS. The preprocessing agent produces receipt R1 with `output_commitment=hash(cleaned_dataset)`. The training agent takes `input_commitment=hash(cleaned_dataset)` (matching R1's output) and produces receipt R2 with `output_commitment=hash(model_weights)`. The evaluation agent takes the model weights and test data, producing receipt R3 with the accuracy score in its output. An FDA auditor can chain R1→R2→R3 to verify: the correct preprocessing code ran on the declared dataset, the correct training code produced the model, and the evaluation used the same model. Any tampering breaks the hash chain.
+**Example**: A pharmaceutical company trains a drug interaction prediction model. The training has 3 steps: data preprocessing, model training, and evaluation. Each step runs as a ProofGrade WASM agent on TOS. The preprocessing agent produces receipt R1 with `output_commitment=hash(cleaned_dataset)`. The training agent takes `input_commitment=hash(cleaned_dataset)` (matching R1's output) and produces receipt R2 with `output_commitment=hash(model_weights)`. The evaluation agent takes the model weights and test data, producing receipt R3 with the accuracy score in its output. An FDA auditor can chain R1→R2→R3 to verify: the correct preprocessing code ran on the declared dataset, the correct training code produced the model, and the evaluation used the same model. Any tampering breaks the hash chain.
 
 **Target users**: Pharma/biotech model validation, AI safety auditing, ML governance platforms.
 
-**Key ATOS features used**: ProofGrade execution, ExecutionReceipt chain (input_commitment matches prior output_commitment), transcript, code_hash verification.
+**Key TOS features used**: ProofGrade execution, ExecutionReceipt chain (input_commitment matches prior output_commitment), transcript, code_hash verification.
 
 ---
 
@@ -244,7 +244,7 @@ Auditor → chains the receipts to verify: correct code + correct data → corre
 
 **Problem**: Organizations need to grant temporary, scoped execution authority to partners — but traditional API keys are all-or-nothing and don't expire safely.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Org A → creates capability lease for Org B:
@@ -252,8 +252,8 @@ Org A → creates capability lease for Org B:
         - expiry: 24 hours
         - delegation_depth: 0 (B cannot re-delegate)
         - Ed25519 signed by Org A's principal
-Org B → deploys agent on ATOS with the leased capability
-ATOS → enforces expiry on every capability check
+Org B → deploys agent on TOS with the leased capability
+TOS → enforces expiry on every capability check
      → after 24 hours, Org B's agent loses access automatically
 ```
 
@@ -261,7 +261,7 @@ ATOS → enforces expiry on every capability check
 
 **Target users**: Supply chain consortiums, B2B data sharing, temporary partner access.
 
-**Key ATOS features used**: Capability leases (expiry_ticks, delegation_depth), Ed25519 signed delegation, authd revocation, automatic expiry enforcement.
+**Key TOS features used**: Capability leases (expiry_ticks, delegation_depth), Ed25519 signed delegation, authd revocation, automatic expiry enforcement.
 
 ---
 
@@ -269,11 +269,11 @@ ATOS → enforces expiry on every capability check
 
 **Problem**: Traditional API billing is based on request counts or time — not actual computation consumed. Providers eat the cost of expensive queries; consumers overpay for cheap ones.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
-API consumer → sends request to ATOS-backed API endpoint
-ATOS → quotad estimates cost before execution
+API consumer → sends request to TOS-backed API endpoint
+TOS → quotad estimates cost before execution
      → consumer confirms or rejects
      → execution runs with fuel metering
      → receipt shows exact energy_used
@@ -281,11 +281,11 @@ ATOS → quotad estimates cost before execution
      → monthly invoice reflects actual computation, not request count
 ```
 
-**Example**: A data analytics API charges per computation, not per request. A simple lookup costs 500 energy units; a complex aggregation costs 50,000. Consumer submits a query — quotad returns an estimate of 12,000 energy units. Consumer approves. ATOS executes and produces a receipt with `energy_used=11,847`. The consumer pays for 11,847 units. Next month, billingd produces an invoice for the consumer's `principal_id` showing: 342 requests, 2,847,291 total energy, $28.47 at $0.00001/energy. Every line item is backed by a verifiable receipt.
+**Example**: A data analytics API charges per computation, not per request. A simple lookup costs 500 energy units; a complex aggregation costs 50,000. Consumer submits a query — quotad returns an estimate of 12,000 energy units. Consumer approves. TOS executes and produces a receipt with `energy_used=11,847`. The consumer pays for 11,847 units. Next month, billingd produces an invoice for the consumer's `principal_id` showing: 342 requests, 2,847,291 total energy, $28.47 at $0.00001/energy. Every line item is backed by a verifiable receipt.
 
 **Target users**: API-as-a-service platforms, metered SaaS, compute-intensive API providers.
 
-**Key ATOS features used**: quotad (pre-execution cost estimation), FuelCosts (per-instruction metering), billingd (per-principal aggregation), ExecutionReceipt.
+**Key TOS features used**: quotad (pre-execution cost estimation), FuelCosts (per-instruction metering), billingd (per-principal aggregation), ExecutionReceipt.
 
 ---
 
@@ -293,26 +293,26 @@ ATOS → quotad estimates cost before execution
 
 **Problem**: Software supply chain attacks (SolarWinds, Log4j) exploit the gap between "code was built" and "code is running." There's no cryptographic proof that the binary running in production matches the signed source.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Developer → atp build agent.wasm -o agent.tos
          → atp sign agent.tos (Ed25519 signature over manifest + code hash)
 CI/CD    → atp verify agent.tos (checks signature + code hash)
-         → submits to pkgd on ATOS node
+         → submits to pkgd on TOS node
 pkgd     → verifies manifest signature
          → checks code_hash matches actual binary
          → installs package
-ATOS     → every execution receipt includes code_hash
+TOS     → every execution receipt includes code_hash
          → TPM measured boot proves kernel integrity
          → full chain: developer → build → sign → deploy → execute → receipt
 ```
 
-**Example**: A security team deploys a threat detection agent. The developer builds `threat_detector.tos` with `atp build`, signs it with the team's Ed25519 key, and pushes to the ATOS node. pkgd verifies the signature matches the team's registered principal. On every execution, the receipt includes `code_hash=0xB7F3...` which matches the signed manifest. If an attacker tries to swap the binary, the code hash won't match the signed manifest — pkgd rejects the installation. If the attacker compromises the kernel, the TPM PCR values change — remote attestation fails. The chain is: signed source → verified build → attested kernel → receipt-proven execution.
+**Example**: A security team deploys a threat detection agent. The developer builds `threat_detector.tos` with `atp build`, signs it with the team's Ed25519 key, and pushes to the TOS node. pkgd verifies the signature matches the team's registered principal. On every execution, the receipt includes `code_hash=0xB7F3...` which matches the signed manifest. If an attacker tries to swap the binary, the code hash won't match the signed manifest — pkgd rejects the installation. If the attacker compromises the kernel, the TPM PCR values change — remote attestation fails. The chain is: signed source → verified build → attested kernel → receipt-proven execution.
 
 **Target users**: Security-sensitive deployments, government/military, regulated industries.
 
-**Key ATOS features used**: atp CLI (build/sign/verify), pkgd (signature verification), .tos package format, TPM 2.0 measured boot, ExecutionReceipt code_hash.
+**Key TOS features used**: atp CLI (build/sign/verify), pkgd (signature verification), .tos package format, TPM 2.0 measured boot, ExecutionReceipt code_hash.
 
 ---
 
@@ -320,7 +320,7 @@ ATOS     → every execution receipt includes code_hash
 
 **Problem**: When infrastructure fails, restoring distributed agent workloads requires manual intervention — finding checkpoints, re-provisioning, restoring state, and re-establishing authority.
 
-**How ATOS solves it**:
+**How TOS solves it**:
 
 ```
 Normal operation:
@@ -336,15 +336,15 @@ Node failure detected:
     4. Emits AgentMigrate event for audit trail
 ```
 
-**Example**: A financial services firm runs 50 ATOS agents across 5 nodes for real-time risk calculation. Node 3 (hosting 12 agents) suffers a hardware failure. Within 30 seconds, membership_d on the remaining nodes detect the missed heartbeat. failover_d identifies the 12 affected agents from its watch table. For each agent, it queries placement_d — which selects the node with the most available energy and matching hardware class. The agents are restored from their PortableCheckpoints on Nodes 1, 2, 4, and 5, resuming with their full keyspace state, capability sets, and remaining energy budgets. The firm's monitoring dashboard (connected to observabilityd) shows the migration events in real time. Total recovery time: under 60 seconds, zero data loss, zero manual intervention.
+**Example**: A financial services firm runs 50 TOS agents across 5 nodes for real-time risk calculation. Node 3 (hosting 12 agents) suffers a hardware failure. Within 30 seconds, membership_d on the remaining nodes detect the missed heartbeat. failover_d identifies the 12 affected agents from its watch table. For each agent, it queries placement_d — which selects the node with the most available energy and matching hardware class. The agents are restored from their PortableCheckpoints on Nodes 1, 2, 4, and 5, resuming with their full keyspace state, capability sets, and remaining energy budgets. The firm's monitoring dashboard (connected to observabilityd) shows the migration events in real time. Total recovery time: under 60 seconds, zero data loss, zero manual intervention.
 
 **Target users**: Financial services, critical infrastructure, high-availability enterprise systems.
 
-**Key ATOS features used**: failover_d (automated recovery), membership_d (heartbeat monitoring), placement_d (intelligent node selection), PortableCheckpoint (full state + authority serialization), routerd (cross-node coordination).
+**Key TOS features used**: failover_d (automated recovery), membership_d (heartbeat monitoring), placement_d (intelligent node selection), PortableCheckpoint (full state + authority serialization), routerd (cross-node coordination).
 
 ---
 
-## What ATOS Is Not For
+## What TOS Is Not For
 
 | Scenario | Why not |
 |----------|---------|
@@ -358,4 +358,4 @@ Node failure detected:
 
 ## One-Line Positioning
 
-**ATOS is the minimum trusted execution substrate that makes external systems believe "this code really ran the way it claims."**
+**TOS is the minimum trusted execution substrate that makes external systems believe "this code really ran the way it claims."**

@@ -1,8 +1,8 @@
 # Base-image payload manifest
 #
 # Format:
-#   /atos/absolute/path = relative/or/absolute/host/path
-#   @tree /atos/prefix = relative/or/absolute/host/directory
+#   /tos/absolute/path = relative/or/absolute/host/path
+#   @tree /tos/prefix = relative/or/absolute/host/directory
 #
 # These files are embedded at build time and installed into the shared
 # base-image keyspace by the root agent during boot.
@@ -14,12 +14,12 @@
 
 /lib/ld-musl-x86_64.so.1 = test_data/musl_libc.so
 /usr/bin/hello_dynamic = test_data/hello_dynamic.elf
-/usr/lib/atos-tests/Hello.class = test_data/Hello.class
-/usr/lib/atos-tests/FsProbe.class = test_data/FsProbe.class
-/usr/lib/atos-tests/JavaChildSmoke.class = test_data/JavaChildSmoke.class
-/usr/lib/atos-tests/JavaThreadSmoke.class = test_data/JavaThreadSmoke.class
-/usr/lib/atos-tests/java-smoke.jar = test_data/java-smoke.jar
-/usr/lib/atos-tests/python_child_smoke.py = test_data/python_child_smoke.py
-/usr/lib/atos-tests/node_child_smoke.js = test_data/node_child_smoke.js
-/usr/lib/atos-tests/node_thread_smoke.js = test_data/node_thread_smoke.js
-/usr/lib/atos-tests/payload.txt = test_data/payload.txt
+/usr/lib/tos-tests/Hello.class = test_data/Hello.class
+/usr/lib/tos-tests/FsProbe.class = test_data/FsProbe.class
+/usr/lib/tos-tests/JavaChildSmoke.class = test_data/JavaChildSmoke.class
+/usr/lib/tos-tests/JavaThreadSmoke.class = test_data/JavaThreadSmoke.class
+/usr/lib/tos-tests/java-smoke.jar = test_data/java-smoke.jar
+/usr/lib/tos-tests/python_child_smoke.py = test_data/python_child_smoke.py
+/usr/lib/tos-tests/node_child_smoke.js = test_data/node_child_smoke.js
+/usr/lib/tos-tests/node_thread_smoke.js = test_data/node_thread_smoke.js
+/usr/lib/tos-tests/payload.txt = test_data/payload.txt

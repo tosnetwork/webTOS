@@ -1,4 +1,4 @@
-//! ATOS ELF64 Binary Loader
+//! TOS ELF64 Binary Loader
 //!
 //! Parses ELF64 executable binaries and extracts loadable segments.
 //! Used to load native agent binaries from an embedded initramfs or disk.

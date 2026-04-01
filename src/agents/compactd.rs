@@ -1,4 +1,4 @@
-//! ATOS compactd — State Compaction and Garbage Collection (Stage 6)
+//! TOS compactd — State Compaction and Garbage Collection (Stage 6)
 //!
 //! Periodically checks keyspace version counts and trims old history.
 //! Also responds to on-demand compaction requests via mailbox.

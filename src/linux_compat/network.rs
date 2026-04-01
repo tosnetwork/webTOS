@@ -1,6 +1,6 @@
 //! Network syscalls for the Linux compatibility layer.
 //!
-//! Socket operations are proxied through the ATOS mailbox system to netd.
+//! Socket operations are proxied through the TOS mailbox system to netd.
 //! Pipes use a mailbox pair. Eventfd uses keyspace-backed counters.
 //! io_uring returns -ENOSYS (runtimes fall back to epoll).
 
@@ -309,7 +309,7 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
 
     match st.get_fd(sockfd) {
         Some(entry) if entry.kind == FdKind::Socket => {
-            // AF_UNIX socket — nscd is never running on ATOS, refuse immediately
+            // AF_UNIX socket — nscd is never running on TOS, refuse immediately
             if entry.keyspace_key == AF_UNIX_MARKER {
                 return -ECONNREFUSED;
             }
@@ -1064,7 +1064,7 @@ fn fmt_u16_decimal(mut val: u16, buf: &mut [u8]) -> usize {
 
 /// io_uring_setup(u32 entries, struct io_uring_params *p)
 ///
-/// Not supported — ATOS uses deterministic epoll instead.
+/// Not supported — TOS uses deterministic epoll instead.
 /// Returns -ENOSYS; Node.js and other runtimes fall back to epoll
 /// automatically when io_uring is unavailable (same as Linux < 5.1).
 /// OpenJDK does not use io_uring.

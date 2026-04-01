@@ -5,7 +5,7 @@
  *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 -o test_python_child_execve.elf test_python_child_execve.c
  *
  * Runs:
- *   execve("/usr/bin/python3", ["python3", "-u", "/usr/lib/atos-tests/python_child_smoke.py"], envp)
+ *   execve("/usr/bin/python3", ["python3", "-u", "/usr/lib/tos-tests/python_child_smoke.py"], envp)
  */
 
 typedef unsigned long u64;
@@ -75,7 +75,7 @@ static void print_num(i64 n) {
 void _start(void) {
     static char path[] = "/usr/bin/python3";
     static char arg1[] = "-u";
-    static char arg2[] = "/usr/lib/atos-tests/python_child_smoke.py";
+    static char arg2[] = "/usr/lib/tos-tests/python_child_smoke.py";
     static char env0[] = "PYTHONHOME=/usr";
     static char env1[] = "PYTHONDONTWRITEBYTECODE=1";
     static char env2[] = "PYTHONNOUSERSITE=1";
