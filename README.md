@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="TOS.png?v=2" alt="TOS Logo" width="200">
-</p>
-
-<p align="center">
   <strong>A provable, metered, migratable agent execution platform — built from scratch.</strong>
 </p>
 
