@@ -31,6 +31,7 @@ const F_SETFL: u32 = 4;
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_REMOVEDIR: u32 = 0x200;
 const AT_EACCESS: u32 = 0x200;
 const AT_EMPTY_PATH: u32 = 0x1000;
 const RENAME_NOREPLACE: u32 = 0x1;
@@ -1458,6 +1459,19 @@ fn mutable_parent_exists(agent_id: u16, path: &[u8]) -> bool {
     is_directory_path(agent_id, &path[..last_slash])
 }
 
+fn directory_has_children(agent_id: u16, path: &[u8]) -> bool {
+    let mut child_names = [[0u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT];
+    let mut child_lens = [0u16; MAX_DIRENTS_COLLECT];
+    let mut child_dtypes = [0u8; MAX_DIRENTS_COLLECT];
+    collect_directory_entries(
+        agent_id,
+        path,
+        &mut child_names,
+        &mut child_lens,
+        &mut child_dtypes,
+    ) > 0
+}
+
 fn push_dir_entry(
     names: &mut [[u8; MAX_DIRENT_NAME]; MAX_DIRENTS_COLLECT],
     lens: &mut [u16; MAX_DIRENTS_COLLECT],
@@ -2315,12 +2329,13 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
     let directory_target = is_directory_path(agent_id, open_path);
 
     let (keyspace_id, key) = super::vfs::resolve_path(agent_id, open_path);
+    let existed = directory_target
+        || is_special
+        || crate::state::query_file_size(keyspace_id, key) > 0
+        || crate::state::state_get(keyspace_id, key).is_some();
 
     if is_dir && !directory_target {
-        let exists = crate::state::query_file_size(keyspace_id, key) > 0
-            || crate::state::state_get(keyspace_id, key).is_some()
-            || is_special;
-        let ret = if exists { -ENOTDIR } else { -ENOENT };
+        let ret = if existed { -ENOTDIR } else { -ENOENT };
         if trace_python {
             crate::serial_println!(
                 "[PYDBG] openat-exit agent={} ret={} path={:?} ks={} key={:#x}",
@@ -2332,6 +2347,10 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
             );
         }
         return ret;
+    }
+
+    if (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) && existed && !directory_target {
+        return -EEXIST;
     }
 
     // If not creating and not a special path and not a directory,
@@ -2404,6 +2423,14 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
             flags,
             active: true,
         });
+    }
+
+    if !directory_target && !is_special && (flags & O_CREAT) != 0 && !existed {
+        if let Err(err) = store_regular_file_data(keyspace_id, key, &[]) {
+            log_regular_file_store_failure(agent_id, keyspace_id, key, 0, err);
+            let _ = st.close_fd(fd_idx as i32);
+            return -ENOSPC;
+        }
     }
 
     if !directory_target && !is_special && (flags & O_TRUNC) != 0 && fd_access_mode(flags) != O_RDONLY
@@ -2890,15 +2917,20 @@ fn readlink_path(agent_id: u16, path: &[u8], buf_ptr: u64, bufsiz: u64) -> i64 {
         return to_copy as i64;
     }
 
+    let ret = match metadata_for_path(agent_id, path, AT_SYMLINK_NOFOLLOW) {
+        Ok(_) => -EINVAL,
+        Err(err) => err,
+    };
+
     if trace_python {
         crate::serial_println!(
             "[PYDBG] readlink-exit agent={} ret={} path={:?}",
             agent_id,
-            -EINVAL,
+            ret,
             core::str::from_utf8(path).unwrap_or("?")
         );
     }
-    -EINVAL
+    ret
 }
 
 pub fn sys_readlink(agent_id: u16, pathname_ptr: u64, buf_ptr: u64, bufsiz: u64) -> i64 {
@@ -3536,6 +3568,58 @@ pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
         }
         Err(_) => -ENOENT,
     }
+}
+
+pub fn sys_unlinkat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32) -> i64 {
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if path_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = match resolve_path_at(agent_id, dirfd, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if super::vfs::classify_base_image_path(path).is_some()
+        || super::vfs::is_special_path(path).is_some()
+    {
+        return -EROFS;
+    }
+
+    let is_dir = is_directory_path(agent_id, path);
+    if (flags & AT_REMOVEDIR) != 0 {
+        if !is_dir {
+            return -ENOTDIR;
+        }
+        if directory_has_children(agent_id, path) {
+            return -ENOTEMPTY;
+        }
+        state::remove_mutable_path(agent_id, path);
+        return 0;
+    }
+
+    if is_dir {
+        return -EISDIR;
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, path);
+    match crate::state::state_delete(ks, key) {
+        Ok(()) => {
+            state::remove_mutable_path(agent_id, path);
+            0
+        }
+        Err(_) => -ENOENT,
+    }
+}
+
+pub fn sys_rmdir(agent_id: u16, pathname_ptr: u64) -> i64 {
+    sys_unlinkat(agent_id, AT_FDCWD, pathname_ptr, AT_REMOVEDIR)
 }
 
 // ── sys_mkdir ──────────────────────────────────────────────────────────────

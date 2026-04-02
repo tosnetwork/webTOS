@@ -131,6 +131,14 @@ fn java_focus_runs_phase6() -> bool {
 }
 
 #[inline]
+fn java_focus_runs_jtreg_only() -> bool {
+    matches!(
+        java_smoke_focus(),
+        JavaSmokeFocus::Jtreg | JavaSmokeFocus::JtregJavac
+    )
+}
+
+#[inline]
 fn java_focus_label() -> &'static str {
     match java_smoke_focus() {
         JavaSmokeFocus::Version => "version",
@@ -368,7 +376,7 @@ fn spawn_java_jtreg_smoke(root_id: u16) {
     match crate::agent_loader::spawn_linux_agent(
         root_id,
         JAVA_JTREG_EXECVE_ELF,
-        2_000_000_000,
+        50_000_000_000,
         262_144,
         b"/app/test_java_jtreg_execve",
         &[b"/app/test_java_jtreg_execve" as &[u8]],
@@ -388,7 +396,7 @@ fn spawn_java_jtreg_javac_smoke(root_id: u16) {
     match crate::agent_loader::spawn_linux_agent(
         root_id,
         JAVA_JTREG_JAVAC_EXECVE_ELF,
-        1_000_000_000,
+        20_000_000_000,
         262_144,
         b"/app/test_java_jtreg_javac_execve",
         &[b"/app/test_java_jtreg_javac_execve" as &[u8]],
@@ -536,9 +544,10 @@ pub extern "C" fn root_entry() -> ! {
     if focus_runs_java() {
         serial_println!("[ROOT] Java smoke focus: {}", java_focus_label());
     }
+    let java_jtreg_only_focus = focus_runs_java() && java_focus_runs_jtreg_only();
 
     // Load relative *at path smoke test
-    {
+    if !java_jtreg_only_focus {
         spawn_at_paths_smoke(1);
         spawn_ioctl_smoke(1);
         spawn_tls_clone_smoke(1);
@@ -558,6 +567,11 @@ pub extern "C" fn root_entry() -> ! {
     const JAVA_CHILD_SMOKE_DELAY_TICKS: u64 = 750_000;
     const JAVA_THREAD_SMOKE_DELAY_TICKS: u64 = 900_000;
     let java_phase6_focus = matches!(java_smoke_focus(), JavaSmokeFocus::Phase6);
+    let java_jtreg_smoke_delay_ticks = if java_jtreg_only_focus {
+        1
+    } else {
+        JAVA_JTREG_SMOKE_DELAY_TICKS
+    };
     let java_child_smoke_delay_ticks = if java_phase6_focus {
         450_000
     } else {
@@ -571,7 +585,7 @@ pub extern "C" fn root_entry() -> ! {
 
     // ── Stage 9: Load Linux ELF test binary ────────────────────────────
     // Done in root agent (not init) to avoid boot stack overflow.
-    {
+    if !java_jtreg_only_focus {
         static HELLO_ELF: &[u8] = include_bytes!("../../test_data/test_syscalls.elf");
         serial_println!(
             "[ROOT] Loading Linux ELF test binary ({} bytes)...",
@@ -590,7 +604,7 @@ pub extern "C" fn root_entry() -> ! {
     }
 
     // Load argv/envp/auxv smoke test
-    {
+    if !java_jtreg_only_focus {
         static ARGV_ELF: &[u8] = include_bytes!("../../test_data/test_argv.elf");
         serial_println!(
             "[ROOT] Loading argv test binary ({} bytes)...",
@@ -616,42 +630,44 @@ pub extern "C" fn root_entry() -> ! {
             crate::base_image::embedded_file_count()
         );
 
-        // Load a dynamically-linked ELF directly from memory.
-        static DYNAMIC_ELF: &[u8] = include_bytes!("../../test_data/hello_dynamic.elf");
-        serial_println!(
-            "[ROOT] Loading dynamic ELF test ({} bytes)...",
-            DYNAMIC_ELF.len()
-        );
-        match crate::agent_loader::spawn_linux_agent(
-            1,
-            DYNAMIC_ELF,
-            1_000_000,
-            512, // more memory for dynamic linker
-            b"/app/hello_dynamic",
-            &[b"/app/hello_dynamic" as &[u8]],
-        ) {
-            Ok(id) => serial_println!("[ROOT] dynamic ELF agent created: id={}", id),
-            Err(e) => serial_println!("[ROOT] dynamic ELF load failed: error {}", e),
-        }
+        if !java_jtreg_only_focus {
+            // Load a dynamically-linked ELF directly from memory.
+            static DYNAMIC_ELF: &[u8] = include_bytes!("../../test_data/hello_dynamic.elf");
+            serial_println!(
+                "[ROOT] Loading dynamic ELF test ({} bytes)...",
+                DYNAMIC_ELF.len()
+            );
+            match crate::agent_loader::spawn_linux_agent(
+                1,
+                DYNAMIC_ELF,
+                1_000_000,
+                512, // more memory for dynamic linker
+                b"/app/hello_dynamic",
+                &[b"/app/hello_dynamic" as &[u8]],
+            ) {
+                Ok(id) => serial_println!("[ROOT] dynamic ELF agent created: id={}", id),
+                Err(e) => serial_println!("[ROOT] dynamic ELF load failed: error {}", e),
+            }
 
-        static EXECVE_ELF: &[u8] = include_bytes!("../../test_data/test_execve.elf");
-        serial_println!(
-            "[ROOT] Loading execve smoke test ({} bytes)...",
-            EXECVE_ELF.len()
-        );
-        match crate::agent_loader::spawn_linux_agent(
-            1,
-            EXECVE_ELF,
-            100_000,
-            64,
-            b"/app/test_execve",
-            &[b"/app/test_execve" as &[u8]],
-        ) {
-            Ok(id) => serial_println!("[ROOT] execve smoke test agent created: id={}", id),
-            Err(e) => serial_println!("[ROOT] execve smoke test load failed: error {}", e),
-        }
+            static EXECVE_ELF: &[u8] = include_bytes!("../../test_data/test_execve.elf");
+            serial_println!(
+                "[ROOT] Loading execve smoke test ({} bytes)...",
+                EXECVE_ELF.len()
+            );
+            match crate::agent_loader::spawn_linux_agent(
+                1,
+                EXECVE_ELF,
+                100_000,
+                64,
+                b"/app/test_execve",
+                &[b"/app/test_execve" as &[u8]],
+            ) {
+                Ok(id) => serial_println!("[ROOT] execve smoke test agent created: id={}", id),
+                Err(e) => serial_println!("[ROOT] execve smoke test load failed: error {}", e),
+            }
 
-        spawn_signal_smoke(1);
+            spawn_signal_smoke(1);
+        }
 
         if focus_runs_python() && linux_path_exists(b"/usr/bin/python3") {
             static PYTHON_EXECVE_ELF: &[u8] =
@@ -737,7 +753,7 @@ pub extern "C" fn root_entry() -> ! {
             {
                 serial_println!(
                     "[ROOT] Java jtreg javac smoke test available; delaying until root tick {}",
-                    JAVA_JTREG_SMOKE_DELAY_TICKS
+                    java_jtreg_smoke_delay_ticks
                 );
             } else if java_focus_runs_jtreg_javac() {
                 serial_println!("[ROOT] Java jtreg javac smoke test disabled or payload missing");
@@ -748,7 +764,7 @@ pub extern "C" fn root_entry() -> ! {
             {
                 serial_println!(
                     "[ROOT] Java jtreg smoke test available; delaying until root tick {}",
-                    JAVA_JTREG_SMOKE_DELAY_TICKS
+                    java_jtreg_smoke_delay_ticks
                 );
             } else {
                 serial_println!("[ROOT] Java jtreg smoke test disabled or payload missing");
@@ -892,7 +908,7 @@ pub extern "C" fn root_entry() -> ! {
 
         if java_jtreg_javac_available
             && !java_jtreg_javac_smoke_launched
-            && count >= JAVA_JTREG_SMOKE_DELAY_TICKS
+            && count >= java_jtreg_smoke_delay_ticks
         {
             spawn_java_jtreg_javac_smoke(1);
             java_jtreg_javac_smoke_launched = true;
@@ -900,7 +916,7 @@ pub extern "C" fn root_entry() -> ! {
 
         if java_jtreg_available
             && !java_jtreg_smoke_launched
-            && count >= JAVA_JTREG_SMOKE_DELAY_TICKS
+            && count >= java_jtreg_smoke_delay_ticks
         {
             spawn_java_jtreg_smoke(1);
             java_jtreg_smoke_launched = true;

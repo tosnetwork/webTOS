@@ -1215,7 +1215,9 @@ fn trace_runtime_agent(agent_id: u16) -> bool {
 
 #[inline]
 fn trace_jtreg_java_agent(agent_id: u16) -> bool {
-    option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") && state::trace_java_agent(agent_id)
+    option_env!("TOS_TRACE_JTREG_RUNTIME") == Some("1")
+        && option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
+        && state::trace_java_agent(agent_id)
 }
 
 #[inline]
@@ -1827,7 +1829,13 @@ pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
         }
         sched::remove_from_run_queue(member);
         agent::terminate_agent_no_reparent(member, AgentStatus::Exited);
-        agent::auto_reap_if_unwaitable(member);
+        // Keep the thread-group leader around for parent wait/reap. Asterinas
+        // similarly keeps the process object reachable from the parent's
+        // children table until wait consumes it; only worker threads can be
+        // auto-reaped here.
+        if is_thread_group_worker(member) {
+            agent::auto_reap_if_unwaitable(member);
+        }
     }
 
     if let Some(pid) = parent_id {

@@ -5,11 +5,6 @@
  *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 \
  *     -o test_java_jtreg_execve.elf test_java_jtreg_execve.c
  *
- * Runs a first-pass smoke subset that has already been validated on the host:
- *   - /jdk/test/jdk/java/lang/String/Chars.java
- *   - /jdk/test/jdk/java/io/File/IsAbsolute.java
- *   - /jdk/test/jdk/java/util/zip/ZipEntry/Constructor.java
- *
  * The first guest-side bring-up deliberately uses otherVM instead of agentVM.
  * jtreg's agentVM pool uses socket-based VM management, and TOS does not yet
  * provide a Linux-like localhost socket stack for that path.
@@ -111,11 +106,16 @@ void _start(void) {
     static char arg13[] = "-noshell";
     static char arg14[] = "-verbose:error,fail,summary";
     static char arg15[] = "-ignore:quiet";
-    static char arg16[] = "-w:/tmp/JTwork";
-    static char arg17[] = "-r:/tmp/JTreport";
-    static char arg18[] = "/jdk/test/jdk/java/lang/String/Chars.java";
-    static char arg19[] = "/jdk/test/jdk/java/io/File/IsAbsolute.java";
-    static char arg20[] = "/jdk/test/jdk/java/util/zip/ZipEntry/Constructor.java";
+    static char arg16[] = "-timeoutFactor:4";
+    static char arg17[] = "-w:/tmp/JTwork";
+    static char arg18[] = "-r:/tmp/JTreport";
+    static char arg19[] = "/jdk/test/jdk/java/lang/String/Chars.java";
+    static char arg20[] = "/jdk/test/jdk/java/io/File/IsAbsolute.java";
+    static char arg21[] = "/jdk/test/jdk/java/nio/file/DirectoryStream/Basic.java";
+    static char arg22[] = "/jdk/test/jdk/java/nio/file/Path/Misc.java";
+    static char arg23[] = "/jdk/test/jdk/java/util/Base64/Base64GetEncoderTest.java";
+    static char arg24[] = "/jdk/test/jdk/java/util/concurrent/TimeUnit/Basic.java";
+    static char arg25[] = "/jdk/test/jdk/java/util/zip/ZipEntry/Constructor.java";
     static char env0[] = "JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64";
     static char env1[] = "LANG=C";
     static char env2[] = "LC_ALL=C";
@@ -130,7 +130,7 @@ void _start(void) {
     static char *argv[] = {
         arg0,  arg1,  arg2,  arg3,  arg4,  arg5,  arg6,  arg7,
         arg8,  arg9,  arg10, arg11, arg12, arg13, arg14, arg15,
-        arg16, arg17, arg18, arg19, arg20, 0,
+        arg16, arg17, arg18, arg19, arg20, arg21, arg22, arg23, arg24, arg25, 0,
     };
     static char *envp[] = {env0, env1, env2, env3, env4, env5, 0};
 

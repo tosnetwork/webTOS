@@ -1407,19 +1407,24 @@ pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
 
 /// Return true if detailed Linux runtime tracing should be enabled for this agent.
 pub fn trace_runtime_agent(agent_id: u16) -> bool {
+    let trace_java = option_env!("TOS_TRACE_JAVA_RUNTIME") == Some("1") && trace_java_agent(agent_id);
     if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") && trace_java_agent(agent_id) {
-        return false;
+        return option_env!("TOS_TRACE_JTREG_RUNTIME") == Some("1");
     }
     exe_path_eq(agent_id, b"/app/hello_dynamic")
         || exe_path_eq(agent_id, b"/usr/bin/hello_dynamic")
         || exe_path_eq(agent_id, b"/usr/bin/node")
-        || trace_java_agent(agent_id)
+        || trace_java
         || get_state(agent_id)
             .map(|st| {
                 st.vfork_parent != 0
-                    && (exe_path_eq(agent_id, b"/usr/bin/java")
-                        || exe_path_eq(agent_id, b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
-                        || exe_path_eq(agent_id, b"/usr/bin/node"))
+                    && (exe_path_eq(agent_id, b"/usr/bin/node")
+                        || (trace_java
+                            && (exe_path_eq(agent_id, b"/usr/bin/java")
+                                || exe_path_eq(
+                                    agent_id,
+                                    b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java"
+                                ))))
             })
             .unwrap_or(false)
 }
