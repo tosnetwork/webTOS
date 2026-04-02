@@ -409,12 +409,24 @@ fn read_file_data(
     Ok(0)
 }
 
-fn load_regular_file_data(keyspace: u16, key: u64) -> Vec<u8> {
+fn try_alloc_zeroed_vec(len: usize) -> Result<Vec<u8>, i64> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| -ENOMEM)?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
+fn try_clone_vec(bytes: &[u8]) -> Result<Vec<u8>, i64> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(bytes.len()).map_err(|_| -ENOMEM)?;
+    data.extend_from_slice(bytes);
+    Ok(data)
+}
+
+fn load_regular_file_data(keyspace: u16, key: u64) -> Result<Vec<u8>, i64> {
     if keyspace == super::vfs::BASE_IMAGE_KEYSPACE {
         if let Some(entry) = crate::base_image::find_by_key(key) {
-            let mut data = Vec::with_capacity(entry.data.len());
-            data.extend_from_slice(entry.data);
-            return data;
+            return try_clone_vec(entry.data);
         }
     }
 
@@ -422,22 +434,46 @@ fn load_regular_file_data(keyspace: u16, key: u64) -> Vec<u8> {
         if crate::state::parse_multi_segment_header(keyspace, key, &value[..value_len], value_len)
             .is_none()
         {
-            let mut data = Vec::with_capacity(value_len);
-            data.extend_from_slice(&value[..value_len]);
-            return data;
+            return try_clone_vec(&value[..value_len]);
         }
     }
 
     let size = crate::state::query_file_size(keyspace, key);
     if size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let mut data = Vec::with_capacity(size);
-    data.resize(size, 0);
+    let mut data = match try_alloc_zeroed_vec(size) {
+        Ok(data) => data,
+        Err(err) => {
+            let header = crate::state::state_get(keyspace, key)
+                .map(|(buf, len)| {
+                    let mut bytes = [0u8; 6];
+                    let copy_len = len.min(bytes.len());
+                    bytes[..copy_len].copy_from_slice(&buf[..copy_len]);
+                    (len, bytes)
+                })
+                .unwrap_or((0, [0u8; 6]));
+            crate::serial_println!(
+                "[RTDBG] load-file-alloc-fail ks={} key={:#x} size={} value_len={} hdr=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] err={}",
+                keyspace,
+                key,
+                size,
+                header.0,
+                header.1[0],
+                header.1[1],
+                header.1[2],
+                header.1[3],
+                header.1[4],
+                header.1[5],
+                err
+            );
+            return Err(err);
+        }
+    };
     let loaded = crate::state::load_file_range(keyspace, key, 0, &mut data);
     data.truncate(loaded);
-    data
+    Ok(data)
 }
 
 fn store_regular_file_data(keyspace: u16, key: u64, data: &[u8]) -> Result<(), i64> {
@@ -463,28 +499,39 @@ fn log_regular_file_store_failure(agent_id: u16, keyspace: u16, key: u64, data_l
     }
 }
 
-fn write_regular_file_data(
+fn write_regular_file_bytes(
     agent_id: u16,
     keyspace: u16,
     key: u64,
     current_offset: u64,
     flags: u32,
-    buf_ptr: u64,
-    count: usize,
+    incoming: &[u8],
 ) -> Result<(usize, u64), i64> {
-    let mut incoming = Vec::with_capacity(count);
-    incoming.resize(count, 0);
-    if count > 0 && !read_user_mem(agent_id, buf_ptr, &mut incoming, count) {
-        return Err(-EFAULT);
-    }
-
-    let mut file_data = load_regular_file_data(keyspace, key);
+    let count = incoming.len();
+    let current_len = crate::state::query_file_size(keyspace, key).max(
+        crate::state::state_get(keyspace, key)
+            .map(|(_, len)| len)
+            .unwrap_or(0),
+    );
     let write_offset = if (flags & O_APPEND) != 0 {
-        file_data.len()
+        current_len
     } else {
         current_offset as usize
     };
     let write_end = write_offset.checked_add(count).ok_or(-EINVAL)?;
+
+    if write_offset == current_len {
+        let next_len = crate::state::append_file_data(keyspace, key, &incoming).map_err(|err| {
+            if err == crate::agent::E_QUOTA_EXCEEDED {
+                -ENOSPC
+            } else {
+                -ENOMEM
+            }
+        })?;
+        return Ok((count, next_len as u64));
+    }
+
+    let mut file_data = load_regular_file_data(keyspace, key)?;
 
     if file_data.len() < write_end {
         file_data.resize(write_end, 0);
@@ -496,6 +543,40 @@ fn write_regular_file_data(
         return Err(-ENOSPC);
     }
     Ok((count, write_end as u64))
+}
+
+fn write_regular_file_data(
+    agent_id: u16,
+    keyspace: u16,
+    key: u64,
+    current_offset: u64,
+    flags: u32,
+    buf_ptr: u64,
+    count: usize,
+) -> Result<(usize, u64), i64> {
+    const INLINE_WRITE_BUF: usize = 4096;
+
+    if count <= INLINE_WRITE_BUF {
+        let mut incoming = [0u8; INLINE_WRITE_BUF];
+        if count > 0 && !read_user_mem(agent_id, buf_ptr, &mut incoming[..count], count) {
+            return Err(-EFAULT);
+        }
+        return write_regular_file_bytes(
+            agent_id,
+            keyspace,
+            key,
+            current_offset,
+            flags,
+            &incoming[..count],
+        );
+    }
+
+    let mut incoming = try_alloc_zeroed_vec(count)?;
+    if count > 0 && !read_user_mem(agent_id, buf_ptr, &mut incoming, count) {
+        return Err(-EFAULT);
+    }
+
+    write_regular_file_bytes(agent_id, keyspace, key, current_offset, flags, &incoming)
 }
 
 /// Read from a multi-segment file at a given offset into user memory.
@@ -3383,7 +3464,11 @@ fn rename_regular_file(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
         return -ENOENT;
     }
 
-    let data = load_regular_file_data(old_ks, old_key);
+    let data = match load_regular_file_data(old_ks, old_key) {
+        Ok(data) => data,
+        Err(err) if err == -ENOMEM => return -ENOMEM,
+        Err(_) => return -EFAULT,
+    };
     let (new_ks, new_key) = super::vfs::resolve_path(agent_id, new_path);
     if let Err(err) = store_regular_file_data(new_ks, new_key, &data) {
         log_regular_file_store_failure(agent_id, new_ks, new_key, data.len(), err);
@@ -3426,7 +3511,11 @@ fn rename_directory_tree(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64
 
     for (old_file, new_file) in &files_to_copy {
         let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_file);
-        let data = load_regular_file_data(old_ks, old_key);
+        let data = match load_regular_file_data(old_ks, old_key) {
+            Ok(data) => data,
+            Err(err) if err == -ENOMEM => return -ENOMEM,
+            Err(_) => return -EFAULT,
+        };
         let (new_ks, new_key) = super::vfs::resolve_path(agent_id, new_file);
         if let Err(err) = store_regular_file_data(new_ks, new_key, &data) {
             log_regular_file_store_failure(agent_id, new_ks, new_key, data.len(), err);
@@ -3813,7 +3902,11 @@ pub fn sys_ftruncate(agent_id: u16, fd: i32, length: u64) -> i64 {
     let key = entry.keyspace_key;
     let ks = entry.keyspace_id;
     let new_len = length as usize;
-    let mut file_data = load_regular_file_data(ks, key);
+    let mut file_data = match load_regular_file_data(ks, key) {
+        Ok(data) => data,
+        Err(err) if err == -ENOMEM => return -ENOMEM,
+        Err(_) => return -EFAULT,
+    };
     if file_data.len() > new_len {
         file_data.truncate(new_len);
     } else if file_data.len() < new_len {

@@ -626,6 +626,32 @@ fn spawn_mux_smoke(root_id: u16) {
     }
 }
 
+fn spawn_large_file_lifecycle_smoke(root_id: u16) {
+    static LARGE_FILE_SMOKE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_large_file_lifecycle.elf");
+    serial_println!(
+        "[ROOT] Loading large-file lifecycle smoke test ({} bytes)...",
+        LARGE_FILE_SMOKE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        LARGE_FILE_SMOKE_ELF,
+        5_000_000,
+        2048,
+        b"/app/test_large_file_lifecycle",
+        &[b"/app/test_large_file_lifecycle" as &[u8]],
+    ) {
+        Ok(id) => serial_println!(
+            "[ROOT] large-file lifecycle smoke test agent created: id={}",
+            id
+        ),
+        Err(e) => serial_println!(
+            "[ROOT] large-file lifecycle smoke test load failed: error {}",
+            e
+        ),
+    }
+}
+
 /// Root agent entry point.
 ///
 /// Runs an infinite loop, periodically logging a tick count and yielding
@@ -638,6 +664,8 @@ pub extern "C" fn root_entry() -> ! {
         serial_println!("[ROOT] Java smoke focus: {}", java_focus_label());
     }
     let java_jtreg_only_focus = focus_runs_java() && java_focus_runs_jtreg_only();
+
+    spawn_large_file_lifecycle_smoke(1);
 
     // Load relative *at path smoke test
     if !java_jtreg_only_focus {

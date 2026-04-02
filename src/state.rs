@@ -6,12 +6,13 @@
 //! CAP_STATE_WRITE capability. An agent always has implicit access to
 //! its own private keyspace.
 
+use alloc::vec::Vec;
 use crate::agent::{
     KeyspaceId, E_INVALID_ARG, E_NOT_FOUND, E_PAYLOAD_TOO_LARGE, E_QUOTA_EXCEEDED, MAX_AGENTS,
 };
 use crate::merkle::{self, MerkleHash};
 
-const MAX_ENTRIES_PER_KEYSPACE: usize = 2048;
+const MAX_ENTRIES_PER_KEYSPACE: usize = 4096;
 pub const MAX_VALUE_SIZE: usize = 256;
 
 // ─── State entry ────────────────────────────────────────────────────────────
@@ -266,7 +267,11 @@ pub fn state_put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64
         let _ = base_image_put(key, value);
         return Ok(());
     }
+    let old_multi_segment = existing_multi_segment_layout(keyspace, key);
     put(keyspace, key, value)?;
+    if let Some(segment_chunk_counts) = old_multi_segment {
+        cleanup_multi_segment_tree(keyspace, key, &segment_chunk_counts);
+    }
     advance_version(keyspace);
     Ok(())
 }
@@ -276,6 +281,7 @@ pub fn state_put(keyspace: KeyspaceId, key: u64, value: &[u8]) -> Result<(), i64
 /// Returns `Ok(())` if the key was found and deleted, or `Err(E_NOT_FOUND)`
 /// if it did not exist.
 pub fn state_delete(keyspace: KeyspaceId, key: u64) -> Result<(), i64> {
+    let old_multi_segment = existing_multi_segment_layout(keyspace, key);
     unsafe {
         let idx = keyspace as usize;
         if idx >= MAX_AGENTS {
@@ -287,6 +293,9 @@ pub fn state_delete(keyspace: KeyspaceId, key: u64) -> Result<(), i64> {
                     if entry.active && entry.key == key {
                         entry.active = false;
                         entry.len = 0;
+                        if let Some(segment_chunk_counts) = old_multi_segment.as_ref() {
+                            cleanup_multi_segment_tree_in_keyspace(ks, key, segment_chunk_counts);
+                        }
                         ks.advance_version();
                         return Ok(());
                     }
@@ -765,6 +774,153 @@ pub const MULTI_SEGMENT_SIZE: usize = MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE; /
 /// key + up to MAX_LARGE_VALUE_CHUNKS chunk keys = 257 keys total.
 const SEGMENT_KEY_STRIDE: u64 = (MAX_LARGE_VALUE_CHUNKS as u64) + 2; // 258
 
+fn parse_large_value_header(value: &[u8], value_len: usize) -> Option<(usize, usize)> {
+    if value_len != 6 {
+        return None;
+    }
+
+    let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
+    let chunk_count = u16::from_le_bytes([value[4], value[5]]) as usize;
+    if total == 0 || chunk_count == 0 || total > MAX_LARGE_VALUE_CHUNKS * MAX_VALUE_SIZE {
+        return None;
+    }
+
+    Some((total, chunk_count))
+}
+
+fn existing_multi_segment_layout(keyspace: KeyspaceId, base_key: u64) -> Option<Vec<usize>> {
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        return None;
+    }
+
+    let (meta_buf, meta_len) = state_get(keyspace, base_key)?;
+    let (_, segment_count) =
+        parse_multi_segment_header(keyspace, base_key, &meta_buf[..meta_len], meta_len)?;
+
+    let mut chunk_counts = Vec::with_capacity(segment_count);
+    for segment_index in 0..segment_count {
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((segment_index as u64) * SEGMENT_KEY_STRIDE);
+        let (seg_meta, seg_meta_len) = state_get(keyspace, segment_key)?;
+        let (_, chunk_count) =
+            parse_large_value_header(&seg_meta[..seg_meta_len], seg_meta_len)?;
+        chunk_counts.push(chunk_count);
+    }
+    Some(chunk_counts)
+}
+
+fn delete_key_no_version(ks: &mut Keyspace, key: u64) {
+    for entry in ks.entries.iter_mut() {
+        if entry.active && entry.key == key {
+            entry.active = false;
+            entry.len = 0;
+            return;
+        }
+    }
+}
+
+fn cleanup_multi_segment_tree_in_keyspace(
+    ks: &mut Keyspace,
+    base_key: u64,
+    segment_chunk_counts: &[usize],
+) {
+    for (segment_index, chunk_count) in segment_chunk_counts.iter().copied().enumerate() {
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((segment_index as u64) * SEGMENT_KEY_STRIDE);
+        delete_key_no_version(ks, segment_key);
+        for chunk_index in 0..chunk_count {
+            delete_key_no_version(ks, segment_key.wrapping_add(1).wrapping_add(chunk_index as u64));
+        }
+    }
+}
+
+fn cleanup_multi_segment_tree(keyspace: KeyspaceId, base_key: u64, segment_chunk_counts: &[usize]) {
+    unsafe {
+        let idx = keyspace as usize;
+        if idx >= MAX_AGENTS {
+            return;
+        }
+        if let Some(ks) = KEYSPACES[idx].as_mut() {
+            cleanup_multi_segment_tree_in_keyspace(ks, base_key, segment_chunk_counts);
+        }
+    }
+}
+
+fn cleanup_obsolete_multi_segment_entries(
+    keyspace: KeyspaceId,
+    base_key: u64,
+    old_segment_chunk_counts: &[usize],
+    new_total_size: usize,
+) {
+    unsafe {
+        let idx = keyspace as usize;
+        if idx >= MAX_AGENTS {
+            return;
+        }
+        let Some(ks) = KEYSPACES[idx].as_mut() else {
+            return;
+        };
+
+        let new_segment_count = (new_total_size + MULTI_SEGMENT_SIZE - 1) / MULTI_SEGMENT_SIZE;
+        for (segment_index, old_chunk_count) in old_segment_chunk_counts.iter().copied().enumerate()
+        {
+            let segment_key = base_key
+                .wrapping_add(1)
+                .wrapping_add((segment_index as u64) * SEGMENT_KEY_STRIDE);
+
+            if segment_index >= new_segment_count {
+                delete_key_no_version(ks, segment_key);
+                for chunk_index in 0..old_chunk_count {
+                    delete_key_no_version(
+                        ks,
+                        segment_key.wrapping_add(1).wrapping_add(chunk_index as u64),
+                    );
+                }
+                continue;
+            }
+
+            let segment_start = segment_index * MULTI_SEGMENT_SIZE;
+            let segment_size = (new_total_size - segment_start).min(MULTI_SEGMENT_SIZE);
+            let new_chunk_count = (segment_size + MAX_VALUE_SIZE - 1) / MAX_VALUE_SIZE;
+            for chunk_index in new_chunk_count..old_chunk_count {
+                delete_key_no_version(
+                    ks,
+                    segment_key.wrapping_add(1).wrapping_add(chunk_index as u64),
+                );
+            }
+        }
+    }
+}
+
+fn try_alloc_segment_vec(len: usize) -> Result<Vec<u8>, i64> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|_| E_QUOTA_EXCEEDED)?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
+fn store_segment_chunks(keyspace: KeyspaceId, segment_key: u64, segment_data: &[u8]) -> Result<(), i64> {
+    let chunk_count = segment_data.len().div_ceil(MAX_VALUE_SIZE);
+    let mut seg_meta = [0u8; 6];
+    seg_meta[0..4].copy_from_slice(&(segment_data.len() as u32).to_le_bytes());
+    seg_meta[4..6].copy_from_slice(&(chunk_count as u16).to_le_bytes());
+    put(keyspace, segment_key, &seg_meta)?;
+    for chunk_index in 0..chunk_count {
+        let chunk_start = chunk_index * MAX_VALUE_SIZE;
+        let chunk_end = (chunk_start + MAX_VALUE_SIZE).min(segment_data.len());
+        put(
+            keyspace,
+            segment_key
+                .wrapping_add(1)
+                .wrapping_add(chunk_index as u64),
+            &segment_data[chunk_start..chunk_end],
+        )?;
+    }
+    Ok(())
+}
+
 // ─── Base image dedicated storage ──────────────────────────────────────────
 //
 // The base image keyspace (0xFFFE) cannot use the normal per-agent KEYSPACES
@@ -1058,6 +1214,11 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
         return Err(E_INVALID_ARG);
     }
 
+    let old_multi_segment = if keyspace == BASE_IMAGE_KEYSPACE {
+        None
+    } else {
+        existing_multi_segment_layout(keyspace, base_key)
+    };
     let segment_count = (data.len() + MULTI_SEGMENT_SIZE - 1) / MULTI_SEGMENT_SIZE;
 
     // Store metadata at base_key: total_size(u32 LE) + segment_count(u16 LE)
@@ -1111,9 +1272,84 @@ pub fn store_multi_segment(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> 
     }
 
     if keyspace != BASE_IMAGE_KEYSPACE {
+        if let Some(segment_chunk_counts) = old_multi_segment.as_ref() {
+            cleanup_obsolete_multi_segment_entries(
+                keyspace,
+                base_key,
+                segment_chunk_counts,
+                data.len(),
+            );
+        }
         advance_version(keyspace);
     }
     Ok(())
+}
+
+pub fn append_file_data(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> Result<usize, i64> {
+    if data.is_empty() {
+        return Ok(query_file_size(keyspace, base_key));
+    }
+    if keyspace == BASE_IMAGE_KEYSPACE {
+        return Err(E_INVALID_ARG);
+    }
+
+    let old_total = query_file_size(keyspace, base_key);
+    if old_total == 0 {
+        if let Some((buf, len)) = state_get(keyspace, base_key) {
+            if len + data.len() <= MAX_VALUE_SIZE {
+                let mut combined = [0u8; MAX_VALUE_SIZE];
+                combined[..len].copy_from_slice(&buf[..len]);
+                combined[len..len + data.len()].copy_from_slice(data);
+                state_put(keyspace, base_key, &combined[..len + data.len()])?;
+                return Ok(len + data.len());
+            }
+        } else if data.len() <= MAX_VALUE_SIZE {
+            state_put(keyspace, base_key, data)?;
+            return Ok(data.len());
+        }
+    }
+
+    let new_total = old_total.checked_add(data.len()).ok_or(E_INVALID_ARG)?;    
+    let first_dirty_segment = old_total / MULTI_SEGMENT_SIZE;
+    let new_segment_count = new_total.div_ceil(MULTI_SEGMENT_SIZE);
+
+    for segment_index in first_dirty_segment..new_segment_count {
+        let segment_start = segment_index * MULTI_SEGMENT_SIZE;
+        let segment_end = (segment_start + MULTI_SEGMENT_SIZE).min(new_total);
+        let segment_len = segment_end - segment_start;
+        let mut segment_buf = try_alloc_segment_vec(segment_len)?;
+
+        let existing_len = old_total.saturating_sub(segment_start).min(segment_len);
+        if existing_len > 0 {
+            let loaded =
+                load_file_range(keyspace, base_key, segment_start, &mut segment_buf[..existing_len]);
+            if loaded != existing_len {
+                return Err(E_NOT_FOUND);
+            }
+        }
+
+        let append_start = old_total.max(segment_start);
+        let append_end = new_total.min(segment_end);
+        if append_end > append_start {
+            let src_offset = append_start - old_total;
+            let dst_offset = append_start - segment_start;
+            let copy_len = append_end - append_start;
+            segment_buf[dst_offset..dst_offset + copy_len]
+                .copy_from_slice(&data[src_offset..src_offset + copy_len]);
+        }
+
+        let segment_key = base_key
+            .wrapping_add(1)
+            .wrapping_add((segment_index as u64) * SEGMENT_KEY_STRIDE);
+        store_segment_chunks(keyspace, segment_key, &segment_buf)?;
+    }
+
+    let mut meta = [0u8; 6];
+    meta[0..4].copy_from_slice(&(new_total as u32).to_le_bytes());
+    meta[4..6].copy_from_slice(&(new_segment_count as u16).to_le_bytes());
+    put(keyspace, base_key, &meta)?;
+    advance_version(keyspace);
+    Ok(new_total)
 }
 
 /// Load a multi-segment value that was stored via `store_multi_segment`.
@@ -1172,14 +1408,53 @@ pub fn parse_multi_segment_header(
         return None;
     }
 
+    let expected_segment_count = total.div_ceil(MULTI_SEGMENT_SIZE);
+    if segment_count != expected_segment_count {
+        return None;
+    }
+
     let first_segment_key = base_key.wrapping_add(1);
-    let first_segment_exists = if keyspace == BASE_IMAGE_KEYSPACE {
-        base_image_state_get(first_segment_key).is_some()
+    let (first_segment_meta, first_segment_meta_len) = if keyspace == BASE_IMAGE_KEYSPACE {
+        match base_image_state_get(first_segment_key) {
+            Some(v) => v,
+            None => return None,
+        }
     } else {
-        state_get(keyspace, first_segment_key).is_some()
+        match state_get(keyspace, first_segment_key) {
+            Some(v) => v,
+            None => return None,
+        }
     };
 
-    if !first_segment_exists {
+    if first_segment_meta_len != 6 {
+        return None;
+    }
+
+    let first_segment_size = u32::from_le_bytes([
+        first_segment_meta[0],
+        first_segment_meta[1],
+        first_segment_meta[2],
+        first_segment_meta[3],
+    ]) as usize;
+    let first_segment_chunk_count =
+        u16::from_le_bytes([first_segment_meta[4], first_segment_meta[5]]) as usize;
+    let expected_first_segment_size = total.min(MULTI_SEGMENT_SIZE);
+    let expected_first_segment_chunk_count = expected_first_segment_size.div_ceil(MAX_VALUE_SIZE);
+
+    if first_segment_size != expected_first_segment_size
+        || first_segment_chunk_count != expected_first_segment_chunk_count
+    {
+        return None;
+    }
+
+    let first_chunk_key = first_segment_key.wrapping_add(1);
+    let first_chunk_exists = if keyspace == BASE_IMAGE_KEYSPACE {
+        base_image_state_get(first_chunk_key).is_some()
+    } else {
+        state_get(keyspace, first_chunk_key).is_some()
+    };
+
+    if !first_chunk_exists {
         return None;
     }
 

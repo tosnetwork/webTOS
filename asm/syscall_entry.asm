@@ -22,6 +22,8 @@ extern syscall_handler
 section .data
 global CURRENT_KERNEL_RSP
 CURRENT_KERNEL_RSP: dq 0
+global CURRENT_USER_RSP_TMP
+CURRENT_USER_RSP_TMP: dq 0
 global CURRENT_SYSCALL_FRAME
 CURRENT_SYSCALL_FRAME: dq 0
 
@@ -34,9 +36,8 @@ syscall_entry:
     xchg rsp, [rel CURRENT_KERNEL_RSP]
 
     ; Save the kernel stack top and user RSP on the kernel stack.
-    ; Keeping the top on-stack lets us restore CURRENT_KERNEL_RSP before
-    ; SYSRET, so repeated syscalls reuse the same stack top instead of
-    ; walking down the stack forever.
+    ; We restore them later via dedicated globals so user-visible GPRs
+    ; such as RDX survive the syscall return path.
     push rsp
     push qword [rel CURRENT_KERNEL_RSP]
 
@@ -109,11 +110,11 @@ syscall_entry:
     pop r11         ; user RFLAGS
     pop rcx         ; user RIP
 
-    ; Restore user RSP and reset CURRENT_KERNEL_RSP back to the kernel
-    ; stack top saved on entry.
-    pop rdx         ; user RSP
+    ; Restore CURRENT_KERNEL_RSP and the saved user RSP without clobbering
+    ; any user caller-saved registers such as RDX.
+    pop qword [rel CURRENT_USER_RSP_TMP]
     pop qword [rel CURRENT_KERNEL_RSP]
-    mov rsp, rdx
+    mov rsp, [rel CURRENT_USER_RSP_TMP]
 
     ; Return to ring 3
     o64 sysret
