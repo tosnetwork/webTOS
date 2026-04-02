@@ -4,13 +4,29 @@
 //! to ensure deterministic replay across all nodes.
 
 use super::constants::*;
+use crate::agent::{self, AgentStatus, MAX_AGENTS};
+use crate::arch::x86_64::timer;
+
+const NS_PER_TICK: u64 = 10_000_000;
+const TIMER_ABSTIME: u32 = 1;
+
+static mut SLEEP_DEADLINES: [u64; MAX_AGENTS] = [0; MAX_AGENTS];
+
+#[inline]
+fn sleep_slot(agent_id: u16) -> Option<usize> {
+    if agent_id == 0 {
+        return None;
+    }
+    let idx = agent_id as usize - 1;
+    (idx < MAX_AGENTS).then_some(idx)
+}
 
 /// Helper: convert TOS ticks to (seconds, nanoseconds).
 #[inline]
 fn ticks_to_timespec() -> (u64, u64) {
-    let ticks = crate::arch::x86_64::timer::get_ticks();
+    let ticks = timer::get_ticks();
     let seconds = ticks / 100;
-    let nanoseconds = (ticks % 100) * 10_000_000;
+    let nanoseconds = (ticks % 100) * NS_PER_TICK;
     (seconds, nanoseconds)
 }
 
@@ -95,6 +111,53 @@ fn read_timespec(agent_id: u16, ptr: u64) -> Option<(i64, i64)> {
     ))
 }
 
+#[inline]
+fn timespec_to_ticks(sec: i64, nsec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return None;
+    }
+    let secs = (sec as u64).saturating_mul(100);
+    let sub = if nsec == 0 {
+        0
+    } else {
+        ((nsec as u64).saturating_add(NS_PER_TICK - 1)) / NS_PER_TICK
+    };
+    Some(secs.saturating_add(sub))
+}
+
+fn sleep_until_tick(agent_id: u16, deadline_tick: u64) {
+    let Some(slot) = sleep_slot(agent_id) else {
+        return;
+    };
+    unsafe {
+        SLEEP_DEADLINES[slot] = deadline_tick;
+    }
+    crate::sched::block_current(AgentStatus::BlockedRecv);
+    unsafe {
+        SLEEP_DEADLINES[slot] = 0;
+    }
+}
+
+pub fn sleep_tick() {
+    let now = timer::get_ticks();
+    unsafe {
+        for (idx, deadline) in SLEEP_DEADLINES.iter_mut().enumerate() {
+            if *deadline == 0 {
+                continue;
+            }
+            let agent_id = idx as u16 + 1;
+            if agent::get_agent(agent_id).is_none() {
+                *deadline = 0;
+                continue;
+            }
+            if now >= *deadline {
+                *deadline = 0;
+                crate::sched::unblock(agent_id);
+            }
+        }
+    }
+}
+
 // ── clock_getres ───────────────────────────────────────────────────────────
 
 /// clock_getres(clockid_t clk_id, struct timespec *res)
@@ -143,11 +206,20 @@ pub fn sys_time(agent_id: u16, tloc_ptr: u64) -> i64 {
 ///
 /// Deterministic: does not actually sleep. Returns immediately with remaining = 0.
 pub fn sys_nanosleep(agent_id: u16, request_ptr: u64, remain_ptr: u64) -> i64 {
-    if request_ptr != 0 && read_timespec(agent_id, request_ptr).is_none() {
+    let Some((sec, nsec)) = (if request_ptr != 0 {
+        read_timespec(agent_id, request_ptr)
+    } else {
+        Some((0, 0))
+    }) else {
         return -EFAULT;
+    };
+    let Some(delta_ticks) = timespec_to_ticks(sec, nsec) else {
+        return -EINVAL;
+    };
+    if delta_ticks != 0 {
+        let deadline = timer::get_ticks().saturating_add(delta_ticks);
+        sleep_until_tick(agent_id, deadline);
     }
-    // No actual sleeping in deterministic mode — just return success.
-    // If remain_ptr is set, write zero remaining time.
     if remain_ptr != 0 && !write_timespec(agent_id, remain_ptr, 0, 0) {
         return -EFAULT;
     }
@@ -164,12 +236,27 @@ pub fn sys_nanosleep(agent_id: u16, request_ptr: u64, remain_ptr: u64) -> i64 {
 pub fn sys_clock_nanosleep(
     agent_id: u16,
     _clk_id: u32,
-    _flags: u32,
+    flags: u32,
     request_ptr: u64,
     remain_ptr: u64,
 ) -> i64 {
-    if request_ptr != 0 && read_timespec(agent_id, request_ptr).is_none() {
+    let Some((sec, nsec)) = (if request_ptr != 0 {
+        read_timespec(agent_id, request_ptr)
+    } else {
+        Some((0, 0))
+    }) else {
         return -EFAULT;
+    };
+    let Some(req_ticks) = timespec_to_ticks(sec, nsec) else {
+        return -EINVAL;
+    };
+    let deadline = if flags & TIMER_ABSTIME != 0 {
+        req_ticks
+    } else {
+        timer::get_ticks().saturating_add(req_ticks)
+    };
+    if deadline > timer::get_ticks() {
+        sleep_until_tick(agent_id, deadline);
     }
     if remain_ptr != 0 && !write_timespec(agent_id, remain_ptr, 0, 0) {
         return -EFAULT;

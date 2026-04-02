@@ -335,6 +335,7 @@ pub struct LinuxAgentState {
     pub exe_path: [u8; MAX_PATH],    // executable path (for /proc/self/exe, AT_EXECFN)
     pub exe_path_len: u16,
     pub vfork_parent: u16, // blocked parent waiting for vfork child exec/exit
+    pub resource_parent: u16, // parent to refund temporary helper resources to
     pub exit_status: i32,
     pub active: bool,
 }
@@ -405,6 +406,7 @@ impl LinuxAgentState {
             exe_path: [0u8; MAX_PATH],
             exe_path_len: 0,
             vfork_parent: 0,
+            resource_parent: 0,
             exit_status: 0,
             active: true,
         }
@@ -748,6 +750,25 @@ pub fn take_process_vfork_parent(agent_id: u16) -> Option<u16> {
         if let Some(obj) = get_process_object_mut(handle) {
             obj.vfork_parent = 0;
         }
+    }
+    Some(parent_id)
+}
+
+pub fn process_resource_parent(agent_id: u16) -> Option<u16> {
+    get_state(agent_id)
+        .and_then(|st| (st.resource_parent != 0).then_some(st.resource_parent))
+}
+
+pub fn set_process_resource_parent(agent_id: u16, parent_id: u16) {
+    if let Some(st) = get_state_mut(agent_id) {
+        st.resource_parent = parent_id;
+    }
+}
+
+pub fn take_process_resource_parent(agent_id: u16) -> Option<u16> {
+    let parent_id = process_resource_parent(agent_id)?;
+    if let Some(st) = get_state_mut(agent_id) {
+        st.resource_parent = 0;
     }
     Some(parent_id)
 }
@@ -2009,6 +2030,7 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
     st.thread_pending_signals = 0;
     st.group_pending_signals = 0;
     st.vfork_parent = 0;
+    st.resource_parent = 0;
     st.active = true;
 
     let len = path.len().min(MAX_PATH);
@@ -2041,7 +2063,9 @@ pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
 pub fn trace_runtime_agent(agent_id: u16) -> bool {
     let trace_java = option_env!("TOS_TRACE_JAVA_RUNTIME") == Some("1") && trace_java_agent(agent_id);
     if (option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
-        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang"))
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-deadlock")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("deadlock-probe"))
         && trace_java_agent(agent_id)
     {
         return option_env!("TOS_TRACE_JTREG_RUNTIME") == Some("1");

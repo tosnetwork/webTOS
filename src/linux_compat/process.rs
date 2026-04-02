@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use crate::agent::{
     self, AgentContext, AgentId, AgentMode, AgentStatus, MAX_AGENTS, USER_STACK_SIZE,
 };
@@ -716,6 +718,7 @@ fn commit_execve(
         };
     let old_linux_state = state::get_state(agent_id).copied();
     let old_vfork_parent = state::process_vfork_parent(agent_id).unwrap_or(0);
+    let old_resource_parent = state::process_resource_parent(agent_id).unwrap_or(0);
     let old_exit_status = state::process_exit_status(agent_id).unwrap_or(0);
 
     state::reset_for_exec(agent_id, exe, prepared.initial_brk);
@@ -727,6 +730,9 @@ fn commit_execve(
         }
         if old_vfork_parent != 0 {
             state::set_process_vfork_parent(agent_id, old_vfork_parent);
+        }
+        if old_resource_parent != 0 {
+            state::set_process_resource_parent(agent_id, old_resource_parent);
         }
         state::record_process_exit_status(agent_id, old_exit_status);
         let _ = paging::release_address_space(prepared.cr3);
@@ -743,6 +749,9 @@ fn commit_execve(
             if let Some(st) = state::get_state_mut(agent_id) {
                 *st = snapshot;
             }
+        }
+        if old_resource_parent != 0 {
+            state::set_process_resource_parent(agent_id, old_resource_parent);
         }
         let _ = paging::release_address_space(prepared.cr3);
         return -ESRCH;
@@ -763,10 +772,17 @@ fn commit_execve(
         if old_vfork_parent != 0 {
             state::set_process_vfork_parent(agent_id, old_vfork_parent);
         }
+        if old_resource_parent != 0 {
+            state::set_process_resource_parent(agent_id, old_resource_parent);
+        }
         state::record_process_exit_status(agent_id, old_exit_status);
         paging::write_cr3(old_cr3);
         let _ = paging::release_address_space(prepared.cr3);
         return err;
+    }
+
+    if old_resource_parent != 0 {
+        state::set_process_resource_parent(agent_id, old_resource_parent);
     }
 
     crate::linux_compat::signal::reset_signal_state_for_exec(agent_id);
@@ -797,12 +813,25 @@ fn take_vfork_parent(agent_id: u16) -> Option<AgentId> {
 }
 
 #[inline]
+fn take_resource_parent(agent_id: u16) -> Option<AgentId> {
+    state::take_process_resource_parent(agent_id)
+}
+
+#[inline]
 fn resume_vfork_parent(parent_id: AgentId) {
     if let Some(parent) = agent::get_agent_mut(parent_id) {
         if parent.status == AgentStatus::BlockedRecv {
             parent.status = AgentStatus::Ready;
             sched::add_to_run_queue(parent_id);
         }
+    }
+}
+
+#[inline]
+fn refund_vfork_resources(parent_id: AgentId, energy: u64, mem_quota: u32) {
+    if let Some(parent) = agent::get_agent_mut(parent_id) {
+        parent.energy_budget = parent.energy_budget.saturating_add(energy);
+        parent.memory_quota = parent.memory_quota.saturating_add(mem_quota);
     }
 }
 
@@ -1007,6 +1036,7 @@ fn inherit_linux_state_for_clone(
         } else {
             child_id as u32
         };
+        child_state.resource_parent = 0;
 
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child_state.clear_child_tid = child_tid_ptr;
@@ -1198,6 +1228,8 @@ fn trace_node_futex_agent(agent_id: u16) -> bool {
 fn trace_java_futex_agent(agent_id: u16) -> bool {
     if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
         || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-deadlock")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("deadlock-probe")
     {
         return false;
     }
@@ -1554,59 +1586,51 @@ fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: 
     }
 
     // 3. Read argv from user memory
-    let mut argv_bufs: [[u8; 256]; 32] = [[0u8; 256]; 32];
-    let mut argv_lens: [usize; 32] = [0; 32];
+    let mut argv_bufs: Vec<Vec<u8>> = Vec::new();
     let mut argc: usize = 0;
 
     if argv_ptr != 0 {
-        for i in 0..32 {
+        for i in 0..EXECVE_ARG_MAX {
             let Some(ptr) = read_user_u64(agent_id, argv_ptr + (i as u64) * 8) else {
                 return -EFAULT;
             };
             if ptr == 0 {
                 break;
             }
-            let len = match read_user_cstr(agent_id, ptr, &mut argv_bufs[i]) {
-                Ok(len) => len,
+            let arg = match read_user_cstr_vec(agent_id, ptr, EXECVE_ARG_LEN_MAX) {
+                Ok(arg) => arg,
                 Err(err) => return err,
             };
-            argv_lens[i] = len;
+            argv_bufs.push(arg);
             argc += 1;
         }
     }
 
     // Build argv slice references
-    let mut argv_refs: [&[u8]; 32] = [b"" as &[u8]; 32];
-    for i in 0..argc {
-        argv_refs[i] = &argv_bufs[i][..argv_lens[i]];
-    }
+    let argv_refs: Vec<&[u8]> = argv_bufs.iter().map(|arg| arg.as_slice()).collect();
 
     // 4. Read envp from user memory
-    let mut envp_bufs: [[u8; 256]; 32] = [[0u8; 256]; 32];
-    let mut envp_lens: [usize; 32] = [0; 32];
+    let mut envp_bufs: Vec<Vec<u8>> = Vec::new();
     let mut envc: usize = 0;
 
     if envp_ptr != 0 {
-        for i in 0..32 {
+        for i in 0..EXECVE_ENV_MAX {
             let Some(ptr) = read_user_u64(agent_id, envp_ptr + (i as u64) * 8) else {
                 return -EFAULT;
             };
             if ptr == 0 {
                 break;
             }
-            let len = match read_user_cstr(agent_id, ptr, &mut envp_bufs[i]) {
-                Ok(len) => len,
+            let env = match read_user_cstr_vec(agent_id, ptr, EXECVE_ENV_LEN_MAX) {
+                Ok(env) => env,
                 Err(err) => return err,
             };
-            envp_lens[i] = len;
+            envp_bufs.push(env);
             envc += 1;
         }
     }
 
-    let mut envp_refs: [&[u8]; 32] = [b"" as &[u8]; 32];
-    for i in 0..envc {
-        envp_refs[i] = &envp_bufs[i][..envp_lens[i]];
-    }
+    let envp_refs: Vec<&[u8]> = envp_bufs.iter().map(|env| env.as_slice()).collect();
 
     if path.ends_with(b"/java") || path.ends_with(b"/javac") {
         let mut test_name = None;
@@ -1642,6 +1666,48 @@ fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: 
                     .map(|v| core::str::from_utf8(v).unwrap_or("?"))
                     .unwrap_or("-")
             );
+            if path.ends_with(b"/javac")
+                && (option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
+                    || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-deadlock"))
+            {
+                let arg0 = if argc > 0 {
+                    core::str::from_utf8(argv_refs[0]).unwrap_or("?")
+                } else {
+                    "-"
+                };
+                let arg1 = if argc > 1 {
+                    core::str::from_utf8(argv_refs[1]).unwrap_or("?")
+                } else {
+                    "-"
+                };
+                let arg2 = if argc > 2 {
+                    core::str::from_utf8(argv_refs[2]).unwrap_or("?")
+                } else {
+                    "-"
+                };
+                let arg3 = if argc > 3 {
+                    core::str::from_utf8(argv_refs[3]).unwrap_or("?")
+                } else {
+                    "-"
+                };
+                let arg4 = if argc > 4 {
+                    core::str::from_utf8(argv_refs[4]).unwrap_or("?")
+                } else {
+                    "-"
+                };
+                serial_println!(
+                    "[execve-jtreg-javac] agent={} arg0={:?} arg1={:?} arg2={:?} arg3={:?} arg4={:?} last={:?}",
+                    agent_id,
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
+                    arg4,
+                    last_arg
+                        .map(|v| core::str::from_utf8(v).unwrap_or("?"))
+                        .unwrap_or("-")
+                );
+            }
         } else if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang") {
             let arg0 = if argc > 0 {
                 core::str::from_utf8(argv_refs[0]).unwrap_or("?")
@@ -1706,7 +1772,33 @@ fn read_user_cstr(agent_id: u16, ptr: u64, buf: &mut [u8]) -> Result<usize, i64>
         buf[len] = byte[0];
         len += 1;
     }
+    if len == max {
+        return Err(-E2BIG);
+    }
     Ok(len)
+}
+
+fn read_user_cstr_vec(agent_id: u16, ptr: u64, max_len: usize) -> Result<Vec<u8>, i64> {
+    if ptr == 0 {
+        return Err(-EFAULT);
+    }
+
+    let mut out = Vec::with_capacity(64);
+    let mut len = 0usize;
+    let mut byte = [0u8; 1];
+
+    while len < max_len {
+        if !copy_from_user(agent_id, ptr + len as u64, &mut byte) {
+            return Err(-EFAULT);
+        }
+        if byte[0] == 0 {
+            return Ok(out);
+        }
+        out.push(byte[0]);
+        len += 1;
+    }
+
+    Err(-E2BIG)
 }
 
 fn debug_python_exit_rela() {
@@ -1779,6 +1871,11 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
 
     let group_finished = !has_other_active_group_members(agent_id);
     let vfork_parent = take_vfork_parent(agent_id);
+    let resource_parent = take_resource_parent(agent_id);
+    let (remaining_energy, remaining_mem_quota) = match agent::get_agent(agent_id) {
+        Some(agent) => (agent.energy_budget, agent.memory_quota),
+        None => (0, 0),
+    };
     if group_finished {
         record_group_exit_status(agent_id, status);
     }
@@ -1809,6 +1906,9 @@ pub fn sys_exit(agent_id: u16, status: i32) -> i64 {
     if let Some(parent_id) = vfork_parent {
         resume_vfork_parent(parent_id);
     }
+    if let Some(parent_id) = resource_parent {
+        refund_vfork_resources(parent_id, remaining_energy, remaining_mem_quota);
+    }
 
     // This syscall never returns; the scheduler will pick the next agent.
     crate::syscall::set_linux_exit_debug_stage(0xE230);
@@ -1830,7 +1930,13 @@ pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
 
     let group_pid = thread_group_pid(agent_id);
     let parent_id = thread_group_parent_id(agent_id);
-    let vfork_parent = take_vfork_parent(agent_id);
+    let leader_id = thread_group_leader(agent_id);
+    let vfork_parent = take_vfork_parent(leader_id);
+    let resource_parent = take_resource_parent(leader_id);
+    let (remaining_energy, remaining_mem_quota) = match agent::get_agent(leader_id) {
+        Some(agent) => (agent.energy_budget, agent.memory_quota),
+        None => (0, 0),
+    };
     record_group_exit_status(agent_id, status);
 
     let mut members: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
@@ -1864,6 +1970,9 @@ pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
     }
     if let Some(parent_id) = vfork_parent {
         resume_vfork_parent(parent_id);
+    }
+    if let Some(parent_id) = resource_parent {
+        refund_vfork_resources(parent_id, remaining_energy, remaining_mem_quota);
     }
 
     sched::remove_from_run_queue(agent_id);
@@ -2231,8 +2340,10 @@ pub fn sys_vfork(agent_id: u16) -> i64 {
     inherit_linux_state_for_clone(agent_id, child_id, CLONE_VM, 0, 0);
     if let Some(child_state) = state::get_state_mut(child_id) {
         child_state.vfork_parent = agent_id;
+        child_state.resource_parent = agent_id;
     }
     state::set_process_vfork_parent(child_id, agent_id);
+    state::set_process_resource_parent(child_id, agent_id);
 
     sched::add_to_run_queue(child_id);
     if let Some(parent) = agent::get_agent_mut(agent_id) {

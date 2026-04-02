@@ -11,6 +11,8 @@ Boot TOS with a jtreg-enabled runtime bundle and run the full OpenJDK 11
 Options:
   --runtime-manifest PATH   Runtime manifest to embed
                             (default: base_image.runtime.jtreg.manifest)
+  --target PATH             Guest jtreg target path
+                            (default: /jdk/test/jdk/java/lang)
   --qemu-timeout SECONDS    QEMU timeout in seconds (default: 1800)
   --qemu-memory SIZE        Guest RAM size (default: 2048M)
   --image PATH              Disk image path
@@ -21,6 +23,7 @@ EOF
 }
 
 runtime_manifest="${TOS_RUNTIME_MANIFEST:-base_image.runtime.jtreg.manifest}"
+jtreg_target="${TOS_JTREG_LANG_TARGET:-/jdk/test/jdk/java/lang}"
 qemu_timeout="${QEMU_TIMEOUT:-1800}"
 qemu_memory="${QEMU_MEMORY:-2048M}"
 image_path=""
@@ -31,6 +34,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --runtime-manifest)
       runtime_manifest="$2"
+      shift 2
+      ;;
+    --target)
+      jtreg_target="$2"
       shift 2
       ;;
     --qemu-timeout)
@@ -70,9 +77,12 @@ cd "$repo_root"
 
 kernel_elf64="target/x86_64-unknown-tos/release/tos"
 kernel_elf32="target/tos_32.elf"
+jtreg_launcher_src="test_data/test_java_jtreg_lang_execve.c"
+jtreg_launcher_elf="test_data/test_java_jtreg_lang_execve.elf"
 base_test_image="${TOS_BASE_TEST_IMG:-/tmp/tos_test.img}"
 default_image="/tmp/tos_jtreg_java_lang.img"
 default_log="/tmp/tos_jtreg_java_lang.log"
+test_disk_mb="${TOS_TEST_DISK_MB:-512}"
 
 if [[ ! -f "$runtime_manifest" ]]; then
   echo "runtime manifest not found: $runtime_manifest" >&2
@@ -97,18 +107,20 @@ export TOS_RUNTIME_SMOKE_FOCUS="java"
 export TOS_JAVA_SMOKE_FOCUS="jtreg-lang"
 
 echo "[jtreg-lang] build: TOS_RUNTIME_MANIFEST=$TOS_RUNTIME_MANIFEST"
+echo "[jtreg-lang] target: $jtreg_target"
+gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 \
+  -DJTREG_LANG_TARGET="\"$jtreg_target\"" \
+  -o "$jtreg_launcher_elf" "$jtreg_launcher_src"
 cargo build --release --target x86_64-unknown-tos.json
 objcopy -I elf64-x86-64 -O elf32-i386 "$kernel_elf64" "$kernel_elf32"
 
-if [[ ! -f "$base_test_image" ]]; then
-  tools/create_test_disk.sh "$base_test_image"
-fi
+TOS_TEST_DISK_MB="$test_disk_mb" tools/create_test_disk.sh "$base_test_image"
 
 cp "$base_test_image" "$image_path"
 
 qemu_exit=0
 timeout "$qemu_timeout" \
-  qemu-system-x86_64 \
+  stdbuf -o0 -e0 qemu-system-x86_64 \
     -m "$qemu_memory" \
     -serial stdio \
     -display none \
@@ -145,7 +157,7 @@ require_no_line() {
 }
 
 require_no_line 'Page fault|GP fault|TRAP|panic|SIGABRT|KERNEL PANIC'
-require_line '\[JAVA\] launching jtreg java\.lang tree'
+require_line "\\[JAVA\\] launching jtreg java\\.lang tree: ${jtreg_target//\//\\/}"
 require_line 'Test results:.*passed:[[:space:]][1-9][0-9]*'
 require_no_line 'Test results:.*failed:[[:space:]][1-9][0-9]*'
 require_no_line 'Test results:.*error:[[:space:]][1-9][0-9]*'

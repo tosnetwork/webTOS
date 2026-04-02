@@ -36,9 +36,11 @@ enum JavaSmokeFocus {
     Hello,
     Fs,
     Jar,
+    DeadlockProbe,
     JtregJavac,
     Jtreg,
     JtregLang,
+    JtregDeadlock,
     Phase6,
     Full,
 }
@@ -49,9 +51,11 @@ fn java_smoke_focus() -> JavaSmokeFocus {
         Some("version") => JavaSmokeFocus::Version,
         Some("hello") => JavaSmokeFocus::Hello,
         Some("fs") => JavaSmokeFocus::Fs,
+        Some("deadlock-probe") => JavaSmokeFocus::DeadlockProbe,
         Some("jtreg-javac") => JavaSmokeFocus::JtregJavac,
         Some("jtreg") => JavaSmokeFocus::Jtreg,
         Some("jtreg-lang") => JavaSmokeFocus::JtregLang,
+        Some("jtreg-deadlock") => JavaSmokeFocus::JtregDeadlock,
         Some("phase6") => JavaSmokeFocus::Phase6,
         Some("full") => JavaSmokeFocus::Full,
         _ => JavaSmokeFocus::Jar,
@@ -115,6 +119,11 @@ fn java_focus_runs_jar() -> bool {
 }
 
 #[inline]
+fn java_focus_runs_deadlock_probe() -> bool {
+    matches!(java_smoke_focus(), JavaSmokeFocus::DeadlockProbe)
+}
+
+#[inline]
 fn java_focus_runs_jtreg() -> bool {
     matches!(java_smoke_focus(), JavaSmokeFocus::Jtreg)
 }
@@ -122,6 +131,11 @@ fn java_focus_runs_jtreg() -> bool {
 #[inline]
 fn java_focus_runs_jtreg_lang() -> bool {
     matches!(java_smoke_focus(), JavaSmokeFocus::JtregLang)
+}
+
+#[inline]
+fn java_focus_runs_jtreg_deadlock() -> bool {
+    matches!(java_smoke_focus(), JavaSmokeFocus::JtregDeadlock)
 }
 
 #[inline]
@@ -141,7 +155,10 @@ fn java_focus_runs_phase6() -> bool {
 fn java_focus_runs_jtreg_only() -> bool {
     matches!(
         java_smoke_focus(),
-        JavaSmokeFocus::Jtreg | JavaSmokeFocus::JtregLang | JavaSmokeFocus::JtregJavac
+        JavaSmokeFocus::Jtreg
+            | JavaSmokeFocus::JtregLang
+            | JavaSmokeFocus::JtregDeadlock
+            | JavaSmokeFocus::JtregJavac
     )
 }
 
@@ -152,9 +169,11 @@ fn java_focus_label() -> &'static str {
         JavaSmokeFocus::Hello => "hello",
         JavaSmokeFocus::Fs => "fs",
         JavaSmokeFocus::Jar => "jar",
+        JavaSmokeFocus::DeadlockProbe => "deadlock-probe",
         JavaSmokeFocus::JtregJavac => "jtreg-javac",
         JavaSmokeFocus::Jtreg => "jtreg",
         JavaSmokeFocus::JtregLang => "jtreg-lang",
+        JavaSmokeFocus::JtregDeadlock => "jtreg-deadlock",
         JavaSmokeFocus::Phase6 => "phase6",
         JavaSmokeFocus::Full => "full",
     }
@@ -374,6 +393,26 @@ fn spawn_java_jar_smoke(root_id: u16) {
     }
 }
 
+fn spawn_java_deadlock_probe(root_id: u16) {
+    static JAVA_DEADLOCK_PROBE_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_java_deadlock_probe_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Java deadlock probe ({} bytes)...",
+        JAVA_DEADLOCK_PROBE_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        JAVA_DEADLOCK_PROBE_EXECVE_ELF,
+        100_000_000,
+        262_144,
+        b"/app/test_java_deadlock_probe_execve",
+        &[b"/app/test_java_deadlock_probe_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] Java deadlock probe agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] Java deadlock probe load failed: error {}", e),
+    }
+}
+
 fn spawn_java_jtreg_smoke(root_id: u16) {
     static JAVA_JTREG_EXECVE_ELF: &[u8] =
         include_bytes!("../../test_data/test_java_jtreg_execve.elf");
@@ -411,6 +450,32 @@ fn spawn_java_jtreg_lang_smoke(root_id: u16) {
     ) {
         Ok(id) => serial_println!("[ROOT] Java jtreg java.lang agent created: id={}", id),
         Err(e) => serial_println!("[ROOT] Java jtreg java.lang load failed: error {}", e),
+    }
+}
+
+fn spawn_java_jtreg_deadlock_smoke(root_id: u16) {
+    static JAVA_JTREG_DEADLOCK_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_java_jtreg_deadlock_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Java jtreg deadlock isolation run ({} bytes)...",
+        JAVA_JTREG_DEADLOCK_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        JAVA_JTREG_DEADLOCK_EXECVE_ELF,
+        500_000_000_000,
+        262_144,
+        b"/app/test_java_jtreg_deadlock_execve",
+        &[b"/app/test_java_jtreg_deadlock_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!(
+            "[ROOT] Java jtreg deadlock isolation agent created: id={}",
+            id
+        ),
+        Err(e) => serial_println!(
+            "[ROOT] Java jtreg deadlock isolation load failed: error {}",
+            e
+        ),
     }
 }
 
@@ -591,6 +656,7 @@ pub extern "C" fn root_entry() -> ! {
     const JAVA_HELLO_SMOKE_DELAY_TICKS: u64 = 450_000;
     const JAVA_FS_SMOKE_DELAY_TICKS: u64 = 600_000;
     const JAVA_JAR_SMOKE_DELAY_TICKS: u64 = 300_000;
+    const JAVA_DEADLOCK_PROBE_DELAY_TICKS: u64 = 300_000;
     const JAVA_JTREG_SMOKE_DELAY_TICKS: u64 = 1_050_000;
     const JAVA_CHILD_SMOKE_DELAY_TICKS: u64 = 750_000;
     const JAVA_THREAD_SMOKE_DELAY_TICKS: u64 = 900_000;
@@ -611,6 +677,11 @@ pub extern "C" fn root_entry() -> ! {
         1
     } else {
         JAVA_JAR_SMOKE_DELAY_TICKS
+    };
+    let java_deadlock_probe_delay_ticks = if java_runtime_only_focus {
+        2
+    } else {
+        JAVA_DEADLOCK_PROBE_DELAY_TICKS
     };
     let java_jtreg_smoke_delay_ticks = if java_jtreg_only_focus {
         1
@@ -798,6 +869,16 @@ pub extern "C" fn root_entry() -> ! {
             } else {
                 serial_println!("[ROOT] Java JAR smoke test disabled or payload missing");
             }
+            if java_focus_runs_deadlock_probe()
+                && linux_path_exists(b"/usr/lib/tos-tests/JavaAnnotationDeadlockProbe.class")
+            {
+                serial_println!(
+                    "[ROOT] Java deadlock probe available; delaying until root tick {}",
+                    java_deadlock_probe_delay_ticks
+                );
+            } else if java_focus_runs_deadlock_probe() {
+                serial_println!("[ROOT] Java deadlock probe disabled or payload missing");
+            }
             if java_focus_runs_jtreg_javac()
                 && linux_path_exists(b"/jdk/test/lib/jdk/test/lib/Platform.java")
                 && linux_path_exists(b"/jdk/test/lib/sun/hotspot/WhiteBox.java")
@@ -830,6 +911,21 @@ pub extern "C" fn root_entry() -> ! {
                 );
             } else if java_focus_runs_jtreg_lang() {
                 serial_println!("[ROOT] Java jtreg java.lang run disabled or payload missing");
+            }
+            if java_focus_runs_jtreg_deadlock()
+                && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
+                && linux_path_exists(
+                    b"/jdk/test/jdk/java/lang/annotation/AnnotationType/AnnotationTypeDeadlockTest.java",
+                )
+            {
+                serial_println!(
+                    "[ROOT] Java jtreg deadlock isolation run available; delaying until root tick {}",
+                    java_jtreg_smoke_delay_ticks
+                );
+            } else if java_focus_runs_jtreg_deadlock() {
+                serial_println!(
+                    "[ROOT] Java jtreg deadlock isolation run disabled or payload missing"
+                );
             }
             if java_focus_runs_phase6()
                 && linux_path_exists(b"/usr/lib/tos-tests/JavaChildSmoke.class")
@@ -879,6 +975,10 @@ pub extern "C" fn root_entry() -> ! {
         && java_focus_runs_jar()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
         && linux_path_exists(b"/usr/lib/tos-tests/java-smoke.jar");
+    let java_deadlock_probe_available = focus_runs_java()
+        && java_focus_runs_deadlock_probe()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/usr/lib/tos-tests/JavaAnnotationDeadlockProbe.class");
     let java_jtreg_available = focus_runs_java()
         && java_focus_runs_jtreg()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
@@ -889,6 +989,13 @@ pub extern "C" fn root_entry() -> ! {
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
         && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
         && linux_path_exists(b"/jdk/test/jdk/java/lang/String/Chars.java");
+    let java_jtreg_deadlock_available = focus_runs_java()
+        && java_focus_runs_jtreg_deadlock()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
+        && linux_path_exists(
+            b"/jdk/test/jdk/java/lang/annotation/AnnotationType/AnnotationTypeDeadlockTest.java",
+        );
     let java_jtreg_javac_available = focus_runs_java()
         && java_focus_runs_jtreg_javac()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/javac")
@@ -910,9 +1017,11 @@ pub extern "C" fn root_entry() -> ! {
     let mut java_hello_smoke_launched = false;
     let mut java_fs_smoke_launched = false;
     let mut java_jar_smoke_launched = false;
+    let mut java_deadlock_probe_launched = false;
     let mut java_jtreg_javac_smoke_launched = false;
     let mut java_jtreg_smoke_launched = false;
     let mut java_jtreg_lang_smoke_launched = false;
+    let mut java_jtreg_deadlock_smoke_launched = false;
     let mut java_child_smoke_launched = false;
     let mut java_thread_smoke_launched = false;
     loop {
@@ -974,6 +1083,14 @@ pub extern "C" fn root_entry() -> ! {
             java_jar_smoke_launched = true;
         }
 
+        if java_deadlock_probe_available
+            && !java_deadlock_probe_launched
+            && count >= java_deadlock_probe_delay_ticks
+        {
+            spawn_java_deadlock_probe(1);
+            java_deadlock_probe_launched = true;
+        }
+
         if java_jtreg_javac_available
             && !java_jtreg_javac_smoke_launched
             && count >= java_jtreg_smoke_delay_ticks
@@ -996,6 +1113,14 @@ pub extern "C" fn root_entry() -> ! {
         {
             spawn_java_jtreg_lang_smoke(1);
             java_jtreg_lang_smoke_launched = true;
+        }
+
+        if java_jtreg_deadlock_available
+            && !java_jtreg_deadlock_smoke_launched
+            && count >= java_jtreg_smoke_delay_ticks
+        {
+            spawn_java_jtreg_deadlock_smoke(1);
+            java_jtreg_deadlock_smoke_launched = true;
         }
 
         if java_child_available

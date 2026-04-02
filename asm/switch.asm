@@ -30,7 +30,11 @@
 ;   136     rflags
 ;   144     cr3
 ;   152     scratch / alignment
-;   160     fxsave area (512 bytes, 16-byte aligned)
+;   160     user_rip
+;   168     user_rsp
+;   176     user_rflags
+;   184     fpu_pad
+;   192     fxsave area (512 bytes, 16-byte aligned)
 ;
 ; For a cooperative context switch (called from Rust code), we only need
 ; to save/restore callee-saved registers (rbx, rbp, r12-r15, rsp) plus
@@ -65,7 +69,10 @@ global context_switch
 %define CTX_RFLAGS  136
 %define CTX_CR3     144
 %define CTX_SCRATCH 152
-%define CTX_FX      160
+%define CTX_USER_RIP 160
+%define CTX_USER_RSP 168
+%define CTX_USER_RFLAGS 176
+%define CTX_FX      192
 
 context_switch:
     ; Arguments (System V AMD64):
@@ -162,6 +169,7 @@ context_switch:
 
 global enter_user_mode
 global enter_user_clone_return
+global resume_user_trap_return
 global enter_kernel_mode
 
 enter_user_mode:
@@ -208,6 +216,32 @@ enter_user_clone_return:
     ; Restore user-visible registers from the syscall snapshot. The child must
     ; observe Linux syscall semantics: same register state as the parent at
     ; clone return, except RAX=0.
+    mov rbx, [rax + CTX_RBX]
+    mov rbp, [rax + CTX_RBP]
+    mov rdi, [rax + CTX_RDI]
+    mov rsi, [rax + CTX_RSI]
+    mov r8,  [rax + CTX_R8]
+    mov r9,  [rax + CTX_R9]
+    mov r10, [rax + CTX_R10]
+    mov r12, [rax + CTX_R12]
+    mov r13, [rax + CTX_R13]
+    mov r14, [rax + CTX_R14]
+    mov r15, [rax + CTX_R15]
+    mov rcx, [rax + CTX_RCX]
+    mov rdx, [rax + CTX_RDX]
+    mov r11, [rax + CTX_R11]
+    mov rax, [rax + CTX_RAX]
+    iretq
+
+resume_user_trap_return:
+    mov rax, rsi
+
+    push qword 0x1B                      ; SS (USER_DS)
+    push qword [rax + CTX_USER_RSP]      ; RSP
+    push qword [rax + CTX_USER_RFLAGS]   ; RFLAGS
+    push qword 0x23                      ; CS (USER_CS)
+    push qword [rax + CTX_USER_RIP]      ; RIP
+
     mov rbx, [rax + CTX_RBX]
     mov rbp, [rax + CTX_RBP]
     mov rdi, [rax + CTX_RDI]

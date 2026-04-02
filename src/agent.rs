@@ -183,6 +183,14 @@ pub struct AgentContext {
     pub cr3: u64,
     /// Scratch slot used by arch trampolines.
     pub scratch: u64,
+    /// User RIP for preempted ring-3 trap return.
+    pub user_rip: u64,
+    /// User RSP for preempted ring-3 trap return.
+    pub user_rsp: u64,
+    /// User RFLAGS for preempted ring-3 trap return.
+    pub user_rflags: u64,
+    /// Padding to keep the FPU save area 16-byte aligned.
+    pub fpu_pad: u64,
     /// Per-agent x87/SSE state saved by the scheduler.
     pub fpu_state: [u8; 512],
 }
@@ -211,6 +219,10 @@ impl AgentContext {
             rflags: 0,
             cr3: 0,
             scratch: 0,
+            user_rip: 0,
+            user_rsp: 0,
+            user_rflags: 0,
+            fpu_pad: 0,
             fpu_state: [0; 512],
         }
     }

@@ -14,6 +14,7 @@ use crate::serial_println;
 use crate::sync::SpinLock;
 
 extern "C" {
+    fn resume_user_trap_return();
     static mut CURRENT_KERNEL_RSP: u64;
     static mut CURRENT_SYSCALL_FRAME: u64;
 }
@@ -409,6 +410,71 @@ fn select_next_ready_agent() -> AgentId {
     found
 }
 
+pub fn has_other_ready_agent(current_id: AgentId) -> bool {
+    let rq = SCHED_LOCK.lock();
+    for i in 0..rq.len {
+        if let Some(agent_id) = rq.queue[i] {
+            if agent_id == current_id {
+                continue;
+            }
+            if let Some(agent) = get_agent_mut(agent_id) {
+                if agent.status == AgentStatus::Ready {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn preempt_current_user_from_trap(frame: &crate::trap::TrapFrame) -> ! {
+    let id = current();
+    if id == IDLE_AGENT_ID {
+        switch_from_trap();
+    }
+
+    let Some(agent) = get_agent_mut(id) else {
+        switch_from_trap();
+    };
+    if agent.mode != AgentMode::User {
+        switch_from_trap();
+    }
+
+    agent.context.rsp = agent.kernel_stack_top;
+    agent.context.rip = resume_user_trap_return as *const () as u64;
+    agent.context.rax = frame.rax;
+    agent.context.rbx = frame.rbx;
+    agent.context.rcx = frame.rcx;
+    agent.context.rdx = frame.rdx;
+    agent.context.rsi = frame.rsi;
+    agent.context.rdi = frame.rdi;
+    agent.context.rbp = frame.rbp;
+    agent.context.r8 = frame.r8;
+    agent.context.r9 = frame.r9;
+    agent.context.r10 = frame.r10;
+    agent.context.r11 = frame.r11;
+    agent.context.r12 = frame.r12;
+    agent.context.r13 = frame.r13;
+    agent.context.r14 = frame.r14;
+    agent.context.r15 = frame.r15;
+    agent.context.rflags = 0x200;
+    agent.context.scratch = 0;
+    agent.context.user_rip = frame.rip;
+    agent.context.user_rsp = frame.rsp;
+    agent.context.user_rflags = frame.rflags | 0x2;
+    unsafe {
+        core::arch::asm!(
+            "fxsave [{}]",
+            in(reg) agent.context.fpu_state.as_mut_ptr(),
+            options(nostack)
+        );
+    }
+    if agent.status == AgentStatus::Running {
+        agent.status = AgentStatus::Ready;
+    }
+    switch_from_trap();
+}
+
 /// Select the next agent to run and perform a context switch.
 ///
 /// Protected by SpinLock: safe for concurrent calls from multiple cores.
@@ -678,6 +744,7 @@ pub fn timer_tick() {
     }
 
     crate::linux_compat::process::futex_tick();
+    crate::linux_compat::time::sleep_tick();
 
     // Charge energy for blocked agents
     unsafe {
@@ -719,9 +786,6 @@ pub fn timer_tick() {
         // Programs use map helpers to record metrics or trigger alerts.
     }
 
-    // Stage-1 trap handling does not save enough interrupted state to
-    // preempt arbitrary code safely. Cooperative yields still switch
-    // agents; timer IRQs only drive accounting and observability.
     if crate::deterministic::is_enabled() {
         let _ = crate::deterministic::tick();
     }

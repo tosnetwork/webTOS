@@ -20,8 +20,30 @@ use crate::state;
 /// Written at the bottom of every agent stack and checked on each context switch.
 pub const STACK_GUARD_MAGIC: u64 = 0x57AC6E9D_DEAD_BEEF;
 
-const ROOT_AGENT_ENERGY_BUDGET: u64 = 10_000_000;
-const SYSTEM_SERVICE_ENERGY_BUDGET: u64 = 10_000_000;
+const DEFAULT_ROOT_AGENT_ENERGY_BUDGET: u64 = 10_000_000;
+const DEFAULT_SYSTEM_SERVICE_ENERGY_BUDGET: u64 = 10_000_000;
+const LONG_JAVA_ROOT_AGENT_ENERGY_BUDGET: u64 = 1_000_000_000;
+const LONG_JAVA_SYSTEM_SERVICE_ENERGY_BUDGET: u64 = 1_000_000_000;
+
+#[inline]
+fn root_agent_energy_budget() -> u64 {
+    match option_env!("TOS_JAVA_SMOKE_FOCUS") {
+        Some("jtreg") | Some("jtreg-lang") | Some("jtreg-deadlock") => {
+            LONG_JAVA_ROOT_AGENT_ENERGY_BUDGET
+        }
+        _ => DEFAULT_ROOT_AGENT_ENERGY_BUDGET,
+    }
+}
+
+#[inline]
+fn system_service_energy_budget() -> u64 {
+    match option_env!("TOS_JAVA_SMOKE_FOCUS") {
+        Some("jtreg") | Some("jtreg-lang") | Some("jtreg-deadlock") => {
+            LONG_JAVA_SYSTEM_SERVICE_ENERGY_BUDGET
+        }
+        _ => DEFAULT_SYSTEM_SERVICE_ENERGY_BUDGET,
+    }
+}
 
 /// Stack size for each kernel-mode agent.
 ///
@@ -411,7 +433,7 @@ pub fn init() {
         None,                                         // no parent (root)
         agents::root::root_entry as *const () as u64, // entry point
         stack_top(1),                                 // stack
-        ROOT_AGENT_ENERGY_BUDGET,                     // large energy budget
+        root_agent_energy_budget(),                   // large energy budget
         1024,                                         // memory quota (pages)
     )
     .expect("Failed to create root agent");
@@ -477,7 +499,7 @@ pub fn init() {
         "Stated",
         agents::stated::stated_entry as *const () as u64,
         5,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -495,7 +517,7 @@ pub fn init() {
         "Policyd",
         agents::policyd::policyd_entry as *const () as u64,
         6,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -511,7 +533,7 @@ pub fn init() {
         "WASM",
         agents::wasm_agent::wasm_agent_entry as *const () as u64,
         7,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::Normal,
         &[(CapType::EventEmit, 0)],
@@ -523,7 +545,7 @@ pub fn init() {
         "Accountd",
         agents::accountd::accountd_entry as *const () as u64,
         8,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -539,7 +561,7 @@ pub fn init() {
         "Netd",
         agents::netd::netd_entry as *const () as u64,
         9,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -556,7 +578,7 @@ pub fn init() {
         "Skilld",
         agents::skilld::skilld_entry as *const () as u64,
         11,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -573,7 +595,7 @@ pub fn init() {
         "Pkgd",
         agents::pkgd::pkgd_entry as *const () as u64,
         16,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -590,7 +612,7 @@ pub fn init() {
         "Compactd",
         agents::compactd::compactd_main as *const () as u64,
         18,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[
@@ -608,7 +630,7 @@ pub fn init() {
         "Auditd",
         agents::auditd::auditd_main as *const () as u64,
         21,
-        SYSTEM_SERVICE_ENERGY_BUDGET,
+        system_service_energy_budget(),
         256,
         AgentPriority::SystemService,
         &[

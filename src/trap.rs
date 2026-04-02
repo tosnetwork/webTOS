@@ -170,6 +170,14 @@ pub extern "C" fn trap_handler_common(frame: *const TrapFrame) {
             }
             // Energy accounting + preemptive reschedule
             crate::sched::timer_tick();
+            let current = crate::sched::current();
+            let user_mode = (frame.cs & 0x3) == 0x3;
+            if user_mode
+                && current != IDLE_AGENT_ID
+                && crate::sched::has_other_ready_agent(current)
+            {
+                crate::sched::preempt_current_user_from_trap(frame);
+            }
         }
 
         // ── Keyboard interrupt (IRQ1, vector 33) ────────────────────────

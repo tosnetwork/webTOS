@@ -18,6 +18,10 @@
 /usr/lib/tos-tests/FsProbe.class = test_data/FsProbe.class
 /usr/lib/tos-tests/JavaChildSmoke.class = test_data/JavaChildSmoke.class
 /usr/lib/tos-tests/JavaThreadSmoke.class = test_data/JavaThreadSmoke.class
+/usr/lib/tos-tests/JavaAnnotationDeadlockProbe.class = test_data/JavaAnnotationDeadlockProbe.class
+/usr/lib/tos-tests/JavaAnnotationDeadlockProbe$AnnA.class = test_data/JavaAnnotationDeadlockProbe$AnnA.class
+/usr/lib/tos-tests/JavaAnnotationDeadlockProbe$AnnB.class = test_data/JavaAnnotationDeadlockProbe$AnnB.class
+/usr/lib/tos-tests/JavaAnnotationDeadlockProbe$Task.class = test_data/JavaAnnotationDeadlockProbe$Task.class
 /usr/lib/tos-tests/java-smoke.jar = test_data/java-smoke.jar
 /usr/lib/tos-tests/python_child_smoke.py = test_data/python_child_smoke.py
 /usr/lib/tos-tests/node_child_smoke.js = test_data/node_child_smoke.js
