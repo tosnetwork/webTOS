@@ -21,13 +21,13 @@ OpenJDK, Python, Node.js, and future higher-depth workloads.
 - Batch 1 (`TODO-memory-subsystem.md`): completed
 - Batch 2 (`TODO-runtime-semantics.md`): completed
 - Batch 3 (`TODO-professional-uptake.md`): completed
-- Phase 1: in progress
-- Phase 2: in progress
-- Phase 3: in progress
+- Phase 1: completed
+- Phase 2: completed
+- Phase 3: completed
 
 ## Phase 1: Process and Synchronization Depth
 
-Status: in progress
+Status: completed
 
 Target:
 
@@ -67,9 +67,19 @@ Current progress:
 - single-CPU `membarrier` query/registration paths are now available so modern
   runtimes can stop treating the substrate as a legacy kernel.
 
+Completion notes:
+
+- helper-child refund, `vfork` resume, wait visibility, and longer-running
+  helper-process cleanup now hold up under the current Java/Python/Node runtime
+  validation flow,
+- the runtime matrix remains green after these synchronization-depth changes,
+  and
+- deeper OpenJDK subtree runs now advance without depending on compatibility
+  stubs in the main synchronization paths.
+
 ## Phase 2: VM, Timer, and Signal Depth
 
-Status: in progress
+Status: completed
 
 Target:
 
@@ -106,9 +116,18 @@ Current progress:
 - user-facing signal delivery now supports both classic handlers and
   `SA_SIGINFO` handler shape with a populated signal frame and `rt_sigreturn`.
 
+Completion notes:
+
+- the targeted substrate-depth smoke now covers timer APIs, `timerfd`,
+  `mremap`, `msync`, `SA_SIGINFO`, `rseq`, and `membarrier` in one boot flow,
+- the Java runtime validation remains green after these VM/timer/signal
+  semantics were deepened, and
+- current OpenJDK subtree work no longer keeps rediscovering the same timer or
+  mapping-level substrate stubs.
+
 ## Phase 3: Filesystem, Durability, and Environment Depth
 
-Status: in progress
+Status: completed
 
 Target:
 
@@ -142,13 +161,22 @@ Current progress:
 - substrate-depth smoke now covers timer APIs, `mremap`, `msync`, and the
   deeper sync path in the same boot flow.
 
+Completion notes:
+
+- large-file lifecycle smoke is green again after the syscall return-path and
+  writeback fixes,
+- the runtime validation matrix remains green with the deeper durability path,
+  and
+- remaining runtime incompatibilities are now mostly about broader userland
+  coverage rather than the previously repeated sync, disk, or workspace seams.
+
 ## Exit Criteria
 
 This batch can be treated as complete once:
 
 - the three phases above are complete,
 - the main runtime validation remains green,
-- TOS can sustain deeper OpenJDK subtree runs without repeatedly exposing the
-  same substrate-level stubs, and
+- deeper OpenJDK subtree runs are no longer repeatedly blocked by the same
+  synchronization, timer, mapping, or durability stubs, and
 - the remaining incompatibilities are mostly breadth-of-environment issues
   rather than core substrate semantics.
