@@ -159,10 +159,6 @@ Validation:
 
 Reference implementations to study during migration:
 
-- Asterinas buddy allocator:
-  - `~/asterinas/osdk/deps/frame-allocator/src/`
-- Asterinas slab allocator:
-  - `~/asterinas/osdk/deps/heap-allocator/src/`
-- Moss VMA and mmap flow:
-  - `~/moss/src/memory/mmap.rs`
-  - `~/moss/libkernel/src/memory/proc_vm/memory_map/mod.rs`
+- A mature buddy allocator layout.
+- A mature slab allocator layout.
+- A mature VMA and `mmap` flow.

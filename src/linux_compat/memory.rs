@@ -111,14 +111,42 @@ fn insert_vma(state: &mut LinuxAgentState, mut vma: VmaEntry) -> Result<(), i64>
     if !range_is_free(state, vma.start, vma.len) {
         return Err(-EINVAL);
     }
+    state::ensure_vma_mapped_object(&mut vma)?;
     if try_merge_vma(state, &vma) {
         return Ok(());
     }
     vma.active = true;
     let Some(slot) = state.alloc_vma_slot() else {
+        if vma.mapped_object != u16::MAX {
+            state::release_mapped_object(vma.mapped_object);
+        }
         return Err(-ENOMEM);
     };
+    if vma.mapped_object != u16::MAX {
+        state::retain_mapped_object(vma.mapped_object);
+    }
     state.vmas[slot] = vma;
+    Ok(())
+}
+
+fn clear_vma_slot(state: &mut LinuxAgentState, idx: usize) {
+    let old = state.vmas[idx];
+    if old.active && old.mapped_object != u16::MAX {
+        state::release_mapped_object(old.mapped_object);
+    }
+    state.vmas[idx] = VmaEntry::empty();
+}
+
+fn replace_vma_slot(state: &mut LinuxAgentState, idx: usize, mut vma: VmaEntry) -> Result<(), i64> {
+    state::ensure_vma_mapped_object(&mut vma)?;
+    let old = state.vmas[idx];
+    if vma.mapped_object != u16::MAX {
+        state::retain_mapped_object(vma.mapped_object);
+    }
+    state.vmas[idx] = vma;
+    if old.active && old.mapped_object != u16::MAX {
+        state::release_mapped_object(old.mapped_object);
+    }
     Ok(())
 }
 
@@ -158,8 +186,7 @@ fn same_vma_shape(a: &VmaEntry, b: &VmaEntry) -> bool {
         && a.prot == b.prot
         && a.flags == b.flags
         && a.kind == b.kind
-        && a.keyspace_id == b.keyspace_id
-        && a.keyspace_key == b.keyspace_key
+        && a.mapped_object == b.mapped_object
 }
 
 fn file_offsets_are_contiguous(left: &VmaEntry, right: &VmaEntry) -> bool {
@@ -204,7 +231,7 @@ fn merge_adjacent_vmas(state: &mut LinuxAgentState) {
 
                 let right = state.vmas[j];
                 if try_merge_vma(state, &right) {
-                    state.vmas[j] = VmaEntry::empty();
+                    clear_vma_slot(state, j);
                     merged = true;
                     break;
                 }
@@ -254,15 +281,15 @@ fn remove_vma_range(state: &mut LinuxAgentState, start: u64, len: u64) -> Result
         }
 
         match (has_left, has_right) {
-            (false, false) => state.vmas[i] = VmaEntry::empty(),
+            (false, false) => clear_vma_slot(state, i),
             (true, false) => {
-                state.vmas[i] = clone_vma_piece(&vma, vma.start, overlap_start, vma.prot);
+                replace_vma_slot(state, i, clone_vma_piece(&vma, vma.start, overlap_start, vma.prot))?;
             }
             (false, true) => {
-                state.vmas[i] = clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot);
+                replace_vma_slot(state, i, clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot))?;
             }
             (true, true) => {
-                state.vmas[i] = clone_vma_piece(&vma, vma.start, overlap_start, vma.prot);
+                replace_vma_slot(state, i, clone_vma_piece(&vma, vma.start, overlap_start, vma.prot))?;
                 insert_vma(
                     state,
                     clone_vma_piece(&vma, overlap_end, vma.end(), vma.prot),
@@ -299,7 +326,7 @@ fn protect_vma_range(
             return Err(-ENOMEM);
         }
 
-        state.vmas[i] = clone_vma_piece(&vma, overlap_start, overlap_end, prot);
+        replace_vma_slot(state, i, clone_vma_piece(&vma, overlap_start, overlap_end, prot))?;
         if has_left {
             insert_vma(
                 state,
@@ -373,7 +400,7 @@ fn debug_dump_vmas(agent_id: u16, state: &LinuxAgentState, label: &str) {
             continue;
         }
         crate::serial_println!(
-            "[PYDBG] vma[{}] [{:#x},{:#x}) len={:#x} prot={:#x} flags={:#x} kind={:?} ks={} key={:#x} off={:#x}",
+            "[PYDBG] vma[{}] [{:#x},{:#x}) len={:#x} prot={:#x} flags={:#x} kind={:?} obj={} ks={} key={:#x} off={:#x}",
             idx,
             vma.start,
             vma.end(),
@@ -381,6 +408,7 @@ fn debug_dump_vmas(agent_id: u16, state: &LinuxAgentState, label: &str) {
             vma.prot,
             vma.flags,
             vma.kind,
+            vma.mapped_object,
             vma.keyspace_id,
             vma.keyspace_key,
             vma.file_offset
@@ -510,11 +538,13 @@ pub fn handle_user_page_fault(agent_id: u16, fault_addr: u64, error_code: u64) -
 
     if vma.kind == VmaKind::File {
         let page_offset = page_vaddr.saturating_sub(vma.start) as usize;
-        let file_offset = vma.file_offset as usize + page_offset;
+        let (_, ks, key, base_off) = state::mapped_object_backing(vma.mapped_object)
+            .unwrap_or((vma.kind, vma.keyspace_id, vma.keyspace_key, vma.file_offset));
+        let file_offset = base_off as usize + page_offset;
         let page = unsafe {
             core::slice::from_raw_parts_mut(paging::phys_to_virt(frame) as *mut u8, PAGE_SIZE)
         };
-        let _ = read_file_slice(vma.keyspace_id, vma.keyspace_key, file_offset, page);
+        let _ = read_file_slice(ks, key, file_offset, page);
     }
 
     if page_table::map_leaf(cr3, page_vaddr, frame, prot_to_pte_flags(vma.prot)).is_err() {
@@ -917,6 +947,7 @@ pub fn sys_mmap(
         prot,
         flags,
         kind: VmaKind::Anonymous,
+        mapped_object: u16::MAX,
         keyspace_id: 0,
         keyspace_key: 0,
         file_offset: offset,
@@ -1156,6 +1187,7 @@ pub fn sys_brk(agent_id: u16, new_brk: u64) -> i64 {
                 prot: PROT_READ | PROT_WRITE,
                 flags: MAP_PRIVATE | MAP_ANONYMOUS,
                 kind: VmaKind::Anonymous,
+                mapped_object: u16::MAX,
                 keyspace_id: 0,
                 keyspace_key: 0,
                 file_offset: 0,

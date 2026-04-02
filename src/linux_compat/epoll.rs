@@ -377,19 +377,24 @@ fn collect_ready_events(
                 FdKind::Socket => {
                     let mut events = 0;
                     if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                        let peer_closed = !state::pipe_has_writers(entry.mailbox_id).unwrap_or(false);
-                        if fd_allows_write(entry.kind, entry.flags)
-                            && state::pipe_write_ready(entry.keyspace_id)
+                        if let Some((read_handle, write_handle)) =
+                            state::unix_stream_handles(entry.keyspace_id)
                         {
-                            events |= EPOLLOUT;
-                        }
-                        if fd_allows_read(entry.kind, entry.flags)
-                            && state::pipe_read_ready(entry.mailbox_id)
-                        {
-                            events |= EPOLLIN;
-                        }
-                        if peer_closed {
-                            events |= EPOLLHUP;
+                            let peer_closed =
+                                !state::pipe_has_writers(read_handle).unwrap_or(false);
+                            if fd_allows_write(entry.kind, entry.flags)
+                                && state::pipe_write_ready(write_handle)
+                            {
+                                events |= EPOLLOUT;
+                            }
+                            if fd_allows_read(entry.kind, entry.flags)
+                                && state::pipe_read_ready(read_handle)
+                            {
+                                events |= EPOLLIN;
+                            }
+                            if peer_closed {
+                                events |= EPOLLHUP;
+                            }
                         }
                     } else {
                         let peer_closed = !crate::mailbox::mailbox_has_writers(entry.mailbox_id);

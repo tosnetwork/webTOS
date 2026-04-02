@@ -127,11 +127,11 @@ pub enum AgentMode {
     User = 1,
 }
 
-// Ring-3 agents can enter deep dynamic-loader, futex, and JVM teardown paths
-// that materialize substantially larger kernel stack frames than the earlier
-// syscall regression suite. 64 KiB is sufficient for the small tests but not
-// for real Java thread shutdown, which was corrupting adjacent agent contexts.
-pub const KERNEL_STACK_SIZE: usize = 256 * 1024;
+// Linux runtime bring-up, jtreg helper VMs, and nested teardown paths all
+// materialize substantially larger kernel stack frames than the early syscall
+// suite. Keeping the shared kernel stack at 512 KiB avoids the repeated guard
+// hits seen in Java wrapper, helper-thread, and root-service paths.
+pub const KERNEL_STACK_SIZE: usize = 512 * 1024;
 
 // User-mode agents reserve a Linux-like 128 KiB stack window so the
 // reported RLIMIT_STACK matches the bytes actually mapped.
@@ -298,34 +298,13 @@ static mut NEXT_AGENT_ID: AgentId = 0;
 
 #[inline]
 fn is_linux_child_group_leader(agent: &Agent) -> bool {
-    match crate::linux_compat::state::get_state(agent.id) {
-        Some(st) => st.thread_group_leader == agent.id,
-        None => true,
-    }
+    crate::linux_compat::state::process_leader(agent.id)
+        .map(|leader| leader == agent.id)
+        .unwrap_or(true)
 }
 
 fn linux_group_has_other_active_members(agent: &Agent) -> bool {
-    let Some(st) = crate::linux_compat::state::get_state(agent.id) else {
-        return false;
-    };
-    let group_pid = st.pid;
-
-    unsafe {
-        for slot in AGENT_TABLE.iter() {
-            if let Some(other) = slot {
-                if other.id == agent.id || !other.active {
-                    continue;
-                }
-                if let Some(other_st) = crate::linux_compat::state::get_state(other.id) {
-                    if other_st.pid == group_pid {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    false
+    crate::linux_compat::state::process_has_other_active_members(agent.id)
 }
 
 #[inline]
@@ -423,6 +402,7 @@ pub fn terminate_agent(id: AgentId, status: AgentStatus) {
     // Safety: single-core, no preemption during table access
     unsafe {
         crate::linux_compat::process::prepare_agent_termination(id);
+        let current_id = crate::sched::current();
 
         // First, collect children to terminate (avoid borrow conflicts)
         let mut children: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
@@ -470,7 +450,11 @@ pub fn terminate_agent(id: AgentId, status: AgentStatus) {
         }
 
         if destroy_cr3 != 0 {
-            let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
+            if id == current_id {
+                crate::sched::defer_address_space_release(destroy_cr3);
+            } else {
+                let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
+            }
         }
     }
 }
@@ -482,6 +466,7 @@ pub fn terminate_agent(id: AgentId, status: AgentStatus) {
 pub fn terminate_agent_no_reparent(id: AgentId, status: AgentStatus) {
     unsafe {
         crate::linux_compat::process::prepare_agent_termination(id);
+        let current_id = crate::sched::current();
 
         let mut destroy_cr3: u64 = 0;
 
@@ -498,7 +483,11 @@ pub fn terminate_agent_no_reparent(id: AgentId, status: AgentStatus) {
         }
 
         if destroy_cr3 != 0 {
-            let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
+            if id == current_id {
+                crate::sched::defer_address_space_release(destroy_cr3);
+            } else {
+                let _ = crate::arch::x86_64::paging::release_address_space(destroy_cr3);
+            }
         }
     }
 }
@@ -580,6 +569,7 @@ pub fn is_child_of_any_state(child_id: AgentId, parent_id: AgentId) -> bool {
 /// Remove a terminated agent from the agent table (reap).
 /// Only removes agents that are inactive (already terminated).
 pub fn reap_agent(id: AgentId) {
+    let current_id = crate::sched::current();
     unsafe {
         for slot in AGENT_TABLE.iter_mut() {
             if let Some(agent) = slot {
@@ -589,7 +579,11 @@ pub fn reap_agent(id: AgentId) {
                     agent.kernel_stack_top = 0;
                     agent.stack_bottom = 0;
                     crate::linux_compat::state::remove_state(id);
-                    crate::sched::free_agent_stack(stack_top);
+                    if id == current_id {
+                        crate::sched::defer_agent_stack_free(stack_top);
+                    } else {
+                        crate::sched::free_agent_stack(stack_top);
+                    }
                     *slot = None;
                     return;
                 }

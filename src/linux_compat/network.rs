@@ -745,15 +745,9 @@ pub fn sys_socketpair(
         return -EFAULT;
     }
 
-    let ab = match state::alloc_pipe() {
-        Some(handle) => handle,
+    let (end0, end1) = match state::alloc_unix_stream_pair() {
+        Some(handles) => handles,
         None => return -ENOSPC,
-    };
-    let ba = match state::alloc_pipe() {
-        Some(handle) => handle,
-        None => {
-            return -ENOSPC;
-        }
     };
 
     let st = match state::get_files_state_mut(agent_id) {
@@ -769,8 +763,8 @@ pub fn sys_socketpair(
     st.fd_table[fd0] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: SOCKETPAIR_STREAM_MARKER,
-        keyspace_id: ab,
-        mailbox_id: ba,
+        keyspace_id: end0,
+        mailbox_id: 0,
         offset: 0,
         flags: fd_flags,
         active: true,
@@ -789,8 +783,8 @@ pub fn sys_socketpair(
     st.fd_table[fd1] = Some(FdEntry {
         kind: FdKind::Socket,
         keyspace_key: SOCKETPAIR_STREAM_MARKER,
-        keyspace_id: ba,
-        mailbox_id: ab,
+        keyspace_id: end1,
+        mailbox_id: 0,
         offset: 0,
         flags: fd_flags,
         active: true,
@@ -810,12 +804,12 @@ pub fn sys_socketpair(
 
     if state::trace_runtime_agent(agent_id) {
         crate::serial_println!(
-            "[RTDBG] socketpair agent={} fds=({}, {}) ab={} ba={}",
+            "[RTDBG] socketpair agent={} fds=({}, {}) end0={} end1={}",
             agent_id,
             fd0,
             fd1,
-            ab,
-            ba
+            end0,
+            end1
         );
     }
 

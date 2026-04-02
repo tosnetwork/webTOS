@@ -1,0 +1,5 @@
+# TOS guest-side OpenJDK 11 expanded java.lang target set
+#
+# This runs the full package tree instead of a small hand-picked smoke subset.
+
+test/jdk/java/lang

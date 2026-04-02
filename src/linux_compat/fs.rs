@@ -734,7 +734,14 @@ fn metadata_for_fd(agent_id: u16, entry: &FdEntry) -> LinuxStatMeta {
             stat_ino_for_key(entry.keyspace_key),
         ),
         FdKind::Pipe => metadata_for_pipe(agent_id, entry.keyspace_key as u16),
-        FdKind::Socket => metadata_for_socket(agent_id, entry.mailbox_id),
+        FdKind::Socket => metadata_for_socket(
+            agent_id,
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+                entry.keyspace_id
+            } else {
+                entry.mailbox_id
+            },
+        ),
         FdKind::EventFd => metadata_for_eventfd(agent_id, entry.keyspace_key as u16),
         FdKind::Epoll => metadata_for_regular(
             agent_id,
@@ -1837,9 +1844,11 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 return -EBADF;
             }
             if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                let handle = entry.mailbox_id;
+                let Some((read_handle, _write_handle)) = state::unix_stream_handles(entry.keyspace_id) else {
+                    return -EBADF;
+                };
                 loop {
-                    let available = state::pipe_available(handle).unwrap_or(0);
+                    let available = state::pipe_available(read_handle).unwrap_or(0);
                     if available > 0 {
                         let mut total = 0usize;
                         let mut user_ptr = buf_ptr;
@@ -1847,7 +1856,7 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                         while remaining > 0 {
                             let chunk_len = remaining.min(512);
                             let mut chunk = [0u8; 512];
-                            let Some(read_len) = state::pipe_read(handle, &mut chunk[..chunk_len]) else {
+                            let Some(read_len) = state::pipe_read(read_handle, &mut chunk[..chunk_len]) else {
                                 return -EBADF;
                             };
                             if read_len == 0 {
@@ -1865,7 +1874,7 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                                 "[RTDBG] socket-read agent={} fd={} handle={} total={} requested={} available={}",
                                 agent_id,
                                 fd,
-                                handle,
+                                read_handle,
                                 total,
                                 count,
                                 available
@@ -1874,7 +1883,9 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                         return total as i64;
                     }
 
-                    if !state::pipe_has_writers(handle).unwrap_or(false) || (flags & super::network::FD_FLAG_SHUT_RD) != 0 {
+                    if !state::pipe_has_writers(read_handle).unwrap_or(false)
+                        || (flags & super::network::FD_FLAG_SHUT_RD) != 0
+                    {
                         return 0;
                     }
                     if (flags & O_NONBLOCK) != 0 {
@@ -1884,11 +1895,11 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                         return -EINTR;
                     }
 
-                    state::add_blocked_pipe_reader(handle, agent_id);
+                    state::add_blocked_pipe_reader(read_handle, agent_id);
                     crate::sched::block_current(crate::agent::AgentStatus::BlockedRecv);
 
                     if crate::linux_compat::signal::has_unblocked_pending_signal(agent_id) {
-                        state::remove_blocked_pipe_reader(handle, agent_id);
+                        state::remove_blocked_pipe_reader(read_handle, agent_id);
                         return -EINTR;
                     }
                 }
@@ -2137,15 +2148,17 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 if (flags & super::network::FD_FLAG_SHUT_WR) != 0 {
                     return -EPIPE;
                 }
-                let handle = entry.keyspace_id;
+                let Some((_read_handle, write_handle)) = state::unix_stream_handles(entry.keyspace_id) else {
+                    return -EBADF;
+                };
                 let mut total = 0usize;
                 let mut user_ptr = buf_ptr;
                 loop {
-                    if !state::pipe_has_readers(handle).unwrap_or(false) {
+                    if !state::pipe_has_readers(write_handle).unwrap_or(false) {
                         return if total > 0 { total as i64 } else { -EPIPE };
                     }
 
-                    let available = state::pipe_available(handle).unwrap_or(0);
+                    let available = state::pipe_available(write_handle).unwrap_or(0);
                     let free = state::PIPE_BUFFER_SIZE.saturating_sub(available);
                     if free > 0 {
                         let chunk_len = cnt.saturating_sub(total).min(free).min(512);
@@ -2153,7 +2166,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                         if !read_user_mem(agent_id, user_ptr, &mut chunk, chunk_len) {
                             return if total > 0 { total as i64 } else { -EFAULT };
                         }
-                        let Some(written) = state::pipe_write(handle, &chunk[..chunk_len]) else {
+                        let Some(written) = state::pipe_write(write_handle, &chunk[..chunk_len]) else {
                             return if total > 0 { total as i64 } else { -EBADF };
                         };
                         if written == 0 {
@@ -2166,7 +2179,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                                 "[RTDBG] socket-write agent={} fd={} handle={} wrote={} total={} requested={} free={}",
                                 agent_id,
                                 fd,
-                                handle,
+                                write_handle,
                                 written,
                                 total,
                                 count,
@@ -2186,11 +2199,11 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                         return if total > 0 { total as i64 } else { -EINTR };
                     }
 
-                    state::add_blocked_pipe_writer(handle, agent_id);
+                    state::add_blocked_pipe_writer(write_handle, agent_id);
                     crate::sched::block_current(crate::agent::AgentStatus::BlockedSend);
 
                     if crate::linux_compat::signal::has_unblocked_pending_signal(agent_id) {
-                        state::remove_blocked_pipe_writer(handle, agent_id);
+                        state::remove_blocked_pipe_writer(write_handle, agent_id);
                         return if total > 0 { total as i64 } else { -EINTR };
                     }
                 }
@@ -3887,7 +3900,12 @@ pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
                     .min(i32::MAX as usize) as i32,
                 FdKind::Socket => {
                     if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                        state::pipe_available(entry.mailbox_id)
+                        let Some((read_handle, _write_handle)) =
+                            state::unix_stream_handles(entry.keyspace_id)
+                        else {
+                            return -EBADF;
+                        };
+                        state::pipe_available(read_handle)
                             .unwrap_or(0)
                             .min(i32::MAX as usize) as i32
                     } else {
@@ -4303,12 +4321,15 @@ pub fn sys_select(
                 ),
                 FdKind::Socket => {
                     if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                        (
-                            fd_allows_read(entry.kind, entry.flags)
-                                && state::pipe_read_ready(entry.mailbox_id),
-                            fd_allows_write(entry.kind, entry.flags)
-                                && state::pipe_write_ready(entry.keyspace_id),
-                        )
+                        match state::unix_stream_handles(entry.keyspace_id) {
+                            Some((read_handle, write_handle)) => (
+                                fd_allows_read(entry.kind, entry.flags)
+                                    && state::pipe_read_ready(read_handle),
+                                fd_allows_write(entry.kind, entry.flags)
+                                    && state::pipe_write_ready(write_handle),
+                            ),
+                            None => (false, false),
+                        }
                     } else {
                         let readable = fd_allows_read(entry.kind, entry.flags)
                             && crate::mailbox::mailbox_fd_read_ready(entry.mailbox_id);

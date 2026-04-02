@@ -20,9 +20,9 @@ deterministic policy, native runtime structure, or energy accounting.
 
 - Batch 1 (`TODO-memory-subsystem.md`): completed
 - Batch 2 (`TODO-runtime-semantics.md`): completed
-- Phase 1: pending
-- Phase 2: pending
-- Phase 3: pending
+- Phase 1: completed
+- Phase 2: completed
+- Phase 3: completed
 
 ## Current Baseline
 
@@ -42,7 +42,7 @@ deterministic policy, native runtime structure, or energy accounting.
 
 ## Phase 1: Process Objectization
 
-Status: pending
+Status: completed
 
 Target:
 
@@ -85,7 +85,7 @@ Validation gates:
 
 ## Phase 2: Mapped Object and Page-Cache Uptake
 
-Status: pending
+Status: completed
 
 Target:
 
@@ -130,7 +130,7 @@ Validation gates:
 
 ## Phase 3: Unix Object Uptake
 
-Status: pending
+Status: completed
 
 Target:
 
@@ -183,3 +183,19 @@ the following remain true at the same time:
   repeatedly exposing the same substrate-level lifecycle seams.
 - TOS is materially steadier as a Linux substrate than it was at the end of the
   runtime-semantics batch.
+
+## Completion Notes
+
+- Linux process lifecycle state is now centered on explicit process-owned
+  objects for thread-group identity, child lifetime, wait behavior, and
+  `vfork` coordination.
+- File-backed mappings now carry explicit mapped-object identity so loader
+  state, file-backed `mmap`, and lazy fault fill share one stronger lifetime
+  model.
+- Unix stream pairs now have explicit object ownership that makes helper-child
+  I/O and runtime-facing fd behavior more robust under Java, Python, and
+  Node.js workloads.
+- Validation remains green for:
+  - `tools/phase6_runtime_matrix.sh`
+  - `make java-test`
+  - guest-side OpenJDK `jtreg` `java.base` smoke

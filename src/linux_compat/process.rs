@@ -289,9 +289,9 @@ struct FutexKey {
 /// Build a futex key that distinguishes unrelated processes even when they use
 /// the same virtual address.
 ///
-/// This follows the Asterinas/Linux direction: private futexes are scoped to
-/// the current address space, while shared futexes key off the underlying
-/// mapped physical address instead of the raw virtual address.
+/// Private futexes are scoped to the current address space, while shared
+/// futexes key off the underlying mapped physical address instead of the raw
+/// virtual address.
 fn futex_key(agent_id: u16, uaddr: u64, op: u64) -> Option<FutexKey> {
     let cr3 = agent_cr3(agent_id)?;
     if !ensure_user_range_mapped(agent_id, uaddr, core::mem::size_of::<u32>(), false) {
@@ -467,9 +467,9 @@ fn wake_robust_list(agent_id: u16, head_ptr: u64) {
 
 /// Prepare Linux thread-local termination state.
 ///
-/// Mirrors the split used by Asterinas/Moss: thread-local exit artifacts
-/// (`clear_child_tid`, robust futex list, futex wait-queue membership) are
-/// cleaned up independently from the shared address-space lifetime.
+/// Thread-local exit artifacts (`clear_child_tid`, robust futex list, futex
+/// wait-queue membership) are cleaned up independently from the shared
+/// address-space lifetime.
 pub fn prepare_agent_termination(agent_id: u16) {
     clear_futex_wait_state(agent_id);
     clear_process_metadata(agent_id);
@@ -715,7 +715,8 @@ fn commit_execve(
             }
         };
     let old_linux_state = state::get_state(agent_id).copied();
-    let old_vfork_parent = old_linux_state.map(|st| st.vfork_parent).unwrap_or(0);
+    let old_vfork_parent = state::process_vfork_parent(agent_id).unwrap_or(0);
+    let old_exit_status = state::process_exit_status(agent_id).unwrap_or(0);
 
     state::reset_for_exec(agent_id, exe, prepared.initial_brk);
     if let Err(err) = crate::agent_loader::install_initial_linux_vmas(agent_id, &prepared) {
@@ -724,6 +725,10 @@ fn commit_execve(
                 *st = snapshot;
             }
         }
+        if old_vfork_parent != 0 {
+            state::set_process_vfork_parent(agent_id, old_vfork_parent);
+        }
+        state::record_process_exit_status(agent_id, old_exit_status);
         let _ = paging::release_address_space(prepared.cr3);
         return err;
     }
@@ -755,6 +760,10 @@ fn commit_execve(
                 *st = snapshot;
             }
         }
+        if old_vfork_parent != 0 {
+            state::set_process_vfork_parent(agent_id, old_vfork_parent);
+        }
+        state::record_process_exit_status(agent_id, old_exit_status);
         paging::write_cr3(old_cr3);
         let _ = paging::release_address_space(prepared.cr3);
         return err;
@@ -784,14 +793,7 @@ fn commit_execve(
 
 #[inline]
 fn take_vfork_parent(agent_id: u16) -> Option<AgentId> {
-    let parent_id = state::get_state(agent_id).map(|st| st.vfork_parent).unwrap_or(0);
-    if parent_id == 0 {
-        return None;
-    }
-    if let Some(st) = state::get_state_mut(agent_id) {
-        st.vfork_parent = 0;
-    }
-    Some(parent_id)
+    state::take_process_vfork_parent(agent_id)
 }
 
 #[inline]
@@ -872,6 +874,7 @@ fn clone_private_linux_address_space(
 
     if let Some(child_state) = state::get_state_mut(child_id) {
         child_state.vmas = parent_state.vmas;
+        state::retain_vma_table_objects(&child_state.vmas);
         child_state.mmap_next = parent_state.mmap_next;
         child_state.brk_current = parent_state.brk_current;
         child_state.vm_space_owner = child_id;
@@ -936,7 +939,7 @@ fn inherit_linux_state_for_clone(
     let brk_current = unsafe { (*parent_state).brk_current };
     let mmap_next = unsafe { (*parent_state).mmap_next };
     let vm_space_owner = unsafe { (*parent_state).vm_space_owner };
-    let thread_group_leader = unsafe { (*parent_state).thread_group_leader };
+    let parent_thread_group_leader = unsafe { (*parent_state).thread_group_leader };
     let fs_owner = unsafe { (*parent_state).fs_owner };
     let sighand_owner = unsafe { (*parent_state).sighand_owner };
     let uid = unsafe { (*parent_state).uid };
@@ -963,7 +966,7 @@ fn inherit_linux_state_for_clone(
             child_id
         };
         child_state.thread_group_leader = if flags & CLONE_THREAD != 0 {
-            thread_group_leader
+            parent_thread_group_leader
         } else {
             child_id
         };
@@ -1010,6 +1013,13 @@ fn inherit_linux_state_for_clone(
         }
     }
 
+    if flags & CLONE_THREAD != 0 {
+        let _ = state::share_process_object(child_id, parent_id);
+    } else {
+        let parent_leader = thread_group_leader(parent_id);
+        let _ = state::configure_process_object(child_id, parent_leader);
+    }
+
     if flags & CLONE_FILES == 0 {
         state::retain_fd_table_resources(unsafe { &(*shared_files_state).fd_table });
     }
@@ -1017,15 +1027,13 @@ fn inherit_linux_state_for_clone(
 
 #[inline]
 fn thread_group_pid(agent_id: u16) -> u32 {
-    state::get_state(agent_id)
-        .map(|st| st.pid)
+    state::process_pid(agent_id)
         .unwrap_or(agent_id as u32)
 }
 
 #[inline]
 fn thread_group_leader(agent_id: u16) -> u16 {
-    state::get_state(agent_id)
-        .map(|st| st.thread_group_leader)
+    state::process_leader(agent_id)
         .filter(|leader| agent::get_agent_any_state(*leader).is_some())
         .unwrap_or(agent_id)
 }
@@ -1036,77 +1044,40 @@ fn is_thread_group_worker(agent_id: u16) -> bool {
 }
 
 fn has_other_active_group_members(agent_id: u16) -> bool {
-    let group_pid = thread_group_pid(agent_id);
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for id in ids[..count].iter().copied().flatten() {
-        if id == agent_id {
-            continue;
-        }
-        if let Some(ls) = state::get_state(id) {
-            if ls.active && ls.pid == group_pid {
-                return true;
-            }
-        }
-    }
-    false
+    state::process_has_other_active_members(agent_id)
 }
 
 #[inline]
 fn record_group_exit_status(agent_id: u16, status: i32) {
-    let leader_id = thread_group_leader(agent_id);
-    if let Some(ls) = state::get_state_mut(leader_id) {
-        ls.exit_status = status;
-    } else if let Some(ls) = state::get_state_mut(agent_id) {
-        ls.exit_status = status;
-    }
+    state::record_process_exit_status(agent_id, status);
 }
 
 #[inline]
 fn thread_group_parent_id(agent_id: u16) -> Option<AgentId> {
-    let leader_id = thread_group_leader(agent_id);
-    agent::get_agent_any_state(leader_id).and_then(|agent| agent.parent_id)
+    state::process_parent_leader(agent_id)
 }
 
 #[inline]
 fn thread_group_leader_for_agent_any_state(agent_id: u16) -> u16 {
-    state::get_state(agent_id)
-        .map(|st| st.thread_group_leader)
+    state::process_leader(agent_id)
         .filter(|leader| agent::get_agent_any_state(*leader).is_some())
         .unwrap_or(agent_id)
 }
 
 #[inline]
 fn linux_child_wait_parent_leader(child_id: u16) -> Option<AgentId> {
-    let parent_id = agent::get_agent_any_state(child_id).and_then(|agent| agent.parent_id)?;
-    Some(thread_group_leader_for_agent_any_state(parent_id))
+    state::process_parent_leader(child_id)
 }
 
 #[inline]
 fn is_linux_child_group_leader_id(child_id: u16) -> bool {
-    state::get_state(child_id)
-        .map(|st| st.thread_group_leader == child_id)
+    state::process_leader(child_id)
+        .map(|leader| leader == child_id)
         .unwrap_or(true)
 }
 
 fn linux_child_group_has_other_active_members(child_id: u16) -> bool {
-    let Some(group_pid) = state::get_state(child_id).map(|st| st.pid) else {
-        return false;
-    };
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for id in ids[..count].iter().copied().flatten() {
-        if id == child_id {
-            continue;
-        }
-        let Some(st) = state::get_state(id) else {
-            continue;
-        };
-        if st.active && st.pid == group_pid {
-            return true;
-        }
-    }
-    false
+    state::process_has_other_active_members(child_id)
 }
 
 #[inline]
@@ -1117,17 +1088,17 @@ fn is_waitable_linux_child_id(child_id: u16) -> bool {
 
 fn caller_has_waitable_child(agent_id: u16) -> bool {
     let waiter_leader = thread_group_leader(agent_id);
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for child_id in ids[..count].iter().copied().flatten() {
-        if !is_linux_child_group_leader_id(child_id) {
-            continue;
+    let mut found = false;
+    state::for_each_child_process(waiter_leader, |child_id| {
+        if is_linux_child_group_leader_id(child_id)
+            && linux_child_wait_parent_leader(child_id) == Some(waiter_leader)
+        {
+            found = true;
+            return false;
         }
-        if linux_child_wait_parent_leader(child_id) == Some(waiter_leader) {
-            return true;
-        }
-    }
-    false
+        true
+    });
+    found
 }
 
 fn caller_can_wait_on_child(agent_id: u16, child_id: u16) -> bool {
@@ -1140,38 +1111,35 @@ fn find_waitable_terminated_child_for_waiter(
     specific_pid: i32,
 ) -> Option<(AgentId, AgentStatus)> {
     let waiter_leader = thread_group_leader(agent_id);
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for child_id in ids[..count].iter().copied().flatten() {
+    let mut found = None;
+    state::for_each_child_process(waiter_leader, |child_id| {
         let Some(agent) = agent::get_agent_any_state(child_id) else {
-            continue;
+            return true;
         };
         if agent.active
             || (agent.status != AgentStatus::Exited && agent.status != AgentStatus::Faulted)
             || !is_waitable_linux_child_id(child_id)
             || linux_child_wait_parent_leader(child_id) != Some(waiter_leader)
         {
-            continue;
+            return true;
         }
         if specific_pid > 0 && child_id != specific_pid as u16 {
-            continue;
+            return true;
         }
-        return Some((child_id, agent.status));
-    }
-    None
+        found = Some((child_id, agent.status));
+        false
+    });
+    found
 }
 
 fn wake_parent_thread_group_waiters(parent_agent_id: u16) {
     let parent_leader = thread_group_leader_for_agent_any_state(parent_agent_id);
-    let parent_pid = thread_group_pid(parent_leader);
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for id in ids[..count].iter().copied().flatten() {
+    state::for_each_process_member(parent_leader, |id| {
         let Some(st) = state::get_state(id) else {
-            continue;
+            return true;
         };
-        if !st.active || st.pid != parent_pid {
-            continue;
+        if !st.active {
+            return true;
         }
         if let Some(parent) = agent::get_agent_mut(id) {
             if parent.status == AgentStatus::BlockedRecv {
@@ -1179,15 +1147,16 @@ fn wake_parent_thread_group_waiters(parent_agent_id: u16) {
                 sched::add_to_run_queue(id);
             }
         }
-    }
+        true
+    });
 }
 
 #[inline]
 fn wait_status_word(child_id: u16, child_status: AgentStatus) -> u32 {
     match child_status {
         AgentStatus::Exited => {
-            let exit_code = state::get_state(child_id)
-                .map(|st| st.exit_status as u32)
+            let exit_code = state::process_exit_status(child_id)
+                .map(|status| status as u32)
                 .unwrap_or(0)
                 & 0xff;
             exit_code << 8
@@ -1227,7 +1196,9 @@ fn trace_node_futex_agent(agent_id: u16) -> bool {
 
 #[inline]
 fn trace_java_futex_agent(agent_id: u16) -> bool {
-    if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") {
+    if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
+    {
         return false;
     }
     state::trace_java_agent(agent_id)
@@ -1514,7 +1485,11 @@ pub fn sys_execve(agent_id: u16, pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64
     // as host-installed Node.js whose executable can exceed 100 MiB.
     if ks == crate::state::BASE_IMAGE_KEYSPACE {
         if let Some(entry) = crate::base_image::find_by_key(key) {
-            return do_execve(agent_id, path, entry.data, argv_ptr, envp_ptr);
+            let rc = do_execve(agent_id, path, entry.data, argv_ptr, envp_ptr);
+            if rc < 0 {
+                log_execve_error(agent_id, path, rc);
+            }
+            return rc;
         }
     }
 
@@ -1544,13 +1519,33 @@ pub fn sys_execve(agent_id: u16, pathname_ptr: u64, argv_ptr: u64, envp_ptr: u64
                 }
                 // Use len as image_len below
                 let image_len = len;
-                return do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr);
+                let rc = do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr);
+                if rc < 0 {
+                    log_execve_error(agent_id, path, rc);
+                }
+                return rc;
             }
-            None => return -ENOENT,
+            None => {
+                log_execve_error(agent_id, path, -ENOENT);
+                return -ENOENT;
+            }
         }
     }
 
-    do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr)
+    let rc = do_execve(agent_id, path, &image_buf[..image_len], argv_ptr, envp_ptr);
+    if rc < 0 {
+        log_execve_error(agent_id, path, rc);
+    }
+    rc
+}
+
+fn log_execve_error(agent_id: u16, path: &[u8], err: i64) {
+    serial_println!(
+        "[execve] failed: agent={} path={:?} err={}",
+        agent_id,
+        core::str::from_utf8(path).unwrap_or("?"),
+        err
+    );
 }
 
 fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: u64) -> i64 {
@@ -1643,6 +1638,34 @@ fn do_execve(agent_id: u16, path: &[u8], image: &[u8], argv_ptr: u64, envp_ptr: 
                     .map(|v| core::str::from_utf8(v).unwrap_or("?"))
                     .unwrap_or("-"),
                 main_wrapper,
+                last_arg
+                    .map(|v| core::str::from_utf8(v).unwrap_or("?"))
+                    .unwrap_or("-")
+            );
+        } else if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang") {
+            let arg0 = if argc > 0 {
+                core::str::from_utf8(argv_refs[0]).unwrap_or("?")
+            } else {
+                "-"
+            };
+            let arg1 = if argc > 1 {
+                core::str::from_utf8(argv_refs[1]).unwrap_or("?")
+            } else {
+                "-"
+            };
+            let arg2 = if argc > 2 {
+                core::str::from_utf8(argv_refs[2]).unwrap_or("?")
+            } else {
+                "-"
+            };
+            serial_println!(
+                "[execve-java] agent={} exe={:?} argc={} arg0={:?} arg1={:?} arg2={:?} last={:?}",
+                agent_id,
+                core::str::from_utf8(path).unwrap_or("?"),
+                argc,
+                arg0,
+                arg1,
+                arg2,
                 last_arg
                     .map(|v| core::str::from_utf8(v).unwrap_or("?"))
                     .unwrap_or("-")
@@ -1812,16 +1835,15 @@ pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
 
     let mut members: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
     let mut member_count = 0usize;
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let id_count = agent::collect_agent_ids_any_state(&mut ids);
-    for id in ids[..id_count].iter().copied().flatten() {
+    state::for_each_process_member(agent_id, |id| {
         if let Some(ls) = state::get_state(id) {
             if ls.active && ls.pid == group_pid {
                 members[member_count] = Some(id);
                 member_count += 1;
             }
         }
-    }
+        true
+    });
 
     for member in members[..member_count].iter().copied().flatten() {
         if member == agent_id {
@@ -1829,10 +1851,8 @@ pub fn sys_exit_group(agent_id: u16, status: i32) -> i64 {
         }
         sched::remove_from_run_queue(member);
         agent::terminate_agent_no_reparent(member, AgentStatus::Exited);
-        // Keep the thread-group leader around for parent wait/reap. Asterinas
-        // similarly keeps the process object reachable from the parent's
-        // children table until wait consumes it; only worker threads can be
-        // auto-reaped here.
+        // Keep the thread-group leader around for parent wait/reap; only
+        // worker threads can be auto-reaped here.
         if is_thread_group_worker(member) {
             agent::auto_reap_if_unwaitable(member);
         }
@@ -2150,8 +2170,7 @@ pub fn sys_fork(agent_id: u16) -> i64 {
 
 /// vfork(2) -- Create a child that is expected to `execve` quickly.
 ///
-/// Follow the Asterinas/Linux model closely enough for runtime launchers:
-/// the child temporarily shares the parent's VM (`CLONE_VM`-style) and the
+/// The child temporarily shares the parent's VM (`CLONE_VM`-style) and the
 /// parent blocks until the child either `execve`s or exits.
 pub fn sys_vfork(agent_id: u16) -> i64 {
     let (parent_energy, parent_mem_quota) = match agent::get_agent(agent_id) {
@@ -2213,6 +2232,7 @@ pub fn sys_vfork(agent_id: u16) -> i64 {
     if let Some(child_state) = state::get_state_mut(child_id) {
         child_state.vfork_parent = agent_id;
     }
+    state::set_process_vfork_parent(child_id, agent_id);
 
     sched::add_to_run_queue(child_id);
     if let Some(parent) = agent::get_agent_mut(agent_id) {
@@ -2355,23 +2375,7 @@ fn send_thread_signal(tid: i32, sig: i32) -> i64 {
 }
 
 fn find_thread_group_leader_by_pid(pid: i32) -> Option<AgentId> {
-    if pid <= 0 {
-        return None;
-    }
-    let mut ids: [Option<AgentId>; MAX_AGENTS] = [None; MAX_AGENTS];
-    let count = agent::collect_agent_ids_any_state(&mut ids);
-    for id in ids[..count].iter().copied().flatten() {
-        let Some(st) = state::get_state(id) else {
-            continue;
-        };
-        if !st.active || st.pid as i32 != pid || st.thread_group_leader != id {
-            continue;
-        }
-        if agent::get_agent(id).is_some() {
-            return Some(id);
-        }
-    }
-    None
+    state::find_process_leader_by_pid(pid)
 }
 
 fn send_group_signal(pid: i32, sig: i32) -> i64 {

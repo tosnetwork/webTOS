@@ -1,4 +1,4 @@
-.PHONY: build run release clean debug test test-crossnode test-disk java-test jtreg-prepare jtreg-java-base
+.PHONY: build run release clean debug test test-crossnode test-disk java-test jtreg-prepare jtreg-java-base jtreg-java-lang
 
 KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
 KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
@@ -43,6 +43,9 @@ jtreg-prepare:
 
 jtreg-java-base:
 	./tools/jtreg_java_base_smoke.sh
+
+jtreg-java-lang:
+	./tools/jtreg_java_lang.sh
 
 # ─── UEFI targets ─────────────────────────────────────────────
 OVMF = /usr/share/ovmf/OVMF.fd

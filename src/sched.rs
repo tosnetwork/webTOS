@@ -62,6 +62,8 @@ static SCHED_LOCK: SpinLock<RunQueueState> = SpinLock::new(RunQueueState {
 /// Per-core current agent ID (indexed by LAPIC ID, max 16 cores).
 /// Each entry is only written by its own core, so no lock needed.
 static mut PER_CORE_AGENT: [AgentId; 16] = [IDLE_AGENT_ID; 16];
+static mut DEFERRED_STACK_FREE: [u64; 16] = [0; 16];
+static mut DEFERRED_ADDRESS_SPACE_RELEASE: [u64; 16] = [0; 16];
 
 /// Legacy single-core current agent (fallback when LAPIC not active).
 static mut CURRENT_AGENT_ID: AgentId = IDLE_AGENT_ID;
@@ -101,6 +103,74 @@ fn set_current(id: AgentId) {
     unsafe {
         CURRENT_AGENT_ID = id;
     }
+}
+
+#[inline]
+fn scheduler_core_slot() -> usize {
+    if crate::arch::x86_64::lapic::is_active() {
+        (crate::arch::x86_64::lapic::id() as usize).min(15)
+    } else {
+        0
+    }
+}
+
+fn drain_deferred_stack_free() {
+    let core = scheduler_core_slot();
+    let stack_top = unsafe {
+        let pending = DEFERRED_STACK_FREE[core];
+        DEFERRED_STACK_FREE[core] = 0;
+        pending
+    };
+    if stack_top != 0 {
+        free_agent_stack(stack_top);
+    }
+}
+
+pub fn defer_agent_stack_free(stack_top: u64) {
+    if stack_top == 0 {
+        return;
+    }
+    let core = scheduler_core_slot();
+    let previous = unsafe {
+        let old = DEFERRED_STACK_FREE[core];
+        DEFERRED_STACK_FREE[core] = stack_top;
+        old
+    };
+    if previous != 0 {
+        free_agent_stack(previous);
+    }
+}
+
+fn drain_deferred_address_space_release() {
+    let core = scheduler_core_slot();
+    let cr3 = unsafe {
+        let pending = DEFERRED_ADDRESS_SPACE_RELEASE[core];
+        DEFERRED_ADDRESS_SPACE_RELEASE[core] = 0;
+        pending
+    };
+    if cr3 != 0 {
+        let _ = crate::arch::x86_64::paging::release_address_space(cr3);
+    }
+}
+
+pub fn defer_address_space_release(cr3: u64) {
+    if cr3 == 0 {
+        return;
+    }
+    let core = scheduler_core_slot();
+    let previous = unsafe {
+        let old = DEFERRED_ADDRESS_SPACE_RELEASE[core];
+        DEFERRED_ADDRESS_SPACE_RELEASE[core] = cr3;
+        old
+    };
+    if previous != 0 {
+        let _ = crate::arch::x86_64::paging::release_address_space(previous);
+    }
+}
+
+fn drain_deferred_teardown() {
+    drain_deferred_address_space_release();
+    drain_deferred_stack_free();
 }
 
 fn prepare_user_entry(agent_id: AgentId) {
@@ -343,6 +413,7 @@ fn select_next_ready_agent() -> AgentId {
 ///
 /// Protected by SpinLock: safe for concurrent calls from multiple cores.
 pub fn schedule() {
+    drain_deferred_teardown();
     let old_id = current();
 
     // Mark old agent as Ready (if still Running)
@@ -440,6 +511,7 @@ pub fn schedule() {
 /// a scratch continuation into the per-core boot context and jump directly
 /// into the next runnable agent.
 pub fn switch_from_trap() -> ! {
+    drain_deferred_teardown();
     let old_id = current();
     let next_id = select_next_ready_agent();
 
@@ -494,6 +566,7 @@ pub fn switch_from_trap() -> ! {
 /// agent has already been removed from the run queue and must never return to
 /// its saved kernel stack continuation.
 pub fn switch_without_current() -> ! {
+    drain_deferred_teardown();
     let old_id = current();
     if !check_stack_guard(old_id) {
         crate::event::agent_faulted(old_id, 0xFF);

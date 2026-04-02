@@ -38,6 +38,7 @@ enum JavaSmokeFocus {
     Jar,
     JtregJavac,
     Jtreg,
+    JtregLang,
     Phase6,
     Full,
 }
@@ -50,6 +51,7 @@ fn java_smoke_focus() -> JavaSmokeFocus {
         Some("fs") => JavaSmokeFocus::Fs,
         Some("jtreg-javac") => JavaSmokeFocus::JtregJavac,
         Some("jtreg") => JavaSmokeFocus::Jtreg,
+        Some("jtreg-lang") => JavaSmokeFocus::JtregLang,
         Some("phase6") => JavaSmokeFocus::Phase6,
         Some("full") => JavaSmokeFocus::Full,
         _ => JavaSmokeFocus::Jar,
@@ -118,6 +120,11 @@ fn java_focus_runs_jtreg() -> bool {
 }
 
 #[inline]
+fn java_focus_runs_jtreg_lang() -> bool {
+    matches!(java_smoke_focus(), JavaSmokeFocus::JtregLang)
+}
+
+#[inline]
 fn java_focus_runs_jtreg_javac() -> bool {
     matches!(java_smoke_focus(), JavaSmokeFocus::JtregJavac)
 }
@@ -134,7 +141,7 @@ fn java_focus_runs_phase6() -> bool {
 fn java_focus_runs_jtreg_only() -> bool {
     matches!(
         java_smoke_focus(),
-        JavaSmokeFocus::Jtreg | JavaSmokeFocus::JtregJavac
+        JavaSmokeFocus::Jtreg | JavaSmokeFocus::JtregLang | JavaSmokeFocus::JtregJavac
     )
 }
 
@@ -147,6 +154,7 @@ fn java_focus_label() -> &'static str {
         JavaSmokeFocus::Jar => "jar",
         JavaSmokeFocus::JtregJavac => "jtreg-javac",
         JavaSmokeFocus::Jtreg => "jtreg",
+        JavaSmokeFocus::JtregLang => "jtreg-lang",
         JavaSmokeFocus::Phase6 => "phase6",
         JavaSmokeFocus::Full => "full",
     }
@@ -386,6 +394,26 @@ fn spawn_java_jtreg_smoke(root_id: u16) {
     }
 }
 
+fn spawn_java_jtreg_lang_smoke(root_id: u16) {
+    static JAVA_JTREG_LANG_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_java_jtreg_lang_execve.elf");
+    serial_println!(
+        "[ROOT] Loading Java jtreg java.lang run ({} bytes)...",
+        JAVA_JTREG_LANG_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        JAVA_JTREG_LANG_EXECVE_ELF,
+        500_000_000_000,
+        262_144,
+        b"/app/test_java_jtreg_lang_execve",
+        &[b"/app/test_java_jtreg_lang_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] Java jtreg java.lang agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] Java jtreg java.lang load failed: error {}", e),
+    }
+}
+
 fn spawn_java_jtreg_javac_smoke(root_id: u16) {
     static JAVA_JTREG_JAVAC_EXECVE_ELF: &[u8] =
         include_bytes!("../../test_data/test_java_jtreg_javac_execve.elf");
@@ -566,19 +594,42 @@ pub extern "C" fn root_entry() -> ! {
     const JAVA_JTREG_SMOKE_DELAY_TICKS: u64 = 1_050_000;
     const JAVA_CHILD_SMOKE_DELAY_TICKS: u64 = 750_000;
     const JAVA_THREAD_SMOKE_DELAY_TICKS: u64 = 900_000;
+    let java_runtime_only_focus = matches!(linux_runtime_smoke_focus(), LinuxRuntimeSmokeFocus::Java);
     let java_phase6_focus = matches!(java_smoke_focus(), JavaSmokeFocus::Phase6);
+    let java_smoke_delay_ticks = if java_runtime_only_focus { 1 } else { JAVA_SMOKE_DELAY_TICKS };
+    let java_hello_smoke_delay_ticks = if java_runtime_only_focus {
+        2
+    } else {
+        JAVA_HELLO_SMOKE_DELAY_TICKS
+    };
+    let java_fs_smoke_delay_ticks = if java_runtime_only_focus {
+        3
+    } else {
+        JAVA_FS_SMOKE_DELAY_TICKS
+    };
+    let java_jar_smoke_delay_ticks = if java_runtime_only_focus {
+        1
+    } else {
+        JAVA_JAR_SMOKE_DELAY_TICKS
+    };
     let java_jtreg_smoke_delay_ticks = if java_jtreg_only_focus {
         1
+    } else if java_runtime_only_focus {
+        8
     } else {
         JAVA_JTREG_SMOKE_DELAY_TICKS
     };
     let java_child_smoke_delay_ticks = if java_phase6_focus {
-        450_000
+        if java_runtime_only_focus { 2 } else { 450_000 }
+    } else if java_runtime_only_focus {
+        2
     } else {
         JAVA_CHILD_SMOKE_DELAY_TICKS
     };
     let java_thread_smoke_delay_ticks = if java_phase6_focus {
-        600_000
+        if java_runtime_only_focus { 3 } else { 600_000 }
+    } else if java_runtime_only_focus {
+        3
     } else {
         JAVA_THREAD_SMOKE_DELAY_TICKS
     };
@@ -720,13 +771,13 @@ pub extern "C" fn root_entry() -> ! {
             if java_focus_runs_version() {
                 serial_println!(
                     "[ROOT] Java runtime installed; delaying Java smoke test until root tick {}",
-                    JAVA_SMOKE_DELAY_TICKS
+                    java_smoke_delay_ticks
                 );
             }
             if java_focus_runs_hello() && linux_path_exists(b"/usr/lib/tos-tests/Hello.class") {
                 serial_println!(
                     "[ROOT] Java Hello smoke test available; delaying until root tick {}",
-                    JAVA_HELLO_SMOKE_DELAY_TICKS
+                    java_hello_smoke_delay_ticks
                 );
             } else {
                 serial_println!("[ROOT] Java Hello smoke test disabled or payload missing");
@@ -734,7 +785,7 @@ pub extern "C" fn root_entry() -> ! {
             if java_focus_runs_fs() && linux_path_exists(b"/usr/lib/tos-tests/FsProbe.class") {
                 serial_println!(
                     "[ROOT] Java FS smoke test available; delaying until root tick {}",
-                    JAVA_FS_SMOKE_DELAY_TICKS
+                    java_fs_smoke_delay_ticks
                 );
             } else {
                 serial_println!("[ROOT] Java FS smoke test disabled or payload missing");
@@ -742,7 +793,7 @@ pub extern "C" fn root_entry() -> ! {
             if java_focus_runs_jar() && linux_path_exists(b"/usr/lib/tos-tests/java-smoke.jar") {
                 serial_println!(
                     "[ROOT] Java JAR smoke test available; delaying until root tick {}",
-                    JAVA_JAR_SMOKE_DELAY_TICKS
+                    java_jar_smoke_delay_ticks
                 );
             } else {
                 serial_println!("[ROOT] Java JAR smoke test disabled or payload missing");
@@ -766,8 +817,19 @@ pub extern "C" fn root_entry() -> ! {
                     "[ROOT] Java jtreg smoke test available; delaying until root tick {}",
                     java_jtreg_smoke_delay_ticks
                 );
-            } else {
+            } else if java_focus_runs_jtreg() {
                 serial_println!("[ROOT] Java jtreg smoke test disabled or payload missing");
+            }
+            if java_focus_runs_jtreg_lang()
+                && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
+                && linux_path_exists(b"/jdk/test/jdk/java/lang/String/Chars.java")
+            {
+                serial_println!(
+                    "[ROOT] Java jtreg java.lang run available; delaying until root tick {}",
+                    java_jtreg_smoke_delay_ticks
+                );
+            } else if java_focus_runs_jtreg_lang() {
+                serial_println!("[ROOT] Java jtreg java.lang run disabled or payload missing");
             }
             if java_focus_runs_phase6()
                 && linux_path_exists(b"/usr/lib/tos-tests/JavaChildSmoke.class")
@@ -822,6 +884,11 @@ pub extern "C" fn root_entry() -> ! {
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
         && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
         && linux_path_exists(b"/jdk/test/jdk/java/lang/String/Chars.java");
+    let java_jtreg_lang_available = focus_runs_java()
+        && java_focus_runs_jtreg_lang()
+        && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java")
+        && linux_path_exists(b"/jdk/jtreg/lib/jtreg.jar")
+        && linux_path_exists(b"/jdk/test/jdk/java/lang/String/Chars.java");
     let java_jtreg_javac_available = focus_runs_java()
         && java_focus_runs_jtreg_javac()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/javac")
@@ -845,6 +912,7 @@ pub extern "C" fn root_entry() -> ! {
     let mut java_jar_smoke_launched = false;
     let mut java_jtreg_javac_smoke_launched = false;
     let mut java_jtreg_smoke_launched = false;
+    let mut java_jtreg_lang_smoke_launched = false;
     let mut java_child_smoke_launched = false;
     let mut java_thread_smoke_launched = false;
     loop {
@@ -883,25 +951,25 @@ pub extern "C" fn root_entry() -> ! {
             node_thread_smoke_launched = true;
         }
 
-        if java_runtime_available && !java_smoke_launched && count >= JAVA_SMOKE_DELAY_TICKS {
+        if java_runtime_available && !java_smoke_launched && count >= java_smoke_delay_ticks {
             spawn_java_smoke(1);
             java_smoke_launched = true;
         }
 
         if java_hello_available
             && !java_hello_smoke_launched
-            && count >= JAVA_HELLO_SMOKE_DELAY_TICKS
+            && count >= java_hello_smoke_delay_ticks
         {
             spawn_java_hello_smoke(1);
             java_hello_smoke_launched = true;
         }
 
-        if java_fs_available && !java_fs_smoke_launched && count >= JAVA_FS_SMOKE_DELAY_TICKS {
+        if java_fs_available && !java_fs_smoke_launched && count >= java_fs_smoke_delay_ticks {
             spawn_java_fs_smoke(1);
             java_fs_smoke_launched = true;
         }
 
-        if java_jar_available && !java_jar_smoke_launched && count >= JAVA_JAR_SMOKE_DELAY_TICKS {
+        if java_jar_available && !java_jar_smoke_launched && count >= java_jar_smoke_delay_ticks {
             spawn_java_jar_smoke(1);
             java_jar_smoke_launched = true;
         }
@@ -920,6 +988,14 @@ pub extern "C" fn root_entry() -> ! {
         {
             spawn_java_jtreg_smoke(1);
             java_jtreg_smoke_launched = true;
+        }
+
+        if java_jtreg_lang_available
+            && !java_jtreg_lang_smoke_launched
+            && count >= java_jtreg_smoke_delay_ticks
+        {
+            spawn_java_jtreg_lang_smoke(1);
+            java_jtreg_lang_smoke_launched = true;
         }
 
         if java_child_available

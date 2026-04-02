@@ -23,17 +23,16 @@ pub const STACK_GUARD_MAGIC: u64 = 0x57AC6E9D_DEAD_BEEF;
 const ROOT_AGENT_ENERGY_BUDGET: u64 = 10_000_000;
 const SYSTEM_SERVICE_ENERGY_BUDGET: u64 = 10_000_000;
 
-/// Stack size for each agent.
-/// 64 KiB is needed because the WASM agent allocates WasmInstance on the
-/// stack (~33 KB total: 18 KB for operand stack/locals/call stacks, 6 KB
-/// for module metadata, plus call chain and serial formatting overhead).
-/// Without enough stack, the WASM agent overflows into the adjacent
-/// agent's stack, corrupting saved return addresses.
-const AGENT_STACK_SIZE: usize = 65536;
+/// Stack size for each kernel-mode agent.
+///
+/// The root and service agents now run substantially deeper validation and
+/// runtime-loading paths than the original boot-time workloads, so they need
+/// the same 512 KiB headroom as ring-3 syscall stacks.
+const AGENT_STACK_SIZE: usize = KERNEL_STACK_SIZE;
 
 /// Static stacks for agents.
 ///
-/// Each agent gets a fixed 64 KiB kernel stack allocated in BSS. This
+/// Each agent gets a fixed kernel stack allocated in BSS. This
 /// avoids the need for a dynamic allocator during early boot.
 ///
 /// Safety: each stack is used by exactly one agent. Single-core Stage-1

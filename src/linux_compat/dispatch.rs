@@ -374,10 +374,9 @@ pub fn dispatch(
     }
 
     // Keep Linux thread groups making forward progress even though TOS does
-    // not do unsafe trap-time preemption. This is the deterministic analogue
-    // of the scheduler fairness Asterinas gets from real wait/wake scheduling:
-    // once a futex/eventfd wake marks another thread Ready, yield at the next
-    // syscall boundary so busy notifier threads do not monopolize the CPU.
+    // not do unsafe trap-time preemption. Once a futex/eventfd wake marks
+    // another thread Ready, yield at the next syscall boundary so busy
+    // notifier threads do not monopolize the CPU.
     if has_other_ready_thread_group_member(agent_id) {
         sched::yield_current();
     }

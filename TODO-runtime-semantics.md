@@ -16,8 +16,8 @@ structure.
   Python can rely on standard Linux process behavior.
 - Preserve the VMA/page-table split completed in the memory subsystem work and
   build richer runtime policy on top of it.
-- Reuse proven implementation ideas from `~/asterinas` and `~/moss` without
-  importing their full kernel architecture.
+- Reuse proven implementation ideas from mature local reference kernels
+  without importing their full kernel architecture.
 
 ## Status Summary
 
@@ -84,9 +84,9 @@ Completion notes:
 
 Primary references:
 
-- `~/asterinas/kernel/src/process/execve.rs`
-- `~/asterinas/kernel/src/process/program_loader/elf/load_elf.rs`
-- `~/asterinas/kernel/src/process/program_loader/elf/elf_file.rs`
+- process-image replacement and ELF loading flow
+- executable image metadata parsing
+- interpreter-driven dynamic program startup
 
 ## Phase 2: Thread Group and Shared-State Semantics
 
@@ -131,9 +131,9 @@ Completion notes:
 
 Primary references:
 
-- `~/asterinas/kernel/src/process/execve.rs`
-- `~/asterinas/kernel/src/process/clone.rs`
-- `~/moss/src/process/exec.rs`
+- process replacement flow
+- thread and child creation flow
+- multi-process runtime lifecycle management
 
 ## Phase 3: Signal Model Depth
 
@@ -181,8 +181,8 @@ Progress notes:
 
 Primary references:
 
-- `~/asterinas/kernel/src/process/signal/`
-- `~/asterinas/kernel/src/syscall/`
+- process-group signal ownership and delivery flow
+- syscall-facing signal ABI surface
 
 ## Phase 4: VMA Policy Depth Above the New Backend
 
@@ -228,10 +228,9 @@ Progress notes:
 
 Primary references:
 
-- `~/moss/src/memory/mmap.rs`
-- `~/moss/libkernel/src/memory/proc_vm/memory_map/mod.rs`
-- `~/asterinas/kernel/src/syscall/mmap.rs`
-- `~/asterinas/kernel/src/syscall/mprotect.rs`
+- VMA split and merge policy
+- `mmap` overlap and reservation rules
+- `mprotect` permissions transitions
 
 ## Phase 5: Dynamic Runtime Polish
 
@@ -273,9 +272,9 @@ Phase 5 close-out:
 
 Primary references:
 
-- `~/asterinas/kernel/src/syscall/arch_prctl.rs`
-- `~/asterinas/kernel/src/syscall/mmap.rs`
-- `~/asterinas/kernel/src/process/program_loader/elf/`
+- `arch_prctl` and TLS register handling
+- runtime-facing `mmap` details
+- executable loader metadata handoff
 
 Progress notes:
 
@@ -432,21 +431,12 @@ Completion notes:
   fd-backed stream semantics that match Linux runtime expectations.
 - The final Java thread blocker was resolved by switching Linux thread-group
   scans from `0..MAX_AGENTS` assumptions to real agent-table enumeration, which
-  matches the process-table style used by Asterinas, and by raising
-  `MAX_AGENTS` to a runtime-appropriate fixed capacity.
+  matches a real process-table style design, and by raising `MAX_AGENTS` to a
+  runtime-appropriate fixed capacity.
 
 ## Source References
 
-- Asterinas process / ELF loader:
-  - `~/asterinas/kernel/src/process/execve.rs`
-  - `~/asterinas/kernel/src/process/program_loader/elf/load_elf.rs`
-  - `~/asterinas/kernel/src/process/program_loader/elf/elf_file.rs`
-- Asterinas mmap / arch-specific runtime syscalls:
-  - `~/asterinas/kernel/src/syscall/mmap.rs`
-  - `~/asterinas/kernel/src/syscall/mprotect.rs`
-  - `~/asterinas/kernel/src/syscall/arch_prctl.rs`
-- Asterinas signals:
-  - `~/asterinas/kernel/src/process/signal/`
-- Moss VMA / mmap model:
-  - `~/moss/src/memory/mmap.rs`
-  - `~/moss/libkernel/src/memory/proc_vm/memory_map/mod.rs`
+- Process / ELF loader reference material.
+- `mmap` / `mprotect` / TLS reference material.
+- Signal handling reference material.
+- VMA and `mmap` policy reference material.

@@ -4,7 +4,10 @@
 //! cwd, brk pointer, mmap region, identity, etc.
 
 use super::constants::{O_CLOEXEC, SOCKETPAIR_STREAM_MARKER};
-use crate::{agent::MAX_AGENTS, serial_println};
+use crate::{
+    agent::{self, MAX_AGENTS},
+    serial_println,
+};
 
 pub const MAX_FDS: usize = 1024;
 pub const MAX_EPOLL_INSTANCES: usize = 8;
@@ -15,11 +18,16 @@ pub const MAX_VMAS: usize = 1024;
 pub const MAX_EVENTFDS: usize = 256;
 pub const MAX_PIPES: usize = 256;
 pub const MAX_MUTABLE_PATHS: usize = 1024;
+pub const MAX_PROCESS_OBJECTS: usize = MAX_LINUX_AGENTS;
+pub const MAX_MAPPED_OBJECTS: usize = MAX_VMAS;
+pub const MAX_UNIX_STREAMS: usize = 256;
 pub const PIPE_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_MMAP_BASE: u64 = 0x1_0000_0000;
 const O_ACCMODE: u32 = 3;
 const O_RDONLY: u32 = 0;
 const O_WRONLY: u32 = 1;
+const PROCESS_SLOT_EMPTY: u16 = u16::MAX;
+const OBJECT_SLOT_EMPTY: u16 = u16::MAX;
 
 // ── FD types ────────────────────────────────────────────────────────────────
 
@@ -149,6 +157,56 @@ impl PipeObject {
     }
 }
 
+// ── Unix stream endpoints ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct UnixStreamObject {
+    pub active: bool,
+    pub read_handle: u16,
+    pub write_handle: u16,
+    pub refs: u16,
+}
+
+impl UnixStreamObject {
+    pub const fn empty() -> Self {
+        UnixStreamObject {
+            active: false,
+            read_handle: 0,
+            write_handle: 0,
+            refs: 0,
+        }
+    }
+}
+
+// ── Linux process objects ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct LinuxProcessObject {
+    pub active: bool,
+    pub pid: u32,
+    pub leader_id: u16,
+    pub parent_leader_id: u16,
+    pub vfork_parent: u16,
+    pub exit_status: i32,
+    pub members: [u16; MAX_AGENTS],
+    pub children: [u16; MAX_AGENTS],
+}
+
+impl LinuxProcessObject {
+    pub const fn empty() -> Self {
+        LinuxProcessObject {
+            active: false,
+            pid: 0,
+            leader_id: 0,
+            parent_leader_id: 0,
+            vfork_parent: 0,
+            exit_status: 0,
+            members: [PROCESS_SLOT_EMPTY; MAX_AGENTS],
+            children: [PROCESS_SLOT_EMPTY; MAX_AGENTS],
+        }
+    }
+}
+
 // ── Linux user mappings ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +218,29 @@ pub enum VmaKind {
 }
 
 #[derive(Clone, Copy)]
+pub struct MappedObject {
+    pub active: bool,
+    pub kind: VmaKind,
+    pub keyspace_id: u16,
+    pub keyspace_key: u64,
+    pub file_offset: u64,
+    pub refs: u16,
+}
+
+impl MappedObject {
+    pub const fn empty() -> Self {
+        MappedObject {
+            active: false,
+            kind: VmaKind::Empty,
+            keyspace_id: 0,
+            keyspace_key: 0,
+            file_offset: 0,
+            refs: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct VmaEntry {
     pub active: bool,
     pub start: u64,
@@ -167,6 +248,7 @@ pub struct VmaEntry {
     pub prot: u32,
     pub flags: u32,
     pub kind: VmaKind,
+    pub mapped_object: u16,
     pub keyspace_id: u16,
     pub keyspace_key: u64,
     pub file_offset: u64,
@@ -181,6 +263,7 @@ impl VmaEntry {
             prot: 0,
             flags: 0,
             kind: VmaKind::Empty,
+            mapped_object: OBJECT_SLOT_EMPTY,
             keyspace_id: 0,
             keyspace_key: 0,
             file_offset: 0,
@@ -228,6 +311,7 @@ pub struct LinuxAgentState {
     pub brk_current: u64,
     pub mmap_next: u64,      // next deterministic mmap address
     pub vm_space_owner: u16, // Linux agent that owns the shared VM metadata
+    pub process_object: u16, // shared process/thread-group lifecycle object
     pub pid: u32,            // thread-group ID (tgid)
     pub thread_group_leader: u16,
     pub fs_owner: u16,
@@ -297,6 +381,7 @@ impl LinuxAgentState {
             brk_current: 0x0060_0000,     // conventional brk start
             mmap_next: DEFAULT_MMAP_BASE, // deterministic base (4 GB)
             vm_space_owner: agent_id,
+            process_object: PROCESS_SLOT_EMPTY,
             pid: agent_id as u32,
             thread_group_leader: agent_id,
             fs_owner: agent_id,
@@ -449,8 +534,7 @@ fn retain_fd_mailboxes(entry: &FdEntry) {
         }
         FdKind::Socket => {
             if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                retain_pipe_reader(entry.mailbox_id);
-                retain_pipe_writer(entry.keyspace_id);
+                retain_unix_stream(entry.keyspace_id);
             } else {
                 if entry.mailbox_id as usize >= crate::agent::MAX_AGENTS {
                     crate::mailbox::retain_reader_fd(entry.mailbox_id);
@@ -478,8 +562,7 @@ fn release_fd_mailboxes(entry: &FdEntry) {
         }
         FdKind::Socket => {
             if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                release_pipe_reader(entry.mailbox_id);
-                release_pipe_writer(entry.keyspace_id);
+                release_unix_stream(entry.keyspace_id);
             } else {
                 if entry.mailbox_id as usize >= crate::agent::MAX_AGENTS {
                     crate::mailbox::release_reader_fd(entry.mailbox_id);
@@ -543,6 +626,12 @@ struct LinuxStateSlot {
 // Safety: single-core, interrupts disabled during syscall handling.
 static mut LINUX_STATES: [Option<LinuxStateSlot>; MAX_LINUX_AGENTS] =
     [const { None }; MAX_LINUX_AGENTS];
+static mut PROCESS_OBJECTS: [LinuxProcessObject; MAX_PROCESS_OBJECTS] =
+    [const { LinuxProcessObject::empty() }; MAX_PROCESS_OBJECTS];
+static mut MAPPED_OBJECTS: [MappedObject; MAX_MAPPED_OBJECTS] =
+    [const { MappedObject::empty() }; MAX_MAPPED_OBJECTS];
+static mut UNIX_STREAM_OBJECTS: [UnixStreamObject; MAX_UNIX_STREAMS] =
+    [const { UnixStreamObject::empty() }; MAX_UNIX_STREAMS];
 static mut EVENTFD_OBJECTS: [EventFdObject; MAX_EVENTFDS] =
     [const { EventFdObject::empty() }; MAX_EVENTFDS];
 static mut PIPE_OBJECTS: [PipeObject; MAX_PIPES] = [const { PipeObject::empty() }; MAX_PIPES];
@@ -587,6 +676,367 @@ pub fn get_state_mut(agent_id: u16) -> Option<&'static mut LinuxAgentState> {
     unsafe { LINUX_STATES[idx].as_mut().map(|entry| &mut entry.state) }
 }
 
+pub fn process_object_id(agent_id: u16) -> Option<u16> {
+    get_state(agent_id)
+        .map(|st| st.process_object)
+        .filter(|handle| *handle != PROCESS_SLOT_EMPTY)
+}
+
+pub fn process_pid(agent_id: u16) -> Option<u32> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle).map(|obj| obj.pid)
+}
+
+pub fn process_leader(agent_id: u16) -> Option<u16> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle).map(|obj| obj.leader_id)
+}
+
+pub fn process_parent_leader(agent_id: u16) -> Option<u16> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle)
+        .and_then(|obj| (obj.parent_leader_id != 0).then_some(obj.parent_leader_id))
+}
+
+pub fn process_exit_status(agent_id: u16) -> Option<i32> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle).map(|obj| obj.exit_status)
+}
+
+pub fn record_process_exit_status(agent_id: u16, status: i32) {
+    let Some(handle) = process_object_id(agent_id) else {
+        if let Some(st) = get_state_mut(agent_id) {
+            st.exit_status = status;
+        }
+        return;
+    };
+    let leader_id = process_leader(agent_id).unwrap_or(agent_id);
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.exit_status = status;
+    }
+    if let Some(st) = get_state_mut(leader_id) {
+        st.exit_status = status;
+    } else if let Some(st) = get_state_mut(agent_id) {
+        st.exit_status = status;
+    }
+}
+
+pub fn process_vfork_parent(agent_id: u16) -> Option<u16> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle)
+        .and_then(|obj| (obj.vfork_parent != 0).then_some(obj.vfork_parent))
+}
+
+pub fn set_process_vfork_parent(agent_id: u16, parent_id: u16) {
+    if let Some(st) = get_state_mut(agent_id) {
+        st.vfork_parent = parent_id;
+    }
+    let Some(handle) = process_object_id(agent_id) else {
+        return;
+    };
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.vfork_parent = parent_id;
+    }
+}
+
+pub fn take_process_vfork_parent(agent_id: u16) -> Option<u16> {
+    let parent_id = process_vfork_parent(agent_id)?;
+    if let Some(st) = get_state_mut(agent_id) {
+        st.vfork_parent = 0;
+    }
+    if let Some(handle) = process_object_id(agent_id) {
+        if let Some(obj) = get_process_object_mut(handle) {
+            obj.vfork_parent = 0;
+        }
+    }
+    Some(parent_id)
+}
+
+pub fn process_has_other_active_members(agent_id: u16) -> bool {
+    let Some(handle) = process_object_id(agent_id) else {
+        return false;
+    };
+    let Some(obj) = get_process_object(handle) else {
+        return false;
+    };
+    for member in obj.members.iter().copied() {
+        if member == PROCESS_SLOT_EMPTY || member == agent_id {
+            continue;
+        }
+        if get_state(member).map(|st| st.active).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn for_each_process_member(agent_id: u16, mut f: impl FnMut(u16) -> bool) {
+    let Some(handle) = process_object_id(agent_id) else {
+        return;
+    };
+    let Some(obj) = get_process_object(handle) else {
+        return;
+    };
+    let members = obj.members;
+    for member in members.into_iter() {
+        if member == PROCESS_SLOT_EMPTY {
+            continue;
+        }
+        if !f(member) {
+            break;
+        }
+    }
+}
+
+pub fn for_each_child_process(agent_id: u16, mut f: impl FnMut(u16) -> bool) {
+    let Some(handle) = process_object_id(agent_id) else {
+        return;
+    };
+    let Some(obj) = get_process_object(handle) else {
+        return;
+    };
+    let children = obj.children;
+    for child in children.into_iter() {
+        if child == PROCESS_SLOT_EMPTY {
+            continue;
+        }
+        if !f(child) {
+            break;
+        }
+    }
+}
+
+pub fn find_process_leader_by_pid(pid: i32) -> Option<u16> {
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        for obj in PROCESS_OBJECTS.iter() {
+            if !obj.active || obj.pid as i32 != pid {
+                continue;
+            }
+            if agent::get_agent_any_state(obj.leader_id).is_some() {
+                return Some(obj.leader_id);
+            }
+        }
+    }
+    None
+}
+
+pub fn share_process_object(child_id: u16, source_agent_id: u16) -> bool {
+    let Some(source_handle) = process_object_id(source_agent_id) else {
+        return false;
+    };
+    let pid = process_pid(source_agent_id).unwrap_or(source_agent_id as u32);
+    let leader_id = process_leader(source_agent_id).unwrap_or(source_agent_id);
+    let old_handle = process_object_id(child_id).unwrap_or(PROCESS_SLOT_EMPTY);
+
+    if !bind_agent_to_process_object(child_id, source_handle, pid, leader_id) {
+        return false;
+    }
+    if !process_object_add_member(source_handle, child_id) {
+        return false;
+    }
+    if old_handle != PROCESS_SLOT_EMPTY && old_handle != source_handle {
+        process_object_remove_member(old_handle, child_id);
+        maybe_destroy_process_object(old_handle);
+    }
+    true
+}
+
+pub fn configure_process_object(agent_id: u16, parent_leader_id: u16) -> bool {
+    let Some(handle) = process_object_id(agent_id) else {
+        return false;
+    };
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.pid = agent_id as u32;
+        obj.leader_id = agent_id;
+        obj.parent_leader_id = parent_leader_id;
+    }
+    if !bind_agent_to_process_object(agent_id, handle, agent_id as u32, agent_id) {
+        return false;
+    }
+    if parent_leader_id != 0 {
+        if let Some(parent_handle) = process_object_id(parent_leader_id) {
+            let _ = process_object_add_child(parent_handle, agent_id);
+        }
+    }
+    true
+}
+
+pub fn ensure_vma_mapped_object(vma: &mut VmaEntry) -> Result<(), i64> {
+    if !vma.active || vma.kind == VmaKind::Empty {
+        return Ok(());
+    }
+    if vma.mapped_object != OBJECT_SLOT_EMPTY {
+        return Ok(());
+    }
+    unsafe {
+        for (idx, obj) in MAPPED_OBJECTS.iter_mut().enumerate() {
+            if obj.active {
+                continue;
+            }
+            *obj = MappedObject::empty();
+            obj.active = true;
+            obj.kind = vma.kind;
+            obj.keyspace_id = vma.keyspace_id;
+            obj.keyspace_key = vma.keyspace_key;
+            obj.file_offset = vma.file_offset;
+            vma.mapped_object = idx as u16;
+            return Ok(());
+        }
+    }
+    Err(-crate::linux_compat::constants::ENOMEM)
+}
+
+pub fn retain_mapped_object(handle: u16) {
+    let Some(idx) = mapped_object_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &mut MAPPED_OBJECTS[idx];
+        if obj.active {
+            obj.refs = obj.refs.saturating_add(1);
+        }
+    }
+}
+
+pub fn release_mapped_object(handle: u16) {
+    let Some(idx) = mapped_object_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &mut MAPPED_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        obj.refs = obj.refs.saturating_sub(1);
+        if obj.refs == 0 {
+            *obj = MappedObject::empty();
+        }
+    }
+}
+
+pub fn mapped_object_backing(handle: u16) -> Option<(VmaKind, u16, u64, u64)> {
+    let idx = mapped_object_slot(handle)?;
+    unsafe {
+        let obj = &MAPPED_OBJECTS[idx];
+        obj.active
+            .then_some((obj.kind, obj.keyspace_id, obj.keyspace_key, obj.file_offset))
+    }
+}
+
+pub fn retain_vma_table_objects(vmas: &[VmaEntry; MAX_VMAS]) {
+    for vma in vmas.iter().filter(|vma| vma.active) {
+        if vma.mapped_object != OBJECT_SLOT_EMPTY {
+            retain_mapped_object(vma.mapped_object);
+        }
+    }
+}
+
+pub fn release_vma_table_objects(vmas: &[VmaEntry; MAX_VMAS]) {
+    for vma in vmas.iter().filter(|vma| vma.active) {
+        if vma.mapped_object != OBJECT_SLOT_EMPTY {
+            release_mapped_object(vma.mapped_object);
+        }
+    }
+}
+
+pub fn alloc_unix_stream_pair() -> Option<(u16, u16)> {
+    let ab = alloc_pipe()?;
+    let ba = alloc_pipe()?;
+    let cleanup_pipes = || unsafe {
+        if let Some(pipe) = PIPE_OBJECTS.get_mut(ab as usize) {
+            *pipe = PipeObject::empty();
+        }
+        if let Some(pipe) = PIPE_OBJECTS.get_mut(ba as usize) {
+            *pipe = PipeObject::empty();
+        }
+    };
+    unsafe {
+        let mut first = None;
+        let mut second = None;
+        for (idx, obj) in UNIX_STREAM_OBJECTS.iter_mut().enumerate() {
+            if obj.active {
+                continue;
+            }
+            if first.is_none() {
+                *obj = UnixStreamObject {
+                    active: true,
+                    read_handle: ba,
+                    write_handle: ab,
+                    refs: 0,
+                };
+                first = Some(idx as u16);
+                continue;
+            }
+            *obj = UnixStreamObject {
+                active: true,
+                read_handle: ab,
+                write_handle: ba,
+                refs: 0,
+            };
+            second = Some(idx as u16);
+            break;
+        }
+        match (first, second) {
+            (Some(a), Some(b)) => Some((a, b)),
+            (Some(a), None) => {
+                if let Some(idx) = unix_stream_slot(a) {
+                    UNIX_STREAM_OBJECTS[idx] = UnixStreamObject::empty();
+                }
+                cleanup_pipes();
+                None
+            }
+            _ => {
+                cleanup_pipes();
+                None
+            }
+        }
+    }
+}
+
+pub fn retain_unix_stream(handle: u16) {
+    let Some(idx) = unix_stream_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &mut UNIX_STREAM_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        obj.refs = obj.refs.saturating_add(1);
+        retain_pipe_reader(obj.read_handle);
+        retain_pipe_writer(obj.write_handle);
+    }
+}
+
+pub fn release_unix_stream(handle: u16) {
+    let Some(idx) = unix_stream_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &mut UNIX_STREAM_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        obj.refs = obj.refs.saturating_sub(1);
+        release_pipe_reader(obj.read_handle);
+        release_pipe_writer(obj.write_handle);
+        if obj.refs == 0 {
+            *obj = UnixStreamObject::empty();
+        }
+    }
+}
+
+pub fn unix_stream_handles(handle: u16) -> Option<(u16, u16)> {
+    let idx = unix_stream_slot(handle)?;
+    unsafe {
+        let obj = &UNIX_STREAM_OBJECTS[idx];
+        obj.active.then_some((obj.read_handle, obj.write_handle))
+    }
+}
+
 #[inline]
 pub fn fs_owner(agent_id: u16) -> u16 {
     get_state(agent_id)
@@ -602,6 +1052,152 @@ fn clear_owned_mutable_paths(owner: u16) {
             }
         }
     }
+}
+
+#[inline]
+fn process_object_slot(handle: u16) -> Option<usize> {
+    let idx = handle as usize;
+    (idx < MAX_PROCESS_OBJECTS).then_some(idx)
+}
+
+fn alloc_process_object(leader_id: u16, parent_leader_id: u16) -> Option<u16> {
+    unsafe {
+        for (idx, obj) in PROCESS_OBJECTS.iter_mut().enumerate() {
+            if obj.active {
+                continue;
+            }
+            *obj = LinuxProcessObject::empty();
+            obj.active = true;
+            obj.pid = leader_id as u32;
+            obj.leader_id = leader_id;
+            obj.parent_leader_id = parent_leader_id;
+            obj.members[0] = leader_id;
+            return Some(idx as u16);
+        }
+    }
+    None
+}
+
+fn get_process_object(handle: u16) -> Option<&'static LinuxProcessObject> {
+    let idx = process_object_slot(handle)?;
+    unsafe {
+        let obj = &PROCESS_OBJECTS[idx];
+        obj.active.then_some(obj)
+    }
+}
+
+fn get_process_object_mut(handle: u16) -> Option<&'static mut LinuxProcessObject> {
+    let idx = process_object_slot(handle)?;
+    unsafe {
+        let obj = &mut PROCESS_OBJECTS[idx];
+        obj.active.then_some(obj)
+    }
+}
+
+fn process_object_add_member(handle: u16, agent_id: u16) -> bool {
+    let Some(obj) = get_process_object_mut(handle) else {
+        return false;
+    };
+    for member in obj.members.iter_mut() {
+        if *member == agent_id {
+            return true;
+        }
+        if *member == PROCESS_SLOT_EMPTY {
+            *member = agent_id;
+            return true;
+        }
+    }
+    false
+}
+
+fn process_object_remove_member(handle: u16, agent_id: u16) {
+    let Some(obj) = get_process_object_mut(handle) else {
+        return;
+    };
+    for member in obj.members.iter_mut() {
+        if *member == agent_id {
+            *member = PROCESS_SLOT_EMPTY;
+            break;
+        }
+    }
+}
+
+fn process_object_add_child(handle: u16, child_leader_id: u16) -> bool {
+    let Some(obj) = get_process_object_mut(handle) else {
+        return false;
+    };
+    for child in obj.children.iter_mut() {
+        if *child == child_leader_id {
+            return true;
+        }
+        if *child == PROCESS_SLOT_EMPTY {
+            *child = child_leader_id;
+            return true;
+        }
+    }
+    false
+}
+
+fn process_object_remove_child(handle: u16, child_leader_id: u16) {
+    let Some(obj) = get_process_object_mut(handle) else {
+        return;
+    };
+    for child in obj.children.iter_mut() {
+        if *child == child_leader_id {
+            *child = PROCESS_SLOT_EMPTY;
+            break;
+        }
+    }
+}
+
+fn process_object_member_count(handle: u16) -> usize {
+    get_process_object(handle)
+        .map(|obj| {
+            obj.members
+                .iter()
+                .filter(|member| **member != PROCESS_SLOT_EMPTY)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn maybe_destroy_process_object(handle: u16) {
+    let should_destroy = process_object_member_count(handle) == 0;
+    if !should_destroy {
+        return;
+    }
+    if let Some(idx) = process_object_slot(handle) {
+        unsafe {
+            PROCESS_OBJECTS[idx] = LinuxProcessObject::empty();
+        }
+    }
+}
+
+fn agent_parent_leader_id(agent_id: u16) -> u16 {
+    let Some(parent_id) = agent::get_agent_any_state(agent_id).and_then(|agent| agent.parent_id) else {
+        return 0;
+    };
+    process_leader(parent_id).unwrap_or(parent_id)
+}
+
+fn bind_agent_to_process_object(agent_id: u16, handle: u16, pid: u32, leader_id: u16) -> bool {
+    let Some(st) = get_state_mut(agent_id) else {
+        return false;
+    };
+    st.process_object = handle;
+    st.pid = pid;
+    st.thread_group_leader = leader_id;
+    true
+}
+
+fn mapped_object_slot(handle: u16) -> Option<usize> {
+    let idx = handle as usize;
+    (idx < MAX_MAPPED_OBJECTS).then_some(idx)
+}
+
+fn unix_stream_slot(handle: u16) -> Option<usize> {
+    let idx = handle as usize;
+    (idx < MAX_UNIX_STREAMS).then_some(idx)
 }
 
 fn has_other_active_fs_members(owner: u16) -> bool {
@@ -735,10 +1331,20 @@ pub fn sighand_owner(agent_id: u16) -> u16 {
 pub fn init_state(agent_id: u16) {
     clear_owned_mutable_paths(agent_id);
     if let Some(idx) = find_state_slot(agent_id).or_else(find_free_state_slot) {
+        let Some(process_handle) = alloc_process_object(agent_id, agent_parent_leader_id(agent_id))
+        else {
+            serial_println!(
+                "[linux_compat] init_state failed: agent={} process_objects=full",
+                agent_id
+            );
+            return;
+        };
         unsafe {
+            let mut state = LinuxAgentState::new(agent_id);
+            state.process_object = process_handle;
             LINUX_STATES[idx] = Some(LinuxStateSlot {
                 agent_id,
-                state: LinuxAgentState::new(agent_id),
+                state,
             });
         }
         super::signal::init_signal_state(agent_id);
@@ -763,10 +1369,27 @@ pub fn init_state(agent_id: u16) {
 /// Remove the Linux compat state slot for a reaped agent.
 pub fn remove_state(agent_id: u16) {
     let owner = fs_owner(agent_id);
+    let vmas = get_state(agent_id).map(|st| st.vmas);
+    let process_handle = process_object_id(agent_id).unwrap_or(PROCESS_SLOT_EMPTY);
+    let leader_id = process_leader(agent_id).unwrap_or(agent_id);
+    let parent_leader_id = process_parent_leader(agent_id).unwrap_or(0);
+
     if let Some(idx) = find_state_slot(agent_id) {
         unsafe {
             LINUX_STATES[idx] = None;
         }
+    }
+    if let Some(vmas) = vmas {
+        release_vma_table_objects(&vmas);
+    }
+    if process_handle != PROCESS_SLOT_EMPTY {
+        process_object_remove_member(process_handle, agent_id);
+        if leader_id == agent_id && parent_leader_id != 0 {
+            if let Some(parent_handle) = process_object_id(parent_leader_id) {
+                process_object_remove_child(parent_handle, leader_id);
+            }
+        }
+        maybe_destroy_process_object(process_handle);
     }
     super::signal::remove_signal_state(agent_id);
     if owner != 0 && !has_other_active_fs_members(owner) {
@@ -1367,6 +1990,7 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
         }
     }
 
+    let old_vmas = st.vmas;
     st.vmas = [const { VmaEntry::empty() }; MAX_VMAS];
     st.brk_current = initial_brk;
     st.mmap_next = DEFAULT_MMAP_BASE;
@@ -1392,6 +2016,14 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
     st.exe_path[..len].copy_from_slice(&path[..len]);
     st.exe_path_len = len as u16;
     st.exit_status = 0;
+
+    if let Some(handle) = process_object_id(agent_id) {
+        if let Some(obj) = get_process_object_mut(handle) {
+            obj.exit_status = 0;
+            obj.vfork_parent = 0;
+        }
+    }
+    release_vma_table_objects(&old_vmas);
 }
 
 /// Return true if the agent executable path matches `path`.
@@ -1408,7 +2040,10 @@ pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
 /// Return true if detailed Linux runtime tracing should be enabled for this agent.
 pub fn trace_runtime_agent(agent_id: u16) -> bool {
     let trace_java = option_env!("TOS_TRACE_JAVA_RUNTIME") == Some("1") && trace_java_agent(agent_id);
-    if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg") && trace_java_agent(agent_id) {
+    if (option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
+        || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang"))
+        && trace_java_agent(agent_id)
+    {
         return option_env!("TOS_TRACE_JTREG_RUNTIME") == Some("1");
     }
     exe_path_eq(agent_id, b"/app/hello_dynamic")
