@@ -189,6 +189,11 @@ fn focus_label() -> &'static str {
     }
 }
 
+#[inline]
+fn run_substrate_depth_smoke() -> bool {
+    option_env!("TOS_SUBSTRATE_DEPTH_SMOKE") == Some("1")
+}
+
 fn linux_path_exists(path: &[u8]) -> bool {
     let (ks, key) = crate::linux_compat::vfs::resolve_path(0, path);
     crate::state::query_file_size(ks, key) > 0 || crate::state::state_get(ks, key).is_some()
@@ -652,6 +657,28 @@ fn spawn_large_file_lifecycle_smoke(root_id: u16) {
     }
 }
 
+fn spawn_substrate_depth_smoke(root_id: u16) {
+    static SUBSTRATE_DEPTH_ELF: &[u8] = include_bytes!("../../test_data/test_substrate_depth.elf");
+    serial_println!(
+        "[ROOT] Loading substrate depth smoke test ({} bytes)...",
+        SUBSTRATE_DEPTH_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        SUBSTRATE_DEPTH_ELF,
+        5_000_000,
+        4096,
+        b"/app/test_substrate_depth",
+        &[b"/app/test_substrate_depth" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] substrate depth smoke test agent created: id={}", id),
+        Err(e) => serial_println!(
+            "[ROOT] substrate depth smoke test load failed: error {}",
+            e
+        ),
+    }
+}
+
 /// Root agent entry point.
 ///
 /// Runs an infinite loop, periodically logging a tick count and yielding
@@ -666,6 +693,9 @@ pub extern "C" fn root_entry() -> ! {
     let java_jtreg_only_focus = focus_runs_java() && java_focus_runs_jtreg_only();
 
     spawn_large_file_lifecycle_smoke(1);
+    if run_substrate_depth_smoke() {
+        spawn_substrate_depth_smoke(1);
+    }
 
     // Load relative *at path smoke test
     if !java_jtreg_only_focus {

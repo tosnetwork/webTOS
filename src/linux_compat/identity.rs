@@ -9,6 +9,31 @@ use crate::agent::USER_STACK_SIZE;
 use crate::arch::x86_64::page_table;
 use sha2::{Digest, Sha256};
 
+const RSEQ_LEN_X86_64: u32 = 32;
+const RSEQ_FLAG_UNREGISTER: u32 = 1;
+const RSEQ_CPU_ID_UNINITIALIZED: i32 = -1;
+const RSEQ_CPU_ID_REGISTERED: u32 = 0;
+const MEMBARRIER_CMD_QUERY: u32 = 0;
+const MEMBARRIER_CMD_GLOBAL: u32 = 1 << 0;
+const MEMBARRIER_CMD_GLOBAL_EXPEDITED: u32 = 1 << 1;
+const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: u32 = 1 << 2;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED: u32 = 1 << 3;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u32 = 1 << 4;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 1 << 5;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 1 << 6;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ: u32 = 1 << 7;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ: u32 = 1 << 8;
+const MEMBARRIER_CMD_FLAG_CPU: u32 = 1 << 0;
+const MEMBARRIER_SUPPORTED_MASK: u32 = MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+
 #[inline]
 fn current_uid(agent_id: u16) -> u32 {
     state::get_state(agent_id).map(|st| st.uid).unwrap_or(1000)
@@ -73,6 +98,33 @@ fn copy_to_user(agent_id: u16, user_addr: u64, src: &[u8]) -> bool {
         return false;
     }
     page_table::copy_to_user(cr3, user_addr, src)
+}
+
+fn write_rseq_state(agent_id: u16, rseq_ptr: u64, cpu_id: i32) -> bool {
+    if rseq_ptr == 0 {
+        return false;
+    }
+
+    let cpu_start = RSEQ_CPU_ID_REGISTERED.to_ne_bytes();
+    let cpu = cpu_id.to_ne_bytes();
+    let zero_cs = 0u64.to_ne_bytes();
+
+    copy_to_user(agent_id, rseq_ptr, &cpu_start)
+        && copy_to_user(agent_id, rseq_ptr + 4, &cpu)
+        && copy_to_user(agent_id, rseq_ptr + 8, &zero_cs)
+}
+
+pub fn clear_rseq_critical_section(agent_id: u16) {
+    let Some(st) = state::get_state(agent_id) else {
+        return;
+    };
+    if st.rseq_ptr == 0 {
+        return;
+    }
+    let zero_cs = 0u64.to_ne_bytes();
+    let _ = copy_to_user(agent_id, st.rseq_ptr + 8, &zero_cs);
+    let _ = copy_to_user(agent_id, st.rseq_ptr, &RSEQ_CPU_ID_REGISTERED.to_ne_bytes());
+    let _ = copy_to_user(agent_id, st.rseq_ptr + 4, &(RSEQ_CPU_ID_REGISTERED as i32).to_ne_bytes());
 }
 
 // ── Simple identity getters ────────────────────────────────────────────────
@@ -224,6 +276,114 @@ pub fn sys_getcpu(agent_id: u16, cpu_ptr: u64, node_ptr: u64, _tcache: u64) -> i
     }
 
     0
+}
+
+// ── membarrier ─────────────────────────────────────────────────────────────
+
+/// membarrier(int cmd, unsigned int flags, int cpu_id)
+///
+/// TOS currently exposes a deterministic single-CPU substrate. The barrier
+/// operations themselves are therefore no-ops, but runtimes still expect the
+/// Linux query and registration contract. We model that contract explicitly so
+/// modern runtimes stop treating the substrate as a legacy kernel.
+pub fn sys_membarrier(agent_id: u16, cmd: u32, flags: u32, cpu_id: u32) -> i64 {
+    match cmd {
+        MEMBARRIER_CMD_QUERY => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            MEMBARRIER_SUPPORTED_MASK as i64
+        }
+        MEMBARRIER_CMD_GLOBAL => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id)
+                | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED;
+            state::set_process_membarrier_registrations(agent_id, regs);
+            0
+        }
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id);
+            if regs & MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED == 0 {
+                return -EPERM;
+            }
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id)
+                | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+            state::set_process_membarrier_registrations(agent_id, regs);
+            0
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id);
+            if regs & MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED == 0 {
+                return -EPERM;
+            }
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id)
+                | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+            state::set_process_membarrier_registrations(agent_id, regs);
+            0
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id);
+            if regs & MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE == 0 {
+                return -EPERM;
+            }
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ => {
+            if flags != 0 || cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id)
+                | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+            state::set_process_membarrier_registrations(agent_id, regs);
+            0
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ => {
+            if flags & !MEMBARRIER_CMD_FLAG_CPU != 0 {
+                return -EINVAL;
+            }
+            if flags & MEMBARRIER_CMD_FLAG_CPU != 0 && cpu_id != 0 {
+                return -EINVAL;
+            }
+            if flags == 0 && cpu_id != 0 {
+                return -EINVAL;
+            }
+            let regs = state::process_membarrier_registrations(agent_id);
+            if regs & MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ == 0 {
+                return -EPERM;
+            }
+            0
+        }
+        _ => -EINVAL,
+    }
 }
 
 // ── arch_prctl ─────────────────────────────────────────────────────────────
@@ -429,10 +589,50 @@ pub fn sys_getrandom(agent_id: u16, buf_ptr: u64, buflen: u64, _flags: u64) -> i
 
 /// rseq(struct rseq *rseq, u32 rseq_len, int flags, u32 sig)
 ///
-/// Restartable sequences registration. TOS does not implement the kernel
-/// bookkeeping needed to make user-space rseq critical sections safe, so we
-/// must report it as unavailable and let libc fall back to non-rseq paths.
+/// TOS exposes a deterministic single-CPU registration model. That is enough
+/// for libc and runtime fast paths that probe for rseq availability and use
+/// the CPU ID fields on a uniprocessor substrate.
 #[allow(dead_code)]
-pub fn sys_rseq(_agent_id: u16, _rseq_ptr: u64, _rseq_len: u32, _flags: u32, _sig: u32) -> i64 {
-    -ENOSYS
+pub fn sys_rseq(agent_id: u16, rseq_ptr: u64, rseq_len: u32, flags: u32, sig: u32) -> i64 {
+    if flags & !RSEQ_FLAG_UNREGISTER != 0 {
+        return -EINVAL;
+    }
+    if rseq_len != RSEQ_LEN_X86_64 {
+        return -EINVAL;
+    }
+    if rseq_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let Some(st) = state::get_state_mut(agent_id) else {
+        return -EBADF;
+    };
+
+    if flags & RSEQ_FLAG_UNREGISTER != 0 {
+        if st.rseq_ptr == 0
+            || st.rseq_ptr != rseq_ptr
+            || st.rseq_len != rseq_len
+            || st.rseq_sig != sig
+        {
+            return -EINVAL;
+        }
+        if !write_rseq_state(agent_id, rseq_ptr, RSEQ_CPU_ID_UNINITIALIZED) {
+            return -EFAULT;
+        }
+        st.rseq_ptr = 0;
+        st.rseq_len = 0;
+        st.rseq_sig = 0;
+        return 0;
+    }
+
+    if st.rseq_ptr != 0 {
+        return -EINVAL;
+    }
+    if !write_rseq_state(agent_id, rseq_ptr, RSEQ_CPU_ID_REGISTERED as i32) {
+        return -EFAULT;
+    }
+    st.rseq_ptr = rseq_ptr;
+    st.rseq_len = rseq_len;
+    st.rseq_sig = sig;
+    0
 }

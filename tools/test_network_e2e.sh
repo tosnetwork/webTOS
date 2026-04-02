@@ -18,7 +18,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-tos/release/tos}"
 ELF32="/tmp/tos_net_test.elf"
-QEMU_MEMORY="${QEMU_MEMORY:-512M}"
+QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 
 echo "=== TOS Network End-to-End Test ==="
 

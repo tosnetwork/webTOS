@@ -72,6 +72,7 @@ fn dispatch_file_syscall(
         SYS_FCNTL => fs::sys_fcntl(agent_id, a1 as i32, a2 as u32, a3),
         SYS_FLOCK => fs::sys_flock(agent_id, a1 as i32, a2 as u32),
         SYS_FSYNC => fs::sys_fsync(agent_id, a1 as i32),
+        SYS_FDATASYNC => fs::sys_fdatasync(agent_id, a1 as i32),
         SYS_GETCWD => fs::sys_getcwd(agent_id, a1, a2),
         SYS_CHDIR => fs::sys_chdir(agent_id, a1),
         SYS_FTRUNCATE => fs::sys_ftruncate(agent_id, a1 as i32, a2),
@@ -115,8 +116,8 @@ fn dispatch_memory_syscall(
         SYS_MPROTECT => memory::sys_mprotect(agent_id, a1, a2, a3 as u32),
         SYS_MUNMAP => memory::sys_munmap(agent_id, a1, a2),
         SYS_BRK => memory::sys_brk(agent_id, a1),
-        SYS_MREMAP => -ENOSYS,
-        SYS_MSYNC => 0,
+        SYS_MREMAP => memory::sys_mremap(agent_id, a1, a2, a3, a4, a5),
+        SYS_MSYNC => memory::sys_msync(agent_id, a1, a2, a3),
         SYS_MADVISE => memory::sys_madvise(agent_id, a1, a2, a3 as u32),
         _ => return None,
     };
@@ -266,6 +267,9 @@ fn dispatch_time_syscall(
         SYS_CLOCK_GETTIME => time::sys_clock_gettime(agent_id, a1, a2),
         SYS_CLOCK_GETRES => time::sys_clock_getres(agent_id, a1, a2),
         SYS_CLOCK_NANOSLEEP => time::sys_clock_nanosleep(agent_id, a1 as u32, a2 as u32, a3, a4),
+        SYS_TIMERFD_CREATE => time::sys_timerfd_create(agent_id, a1 as i32, a2 as i32),
+        SYS_TIMERFD_SETTIME => time::sys_timerfd_settime(agent_id, a1 as i32, a2 as i32, a3, a4),
+        SYS_TIMERFD_GETTIME => time::sys_timerfd_gettime(agent_id, a1 as i32, a2),
         _ => return None,
     };
     Some(result)
@@ -295,7 +299,10 @@ fn dispatch_identity_syscall(
         SYS_ARCH_PRCTL => identity::sys_arch_prctl(agent_id, a1 as i32, a2),
         SYS_PRLIMIT64 => identity::sys_prlimit64(agent_id, a1, a2, a3, a4),
         SYS_GETRANDOM => identity::sys_getrandom(agent_id, a1, a2, a3),
+        SYS_MEMBARRIER => identity::sys_membarrier(agent_id, a1 as u32, a2 as u32, a3 as u32),
         SYS_RSEQ => identity::sys_rseq(agent_id, a1, a2 as u32, a3 as u32, a4 as u32),
+        SYS_SYNC => fs::sys_sync(),
+        SYS_SYNCFS => fs::sys_syncfs(agent_id, a1 as i32),
         _ => return None,
     };
     Some(result)
@@ -319,6 +326,10 @@ pub fn dispatch(
     if state::get_state(agent_id).is_none() {
         state::init_state(agent_id);
     }
+
+    // Any syscall entry aborts an in-flight rseq critical section on Linux.
+    // TOS uses the same rule for its deterministic single-CPU registration.
+    identity::clear_rseq_critical_section(agent_id);
 
     let trace_python = state::trace_runtime_agent(agent_id);
     if trace_python {

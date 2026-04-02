@@ -18,6 +18,8 @@ static volatile sig_atomic_t handled = 0;
 static volatile sig_atomic_t handled_count = 0;
 static volatile sig_atomic_t nested_seen = 0;
 static volatile sig_atomic_t altstack_seen = 0;
+static volatile sig_atomic_t siginfo_seen = 0;
+static volatile sig_atomic_t ucontext_seen = 0;
 static unsigned char alt_stack_mem[SIGSTKSZ];
 
 static void on_sigusr1(int signum) {
@@ -52,10 +54,20 @@ static void on_sigusr2_altstack(int signum) {
     }
 }
 
+static void on_sigusr1_siginfo(int signum, siginfo_t *info, void *ucontext) {
+    if (info && info->si_signo == signum) {
+        siginfo_seen = signum;
+    }
+    if (ucontext != 0) {
+        ucontext_seen = signum;
+    }
+}
+
 int main(void) {
     struct sigaction sa;
     struct sigaction nested_sa;
     struct sigaction alt_sa;
+    struct sigaction info_sa;
     sigset_t set;
     sigset_t old_set;
     sigset_t kill_only;
@@ -76,6 +88,9 @@ int main(void) {
     for (unsigned long i = 0; i < sizeof(old_sa); i++) {
         ((unsigned char *)&old_sa)[i] = 0;
     }
+    for (unsigned long i = 0; i < sizeof(info_sa); i++) {
+        ((unsigned char *)&info_sa)[i] = 0;
+    }
     for (unsigned long i = 0; i < sizeof(old_stack); i++) {
         ((unsigned char *)&old_stack)[i] = 0;
     }
@@ -84,6 +99,8 @@ int main(void) {
     nested_sa.sa_flags = SA_NODEFER;
     alt_sa.sa_handler = on_sigusr2_altstack;
     alt_sa.sa_flags = SA_ONSTACK;
+    info_sa.sa_sigaction = on_sigusr1_siginfo;
+    info_sa.sa_flags = SA_SIGINFO;
 
     errno = 0;
     if (sigpending((sigset_t *)0) != -1 || errno != EFAULT) {
@@ -318,6 +335,20 @@ int main(void) {
         static const char msg[] = "TOS-SIGNAL-FAIL sigaltstack-disabled-query\n";
         write(1, msg, sizeof(msg) - 1);
         return 34;
+    }
+
+    if (sigaction(SIGUSR1, &info_sa, 0) != 0) {
+        static const char msg[] = "TOS-SIGNAL-FAIL sigaction-siginfo\n";
+        write(1, msg, sizeof(msg) - 1);
+        return 35;
+    }
+
+    siginfo_seen = 0;
+    ucontext_seen = 0;
+    if (kill(getpid(), SIGUSR1) != 0 || siginfo_seen != SIGUSR1 || ucontext_seen != SIGUSR1) {
+        static const char msg[] = "TOS-SIGNAL-FAIL siginfo-delivery\n";
+        write(1, msg, sizeof(msg) - 1);
+        return 36;
     }
 
     static const char ok[] = "TOS-SIGNAL-OK\n";

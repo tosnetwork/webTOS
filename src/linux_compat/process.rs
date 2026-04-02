@@ -32,6 +32,8 @@ const RLIMIT_STACK: u64 = 3;
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
+const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_WAKE_OP: u32 = 5;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
@@ -44,6 +46,18 @@ const ROBUST_LIST_LIMIT: usize = 2048;
 
 /// Default bitmask: match everything (used by plain FUTEX_WAIT/FUTEX_WAKE).
 const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
+const FUTEX_OP_SET: u32 = 0;
+const FUTEX_OP_ADD: u32 = 1;
+const FUTEX_OP_OR: u32 = 2;
+const FUTEX_OP_ANDN: u32 = 3;
+const FUTEX_OP_XOR: u32 = 4;
+const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+const FUTEX_OP_CMP_EQ: u32 = 0;
+const FUTEX_OP_CMP_NE: u32 = 1;
+const FUTEX_OP_CMP_LT: u32 = 2;
+const FUTEX_OP_CMP_LE: u32 = 3;
+const FUTEX_OP_CMP_GT: u32 = 4;
+const FUTEX_OP_CMP_GE: u32 = 5;
 
 // ── FUTEX wait queue ──────────────────────────────────────────────────────
 
@@ -1221,11 +1235,15 @@ fn trace_jtreg_java_agent(agent_id: u16) -> bool {
 
 #[inline]
 fn trace_node_futex_agent(agent_id: u16) -> bool {
-    state::exe_path_eq(agent_id, b"/usr/bin/node")
+    option_env!("TOS_TRACE_NODE_RUNTIME") == Some("1")
+        && state::exe_path_eq(agent_id, b"/usr/bin/node")
 }
 
 #[inline]
 fn trace_java_futex_agent(agent_id: u16) -> bool {
+    if option_env!("TOS_TRACE_JAVA_RUNTIME") != Some("1") {
+        return false;
+    }
     if option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
         || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
         || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-deadlock")
@@ -1241,10 +1259,139 @@ fn futex_cmd_name(cmd: u32) -> &'static str {
         FUTEX_WAIT => "WAIT",
         FUTEX_WAKE => "WAKE",
         FUTEX_REQUEUE => "REQUEUE",
+        FUTEX_CMP_REQUEUE => "CMP_REQUEUE",
+        FUTEX_WAKE_OP => "WAKE_OP",
         FUTEX_WAIT_BITSET => "WAIT_BITSET",
         FUTEX_WAKE_BITSET => "WAKE_BITSET",
         _ => "OTHER",
     }
+}
+
+fn wake_futex_key(
+    key: FutexKey,
+    max_wake: usize,
+    bitset: u32,
+    trace: bool,
+    agent_id: u16,
+    cmd: u32,
+    uaddr: u64,
+    op: u64,
+) -> usize {
+    if max_wake == 0 {
+        return 0;
+    }
+
+    let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+    let mut matching_indices: [usize; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
+    let mut match_count: usize = 0;
+
+    unsafe {
+        for i in 0..MAX_FUTEX_WAITERS {
+            if !FUTEX_WAITERS[i].active {
+                continue;
+            }
+            if agent::get_agent(FUTEX_WAITERS[i].agent_id).is_none() {
+                FUTEX_WAITERS[i].active = false;
+                continue;
+            }
+            if FUTEX_WAITERS[i].futex_scope == key.scope
+                && FUTEX_WAITERS[i].futex_key_addr == key.addr
+                && (FUTEX_WAITERS[i].bitset & bitset) != 0
+            {
+                matching[match_count] = FUTEX_WAITERS[i].agent_id;
+                matching_indices[match_count] = i;
+                match_count += 1;
+            }
+        }
+    }
+
+    if match_count == 0 {
+        return 0;
+    }
+
+    for i in 1..match_count {
+        let key_id = matching[i];
+        let key_idx = matching_indices[i];
+        let mut j = i;
+        while j > 0 && matching[j - 1] > key_id {
+            matching[j] = matching[j - 1];
+            matching_indices[j] = matching_indices[j - 1];
+            j -= 1;
+        }
+        matching[j] = key_id;
+        matching_indices[j] = key_idx;
+    }
+
+    let wake_count = match_count.min(max_wake);
+    for w in 0..wake_count {
+        let wid = matching[w];
+        let widx = matching_indices[w];
+        unsafe {
+            FUTEX_WAITERS[widx].active = false;
+        }
+        set_futex_wait_result(wid, 0);
+        if let Some(agent) = agent::get_agent_mut(wid) {
+            agent.status = AgentStatus::Ready;
+        }
+        sched::add_to_run_queue(wid);
+    }
+
+    if trace {
+        serial_println!(
+            "[RTDBG] futex-{}-wake agent={} uaddr={:#x} max={} woke={} bitset={:#x} op={:#x}",
+            futex_cmd_name(cmd),
+            agent_id,
+            uaddr,
+            max_wake,
+            wake_count,
+            bitset,
+            op
+        );
+    }
+
+    wake_count
+}
+
+fn decode_futex_wake_op_arg(raw: u32) -> i32 {
+    let signed = ((raw & 0x0fff) << 20) as i32;
+    signed >> 20
+}
+
+fn apply_futex_wake_op(old: u32, encoded_op: u32) -> Option<(u32, bool)> {
+    let op = (encoded_op >> 28) & 0xf;
+    let cmp = (encoded_op >> 24) & 0xf;
+    let mut oparg = decode_futex_wake_op_arg((encoded_op >> 12) & 0x0fff);
+    let cmparg = decode_futex_wake_op_arg(encoded_op & 0x0fff);
+
+    if op & FUTEX_OP_OPARG_SHIFT != 0 {
+        if !(0..31).contains(&oparg) {
+            return None;
+        }
+        oparg = 1i32 << oparg;
+    }
+    let base_op = op & !FUTEX_OP_OPARG_SHIFT;
+
+    let new = match base_op {
+        FUTEX_OP_SET => oparg as u32,
+        FUTEX_OP_ADD => old.wrapping_add(oparg as u32),
+        FUTEX_OP_OR => old | (oparg as u32),
+        FUTEX_OP_ANDN => old & !(oparg as u32),
+        FUTEX_OP_XOR => old ^ (oparg as u32),
+        _ => return None,
+    };
+
+    let old_signed = old as i32;
+    let should_wake_second = match cmp {
+        FUTEX_OP_CMP_EQ => old_signed == cmparg,
+        FUTEX_OP_CMP_NE => old_signed != cmparg,
+        FUTEX_OP_CMP_LT => old_signed < cmparg,
+        FUTEX_OP_CMP_LE => old_signed <= cmparg,
+        FUTEX_OP_CMP_GT => old_signed > cmparg,
+        FUTEX_OP_CMP_GE => old_signed >= cmparg,
+        _ => return None,
+    };
+
+    Some((new, should_wake_second))
 }
 
 fn log_clone_vma(agent_id: u16, label: &str, addr: u64) {
@@ -1300,6 +1447,12 @@ fn log_clone_vma(agent_id: u16, label: &str, addr: u64) {
 
 const PR_SET_NAME: u32 = 15;
 const PR_GET_NAME: u32 = 16;
+const PR_GET_DUMPABLE: u32 = 3;
+const PR_SET_DUMPABLE: u32 = 4;
+const PR_GET_KEEPCAPS: u32 = 7;
+const PR_SET_KEEPCAPS: u32 = 8;
+const PR_SET_NO_NEW_PRIVS: u32 = 38;
+const PR_GET_NO_NEW_PRIVS: u32 = 39;
 
 // ── Per-agent metadata (names, etc.) ───────────────────────────────────────
 
@@ -2020,9 +2173,52 @@ pub fn sys_set_robust_list(agent_id: u16, head: u64, len: u64) -> i64 {
 
 /// prctl(2) -- Process control operations.
 ///
-/// Handles PR_SET_NAME and PR_GET_NAME; others return 0.
+/// Handles a focused Linux-compatible subset of prctl options.
 pub fn sys_prctl(agent_id: u16, option: u32, arg2: u64, _arg3: u64, _arg4: u64, _arg5: u64) -> i64 {
     match option {
+        PR_GET_DUMPABLE => state::get_state(agent_id)
+            .map(|st| st.pr_dumpable as i64)
+            .unwrap_or(-EINVAL),
+        PR_SET_DUMPABLE => {
+            let value = match arg2 {
+                0 => 0u8,
+                1 => 1u8,
+                _ => return -EINVAL,
+            };
+            let Some(st) = state::get_state_mut(agent_id) else {
+                return -EINVAL;
+            };
+            st.pr_dumpable = value;
+            0
+        }
+        PR_GET_KEEPCAPS => state::get_state(agent_id)
+            .map(|st| st.pr_keepcaps as i64)
+            .unwrap_or(-EINVAL),
+        PR_SET_KEEPCAPS => {
+            let value = match arg2 {
+                0 => 0u8,
+                1 => 1u8,
+                _ => return -EINVAL,
+            };
+            let Some(st) = state::get_state_mut(agent_id) else {
+                return -EINVAL;
+            };
+            st.pr_keepcaps = value;
+            0
+        }
+        PR_GET_NO_NEW_PRIVS => state::get_state(agent_id)
+            .map(|st| st.pr_no_new_privs as i64)
+            .unwrap_or(-EINVAL),
+        PR_SET_NO_NEW_PRIVS => {
+            if arg2 != 1 {
+                return -EINVAL;
+            }
+            let Some(st) = state::get_state_mut(agent_id) else {
+                return -EINVAL;
+            };
+            st.pr_no_new_privs = 1;
+            0
+        }
         PR_SET_NAME => {
             if arg2 == 0 {
                 return -EFAULT;
@@ -2047,8 +2243,7 @@ pub fn sys_prctl(agent_id: u16, option: u32, arg2: u64, _arg3: u64, _arg4: u64, 
             0
         }
         _ => {
-            // Unhandled prctl options succeed silently.
-            0
+            -EINVAL
         }
     }
 }
@@ -2793,91 +2988,86 @@ pub fn sys_futex(
             let Some(futex_key) = futex_key(agent_id, uaddr, op) else {
                 return -EFAULT;
             };
-
-            // Step 1: Collect matching waiters (address match + bitmask overlap).
-            let mut matching: [u16; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
-            let mut matching_indices: [usize; MAX_FUTEX_WAITERS] = [0; MAX_FUTEX_WAITERS];
-            let mut match_count: usize = 0;
-
-            unsafe {
-                for i in 0..MAX_FUTEX_WAITERS {
-                    if !FUTEX_WAITERS[i].active {
-                        continue;
-                    }
-                    if agent::get_agent(FUTEX_WAITERS[i].agent_id).is_none() {
-                        FUTEX_WAITERS[i].active = false;
-                        continue;
-                    }
-                    if FUTEX_WAITERS[i].futex_scope == futex_key.scope
-                        && FUTEX_WAITERS[i].futex_key_addr == futex_key.addr
-                        && (FUTEX_WAITERS[i].bitset & bitset) != 0
-                    {
-                        matching[match_count] = FUTEX_WAITERS[i].agent_id;
-                        matching_indices[match_count] = i;
-                        match_count += 1;
-                    }
-                }
+            wake_futex_key(futex_key, max_wake, bitset, trace, agent_id, cmd, uaddr, op) as i64
+        }
+        FUTEX_WAKE_OP => {
+            if uaddr == 0 || uaddr2 == 0 {
+                return -EFAULT;
             }
 
-            if match_count == 0 {
-                return 0;
+            let Some(first_key) = futex_key(agent_id, uaddr, op) else {
+                return -EFAULT;
+            };
+            let Some(second_key) = futex_key(agent_id, uaddr2, op) else {
+                return -EFAULT;
+            };
+
+            let Some(old_val) = read_user_u32(agent_id, uaddr2) else {
+                return -EFAULT;
+            };
+            let Some((new_val, wake_second)) = apply_futex_wake_op(old_val, val3 as u32) else {
+                return -EINVAL;
+            };
+            if !write_user_u32(agent_id, uaddr2, new_val) {
+                return -EFAULT;
             }
 
-            // Step 2: Sort matching entries by agent_id (deterministic ordering).
-            // Simple insertion sort -- small array.
-            for i in 1..match_count {
-                let key_id = matching[i];
-                let key_idx = matching_indices[i];
-                let mut j = i;
-                while j > 0 && matching[j - 1] > key_id {
-                    matching[j] = matching[j - 1];
-                    matching_indices[j] = matching_indices[j - 1];
-                    j -= 1;
-                }
-                matching[j] = key_id;
-                matching_indices[j] = key_idx;
-            }
+            let woke_first = wake_futex_key(
+                first_key,
+                val as usize,
+                FUTEX_BITSET_MATCH_ANY,
+                trace,
+                agent_id,
+                cmd,
+                uaddr,
+                op,
+            );
+            let woke_second = if wake_second {
+                wake_futex_key(
+                    second_key,
+                    timeout_or_val2 as usize,
+                    FUTEX_BITSET_MATCH_ANY,
+                    trace,
+                    agent_id,
+                    cmd,
+                    uaddr2,
+                    op,
+                )
+            } else {
+                0
+            };
 
-            // Step 3: Wake up to max_wake waiters (lowest agent_id first).
-            let wake_count = match_count.min(max_wake);
-            for w in 0..wake_count {
-                let wid = matching[w];
-                let widx = matching_indices[w];
-
-                // Mark waiter as inactive.
-                unsafe {
-                    FUTEX_WAITERS[widx].active = false;
-                }
-                set_futex_wait_result(wid, 0);
-
-                // Set agent status back to Ready and add to run queue.
-                if let Some(agent) = agent::get_agent_mut(wid) {
-                    agent.status = AgentStatus::Ready;
-                }
-                sched::add_to_run_queue(wid);
-            }
-
-            // Step 4: Return number of waiters woken.
             if trace {
                 serial_println!(
-                    "[RTDBG] futex-{}-wake agent={} uaddr={:#x} max={} woke={} bitset={:#x} op={:#x}",
+                    "[RTDBG] futex-{}-op agent={} uaddr1={:#x} uaddr2={:#x} old={} new={} woke1={} woke2={} encoded={:#x}",
                     futex_cmd_name(cmd),
                     agent_id,
                     uaddr,
-                    max_wake,
-                    wake_count,
-                    bitset,
-                    op
+                    uaddr2,
+                    old_val,
+                    new_val,
+                    woke_first,
+                    woke_second,
+                    val3
                 );
             }
-            wake_count as i64
+
+            (woke_first + woke_second) as i64
         }
-        FUTEX_REQUEUE => {
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             // FUTEX_REQUEUE: wake `val` waiters on uaddr, then move up to
             // `val2` remaining waiters from uaddr to uaddr2.
             // val2 is passed via timeout_or_val2, uaddr2 via the 5th syscall arg.
             if uaddr == 0 {
                 return -EFAULT;
+            }
+            if cmd == FUTEX_CMP_REQUEUE {
+                let Some(current_val) = read_user_u32(agent_id, uaddr) else {
+                    return -EFAULT;
+                };
+                if current_val != val3 as u32 {
+                    return -EAGAIN;
+                }
             }
             let max_wake = val as usize;
             let max_requeue = timeout_or_val2 as usize;
@@ -2973,8 +3163,7 @@ pub fn sys_futex(
                     val3
                 );
             }
-            // Other futex ops not implemented. Return 0 to avoid crashing.
-            0
+            -ENOSYS
         }
     }
 }

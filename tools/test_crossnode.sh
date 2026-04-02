@@ -10,7 +10,7 @@ set -e
 
 KERNEL="${1:-target/x86_64-unknown-tos/release/tos}"
 ELF32="/tmp/tos_crossnode.elf"
-QEMU_MEMORY="${QEMU_MEMORY:-512M}"
+QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 
 echo "=== TOS Cross-Node Test ==="
 echo "Building kernel..."

@@ -151,7 +151,7 @@ fn fd_allows_read(kind: FdKind, flags: u32) -> bool {
     match kind {
         FdKind::Directory => true,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_WRONLY,
-        FdKind::Socket | FdKind::EventFd => true,
+        FdKind::Socket | FdKind::EventFd | FdKind::TimerFd => true,
         FdKind::Epoll => false,
     }
 }
@@ -161,6 +161,7 @@ fn fd_allows_write(kind: FdKind, flags: u32) -> bool {
         FdKind::Directory => false,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_RDONLY,
         FdKind::Socket | FdKind::EventFd => true,
+        FdKind::TimerFd => false,
         FdKind::Epoll => false,
     }
 }
@@ -168,6 +169,10 @@ fn fd_allows_write(kind: FdKind, flags: u32) -> bool {
 #[inline]
 fn eventfd_handle(entry: &FdEntry) -> Option<u16> {
     (entry.kind == FdKind::EventFd).then_some(entry.keyspace_key as u16)
+}
+
+fn timerfd_handle(entry: &FdEntry) -> Option<u16> {
+    (entry.kind == FdKind::TimerFd).then_some(entry.keyspace_key as u16)
 }
 
 /// Hash a pathname to a deterministic u64 keyspace key using the first 8
@@ -733,6 +738,22 @@ fn metadata_for_eventfd(agent_id: u16, handle: u16) -> LinuxStatMeta {
     }
 }
 
+fn metadata_for_timerfd(agent_id: u16, handle: u16) -> LinuxStatMeta {
+    let (uid, gid) = agent_uid_gid(agent_id);
+    LinuxStatMeta {
+        st_dev: 0x107,
+        st_ino: stat_ino_for_key(handle as u64),
+        st_mode: 0o600,
+        st_nlink: 1,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: 4096,
+        st_blocks: 0,
+    }
+}
+
 fn metadata_for_special(agent_id: u16, special: super::vfs::SpecialFile) -> LinuxStatMeta {
     let (uid, gid) = agent_uid_gid(agent_id);
     match special {
@@ -824,6 +845,7 @@ fn metadata_for_fd(agent_id: u16, entry: &FdEntry) -> LinuxStatMeta {
             },
         ),
         FdKind::EventFd => metadata_for_eventfd(agent_id, entry.keyspace_key as u16),
+        FdKind::TimerFd => metadata_for_timerfd(agent_id, entry.keyspace_key as u16),
         FdKind::Epoll => metadata_for_regular(
             agent_id,
             0,
@@ -1053,7 +1075,9 @@ fn statfs_for_fd(agent_id: u16, entry: &FdEntry) -> LinuxStatFsMeta {
             entry.keyspace_id as u64,
             entry.keyspace_id == super::vfs::BASE_IMAGE_KEYSPACE,
         ),
-        FdKind::Pipe | FdKind::EventFd => statfs_for_magic(TMPFS_MAGIC, 0x7069_7065, false),
+        FdKind::Pipe | FdKind::EventFd | FdKind::TimerFd => {
+            statfs_for_magic(TMPFS_MAGIC, 0x7069_7065, false)
+        }
         FdKind::Socket => statfs_for_magic(TMPFS_MAGIC, 0x736f_636b, false),
         FdKind::Epoll => statfs_for_magic(TMPFS_MAGIC, 0x6570_6f6c, false),
     }
@@ -2083,6 +2107,41 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 }
             }
         }
+        FdKind::TimerFd => {
+            if !fd_allows_read(kind, flags) {
+                return -EBADF;
+            }
+            if count < 8 {
+                return -EINVAL;
+            }
+
+            let Some(handle) = timerfd_handle(entry) else {
+                return -EBADF;
+            };
+            loop {
+                if let Some(expirations) = state::timerfd_take_expirations(handle) {
+                    if !write_user_mem(agent_id, buf_ptr, &expirations.to_ne_bytes()) {
+                        return -EFAULT;
+                    }
+                    return 8;
+                }
+
+                if (flags & O_NONBLOCK) != 0 {
+                    return -EAGAIN;
+                }
+                if crate::linux_compat::signal::has_unblocked_pending_signal(agent_id) {
+                    return -EINTR;
+                }
+
+                state::add_blocked_timerfd_reader(handle, agent_id);
+                crate::sched::block_current(crate::agent::AgentStatus::BlockedRecv);
+
+                if crate::linux_compat::signal::has_unblocked_pending_signal(agent_id) {
+                    state::remove_blocked_timerfd_reader(handle, agent_id);
+                    return -EINTR;
+                }
+            }
+        }
         FdKind::Directory => -EISDIR,
         _ => -EINVAL,
     }
@@ -2376,6 +2435,7 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
                 return 8;
             }
         }
+        FdKind::TimerFd => -EINVAL,
         FdKind::Directory => -EISDIR,
         _ => -EINVAL,
     }
@@ -4022,6 +4082,16 @@ pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
                         0
                     }
                 }
+                FdKind::TimerFd => {
+                    if timerfd_handle(entry)
+                        .map(state::timerfd_read_ready)
+                        .unwrap_or(false)
+                    {
+                        8
+                    } else {
+                        0
+                    }
+                }
                 FdKind::Directory | FdKind::Epoll => 0,
             };
             if !write_user_mem(agent_id, arg, &available.to_ne_bytes()) {
@@ -4129,6 +4199,15 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
                                 .unwrap_or(false)
                         {
                             r |= POLLOUT;
+                        }
+                    }
+                    FdKind::TimerFd => {
+                        if events & POLLIN != 0
+                            && timerfd_handle(entry)
+                                .map(state::timerfd_read_ready)
+                                .unwrap_or(false)
+                        {
+                            r |= POLLIN;
                         }
                     }
                     FdKind::Epoll => {}
@@ -4437,6 +4516,12 @@ pub fn sys_select(
                         .map(state::eventfd_write_ready)
                         .unwrap_or(false),
                 ),
+                FdKind::TimerFd => (
+                    timerfd_handle(entry)
+                        .map(state::timerfd_read_ready)
+                        .unwrap_or(false),
+                    false,
+                ),
                 FdKind::Epoll => (false, false),
             };
 
@@ -4497,16 +4582,39 @@ pub fn sys_dup2(agent_id: u16, oldfd: i32, newfd: i32) -> i64 {
     newfd as i64
 }
 
-/// fsync stub — always succeeds (keyspace is always "synced")
 pub fn sys_fsync(agent_id: u16, fd: i32) -> i64 {
     let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
-    match st.get_fd(fd) {
-        Some(e) if e.active => 0,
-        _ => -EBADF,
+    let entry = match st.get_fd(fd) {
+        Some(e) if e.active => *e,
+        _ => return -EBADF,
+    };
+    match entry.kind {
+        FdKind::File | FdKind::Directory => {
+            if entry.keyspace_id != super::vfs::BASE_IMAGE_KEYSPACE {
+                crate::persist::save_state_to_disk();
+            }
+            0
+        }
+        FdKind::Pipe | FdKind::Socket | FdKind::Epoll | FdKind::EventFd | FdKind::TimerFd => {
+            -EINVAL
+        }
     }
+}
+
+pub fn sys_fdatasync(agent_id: u16, fd: i32) -> i64 {
+    sys_fsync(agent_id, fd)
+}
+
+pub fn sys_sync() -> i64 {
+    crate::persist::save_state_to_disk();
+    0
+}
+
+pub fn sys_syncfs(agent_id: u16, fd: i32) -> i64 {
+    sys_fsync(agent_id, fd)
 }
 
 /// chdir(path)

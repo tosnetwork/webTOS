@@ -16,6 +16,7 @@ pub const MAX_PATH: usize = 512;
 pub const MAX_DIRECTORY_HANDLES: usize = 64;
 pub const MAX_VMAS: usize = 1024;
 pub const MAX_EVENTFDS: usize = 256;
+pub const MAX_TIMERFDS: usize = 256;
 pub const MAX_PIPES: usize = 256;
 pub const MAX_MUTABLE_PATHS: usize = 4096;
 pub const MAX_PROCESS_OBJECTS: usize = MAX_LINUX_AGENTS;
@@ -40,6 +41,7 @@ pub enum FdKind {
     Epoll = 3,     // epoll instance reference
     EventFd = 4,   // eventfd counter
     Directory = 5, // virtual directory handle
+    TimerFd = 6,   // timerfd counter/timer state
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +130,31 @@ impl EventFdObject {
     }
 }
 
+// ── Timerfd objects ────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct TimerFdObject {
+    pub active: bool,
+    pub interval_ticks: u64,
+    pub deadline_tick: u64,
+    pub expirations: u64,
+    pub refs: u16,
+    pub blocked_readers: [Option<u16>; MAX_AGENTS],
+}
+
+impl TimerFdObject {
+    pub const fn empty() -> Self {
+        TimerFdObject {
+            active: false,
+            interval_ticks: 0,
+            deadline_tick: 0,
+            expirations: 0,
+            refs: 0,
+            blocked_readers: [None; MAX_AGENTS],
+        }
+    }
+}
+
 // ── Pipe objects ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -188,6 +215,7 @@ pub struct LinuxProcessObject {
     pub parent_leader_id: u16,
     pub vfork_parent: u16,
     pub exit_status: i32,
+    pub membarrier_registrations: u32,
     pub members: [u16; MAX_AGENTS],
     pub children: [u16; MAX_AGENTS],
 }
@@ -201,6 +229,7 @@ impl LinuxProcessObject {
             parent_leader_id: 0,
             vfork_parent: 0,
             exit_status: 0,
+            membarrier_registrations: 0,
             members: [PROCESS_SLOT_EMPTY; MAX_AGENTS],
             children: [PROCESS_SLOT_EMPTY; MAX_AGENTS],
         }
@@ -236,6 +265,23 @@ impl MappedObject {
             keyspace_key: 0,
             file_offset: 0,
             refs: 0,
+        }
+    }
+}
+
+// ── Process timers ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+pub struct ItimerState {
+    pub interval_ticks: u64,
+    pub deadline_tick: u64,
+}
+
+impl ItimerState {
+    pub const fn empty() -> Self {
+        ItimerState {
+            interval_ticks: 0,
+            deadline_tick: 0,
         }
     }
 }
@@ -324,14 +370,22 @@ pub struct LinuxAgentState {
     pub epoll_instances: [EpollInstance; MAX_EPOLL_INSTANCES],
     pub robust_list_head: u64,
     pub clear_child_tid: u64,
+    pub rseq_ptr: u64,
+    pub rseq_len: u32,
+    pub rseq_sig: u32,
     pub fs_base: u64,           // TLS FS base (arch_prctl SET_FS)
     pub gs_base: u64,           // TLS GS base (arch_prctl SET_GS)
+    pub pr_dumpable: u8,
+    pub pr_keepcaps: u8,
+    pub pr_no_new_privs: u8,
+    pub prctl_pad: u8,
     pub sigaltstack_sp: u64,    // alternate signal stack base
     pub sigaltstack_size: u64,  // alternate signal stack size
     pub sigaltstack_flags: u32, // alternate signal stack attribute flags
     pub sigaltstack_pad: u32,
     pub thread_pending_signals: u64, // thread-directed pending signals
     pub group_pending_signals: u64,  // thread-group-directed pending signals
+    pub itimers: [ItimerState; 3],   // ITIMER_REAL / VIRTUAL / PROF
     pub exe_path: [u8; MAX_PATH],    // executable path (for /proc/self/exe, AT_EXECFN)
     pub exe_path_len: u16,
     pub vfork_parent: u16, // blocked parent waiting for vfork child exec/exit
@@ -395,14 +449,22 @@ impl LinuxAgentState {
             epoll_instances: [const { EpollInstance::empty() }; MAX_EPOLL_INSTANCES],
             robust_list_head: 0,
             clear_child_tid: 0,
+            rseq_ptr: 0,
+            rseq_len: 0,
+            rseq_sig: 0,
             fs_base: 0,
             gs_base: 0,
+            pr_dumpable: 1,
+            pr_keepcaps: 0,
+            pr_no_new_privs: 0,
+            prctl_pad: 0,
             sigaltstack_sp: 0,
             sigaltstack_size: 0,
             sigaltstack_flags: 0,
             sigaltstack_pad: 0,
             thread_pending_signals: 0,
             group_pending_signals: 0,
+            itimers: [const { ItimerState::empty() }; 3],
             exe_path: [0u8; MAX_PATH],
             exe_path_len: 0,
             vfork_parent: 0,
@@ -582,6 +644,8 @@ pub fn retain_fd_resources(entry: &FdEntry) {
     retain_fd_mailboxes(entry);
     if entry.kind == FdKind::EventFd {
         retain_eventfd(entry.keyspace_key as u16);
+    } else if entry.kind == FdKind::TimerFd {
+        retain_timerfd(entry.keyspace_key as u16);
     }
 }
 
@@ -589,6 +653,8 @@ pub fn release_fd_resources(entry: &FdEntry) {
     release_fd_mailboxes(entry);
     if entry.kind == FdKind::EventFd {
         release_eventfd(entry.keyspace_key as u16);
+    } else if entry.kind == FdKind::TimerFd {
+        release_timerfd(entry.keyspace_key as u16);
     }
 }
 
@@ -636,6 +702,8 @@ static mut UNIX_STREAM_OBJECTS: [UnixStreamObject; MAX_UNIX_STREAMS] =
     [const { UnixStreamObject::empty() }; MAX_UNIX_STREAMS];
 static mut EVENTFD_OBJECTS: [EventFdObject; MAX_EVENTFDS] =
     [const { EventFdObject::empty() }; MAX_EVENTFDS];
+static mut TIMERFD_OBJECTS: [TimerFdObject; MAX_TIMERFDS] =
+    [const { TimerFdObject::empty() }; MAX_TIMERFDS];
 static mut PIPE_OBJECTS: [PipeObject; MAX_PIPES] = [const { PipeObject::empty() }; MAX_PIPES];
 static mut MUTABLE_PATHS: [MutablePathEntry; MAX_MUTABLE_PATHS] =
     [const { MutablePathEntry::empty() }; MAX_MUTABLE_PATHS];
@@ -703,6 +771,22 @@ pub fn process_parent_leader(agent_id: u16) -> Option<u16> {
 pub fn process_exit_status(agent_id: u16) -> Option<i32> {
     let handle = process_object_id(agent_id)?;
     get_process_object(handle).map(|obj| obj.exit_status)
+}
+
+pub fn process_membarrier_registrations(agent_id: u16) -> u32 {
+    process_object_id(agent_id)
+        .and_then(get_process_object)
+        .map(|obj| obj.membarrier_registrations)
+        .unwrap_or(0)
+}
+
+pub fn set_process_membarrier_registrations(agent_id: u16, flags: u32) {
+    let Some(handle) = process_object_id(agent_id) else {
+        return;
+    };
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.membarrier_registrations = flags;
+    }
 }
 
 pub fn record_process_exit_status(agent_id: u16, status: i32) {
@@ -842,6 +926,23 @@ pub fn find_process_leader_by_pid(pid: i32) -> Option<u16> {
         }
     }
     None
+}
+
+pub fn for_each_process_leader(mut f: impl FnMut(u16) -> bool) {
+    unsafe {
+        for obj in PROCESS_OBJECTS.iter() {
+            if !obj.active {
+                continue;
+            }
+            let leader = obj.leader_id;
+            if leader == 0 || agent::get_agent_any_state(leader).is_none() {
+                continue;
+            }
+            if !f(leader) {
+                break;
+            }
+        }
+    }
 }
 
 pub fn share_process_object(child_id: u16, source_agent_id: u16) -> bool {
@@ -1432,6 +1533,19 @@ pub fn alloc_eventfd(initval: u64) -> Option<u16> {
     None
 }
 
+pub fn alloc_timerfd() -> Option<u16> {
+    unsafe {
+        for (idx, obj) in TIMERFD_OBJECTS.iter_mut().enumerate() {
+            if !obj.active {
+                *obj = TimerFdObject::empty();
+                obj.active = true;
+                return Some(idx as u16);
+            }
+        }
+    }
+    None
+}
+
 pub fn eventfd_counter(handle: u16) -> Option<u64> {
     unsafe {
         let obj = EVENTFD_OBJECTS.get(handle as usize)?;
@@ -1463,9 +1577,63 @@ pub fn eventfd_write_ready(handle: u16) -> bool {
         .unwrap_or(false)
 }
 
+pub fn timerfd_state(handle: u16) -> Option<(u64, u64, u64)> {
+    unsafe {
+        let obj = TIMERFD_OBJECTS.get(handle as usize)?;
+        obj.active
+            .then_some((obj.interval_ticks, obj.deadline_tick, obj.expirations))
+    }
+}
+
+pub fn timerfd_arm(handle: u16, interval_ticks: u64, deadline_tick: u64) -> bool {
+    unsafe {
+        match TIMERFD_OBJECTS.get_mut(handle as usize) {
+            Some(obj) if obj.active => {
+                obj.interval_ticks = interval_ticks;
+                obj.deadline_tick = deadline_tick;
+                obj.expirations = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn timerfd_read_ready(handle: u16) -> bool {
+    unsafe {
+        match TIMERFD_OBJECTS.get(handle as usize) {
+            Some(obj) if obj.active => obj.expirations > 0,
+            _ => false,
+        }
+    }
+}
+
+pub fn timerfd_take_expirations(handle: u16) -> Option<u64> {
+    unsafe {
+        let obj = TIMERFD_OBJECTS.get_mut(handle as usize)?;
+        if !obj.active || obj.expirations == 0 {
+            return None;
+        }
+        let expirations = obj.expirations;
+        obj.expirations = 0;
+        Some(expirations)
+    }
+}
+
 fn retain_eventfd(handle: u16) {
     unsafe {
         let Some(obj) = EVENTFD_OBJECTS.get_mut(handle as usize) else {
+            return;
+        };
+        if obj.active {
+            obj.refs = obj.refs.saturating_add(1);
+        }
+    }
+}
+
+fn retain_timerfd(handle: u16) {
+    unsafe {
+        let Some(obj) = TIMERFD_OBJECTS.get_mut(handle as usize) else {
             return;
         };
         if obj.active {
@@ -1485,6 +1653,17 @@ fn maybe_destroy_eventfd(handle: u16) {
     }
 }
 
+fn maybe_destroy_timerfd(handle: u16) {
+    unsafe {
+        let Some(obj) = TIMERFD_OBJECTS.get_mut(handle as usize) else {
+            return;
+        };
+        if obj.active && obj.refs == 0 {
+            *obj = TimerFdObject::empty();
+        }
+    }
+}
+
 fn release_eventfd(handle: u16) {
     unsafe {
         let Some(obj) = EVENTFD_OBJECTS.get_mut(handle as usize) else {
@@ -1496,6 +1675,19 @@ fn release_eventfd(handle: u16) {
         obj.refs = obj.refs.saturating_sub(1);
     }
     maybe_destroy_eventfd(handle);
+}
+
+fn release_timerfd(handle: u16) {
+    unsafe {
+        let Some(obj) = TIMERFD_OBJECTS.get_mut(handle as usize) else {
+            return;
+        };
+        if !obj.active {
+            return;
+        }
+        obj.refs = obj.refs.saturating_sub(1);
+    }
+    maybe_destroy_timerfd(handle);
 }
 
 pub fn alloc_pipe() -> Option<u16> {
@@ -1672,9 +1864,46 @@ pub fn add_blocked_eventfd_reader(handle: u16, agent_id: u16) {
     }
 }
 
+pub fn add_blocked_timerfd_reader(handle: u16, agent_id: u16) {
+    unsafe {
+        let Some(obj) = TIMERFD_OBJECTS.get_mut(handle as usize) else {
+            return;
+        };
+        if !obj.active {
+            return;
+        }
+        for slot in obj.blocked_readers.iter_mut() {
+            if *slot == Some(agent_id) {
+                return;
+            }
+            if slot.is_none() {
+                *slot = Some(agent_id);
+                return;
+            }
+        }
+    }
+}
+
 pub fn remove_blocked_eventfd_reader(handle: u16, agent_id: u16) {
     unsafe {
         let Some(obj) = EVENTFD_OBJECTS.get_mut(handle as usize) else {
+            return;
+        };
+        if !obj.active {
+            return;
+        }
+        for slot in obj.blocked_readers.iter_mut() {
+            if *slot == Some(agent_id) {
+                *slot = None;
+                return;
+            }
+        }
+    }
+}
+
+pub fn remove_blocked_timerfd_reader(handle: u16, agent_id: u16) {
+    unsafe {
+        let Some(obj) = TIMERFD_OBJECTS.get_mut(handle as usize) else {
             return;
         };
         if !obj.active {
@@ -1846,6 +2075,39 @@ fn try_unblock_eventfd_reader(handle: u16) -> Option<u16> {
     }
 }
 
+fn try_unblock_timerfd_reader(handle: u16) -> Option<u16> {
+    unsafe {
+        let obj = TIMERFD_OBJECTS.get_mut(handle as usize)?;
+        if !obj.active {
+            return None;
+        }
+        let mut best_idx = None;
+        let mut best_id = 0u16;
+        for (idx, slot) in obj.blocked_readers.iter_mut().enumerate() {
+            let Some(agent_id) = *slot else {
+                continue;
+            };
+            let still_blocked = crate::agent::get_agent(agent_id)
+                .map(|agent| agent.status == crate::agent::AgentStatus::BlockedRecv)
+                .unwrap_or(false);
+            if !still_blocked {
+                *slot = None;
+                continue;
+            }
+            if best_idx.is_none() || agent_id < best_id {
+                best_idx = Some(idx);
+                best_id = agent_id;
+            }
+        }
+        if let Some(idx) = best_idx {
+            obj.blocked_readers[idx] = None;
+            Some(best_id)
+        } else {
+            None
+        }
+    }
+}
+
 fn try_unblock_pipe_writer(handle: u16) -> Option<u16> {
     unsafe {
         let pipe = PIPE_OBJECTS.get_mut(handle as usize)?;
@@ -1930,9 +2192,42 @@ pub fn wake_eventfd_readers(handle: u16) {
     }
 }
 
+pub fn wake_timerfd_readers(handle: u16) {
+    while let Some(agent_id) = try_unblock_timerfd_reader(handle) {
+        crate::sched::unblock(agent_id);
+    }
+}
+
 pub fn wake_eventfd_writers(handle: u16) {
     while let Some(agent_id) = try_unblock_eventfd_writer(handle) {
         crate::sched::unblock(agent_id);
+    }
+}
+
+pub fn timerfd_tick(now: u64) {
+    unsafe {
+        for handle in 0..MAX_TIMERFDS {
+            let Some(obj) = TIMERFD_OBJECTS.get_mut(handle) else {
+                continue;
+            };
+            if !obj.active || obj.deadline_tick == 0 || now < obj.deadline_tick {
+                continue;
+            }
+
+            if obj.interval_ticks == 0 {
+                obj.expirations = obj.expirations.saturating_add(1);
+                obj.deadline_tick = 0;
+            } else {
+                let overdue = now.saturating_sub(obj.deadline_tick);
+                let periods = overdue / obj.interval_ticks;
+                let fired = periods.saturating_add(1);
+                obj.expirations = obj.expirations.saturating_add(fired);
+                obj.deadline_tick = obj
+                    .deadline_tick
+                    .saturating_add(fired.saturating_mul(obj.interval_ticks));
+            }
+            wake_timerfd_readers(handle as u16);
+        }
     }
 }
 
@@ -2021,6 +2316,9 @@ pub fn reset_for_exec(agent_id: u16, path: &[u8], initial_brk: u64) {
     st.sighand_owner = agent_id;
     st.robust_list_head = 0;
     st.clear_child_tid = 0;
+    st.rseq_ptr = 0;
+    st.rseq_len = 0;
+    st.rseq_sig = 0;
     st.fs_base = 0;
     st.gs_base = 0;
     st.sigaltstack_sp = 0;
@@ -2062,6 +2360,8 @@ pub fn exe_path_eq(agent_id: u16, path: &[u8]) -> bool {
 /// Return true if detailed Linux runtime tracing should be enabled for this agent.
 pub fn trace_runtime_agent(agent_id: u16) -> bool {
     let trace_java = option_env!("TOS_TRACE_JAVA_RUNTIME") == Some("1") && trace_java_agent(agent_id);
+    let trace_node = option_env!("TOS_TRACE_NODE_RUNTIME") == Some("1")
+        && exe_path_eq(agent_id, b"/usr/bin/node");
     if (option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg")
         || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-lang")
         || option_env!("TOS_JAVA_SMOKE_FOCUS") == Some("jtreg-deadlock")
@@ -2072,12 +2372,12 @@ pub fn trace_runtime_agent(agent_id: u16) -> bool {
     }
     exe_path_eq(agent_id, b"/app/hello_dynamic")
         || exe_path_eq(agent_id, b"/usr/bin/hello_dynamic")
-        || exe_path_eq(agent_id, b"/usr/bin/node")
+        || trace_node
         || trace_java
         || get_state(agent_id)
             .map(|st| {
                 st.vfork_parent != 0
-                    && (exe_path_eq(agent_id, b"/usr/bin/node")
+                    && (trace_node
                         || (trace_java
                             && (exe_path_eq(agent_id, b"/usr/bin/java")
                                 || exe_path_eq(

@@ -5,6 +5,7 @@
 //! and rt_sigprocmask during initialization.
 
 use crate::linux_compat::constants::*;
+use crate::linux_compat::identity;
 use crate::linux_compat::state::{self, MAX_LINUX_AGENTS};
 use crate::linux_compat::process;
 use crate::serial_println;
@@ -28,10 +29,34 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 
 const SIGNAL_FRAME_MAGIC: u64 = 0x4154_4f53_5349_4746;
 const SIGALTSTACK_SIZE: usize = 24;
+const SIGINFO_SIZE: usize = 128;
+const UCONTEXT_SIZE: usize = 968;
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
 const SS_AUTODISARM: u32 = 1 << 31;
 const MINSIGSTKSZ: u64 = 2048;
+
+const UCONTEXT_UC_SIGMASK_OFFSET: usize = 296;
+const UCONTEXT_MCONTEXT_GREGS_OFFSET: usize = 40;
+const GREG_SLOT_SIZE: usize = 8;
+const GREG_R8: usize = 0;
+const GREG_R9: usize = 1;
+const GREG_R10: usize = 2;
+const GREG_R11: usize = 3;
+const GREG_R12: usize = 4;
+const GREG_R13: usize = 5;
+const GREG_R14: usize = 6;
+const GREG_R15: usize = 7;
+const GREG_RDI: usize = 8;
+const GREG_RSI: usize = 9;
+const GREG_RBP: usize = 10;
+const GREG_RBX: usize = 11;
+const GREG_RDX: usize = 12;
+const GREG_RAX: usize = 13;
+const GREG_RCX: usize = 14;
+const GREG_RSP: usize = 15;
+const GREG_RIP: usize = 16;
+const GREG_EFL: usize = 17;
 
 // ── Signal handler representation ──────────────────────────────────────────
 
@@ -56,6 +81,8 @@ struct UserSignalFrame {
     saved_rax: i64,
     _pad: i64,
     saved: process::SyscallSavedFrame,
+    siginfo: [u8; SIGINFO_SIZE],
+    ucontext: [u8; UCONTEXT_SIZE],
 }
 
 impl SigActionEntry {
@@ -298,7 +325,12 @@ fn serialize_user_signal_frame(frame: &UserSignalFrame, dst: &mut [u8]) {
     push_u64(dst, &mut off, frame.saved_blocked_mask);
     push_i64(dst, &mut off, frame.saved_rax);
     push_i64(dst, &mut off, frame._pad);
-    serialize_syscall_saved_frame(&frame.saved, &mut dst[off..]);
+    let saved_size = core::mem::size_of::<process::SyscallSavedFrame>();
+    serialize_syscall_saved_frame(&frame.saved, &mut dst[off..off + saved_size]);
+    off += saved_size;
+    dst[off..off + SIGINFO_SIZE].copy_from_slice(&frame.siginfo);
+    off += SIGINFO_SIZE;
+    dst[off..off + UCONTEXT_SIZE].copy_from_slice(&frame.ucontext);
 }
 
 fn deserialize_user_signal_frame(src: &[u8]) -> UserSignalFrame {
@@ -307,14 +339,82 @@ fn deserialize_user_signal_frame(src: &[u8]) -> UserSignalFrame {
     let saved_blocked_mask = pop_u64(src, &mut off);
     let saved_rax = pop_i64(src, &mut off);
     let pad = pop_i64(src, &mut off);
-    let saved = deserialize_syscall_saved_frame(&src[off..]);
+    let saved_size = core::mem::size_of::<process::SyscallSavedFrame>();
+    let saved = deserialize_syscall_saved_frame(&src[off..off + saved_size]);
+    off += saved_size;
+    let mut siginfo = [0u8; SIGINFO_SIZE];
+    siginfo.copy_from_slice(&src[off..off + SIGINFO_SIZE]);
+    off += SIGINFO_SIZE;
+    let mut ucontext = [0u8; UCONTEXT_SIZE];
+    ucontext.copy_from_slice(&src[off..off + UCONTEXT_SIZE]);
     UserSignalFrame {
         magic,
         saved_blocked_mask,
         saved_rax,
         _pad: pad,
         saved,
+        siginfo,
+        ucontext,
     }
+}
+
+#[inline]
+fn set_greg(dst: &mut [u8; UCONTEXT_SIZE], greg: usize, value: u64) {
+    let off = UCONTEXT_MCONTEXT_GREGS_OFFSET + greg * GREG_SLOT_SIZE;
+    dst[off..off + GREG_SLOT_SIZE].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn build_siginfo(signum: u32) -> [u8; SIGINFO_SIZE] {
+    let mut siginfo = [0u8; SIGINFO_SIZE];
+    siginfo[0..4].copy_from_slice(&(signum as i32).to_ne_bytes());
+    siginfo
+}
+
+fn build_ucontext(
+    saved: &process::SyscallSavedFrame,
+    blocked_mask: u64,
+    initial_rsp: u64,
+    current_result: i64,
+) -> [u8; UCONTEXT_SIZE] {
+    let mut ucontext = [0u8; UCONTEXT_SIZE];
+    ucontext[UCONTEXT_UC_SIGMASK_OFFSET..UCONTEXT_UC_SIGMASK_OFFSET + 8]
+        .copy_from_slice(&blocked_mask.to_ne_bytes());
+
+    set_greg(&mut ucontext, GREG_R8, saved.r8);
+    set_greg(&mut ucontext, GREG_R9, saved.r9);
+    set_greg(&mut ucontext, GREG_R10, saved.r10);
+    set_greg(&mut ucontext, GREG_R11, 0);
+    set_greg(&mut ucontext, GREG_R12, saved.r12);
+    set_greg(&mut ucontext, GREG_R13, saved.r13);
+    set_greg(&mut ucontext, GREG_R14, saved.r14);
+    set_greg(&mut ucontext, GREG_R15, saved.r15);
+    set_greg(&mut ucontext, GREG_RDI, saved.rdi);
+    set_greg(&mut ucontext, GREG_RSI, saved.rsi);
+    set_greg(&mut ucontext, GREG_RBP, saved.rbp);
+    set_greg(&mut ucontext, GREG_RBX, saved.rbx);
+    set_greg(&mut ucontext, GREG_RDX, saved.rdx);
+    set_greg(&mut ucontext, GREG_RAX, current_result as u64);
+    set_greg(&mut ucontext, GREG_RCX, 0);
+    set_greg(&mut ucontext, GREG_RSP, initial_rsp);
+    set_greg(&mut ucontext, GREG_RIP, saved.user_rip);
+    set_greg(&mut ucontext, GREG_EFL, saved.user_rflags);
+
+    ucontext
+}
+
+#[inline]
+fn signal_frame_saved_offset() -> usize {
+    core::mem::size_of::<u64>() * 2 + core::mem::size_of::<i64>() * 2
+}
+
+#[inline]
+fn signal_frame_siginfo_offset() -> usize {
+    signal_frame_saved_offset() + core::mem::size_of::<process::SyscallSavedFrame>()
+}
+
+#[inline]
+fn signal_frame_ucontext_offset() -> usize {
+    signal_frame_siginfo_offset() + SIGINFO_SIZE
 }
 
 #[inline]
@@ -605,9 +705,6 @@ fn install_user_signal_frame(
     if action.restorer == 0 {
         return Err(-EINVAL);
     }
-    if action.flags & SA_SIGINFO != 0 {
-        return Err(-ENOSYS);
-    }
 
     let Some(saved) = process::snapshot_current_syscall_frame() else {
         return Err(-EFAULT);
@@ -628,6 +725,8 @@ fn install_user_signal_frame(
         saved_rax: current_result,
         _pad: 0,
         saved,
+        siginfo: build_siginfo(signum),
+        ucontext: build_ucontext(&saved, blocked_mask(agent_id), saved.user_rsp, current_result),
     };
 
     let mut frame_bytes = [0u8; core::mem::size_of::<UserSignalFrame>()];
@@ -655,11 +754,18 @@ fn install_user_signal_frame(
     let Some(current) = process::current_syscall_frame_mut() else {
         return Err(-EFAULT);
     };
+    let siginfo_ptr = frame_base + signal_frame_siginfo_offset() as u64;
+    let ucontext_ptr = frame_base + signal_frame_ucontext_offset() as u64;
     current.user_rip = action.handler;
     current.user_rsp = user_rsp;
     current.rdi = signum as u64;
-    current.rsi = 0;
-    current.rdx = 0;
+    if action.flags & SA_SIGINFO != 0 {
+        current.rsi = siginfo_ptr;
+        current.rdx = ucontext_ptr;
+    } else {
+        current.rsi = 0;
+        current.rdx = 0;
+    }
 
     Ok(())
 }
@@ -970,6 +1076,7 @@ pub fn deliver_pending_signals(agent_id: u16, current_result: i64) -> i64 {
 
         let action = get_sigaction(agent_id, signum);
         let handler = action.handler;
+        identity::clear_rseq_critical_section(agent_id);
         if signum == SIGCHLD && state::trace_runtime_agent(agent_id) {
             serial_println!(
                 "[SIGDBG] deliver agent={} group={} handler={:#x} flags={:#x} restorer={:#x} blocked={:#x}",

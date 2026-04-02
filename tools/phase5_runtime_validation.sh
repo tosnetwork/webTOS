@@ -17,7 +17,7 @@ Options:
   --profile NAME            Validation profile: java, python, node, all
                             (default: all)
   --qemu-timeout SECONDS    QEMU timeout in seconds (default: 45)
-  --qemu-memory SIZE        Guest RAM size passed to QEMU (default: 512M)
+  --qemu-memory SIZE        Guest RAM size passed to QEMU (default: 1024M)
   --image PATH              Reuse or write the disk image at PATH
   --log PATH                Write the QEMU serial log to PATH
   --build-only              Build and stage the kernel, but do not boot QEMU
@@ -39,7 +39,7 @@ EOF
 profile="all"
 runtime_manifest="${TOS_RUNTIME_MANIFEST:-}"
 qemu_timeout="${QEMU_TIMEOUT:-45}"
-qemu_memory="${QEMU_MEMORY:-512M}"
+qemu_memory="${QEMU_MEMORY:-1024M}"
 runtime_focus="${TOS_RUNTIME_SMOKE_FOCUS:-}"
 java_focus="${TOS_JAVA_SMOKE_FOCUS:-}"
 image_path=""

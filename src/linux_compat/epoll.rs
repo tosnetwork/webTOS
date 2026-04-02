@@ -71,7 +71,7 @@ fn fd_allows_read(kind: FdKind, flags: u32) -> bool {
     match kind {
         FdKind::Directory => true,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_WRONLY,
-        FdKind::Socket | FdKind::EventFd => true,
+        FdKind::Socket | FdKind::EventFd | FdKind::TimerFd => true,
         FdKind::Epoll => false,
     }
 }
@@ -81,6 +81,7 @@ fn fd_allows_write(kind: FdKind, flags: u32) -> bool {
         FdKind::Directory => false,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_RDONLY,
         FdKind::Socket | FdKind::EventFd => true,
+        FdKind::TimerFd => false,
         FdKind::Epoll => false,
     }
 }
@@ -299,6 +300,10 @@ fn eventfd_handle(entry: &FdEntry) -> Option<u16> {
     (entry.kind == FdKind::EventFd).then_some(entry.keyspace_key as u16)
 }
 
+fn timerfd_handle(entry: &FdEntry) -> Option<u16> {
+    (entry.kind == FdKind::TimerFd).then_some(entry.keyspace_key as u16)
+}
+
 fn collect_ready_events(
     agent_id: u16,
     epfd: i32,
@@ -428,6 +433,16 @@ fn collect_ready_events(
                         events |= EPOLLIN;
                     }
                     events
+                }
+                FdKind::TimerFd => {
+                    if timerfd_handle(entry)
+                        .map(state::timerfd_read_ready)
+                        .unwrap_or(false)
+                    {
+                        EPOLLIN
+                    } else {
+                        0
+                    }
                 }
                 FdKind::File | FdKind::Directory => {
                     let mut events = 0;

@@ -3,7 +3,7 @@
 KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
 KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
 KERNEL_ELF32 = target/tos_32.elf
-QEMU_MEMORY ?= 512M
+QEMU_MEMORY ?= 1024M
 TEST_DISK ?= /tmp/tos_test.img
 
 build:

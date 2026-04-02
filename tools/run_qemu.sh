@@ -3,7 +3,7 @@
 set -e
 
 KERNEL="${1:-target/x86_64-unknown-tos/debug/tos}"
-QEMU_MEMORY="${QEMU_MEMORY:-512M}"
+QEMU_MEMORY="${QEMU_MEMORY:-1024M}"
 
 if [ ! -f "$KERNEL" ]; then
     echo "Kernel binary not found: $KERNEL"

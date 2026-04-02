@@ -114,7 +114,7 @@ fn fd_allows_read(kind: FdKind, flags: u32) -> bool {
     match kind {
         FdKind::Directory => true,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_WRONLY,
-        FdKind::Socket | FdKind::EventFd => true,
+        FdKind::Socket | FdKind::EventFd | FdKind::TimerFd => true,
         FdKind::Epoll => false,
     }
 }
@@ -124,6 +124,7 @@ fn fd_allows_write(kind: FdKind, flags: u32) -> bool {
         FdKind::Directory => false,
         FdKind::File | FdKind::Pipe => fd_access_mode(flags) != O_RDONLY,
         FdKind::Socket | FdKind::EventFd => true,
+        FdKind::TimerFd => false,
         FdKind::Epoll => false,
     }
 }

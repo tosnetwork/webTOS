@@ -91,6 +91,7 @@ pub const SYS_UNAME: u64 = 63;
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_FLOCK: u64 = 73;
 pub const SYS_FSYNC: u64 = 74;
+pub const SYS_FDATASYNC: u64 = 75;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FCHDIR: u64 = 81;
@@ -112,6 +113,7 @@ pub const SYS_SETGROUPS: u64 = 116;
 
 // ── Architecture ────────────────────────────────────────────────────────────
 pub const SYS_ARCH_PRCTL: u64 = 158;
+pub const SYS_SYNC: u64 = 162;
 
 // ── Futex ───────────────────────────────────────────────────────────────────
 pub const SYS_FUTEX: u64 = 202;
@@ -164,9 +166,14 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_READLINKAT: u64 = 267;
 pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
+pub const SYS_TIMERFD_CREATE: u64 = 283;
+pub const SYS_TIMERFD_SETTIME: u64 = 286;
+pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_PRLIMIT64: u64 = 302;
+pub const SYS_SYNCFS: u64 = 306;
 pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_GETRANDOM: u64 = 318;
+pub const SYS_MEMBARRIER: u64 = 324;
 pub const SYS_STATX: u64 = 332;
 pub const SYS_RSEQ: u64 = 334;
 pub const SYS_IO_URING_SETUP: u64 = 425;

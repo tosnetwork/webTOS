@@ -4,11 +4,19 @@
 //! to ensure deterministic replay across all nodes.
 
 use super::constants::*;
+use super::state::{self, FdEntry, FdKind};
 use crate::agent::{self, AgentStatus, MAX_AGENTS};
 use crate::arch::x86_64::timer;
 
 const NS_PER_TICK: u64 = 10_000_000;
 const TIMER_ABSTIME: u32 = 1;
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const ITIMER_REAL: u64 = 0;
+const ITIMER_VIRTUAL: u64 = 1;
+const ITIMER_PROF: u64 = 2;
+const NUM_ITIMERS: usize = 3;
+const SIGALRM: u32 = 14;
 
 static mut SLEEP_DEADLINES: [u64; MAX_AGENTS] = [0; MAX_AGENTS];
 
@@ -28,6 +36,52 @@ fn ticks_to_timespec() -> (u64, u64) {
     let seconds = ticks / 100;
     let nanoseconds = (ticks % 100) * NS_PER_TICK;
     (seconds, nanoseconds)
+}
+
+#[inline]
+fn ticks_to_timeval(ticks: u64) -> (u64, u64) {
+    let sec = ticks / 100;
+    let rem_ticks = ticks % 100;
+    (sec, rem_ticks * 10_000)
+}
+
+#[inline]
+fn itimer_index(which: u64) -> Option<usize> {
+    match which {
+        ITIMER_REAL => Some(0),
+        ITIMER_VIRTUAL => Some(1),
+        ITIMER_PROF => Some(2),
+        _ => None,
+    }
+}
+
+#[inline]
+fn process_timer_owner(agent_id: u16) -> u16 {
+    state::get_state(agent_id)
+        .map(|st| st.thread_group_leader)
+        .unwrap_or(agent_id)
+}
+
+#[inline]
+fn remaining_timer_ticks(it: &state::ItimerState, now: u64) -> u64 {
+    if it.deadline_tick == 0 || now >= it.deadline_tick {
+        0
+    } else {
+        it.deadline_tick - now
+    }
+}
+
+fn timeval_to_ticks(sec: i64, usec: i64) -> Option<u64> {
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return None;
+    }
+    let base = (sec as u64).saturating_mul(100);
+    let sub = if usec == 0 {
+        0
+    } else {
+        (((usec as u64) * 1_000).saturating_add(NS_PER_TICK - 1)) / NS_PER_TICK
+    };
+    Some(base.saturating_add(sub))
 }
 
 fn agent_cr3(agent_id: u16) -> Option<u64> {
@@ -112,6 +166,65 @@ fn read_timespec(agent_id: u16, ptr: u64) -> Option<(i64, i64)> {
 }
 
 #[inline]
+fn write_timeval(agent_id: u16, ptr: u64, sec: u64, usec: u64) -> bool {
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&(sec as i64).to_ne_bytes());
+    buf[8..16].copy_from_slice(&(usec as i64).to_ne_bytes());
+    copy_to_user(agent_id, ptr, &buf)
+}
+
+#[inline]
+fn read_timeval(agent_id: u16, ptr: u64) -> Option<(i64, i64)> {
+    let mut buf = [0u8; 16];
+    if !copy_from_user(agent_id, ptr, &mut buf) {
+        return None;
+    }
+    Some((
+        i64::from_ne_bytes(buf[0..8].try_into().ok()?),
+        i64::from_ne_bytes(buf[8..16].try_into().ok()?),
+    ))
+}
+
+#[inline]
+fn write_itimerval(agent_id: u16, ptr: u64, interval_ticks: u64, value_ticks: u64) -> bool {
+    let (int_sec, int_usec) = ticks_to_timeval(interval_ticks);
+    let (val_sec, val_usec) = ticks_to_timeval(value_ticks);
+    write_timeval(agent_id, ptr, int_sec, int_usec)
+        && write_timeval(agent_id, ptr + 16, val_sec, val_usec)
+}
+
+#[inline]
+fn read_itimerval(agent_id: u16, ptr: u64) -> Option<(u64, u64)> {
+    let (int_sec, int_usec) = read_timeval(agent_id, ptr)?;
+    let (val_sec, val_usec) = read_timeval(agent_id, ptr + 16)?;
+    Some((
+        timeval_to_ticks(int_sec, int_usec)?,
+        timeval_to_ticks(val_sec, val_usec)?,
+    ))
+}
+
+#[inline]
+fn write_itimerspec(agent_id: u16, ptr: u64, interval_ticks: u64, value_ticks: u64) -> bool {
+    let (int_sec, int_nsec) = (
+        interval_ticks / 100,
+        (interval_ticks % 100) * NS_PER_TICK,
+    );
+    let (val_sec, val_nsec) = (value_ticks / 100, (value_ticks % 100) * NS_PER_TICK);
+    write_timespec(agent_id, ptr, int_sec, int_nsec)
+        && write_timespec(agent_id, ptr + 16, val_sec, val_nsec)
+}
+
+#[inline]
+fn read_itimerspec(agent_id: u16, ptr: u64) -> Option<(u64, u64)> {
+    let (int_sec, int_nsec) = read_timespec(agent_id, ptr)?;
+    let (val_sec, val_nsec) = read_timespec(agent_id, ptr + 16)?;
+    Some((
+        timespec_to_ticks(int_sec, int_nsec)?,
+        timespec_to_ticks(val_sec, val_nsec)?,
+    ))
+}
+
+#[inline]
 fn timespec_to_ticks(sec: i64, nsec: i64) -> Option<u64> {
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return None;
@@ -156,6 +269,37 @@ pub fn sleep_tick() {
             }
         }
     }
+
+    let mut fired: [u16; state::MAX_LINUX_AGENTS] = [0; state::MAX_LINUX_AGENTS];
+    let mut fired_count = 0usize;
+    state::for_each_process_leader(|leader| {
+        let Some(st) = state::get_state_mut(leader) else {
+            return true;
+        };
+        let mut process_fired = false;
+        for it in st.itimers.iter_mut() {
+            if it.deadline_tick == 0 || now < it.deadline_tick {
+                continue;
+            }
+            process_fired = true;
+            if it.interval_ticks != 0 {
+                it.deadline_tick = now.saturating_add(it.interval_ticks);
+            } else {
+                it.deadline_tick = 0;
+            }
+        }
+        if process_fired && fired_count < fired.len() {
+            fired[fired_count] = leader;
+            fired_count += 1;
+        }
+        true
+    });
+
+    for leader in fired.into_iter().take(fired_count) {
+        super::signal::raise_group_signal(leader, SIGALRM);
+    }
+
+    state::timerfd_tick(now);
 }
 
 // ── clock_getres ───────────────────────────────────────────────────────────
@@ -301,13 +445,25 @@ pub fn sys_gettimeofday(agent_id: u16, tv_ptr: u64, tz_ptr: u64) -> i64 {
 
 /// getitimer(int which, struct itimerval *curr_value)
 ///
-/// Deterministic stub: returns zeroed timer (no active timers).
-pub fn sys_getitimer(agent_id: u16, _which: u64, curr_value_ptr: u64) -> i64 {
+pub fn sys_getitimer(agent_id: u16, which: u64, curr_value_ptr: u64) -> i64 {
     if curr_value_ptr == 0 {
         return -EFAULT;
     }
-    // itimerval = two timevals (it_interval + it_value) = 32 bytes total
-    if !copy_to_user(agent_id, curr_value_ptr, &[0u8; 32]) {
+    let Some(index) = itimer_index(which) else {
+        return -EINVAL;
+    };
+    let owner = process_timer_owner(agent_id);
+    let now = timer::get_ticks();
+    let Some(st) = state::get_state(owner) else {
+        return -EINVAL;
+    };
+    let it = st.itimers[index];
+    if !write_itimerval(
+        agent_id,
+        curr_value_ptr,
+        it.interval_ticks,
+        remaining_timer_ticks(&it, now),
+    ) {
         return -EFAULT;
     }
     0
@@ -315,20 +471,214 @@ pub fn sys_getitimer(agent_id: u16, _which: u64, curr_value_ptr: u64) -> i64 {
 
 /// setitimer(int which, const struct itimerval *new, struct itimerval *old)
 ///
-/// Deterministic stub: no-op, writes zeroed old value if requested.
-pub fn sys_setitimer(agent_id: u16, _which: u64, new_value_ptr: u64, old_value_ptr: u64) -> i64 {
-    if new_value_ptr != 0 && read_timespec(agent_id, new_value_ptr).is_none() {
+pub fn sys_setitimer(agent_id: u16, which: u64, new_value_ptr: u64, old_value_ptr: u64) -> i64 {
+    let Some(index) = itimer_index(which) else {
+        return -EINVAL;
+    };
+    let owner = process_timer_owner(agent_id);
+    let now = timer::get_ticks();
+    let new_timer = if new_value_ptr != 0 {
+        match read_itimerval(agent_id, new_value_ptr) {
+            Some(v) => Some(v),
+            None => return -EFAULT,
+        }
+    } else {
+        None
+    };
+
+    let Some(st) = state::get_state_mut(owner) else {
+        return -EINVAL;
+    };
+    let old = st.itimers[index];
+    if old_value_ptr != 0
+        && !write_itimerval(
+            agent_id,
+            old_value_ptr,
+            old.interval_ticks,
+            remaining_timer_ticks(&old, now),
+        )
+    {
         return -EFAULT;
     }
-    if old_value_ptr != 0 && !copy_to_user(agent_id, old_value_ptr, &[0u8; 32]) {
-        return -EFAULT;
+
+    if let Some((interval_ticks, value_ticks)) = new_timer {
+        st.itimers[index].interval_ticks = interval_ticks;
+        st.itimers[index].deadline_tick = if value_ticks == 0 {
+            0
+        } else {
+            now.saturating_add(value_ticks)
+        };
     }
     0
 }
 
 /// alarm(unsigned int seconds)
 ///
-/// Deterministic stub: returns 0 (no previous alarm).
-pub fn sys_alarm(_agent_id: u16, _seconds: u32) -> i64 {
+pub fn sys_alarm(agent_id: u16, seconds: u32) -> i64 {
+    let owner = process_timer_owner(agent_id);
+    let now = timer::get_ticks();
+    let Some(st) = state::get_state_mut(owner) else {
+        return -EINVAL;
+    };
+    let old = st.itimers[ITIMER_REAL as usize];
+    let remaining = remaining_timer_ticks(&old, now);
+    st.itimers[ITIMER_REAL as usize].interval_ticks = 0;
+    st.itimers[ITIMER_REAL as usize].deadline_tick = if seconds == 0 {
+        0
+    } else {
+        now.saturating_add((seconds as u64).saturating_mul(100))
+    };
+    remaining.div_ceil(100) as i64
+}
+
+// ── timerfd ────────────────────────────────────────────────────────────────
+
+fn timerfd_handle(entry: &FdEntry) -> Option<u16> {
+    (entry.kind == FdKind::TimerFd).then_some(entry.keyspace_key as u16)
+}
+
+pub fn sys_timerfd_create(agent_id: u16, clockid: i32, flags: i32) -> i64 {
+    let flags = flags as u32;
+    let supported_flags = O_CLOEXEC | O_NONBLOCK;
+    if clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC {
+        return -EINVAL;
+    }
+    if flags & !supported_flags != 0 {
+        return -EINVAL;
+    }
+
+    let handle = match state::alloc_timerfd() {
+        Some(handle) => handle,
+        None => return -EMFILE,
+    };
+
+    let st = match state::get_files_state_mut(agent_id) {
+        Some(s) => s,
+        None => {
+            state::release_fd_resources(&FdEntry {
+                kind: FdKind::TimerFd,
+                keyspace_key: handle as u64,
+                keyspace_id: 0,
+                mailbox_id: 0,
+                offset: 0,
+                flags,
+                active: true,
+            });
+            return -EBADF;
+        }
+    };
+
+    let fd = match st.alloc_fd() {
+        Some(f) => f,
+        None => {
+            state::release_fd_resources(&FdEntry {
+                kind: FdKind::TimerFd,
+                keyspace_key: handle as u64,
+                keyspace_id: 0,
+                mailbox_id: 0,
+                offset: 0,
+                flags,
+                active: true,
+            });
+            return -EMFILE;
+        }
+    };
+
+    st.fd_table[fd] = Some(FdEntry {
+        kind: FdKind::TimerFd,
+        keyspace_key: handle as u64,
+        keyspace_id: 0,
+        mailbox_id: 0,
+        offset: 0,
+        flags,
+        active: true,
+    });
+    if let Some(entry) = st.fd_table[fd].as_ref() {
+        state::retain_fd_resources(entry);
+    }
+    fd as i64
+}
+
+pub fn sys_timerfd_settime(
+    agent_id: u16,
+    fd: i32,
+    flags: i32,
+    new_value_ptr: u64,
+    old_value_ptr: u64,
+) -> i64 {
+    let flags = flags as u32;
+    if flags & !TIMER_ABSTIME != 0 {
+        return -EINVAL;
+    }
+    if new_value_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let Some((interval_ticks, value_ticks)) = read_itimerspec(agent_id, new_value_ptr) else {
+        return -EFAULT;
+    };
+
+    let st = match state::get_files_state(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
+    };
+    let handle = match st.get_fd(fd).and_then(timerfd_handle) {
+        Some(handle) => handle,
+        None => return -EBADF,
+    };
+
+    let now = timer::get_ticks();
+    let Some((old_interval, old_deadline, old_expirations)) = state::timerfd_state(handle) else {
+        return -EBADF;
+    };
+    if old_value_ptr != 0 {
+        let remaining = if old_expirations > 0 || old_deadline == 0 || old_deadline <= now {
+            0
+        } else {
+            old_deadline - now
+        };
+        if !write_itimerspec(agent_id, old_value_ptr, old_interval, remaining) {
+            return -EFAULT;
+        }
+    }
+
+    let deadline_tick = if value_ticks == 0 {
+        0
+    } else if flags & TIMER_ABSTIME != 0 {
+        value_ticks
+    } else {
+        now.saturating_add(value_ticks)
+    };
+    if !state::timerfd_arm(handle, interval_ticks, deadline_tick) {
+        return -EBADF;
+    }
+    0
+}
+
+pub fn sys_timerfd_gettime(agent_id: u16, fd: i32, curr_value_ptr: u64) -> i64 {
+    if curr_value_ptr == 0 {
+        return -EFAULT;
+    }
+
+    let st = match state::get_files_state(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
+    };
+    let handle = match st.get_fd(fd).and_then(timerfd_handle) {
+        Some(handle) => handle,
+        None => return -EBADF,
+    };
+    let now = timer::get_ticks();
+    let Some((interval_ticks, deadline_tick, expirations)) = state::timerfd_state(handle) else {
+        return -EBADF;
+    };
+    let remaining = if expirations > 0 || deadline_tick == 0 || deadline_tick <= now {
+        0
+    } else {
+        deadline_tick - now
+    };
+    if !write_itimerspec(agent_id, curr_value_ptr, interval_ticks, remaining) {
+        return -EFAULT;
+    }
     0
 }

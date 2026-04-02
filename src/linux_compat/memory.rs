@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use super::constants::{EBADF, EEXIST, EINVAL, ENOMEM};
 use super::state::{self, get_state, get_state_mut, LinuxAgentState, VmaEntry, VmaKind};
 use crate::agent;
@@ -23,6 +24,9 @@ const MAP_PRIVATE: u32 = 0x02;
 const MAP_FIXED: u32 = 0x10;
 const MAP_ANONYMOUS: u32 = 0x20;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
+const MREMAP_MAYMOVE: u64 = 0x1;
+const MREMAP_FIXED: u64 = 0x2;
+const MREMAP_DONTUNMAP: u64 = 0x4;
 
 // ── mprotect / mmap prot constants ─────────────────────────────────────────
 
@@ -35,6 +39,9 @@ const PROT_EXEC: u32 = 0x4;
 
 const MADV_NORMAL: u32 = 0;
 const MADV_DONTNEED: u32 = 4;
+const MS_ASYNC: u64 = 0x1;
+const MS_INVALIDATE: u64 = 0x2;
+const MS_SYNC: u64 = 0x4;
 
 // ── Deterministic mmap base ────────────────────────────────────────────────
 
@@ -178,6 +185,30 @@ fn range_is_free(state: &LinuxAgentState, start: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+fn range_is_free_except(state: &LinuxAgentState, start: u64, len: u64, except_idx: usize) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    for (idx, vma) in state.vmas.iter().enumerate() {
+        if idx == except_idx || !vma.active {
+            continue;
+        }
+        if ranges_overlap(start, end, vma.start, vma.end()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn find_exact_vma_index(state: &LinuxAgentState, start: u64, len: u64) -> Option<usize> {
+    state
+        .vmas
+        .iter()
+        .enumerate()
+        .find(|(_, vma)| vma.active && vma.start == start && vma.len == len)
+        .map(|(idx, _)| idx)
 }
 
 fn same_vma_shape(a: &VmaEntry, b: &VmaEntry) -> bool {
@@ -418,6 +449,34 @@ fn debug_dump_vmas(agent_id: u16, state: &LinuxAgentState, label: &str) {
 
 fn read_file_slice(keyspace: u16, key: u64, offset: usize, dst: &mut [u8]) -> usize {
     crate::state::load_file_range(keyspace, key, offset, dst)
+}
+
+fn write_file_slice(keyspace: u16, key: u64, offset: usize, src: &[u8]) -> Result<(), i64> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if keyspace == super::vfs::BASE_IMAGE_KEYSPACE {
+        return Err(-EINVAL);
+    }
+
+    let end = offset.checked_add(src.len()).ok_or(-EINVAL)?;
+    let current_len = crate::state::query_file_size(keyspace, key);
+    let mut file_data = Vec::new();
+    if current_len != 0 {
+        file_data.resize(current_len, 0);
+        let loaded = crate::state::load_file_range(keyspace, key, 0, &mut file_data);
+        file_data.truncate(loaded);
+    }
+    if end > file_data.len() {
+        file_data.resize(end, 0);
+    }
+    file_data[offset..end].copy_from_slice(src);
+
+    if file_data.len() <= crate::state::MAX_VALUE_SIZE {
+        crate::state::state_put(keyspace, key, &file_data)
+    } else {
+        crate::state::store_multi_segment(keyspace, key, &file_data)
+    }
 }
 
 fn fault_access_allowed(vma: &VmaEntry, error_code: u64) -> bool {
@@ -789,6 +848,83 @@ fn debug_dump_page_bytes(agent_id: u16, cr3: u64, label: &str, vaddr: u64) {
     );
 }
 
+fn unmap_and_release_range(cr3: u64, start: u64, len: u64) {
+    let page_count = (len / PAGE_SIZE as u64) as usize;
+    for i in 0..page_count {
+        let page_vaddr = start + (i as u64) * PAGE_SIZE as u64;
+        if let Some(pte) = page_table::leaf_pte(cr3, page_vaddr) {
+            let phys = pte.phys_addr();
+            page_table::unmap_leaf(cr3, page_vaddr);
+            page_table::invalidate(page_vaddr);
+            if phys != 0 {
+                let _ = release_frame(phys);
+            }
+        }
+    }
+}
+
+fn move_leaf_range(
+    cr3: u64,
+    old_addr: u64,
+    new_addr: u64,
+    move_len: u64,
+    prot: u32,
+) -> Result<(), i64> {
+    let page_count = (move_len / PAGE_SIZE as u64) as usize;
+    let mut mapped = 0usize;
+    for i in 0..page_count {
+        let src = old_addr + (i as u64) * PAGE_SIZE as u64;
+        let dst = new_addr + (i as u64) * PAGE_SIZE as u64;
+        let Some(pte) = page_table::leaf_pte(cr3, src) else {
+            continue;
+        };
+        let phys = pte.phys_addr();
+        let result = if phys == 0 && pte.is_soft_reserved() {
+            page_table::map_reserved_leaf(cr3, dst).map_err(|_| -ENOMEM)
+        } else if phys != 0 {
+            page_table::map_leaf(cr3, dst, phys, prot_to_pte_flags(prot)).map_err(|_| -ENOMEM)
+        } else {
+            Ok(())
+        };
+        if let Err(err) = result {
+            for rollback in 0..mapped {
+                let rb_dst = new_addr + (rollback as u64) * PAGE_SIZE as u64;
+                page_table::unmap_leaf(cr3, rb_dst);
+                page_table::invalidate(rb_dst);
+            }
+            return Err(err);
+        }
+        mapped += 1;
+    }
+
+    for i in 0..page_count {
+        let src = old_addr + (i as u64) * PAGE_SIZE as u64;
+        if page_table::leaf_pte(cr3, src).is_some() {
+            page_table::unmap_leaf(cr3, src);
+            page_table::invalidate(src);
+        }
+    }
+    Ok(())
+}
+
+fn choose_mremap_target(
+    state: &mut LinuxAgentState,
+    len: u64,
+    exclude_idx: usize,
+) -> Result<u64, i64> {
+    let mut candidate = state.mmap_next.max(MMAP_BASE);
+    loop {
+        if range_is_free_except(state, candidate, len, exclude_idx) {
+            state.mmap_next = candidate.saturating_add(len);
+            return Ok(candidate);
+        }
+        candidate = candidate.saturating_add(PAGE_SIZE as u64);
+        if candidate >= (1u64 << 47) {
+            return Err(-ENOMEM);
+        }
+    }
+}
+
 fn debug_dump_mapped_rela(agent_id: u16, cr3: u64, key: u64, base: u64, image: &[u8]) {
     let Ok(elf) = crate::loader::parse_elf64(image) else {
         return;
@@ -998,6 +1134,215 @@ pub fn sys_mmap(
         crate::serial_println!("[PYDBG] mmap-exit agent={} ret={:#x}", agent_id, vaddr);
     }
     vaddr as i64
+}
+
+// ── sys_mremap ─────────────────────────────────────────────────────────────
+
+pub fn sys_mremap(
+    agent_id: u16,
+    old_addr: u64,
+    old_size: u64,
+    new_size: u64,
+    flags: u64,
+    new_addr: u64,
+) -> i64 {
+    if old_size == 0 || new_size == 0 || old_addr & (PAGE_SIZE as u64 - 1) != 0 {
+        return -EINVAL;
+    }
+    if flags & MREMAP_DONTUNMAP != 0 {
+        return -EINVAL;
+    }
+    if flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0 {
+        return -EINVAL;
+    }
+
+    let cr3 = match get_agent_cr3(agent_id) {
+        Some(c) => c,
+        None => return -EINVAL,
+    };
+    let old_len = page_align_up(old_size);
+    let new_len = page_align_up(new_size);
+    let vm_owner = vm_owner_agent_id(agent_id);
+
+    let old_vma = {
+        let Some(state) = get_state(vm_owner) else {
+            return -EINVAL;
+        };
+        let Some(idx) = find_exact_vma_index(state, old_addr, old_len) else {
+            return -EINVAL;
+        };
+        state.vmas[idx]
+    };
+
+    if old_len == new_len {
+        return old_addr as i64;
+    }
+
+    if new_len < old_len {
+        let tail = old_addr + new_len;
+        return if sys_munmap(agent_id, tail, old_len - new_len) == 0 {
+            old_addr as i64
+        } else {
+            -EINVAL
+        };
+    }
+
+    let grow_by = new_len - old_len;
+    if let Some(state) = get_state_mut(vm_owner) {
+        if let Some(idx) = find_exact_vma_index(state, old_addr, old_len) {
+            if range_is_free_except(state, old_addr + old_len, grow_by, idx) {
+                let mut grown = old_vma;
+                grown.len = new_len;
+                if let Err(err) = replace_vma_slot(state, idx, grown) {
+                    return err;
+                }
+                return old_addr as i64;
+            }
+        }
+    }
+
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -ENOMEM;
+    }
+
+    let target = if flags & MREMAP_FIXED != 0 {
+        if new_addr & (PAGE_SIZE as u64 - 1) != 0 {
+            return -EINVAL;
+        }
+        let old_end = old_addr + old_len;
+        let new_end = new_addr + new_len;
+        if ranges_overlap(old_addr, old_end, new_addr, new_end) && new_addr != old_addr {
+            return -EINVAL;
+        }
+        let _ = sys_munmap(agent_id, new_addr, new_len);
+        new_addr
+    } else {
+        let Some(state) = get_state_mut(vm_owner) else {
+            return -EINVAL;
+        };
+        let Some(idx) = find_exact_vma_index(state, old_addr, old_len) else {
+            return -EINVAL;
+        };
+        match choose_mremap_target(state, new_len, idx) {
+            Ok(addr) => addr,
+            Err(err) => return err,
+        }
+    };
+
+    {
+        let Some(state) = get_state_mut(vm_owner) else {
+            return -EINVAL;
+        };
+        let Some(idx) = find_exact_vma_index(state, old_addr, old_len) else {
+            return -EINVAL;
+        };
+        if !range_is_free_except(state, target, new_len, idx) {
+            return -ENOMEM;
+        }
+    }
+
+    let move_len = core::cmp::min(old_len, new_len);
+    if let Err(err) = move_leaf_range(cr3, old_addr, target, move_len, old_vma.prot) {
+        return err;
+    }
+    if old_len > move_len {
+        unmap_and_release_range(cr3, old_addr + move_len, old_len - move_len);
+    }
+
+    let Some(state) = get_state_mut(vm_owner) else {
+        return -EINVAL;
+    };
+    let Some(idx) = find_exact_vma_index(state, old_addr, old_len) else {
+        return -EINVAL;
+    };
+    let mut moved = old_vma;
+    moved.start = target;
+    moved.len = new_len;
+    if let Err(err) = replace_vma_slot(state, idx, moved) {
+        return err;
+    }
+    merge_adjacent_vmas(state);
+    target as i64
+}
+
+// ── sys_msync ─────────────────────────────────────────────────────────────
+
+pub fn sys_msync(agent_id: u16, addr: u64, length: u64, flags: u64) -> i64 {
+    if addr & (PAGE_SIZE as u64 - 1) != 0 {
+        return -EINVAL;
+    }
+    let supported = MS_ASYNC | MS_SYNC | MS_INVALIDATE;
+    if flags & !supported != 0 {
+        return -EINVAL;
+    }
+    let sync_mode = flags & (MS_ASYNC | MS_SYNC);
+    if sync_mode == (MS_ASYNC | MS_SYNC) {
+        return -EINVAL;
+    }
+    if length == 0 {
+        return 0;
+    }
+
+    let cr3 = match get_agent_cr3(agent_id) {
+        Some(c) => c,
+        None => return -EINVAL,
+    };
+    let aligned_len = page_align_up(length);
+    let vm_owner = vm_owner_agent_id(agent_id);
+    let state = match get_state(vm_owner) {
+        Some(s) => s,
+        None => return -EINVAL,
+    };
+    if !range_fully_covered(state, addr, aligned_len) {
+        return -ENOMEM;
+    }
+
+    let Some(end) = addr.checked_add(aligned_len) else {
+        return -EINVAL;
+    };
+    let mut needs_persist = false;
+    for vma in state.vmas.iter().copied().filter(|vma| vma.active) {
+        let overlap_start = core::cmp::max(vma.start, addr);
+        let overlap_end = core::cmp::min(vma.end(), end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if vma.kind != VmaKind::File || (vma.flags & MAP_SHARED) == 0 {
+            continue;
+        }
+        if vma.keyspace_id == super::vfs::BASE_IMAGE_KEYSPACE {
+            continue;
+        }
+
+        let mut page = overlap_start & !(PAGE_SIZE as u64 - 1);
+        while page < overlap_end {
+            let Some(phys) = page_table::mapped_phys(cr3, page) else {
+                page += PAGE_SIZE as u64;
+                continue;
+            };
+            let chunk_start = core::cmp::max(page, overlap_start);
+            let chunk_end = core::cmp::min(page + PAGE_SIZE as u64, overlap_end);
+            let page_offset = chunk_start.saturating_sub(page) as usize;
+            let chunk_len = (chunk_end - chunk_start) as usize;
+            let file_offset = vma.file_offset as usize + (chunk_start - vma.start) as usize;
+            let src = unsafe {
+                core::slice::from_raw_parts(
+                    (paging::phys_to_virt(phys) + page_offset) as *const u8,
+                    chunk_len,
+                )
+            };
+            if let Err(err) = write_file_slice(vma.keyspace_id, vma.keyspace_key, file_offset, src) {
+                return err;
+            }
+            needs_persist = true;
+            page += PAGE_SIZE as u64;
+        }
+    }
+
+    if needs_persist {
+        crate::persist::save_state_to_disk();
+    }
+    0
 }
 
 // ── sys_munmap ─────────────────────────────────────────────────────────────

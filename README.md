@@ -98,7 +98,7 @@ cd tos
 make run
 ```
 
-The default QEMU launch now uses `512M` of guest RAM. Override it with
+The default QEMU launch now uses `1024M` of guest RAM. Override it with
 `QEMU_MEMORY=<size>` if you need a different setting.
 
 ### Optional Linux Runtime Payloads

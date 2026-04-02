@@ -37,8 +37,21 @@ typedef unsigned int u32;
 
 #define PR_SET_NAME 15
 #define PR_GET_NAME 16
+#define PR_GET_DUMPABLE 3
+#define PR_SET_DUMPABLE 4
+#define PR_GET_KEEPCAPS 7
+#define PR_SET_KEEPCAPS 8
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
 
 #define FUTEX_WAIT 0
+#define FUTEX_WAKE_OP 5
+#define FUTEX_OP_SET 0
+#define FUTEX_OP_ADD 1
+#define FUTEX_OP_CMP_EQ 0
+
+#define FUTEX_OP(op, oparg, cmp, cmparg) \
+    (((op & 0xfU) << 28) | ((cmp & 0xfU) << 24) | (((oparg) & 0xfffU) << 12) | ((cmparg) & 0xfffU))
 
 #define RLIMIT_STACK 3
 #define RLIMIT_NOFILE 7
@@ -99,6 +112,18 @@ static i64 sys_prctl(u64 option, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
 
 static i64 sys_futex(u32 *uaddr, u32 op, u32 val, const void *timeout) {
     return sys_call6(SYS_FUTEX, (u64)uaddr, op, val, (u64)timeout, 0, 0);
+}
+
+static i64 sys_futex_wake_op(u32 *uaddr, u32 wake_count, u32 wake_count2, u32 *uaddr2, u32 encoded) {
+    return sys_call6(
+        SYS_FUTEX,
+        (u64)uaddr,
+        FUTEX_WAKE_OP,
+        wake_count,
+        wake_count2,
+        (u64)uaddr2,
+        encoded
+    );
 }
 
 static i64 sys_prlimit64(i64 pid, u32 resource, const void *new_limit, void *old_limit) {
@@ -183,6 +208,7 @@ void _start(void) {
     struct rlimit64 old_stack = {0, 0};
     struct rlimit64 new_limit = {123, 456};
     u32 futex_word = 1;
+    u32 futex_op_word = 3;
     u32 wstatus = 0;
     i64 self_tid = sys_gettid();
 
@@ -208,6 +234,18 @@ void _start(void) {
     check("prctl(PR_SET_NAME)", sys_prctl(PR_SET_NAME, (u64)set_name, 0, 0, 0) == 0);
     check("prctl(PR_GET_NAME)", sys_prctl(PR_GET_NAME, (u64)get_name, 0, 0, 0) == 0);
     check("prctl(PR_GET_NAME) matches", streq(get_name, "tls-probe"));
+    check("prctl(PR_GET_DUMPABLE) default=1", sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
+    check("prctl(PR_SET_DUMPABLE,0)", sys_prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0);
+    check("prctl(PR_GET_DUMPABLE)=0", sys_prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 0);
+    check("prctl(PR_SET_DUMPABLE,1)", sys_prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == 0);
+    check("prctl(PR_GET_KEEPCAPS) default=0", sys_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 0);
+    check("prctl(PR_SET_KEEPCAPS,1)", sys_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) == 0);
+    check("prctl(PR_GET_KEEPCAPS)=1", sys_prctl(PR_GET_KEEPCAPS, 0, 0, 0, 0) == 1);
+    check("prctl(PR_GET_NO_NEW_PRIVS) default=0", sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 0);
+    check("prctl(PR_SET_NO_NEW_PRIVS,1)", sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
+    check("prctl(PR_GET_NO_NEW_PRIVS)=1", sys_prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) == 1);
+    check("prctl(PR_SET_NO_NEW_PRIVS,0) -> EINVAL", sys_prctl(PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0) == -EINVAL);
+    check("prctl(unknown) -> EINVAL", sys_prctl(0xfeed, 0, 0, 0, 0) == -EINVAL);
     check("uname(NULL) -> EFAULT", sys_uname((void *)0) == -EFAULT);
     check("uname()", sys_uname(utsname) == 0);
     check("uname.sysname == Linux", streq_field(&utsname[0], "Linux"));
@@ -220,6 +258,16 @@ void _start(void) {
     check("prlimit64(invalid new ptr) -> EFAULT", sys_prlimit64(0, RLIMIT_NOFILE, (void *)1, (void *)0) == -EFAULT);
     check("prlimit64(invalid old ptr) -> EFAULT", sys_prlimit64(0, RLIMIT_NOFILE, (void *)0, (void *)1) == -EFAULT);
     check("futex WAIT invalid timeout -> EFAULT", sys_futex(&futex_word, FUTEX_WAIT, 1, (void *)1) == -EFAULT);
+    check(
+        "futex WAKE_OP updates uaddr2",
+        sys_futex_wake_op(
+            &futex_word,
+            1,
+            1,
+            &futex_op_word,
+            FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 3)
+        ) == 0 && futex_op_word == 4
+    );
 
     u64 child_stack_top = ((u64)(child_stack + sizeof(child_stack)) & ~0xFUL);
     i64 clone_ret;
