@@ -5,18 +5,24 @@
 **Language:** English
 **Purpose:** Implementation reference for building TOS — a hardware-level deterministic execution VM.
 
-> **Implementation Status (Stage-1):** All Phase 0–6 objectives are complete. See `[IMPL]` markers throughout this document for per-item status. Last verified: 2026-03-22.
+> **Implementation Status:** Stages 1–10 are structurally implemented. See `[IMPL]` markers throughout this document for per-item status. Last verified: 2026-04-03.
+>
+> **Known gaps (verified by code audit 2026-04-03):**
+> - Stage-5: `StateTransaction` (atomic multi-key commit/rollback) is NOT implemented. Only single-key put/get exists in `state.rs`.
+> - Stage-6: Package signing in `atp` CLI uses FNV-1a hash, NOT Ed25519. Deploy trust is not cryptographically sound.
+> - Stage-8: WASM host bindings are incomplete. Only 6 basic functions (yield, send, recv, exit, energy_get, log). Missing: `state_get`, `state_put`, `state_delete`, `contract_call`. Contracts cannot access persistent state or call other contracts through the WASM ABI.
+> - See `TODO-proof-contract-platform.md` for the plan to close these gaps.
 
 ---
 
 ## Abstract
 
-TOS is a **hardware-level deterministic execution virtual machine**. It runs directly on x86_64 hardware (or QEMU), providing isolated, metered, verifiable execution for smart contracts, JVM programs, and WASM modules — without relying on any host operating system.
+TOS is a **hardware-level deterministic execution virtual machine**. It runs directly on x86_64 hardware (or QEMU), providing isolated, metered, verifiable execution for smart contracts and WASM modules — without relying on any host operating system. Linux x86_64 programs (including JVM and Node.js) can also run via the deterministic Linux compatibility layer.
 
 TOS is **not** an operating system in the traditional sense. It is a bare-metal execution substrate comparable to:
 
 * **EVM** — but running on real hardware instead of inside a blockchain node process
-* **JVM** — but with deterministic execution, energy metering, and cryptographic state proofs
+* **JVM/Node.js** — but running via Linux compat layer with deterministic execution, energy metering, and cryptographic state proofs
 * **A hardware security module** — but programmable, auditable, and verifiable
 
 The core promise of TOS is:
@@ -39,7 +45,7 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 
 * **TOS** — the full system.
 * **TOS-0** — the privileged kernel substrate: boot, memory, traps, syscalls, scheduling, mailbox IPC, capability enforcement, energy accounting, audit.
-* **TOS-1** — the runtime host layer: WASM engine, deterministic Linux compatibility layer.
+* **TOS-1** — the runtime host layer: WASM engine, native runtime, deterministic Linux compatibility layer.
 * **TOS-2** — the contract and system-service layer: deployed contracts, stated, policyd, netd.
 
 ---
@@ -78,10 +84,10 @@ Its first-class concepts are:
 
 | Traditional VM | TOS Equivalent | Advantage |
 |---|---|---|
-| EVM (Ethereum) | TOS with WASM/JVM runtimes | Runs on hardware, not inside a process; multi-language; richer state model |
+| EVM (Ethereum) | TOS with WASM + Linux compat | Runs on hardware, not inside a process; multi-language; richer state model |
 | JVM (on Linux) | TOS with Linux compat layer | Runs unmodified OpenJDK deterministically via syscall translation |
 | Docker/VM isolation | TOS per-contract page tables | Hardware-enforced isolation at the page table level, not process-level |
-| Gas metering (EVM) | TOS energy budget | Unified across WASM, JVM, native; tick-based preemption, no per-opcode overhead |
+| Gas metering (EVM) | TOS energy budget | Unified across WASM, native, Linux-compat; tick-based preemption, no per-opcode overhead |
 
 ### The Execution Model
 
@@ -278,7 +284,7 @@ Make contract storage durable, versioned, provable, and crash-recoverable.
 
 **Core Capabilities**
 - versioned keyspaces with monotonic version counter and root history `[IMPL: ✅ state.rs]`
-- transactional mutation groups (atomic multi-key updates with rollback) `[IMPL: ✅ StateTransaction]`
+- transactional mutation groups (atomic multi-key updates with rollback) `[IMPL: ❌ NOT IMPLEMENTED — only single-key put/get exists; StateTransaction type does not exist]`
 - Merkle proofs against current and historical state roots `[IMPL: ✅ proof.rs + merkle.rs]`
 - compaction and garbage collection (bounded storage growth) `[IMPL: ✅ agents/compactd.rs]`
 - crash recovery with CRC-validated append-only log `[IMPL: ✅ persist.rs]`
@@ -307,7 +313,7 @@ Make contracts deployable, addressable, composable, and upgradable artifacts.
 - **Contract addressing**: each deployed contract has a unique content-addressed ID `[IMPL: ✅ contract.rs ContractId]`
 - **Inter-contract calls**: Contract A sends mailbox message to Contract B, receives response (synchronous RPC pattern) `[IMPL: ✅ contract_call.rs]`
 - **Upgrade/rollback**: checkpoint old → deploy new → migrate state → verify → terminate old `[IMPL: ⚠️ checkpoint exists, upgrade flow is stub]`
-- **Signature verification**: deployment requires valid publisher signature `[IMPL: ⚠️ atp signs with FNV-1a, not Ed25519]`
+- **Signature verification**: deployment requires valid publisher signature `[IMPL: ❌ atp signs with FNV-1a hash, NOT Ed25519 — not cryptographically sound; must be replaced before production use]`
 - **atp CLI tool**: build, sign, deploy, inspect, list, upgrade, rollback, verify `[IMPL: ✅ tools/atp/]`
 
 **Inter-Contract Call Model**
@@ -415,7 +421,7 @@ Provide a production-grade WASM execution engine as the primary contract runtime
 The self-built WASM interpreter provides:
 - 100% WASM MVP spec compliance
 - Built-in fuel metering (1 WASM fuel = 1 TOS energy)
-- Type-safe host bindings for TOS syscalls
+- Type-safe host bindings for TOS syscalls `[IMPL: ⚠️ PARTIAL — only 6 basic functions (yield, send, recv, exit, energy_get, log). Missing: state_get, state_put, state_delete, contract_call. Contracts cannot access persistent state or call other contracts through the WASM ABI.]`
 - `#![no_std]` — runs as native TOS agent
 - Deterministic execution (ideal for verifiable computation)
 - 64 KB chunked code loading from keyspace
@@ -426,6 +432,8 @@ Any language that compiles to WASM runs on TOS: Rust, C, C++, Go, Zig, AssemblyS
 
 **Success Condition**
 Any WASM module runs on TOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
+
+`[IMPL: ⚠️ WASM execution and fuel metering work. Selector dispatch works. But WASM contracts cannot do real blockchain work because state access and inter-contract call host functions are not yet exposed. See TODO-proof-contract-platform.md Phase 1.]`
 
 #### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ✅ Complete — 104 syscalls, 67/67 tests pass in QEMU]`
 
@@ -914,7 +922,7 @@ Stage-10: runtime depth for real-world binaries (dynamic linking, threads, signa
 
 ### One-Sentence Definition
 
-**TOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. Any Linux x86_64 program, including dynamically-linked runtimes like OpenJDK and Node.js, can run on TOS with deterministic guarantees through the 104-syscall Linux compatibility layer.**
+**TOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. WASM contracts run with proof-grade determinism (bit-identical replay). Linux x86_64 programs, including dynamically-linked runtimes like OpenJDK and Node.js, can also run on TOS with scheduling-level deterministic guarantees through the 104-syscall Linux compatibility layer.**
 
 ---
 
@@ -930,7 +938,7 @@ The original intent of TOS is:
 * to make **authority explicit** through capabilities and policy, rather than ambient privilege
 * to make **contract storage, energy budgeting, and auditability** first-class system concepts
 * to prefer **deterministic, replayable execution** over convenience inherited from legacy APIs
-* to support **multiple execution formats** (WASM, JVM, native) under one unified metering and verification model
+* to support **multiple execution formats** (WASM, native, Linux-compat) under one unified metering and verification model
 * to validate this model first in **QEMU**, then expand to real hardware
 
 In practical terms, TOS is centered on:
@@ -958,7 +966,7 @@ It is intentionally not centered on:
 
 ### 1.1 The Problem with Software VMs
 
-Current execution VMs (EVM, JVM, WASM runtimes) run **inside** a host operating system process. This means:
+Current execution VMs (EVM, WASM runtimes) run **inside** a host operating system process. This means:
 
 * isolation depends on the host OS process model (which was designed for human users, not deterministic execution)
 * metering is approximate (wall-clock time) or requires per-opcode instrumentation (EVM gas)
@@ -982,7 +990,7 @@ TOS eliminates the host OS entirely. The execution VM **is** the operating syste
 | Metering | Per-opcode gas | None (wall-clock) | Timer-tick energy (unified) |
 | Determinism | Full | No | Full (WASM) / Scheduling-level (native) |
 | Verification | Consensus | None | Receipt + Replay + TPM |
-| Languages | Solidity only | Java/Kotlin/Scala | WASM (any) + Java + native |
+| Languages | Solidity only | Java/Kotlin/Scala | WASM (any) + native + Linux binaries via compat layer |
 | Storage | 256-bit slots | Filesystem | Merkle keyspaces |
 | Inter-contract calls | CALL opcode | Method calls | Mailbox IPC |
 | Host OS required | Yes (Linux) | Yes (Linux/Windows) | No (bare metal) |
@@ -998,7 +1006,7 @@ TOS is not designed to replace Linux, Windows, or macOS. It is designed as:
 * a deterministic execution substrate for smart contracts
 * a hardware-level VM for verifiable computation
 * a metered execution environment for untrusted code
-* a multi-runtime platform (WASM, JVM, native)
+* a multi-runtime platform (WASM, native, Linux-compat)
 
 ### 2.2 Minimal kernel, rich execution model
 
@@ -1087,7 +1095,7 @@ The first implementation target of TOS is intentionally narrow.
 ### 4.1 Layer naming
 
 * **TOS-0** — privileged kernel substrate
-* **TOS-1** — runtime host layer (WASM, JVM, native)
+* **TOS-1** — runtime host layer (WASM, native, Linux-compat)
 * **TOS-2** — contract and system-service layer
 
 ### 4.2 Logical architecture
@@ -1100,7 +1108,7 @@ The first implementation target of TOS is intentionally narrow.
 | deployed contracts | stated | policyd | netd      |
 +---------------------------------------------------+
 | TOS-1 Runtime Host                                |
-| WASM engine | Ristretto JVM | native              |
+| WASM engine | Linux compat layer | native          |
 +---------------------------------------------------+
 | TOS-0 Kernel                                      |
 | sched | mailbox | capability | state | audit      |
@@ -1147,7 +1155,7 @@ Contract {
     id,
     parent_id,
     status,
-    runtime_kind,          // Native, WASM, JVM
+    runtime_kind,          // Native, WASM, LinuxCompat
     execution_context,
     runtime_state,
     mailbox_id,
@@ -1165,7 +1173,7 @@ Required properties:
 * message-addressable (via mailbox)
 * capability-scoped
 * budget-limited
-* deterministic (WASM/JVM) or scheduling-deterministic (native)
+* deterministic (WASM — proof-grade) or scheduling-deterministic (native, Linux-compat — replay-grade)
 
 ### 5.2 Mailbox
 
@@ -1254,7 +1262,7 @@ If TOS runs inside Linux, verification depends on trusting Linux — a 30M+ line
 
 ### 6.2 Why not modify an existing VM
 
-EVM is limited to one instruction set. JVM has no built-in metering or state proofs. WASM runtimes lack hardware-level isolation. TOS combines the best properties of all three under one unified kernel.
+EVM is limited to one instruction set. WASM runtimes running inside a host OS lack hardware-level isolation. TOS combines WASM execution with hardware-level isolation, built-in metering, state proofs, and deterministic execution under one unified kernel.
 
 ### 6.3 Why first run in a virtual machine
 
@@ -1307,7 +1315,7 @@ The following components from yellowpaper v1 are **out of scope** for the TOS VM
 | **RustPython** (v1 Stage-11) | RustPython is not mature enough. Python compiles to WASM or runs via Linux compat layer. |
 | **Ristretto JVM** (v1 Stage-11) | Replaced by Linux compat layer — unmodified OpenJDK runs deterministically via syscall translation. |
 | **revm / EVM** (v1 Stage-11) | Removed from scope. |
-| **SP1 zkVM** (v1 Stage-11) | Removed from scope. |
+| **SP1 zkVM** (v1 Stage-11) | Removed from v2 scope. Planned as a future extension: wrap wasbi WASM interpreter as SP1 guest program to produce ZK proofs alongside ExecutionReceipts. See `TODO-proof-contract-platform.md` Phase 4 for format compatibility notes. |
 
 **What is kept from v1 but simplified:**
 
@@ -1366,7 +1374,7 @@ TOS evolves from a minimal kernel into a hardware-level execution VM that extern
 +---------------------------------------------------+
 |       External Systems (via TCP)                  |
 +---------------------------------------------------+
-|    Contracts (WASM / JVM / Native)                |
+|    Contracts (WASM / Native / Linux-compat)        |
 +---------------------------------------------------+
 |    TOS Runtime (scheduler, IPC, caps, metering)  |
 +---------------------------------------------------+
@@ -1380,7 +1388,7 @@ TOS evolves from a minimal kernel into a hardware-level execution VM that extern
 
 * A hardware-level deterministic execution VM
 * A bare-metal substrate for smart contracts and verifiable computation
-* A multi-runtime platform (WASM, JVM, native) with unified metering
+* A multi-runtime platform (WASM, native, Linux-compat) with unified metering
 * A system where every execution is isolated, metered, and produces a verifiable receipt
 
 ### 28.2 What TOS Is Not
@@ -1725,11 +1733,13 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 | 2 | Isolation + Runtime | Ring-3, WASM, eBPF-lite, persistent state | ✅ Complete |
 | 3 | Deterministic Execution | Deterministic scheduler, Merkle state, replay | ✅ Complete |
 | 4 | Hardware + TCP Interface | Real hardware, TCP external interface, SDKs | ✅ Complete |
-| 5 | Contract Storage | Versioned keyspaces, transactions, Merkle proofs, crash recovery | ✅ Complete |
-| 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ✅ Complete |
-| 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ Complete |
-| 8 | WASM Runtime | Production WASM engine with fuel metering | ✅ Complete |
+| 5 | Contract Storage | Versioned keyspaces, transactions, Merkle proofs, crash recovery | ⚠️ 90% — atomic multi-key StateTransaction missing |
+| 6 | Package Management | Deploy, address, inter-contract calls, upgrade/rollback | ⚠️ 85% — package signing uses FNV-1a, not Ed25519 |
+| 7 | Verifiable Execution | ExecutionReceipt, Replay/Proof Bundles, TPM | ✅ 95% Complete (TPM untested on real hardware) |
+| 8 | WASM Runtime | Production WASM engine with fuel metering | ⚠️ 80% — WASM host bindings incomplete (no state/contract access) |
 | 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
 | 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ✅ Complete |
 
-**TOS is complete when any Linux program — including dynamically-linked OpenJDK and Node.js — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
+**Next milestone:** Close the three critical gaps in Stages 5, 6, and 8 so that WASM contracts can access persistent state, call other contracts, and deploy with cryptographic trust. See `TODO-proof-contract-platform.md` for the implementation plan.
+
+**TOS is complete when any program — whether WASM, native, or Linux-compatible — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**

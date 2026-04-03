@@ -195,6 +195,15 @@ static int streq_field(const char *field, const char *expect) {
     return field[i] == 0 && expect[i] == 0;
 }
 
+static int load_i32_ne(const unsigned char *p) {
+    return (int)(
+        ((u32)p[0]) |
+        ((u32)p[1] << 8) |
+        ((u32)p[2] << 16) |
+        ((u32)p[3] << 24)
+    );
+}
+
 struct rlimit64 {
     u64 cur;
     u64 max;
@@ -317,9 +326,9 @@ void _start(void) {
         "waitid(P_PID, child, WEXITED|WNOWAIT)",
         sys_waitid(P_PID, (u64)clone_ret, siginfo, WEXITED | WNOWAIT) == 0
     );
-    check("waitid si_signo == SIGCHLD", *(int *)&siginfo[0] == SIGCHLD);
-    check("waitid si_pid == child", *(int *)&siginfo[16] == (int)clone_ret);
-    check("waitid si_status == 0", *(int *)&siginfo[24] == 0);
+    check("waitid si_signo == SIGCHLD", load_i32_ne(&siginfo[0]) == SIGCHLD);
+    check("waitid si_pid == child", load_i32_ne(&siginfo[16]) == (int)clone_ret);
+    check("waitid si_status == 0", load_i32_ne(&siginfo[24]) == 0);
     wait_ret_seen = sys_wait4(clone_ret, &wstatus);
     check("wait4(child)", wait_ret_seen == (i64)parent_tid_seen);
     check("child exit status == 0", (wstatus & 0xff) == 0 && ((wstatus >> 8) & 0xff) == 0);

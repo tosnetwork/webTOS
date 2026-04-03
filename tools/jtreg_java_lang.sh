@@ -119,10 +119,11 @@ TOS_TEST_DISK_MB="$test_disk_mb" tools/create_test_disk.sh "$base_test_image"
 cp "$base_test_image" "$image_path"
 
 qemu_exit=0
+: >"$log_path"
 timeout "$qemu_timeout" \
   stdbuf -o0 -e0 qemu-system-x86_64 \
     -m "$qemu_memory" \
-    -serial stdio \
+    -serial "file:$log_path" \
     -display none \
     -kernel "$kernel_elf32" \
     -device virtio-net-pci,netdev=n0 \
@@ -130,7 +131,7 @@ timeout "$qemu_timeout" \
     -drive "file=$image_path,format=raw,if=ide" \
     -no-reboot \
     -no-shutdown \
-  >"$log_path" 2>&1 || qemu_exit=$?
+  2>>"$log_path" || qemu_exit=$?
 
 if [[ "$qemu_exit" -ne 0 && "$qemu_exit" -ne 124 ]]; then
   echo "[jtreg-lang] qemu failed: exit=$qemu_exit log=$log_path" >&2
