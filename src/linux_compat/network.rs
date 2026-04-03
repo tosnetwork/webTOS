@@ -10,9 +10,19 @@ use crate::agent::MAX_MESSAGE_PAYLOAD;
 
 const O_ACCMODE: u32 = 3;
 const SOL_SOCKET: u64 = 1;
+const SOL_TCP: u64 = 6;
+const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
+const SO_ERROR: u64 = 4;
+const SO_SNDBUF: u64 = 7;
+const SO_RCVBUF: u64 = 8;
+const SO_KEEPALIVE: u64 = 9;
+const SO_REUSEPORT: u64 = 15;
+const SO_ACCEPTCONN: u64 = 30;
 const SO_PROTOCOL: u64 = 38;
 const SO_DOMAIN: u64 = 39;
+const TCP_NODELAY: u64 = 1;
+const DEFAULT_SOCKET_BUFFER_BYTES: u32 = 212_992;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_STREAM: u32 = 1;
 
@@ -221,6 +231,7 @@ fn replay_network_recv(agent_id: u16, buf_ptr: u64, count: u64) -> i64 {
 /// Address family constants.
 const AF_UNIX: i32 = 1;
 const AF_INET: i32 = 2;
+const INADDR_LOOPBACK: u32 = 0x7F00_0001;
 
 /// Sentinel keyspace_key indicating an AF_UNIX socket.
 const AF_UNIX_MARKER: u64 = 0xFFFF_FFFF;
@@ -249,17 +260,80 @@ fn write_sockaddr_to_user(
 }
 
 /// Marker for local socketpair byte-stream endpoints.
-const SOCKETPAIR_STREAM_MARKER: u64 = super::constants::SOCKETPAIR_STREAM_MARKER;
-
 /// Netd's mailbox ID (agent 9).
 const NETD_MAILBOX: u16 = 9;
 
 /// Socket fd flag: listening (set by listen()).
-const FD_FLAG_LISTENING: u32 = 0x0100_0000;
+const FD_FLAG_LISTENING: u32 = SOCKET_FD_FLAG_LISTENING;
 /// Socket fd flag: shutdown read side.
-pub const FD_FLAG_SHUT_RD: u32 = 0x0200_0000;
+pub const FD_FLAG_SHUT_RD: u32 = SOCKET_FD_FLAG_SHUT_RD;
 /// Socket fd flag: shutdown write side.
-pub const FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
+pub const FD_FLAG_SHUT_WR: u32 = SOCKET_FD_FLAG_SHUT_WR;
+/// Socket fd flag: SO_REUSEADDR state.
+const FD_FLAG_REUSEADDR: u32 = SOCKET_FD_FLAG_REUSEADDR;
+/// Socket fd flag: SO_REUSEPORT state.
+const FD_FLAG_REUSEPORT: u32 = SOCKET_FD_FLAG_REUSEPORT;
+/// Socket fd flag: SO_KEEPALIVE state.
+const FD_FLAG_KEEPALIVE: u32 = SOCKET_FD_FLAG_KEEPALIVE;
+/// Socket fd flag: TCP_NODELAY state.
+const FD_FLAG_NODELAY: u32 = SOCKET_FD_FLAG_NODELAY;
+
+fn pack_inet_addr(ip: u32, port: u16) -> u64 {
+    ((ip as u64) << 16) | port as u64
+}
+
+fn unpack_inet_addr(packed_addr: u64) -> (u32, u16) {
+    (
+        ((packed_addr >> 16) & 0xFFFF_FFFF) as u32,
+        (packed_addr & 0xFFFF) as u16,
+    )
+}
+
+fn local_stream_marker(keyspace_key: u64) -> bool {
+    keyspace_key == SOCKETPAIR_STREAM_MARKER || keyspace_key == LOCAL_INET_STREAM_MARKER
+}
+
+fn socket_domain(entry: &FdEntry) -> u32 {
+    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER || entry.keyspace_key == AF_UNIX_MARKER {
+        AF_UNIX as u32
+    } else {
+        AF_INET as u32
+    }
+}
+
+fn read_socket_opt_bool(agent_id: u16, optval_ptr: u64, optlen: u64) -> Result<bool, i64> {
+    if optval_ptr == 0 {
+        return Err(-EFAULT);
+    }
+    if optlen < 4 {
+        return Err(-EINVAL);
+    }
+    let Some(value) = read_user_u32(agent_id, optval_ptr) else {
+        return Err(-EFAULT);
+    };
+    Ok(value != 0)
+}
+
+fn read_sockaddr_in(agent_id: u16, addr_ptr: u64) -> Result<(u16, u16, u32), i64> {
+    let Some(family) = read_user_u16(agent_id, addr_ptr) else {
+        return Err(-EFAULT);
+    };
+    let Some(port_raw) = read_user_u16(agent_id, addr_ptr + 2) else {
+        return Err(-EFAULT);
+    };
+    let Some(ip_raw) = read_user_u32(agent_id, addr_ptr + 4) else {
+        return Err(-EFAULT);
+    };
+    Ok((family, u16::from_be(port_raw), u32::from_be(ip_raw)))
+}
+
+fn sockaddr_in_bytes(ip: u32, port: u16) -> [u8; 16] {
+    let mut addr = [0u8; 16];
+    addr[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+    addr[4..8].copy_from_slice(&ip.to_be_bytes());
+    addr
+}
 
 // ── socket ─────────────────────────────────────────────────────────────────
 
@@ -303,7 +377,7 @@ pub fn sys_socket(agent_id: u16, domain: i32, _sock_type: i32, _protocol: i32) -
 pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64 {
     const ECONNREFUSED: i64 = 111;
 
-    let st = match state::get_files_state_mut(agent_id) {
+    let st = match state::get_files_state(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -323,19 +397,62 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
         return -EFAULT;
     }
 
-    // Read sockaddr_in from user memory: family(u16) + port(u16) + ip(u32)
-    let Some(port_raw) = read_user_u16(agent_id, addr_ptr + 2) else {
+    let Ok((family, port, ip)) = read_sockaddr_in(agent_id, addr_ptr) else {
         return -EFAULT;
     };
-    let Some(ip_raw) = read_user_u32(agent_id, addr_ptr + 4) else {
-        return -EFAULT;
+    if family as i32 != AF_INET {
+        return -EAFNOSUPPORT;
+    }
+
+    let packed = pack_inet_addr(ip, port);
+    let is_loopback = ip == INADDR_LOOPBACK || ip == 0;
+    if is_loopback {
+        let Some(listener_handle) = state::find_local_listener(packed) else {
+            return -ECONNREFUSED;
+        };
+        let Some((client_handle, server_handle)) = state::alloc_unix_stream_pair() else {
+            return -ENOSPC;
+        };
+        if !state::enqueue_local_listener_pending(listener_handle, server_handle) {
+            state::release_unix_stream(client_handle);
+            state::release_unix_stream(server_handle);
+            return -ECONNREFUSED;
+        }
+        if state::trace_runtime_agent(agent_id) {
+            crate::serial_println!(
+                "[RTDBG] local-connect agent={} fd={} ip={}.{}.{}.{} port={} listener={} client_handle={} server_handle={}",
+                agent_id,
+                sockfd,
+                (ip >> 24) & 0xff,
+                (ip >> 16) & 0xff,
+                (ip >> 8) & 0xff,
+                ip & 0xff,
+                port,
+                listener_handle,
+                client_handle,
+                server_handle
+            );
+        }
+
+        let st = match state::get_files_state_mut(agent_id) {
+            Some(s) => s,
+            None => {
+                state::release_unix_stream(client_handle);
+                return -EBADF;
+            }
+        };
+        let entry = st.get_fd_mut(sockfd).unwrap();
+        entry.keyspace_key = LOCAL_INET_STREAM_MARKER;
+        entry.keyspace_id = client_handle;
+        entry.mailbox_id = 0;
+        state::retain_unix_stream(client_handle);
+        return 0;
+    }
+
+    let st = match state::get_files_state_mut(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
     };
-    let port = u16::from_be(port_raw);
-    let ip = u32::from_be(ip_raw);
-
-    // Pack ip:port into keyspace_key — ip in upper 32 bits, port in lower 16
-    let packed = ((ip as u64) << 16) | (port as u64);
-
     let entry = st.get_fd_mut(sockfd).unwrap();
     entry.keyspace_key = packed;
     entry.mailbox_id = NETD_MAILBOX;
@@ -346,35 +463,136 @@ pub fn sys_connect(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> 
 // ── accept ─────────────────────────────────────────────────────────────────
 
 /// accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
-pub fn sys_accept(agent_id: u16, sockfd: i32, _addr_ptr: u64, _addrlen_ptr: u64) -> i64 {
-    let st = match state::get_files_state_mut(agent_id) {
-        Some(s) => s,
-        None => return -EBADF,
-    };
+fn sys_accept_inner(
+    agent_id: u16,
+    sockfd: i32,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    accept_flags: u32,
+) -> i64 {
+    loop {
+        let (socket_marker, listener_handle, socket_flags, listener_addr) = {
+            let st = match state::get_files_state(agent_id) {
+                Some(s) => s,
+                None => return -EBADF,
+            };
+            match st.get_fd(sockfd) {
+                Some(entry) if entry.kind == FdKind::Socket => (
+                    entry.keyspace_key,
+                    entry.keyspace_id,
+                    entry.flags,
+                    if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                        state::local_listener_addr(entry.keyspace_id).unwrap_or(0)
+                    } else {
+                        0
+                    },
+                ),
+                Some(_) => return -ENOTSOCK,
+                None => return -EBADF,
+            }
+        };
 
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {}
-        Some(_) => return -ENOTSOCK,
-        None => return -EBADF,
+        if socket_marker == LOCAL_INET_LISTENER_MARKER {
+            if let Some(server_handle) = state::dequeue_local_listener_pending(listener_handle) {
+                if state::trace_runtime_agent(agent_id) {
+                    crate::serial_println!(
+                        "[RTDBG] local-accept agent={} fd={} listener={} server_handle={} flags=0x{:x}",
+                        agent_id,
+                        sockfd,
+                        listener_handle,
+                        server_handle,
+                        accept_flags
+                    );
+                }
+                let st = match state::get_files_state_mut(agent_id) {
+                    Some(s) => s,
+                    None => {
+                        state::release_unix_stream(server_handle);
+                        return -EBADF;
+                    }
+                };
+                let new_fd = match st.alloc_fd() {
+                    Some(f) => f,
+                    None => {
+                        state::release_unix_stream(server_handle);
+                        return -EMFILE;
+                    }
+                };
+
+                st.fd_table[new_fd] = Some(FdEntry {
+                    kind: FdKind::Socket,
+                    keyspace_key: LOCAL_INET_STREAM_MARKER,
+                    keyspace_id: server_handle,
+                    mailbox_id: 0,
+                    offset: 0,
+                    flags: accept_flags & (O_NONBLOCK | O_CLOEXEC),
+                    active: true,
+                });
+
+                if addr_ptr != 0 && addrlen_ptr != 0 {
+                    let (listener_ip, listener_port) = unpack_inet_addr(listener_addr);
+                    let peer_ip = if listener_ip == 0 {
+                        INADDR_LOOPBACK
+                    } else {
+                        listener_ip
+                    };
+                    let addr = sockaddr_in_bytes(peer_ip, listener_port);
+                    if write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr) < 0 {
+                        st.close_fd(new_fd as i32);
+                        return -EFAULT;
+                    }
+                }
+
+                return new_fd as i64;
+            }
+
+            if (socket_flags & O_NONBLOCK) != 0 || (accept_flags & O_NONBLOCK) != 0 {
+                return -EAGAIN;
+            }
+            if crate::linux_compat::signal::has_unblocked_pending_signal(agent_id) {
+                return -EINTR;
+            }
+            crate::sched::yield_current();
+            continue;
+        }
+
+        let st = match state::get_files_state_mut(agent_id) {
+            Some(s) => s,
+            None => return -EBADF,
+        };
+        let new_fd = match st.alloc_fd() {
+            Some(f) => f,
+            None => return -EMFILE,
+        };
+        st.fd_table[new_fd] = Some(FdEntry {
+            kind: FdKind::Socket,
+            keyspace_key: 0,
+            keyspace_id: 0,
+            mailbox_id: agent_id,
+            offset: 0,
+            flags: accept_flags & (O_NONBLOCK | O_CLOEXEC),
+            active: true,
+        });
+        return new_fd as i64;
     }
+}
 
-    // Allocate a new fd for the accepted connection
-    let new_fd = match st.alloc_fd() {
-        Some(f) => f,
-        None => return -EMFILE,
-    };
+pub fn sys_accept(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u64) -> i64 {
+    sys_accept_inner(agent_id, sockfd, addr_ptr, addrlen_ptr, 0)
+}
 
-    st.fd_table[new_fd] = Some(FdEntry {
-        kind: FdKind::Socket,
-        keyspace_key: 0,
-        keyspace_id: 0,
-        mailbox_id: agent_id,
-        offset: 0,
-        flags: 0,
-        active: true,
-    });
-
-    new_fd as i64
+pub fn sys_accept4(
+    agent_id: u16,
+    sockfd: i32,
+    addr_ptr: u64,
+    addrlen_ptr: u64,
+    flags: u64,
+) -> i64 {
+    let accept_flags = flags as u32;
+    if accept_flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return -EINVAL;
+    }
+    sys_accept_inner(agent_id, sockfd, addr_ptr, addrlen_ptr, accept_flags)
 }
 
 // ── sendto ─────────────────────────────────────────────────────────────────
@@ -397,11 +615,15 @@ pub fn sys_sendto(
         None => return -EBADF,
     };
 
-    let packed_addr = match st.get_fd(sockfd) {
+    let socket_key = match st.get_fd(sockfd) {
         Some(entry) if entry.kind == FdKind::Socket => entry.keyspace_key,
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
     };
+
+    if local_stream_marker(socket_key) {
+        return super::fs::sys_write(agent_id, sockfd, buf_ptr, len);
+    }
 
     if buf_ptr == 0 || len == 0 {
         return 0;
@@ -422,8 +644,8 @@ pub fn sys_sendto(
     }
 
     // Build URL from packed ip:port in keyspace_key
-    let port = (packed_addr & 0xFFFF) as u16;
-    let ip = ((packed_addr >> 16) & 0xFFFF_FFFF) as u32;
+    let port = (socket_key & 0xFFFF) as u16;
+    let ip = ((socket_key >> 16) & 0xFFFF_FFFF) as u32;
     let ip_bytes = ip.to_be_bytes();
 
     // Format URL as "ip0.ip1.ip2.ip3:port/"
@@ -498,18 +720,22 @@ pub fn sys_recvfrom(
     _src_addr: u64,
     _addrlen_ptr: u64,
 ) -> i64 {
-    let fd_flags = {
+    let (fd_flags, socket_key) = {
         let st = match state::get_files_state(agent_id) {
             Some(s) => s,
             None => return -EBADF,
         };
 
         match st.get_fd(sockfd) {
-            Some(entry) if entry.kind == FdKind::Socket => entry.flags,
+            Some(entry) if entry.kind == FdKind::Socket => (entry.flags, entry.keyspace_key),
             Some(_) => return -ENOTSOCK,
             None => return -EBADF,
         }
     };
+
+    if local_stream_marker(socket_key) {
+        return super::fs::sys_read(agent_id, sockfd, buf_ptr, len);
+    }
 
     if buf_ptr == 0 || len == 0 {
         return 0;
@@ -630,9 +856,29 @@ pub fn sys_shutdown(agent_id: u16, sockfd: i32, how: i32) -> i64 {
 
     let entry = st.get_fd_mut(sockfd).unwrap();
     match how {
-        0 => entry.flags |= FD_FLAG_SHUT_RD,                   // SHUT_RD
-        1 => entry.flags |= FD_FLAG_SHUT_WR,                   // SHUT_WR
-        2 => entry.flags |= FD_FLAG_SHUT_RD | FD_FLAG_SHUT_WR, // SHUT_RDWR
+        0 => {
+            if local_stream_marker(entry.keyspace_key) && (entry.flags & FD_FLAG_SHUT_RD) == 0 {
+                state::shutdown_unix_stream_read(entry.keyspace_id);
+            }
+            entry.flags |= FD_FLAG_SHUT_RD;
+        }
+        1 => {
+            if local_stream_marker(entry.keyspace_key) && (entry.flags & FD_FLAG_SHUT_WR) == 0 {
+                state::shutdown_unix_stream_write(entry.keyspace_id);
+            }
+            entry.flags |= FD_FLAG_SHUT_WR;
+        }
+        2 => {
+            if local_stream_marker(entry.keyspace_key) {
+                if (entry.flags & FD_FLAG_SHUT_RD) == 0 {
+                    state::shutdown_unix_stream_read(entry.keyspace_id);
+                }
+                if (entry.flags & FD_FLAG_SHUT_WR) == 0 {
+                    state::shutdown_unix_stream_write(entry.keyspace_id);
+                }
+            }
+            entry.flags |= FD_FLAG_SHUT_RD | FD_FLAG_SHUT_WR;
+        }
         _ => return -EINVAL,
     }
 
@@ -660,14 +906,33 @@ pub fn sys_bind(agent_id: u16, sockfd: i32, addr_ptr: u64, _addrlen: u64) -> i64
         return -EFAULT;
     }
 
-    // Read sin_port from sockaddr_in (offset 2, network byte order)
-    let Some(port_raw) = read_user_u16(agent_id, addr_ptr + 2) else {
+    let Ok((family, mut port, ip)) = read_sockaddr_in(agent_id, addr_ptr) else {
         return -EFAULT;
     };
-    let port = u16::from_be(port_raw);
+    if family as i32 != AF_INET {
+        return -EAFNOSUPPORT;
+    }
+    if port == 0 {
+        let Some(ephemeral) = state::alloc_ephemeral_loopback_port(ip) else {
+            return -ENOSPC;
+        };
+        port = ephemeral;
+    }
 
     let entry = st.get_fd_mut(sockfd).unwrap();
-    entry.keyspace_key = port as u64;
+    entry.keyspace_key = pack_inet_addr(ip, port);
+    if state::trace_runtime_agent(agent_id) {
+        crate::serial_println!(
+            "[RTDBG] bind agent={} fd={} ip={}.{}.{}.{} port={}",
+            agent_id,
+            sockfd,
+            (ip >> 24) & 0xff,
+            (ip >> 16) & 0xff,
+            (ip >> 8) & 0xff,
+            ip & 0xff,
+            port
+        );
+    }
 
     0
 }
@@ -690,7 +955,39 @@ pub fn sys_listen(agent_id: u16, sockfd: i32, _backlog: i32) -> i64 {
     }
 
     let entry = st.get_fd_mut(sockfd).unwrap();
+    if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+        return 0;
+    }
+    let mut packed_addr = entry.keyspace_key;
+    if packed_addr == 0 {
+        let Some(port) = state::alloc_ephemeral_loopback_port(0) else {
+            return -ENOSPC;
+        };
+        packed_addr = pack_inet_addr(0, port);
+    }
+    let Some(listener_handle) = state::alloc_local_listener(packed_addr, _backlog.max(1) as usize)
+    else {
+        return -EADDRINUSE;
+    };
+    entry.keyspace_key = LOCAL_INET_LISTENER_MARKER;
+    entry.keyspace_id = listener_handle;
     entry.flags |= FD_FLAG_LISTENING;
+    state::retain_local_listener(listener_handle);
+    if state::trace_runtime_agent(agent_id) {
+        let (ip, port) = unpack_inet_addr(packed_addr);
+        crate::serial_println!(
+            "[RTDBG] listen agent={} fd={} listener={} ip={}.{}.{}.{} port={} backlog={}",
+            agent_id,
+            sockfd,
+            listener_handle,
+            (ip >> 24) & 0xff,
+            (ip >> 16) & 0xff,
+            (ip >> 8) & 0xff,
+            ip & 0xff,
+            port,
+            _backlog
+        );
+    }
 
     0
 }
@@ -706,30 +1003,67 @@ pub fn sys_getsockname(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u
         None => return -EBADF,
     };
 
-    match st.get_fd(sockfd) {
-        Some(entry) if entry.kind == FdKind::Socket => {
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER || entry.keyspace_key == AF_UNIX_MARKER {
-                let addr = (AF_UNIX as u16).to_ne_bytes();
-                return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
-            }
-        }
+    let entry = match st.get_fd(sockfd) {
+        Some(entry) if entry.kind == FdKind::Socket => entry,
         Some(_) => return -ENOTSOCK,
         None => return -EBADF,
+    };
+
+    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER || entry.keyspace_key == AF_UNIX_MARKER {
+        let addr = (AF_UNIX as u16).to_ne_bytes();
+        return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
+    }
+
+    let packed_addr = if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+        state::local_listener_addr(entry.keyspace_id).unwrap_or(0)
+    } else if entry.keyspace_key == LOCAL_INET_STREAM_MARKER {
+        pack_inet_addr(INADDR_LOOPBACK, 0)
+    } else {
+        entry.keyspace_key
+    };
+
+    if packed_addr != 0 {
+        let (ip, port) = unpack_inet_addr(packed_addr);
+        let addr = sockaddr_in_bytes(ip, port);
+        return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
     }
 
     // Write a minimal sockaddr_in: AF_INET (2), port 0, addr 0.0.0.0
-    // struct sockaddr_in is 16 bytes
-    let mut addr = [0u8; 16];
-    addr[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    let addr = sockaddr_in_bytes(0, 0);
     write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr)
 }
 
-// ── getpeername ─────────────────────────────────────────────────────────────
-
 /// getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 pub fn sys_getpeername(agent_id: u16, sockfd: i32, addr_ptr: u64, addrlen_ptr: u64) -> i64 {
-    // Same implementation as getsockname for now
-    sys_getsockname(agent_id, sockfd, addr_ptr, addrlen_ptr)
+    let st = match state::get_files_state(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
+    };
+
+    let entry = match st.get_fd(sockfd) {
+        Some(entry) if entry.kind == FdKind::Socket => entry,
+        Some(_) => return -ENOTSOCK,
+        None => return -EBADF,
+    };
+
+    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER || entry.keyspace_key == AF_UNIX_MARKER {
+        let addr = (AF_UNIX as u16).to_ne_bytes();
+        return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
+    }
+
+    if entry.keyspace_key == LOCAL_INET_STREAM_MARKER {
+        let addr = sockaddr_in_bytes(INADDR_LOOPBACK, 0);
+        return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
+    }
+
+    if entry.keyspace_key != 0 && entry.keyspace_key != LOCAL_INET_LISTENER_MARKER {
+        let (ip, port) = unpack_inet_addr(entry.keyspace_key);
+        let addr = sockaddr_in_bytes(ip, port);
+        return write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr);
+    }
+
+    let addr = sockaddr_in_bytes(0, 0);
+    write_sockaddr_to_user(agent_id, addr_ptr, addrlen_ptr, &addr)
 }
 
 // ── socketpair ─────────────────────────────────────────────────────────────
@@ -823,12 +1157,12 @@ pub fn sys_socketpair(
 pub fn sys_setsockopt(
     agent_id: u16,
     sockfd: i32,
-    _level: u64,
-    _optname: u64,
-    _optval_ptr: u64,
-    _optlen: u64,
+    level: u64,
+    optname: u64,
+    optval_ptr: u64,
+    optlen: u64,
 ) -> i64 {
-    let st = match state::get_files_state(agent_id) {
+    let st = match state::get_files_state_mut(agent_id) {
         Some(s) => s,
         None => return -EBADF,
     };
@@ -839,7 +1173,33 @@ pub fn sys_setsockopt(
         None => return -EBADF,
     }
 
-    // Accept all socket options silently
+    let entry = st.get_fd_mut(sockfd).unwrap();
+    let bit = match (level, optname) {
+        (SOL_SOCKET, SO_REUSEADDR) => Some(FD_FLAG_REUSEADDR),
+        (SOL_SOCKET, SO_REUSEPORT) => Some(FD_FLAG_REUSEPORT),
+        (SOL_SOCKET, SO_KEEPALIVE) => Some(FD_FLAG_KEEPALIVE),
+        (SOL_TCP, TCP_NODELAY) => Some(FD_FLAG_NODELAY),
+        (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => {
+            if optval_ptr == 0 || optlen < 4 {
+                return -EINVAL;
+            }
+            return 0;
+        }
+        _ => None,
+    };
+
+    if let Some(bit) = bit {
+        let enabled = match read_socket_opt_bool(agent_id, optval_ptr, optlen) {
+            Ok(enabled) => enabled,
+            Err(err) => return err,
+        };
+        if enabled {
+            entry.flags |= bit;
+        } else {
+            entry.flags &= !bit;
+        }
+    }
+
     0
 }
 
@@ -849,8 +1209,8 @@ pub fn sys_setsockopt(
 pub fn sys_getsockopt(
     agent_id: u16,
     sockfd: i32,
-    _level: u64,
-    _optname: u64,
+    level: u64,
+    optname: u64,
     optval_ptr: u64,
     optlen_ptr: u64,
 ) -> i64 {
@@ -870,24 +1230,73 @@ pub fn sys_getsockopt(
             return -EFAULT;
         };
         let mut value = [0u8; 4];
-        let value_len = match (_level, _optname) {
+        let value_len = match (level, optname) {
             (SOL_SOCKET, SO_TYPE) => {
                 value.copy_from_slice(&SOCK_STREAM.to_ne_bytes());
                 4usize
             }
             (SOL_SOCKET, SO_DOMAIN) => {
-                let domain = if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
-                    || entry.keyspace_key == AF_UNIX_MARKER
-                {
-                    AF_UNIX as u32
-                } else {
-                    AF_INET as u32
-                };
+                let domain = socket_domain(entry);
                 value.copy_from_slice(&domain.to_ne_bytes());
                 4usize
             }
             (SOL_SOCKET, SO_PROTOCOL) => {
                 value.copy_from_slice(&0u32.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_ERROR) => {
+                value.copy_from_slice(&0u32.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_ACCEPTCONN) => {
+                let enabled = if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER
+                    || (entry.flags & FD_FLAG_LISTENING) != 0
+                {
+                    1u32
+                } else {
+                    0u32
+                };
+                value.copy_from_slice(&enabled.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_REUSEADDR) => {
+                let enabled = if (entry.flags & FD_FLAG_REUSEADDR) != 0 {
+                    1u32
+                } else {
+                    0u32
+                };
+                value.copy_from_slice(&enabled.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_REUSEPORT) => {
+                let enabled = if (entry.flags & FD_FLAG_REUSEPORT) != 0 {
+                    1u32
+                } else {
+                    0u32
+                };
+                value.copy_from_slice(&enabled.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_KEEPALIVE) => {
+                let enabled = if (entry.flags & FD_FLAG_KEEPALIVE) != 0 {
+                    1u32
+                } else {
+                    0u32
+                };
+                value.copy_from_slice(&enabled.to_ne_bytes());
+                4usize
+            }
+            (SOL_SOCKET, SO_SNDBUF) | (SOL_SOCKET, SO_RCVBUF) => {
+                value.copy_from_slice(&DEFAULT_SOCKET_BUFFER_BYTES.to_ne_bytes());
+                4usize
+            }
+            (SOL_TCP, TCP_NODELAY) => {
+                let enabled = if (entry.flags & FD_FLAG_NODELAY) != 0 {
+                    1u32
+                } else {
+                    0u32
+                };
+                value.copy_from_slice(&enabled.to_ne_bytes());
                 4usize
             }
             _ => 4usize,

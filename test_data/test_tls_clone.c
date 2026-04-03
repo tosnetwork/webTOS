@@ -12,6 +12,7 @@ typedef unsigned int u32;
 #define SYS_WRITE 1
 #define SYS_EXIT 60
 #define SYS_WAIT4 61
+#define SYS_WAITID 247
 #define SYS_UNAME 63
 #define SYS_ARCH_PRCTL 158
 #define SYS_CLONE 56
@@ -53,6 +54,10 @@ typedef unsigned int u32;
 #define FUTEX_OP(op, oparg, cmp, cmparg) \
     (((op & 0xfU) << 28) | ((cmp & 0xfU) << 24) | (((oparg) & 0xfffU) << 12) | ((cmparg) & 0xfffU))
 
+#define P_PID 1
+#define WEXITED 0x00000004U
+#define WNOWAIT 0x01000000U
+
 #define RLIMIT_STACK 3
 #define RLIMIT_NOFILE 7
 
@@ -84,6 +89,10 @@ static i64 sys_arch_prctl(u64 code, u64 addr) {
 
 static i64 sys_wait4(i64 pid, u32 *wstatus) {
     return sys_call6(SYS_WAIT4, (u64)pid, (u64)wstatus, 0, 0, 0, 0);
+}
+
+static i64 sys_waitid(u32 idtype, u64 id, void *siginfo, u32 options) {
+    return sys_call6(SYS_WAITID, idtype, id, (u64)siginfo, options, 0, 0);
 }
 
 static i64 sys_uname(void *buf) {
@@ -210,6 +219,7 @@ void _start(void) {
     u32 futex_word = 1;
     u32 futex_op_word = 3;
     u32 wstatus = 0;
+    unsigned char siginfo[128] = {0};
     i64 self_tid = sys_gettid();
 
     print("=== TOS TLS/clone smoke test ===\n");
@@ -303,6 +313,13 @@ void _start(void) {
 
     check("clone(CLONE_SETTLS)", clone_ret > 0);
     check("parent_tid written", clone_ret > 0 && parent_tid_seen == (u32)clone_ret);
+    check(
+        "waitid(P_PID, child, WEXITED|WNOWAIT)",
+        sys_waitid(P_PID, (u64)clone_ret, siginfo, WEXITED | WNOWAIT) == 0
+    );
+    check("waitid si_signo == SIGCHLD", *(int *)&siginfo[0] == SIGCHLD);
+    check("waitid si_pid == child", *(int *)&siginfo[16] == (int)clone_ret);
+    check("waitid si_status == 0", *(int *)&siginfo[24] == 0);
     wait_ret_seen = sys_wait4(clone_ret, &wstatus);
     check("wait4(child)", wait_ret_seen == (i64)parent_tid_seen);
     check("child exit status == 0", (wstatus & 0xff) == 0 && ((wstatus >> 8) & 0xff) == 0);

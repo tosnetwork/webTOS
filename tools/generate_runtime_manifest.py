@@ -96,6 +96,52 @@ def add_ldd_closure(entries: OrderedDict[str, str], seeds: list[Path]) -> None:
                 queue.append(resolved)
 
 
+def add_optional_executable(entries: OrderedDict[str, str], spec: str, tos_path: str | None = None) -> Path | None:
+    resolved = shutil.which(spec)
+    if not resolved:
+        return None
+    path = Path(resolved).resolve()
+    add_file(entries, tos_path or path.as_posix(), path)
+    return path
+
+
+def add_linux_tool_subset(entries: OrderedDict[str, str], mode: str) -> list[Path]:
+    if mode == "none":
+        return []
+
+    seeds: list[Path] = []
+    repo_root = Path(__file__).resolve().parent.parent
+    guest_ps = (repo_root / "test_data/guest_ps.elf").resolve()
+    # Keep the first batch intentionally small and broadly useful for runtime
+    # probes and test harnesses.
+    for spec, tos_path in (
+        ("sh", "/bin/sh"),
+        ("env", "/usr/bin/env"),
+        ("mkdir", "/bin/mkdir"),
+        ("rm", "/bin/rm"),
+        ("rmdir", "/bin/rmdir"),
+        ("ln", "/bin/ln"),
+        ("mv", "/bin/mv"),
+        ("touch", "/bin/touch"),
+        ("sleep", "/bin/sleep"),
+        ("cat", "/bin/cat"),
+        ("pwd", "/bin/pwd"),
+        ("uname", "/usr/bin/uname"),
+    ):
+        path = add_optional_executable(entries, spec, tos_path)
+        if path is not None:
+            seeds.append(path)
+
+    if guest_ps.exists():
+        add_file(entries, "/usr/bin/ps", guest_ps)
+    else:
+        path = add_optional_executable(entries, "ps", "/usr/bin/ps")
+        if path is not None:
+            seeds.append(path)
+
+    return seeds
+
+
 def trace_python_files(python_bin: Path, stdlib: Path) -> list[tuple[str, Path]]:
     with tempfile.NamedTemporaryFile(prefix="tos-python-trace-", delete=False) as trace_file:
         trace_path = Path(trace_file.name)
@@ -249,11 +295,20 @@ def main() -> int:
         default="full",
         help="whether to include the full java.home tree",
     )
+    parser.add_argument(
+        "--linux-tools",
+        choices=("minimal", "none"),
+        default="minimal",
+        help="whether to include a small common Linux userland tool subset",
+    )
     args = parser.parse_args()
 
     runtimes = {item.strip() for item in args.runtimes.split(",") if item.strip()}
     files: OrderedDict[str, str] = OrderedDict()
     trees: OrderedDict[str, str] = OrderedDict()
+
+    tool_seeds = add_linux_tool_subset(files, args.linux_tools)
+    add_ldd_closure(files, tool_seeds)
 
     if "python" in runtimes:
         python_bin = resolve_executable(args.python)

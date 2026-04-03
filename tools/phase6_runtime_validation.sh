@@ -14,7 +14,7 @@ Options:
   --profile NAME            Validation profile: java, python, node, all
                             (default: all)
   --qemu-timeout SECONDS    QEMU timeout in seconds
-                            (default: java -> 75, others -> 60)
+                            (default: java -> 75, node -> 90, others -> 60)
   --qemu-memory SIZE        Guest RAM size passed to QEMU
                             (default: java -> 1024M, node -> 2048M, others -> 512M)
   --image PATH              Reuse or write the disk image at PATH
@@ -100,6 +100,7 @@ default_memory_for_profile() {
 default_timeout_for_profile() {
   case "$1" in
     java) echo "75" ;;
+    node) echo "90" ;;
     *) echo "60" ;;
   esac
 }
@@ -132,18 +133,34 @@ validate_phase6_log() {
 
   case "$current_profile" in
     java)
+      require_no_line 'TOS-JAVA-THREAD-FAIL' "$log"
       require_line 'TOS-JAVA-JAR payload=jar-ok' "$log"
+      require_line 'TOS-JAVA-ZIP-OK entries=[0-9]+' "$log"
       require_line 'TOS-JAVA-CHILD line=.* status=0' "$log"
+      require_line 'TOS-JAVA-QUEUE-OK total=[0-9]+' "$log"
       require_line 'TOS-JAVA-THREAD-OK total=[0-9]+' "$log"
       ;;
     python)
-      require_line '\[PYTHON\] launching python child-process smoke' "$log"
+      require_no_line 'Traceback \(most recent call last\)|ModuleNotFoundError|AssertionError' "$log"
+      require_line '\[PYTHON\] launching python API subset smoke' "$log"
+      require_line 'TOS-PY-API filesystem=ok' "$log"
+      require_line 'TOS-PY-API queue=ok' "$log"
+      require_line 'TOS-PY-API-OK total=10' "$log"
       require_line 'TOS-PY-CHILD exit=7 status=0' "$log"
       ;;
     node)
+      require_no_line 'TOS-NODE-API-FAIL|TOS-NODE-THREAD-FAIL' "$log"
       require_line '\[NODE\] launching node child-process smoke' "$log"
+      require_line 'TOS-NODE-FS-OK entries=[0-9]+ bytes=[0-9]+' "$log"
+      require_line 'TOS-NODE-PATH-OK relative=' "$log"
       require_line 'TOS-NODE-CHILD stdout=7 status=0' "$log"
+      require_line 'TOS-NODE-CHILD-ENV-OK value=ready:PIPE' "$log"
+      require_line 'TOS-NODE-TIMER-OK' "$log"
+      require_line 'TOS-NODE-IMMEDIATE-OK' "$log"
+      require_line 'TOS-NODE-STREAM-OK bytes=[0-9]+' "$log"
+      require_line 'TOS-NODE-NET-OK bytes=[0-9]+' "$log"
       require_line '\[NODE\] launching node thread smoke' "$log"
+      require_line 'TOS-NODE-THREAD-MSG-OK workers=[0-9]+' "$log"
       require_line 'TOS-NODE-THREAD-OK total=[0-9]+' "$log"
       ;;
     *)

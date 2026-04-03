@@ -1,5 +1,5 @@
 /*
- * test_node_thread_execve.c — Multi-threaded stress smoke for Node.js.
+ * test_node_thread_execve.c — Node.js worker_threads smoke for maturity validation.
  *
  * Build:
  *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 -o test_node_thread_execve.elf test_node_thread_execve.c

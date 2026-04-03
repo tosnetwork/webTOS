@@ -25,6 +25,22 @@ typedef unsigned short u16;
 #define SYS_GETITIMER 36
 #define SYS_SETITIMER 38
 #define SYS_ALARM 37
+#define SYS_GETPID 39
+#define SYS_SOCKET 41
+#define SYS_CONNECT 42
+#define SYS_ACCEPT4 288
+#define SYS_SETSOCKOPT 54
+#define SYS_GETSOCKOPT 55
+#define SYS_FORK 57
+#define SYS_WAIT4 61
+#define SYS_KILL 62
+#define SYS_BIND 49
+#define SYS_LISTEN 50
+#define SYS_GETSOCKNAME 51
+#define SYS_SETPGID 109
+#define SYS_SETSID 112
+#define SYS_GETPGID 121
+#define SYS_GETSID 124
 #define SYS_TIMERFD_CREATE 283
 #define SYS_TIMERFD_SETTIME 286
 #define SYS_TIMERFD_GETTIME 287
@@ -33,6 +49,8 @@ typedef unsigned short u16;
 #define SYS_MEMBARRIER 324
 #define SYS_RSEQ 334
 #define SYS_OPENAT 257
+#define SYS_NEWFSTATAT 262
+#define SYS_READLINKAT 267
 #define SYS_SYNCFS 306
 #define SYS_EXIT 60
 
@@ -47,6 +65,7 @@ typedef unsigned short u16;
 #define MS_SYNC 0x4
 
 #define AT_FDCWD (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
 #define O_RDWR 2
 #define O_NONBLOCK 0x800
 #define O_CREAT 0x40
@@ -60,6 +79,10 @@ typedef unsigned short u16;
 #define ENOMEM 12
 #define EPERM 1
 #define EAGAIN 11
+
+#define MODE_S_IFMT 0170000
+#define MODE_S_IFREG 0100000
+#define MODE_S_IFLNK 0120000
 
 #define SIGALRM 14
 #define SIG_IGN 1UL
@@ -88,6 +111,25 @@ typedef unsigned short u16;
 
 #define CLOCK_MONOTONIC 1
 #define TFD_TIMER_ABSTIME 1
+#define AF_INET 2
+#define SOCK_STREAM 1
+#define SOL_SOCKET 1
+#define SOL_TCP 6
+#define SO_REUSEADDR 2
+#define SO_ERROR 4
+#define SO_SNDBUF 7
+#define SO_RCVBUF 8
+#define SO_KEEPALIVE 9
+#define SO_REUSEPORT 15
+#define SO_ACCEPTCONN 30
+#define TCP_NODELAY 1
+
+struct sockaddr_in {
+    u16 sin_family;
+    u16 sin_port;
+    u32 sin_addr;
+    unsigned char sin_zero[8];
+};
 
 struct kernel_sigaction {
     u64 handler;
@@ -209,6 +251,30 @@ static i64 sys_openat(int dirfd, const char *path, int flags, int mode) {
     );
 }
 
+static i64 sys_newfstatat(int dirfd, const char *path, void *statbuf, int flags) {
+    return sys_call6(
+        SYS_NEWFSTATAT,
+        (u64)(long)dirfd,
+        (u64)path,
+        (u64)statbuf,
+        (u64)(u32)flags,
+        0,
+        0
+    );
+}
+
+static i64 sys_readlinkat(int dirfd, const char *path, char *buf, u64 bufsiz) {
+    return sys_call6(
+        SYS_READLINKAT,
+        (u64)(long)dirfd,
+        (u64)path,
+        (u64)buf,
+        bufsiz,
+        0,
+        0
+    );
+}
+
 static i64 sys_getitimer(int which, struct itimerval *curr) {
     return sys_call6(SYS_GETITIMER, (u64)(u32)which, (u64)curr, 0, 0, 0, 0);
 }
@@ -219,6 +285,86 @@ static i64 sys_setitimer(int which, const struct itimerval *newv, struct itimerv
 
 static i64 sys_alarm(u32 seconds) {
     return sys_call6(SYS_ALARM, (u64)seconds, 0, 0, 0, 0, 0);
+}
+
+static i64 sys_getpid(void) {
+    return sys_call6(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+}
+
+static i64 sys_socket(int domain, int type, int protocol) {
+    return sys_call6(SYS_SOCKET, (u64)(u32)domain, (u64)(u32)type, (u64)(u32)protocol, 0, 0, 0);
+}
+
+static i64 sys_connect(int fd, const struct sockaddr_in *addr, u32 len) {
+    return sys_call6(SYS_CONNECT, (u64)(u32)fd, (u64)addr, (u64)len, 0, 0, 0);
+}
+
+static i64 sys_bind(int fd, const struct sockaddr_in *addr, u32 len) {
+    return sys_call6(SYS_BIND, (u64)(u32)fd, (u64)addr, (u64)len, 0, 0, 0);
+}
+
+static i64 sys_listen(int fd, int backlog) {
+    return sys_call6(SYS_LISTEN, (u64)(u32)fd, (u64)(u32)backlog, 0, 0, 0, 0);
+}
+
+static i64 sys_accept4(int fd, struct sockaddr_in *addr, u32 *addrlen, int flags) {
+    return sys_call6(SYS_ACCEPT4, (u64)(u32)fd, (u64)addr, (u64)addrlen, (u64)(u32)flags, 0, 0);
+}
+
+static i64 sys_getsockname(int fd, struct sockaddr_in *addr, u32 *addrlen) {
+    return sys_call6(SYS_GETSOCKNAME, (u64)(u32)fd, (u64)addr, (u64)addrlen, 0, 0, 0);
+}
+
+static i64 sys_setsockopt(int fd, int level, int optname, const void *optval, u32 optlen) {
+    return sys_call6(
+        SYS_SETSOCKOPT,
+        (u64)(u32)fd,
+        (u64)(u32)level,
+        (u64)(u32)optname,
+        (u64)optval,
+        (u64)optlen,
+        0
+    );
+}
+
+static i64 sys_getsockopt(int fd, int level, int optname, void *optval, u32 *optlen) {
+    return sys_call6(
+        SYS_GETSOCKOPT,
+        (u64)(u32)fd,
+        (u64)(u32)level,
+        (u64)(u32)optname,
+        (u64)optval,
+        (u64)optlen,
+        0
+    );
+}
+
+static i64 sys_fork(void) {
+    return sys_call6(SYS_FORK, 0, 0, 0, 0, 0, 0);
+}
+
+static i64 sys_wait4(i64 pid, u32 *status) {
+    return sys_call6(SYS_WAIT4, (u64)pid, (u64)status, 0, 0, 0, 0);
+}
+
+static i64 sys_kill(i64 pid, int sig) {
+    return sys_call6(SYS_KILL, (u64)pid, (u64)(u32)sig, 0, 0, 0, 0);
+}
+
+static i64 sys_setpgid(i64 pid, i64 pgid) {
+    return sys_call6(SYS_SETPGID, (u64)pid, (u64)pgid, 0, 0, 0, 0);
+}
+
+static i64 sys_setsid(void) {
+    return sys_call6(SYS_SETSID, 0, 0, 0, 0, 0, 0);
+}
+
+static i64 sys_getpgid(i64 pid) {
+    return sys_call6(SYS_GETPGID, (u64)pid, 0, 0, 0, 0, 0);
+}
+
+static i64 sys_getsid(i64 pid) {
+    return sys_call6(SYS_GETSID, (u64)pid, 0, 0, 0, 0, 0);
 }
 
 static i64 sys_timerfd_create(int clockid, int flags) {
@@ -243,6 +389,10 @@ static i64 sys_membarrier(u32 cmd, u32 flags, u32 cpu_id) {
 
 static i64 sys_rseq(struct rseq_area *rseq, u32 len, u32 flags, u32 sig) {
     return sys_call6(SYS_RSEQ, (u64)rseq, (u64)len, (u64)flags, (u64)sig, 0, 0);
+}
+
+static u16 bswap16(u16 value) {
+    return (u16)((value << 8) | (value >> 8));
 }
 
 static void sys_exit(int code) {
@@ -275,6 +425,16 @@ static void check(const char *name, int cond) {
     print("\n");
 }
 
+static int bytes_eq(const char *a, const char *b, int len) {
+    int i;
+    for (i = 0; i < len; i++) {
+        if ((unsigned char)a[i] != (unsigned char)b[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void _start(void) {
     struct kernel_sigaction ign_alrm;
     struct itimerval cur;
@@ -289,7 +449,11 @@ void _start(void) {
     static char file_path[] = "/tmp/substrate_depth.bin";
     char first_byte = 0;
     char page_buf[4096];
+    unsigned char statbuf[256];
+    char proc_fd_path[32];
+    char link_buf[256];
     struct rseq_area rseq;
+    u32 wstatus = 0;
     struct itimerspec timer_new;
     struct itimerspec timer_old;
     struct itimerspec timer_cur;
@@ -298,6 +462,7 @@ void _start(void) {
     u32 node = 99;
     int fd;
     int tfd;
+    i64 pid;
     char *shared_map;
     int i;
 
@@ -312,6 +477,41 @@ void _start(void) {
     check("getitimer(NULL) -> EFAULT", sys_getitimer(0, (struct itimerval *)0) == -EFAULT);
     check("setitimer(bad which) -> EINVAL", sys_setitimer(9, (struct itimerval *)0, (struct itimerval *)0) == -EINVAL);
     check("getcpu() reports cpu0/node0", sys_getcpu(&cpu, &node) == 0 && cpu == 0 && node == 0);
+    check("getpgid(self) returns active group", sys_getpgid(0) > 0 && sys_getpgid(sys_getpid()) == sys_getpgid(0));
+    check("getsid(self) returns active session", sys_getsid(0) > 0 && sys_getsid(sys_getpid()) == sys_getsid(0));
+    pid = sys_fork();
+    check("fork for setsid", pid >= 0);
+    if (pid == 0) {
+        i64 child_pid = sys_getpid();
+        check("child setsid", sys_setsid() == child_pid);
+        check("child getsid after setsid", sys_getsid(0) == child_pid);
+        check("child getpgid after setsid", sys_getpgid(0) == child_pid);
+        check("child setpgid on session leader -> EPERM", sys_setpgid(0, 0) == -EPERM);
+        sys_exit(fail_count == 0 ? 0 : 1);
+    } else if (pid > 0) {
+        wstatus = 0;
+        check("wait4 setsid child", sys_wait4(pid, &wstatus) == pid && wstatus == 0);
+    }
+    pid = sys_fork();
+    check("fork for process group", pid >= 0);
+    if (pid == 0) {
+        i64 child_pid = sys_getpid();
+        sleep_req.tv_sec = 0;
+        sleep_req.tv_nsec = 40000000;
+        check("child setpgid self", sys_setpgid(0, 0) == 0);
+        check("child getpgid self", sys_getpgid(0) == child_pid);
+        check("child getsid inherited", sys_getsid(0) > 0);
+        check("child setsid after setpgid -> EPERM", sys_setsid() == -EPERM);
+        sys_nanosleep(&sleep_req, (struct timespec *)0);
+        sys_exit(fail_count == 0 ? 0 : 1);
+    } else if (pid > 0) {
+        sleep_req.tv_sec = 0;
+        sleep_req.tv_nsec = 10000000;
+        sys_nanosleep(&sleep_req, (struct timespec *)0);
+        check("kill(-pgid, 0) finds child group", sys_kill(-pid, 0) == 0);
+        wstatus = 0;
+        check("wait4(-pgid) reaps child", sys_wait4(-pid, &wstatus) == pid && wstatus == 0);
+    }
     check("membarrier(query bad flags) -> EINVAL", sys_membarrier(MEMBARRIER_CMD_QUERY, 1, 0) == -EINVAL);
     check("membarrier(query)", sys_membarrier(MEMBARRIER_CMD_QUERY, 0, 0) == (i64)MEMBARRIER_SUPPORTED_MASK);
     check("membarrier(private expedited before register) -> EPERM",
@@ -408,6 +608,113 @@ void _start(void) {
     check("timerfd_settime(bad flags) -> EINVAL",
           sys_timerfd_settime(tfd, TFD_TIMER_ABSTIME << 1, &timer_new, &timer_old) == -EINVAL);
     check("close timerfd", sys_close(tfd) == 0);
+
+    {
+        int listen_fd = (int)sys_socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {0};
+        struct sockaddr_in bound = {0};
+        struct sockaddr_in accepted_peer = {0};
+        u32 addrlen = sizeof(bound);
+        u32 peer_len = sizeof(accepted_peer);
+        int client_fd;
+        int accepted_fd;
+        char payload[4] = {0};
+        u32 sockopt_len;
+        int sockopt_val;
+        int enabled = 1;
+
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr = 0x0100007f; /* 127.0.0.1 in network-byte-order bytes */
+
+        check("loopback socket(listener)", listen_fd >= 0);
+        if (listen_fd >= 0) {
+            check("loopback setsockopt(reuseaddr)",
+                  sys_setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, 4) == 0);
+            check("loopback setsockopt(reuseport)",
+                  sys_setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &enabled, 4) == 0);
+            check("loopback setsockopt(keepalive)",
+                  sys_setsockopt(listen_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, 4) == 0);
+            sockopt_len = 4;
+            sockopt_val = 0;
+            check("loopback getsockopt(reuseaddr)",
+                  sys_getsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &sockopt_val, &sockopt_len) == 0 &&
+                  sockopt_len == 4 &&
+                  sockopt_val == 1);
+            check("loopback bind(127.0.0.1:0)",
+                  sys_bind(listen_fd, &addr, sizeof(addr)) == 0);
+            check("loopback listen", sys_listen(listen_fd, 4) == 0);
+            sockopt_len = 4;
+            sockopt_val = 0;
+            check("loopback getsockopt(acceptconn)",
+                  sys_getsockopt(listen_fd, SOL_SOCKET, SO_ACCEPTCONN, &sockopt_val, &sockopt_len) == 0 &&
+                  sockopt_len == 4 &&
+                  sockopt_val == 1);
+            sockopt_len = 4;
+            sockopt_val = 0;
+            check("loopback getsockopt(keepalive)",
+                  sys_getsockopt(listen_fd, SOL_SOCKET, SO_KEEPALIVE, &sockopt_val, &sockopt_len) == 0 &&
+                  sockopt_len == 4 &&
+                  sockopt_val == 1);
+            sockopt_len = 4;
+            sockopt_val = 0;
+            check("loopback getsockopt(sndbuf)",
+                  sys_getsockopt(listen_fd, SOL_SOCKET, SO_SNDBUF, &sockopt_val, &sockopt_len) == 0 &&
+                  sockopt_len == 4 &&
+                  sockopt_val > 0);
+            check("loopback getsockname",
+                  sys_getsockname(listen_fd, &bound, &addrlen) == 0 &&
+                  bound.sin_family == AF_INET &&
+                  bswap16(bound.sin_port) != 0);
+
+            client_fd = (int)sys_socket(AF_INET, SOCK_STREAM, 0);
+            check("loopback socket(client)", client_fd >= 0);
+            if (client_fd >= 0) {
+                check("loopback setsockopt(tcp_nodelay)",
+                      sys_setsockopt(client_fd, SOL_TCP, TCP_NODELAY, &enabled, 4) == 0);
+                sockopt_len = 4;
+                sockopt_val = 0;
+                check("loopback getsockopt(tcp_nodelay)",
+                      sys_getsockopt(client_fd, SOL_TCP, TCP_NODELAY, &sockopt_val, &sockopt_len) == 0 &&
+                      sockopt_len == 4 &&
+                      sockopt_val == 1);
+                sockopt_len = 4;
+                sockopt_val = -1;
+                check("loopback getsockopt(so_error)",
+                      sys_getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &sockopt_val, &sockopt_len) == 0 &&
+                      sockopt_len == 4 &&
+                      sockopt_val == 0);
+                sockopt_len = 4;
+                sockopt_val = 0;
+                check("loopback getsockopt(rcvbuf)",
+                      sys_getsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &sockopt_val, &sockopt_len) == 0 &&
+                      sockopt_len == 4 &&
+                      sockopt_val > 0);
+                addr.sin_port = bound.sin_port;
+                check("loopback connect", sys_connect(client_fd, &addr, sizeof(addr)) == 0);
+                accepted_fd = (int)sys_accept4(listen_fd, &accepted_peer, &peer_len, 0);
+                check("loopback accept4", accepted_fd >= 0);
+                if (accepted_fd >= 0) {
+                    check("loopback client->server write", sys_write(client_fd, "ping", 4) == 4);
+                    check("loopback server read", sys_read(accepted_fd, payload, 4) == 4 &&
+                                                      payload[0] == 'p' &&
+                                                      payload[1] == 'i' &&
+                                                      payload[2] == 'n' &&
+                                                      payload[3] == 'g');
+                    check("loopback server->client write", sys_write(accepted_fd, "pong", 4) == 4);
+                    payload[0] = payload[1] = payload[2] = payload[3] = 0;
+                    check("loopback client read", sys_read(client_fd, payload, 4) == 4 &&
+                                                       payload[0] == 'p' &&
+                                                       payload[1] == 'o' &&
+                                                       payload[2] == 'n' &&
+                                                       payload[3] == 'g');
+                    check("loopback close accepted", sys_close(accepted_fd) == 0);
+                }
+                check("loopback close client", sys_close(client_fd) == 0);
+            }
+            check("loopback close listener", sys_close(listen_fd) == 0);
+        }
+    }
     check("msync(hole) -> ENOMEM", sys_msync((void *)0x50000000, 4096, MS_SYNC) == -ENOMEM);
     check("msync(bad flags) -> EINVAL", sys_msync((void *)0x50000000, 4096, MS_SYNC | MS_ASYNC) == -EINVAL);
 
@@ -470,6 +777,63 @@ void _start(void) {
         if (fd >= 0) {
             check("read synced byte", sys_read(fd, &first_byte, 1) == 1);
             check("shared file writeback visible", first_byte == 'M');
+            {
+                int proc_len = 0;
+                int tmp_fd = fd;
+                i64 link_len;
+                proc_fd_path[proc_len++] = '/';
+                proc_fd_path[proc_len++] = 'p';
+                proc_fd_path[proc_len++] = 'r';
+                proc_fd_path[proc_len++] = 'o';
+                proc_fd_path[proc_len++] = 'c';
+                proc_fd_path[proc_len++] = '/';
+                proc_fd_path[proc_len++] = 's';
+                proc_fd_path[proc_len++] = 'e';
+                proc_fd_path[proc_len++] = 'l';
+                proc_fd_path[proc_len++] = 'f';
+                proc_fd_path[proc_len++] = '/';
+                proc_fd_path[proc_len++] = 'f';
+                proc_fd_path[proc_len++] = 'd';
+                proc_fd_path[proc_len++] = '/';
+                if (tmp_fd >= 100) {
+                    proc_fd_path[proc_len++] = (char)('0' + (tmp_fd / 100));
+                    proc_fd_path[proc_len++] = (char)('0' + ((tmp_fd / 10) % 10));
+                } else if (tmp_fd >= 10) {
+                    proc_fd_path[proc_len++] = (char)('0' + (tmp_fd / 10));
+                }
+                proc_fd_path[proc_len++] = (char)('0' + (tmp_fd % 10));
+                proc_fd_path[proc_len] = 0;
+
+                link_len = sys_readlinkat(AT_FDCWD, proc_fd_path, link_buf, sizeof(link_buf));
+                check("readlink /proc/self/fd/<fd>", link_len == (i64)(sizeof(file_path) - 1));
+                if (link_len == (i64)(sizeof(file_path) - 1)) {
+                    check(
+                        "/proc/self/fd target matches path",
+                        bytes_eq(link_buf, file_path, (int)(sizeof(file_path) - 1))
+                    );
+                }
+
+                check(
+                    "lstat /proc/self/fd/<fd>",
+                    sys_newfstatat(AT_FDCWD, proc_fd_path, statbuf, AT_SYMLINK_NOFOLLOW) == 0
+                );
+                if (sys_newfstatat(AT_FDCWD, proc_fd_path, statbuf, AT_SYMLINK_NOFOLLOW) == 0) {
+                    check(
+                        "/proc/self/fd/<fd> reports symlink",
+                        ((*(u16 *)&statbuf[24]) & MODE_S_IFMT) == MODE_S_IFLNK
+                    );
+                }
+                check(
+                    "stat /proc/self/fd/<fd> follows target",
+                    sys_newfstatat(AT_FDCWD, proc_fd_path, statbuf, 0) == 0
+                );
+                if (sys_newfstatat(AT_FDCWD, proc_fd_path, statbuf, 0) == 0) {
+                    check(
+                        "/proc/self/fd/<fd> follow reports regular file",
+                        ((*(u16 *)&statbuf[24]) & MODE_S_IFMT) == MODE_S_IFREG
+                    );
+                }
+            }
             check("close reopened file", sys_close(fd) == 0);
         }
     }

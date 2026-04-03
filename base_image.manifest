@@ -26,4 +26,5 @@
 /usr/lib/tos-tests/python_child_smoke.py = test_data/python_child_smoke.py
 /usr/lib/tos-tests/node_child_smoke.js = test_data/node_child_smoke.js
 /usr/lib/tos-tests/node_thread_smoke.js = test_data/node_thread_smoke.js
+/usr/lib/tos-tests/shell_env_probe.sh = test_data/shell_env_probe.sh
 /usr/lib/tos-tests/payload.txt = test_data/payload.txt

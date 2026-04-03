@@ -21,6 +21,6 @@ run_profile() {
 
 run_profile java 75
 run_profile python 60
-run_profile node 60
+run_profile node 90
 
 echo "[phase6-matrix] all runtime profiles passed"

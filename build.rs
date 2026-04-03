@@ -257,6 +257,9 @@ fn base_image_key(tos_path: &str) -> u64 {
     if let Some(relative) = tos_path.strip_prefix("/usr/bin/") {
         return sha256_key_prefixed(b"base:usrbin/", relative.as_bytes());
     }
+    if let Some(relative) = tos_path.strip_prefix("/bin/") {
+        return sha256_key_prefixed(b"base:usrbin/", relative.as_bytes());
+    }
     if let Some(relative) = tos_path.strip_prefix("/jdk/") {
         return sha256_key_prefixed(b"base:jdk/", relative.as_bytes());
     }

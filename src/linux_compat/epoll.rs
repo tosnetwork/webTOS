@@ -381,7 +381,9 @@ fn collect_ready_events(
                 }
                 FdKind::Socket => {
                     let mut events = 0;
-                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                        || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                    {
                         if let Some((read_handle, write_handle)) =
                             state::unix_stream_handles(entry.keyspace_id)
                         {
@@ -400,6 +402,12 @@ fn collect_ready_events(
                             if peer_closed {
                                 events |= EPOLLHUP;
                             }
+                        }
+                    } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                        if fd_allows_read(entry.kind, entry.flags)
+                            && state::local_listener_read_ready(entry.keyspace_id)
+                        {
+                            events |= EPOLLIN;
                         }
                     } else {
                         let peer_closed = !crate::mailbox::mailbox_has_writers(entry.mailbox_id);

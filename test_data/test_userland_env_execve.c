@@ -1,14 +1,14 @@
 /*
- * test_python_execve.c — Python API subset smoke for host-installed Python.
+ * test_userland_env_execve.c — Minimal Linux userland environment smoke.
  *
  * Build:
- *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 -o test_python_execve.elf test_python_execve.c
+ *   gcc -nostdlib -static -Os -s -Wl,-Ttext=0x40000000 \
+ *     -o test_userland_env_execve.elf test_userland_env_execve.c
  *
- * This binary performs:
- *   execve("/usr/bin/python3", ["python3", "-u", "/usr/lib/tos-tests/python_child_smoke.py"], envp)
- *
- * Success is observed if the guest-side Python API subset prints all markers
- * and exits cleanly.
+ * Runs:
+ *   execve("/usr/bin/env",
+ *          ["env", "-i", "PATH=/bin:/usr/bin", "TOS_PROBE=ok",
+ *           "/bin/sh", "/usr/lib/tos-tests/shell_env_probe.sh"], envp)
  */
 
 typedef unsigned long u64;
@@ -20,8 +20,7 @@ static i64 sys_write(int fd, const void *buf, u64 count) {
         "syscall"
         : "=a"(ret)
         : "a"(1), "D"((u64)fd), "S"((u64)buf), "d"(count)
-        : "rcx", "r11", "memory"
-    );
+        : "rcx", "r11", "memory");
     return ret;
 }
 
@@ -31,8 +30,7 @@ static i64 sys_execve(const char *path, char *const argv[], char *const envp[]) 
         "syscall"
         : "=a"(ret)
         : "a"(59), "D"((u64)path), "S"((u64)argv), "d"((u64)envp)
-        : "rcx", "r11", "memory"
-    );
+        : "rcx", "r11", "memory");
     return ret;
 }
 
@@ -41,14 +39,15 @@ static void sys_exit(int code) {
         "syscall"
         :
         : "a"(60), "D"((u64)code)
-        : "rcx", "r11", "memory"
-    );
+        : "rcx", "r11", "memory");
     __builtin_unreachable();
 }
 
 static void print(const char *s) {
     u64 len = 0;
-    while (s[len]) len++;
+    while (s[len]) {
+        len++;
+    }
     sys_write(1, s, len);
 }
 
@@ -67,7 +66,7 @@ static void print_num(i64 n) {
         v = (unsigned long)n;
     }
     while (v > 0) {
-        buf[i++] = '0' + (v % 10);
+        buf[i++] = (char)('0' + (v % 10));
         v /= 10;
     }
     while (i > 0) {
@@ -77,20 +76,19 @@ static void print_num(i64 n) {
 }
 
 void _start(void) {
-    static char path[] = "/usr/bin/python3";
-    static char arg1[] = "-u";
-    static char arg2[] = "/usr/lib/tos-tests/python_child_smoke.py";
-    static char env0[] = "PYTHONHOME=/usr";
-    static char env1[] = "PYTHONDONTWRITEBYTECODE=1";
-    static char env2[] = "PYTHONNOUSERSITE=1";
-    static char env3[] = "PYTHONUNBUFFERED=1";
-    static char env4[] = "LANG=C";
-    static char *argv[] = {path, arg1, arg2, 0};
-    static char *envp[] = {env0, env1, env2, env3, env4, 0};
+    static char path[] = "/usr/bin/env";
+    static char arg1[] = "-i";
+    static char arg2[] = "PATH=/bin:/usr/bin";
+    static char arg3[] = "TOS_PROBE=ok";
+    static char arg4[] = "/bin/sh";
+    static char arg5[] = "/usr/lib/tos-tests/shell_env_probe.sh";
+    static char env0[] = "LANG=C";
+    static char *argv[] = {path, arg1, arg2, arg3, arg4, arg5, 0};
+    static char *envp[] = {env0, 0};
 
-    print("[PYTHON] launching python API subset smoke\n");
+    print("[USERLAND] launching /usr/bin/env -> /bin/sh smoke\n");
     i64 ret = sys_execve(path, argv, envp);
-    print("[PYTHON] execve returned ");
+    print("[USERLAND] env execve returned ");
     print_num(ret);
     print("\n");
     sys_exit(1);

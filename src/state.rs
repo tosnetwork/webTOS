@@ -1293,6 +1293,7 @@ pub fn append_file_data(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> Res
         return Err(E_INVALID_ARG);
     }
 
+    let old_multi_segment = existing_multi_segment_layout(keyspace, base_key);
     let old_total = query_file_size(keyspace, base_key);
     if old_total == 0 {
         if let Some((buf, len)) = state_get(keyspace, base_key) {
@@ -1309,7 +1310,28 @@ pub fn append_file_data(keyspace: KeyspaceId, base_key: u64, data: &[u8]) -> Res
         }
     }
 
-    let new_total = old_total.checked_add(data.len()).ok_or(E_INVALID_ARG)?;    
+    let new_total = old_total.checked_add(data.len()).ok_or(E_INVALID_ARG)?;
+
+    // Keep small files in the inline storage format. Converting a <=256-byte
+    // file into segmented storage makes the 6-byte storage header visible to
+    // normal file I/O unless every read path treats it specially.
+    if new_total <= MAX_VALUE_SIZE {
+        let mut combined = [0u8; MAX_VALUE_SIZE];
+        if old_total > 0 {
+            let loaded = load_file_range(keyspace, base_key, 0, &mut combined[..old_total]);
+            if loaded != old_total {
+                return Err(E_NOT_FOUND);
+            }
+        }
+        combined[old_total..new_total].copy_from_slice(data);
+        put(keyspace, base_key, &combined[..new_total])?;
+        if let Some(segment_chunk_counts) = old_multi_segment.as_ref() {
+            cleanup_multi_segment_tree(keyspace, base_key, segment_chunk_counts);
+        }
+        advance_version(keyspace);
+        return Ok(new_total);
+    }
+
     let first_dirty_segment = old_total / MULTI_SEGMENT_SIZE;
     let new_segment_count = new_total.div_ceil(MULTI_SEGMENT_SIZE);
 
@@ -1404,7 +1426,7 @@ pub fn parse_multi_segment_header(
 
     let total = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
     let segment_count = u16::from_le_bytes([value[4], value[5]]) as usize;
-    if total <= MAX_VALUE_SIZE || segment_count == 0 {
+    if total == 0 || segment_count == 0 {
         return None;
     }
 

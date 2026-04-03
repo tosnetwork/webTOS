@@ -28,7 +28,7 @@ The script expects the current repo layout and the existing single-node test
 image at /tmp/tos_test.img. It validates the runtime smoke markers that are
 already emitted by the root agent:
   - Java:   [JAVA] launch line + TOS-JAVA-JAR payload marker + clean exit
-  - Python: [PYTHON] launch line + runtime output "1" + clean exit
+  - Python: [PYTHON] launch line + API subset markers + clean exit
   - Node:   [NODE] launch line + runtime output "1" + clean exit
 
 Use TOS_RUNTIME_MANIFEST to point the build at a chosen runtime manifest
@@ -156,6 +156,17 @@ export TOS_RUNTIME_MANIFEST="$runtime_manifest"
 export TOS_RUNTIME_SMOKE_FOCUS="$runtime_focus"
 export TOS_JAVA_SMOKE_FOCUS="$java_focus"
 
+build_key="$(
+  printf '%s\n%s\n%s\n' \
+    "$TOS_RUNTIME_MANIFEST" \
+    "$TOS_RUNTIME_SMOKE_FOCUS" \
+    "$TOS_JAVA_SMOKE_FOCUS" \
+  | sha256sum | cut -c1-16
+)"
+export CARGO_TARGET_DIR="${TOS_CARGO_TARGET_DIR:-/tmp/tos-target-$build_key}"
+kernel_elf64="$CARGO_TARGET_DIR/x86_64-unknown-tos/release/tos"
+kernel_elf32="$CARGO_TARGET_DIR/tos_32.elf"
+
 echo "[phase5] build: TOS_RUNTIME_MANIFEST=$TOS_RUNTIME_MANIFEST TOS_RUNTIME_SMOKE_FOCUS=$TOS_RUNTIME_SMOKE_FOCUS TOS_JAVA_SMOKE_FOCUS=$TOS_JAVA_SMOKE_FOCUS"
 cargo build --release --target x86_64-unknown-tos.json
 
@@ -276,8 +287,19 @@ case "$profile" in
     require_line '\[linux_compat\] exit_group: agent=[0-9]+ status=0'
     ;;
   python)
-    require_line '\[PYTHON\] launching /usr/bin/python3( -S)? -c print\(1\)'
-    require_line_after '\[PYTHON\] launching /usr/bin/python3( -S)? -c print\(1\)' '^1$'
+    require_line '\[PYTHON\] launching python API subset smoke'
+    require_line 'TOS-PY-API os=ok'
+    require_line 'TOS-PY-API io=ok'
+    require_line 'TOS-PY-API pathlib=ok'
+    require_line 'TOS-PY-API filesystem=ok'
+    require_line 'TOS-PY-API subprocess=ok'
+    require_line 'TOS-PY-API mmap=(ok|skip)'
+    require_line 'TOS-PY-API signal=ok'
+    require_line 'TOS-PY-API socket=(ok|skip)'
+    require_line 'TOS-PY-API threading=ok'
+    require_line 'TOS-PY-API queue=ok'
+    require_line 'TOS-PY-API-OK total=10'
+    require_line 'TOS-PY-CHILD exit=7 status=0'
     require_line '\[linux_compat\] exit_group: agent=[0-9]+ status=0'
     ;;
   node)
@@ -287,8 +309,19 @@ case "$profile" in
     require_no_line_after '\[NODE\] launching /usr/bin/node -e console\.log\(1\)' 'terminated by SIG|exit_group: agent=[0-9]+ status=134'
     ;;
   all)
-    require_line '\[PYTHON\] launching /usr/bin/python3( -S)? -c print\(1\)'
-    require_line_after '\[PYTHON\] launching /usr/bin/python3( -S)? -c print\(1\)' '^1$'
+    require_line '\[PYTHON\] launching python API subset smoke'
+    require_line 'TOS-PY-API os=ok'
+    require_line 'TOS-PY-API io=ok'
+    require_line 'TOS-PY-API pathlib=ok'
+    require_line 'TOS-PY-API filesystem=ok'
+    require_line 'TOS-PY-API subprocess=ok'
+    require_line 'TOS-PY-API mmap=(ok|skip)'
+    require_line 'TOS-PY-API signal=ok'
+    require_line 'TOS-PY-API socket=(ok|skip)'
+    require_line 'TOS-PY-API threading=ok'
+    require_line 'TOS-PY-API queue=ok'
+    require_line 'TOS-PY-API-OK total=10'
+    require_line 'TOS-PY-CHILD exit=7 status=0'
     require_line '\[NODE\] launching /usr/bin/node -e console\.log\(1\)'
     require_line_after '\[NODE\] launching /usr/bin/node -e console\.log\(1\)' '^1$'
     require_line 'TOS-JAVA-JAR payload=jar-ok'

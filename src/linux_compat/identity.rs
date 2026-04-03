@@ -149,18 +149,102 @@ pub fn sys_getegid(agent_id: u16) -> i64 {
     current_gid(agent_id) as i64
 }
 
-/// setpgid(pid, pgid) -> 0 (no-op)
-pub fn sys_setpgid(_agent_id: u16, _pid: u64, _pgid: u64) -> i64 {
+/// umask(mask) -> previous umask
+pub fn sys_umask(agent_id: u16, mask: u32) -> i64 {
+    let Some(st) = state::get_state_mut(agent_id) else {
+        return -EINVAL;
+    };
+    let old = st.umask;
+    st.umask = (mask as u16) & 0o777;
+    old as i64
+}
+
+fn resolve_process_leader_for_pid(agent_id: u16, pid: u64) -> Option<u16> {
+    if pid == 0 {
+        state::process_leader(agent_id).or(Some(agent_id))
+    } else if pid <= i32::MAX as u64 {
+        state::find_process_leader_by_pid(pid as i32)
+    } else {
+        None
+    }
+}
+
+/// setpgid(pid, pgid) -> 0
+pub fn sys_setpgid(agent_id: u16, pid: u64, pgid: u64) -> i64 {
+    let Some(caller_leader) = state::process_leader(agent_id).or(Some(agent_id)) else {
+        return -ESRCH;
+    };
+    let Some(target_leader) = resolve_process_leader_for_pid(agent_id, pid) else {
+        return -ESRCH;
+    };
+    if target_leader != caller_leader
+        && state::process_parent_leader(target_leader) != Some(caller_leader)
+    {
+        return -ESRCH;
+    }
+
+    let target_pid = state::process_pid(target_leader).unwrap_or(target_leader as u32);
+    let target_sid = state::process_sid(target_leader).unwrap_or(target_pid);
+    let caller_sid = state::process_sid(caller_leader).unwrap_or(target_sid);
+    if target_sid != caller_sid {
+        return -EPERM;
+    }
+    if target_sid == target_pid {
+        return -EPERM;
+    }
+
+    let requested_pgid = if pgid == 0 {
+        target_pid
+    } else if pgid <= i32::MAX as u64 {
+        pgid as u32
+    } else {
+        return -EINVAL;
+    };
+    if requested_pgid != target_pid
+        && !state::process_group_exists_in_session(target_sid, requested_pgid)
+    {
+        return -EPERM;
+    }
+
+    if !state::set_process_pgid(target_leader, requested_pgid) {
+        return -ESRCH;
+    }
     0
 }
 
-/// getpgid(pid) -> pid (or agent's own pid if 0)
+/// getpgid(pid) -> process group id
 pub fn sys_getpgid(agent_id: u16, pid: u64) -> i64 {
-    if pid == 0 {
-        agent_id as i64
-    } else {
-        pid as i64
+    let Some(target_leader) = resolve_process_leader_for_pid(agent_id, pid) else {
+        return -ESRCH;
+    };
+    state::process_pgid(target_leader)
+        .map(|pgid| pgid as i64)
+        .unwrap_or(-ESRCH)
+}
+
+/// setsid() -> new session id
+pub fn sys_setsid(agent_id: u16) -> i64 {
+    let Some(leader_id) = state::process_leader(agent_id).or(Some(agent_id)) else {
+        return -ESRCH;
+    };
+    let pid = state::process_pid(leader_id).unwrap_or(leader_id as u32);
+    if state::process_pgid(leader_id).unwrap_or(pid) == pid {
+        return -EPERM;
     }
+    if !state::set_process_sid(leader_id, pid) || !state::set_process_pgid(leader_id, pid) {
+        return -ESRCH;
+    }
+    pid as i64
+}
+
+/// getsid(pid) -> session id
+pub fn sys_getsid(agent_id: u16, pid: u64) -> i64 {
+    let Some(target_leader) = resolve_process_leader_for_pid(agent_id, pid) else {
+        return -ESRCH;
+    };
+    state::process_sid(target_leader)
+        .map(|sid| sid as i64)
+        .unwrap_or(-ESRCH)
 }
 
 /// getgroups(size, list) -> 1 deterministic supplementary group.

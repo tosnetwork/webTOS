@@ -348,6 +348,84 @@ fn resolve_path_at<'a>(
     Ok(&dst[..norm_len])
 }
 
+fn resolve_symlink_target_path<'a>(
+    link_path: &[u8],
+    target: &[u8],
+    dst: &'a mut [u8; MAX_PATH],
+) -> Result<&'a [u8], i64> {
+    if target.is_empty() {
+        return Err(-ENOENT);
+    }
+    if target[0] == b'/' {
+        let len = normalize_absolute_path(target, dst);
+        return Ok(&dst[..len]);
+    }
+
+    let mut combined = [0u8; MAX_PATH];
+    let parent_len = match link_path.iter().rposition(|&b| b == b'/') {
+        Some(0) => 1,
+        Some(idx) => idx,
+        None => 1,
+    };
+    if parent_len + 1 + target.len() > MAX_PATH {
+        return Err(-EINVAL);
+    }
+
+    combined[..parent_len].copy_from_slice(&link_path[..parent_len]);
+    let mut len = parent_len;
+    if combined[len - 1] != b'/' {
+        combined[len] = b'/';
+        len += 1;
+    }
+    combined[len..len + target.len()].copy_from_slice(target);
+    len += target.len();
+
+    let norm_len = normalize_absolute_path(&combined[..len], dst);
+    Ok(&dst[..norm_len])
+}
+
+fn follow_mutable_symlinks<'a>(
+    agent_id: u16,
+    path: &[u8],
+    follow_final: bool,
+    dst: &'a mut [u8; MAX_PATH],
+) -> Result<&'a [u8], i64> {
+    let copy_len = path.len().min(MAX_PATH);
+    let mut current = [0u8; MAX_PATH];
+    current[..copy_len].copy_from_slice(&path[..copy_len]);
+    let mut current_len = copy_len;
+
+    for _ in 0..8 {
+        let current_path = &current[..current_len];
+        let Some(kind) = state::lookup_mutable_path_kind(agent_id, current_path) else {
+            dst[..current_len].copy_from_slice(current_path);
+            return Ok(&dst[..current_len]);
+        };
+
+        if kind != state::MutablePathKind::Symlink {
+            dst[..current_len].copy_from_slice(current_path);
+            return Ok(&dst[..current_len]);
+        }
+        if !follow_final {
+            dst[..current_len].copy_from_slice(current_path);
+            return Ok(&dst[..current_len]);
+        }
+
+        let mut target_raw = [0u8; MAX_PATH];
+        let Some(target) =
+            state::lookup_mutable_symlink_target(agent_id, current_path, &mut target_raw)
+        else {
+            return Err(-ENOENT);
+        };
+        let mut next = [0u8; MAX_PATH];
+        let resolved = resolve_symlink_target_path(current_path, target, &mut next)?;
+        current_len = resolved.len();
+        current[..current_len].copy_from_slice(resolved);
+    }
+
+    Err(-ELOOP)
+}
+
 /// Copy bytes from a kernel buffer to user memory.
 #[inline]
 fn write_user_mem(agent_id: u16, dst: u64, src: &[u8]) -> bool {
@@ -838,7 +916,10 @@ fn metadata_for_fd(agent_id: u16, entry: &FdEntry) -> LinuxStatMeta {
         FdKind::Pipe => metadata_for_pipe(agent_id, entry.keyspace_key as u16),
         FdKind::Socket => metadata_for_socket(
             agent_id,
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_LISTENER_MARKER
+            {
                 entry.keyspace_id
             } else {
                 entry.mailbox_id
@@ -871,6 +952,146 @@ fn copy_proc_self_exe_target<'a>(agent_id: u16, dst: &'a mut [u8; MAX_PATH]) -> 
     }
 }
 
+fn parse_proc_self_fd_path(path: &[u8]) -> Option<i32> {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let suffix = path.strip_prefix(PREFIX)?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    let mut fd = 0i32;
+    for &ch in suffix {
+        if !ch.is_ascii_digit() {
+            return None;
+        }
+        fd = fd.checked_mul(10)?.checked_add((ch - b'0') as i32)?;
+    }
+    Some(fd)
+}
+
+fn proc_fd_entry(agent_id: u16, fd: i32) -> Option<FdEntry> {
+    let st = state::get_files_state(agent_id)?;
+    let entry = st.get_fd(fd)?;
+    entry.active.then_some(*entry)
+}
+
+fn special_file_path(special: super::vfs::SpecialFile) -> &'static [u8] {
+    match special {
+        super::vfs::SpecialFile::Null => b"/dev/null",
+        super::vfs::SpecialFile::Urandom => b"/dev/urandom",
+        super::vfs::SpecialFile::ProcSelfExe => b"/proc/self/exe",
+        super::vfs::SpecialFile::ProcSelfMaps => b"/proc/self/maps",
+        super::vfs::SpecialFile::ProcSelfCgroup => b"/proc/self/cgroup",
+        super::vfs::SpecialFile::ProcMeminfo => b"/proc/meminfo",
+        super::vfs::SpecialFile::ProcVersionSignature => b"/proc/version_signature",
+        super::vfs::SpecialFile::SysCpuOnline => b"/sys/devices/system/cpu/online",
+        super::vfs::SpecialFile::SysCgroupMemoryMax => b"/sys/fs/cgroup/memory.max",
+        super::vfs::SpecialFile::SysCgroupMemoryHigh => b"/sys/fs/cgroup/memory.high",
+    }
+}
+
+fn proc_fd_path_for_regular_file(
+    agent_id: u16,
+    entry: &FdEntry,
+    dst: &mut [u8; MAX_PATH],
+) -> Option<usize> {
+    if let Some(special) = special_file_for_fd(entry) {
+        let path = special_file_path(special);
+        dst[..path.len()].copy_from_slice(path);
+        return Some(path.len());
+    }
+
+    if entry.keyspace_key == 0 && entry.mailbox_id == 0 {
+        let path = b"/dev/console";
+        dst[..path.len()].copy_from_slice(path);
+        return Some(path.len());
+    }
+
+    if entry.keyspace_id == super::vfs::BASE_IMAGE_KEYSPACE {
+        if let Some(base) = crate::base_image::find_by_key(entry.keyspace_key) {
+            let path = base.path.as_bytes();
+            dst[..path.len()].copy_from_slice(path);
+            return Some(path.len());
+        }
+    }
+
+    let mut exe_buf = [0u8; MAX_PATH];
+    let exe_path = copy_proc_self_exe_target(agent_id, &mut exe_buf);
+    let (exe_ks, exe_key) = super::vfs::resolve_path(agent_id, exe_path);
+    if entry.keyspace_id == exe_ks && entry.keyspace_key == exe_key {
+        dst[..exe_path.len()].copy_from_slice(exe_path);
+        return Some(exe_path.len());
+    }
+
+    let mut found_len = 0usize;
+    state::iter_mutable_paths_kind(agent_id, |path, kind| {
+        if kind == state::MutablePathKind::Directory {
+            return true;
+        }
+        let (ks, key) = super::vfs::resolve_path(agent_id, path);
+        if ks == entry.keyspace_id && key == entry.keyspace_key {
+            found_len = path.len();
+            dst[..found_len].copy_from_slice(path);
+            return false;
+        }
+        true
+    });
+    (found_len > 0).then_some(found_len)
+}
+
+fn proc_fd_target_path<'a>(
+    agent_id: u16,
+    fd: i32,
+    entry: &FdEntry,
+    dst: &'a mut [u8; MAX_PATH],
+) -> &'a [u8] {
+    if entry.kind == FdKind::File {
+        if let Some(len) = proc_fd_path_for_regular_file(agent_id, entry, dst) {
+            return &dst[..len];
+        }
+    } else if entry.kind == FdKind::Directory {
+        if let Some(st) = state::get_files_state(agent_id) {
+            if let Some(handle) = st.get_directory_handle(entry.keyspace_key as u16) {
+                let len = handle.path_len as usize;
+                dst[..len].copy_from_slice(&handle.path[..len]);
+                return &dst[..len];
+            }
+        }
+    }
+
+    let mut out = FixedBuf::new(dst);
+    match entry.kind {
+        FdKind::Pipe => {
+            let _ = write!(out, "pipe:[{}]", stat_ino_for_key(entry.keyspace_key));
+        }
+        FdKind::Socket => {
+            let inode = if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_LISTENER_MARKER
+            {
+                stat_ino_for_key(entry.keyspace_id as u64)
+            } else {
+                stat_ino_for_key(entry.mailbox_id as u64)
+            };
+            let _ = write!(out, "socket:[{}]", inode);
+        }
+        FdKind::EventFd => {
+            let _ = out.write_bytes(b"anon_inode:[eventfd]");
+        }
+        FdKind::TimerFd => {
+            let _ = out.write_bytes(b"anon_inode:[timerfd]");
+        }
+        FdKind::Epoll => {
+            let _ = out.write_bytes(b"anon_inode:[eventpoll]");
+        }
+        FdKind::File | FdKind::Directory => {
+            let _ = write!(out, "/proc/self/fd/{}", fd);
+        }
+    }
+    let len = out.len();
+    &dst[..len]
+}
+
 fn metadata_for_regular_lookup(agent_id: u16, path: &[u8]) -> Result<LinuxStatMeta, i64> {
     let (ks, key) = super::vfs::resolve_path(agent_id, path);
     let file_size = crate::state::query_file_size(ks, key);
@@ -901,7 +1122,35 @@ fn metadata_for_proc_self_exe_target(agent_id: u16) -> LinuxStatMeta {
     )
 }
 
+fn metadata_for_symlink(agent_id: u16, path: &[u8], target_len: u64) -> LinuxStatMeta {
+    let (uid, gid) = agent_uid_gid(agent_id);
+    LinuxStatMeta {
+        st_dev: stat_dev_for_keyspace(state::fs_owner(agent_id)),
+        st_ino: stat_ino_for_key(path_to_key(path)),
+        st_mode: MODE_LNK_0777,
+        st_nlink: 1,
+        st_uid: uid,
+        st_gid: gid,
+        st_rdev: 0,
+        st_size: target_len,
+        st_blksize: 4096,
+        st_blocks: 0,
+    }
+}
+
 fn metadata_for_path(agent_id: u16, path: &[u8], flags: u32) -> Result<LinuxStatMeta, i64> {
+    if let Some(fd) = parse_proc_self_fd_path(path) {
+        let Some(entry) = proc_fd_entry(agent_id, fd) else {
+            return Err(-ENOENT);
+        };
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            let mut target_buf = [0u8; MAX_PATH];
+            let target = proc_fd_target_path(agent_id, fd, &entry, &mut target_buf);
+            return Ok(metadata_for_symlink(agent_id, path, target.len() as u64));
+        }
+        return Ok(metadata_for_fd(agent_id, &entry));
+    }
+
     if let Some(special) = super::vfs::is_special_path(path) {
         if special == super::vfs::SpecialFile::ProcSelfExe
             && (flags & AT_SYMLINK_NOFOLLOW) == 0
@@ -909,6 +1158,32 @@ fn metadata_for_path(agent_id: u16, path: &[u8], flags: u32) -> Result<LinuxStat
             return Ok(metadata_for_proc_self_exe_target(agent_id));
         }
         return Ok(metadata_for_special(agent_id, special));
+    }
+
+    if let Some(kind) = state::lookup_mutable_path_kind(agent_id, path) {
+        match kind {
+            state::MutablePathKind::Directory => {
+                return Ok(metadata_for_directory(agent_id, path_to_key(path)));
+            }
+            state::MutablePathKind::Symlink => {
+                let mut target_buf = [0u8; MAX_PATH];
+                let Some(target) =
+                    state::lookup_mutable_symlink_target(agent_id, path, &mut target_buf)
+                else {
+                    return Err(-ENOENT);
+                };
+                if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+                    return Ok(metadata_for_symlink(agent_id, path, target.len() as u64));
+                }
+                let mut resolved_buf = [0u8; MAX_PATH];
+                let resolved = follow_mutable_symlinks(agent_id, path, true, &mut resolved_buf)?;
+                if resolved == path {
+                    return Ok(metadata_for_symlink(agent_id, path, target.len() as u64));
+                }
+                return metadata_for_path(agent_id, resolved, flags);
+            }
+            state::MutablePathKind::File => {}
+        }
     }
 
     if is_directory_path(agent_id, path) {
@@ -1087,14 +1362,16 @@ fn resolve_open_path<'a>(
     agent_id: u16,
     path: &[u8],
     dst: &'a mut [u8; MAX_PATH],
-) -> (&'a [u8], bool, bool) {
-    if super::vfs::is_special_path(path) == Some(super::vfs::SpecialFile::ProcSelfExe) {
-        return (copy_proc_self_exe_target(agent_id, dst), false, true);
+) -> Result<(&'a [u8], bool, bool), i64> {
+    let mut resolved_buf = [0u8; MAX_PATH];
+    let resolved = follow_mutable_symlinks(agent_id, path, true, &mut resolved_buf)?;
+    if super::vfs::is_special_path(resolved) == Some(super::vfs::SpecialFile::ProcSelfExe) {
+        return Ok((copy_proc_self_exe_target(agent_id, dst), false, true));
     }
-    let is_special = super::vfs::is_special_path(path).is_some();
-    let len = path.len().min(MAX_PATH);
-    dst[..len].copy_from_slice(&path[..len]);
-    (&dst[..len], is_special, false)
+    let is_special = super::vfs::is_special_path(resolved).is_some();
+    let len = resolved.len().min(MAX_PATH);
+    dst[..len].copy_from_slice(&resolved[..len]);
+    Ok((&dst[..len], is_special, false))
 }
 
 fn special_file_for_fd(entry: &FdEntry) -> Option<super::vfs::SpecialFile> {
@@ -1690,7 +1967,7 @@ fn collect_mutable_children(
     dtypes: &mut [u8; MAX_DIRENTS_COLLECT],
     count: &mut usize,
 ) {
-    state::iter_mutable_paths(agent_id, |path, is_dir| {
+    state::iter_mutable_paths_kind(agent_id, |path, kind| {
         if path == dir_path || path.len() <= dir_path.len() {
             return true;
         }
@@ -1720,7 +1997,11 @@ fn collect_mutable_children(
                 dtypes,
                 count,
                 remainder,
-                if is_dir { DT_DIR } else { DT_REG },
+                match kind {
+                    state::MutablePathKind::Directory => DT_DIR,
+                    state::MutablePathKind::Symlink => DT_LNK,
+                    state::MutablePathKind::File => DT_REG,
+                },
             );
         }
         true
@@ -1948,7 +2229,9 @@ pub fn sys_read(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
             if !fd_allows_read(kind, flags) {
                 return -EBADF;
             }
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+            {
                 let Some((read_handle, _write_handle)) = state::unix_stream_handles(entry.keyspace_id) else {
                     return -EBADF;
                 };
@@ -2284,7 +2567,9 @@ pub fn sys_write(agent_id: u16, fd: i32, buf_ptr: u64, count: u64) -> i64 {
             if !fd_allows_write(kind, flags) {
                 return -EBADF;
             }
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+            {
                 if (flags & super::network::FD_FLAG_SHUT_WR) != 0 {
                     return -EPIPE;
                 }
@@ -2466,7 +2751,11 @@ pub fn sys_openat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32, mode
     };
     let trace_python = super::state::trace_runtime_agent(agent_id);
     let mut open_path_buf = [0u8; MAX_PATH];
-    let (open_path, is_special, synthetic_ok) = resolve_open_path(agent_id, path, &mut open_path_buf);
+    let (open_path, is_special, synthetic_ok) =
+        match resolve_open_path(agent_id, path, &mut open_path_buf) {
+            Ok(values) => values,
+            Err(err) => return err,
+        };
     if trace_python {
         crate::serial_println!(
             "[PYDBG] openat-enter agent={} dirfd={} flags={:#x} mode={:#x} path={:?}",
@@ -2687,6 +2976,85 @@ pub fn sys_fstat(agent_id: u16, fd: i32, statbuf_ptr: u64) -> i64 {
 /// Write a populated `struct stat` to user memory.
 fn fill_stat_buf(ptr: u64, file_size: u64, st_dev: u64, st_ino: u64) {
     let _ = (ptr, file_size, st_dev, st_ino);
+}
+
+fn validate_utimens_timespecs(agent_id: u16, times_ptr: u64) -> i64 {
+    if times_ptr == 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 32];
+    if !copy_from_user(agent_id, times_ptr, &mut buf) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// Update file timestamps by pathname or file descriptor.
+///
+/// TOS currently treats timestamp updates as metadata-preserving no-ops, but
+/// the syscall still validates the Linux-visible contract so normal userland
+/// tools such as `touch` stop failing with `ENOSYS`.
+pub fn sys_utimensat(
+    agent_id: u16,
+    dirfd: i32,
+    pathname_ptr: u64,
+    times_ptr: u64,
+    flags: u32,
+) -> i64 {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+
+    let ret = validate_utimens_timespecs(agent_id, times_ptr);
+    if ret != 0 {
+        return ret;
+    }
+
+    if pathname_ptr == 0 {
+        if dirfd < 0 {
+            return -EFAULT;
+        }
+        let st = match state::get_files_state(agent_id) {
+            Some(s) => s,
+            None => return -EBADF,
+        };
+        let Some(entry) = st.get_fd(dirfd).filter(|entry| entry.active) else {
+            return -EBADF;
+        };
+        let _ = metadata_for_fd(agent_id, entry);
+        return 0;
+    }
+
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, pathname_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if path_len == 0 {
+        if (flags & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+            let st = match state::get_files_state(agent_id) {
+                Some(s) => s,
+                None => return -EBADF,
+            };
+            let Some(entry) = st.get_fd(dirfd).filter(|entry| entry.active) else {
+                return -EBADF;
+            };
+            let _ = metadata_for_fd(agent_id, entry);
+            return 0;
+        }
+        return -ENOENT;
+    }
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let path = match resolve_path_at(agent_id, dirfd, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    match metadata_for_path(agent_id, path, flags) {
+        Ok(_) => 0,
+        Err(err) => err,
+    }
 }
 
 // ── sys_newfstatat ─────────────────────────────────────────────────────────
@@ -3037,8 +3405,7 @@ pub fn sys_faccessat2(
 
 /// Read the target of a symbolic link.
 ///
-/// `/proc/self/exe` is handled specially and returns `"/app/binary"`.
-/// All other paths return `-EINVAL` (no real symlinks).
+/// `/proc/self/exe` and mutable symlinks are handled specially.
 fn readlink_path(agent_id: u16, path: &[u8], buf_ptr: u64, bufsiz: u64) -> i64 {
     let trace_python = super::state::trace_runtime_agent(agent_id);
     if trace_python {
@@ -3058,6 +3425,44 @@ fn readlink_path(agent_id: u16, path: &[u8], buf_ptr: u64, bufsiz: u64) -> i64 {
         };
         let to_copy = (bufsiz as usize).min(result.len());
         if !write_user_mem(agent_id, buf_ptr, &result[..to_copy]) {
+            return -EFAULT;
+        }
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] readlink-exit agent={} ret={} path={:?}",
+                agent_id,
+                to_copy,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+        }
+        return to_copy as i64;
+    }
+
+    if let Some(fd) = parse_proc_self_fd_path(path) {
+        let Some(entry) = proc_fd_entry(agent_id, fd) else {
+            return -ENOENT;
+        };
+        let mut fd_target_buf = [0u8; MAX_PATH];
+        let result = proc_fd_target_path(agent_id, fd, &entry, &mut fd_target_buf);
+        let to_copy = (bufsiz as usize).min(result.len());
+        if !write_user_mem(agent_id, buf_ptr, &result[..to_copy]) {
+            return -EFAULT;
+        }
+        if trace_python {
+            crate::serial_println!(
+                "[PYDBG] readlink-exit agent={} ret={} path={:?}",
+                agent_id,
+                to_copy,
+                core::str::from_utf8(path).unwrap_or("?")
+            );
+        }
+        return to_copy as i64;
+    }
+
+    let mut target_buf = [0u8; MAX_PATH];
+    if let Some(target) = state::lookup_mutable_symlink_target(agent_id, path, &mut target_buf) {
+        let to_copy = (bufsiz as usize).min(target.len());
+        if !write_user_mem(agent_id, buf_ptr, &target[..to_copy]) {
             return -EFAULT;
         }
         if trace_python {
@@ -3517,6 +3922,16 @@ pub fn sys_dup3(agent_id: u16, oldfd: i32, newfd: i32, flags: u32) -> i64 {
 /// is marked inactive.  Returns 0 on success or `-ENOENT` if the key
 /// did not exist.
 fn rename_regular_file(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
+    let mut target_buf = [0u8; MAX_PATH];
+    if let Some(target) = state::lookup_mutable_symlink_target(agent_id, old_path, &mut target_buf)
+    {
+        state::remove_mutable_path(agent_id, old_path);
+        if !state::record_mutable_symlink(agent_id, new_path, target) {
+            return -ENOSPC;
+        }
+        return 0;
+    }
+
     let (old_ks, old_key) = super::vfs::resolve_path(agent_id, old_path);
     if crate::state::query_file_size(old_ks, old_key) == 0
         && crate::state::state_get(old_ks, old_key).is_none()
@@ -3542,10 +3957,19 @@ fn rename_regular_file(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
 }
 
 fn rename_directory_tree(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64 {
-    let mut entries: Vec<(Vec<u8>, bool)> = Vec::new();
-    state::iter_mutable_paths(agent_id, |path, is_dir| {
+    let mut entries: Vec<(Vec<u8>, state::MutablePathKind, Vec<u8>)> = Vec::new();
+    state::iter_mutable_paths_kind(agent_id, |path, kind| {
         if path_is_same_or_child(path, old_path) {
-            entries.push((path.to_vec(), is_dir));
+            let mut target = Vec::new();
+            if kind == state::MutablePathKind::Symlink {
+                let mut target_buf = [0u8; MAX_PATH];
+                if let Some(link_target) =
+                    state::lookup_mutable_symlink_target(agent_id, path, &mut target_buf)
+                {
+                    target.extend_from_slice(link_target);
+                }
+            }
+            entries.push((path.to_vec(), kind, target));
         }
         true
     });
@@ -3555,17 +3979,23 @@ fn rename_directory_tree(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64
     }
 
     let mut files_to_copy: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut new_entries: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut new_entries: Vec<(Vec<u8>, state::MutablePathKind, Vec<u8>)> = Vec::new();
 
-    for (path, is_dir) in &entries {
+    for (path, kind, target) in &entries {
         let Some(new_entry_path) = renamed_path(old_path, new_path, path) else {
             return -EINVAL;
         };
-        if *is_dir {
-            new_entries.push((new_entry_path, true));
-        } else {
-            files_to_copy.push((path.clone(), new_entry_path.clone()));
-            new_entries.push((new_entry_path, false));
+        match kind {
+            state::MutablePathKind::Directory => {
+                new_entries.push((new_entry_path, *kind, Vec::new()));
+            }
+            state::MutablePathKind::Symlink => {
+                new_entries.push((new_entry_path, *kind, target.clone()));
+            }
+            state::MutablePathKind::File => {
+                files_to_copy.push((path.clone(), new_entry_path.clone()));
+                new_entries.push((new_entry_path, *kind, Vec::new()));
+            }
         }
     }
 
@@ -3588,11 +4018,20 @@ fn rename_directory_tree(agent_id: u16, old_path: &[u8], new_path: &[u8]) -> i64
         let _ = crate::state::state_delete(old_ks, old_key);
     }
 
-    for (old_entry, _) in &entries {
+    for (old_entry, _, _) in &entries {
         state::remove_mutable_path(agent_id, old_entry);
     }
-    for (new_entry, is_dir) in &new_entries {
-        if !state::record_mutable_path(agent_id, new_entry, *is_dir) {
+    for (new_entry, kind, target) in &new_entries {
+        let ok = match kind {
+            state::MutablePathKind::Directory => {
+                state::record_mutable_path(agent_id, new_entry, true)
+            }
+            state::MutablePathKind::File => state::record_mutable_path(agent_id, new_entry, false),
+            state::MutablePathKind::Symlink => {
+                state::record_mutable_symlink(agent_id, new_entry, target)
+            }
+        };
+        if !ok {
             return -ENOSPC;
         }
     }
@@ -3722,6 +4161,11 @@ pub fn sys_unlink(agent_id: u16, pathname_ptr: u64) -> i64 {
         Err(err) => return err,
     };
 
+    if state::lookup_mutable_path_kind(agent_id, path) == Some(state::MutablePathKind::Symlink) {
+        state::remove_mutable_path(agent_id, path);
+        return 0;
+    }
+
     let (ks, key) = super::vfs::resolve_path(agent_id, path);
     match crate::state::state_delete(ks, key) {
         Ok(()) => {
@@ -3770,6 +4214,11 @@ pub fn sys_unlinkat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32) ->
         return -EISDIR;
     }
 
+    if state::lookup_mutable_path_kind(agent_id, path) == Some(state::MutablePathKind::Symlink) {
+        state::remove_mutable_path(agent_id, path);
+        return 0;
+    }
+
     let (ks, key) = super::vfs::resolve_path(agent_id, path);
     match crate::state::state_delete(ks, key) {
         Ok(()) => {
@@ -3782,6 +4231,54 @@ pub fn sys_unlinkat(agent_id: u16, dirfd: i32, pathname_ptr: u64, flags: u32) ->
 
 pub fn sys_rmdir(agent_id: u16, pathname_ptr: u64) -> i64 {
     sys_unlinkat(agent_id, AT_FDCWD, pathname_ptr, AT_REMOVEDIR)
+}
+
+pub fn sys_symlinkat(agent_id: u16, target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> i64 {
+    let mut target_buf = [0u8; MAX_PATH];
+    let target_len = match read_pathname(agent_id, target_ptr, &mut target_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if target_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut path_buf = [0u8; MAX_PATH];
+    let path_len = match read_pathname(agent_id, linkpath_ptr, &mut path_buf) {
+        Ok(len) => len,
+        Err(err) => return err,
+    };
+    if path_len == 0 {
+        return -ENOENT;
+    }
+
+    let mut norm_buf = [0u8; MAX_PATH];
+    let link_path = match resolve_path_at(agent_id, newdirfd, &path_buf[..path_len], &mut norm_buf) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    if super::vfs::classify_base_image_path(link_path).is_some()
+        || super::vfs::is_special_path(link_path).is_some()
+    {
+        return -EROFS;
+    }
+    if !mutable_parent_exists(agent_id, link_path) {
+        return -ENOENT;
+    }
+    if state::lookup_mutable_path_kind(agent_id, link_path).is_some() {
+        return -EEXIST;
+    }
+
+    let (ks, key) = super::vfs::resolve_path(agent_id, link_path);
+    if crate::state::query_file_size(ks, key) > 0 || crate::state::state_get(ks, key).is_some() {
+        return -EEXIST;
+    }
+
+    if !state::record_mutable_symlink(agent_id, link_path, &target_buf[..target_len]) {
+        return -ENOSPC;
+    }
+    0
 }
 
 // ── sys_mkdir ──────────────────────────────────────────────────────────────
@@ -4052,7 +4549,9 @@ pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
                     .unwrap_or(0)
                     .min(i32::MAX as usize) as i32,
                 FdKind::Socket => {
-                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                        || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                    {
                         let Some((read_handle, _write_handle)) =
                             state::unix_stream_handles(entry.keyspace_id)
                         else {
@@ -4060,6 +4559,9 @@ pub fn sys_ioctl(agent_id: u16, fd: i32, cmd: u64, arg: u64) -> i64 {
                         };
                         state::pipe_available(read_handle)
                             .unwrap_or(0)
+                            .min(i32::MAX as usize) as i32
+                    } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                        state::local_listener_pending_count(entry.keyspace_id)
                             .min(i32::MAX as usize) as i32
                     } else {
                         match crate::mailbox::get_mailbox(entry.mailbox_id) {
@@ -4176,12 +4678,40 @@ pub fn sys_poll(agent_id: u16, fds: u64, nfds: u64, _timeout: i32) -> i64 {
                         }
                     }
                     FdKind::Socket => {
-                        if events & POLLOUT != 0 && fd_allows_write(entry.kind, entry.flags) {
-                            r |= POLLOUT;
-                        }
-                        if events & POLLIN != 0 && fd_allows_read(entry.kind, entry.flags) {
-                            if crate::mailbox::mailbox_fd_read_ready(entry.mailbox_id) {
+                        if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                            || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                        {
+                            if let Some((read_handle, write_handle)) =
+                                state::unix_stream_handles(entry.keyspace_id)
+                            {
+                                if events & POLLOUT != 0
+                                    && fd_allows_write(entry.kind, entry.flags)
+                                    && state::pipe_write_ready(write_handle)
+                                {
+                                    r |= POLLOUT;
+                                }
+                                if events & POLLIN != 0
+                                    && fd_allows_read(entry.kind, entry.flags)
+                                    && state::pipe_read_ready(read_handle)
+                                {
+                                    r |= POLLIN;
+                                }
+                            }
+                        } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                            if events & POLLIN != 0
+                                && fd_allows_read(entry.kind, entry.flags)
+                                && state::local_listener_read_ready(entry.keyspace_id)
+                            {
                                 r |= POLLIN;
+                            }
+                        } else {
+                            if events & POLLOUT != 0 && fd_allows_write(entry.kind, entry.flags) {
+                                r |= POLLOUT;
+                            }
+                            if events & POLLIN != 0 && fd_allows_read(entry.kind, entry.flags) {
+                                if crate::mailbox::mailbox_fd_read_ready(entry.mailbox_id) {
+                                    r |= POLLIN;
+                                }
                             }
                         }
                     }
@@ -4492,7 +5022,9 @@ pub fn sys_select(
                         && state::pipe_write_ready(entry.keyspace_key as u16),
                 ),
                 FdKind::Socket => {
-                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+                    if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                        || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+                    {
                         match state::unix_stream_handles(entry.keyspace_id) {
                             Some((read_handle, write_handle)) => (
                                 fd_allows_read(entry.kind, entry.flags)
@@ -4502,6 +5034,12 @@ pub fn sys_select(
                             ),
                             None => (false, false),
                         }
+                    } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                        (
+                            fd_allows_read(entry.kind, entry.flags)
+                                && state::local_listener_read_ready(entry.keyspace_id),
+                            false,
+                        )
                     } else {
                         let readable = fd_allows_read(entry.kind, entry.flags)
                             && crate::mailbox::mailbox_fd_read_ready(entry.mailbox_id);
@@ -4606,6 +5144,17 @@ pub fn sys_fsync(agent_id: u16, fd: i32) -> i64 {
 
 pub fn sys_fdatasync(agent_id: u16, fd: i32) -> i64 {
     sys_fsync(agent_id, fd)
+}
+
+pub fn sys_fadvise64(agent_id: u16, fd: i32, _offset: u64, _len: u64, _advice: i32) -> i64 {
+    let st = match state::get_files_state(agent_id) {
+        Some(s) => s,
+        None => return -EBADF,
+    };
+    match st.get_fd(fd) {
+        Some(entry) if entry.active => 0,
+        _ => -EBADF,
+    }
 }
 
 pub fn sys_sync() -> i64 {

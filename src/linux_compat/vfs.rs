@@ -114,6 +114,10 @@ pub fn classify_base_image_path(path: &[u8]) -> Option<(BaseImageNamespace, &[u8
         return Some((BaseImageNamespace::UsrBin, &path[9..]));
     }
 
+    if starts_with(path, b"/bin/") {
+        return Some((BaseImageNamespace::UsrBin, &path[5..]));
+    }
+
     if starts_with(path, b"/jdk/") {
         return Some((BaseImageNamespace::Jdk, &path[5..]));
     }
@@ -132,6 +136,7 @@ pub fn classify_base_image_path(path: &[u8]) -> Option<(BaseImageNamespace, &[u8
 /// | `/lib/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:lib/" + filename)` |
 /// | `/usr/lib/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:lib/" + filename)` |
 /// | `/usr/bin/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:usrbin/" + relative)` |
+/// | `/bin/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:usrbin/" + relative)` |
 /// | `/jdk/` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:jdk/" + relative)` |
 /// | `/etc/*` | `BASE_IMAGE_KEYSPACE` | `sha256_key("base:etc/" + relative)` |
 /// | `/app/` | current Linux process keyspace | `sha256_key(path)` |

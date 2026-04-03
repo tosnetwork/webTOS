@@ -3,7 +3,10 @@
 //! Each agent running in Linux-compat mode gets its own virtual fd table,
 //! cwd, brk pointer, mmap region, identity, etc.
 
-use super::constants::{O_CLOEXEC, SOCKETPAIR_STREAM_MARKER};
+use super::constants::{
+    LOCAL_INET_LISTENER_MARKER, LOCAL_INET_STREAM_MARKER, O_CLOEXEC,
+    SOCKETPAIR_STREAM_MARKER, SOCKET_FD_FLAG_SHUT_RD, SOCKET_FD_FLAG_SHUT_WR,
+};
 use crate::{
     agent::{self, MAX_AGENTS},
     serial_println,
@@ -22,6 +25,8 @@ pub const MAX_MUTABLE_PATHS: usize = 4096;
 pub const MAX_PROCESS_OBJECTS: usize = MAX_LINUX_AGENTS;
 pub const MAX_MAPPED_OBJECTS: usize = MAX_VMAS;
 pub const MAX_UNIX_STREAMS: usize = 256;
+pub const MAX_LOCAL_LISTENERS: usize = 256;
+pub const MAX_LOCAL_LISTENER_PENDING: usize = 32;
 pub const PIPE_BUFFER_SIZE: usize = 16 * 1024;
 pub const DEFAULT_MMAP_BASE: u64 = 0x1_0000_0000;
 const O_ACCMODE: u32 = 3;
@@ -80,9 +85,19 @@ pub struct DirectoryHandle {
 pub struct MutablePathEntry {
     pub active: bool,
     pub owner: u16,
-    pub is_dir: bool,
+    pub kind: MutablePathKind,
     pub path_len: u16,
     pub path: [u8; MAX_PATH],
+    pub target_len: u16,
+    pub target: [u8; MAX_PATH],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MutablePathKind {
+    File = 0,
+    Directory = 1,
+    Symlink = 2,
 }
 
 impl MutablePathEntry {
@@ -90,9 +105,11 @@ impl MutablePathEntry {
         MutablePathEntry {
             active: false,
             owner: 0,
-            is_dir: false,
+            kind: MutablePathKind::File,
             path_len: 0,
             path: [0u8; MAX_PATH],
+            target_len: 0,
+            target: [0u8; MAX_PATH],
         }
     }
 }
@@ -194,6 +211,29 @@ pub struct UnixStreamObject {
     pub refs: u16,
 }
 
+#[derive(Clone, Copy)]
+pub struct LocalListenerObject {
+    pub active: bool,
+    pub packed_addr: u64,
+    pub refs: u16,
+    pub backlog: u16,
+    pub pending_len: u16,
+    pub pending: [u16; MAX_LOCAL_LISTENER_PENDING],
+}
+
+impl LocalListenerObject {
+    pub const fn empty() -> Self {
+        LocalListenerObject {
+            active: false,
+            packed_addr: 0,
+            refs: 0,
+            backlog: 0,
+            pending_len: 0,
+            pending: [0; MAX_LOCAL_LISTENER_PENDING],
+        }
+    }
+}
+
 impl UnixStreamObject {
     pub const fn empty() -> Self {
         UnixStreamObject {
@@ -211,6 +251,8 @@ impl UnixStreamObject {
 pub struct LinuxProcessObject {
     pub active: bool,
     pub pid: u32,
+    pub pgid: u32,
+    pub sid: u32,
     pub leader_id: u16,
     pub parent_leader_id: u16,
     pub vfork_parent: u16,
@@ -225,6 +267,8 @@ impl LinuxProcessObject {
         LinuxProcessObject {
             active: false,
             pid: 0,
+            pgid: 0,
+            sid: 0,
             leader_id: 0,
             parent_leader_id: 0,
             vfork_parent: 0,
@@ -379,6 +423,7 @@ pub struct LinuxAgentState {
     pub pr_keepcaps: u8,
     pub pr_no_new_privs: u8,
     pub prctl_pad: u8,
+    pub umask: u16,
     pub sigaltstack_sp: u64,    // alternate signal stack base
     pub sigaltstack_size: u64,  // alternate signal stack size
     pub sigaltstack_flags: u32, // alternate signal stack attribute flags
@@ -458,6 +503,7 @@ impl LinuxAgentState {
             pr_keepcaps: 0,
             pr_no_new_privs: 0,
             prctl_pad: 0,
+            umask: 0o022,
             sigaltstack_sp: 0,
             sigaltstack_size: 0,
             sigaltstack_flags: 0,
@@ -597,8 +643,12 @@ fn retain_fd_mailboxes(entry: &FdEntry) {
             }
         }
         FdKind::Socket => {
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+            {
                 retain_unix_stream(entry.keyspace_id);
+            } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                retain_local_listener(entry.keyspace_id);
             } else {
                 if entry.mailbox_id as usize >= crate::agent::MAX_AGENTS {
                     crate::mailbox::retain_reader_fd(entry.mailbox_id);
@@ -625,8 +675,12 @@ fn release_fd_mailboxes(entry: &FdEntry) {
             }
         }
         FdKind::Socket => {
-            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER {
-                release_unix_stream(entry.keyspace_id);
+            if entry.keyspace_key == SOCKETPAIR_STREAM_MARKER
+                || entry.keyspace_key == LOCAL_INET_STREAM_MARKER
+            {
+                release_unix_stream_fd(entry.keyspace_id, entry.flags);
+            } else if entry.keyspace_key == LOCAL_INET_LISTENER_MARKER {
+                release_local_listener(entry.keyspace_id);
             } else {
                 if entry.mailbox_id as usize >= crate::agent::MAX_AGENTS {
                     crate::mailbox::release_reader_fd(entry.mailbox_id);
@@ -700,6 +754,8 @@ static mut MAPPED_OBJECTS: [MappedObject; MAX_MAPPED_OBJECTS] =
     [const { MappedObject::empty() }; MAX_MAPPED_OBJECTS];
 static mut UNIX_STREAM_OBJECTS: [UnixStreamObject; MAX_UNIX_STREAMS] =
     [const { UnixStreamObject::empty() }; MAX_UNIX_STREAMS];
+static mut LOCAL_LISTENER_OBJECTS: [LocalListenerObject; MAX_LOCAL_LISTENERS] =
+    [const { LocalListenerObject::empty() }; MAX_LOCAL_LISTENERS];
 static mut EVENTFD_OBJECTS: [EventFdObject; MAX_EVENTFDS] =
     [const { EventFdObject::empty() }; MAX_EVENTFDS];
 static mut TIMERFD_OBJECTS: [TimerFdObject; MAX_TIMERFDS] =
@@ -707,6 +763,7 @@ static mut TIMERFD_OBJECTS: [TimerFdObject; MAX_TIMERFDS] =
 static mut PIPE_OBJECTS: [PipeObject; MAX_PIPES] = [const { PipeObject::empty() }; MAX_PIPES];
 static mut MUTABLE_PATHS: [MutablePathEntry; MAX_MUTABLE_PATHS] =
     [const { MutablePathEntry::empty() }; MAX_MUTABLE_PATHS];
+static mut NEXT_EPHEMERAL_LOOPBACK_PORT: u16 = 40000;
 
 #[inline]
 fn find_state_slot(agent_id: u16) -> Option<usize> {
@@ -757,6 +814,16 @@ pub fn process_pid(agent_id: u16) -> Option<u32> {
     get_process_object(handle).map(|obj| obj.pid)
 }
 
+pub fn process_pgid(agent_id: u16) -> Option<u32> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle).map(|obj| obj.pgid)
+}
+
+pub fn process_sid(agent_id: u16) -> Option<u32> {
+    let handle = process_object_id(agent_id)?;
+    get_process_object(handle).map(|obj| obj.sid)
+}
+
 pub fn process_leader(agent_id: u16) -> Option<u16> {
     let handle = process_object_id(agent_id)?;
     get_process_object(handle).map(|obj| obj.leader_id)
@@ -787,6 +854,28 @@ pub fn set_process_membarrier_registrations(agent_id: u16, flags: u32) {
     if let Some(obj) = get_process_object_mut(handle) {
         obj.membarrier_registrations = flags;
     }
+}
+
+pub fn set_process_pgid(agent_id: u16, pgid: u32) -> bool {
+    let Some(handle) = process_object_id(agent_id) else {
+        return false;
+    };
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.pgid = pgid;
+        return true;
+    }
+    false
+}
+
+pub fn set_process_sid(agent_id: u16, sid: u32) -> bool {
+    let Some(handle) = process_object_id(agent_id) else {
+        return false;
+    };
+    if let Some(obj) = get_process_object_mut(handle) {
+        obj.sid = sid;
+        return true;
+    }
+    false
 }
 
 pub fn record_process_exit_status(agent_id: u16, status: i32) {
@@ -945,6 +1034,37 @@ pub fn for_each_process_leader(mut f: impl FnMut(u16) -> bool) {
     }
 }
 
+pub fn process_group_exists_in_session(session_sid: u32, pgid: u32) -> bool {
+    unsafe {
+        for obj in PROCESS_OBJECTS.iter() {
+            if !obj.active || obj.pgid != pgid || obj.sid != session_sid {
+                continue;
+            }
+            if agent::get_agent_any_state(obj.leader_id).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn for_each_process_in_group(pgid: u32, mut f: impl FnMut(u16) -> bool) {
+    unsafe {
+        for obj in PROCESS_OBJECTS.iter() {
+            if !obj.active || obj.pgid != pgid {
+                continue;
+            }
+            let leader = obj.leader_id;
+            if leader == 0 || agent::get_agent_any_state(leader).is_none() {
+                continue;
+            }
+            if !f(leader) {
+                break;
+            }
+        }
+    }
+}
+
 pub fn share_process_object(child_id: u16, source_agent_id: u16) -> bool {
     let Some(source_handle) = process_object_id(source_agent_id) else {
         return false;
@@ -970,8 +1090,20 @@ pub fn configure_process_object(agent_id: u16, parent_leader_id: u16) -> bool {
     let Some(handle) = process_object_id(agent_id) else {
         return false;
     };
+    let inherited_pgid = process_pgid(parent_leader_id).unwrap_or(agent_id as u32);
+    let inherited_sid = process_sid(parent_leader_id).unwrap_or(agent_id as u32);
     if let Some(obj) = get_process_object_mut(handle) {
         obj.pid = agent_id as u32;
+        obj.pgid = if parent_leader_id != 0 {
+            inherited_pgid
+        } else {
+            agent_id as u32
+        };
+        obj.sid = if parent_leader_id != 0 {
+            inherited_sid
+        } else {
+            agent_id as u32
+        };
         obj.leader_id = agent_id;
         obj.parent_leader_id = parent_leader_id;
     }
@@ -1151,11 +1283,254 @@ pub fn release_unix_stream(handle: u16) {
     }
 }
 
+pub fn shutdown_unix_stream_read(handle: u16) {
+    let Some(idx) = unix_stream_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &UNIX_STREAM_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        release_pipe_reader(obj.read_handle);
+    }
+}
+
+pub fn shutdown_unix_stream_write(handle: u16) {
+    let Some(idx) = unix_stream_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &UNIX_STREAM_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        release_pipe_writer(obj.write_handle);
+    }
+}
+
+pub fn release_unix_stream_fd(handle: u16, flags: u32) {
+    let Some(idx) = unix_stream_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let obj = &mut UNIX_STREAM_OBJECTS[idx];
+        if !obj.active {
+            return;
+        }
+        obj.refs = obj.refs.saturating_sub(1);
+        if (flags & SOCKET_FD_FLAG_SHUT_RD) == 0 {
+            release_pipe_reader(obj.read_handle);
+        }
+        if (flags & SOCKET_FD_FLAG_SHUT_WR) == 0 {
+            release_pipe_writer(obj.write_handle);
+        }
+        if obj.refs == 0 {
+            *obj = UnixStreamObject::empty();
+        }
+    }
+}
+
 pub fn unix_stream_handles(handle: u16) -> Option<(u16, u16)> {
     let idx = unix_stream_slot(handle)?;
     unsafe {
         let obj = &UNIX_STREAM_OBJECTS[idx];
         obj.active.then_some((obj.read_handle, obj.write_handle))
+    }
+}
+
+fn packed_addr_ip(packed_addr: u64) -> u32 {
+    ((packed_addr >> 16) & 0xFFFF_FFFF) as u32
+}
+
+fn packed_addr_port(packed_addr: u64) -> u16 {
+    (packed_addr & 0xFFFF) as u16
+}
+
+fn listener_conflicts(existing: u64, candidate: u64) -> bool {
+    let existing_port = packed_addr_port(existing);
+    let candidate_port = packed_addr_port(candidate);
+    if existing_port == 0 || candidate_port == 0 || existing_port != candidate_port {
+        return false;
+    }
+    let existing_ip = packed_addr_ip(existing);
+    let candidate_ip = packed_addr_ip(candidate);
+    existing_ip == candidate_ip || existing_ip == 0 || candidate_ip == 0
+}
+
+pub fn alloc_ephemeral_loopback_port(bind_ip: u32) -> Option<u16> {
+    unsafe {
+        for _ in 0..16384 {
+            let port = NEXT_EPHEMERAL_LOOPBACK_PORT;
+            NEXT_EPHEMERAL_LOOPBACK_PORT = if NEXT_EPHEMERAL_LOOPBACK_PORT >= 60999 {
+                40000
+            } else {
+                NEXT_EPHEMERAL_LOOPBACK_PORT + 1
+            };
+            let candidate = ((bind_ip as u64) << 16) | port as u64;
+            let mut conflict = false;
+            for listener in LOCAL_LISTENER_OBJECTS.iter() {
+                if listener.active && listener_conflicts(listener.packed_addr, candidate) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if !conflict {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+pub fn alloc_local_listener(packed_addr: u64, backlog: usize) -> Option<u16> {
+    let backlog = backlog.clamp(1, MAX_LOCAL_LISTENER_PENDING);
+    unsafe {
+        for listener in LOCAL_LISTENER_OBJECTS.iter() {
+            if listener.active && listener_conflicts(listener.packed_addr, packed_addr) {
+                return None;
+            }
+        }
+        for (idx, listener) in LOCAL_LISTENER_OBJECTS.iter_mut().enumerate() {
+            if listener.active {
+                continue;
+            }
+            *listener = LocalListenerObject {
+                active: true,
+                packed_addr,
+                refs: 0,
+                backlog: backlog as u16,
+                pending_len: 0,
+                pending: [0; MAX_LOCAL_LISTENER_PENDING],
+            };
+            return Some(idx as u16);
+        }
+    }
+    None
+}
+
+pub fn retain_local_listener(handle: u16) {
+    let Some(idx) = local_listener_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let listener = &mut LOCAL_LISTENER_OBJECTS[idx];
+        if !listener.active {
+            return;
+        }
+        listener.refs = listener.refs.saturating_add(1);
+    }
+}
+
+pub fn release_local_listener(handle: u16) {
+    let Some(idx) = local_listener_slot(handle) else {
+        return;
+    };
+    unsafe {
+        let listener = &mut LOCAL_LISTENER_OBJECTS[idx];
+        if !listener.active {
+            return;
+        }
+        listener.refs = listener.refs.saturating_sub(1);
+        if listener.refs == 0 {
+            for slot in 0..listener.pending_len as usize {
+                release_unix_stream(listener.pending[slot]);
+            }
+            *listener = LocalListenerObject::empty();
+        }
+    }
+}
+
+pub fn local_listener_addr(handle: u16) -> Option<u64> {
+    let idx = local_listener_slot(handle)?;
+    unsafe {
+        let listener = &LOCAL_LISTENER_OBJECTS[idx];
+        listener.active.then_some(listener.packed_addr)
+    }
+}
+
+pub fn find_local_listener(packed_addr: u64) -> Option<u16> {
+    let target_ip = packed_addr_ip(packed_addr);
+    let target_port = packed_addr_port(packed_addr);
+    unsafe {
+        for (idx, listener) in LOCAL_LISTENER_OBJECTS.iter().enumerate() {
+            if !listener.active || packed_addr_port(listener.packed_addr) != target_port {
+                continue;
+            }
+            if packed_addr_ip(listener.packed_addr) == target_ip {
+                return Some(idx as u16);
+            }
+        }
+        for (idx, listener) in LOCAL_LISTENER_OBJECTS.iter().enumerate() {
+            if !listener.active || packed_addr_port(listener.packed_addr) != target_port {
+                continue;
+            }
+            if packed_addr_ip(listener.packed_addr) == 0 {
+                return Some(idx as u16);
+            }
+        }
+    }
+    None
+}
+
+pub fn enqueue_local_listener_pending(handle: u16, server_stream_handle: u16) -> bool {
+    let Some(idx) = local_listener_slot(handle) else {
+        return false;
+    };
+    unsafe {
+        let listener = &mut LOCAL_LISTENER_OBJECTS[idx];
+        if !listener.active
+            || listener.pending_len as usize >= MAX_LOCAL_LISTENER_PENDING
+            || listener.pending_len >= listener.backlog
+        {
+            return false;
+        }
+        retain_unix_stream(server_stream_handle);
+        listener.pending[listener.pending_len as usize] = server_stream_handle;
+        listener.pending_len += 1;
+        true
+    }
+}
+
+pub fn dequeue_local_listener_pending(handle: u16) -> Option<u16> {
+    let idx = local_listener_slot(handle)?;
+    unsafe {
+        let listener = &mut LOCAL_LISTENER_OBJECTS[idx];
+        if !listener.active || listener.pending_len == 0 {
+            return None;
+        }
+        let stream_handle = listener.pending[0];
+        let pending_len = listener.pending_len as usize;
+        for slot in 1..pending_len {
+            listener.pending[slot - 1] = listener.pending[slot];
+        }
+        listener.pending[pending_len - 1] = 0;
+        listener.pending_len -= 1;
+        Some(stream_handle)
+    }
+}
+
+pub fn local_listener_read_ready(handle: u16) -> bool {
+    let Some(idx) = local_listener_slot(handle) else {
+        return false;
+    };
+    unsafe {
+        let listener = &LOCAL_LISTENER_OBJECTS[idx];
+        listener.active && listener.pending_len > 0
+    }
+}
+
+pub fn local_listener_pending_count(handle: u16) -> usize {
+    let Some(idx) = local_listener_slot(handle) else {
+        return 0;
+    };
+    unsafe {
+        let listener = &LOCAL_LISTENER_OBJECTS[idx];
+        if listener.active {
+            listener.pending_len as usize
+        } else {
+            0
+        }
     }
 }
 
@@ -1191,6 +1566,8 @@ fn alloc_process_object(leader_id: u16, parent_leader_id: u16) -> Option<u16> {
             *obj = LinuxProcessObject::empty();
             obj.active = true;
             obj.pid = leader_id as u32;
+            obj.pgid = leader_id as u32;
+            obj.sid = leader_id as u32;
             obj.leader_id = leader_id;
             obj.parent_leader_id = parent_leader_id;
             obj.members[0] = leader_id;
@@ -1322,6 +1699,11 @@ fn unix_stream_slot(handle: u16) -> Option<usize> {
     (idx < MAX_UNIX_STREAMS).then_some(idx)
 }
 
+fn local_listener_slot(handle: u16) -> Option<usize> {
+    let idx = handle as usize;
+    (idx < MAX_LOCAL_LISTENERS).then_some(idx)
+}
+
 fn has_other_active_fs_members(owner: u16) -> bool {
     unsafe {
         for slot in LINUX_STATES.iter() {
@@ -1339,6 +1721,11 @@ fn has_other_active_fs_members(owner: u16) -> bool {
 pub fn record_mutable_path(agent_id: u16, path: &[u8], is_dir: bool) -> bool {
     let owner = fs_owner(agent_id);
     let copy_len = path.len().min(MAX_PATH);
+    let kind = if is_dir {
+        MutablePathKind::Directory
+    } else {
+        MutablePathKind::File
+    };
 
     unsafe {
         for entry in MUTABLE_PATHS.iter_mut() {
@@ -1349,7 +1736,9 @@ pub fn record_mutable_path(agent_id: u16, path: &[u8], is_dir: bool) -> bool {
                 && entry.path_len as usize == copy_len
                 && entry.path[..copy_len] == path[..copy_len]
             {
-                entry.is_dir = is_dir;
+                entry.kind = kind;
+                entry.target_len = 0;
+                entry.target = [0u8; MAX_PATH];
                 return true;
             }
         }
@@ -1361,7 +1750,7 @@ pub fn record_mutable_path(agent_id: u16, path: &[u8], is_dir: bool) -> bool {
             *entry = MutablePathEntry::empty();
             entry.active = true;
             entry.owner = owner;
-            entry.is_dir = is_dir;
+            entry.kind = kind;
             entry.path_len = copy_len as u16;
             entry.path[..copy_len].copy_from_slice(&path[..copy_len]);
             return true;
@@ -1371,7 +1760,48 @@ pub fn record_mutable_path(agent_id: u16, path: &[u8], is_dir: bool) -> bool {
     false
 }
 
-pub fn lookup_mutable_path(agent_id: u16, path: &[u8]) -> Option<bool> {
+pub fn record_mutable_symlink(agent_id: u16, path: &[u8], target: &[u8]) -> bool {
+    let owner = fs_owner(agent_id);
+    let path_len = path.len().min(MAX_PATH);
+    let target_len = target.len().min(MAX_PATH);
+
+    unsafe {
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if !entry.active {
+                continue;
+            }
+            if entry.owner == owner
+                && entry.path_len as usize == path_len
+                && entry.path[..path_len] == path[..path_len]
+            {
+                entry.kind = MutablePathKind::Symlink;
+                entry.target_len = target_len as u16;
+                entry.target = [0u8; MAX_PATH];
+                entry.target[..target_len].copy_from_slice(&target[..target_len]);
+                return true;
+            }
+        }
+
+        for entry in MUTABLE_PATHS.iter_mut() {
+            if entry.active {
+                continue;
+            }
+            *entry = MutablePathEntry::empty();
+            entry.active = true;
+            entry.owner = owner;
+            entry.kind = MutablePathKind::Symlink;
+            entry.path_len = path_len as u16;
+            entry.path[..path_len].copy_from_slice(&path[..path_len]);
+            entry.target_len = target_len as u16;
+            entry.target[..target_len].copy_from_slice(&target[..target_len]);
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn lookup_mutable_path_kind(agent_id: u16, path: &[u8]) -> Option<MutablePathKind> {
     let owner = fs_owner(agent_id);
     let cmp_len = path.len().min(MAX_PATH);
     unsafe {
@@ -1380,7 +1810,33 @@ pub fn lookup_mutable_path(agent_id: u16, path: &[u8]) -> Option<bool> {
                 continue;
             }
             if entry.path_len as usize == cmp_len && entry.path[..cmp_len] == path[..cmp_len] {
-                return Some(entry.is_dir);
+                return Some(entry.kind);
+            }
+        }
+    }
+    None
+}
+
+pub fn lookup_mutable_path(agent_id: u16, path: &[u8]) -> Option<bool> {
+    lookup_mutable_path_kind(agent_id, path).map(|kind| kind == MutablePathKind::Directory)
+}
+
+pub fn lookup_mutable_symlink_target<'a>(
+    agent_id: u16,
+    path: &[u8],
+    dst: &'a mut [u8; MAX_PATH],
+) -> Option<&'a [u8]> {
+    let owner = fs_owner(agent_id);
+    let cmp_len = path.len().min(MAX_PATH);
+    unsafe {
+        for entry in MUTABLE_PATHS.iter() {
+            if !entry.active || entry.owner != owner || entry.kind != MutablePathKind::Symlink {
+                continue;
+            }
+            if entry.path_len as usize == cmp_len && entry.path[..cmp_len] == path[..cmp_len] {
+                let len = entry.target_len as usize;
+                dst[..len].copy_from_slice(&entry.target[..len]);
+                return Some(&dst[..len]);
             }
         }
     }
@@ -1407,6 +1863,13 @@ pub fn iter_mutable_paths<F>(agent_id: u16, mut f: F) -> usize
 where
     F: FnMut(&[u8], bool) -> bool,
 {
+    iter_mutable_paths_kind(agent_id, |path, kind| f(path, kind == MutablePathKind::Directory))
+}
+
+pub fn iter_mutable_paths_kind<F>(agent_id: u16, mut f: F) -> usize
+where
+    F: FnMut(&[u8], MutablePathKind) -> bool,
+{
     let owner = fs_owner(agent_id);
     let mut count = 0usize;
     unsafe {
@@ -1415,7 +1878,7 @@ where
                 continue;
             }
             count += 1;
-            if !f(&entry.path[..entry.path_len as usize], entry.is_dir) {
+            if !f(&entry.path[..entry.path_len as usize], entry.kind) {
                 break;
             }
         }

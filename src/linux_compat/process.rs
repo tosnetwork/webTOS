@@ -397,6 +397,10 @@ fn write_user_u32(agent_id: u16, user_addr: u64, value: u32) -> bool {
     copy_to_user(agent_id, user_addr, &value.to_ne_bytes())
 }
 
+fn write_user_i32(agent_id: u16, user_addr: u64, value: i32) -> bool {
+    copy_to_user(agent_id, user_addr, &value.to_ne_bytes())
+}
+
 fn write_user_u64(agent_id: u16, user_addr: u64, value: u64) -> bool {
     copy_to_user(agent_id, user_addr, &value.to_ne_bytes())
 }
@@ -552,6 +556,14 @@ pub fn futex_tick() {
 // ── wait4 options ─────────────────────────────────────────────────────────
 
 const WNOHANG: u64 = 1;
+const WEXITED: u32 = 0x0000_0004;
+const WNOWAIT: u32 = 0x0100_0000;
+const P_ALL: u32 = 0;
+const P_PID: u32 = 1;
+const P_PGID: u32 = 2;
+const SIGCHLD_NUM: i32 = 17;
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
 
 // ── Clone3 args layout (subset of Linux struct clone_args) ─────────────────
 
@@ -1145,7 +1157,26 @@ fn caller_has_waitable_child(agent_id: u16) -> bool {
     found
 }
 
-fn caller_can_wait_on_child(agent_id: u16, child_id: u16) -> bool {
+fn caller_has_waitable_child_in_pgid(agent_id: u16, pgid: u32) -> bool {
+    let waiter_leader = thread_group_leader(agent_id);
+    let mut found = false;
+    state::for_each_child_process(waiter_leader, |child_id| {
+        if is_linux_child_group_leader_id(child_id)
+            && linux_child_wait_parent_leader(child_id) == Some(waiter_leader)
+            && state::process_pgid(child_id) == Some(pgid)
+        {
+            found = true;
+            return false;
+        }
+        true
+    });
+    found
+}
+
+fn caller_can_wait_on_child_pid(agent_id: u16, pid: i32) -> bool {
+    let Some(child_id) = state::find_process_leader_by_pid(pid) else {
+        return false;
+    };
     is_linux_child_group_leader_id(child_id)
         && linux_child_wait_parent_leader(child_id) == Some(thread_group_leader(agent_id))
 }
@@ -1153,6 +1184,7 @@ fn caller_can_wait_on_child(agent_id: u16, child_id: u16) -> bool {
 fn find_waitable_terminated_child_for_waiter(
     agent_id: u16,
     specific_pid: i32,
+    specific_pgid: Option<u32>,
 ) -> Option<(AgentId, AgentStatus)> {
     let waiter_leader = thread_group_leader(agent_id);
     let mut found = None;
@@ -1167,8 +1199,13 @@ fn find_waitable_terminated_child_for_waiter(
         {
             return true;
         }
-        if specific_pid > 0 && child_id != specific_pid as u16 {
+        if specific_pid > 0 && state::process_pid(child_id) != Some(specific_pid as u32) {
             return true;
+        }
+        if let Some(pgid) = specific_pgid {
+            if state::process_pgid(child_id) != Some(pgid) {
+                return true;
+            }
         }
         found = Some((child_id, agent.status));
         false
@@ -1208,6 +1245,37 @@ fn wait_status_word(child_id: u16, child_status: AgentStatus) -> u32 {
         AgentStatus::Faulted => 11u32,
         _ => 0,
     }
+}
+
+fn waitid_info_status(child_id: u16, child_status: AgentStatus) -> (i32, i32) {
+    match child_status {
+        AgentStatus::Exited => (
+            CLD_EXITED,
+            state::process_exit_status(child_id).unwrap_or(0) & 0xff,
+        ),
+        AgentStatus::Faulted => (CLD_KILLED, 11),
+        _ => (CLD_EXITED, 0),
+    }
+}
+
+fn clear_waitid_siginfo(agent_id: u16, info_ptr: u64) -> bool {
+    let siginfo = [0u8; 128];
+    copy_to_user(agent_id, info_ptr, &siginfo)
+}
+
+fn write_waitid_siginfo(agent_id: u16, info_ptr: u64, child_id: u16, child_status: AgentStatus) -> bool {
+    let mut siginfo = [0u8; 128];
+    let (code, status) = waitid_info_status(child_id, child_status);
+    let pid = state::process_pid(child_id).unwrap_or(child_id as u32) as i32;
+    let uid = state::get_state(child_id).map(|st| st.uid).unwrap_or(1000);
+
+    siginfo[0..4].copy_from_slice(&SIGCHLD_NUM.to_ne_bytes());
+    siginfo[4..8].copy_from_slice(&0i32.to_ne_bytes());
+    siginfo[8..12].copy_from_slice(&code.to_ne_bytes());
+    siginfo[16..20].copy_from_slice(&pid.to_ne_bytes());
+    siginfo[20..24].copy_from_slice(&uid.to_ne_bytes());
+    siginfo[24..28].copy_from_slice(&status.to_ne_bytes());
+    copy_to_user(agent_id, info_ptr, &siginfo)
 }
 
 #[inline]
@@ -2254,6 +2322,82 @@ pub fn sys_sched_yield(_agent_id: u16) -> i64 {
     0
 }
 
+const SCHED_OTHER: i32 = 0;
+
+#[inline]
+fn resolve_sched_target(agent_id: u16, pid: i32) -> Option<u16> {
+    if pid == 0 {
+        return Some(agent_id);
+    }
+    if pid < 0 {
+        return None;
+    }
+
+    let target_id = pid as u16;
+    let target = agent::get_agent_any_state(target_id)?;
+    let caller_group = thread_group_pid(agent_id);
+    let target_group = thread_group_pid(target.id);
+    if target_group == caller_group || target.id == agent_id {
+        Some(target.id)
+    } else {
+        None
+    }
+}
+
+/// sched_setparam(2) -- Set scheduling parameters.
+///
+/// TOS keeps deterministic scheduling, so only the default Linux policy is
+/// accepted and priority must remain zero.
+pub fn sys_sched_setparam(agent_id: u16, pid: i32, param_ptr: u64) -> i64 {
+    if param_ptr == 0 {
+        return -EFAULT;
+    }
+    let Some(_target) = resolve_sched_target(agent_id, pid) else {
+        return -ESRCH;
+    };
+    let Some(priority) = read_user_i64(agent_id, param_ptr) else {
+        return -EFAULT;
+    };
+    if priority != 0 {
+        return -EINVAL;
+    }
+    0
+}
+
+/// sched_getparam(2) -- Get scheduling parameters.
+///
+/// Single-policy deterministic scheduling reports priority zero.
+pub fn sys_sched_getparam(agent_id: u16, pid: i32, param_ptr: u64) -> i64 {
+    if param_ptr == 0 {
+        return -EFAULT;
+    }
+    let Some(_target) = resolve_sched_target(agent_id, pid) else {
+        return -ESRCH;
+    };
+    if !write_user_u32(agent_id, param_ptr, 0) {
+        return -EFAULT;
+    }
+    0
+}
+
+/// sched_setscheduler(2) -- Set the scheduler policy.
+///
+/// The deterministic policy maps to Linux `SCHED_OTHER` with zero priority.
+pub fn sys_sched_setscheduler(agent_id: u16, pid: i32, policy: i32, param_ptr: u64) -> i64 {
+    if policy != SCHED_OTHER {
+        return -EINVAL;
+    }
+    sys_sched_setparam(agent_id, pid, param_ptr)
+}
+
+/// sched_getscheduler(2) -- Get the scheduler policy.
+pub fn sys_sched_getscheduler(agent_id: u16, pid: i32) -> i64 {
+    let Some(_target) = resolve_sched_target(agent_id, pid) else {
+        return -ESRCH;
+    };
+    SCHED_OTHER as i64
+}
+
 /// sched_getaffinity(2) -- Get CPU affinity mask.
 ///
 /// Writes a bitmask with CPU 0 set. TOS is deterministic so affinity
@@ -2558,11 +2702,12 @@ pub fn sys_vfork(agent_id: u16) -> i64 {
 /// Blocks the parent until a child terminates unless WNOHANG is set.
 pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage_ptr: u64) -> i64 {
     let pid_i32 = pid as i64 as i32;
+    let mut specific_pgid = None;
 
     // Determine which child to wait for.
     let specific_pid = if pid_i32 > 0 {
         // Wait for specific child -- verify it's actually our child.
-        if !caller_can_wait_on_child(agent_id, pid_i32 as u16) {
+        if !caller_can_wait_on_child_pid(agent_id, pid_i32) {
             return -ECHILD;
         }
         pid_i32
@@ -2574,13 +2719,16 @@ pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage
         -1
     } else {
         // pid < -1: wait for any child in process group |pid|.
-        // We don't implement process groups; treat as any child.
+        specific_pgid = Some(pid_i32.unsigned_abs());
+        if !caller_has_waitable_child_in_pgid(agent_id, specific_pgid.unwrap()) {
+            return -ECHILD;
+        }
         -1
     };
 
     // Check for an already-terminated child.
     if let Some((child_id, child_status)) =
-        find_waitable_terminated_child_for_waiter(agent_id, specific_pid)
+        find_waitable_terminated_child_for_waiter(agent_id, specific_pid, specific_pgid)
     {
         // Compute the wait status word.
         let wstatus = wait_status_word(child_id, child_status);
@@ -2609,7 +2757,7 @@ pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage
             wstatus
         );
 
-        return child_id as i64;
+        return state::process_pid(child_id).unwrap_or(child_id as u32) as i64;
     }
 
     // No terminated child found yet.
@@ -2628,7 +2776,7 @@ pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage
 
     // Resumed after being woken -- retry the check.
     if let Some((child_id, child_status)) =
-        find_waitable_terminated_child_for_waiter(agent_id, specific_pid)
+        find_waitable_terminated_child_for_waiter(agent_id, specific_pid, specific_pgid)
     {
         let wstatus = wait_status_word(child_id, child_status);
 
@@ -2653,10 +2801,117 @@ pub fn sys_wait4(agent_id: u16, pid: u64, wstatus_ptr: u64, options: u64, rusage
             child_id
         );
 
-        return child_id as i64;
+        return state::process_pid(child_id).unwrap_or(child_id as u32) as i64;
     }
 
     // Spurious wakeup or child not yet terminated -- return -ECHILD.
+    -ECHILD
+}
+
+/// waitid(2) -- Wait for child state changes with siginfo output.
+///
+/// This currently supports exited children for `P_ALL`, `P_PID`, and
+/// `P_PGID`, plus `WNOHANG` and `WNOWAIT`. Stopped/continued states are not
+/// yet modeled because TOS does not expose ptrace/job-control stop states.
+pub fn sys_waitid(
+    agent_id: u16,
+    idtype: u32,
+    id: u64,
+    info_ptr: u64,
+    options: u32,
+    rusage_ptr: u64,
+) -> i64 {
+    if info_ptr == 0 {
+        return -EFAULT;
+    }
+    if options & WEXITED == 0 {
+        return -EINVAL;
+    }
+    if options & !(WNOHANG as u32 | WEXITED | WNOWAIT) != 0 {
+        return -EINVAL;
+    }
+
+    let mut specific_pid = -1i32;
+    let mut specific_pgid = None;
+    match idtype {
+        P_ALL => {
+            if !caller_has_waitable_child(agent_id) {
+                return -ECHILD;
+            }
+        }
+        P_PID => {
+            if id == 0 || id > i32::MAX as u64 {
+                return -ECHILD;
+            }
+            specific_pid = id as i32;
+            if !caller_can_wait_on_child_pid(agent_id, specific_pid) {
+                return -ECHILD;
+            }
+        }
+        P_PGID => {
+            let pgid = if id == 0 {
+                state::process_pgid(agent_id).unwrap_or(thread_group_pid(agent_id)) as u64
+            } else {
+                id
+            };
+            if pgid == 0 || pgid > i32::MAX as u64 {
+                return -ECHILD;
+            }
+            specific_pgid = Some(pgid as u32);
+            if !caller_has_waitable_child_in_pgid(agent_id, specific_pgid.unwrap()) {
+                return -ECHILD;
+            }
+        }
+        _ => return -EINVAL,
+    }
+
+    let handle_match = |child_id: u16, child_status: AgentStatus| -> i64 {
+        if !write_waitid_siginfo(agent_id, info_ptr, child_id, child_status) {
+            return -EFAULT;
+        }
+        if rusage_ptr != 0 {
+            let rusage = [0u8; 144];
+            if !copy_to_user(agent_id, rusage_ptr, &rusage) {
+                return -EFAULT;
+            }
+        }
+        if options & WNOWAIT == 0 {
+            agent::reap_agent(child_id);
+        }
+        0
+    };
+
+    if let Some((child_id, child_status)) =
+        find_waitable_terminated_child_for_waiter(agent_id, specific_pid, specific_pgid)
+    {
+        return handle_match(child_id, child_status);
+    }
+
+    if options & WNOHANG as u32 != 0 {
+        if !clear_waitid_siginfo(agent_id, info_ptr) {
+            return -EFAULT;
+        }
+        if rusage_ptr != 0 {
+            let rusage = [0u8; 144];
+            if !copy_to_user(agent_id, rusage_ptr, &rusage) {
+                return -EFAULT;
+            }
+        }
+        return 0;
+    }
+
+    if let Some(agent) = agent::get_agent_mut(agent_id) {
+        agent.status = AgentStatus::BlockedRecv;
+    }
+    sched::remove_from_run_queue(agent_id);
+    sched::yield_current();
+
+    if let Some((child_id, child_status)) =
+        find_waitable_terminated_child_for_waiter(agent_id, specific_pid, specific_pgid)
+    {
+        return handle_match(child_id, child_status);
+    }
+
     -ECHILD
 }
 
@@ -2698,9 +2953,53 @@ fn send_group_signal(pid: i32, sig: i32) -> i64 {
     0
 }
 
+fn send_process_group_signal(pgid: i32, sig: i32) -> i64 {
+    if pgid <= 0 {
+        return -ESRCH;
+    }
+    if !(0..=64).contains(&sig) {
+        return -EINVAL;
+    }
+
+    let mut found = false;
+    state::for_each_process_in_group(pgid as u32, |leader_id| {
+        found = true;
+        if sig != 0 {
+            super::signal::raise_group_signal(leader_id, sig as u32);
+        }
+        true
+    });
+    if found { 0 } else { -ESRCH }
+}
+
 /// kill(2) -- Send a signal to a process.
-pub fn sys_kill(_agent_id: u16, pid: i32, sig: i32) -> i64 {
-    send_group_signal(pid, sig)
+pub fn sys_kill(agent_id: u16, pid: i32, sig: i32) -> i64 {
+    if pid > 0 {
+        return send_group_signal(pid, sig);
+    }
+    if pid == 0 {
+        let pgid = state::process_pgid(agent_id).unwrap_or(thread_group_pid(agent_id));
+        return send_process_group_signal(pgid as i32, sig);
+    }
+    if pid == -1 {
+        if !(0..=64).contains(&sig) {
+            return -EINVAL;
+        }
+        let mut found = false;
+        let caller_leader = thread_group_leader(agent_id);
+        state::for_each_process_leader(|leader_id| {
+            if leader_id == caller_leader {
+                return true;
+            }
+            found = true;
+            if sig != 0 {
+                super::signal::raise_group_signal(leader_id, sig as u32);
+            }
+            true
+        });
+        return if found { 0 } else { -ESRCH };
+    }
+    send_process_group_signal(pid.saturating_abs(), sig)
 }
 
 /// tgkill(2) -- Send a signal to a specific thread.

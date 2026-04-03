@@ -20,6 +20,106 @@ enum LinuxRuntimeSmokeFocus {
     All,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PythonSmokeFocus {
+    Smoke,
+    Api,
+    Full,
+}
+
+#[inline]
+fn python_smoke_focus() -> PythonSmokeFocus {
+    match option_env!("TOS_PYTHON_SMOKE_FOCUS") {
+        Some("api") => PythonSmokeFocus::Api,
+        Some("full") => PythonSmokeFocus::Full,
+        _ => PythonSmokeFocus::Smoke,
+    }
+}
+
+#[inline]
+fn python_focus_runs_basic() -> bool {
+    matches!(
+        python_smoke_focus(),
+        PythonSmokeFocus::Smoke | PythonSmokeFocus::Api | PythonSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn python_focus_runs_child() -> bool {
+    matches!(
+        python_smoke_focus(),
+        PythonSmokeFocus::Smoke | PythonSmokeFocus::Api | PythonSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn python_focus_runs_api() -> bool {
+    matches!(
+        python_smoke_focus(),
+        PythonSmokeFocus::Api | PythonSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn python_focus_label() -> &'static str {
+    match python_smoke_focus() {
+        PythonSmokeFocus::Smoke => "smoke",
+        PythonSmokeFocus::Api => "api",
+        PythonSmokeFocus::Full => "full",
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeSmokeFocus {
+    Smoke,
+    Api,
+    Full,
+}
+
+#[inline]
+fn node_smoke_focus() -> NodeSmokeFocus {
+    match option_env!("TOS_NODE_SMOKE_FOCUS") {
+        Some("api") => NodeSmokeFocus::Api,
+        Some("full") => NodeSmokeFocus::Full,
+        _ => NodeSmokeFocus::Smoke,
+    }
+}
+
+#[inline]
+fn node_focus_runs_basic() -> bool {
+    matches!(node_smoke_focus(), NodeSmokeFocus::Smoke | NodeSmokeFocus::Full)
+}
+
+#[inline]
+fn node_focus_runs_child() -> bool {
+    matches!(
+        node_smoke_focus(),
+        NodeSmokeFocus::Smoke | NodeSmokeFocus::Api | NodeSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn node_focus_runs_thread() -> bool {
+    matches!(
+        node_smoke_focus(),
+        NodeSmokeFocus::Smoke | NodeSmokeFocus::Api | NodeSmokeFocus::Full
+    )
+}
+
+#[inline]
+fn node_focus_runs_api() -> bool {
+    matches!(node_smoke_focus(), NodeSmokeFocus::Api | NodeSmokeFocus::Full)
+}
+
+#[inline]
+fn node_focus_label() -> &'static str {
+    match node_smoke_focus() {
+        NodeSmokeFocus::Smoke => "smoke",
+        NodeSmokeFocus::Api => "api",
+        NodeSmokeFocus::Full => "full",
+    }
+}
+
 #[inline]
 fn linux_runtime_smoke_focus() -> LinuxRuntimeSmokeFocus {
     match option_env!("TOS_RUNTIME_SMOKE_FOCUS") {
@@ -192,6 +292,11 @@ fn focus_label() -> &'static str {
 #[inline]
 fn run_substrate_depth_smoke() -> bool {
     option_env!("TOS_SUBSTRATE_DEPTH_SMOKE") == Some("1")
+}
+
+#[inline]
+fn run_userland_env_smoke() -> bool {
+    option_env!("TOS_USERLAND_ENV_SMOKE") == Some("1")
 }
 
 fn linux_path_exists(path: &[u8]) -> bool {
@@ -555,6 +660,26 @@ fn spawn_python_child_smoke(root_id: u16) {
     }
 }
 
+fn spawn_userland_env_smoke(root_id: u16) {
+    static USERLAND_ENV_EXECVE_ELF: &[u8] =
+        include_bytes!("../../test_data/test_userland_env_execve.elf");
+    serial_println!(
+        "[ROOT] Loading userland env smoke test ({} bytes)...",
+        USERLAND_ENV_EXECVE_ELF.len()
+    );
+    match crate::agent_loader::spawn_linux_agent(
+        root_id,
+        USERLAND_ENV_EXECVE_ELF,
+        2_000_000,
+        4096,
+        b"/app/test_userland_env_execve",
+        &[b"/app/test_userland_env_execve" as &[u8]],
+    ) {
+        Ok(id) => serial_println!("[ROOT] userland env smoke test agent created: id={}", id),
+        Err(e) => serial_println!("[ROOT] userland env smoke test load failed: error {}", e),
+    }
+}
+
 fn spawn_at_paths_smoke(root_id: u16) {
     static AT_PATHS_ELF: &[u8] = include_bytes!("../../test_data/test_at_paths.elf");
     serial_println!(
@@ -686,6 +811,12 @@ fn spawn_substrate_depth_smoke(root_id: u16) {
 pub extern "C" fn root_entry() -> ! {
     serial_println!("[ROOT] Root agent started");
     serial_println!("[ROOT] Linux runtime smoke focus: {}", focus_label());
+    if focus_runs_python() {
+        serial_println!("[ROOT] Python smoke focus: {}", python_focus_label());
+    }
+    if focus_runs_node() {
+        serial_println!("[ROOT] Node smoke focus: {}", node_focus_label());
+    }
     crate::heap::run_smoke();
     if focus_runs_java() {
         serial_println!("[ROOT] Java smoke focus: {}", java_focus_label());
@@ -695,6 +826,9 @@ pub extern "C" fn root_entry() -> ! {
     spawn_large_file_lifecycle_smoke(1);
     if run_substrate_depth_smoke() {
         spawn_substrate_depth_smoke(1);
+    }
+    if run_userland_env_smoke() {
+        spawn_userland_env_smoke(1);
     }
 
     // Load relative *at path smoke test
@@ -852,25 +986,29 @@ pub extern "C" fn root_entry() -> ! {
         if focus_runs_python() && linux_path_exists(b"/usr/bin/python3") {
             static PYTHON_EXECVE_ELF: &[u8] =
                 include_bytes!("../../test_data/test_python_execve.elf");
-            serial_println!(
-                "[ROOT] Loading Python smoke test ({} bytes)...",
-                PYTHON_EXECVE_ELF.len()
-            );
-            match crate::agent_loader::spawn_linux_agent(
-                1,
-                PYTHON_EXECVE_ELF,
-                200_000,
-                256,
-                b"/app/test_python_execve",
-                &[b"/app/test_python_execve" as &[u8]],
-            ) {
-                Ok(id) => serial_println!("[ROOT] Python smoke test agent created: id={}", id),
-                Err(e) => serial_println!("[ROOT] Python smoke test load failed: error {}", e),
+            if python_focus_runs_basic() {
+                serial_println!(
+                    "[ROOT] Loading Python smoke test ({} bytes)...",
+                    PYTHON_EXECVE_ELF.len()
+                );
+                match crate::agent_loader::spawn_linux_agent(
+                    1,
+                    PYTHON_EXECVE_ELF,
+                    200_000,
+                    256,
+                    b"/app/test_python_execve",
+                    &[b"/app/test_python_execve" as &[u8]],
+                ) {
+                    Ok(id) => serial_println!("[ROOT] Python smoke test agent created: id={}", id),
+                    Err(e) => serial_println!("[ROOT] Python smoke test load failed: error {}", e),
+                }
             }
-            serial_println!(
-                "[ROOT] Python child-process smoke test available; delaying until root tick {}",
-                PYTHON_CHILD_SMOKE_DELAY_TICKS
-            );
+            if python_focus_runs_child() {
+                serial_println!(
+                    "[ROOT] Python child-process smoke test available; delaying until root tick {}",
+                    PYTHON_CHILD_SMOKE_DELAY_TICKS
+                );
+            }
         } else if !focus_runs_python() {
             serial_println!("[ROOT] Python smoke test disabled by runtime focus");
         } else {
@@ -878,18 +1016,24 @@ pub extern "C" fn root_entry() -> ! {
         }
 
         if focus_runs_node() && linux_path_exists(b"/usr/bin/node") {
-            serial_println!(
-                "[ROOT] Node runtime installed; delaying Node smoke test until root tick {}",
-                NODE_SMOKE_DELAY_TICKS
-            );
-            serial_println!(
-                "[ROOT] Node child-process smoke test available; delaying until root tick {}",
-                NODE_CHILD_SMOKE_DELAY_TICKS
-            );
-            serial_println!(
-                "[ROOT] Node thread smoke test available; delaying until root tick {}",
-                NODE_THREAD_SMOKE_DELAY_TICKS
-            );
+            if node_focus_runs_basic() {
+                serial_println!(
+                    "[ROOT] Node runtime installed; delaying Node smoke test until root tick {}",
+                    NODE_SMOKE_DELAY_TICKS
+                );
+            }
+            if node_focus_runs_child() {
+                serial_println!(
+                    "[ROOT] Node child-process smoke test available; delaying until root tick {}",
+                    NODE_CHILD_SMOKE_DELAY_TICKS
+                );
+            }
+            if node_focus_runs_thread() {
+                serial_println!(
+                    "[ROOT] Node thread smoke test available; delaying until root tick {}",
+                    NODE_THREAD_SMOKE_DELAY_TICKS
+                );
+            }
         } else if !focus_runs_node() {
             serial_println!("[ROOT] Node smoke test disabled by runtime focus");
         } else {
@@ -1014,10 +1158,14 @@ pub extern "C" fn root_entry() -> ! {
 
     let mut count: u64 = 0;
     let mut checkpoint_done = false;
-    let node_runtime_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
-    let python_child_available = focus_runs_python() && linux_path_exists(b"/usr/bin/python3");
-    let node_child_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
-    let node_thread_available = focus_runs_node() && linux_path_exists(b"/usr/bin/node");
+    let node_runtime_available =
+        focus_runs_node() && node_focus_runs_basic() && linux_path_exists(b"/usr/bin/node");
+    let python_child_available =
+        focus_runs_python() && python_focus_runs_child() && linux_path_exists(b"/usr/bin/python3");
+    let node_child_available =
+        focus_runs_node() && node_focus_runs_child() && linux_path_exists(b"/usr/bin/node");
+    let node_thread_available =
+        focus_runs_node() && node_focus_runs_thread() && linux_path_exists(b"/usr/bin/node");
     let java_runtime_available = focus_runs_java()
         && java_focus_runs_version()
         && linux_path_exists(b"/usr/lib/jvm/java-11-openjdk-amd64/bin/java");

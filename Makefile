@@ -1,4 +1,4 @@
-.PHONY: build run release clean debug test test-crossnode test-disk java-test java-deadlock-probe jtreg-prepare jtreg-java-base jtreg-java-lang jtreg-java-deadlock
+.PHONY: build run release clean debug test test-crossnode test-disk java-test java-deadlock-probe python-api-test node-api-test linux-maturity-test jtreg-prepare jtreg-java-base jtreg-java-lang jtreg-java-deadlock userland-env-test
 
 KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
 KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
@@ -41,6 +41,15 @@ java-test:
 java-deadlock-probe:
 	./tools/java_deadlock_probe.sh
 
+python-api-test:
+	./tools/python_api_validation.sh
+
+node-api-test:
+	./tools/node_api_validation.sh
+
+linux-maturity-test:
+	./tools/linux_maturity_validation.sh
+
 jtreg-prepare:
 	./tools/prepare_jtreg_assets.sh
 
@@ -52,6 +61,9 @@ jtreg-java-lang:
 
 jtreg-java-deadlock:
 	./tools/jtreg_java_deadlock.sh
+
+userland-env-test:
+	./tools/userland_env_validation.sh
 
 # ─── UEFI targets ─────────────────────────────────────────────
 OVMF = /usr/share/ovmf/OVMF.fd

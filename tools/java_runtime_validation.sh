@@ -13,9 +13,9 @@ The harness validates these Java smoke paths in one boot:
   - java -version
   - Hello.class classpath launch
   - java.nio.file / java.io filesystem probe
-  - java -jar resource loading
+  - java -jar resource + zip loading
   - ProcessBuilder child-process launch
-  - Thread / CountDownLatch / AtomicLong concurrency smoke
+  - Thread / CountDownLatch / queue / AtomicLong concurrency smoke
 
 Options:
   --runtime-manifest PATH   Runtime manifest to embed
@@ -121,12 +121,16 @@ validate_java_log() {
 
   require_no_line 'Page fault|GP fault|TRAP|panic|SIGABRT|KERNEL PANIC' "$log"
   require_no_line '\[linux_compat\] exit_group: agent=[0-9]+ status=[1-9][0-9]*' "$log"
+  require_no_line 'TOS-JAVA-THREAD-FAIL' "$log"
   require_line 'openjdk version "11\.[0-9]+\.[0-9]+"' "$log"
   require_line 'TOS-JAVA-HELLO' "$log"
   require_line 'TOS-JAVA-FS count=[0-9]+' "$log"
   require_line 'TOS-JAVA-FS first=' "$log"
+  require_line 'TOS-JAVA-FS-TMP-OK entries=[0-9]+ bytes=[0-9]+' "$log"
   require_line 'TOS-JAVA-JAR payload=jar-ok' "$log"
+  require_line 'TOS-JAVA-ZIP-OK entries=[0-9]+' "$log"
   require_line 'TOS-JAVA-CHILD line=.* status=0' "$log"
+  require_line 'TOS-JAVA-QUEUE-OK total=[0-9]+' "$log"
   require_line 'TOS-JAVA-THREAD-OK total=[0-9]+' "$log"
   require_line '\[linux_compat\] exit_group: agent=[0-9]+ status=0' "$log"
 }

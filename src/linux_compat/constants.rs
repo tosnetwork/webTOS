@@ -26,7 +26,16 @@ pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_RT_SIGPENDING: u64 = 127;
 
 // Marker for local AF_UNIX/socketpair byte-stream endpoints.
+pub const LOCAL_INET_LISTENER_MARKER: u64 = 0xFFFF_FFFC;
+pub const LOCAL_INET_STREAM_MARKER: u64 = 0xFFFF_FFFD;
 pub const SOCKETPAIR_STREAM_MARKER: u64 = 0xFFFF_FFFE;
+pub const SOCKET_FD_FLAG_LISTENING: u32 = 0x0100_0000;
+pub const SOCKET_FD_FLAG_SHUT_RD: u32 = 0x0200_0000;
+pub const SOCKET_FD_FLAG_SHUT_WR: u32 = 0x0400_0000;
+pub const SOCKET_FD_FLAG_REUSEADDR: u32 = 0x0800_0000;
+pub const SOCKET_FD_FLAG_REUSEPORT: u32 = 0x1000_0000;
+pub const SOCKET_FD_FLAG_KEEPALIVE: u32 = 0x2000_0000;
+pub const SOCKET_FD_FLAG_NODELAY: u32 = 0x4000_0000;
 
 // ── I/O control ─────────────────────────────────────────────────────────────
 pub const SYS_IOCTL: u64 = 16;
@@ -64,6 +73,7 @@ pub const SYS_TIME: u64 = 201;
 pub const SYS_SOCKET: u64 = 41;
 pub const SYS_CONNECT: u64 = 42;
 pub const SYS_ACCEPT: u64 = 43;
+pub const SYS_ACCEPT4: u64 = 288;
 pub const SYS_SENDTO: u64 = 44;
 pub const SYS_RECVFROM: u64 = 45;
 pub const SYS_SENDMSG: u64 = 46;
@@ -84,6 +94,7 @@ pub const SYS_VFORK: u64 = 58;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_WAIT4: u64 = 61;
+pub const SYS_WAITID: u64 = 247;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
 
@@ -92,6 +103,7 @@ pub const SYS_FCNTL: u64 = 72;
 pub const SYS_FLOCK: u64 = 73;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_FDATASYNC: u64 = 75;
+pub const SYS_UMASK: u64 = 95;
 pub const SYS_GETCWD: u64 = 79;
 pub const SYS_CHDIR: u64 = 80;
 pub const SYS_FCHDIR: u64 = 81;
@@ -107,7 +119,9 @@ pub const SYS_GETEUID: u64 = 107;
 pub const SYS_GETEGID: u64 = 108;
 pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPPID: u64 = 110;
+pub const SYS_SETSID: u64 = 112;
 pub const SYS_GETPGID: u64 = 121;
+pub const SYS_GETSID: u64 = 124;
 pub const SYS_GETGROUPS: u64 = 115;
 pub const SYS_SETGROUPS: u64 = 116;
 
@@ -122,6 +136,7 @@ pub const SYS_FUTEX: u64 = 202;
 pub const SYS_EPOLL_CREATE: u64 = 213;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
+pub const SYS_FADVISE64: u64 = 221;
 
 // ── Time ────────────────────────────────────────────────────────────────────
 pub const SYS_CLOCK_GETTIME: u64 = 228;
@@ -149,6 +164,10 @@ pub const SYS_CAPGET: u64 = 125;
 pub const SYS_SIGALTSTACK: u64 = 131;
 pub const SYS_STATFS: u64 = 137;
 pub const SYS_FSTATFS: u64 = 138;
+pub const SYS_SCHED_SETPARAM: u64 = 142;
+pub const SYS_SCHED_GETPARAM: u64 = 143;
+pub const SYS_SCHED_SETSCHEDULER: u64 = 144;
+pub const SYS_SCHED_GETSCHEDULER: u64 = 145;
 pub const SYS_PRCTL: u64 = 157;
 pub const SYS_GETTID: u64 = 186;
 pub const SYS_SCHED_GETAFFINITY: u64 = 204;
@@ -162,6 +181,7 @@ pub const SYS_MKDIRAT: u64 = 258;
 pub const SYS_UNLINKAT: u64 = 263;
 pub const SYS_NEWFSTATAT: u64 = 262;
 pub const SYS_RENAMEAT: u64 = 264;
+pub const SYS_SYMLINKAT: u64 = 266;
 pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_READLINKAT: u64 = 267;
 pub const SYS_FACCESSAT: u64 = 269;
@@ -175,6 +195,7 @@ pub const SYS_RENAMEAT2: u64 = 316;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_MEMBARRIER: u64 = 324;
 pub const SYS_STATX: u64 = 332;
+pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_RSEQ: u64 = 334;
 pub const SYS_IO_URING_SETUP: u64 = 425;
 pub const SYS_IO_URING_ENTER: u64 = 426;
@@ -202,11 +223,13 @@ pub const EMFILE: i64 = 24;
 pub const EROFS: i64 = 30;
 pub const EPIPE: i64 = 32;
 pub const ENOTEMPTY: i64 = 39;
+pub const ELOOP: i64 = 40;
 pub const ENOSPC: i64 = 28;
 pub const ENOSYS: i64 = 38;
 pub const ECHILD: i64 = 10;
 pub const ENOTSOCK: i64 = 88;
 pub const EAFNOSUPPORT: i64 = 97;
+pub const EADDRINUSE: i64 = 98;
 pub const ETIMEDOUT: i64 = 110;
 
 // ── O_* flags ───────────────────────────────────────────────────────────────
