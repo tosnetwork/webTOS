@@ -132,6 +132,12 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
+        abi::SYS_SENDTO => sys_sendto(env, cpu, a),
+        abi::SYS_RECVFROM => sys_recvfrom(env, cpu, a),
+        abi::SYS_EPOLL_WAIT | abi::SYS_EPOLL_PWAIT => sys_epoll_wait(env, cpu, a),
+        abi::SYS_SELECT => sys_select(env, cpu, a, false),
+        abi::SYS_PSELECT6 => sys_select(env, cpu, a, true),
+        abi::SYS_SENDFILE => sys_sendfile(env, cpu, a),
         _ => dispatch_simple(env, cpu, nr, a).into(),
     }
 }
@@ -200,12 +206,56 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_IOCTL => sys_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FSYNC | abi::SYS_SYNC => Ok(0),
 
+        abi::SYS_SOCKET => sys_socket(env, a[0], a[1], a[2]),
+        abi::SYS_CONNECT => sys_connect(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_SHUTDOWN => sys_shutdown(env, a[0], a[1]),
+        abi::SYS_GETPEERNAME => sys_getpeername(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_GETSOCKNAME => {
+            // Local addresses are broker-side; report the unspecified addr.
+            write_sockaddr_in(
+                cpu,
+                a[1],
+                a[2],
+                std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
+            )?;
+            net_of(env, a[0]).map(|_| 0)
+        }
+        abi::SYS_SETSOCKOPT => net_of(env, a[0]).map(|_| 0),
+        abi::SYS_GETSOCKOPT => sys_getsockopt(env, cpu, a),
+        abi::SYS_SOCKETPAIR => sys_socketpair(env, cpu, a),
+        abi::SYS_BIND => {
+            let target = parse_sockaddr_in(cpu, a[1], a[2])?;
+            if target.port() == 0 {
+                Ok(0) // ephemeral bind: the broker already does this
+            } else {
+                tracing::warn!("bind to a specific port is not supported (no listeners)");
+                Err(abi::EOPNOTSUPP)
+            }
+        }
+        abi::SYS_LISTEN | abi::SYS_ACCEPT | abi::SYS_ACCEPT4 => {
+            tracing::warn!("listening sockets are not supported (client-only network)");
+            Err(abi::EOPNOTSUPP)
+        }
+        abi::SYS_SENDMSG | abi::SYS_RECVMSG => {
+            tracing::warn!("sendmsg/recvmsg are not implemented yet");
+            Err(abi::ENOSYS)
+        }
+        abi::SYS_EVENTFD => sys_eventfd(env, a[0], 0),
+        abi::SYS_EVENTFD2 => sys_eventfd(env, a[0], a[1]),
+        abi::SYS_TIMERFD_CREATE => sys_timerfd_create(env, a[0], a[1]),
+        abi::SYS_TIMERFD_SETTIME => sys_timerfd_settime(env, cpu, a),
+        abi::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(env, cpu, a[0], a[1]),
+        abi::SYS_EPOLL_CREATE | abi::SYS_EPOLL_CREATE1 => sys_epoll_create(env, a[1]),
+        abi::SYS_EPOLL_CTL => sys_epoll_ctl(env, cpu, a),
+
         abi::SYS_MMAP => sys_mmap(env, cpu, a),
         abi::SYS_MUNMAP => match cpu.mem.unmap_memory_len(a[0], a[1]) {
             true => Ok(0),
             false => Err(abi::EINVAL),
         },
         abi::SYS_MPROTECT => sys_mprotect(cpu, a[0], a[1], a[2]),
+        // Advisory only; taking no action is a valid implementation.
+        abi::SYS_MADVISE => Ok(0),
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
         abi::SYS_POLL => sys_poll(env, cpu, a[0], a[1]),
@@ -323,8 +373,13 @@ fn read_backing(
             Ok(chunk)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
-        // Pipes are handled by `outcome_read` before reaching here.
-        Backing::Pipe { .. } => Err(abi::EINVAL),
+        // Handled by `outcome_read` before reaching here.
+        Backing::Pipe { .. }
+        | Backing::SocketPair { .. }
+        | Backing::EventFd(_)
+        | Backing::TimerFd(_)
+        | Backing::Net(_)
+        | Backing::Epoll(_) => Err(abi::EINVAL),
         Backing::Dev(dev) => match dev {
             Dev::Null | Dev::Tty => Ok(Vec::new()),
             Dev::Zero => Ok(vec![0; buf_len]),
@@ -368,8 +423,13 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             Ok(bytes.len() as u64)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
-        // Pipes are handled by `outcome_write` before reaching here.
-        Backing::Pipe { .. } => Err(abi::EINVAL),
+        // Handled by `outcome_write` before reaching here.
+        Backing::Pipe { .. }
+        | Backing::SocketPair { .. }
+        | Backing::EventFd(_)
+        | Backing::TimerFd(_)
+        | Backing::Net(_)
+        | Backing::Epoll(_) => Err(abi::EINVAL),
     }
 }
 
@@ -531,7 +591,7 @@ fn sys_lseek(env: &mut LinuxEnv, fd: u64, offset: u64, whence: u64) -> SysResult
             return Err(abi::EINVAL);
         }
         Backing::Dev(_) => 0,
-        Backing::Std(_) | Backing::Pipe { .. } => return Err(abi::ESPIPE),
+        _ => return Err(abi::ESPIPE),
     };
     let base = match whence {
         abi::SEEK_SET => 0_i64,
@@ -623,11 +683,20 @@ fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
             blksize: 4096,
             ..Default::default()
         },
-        Backing::Pipe { .. } => abi::Stat {
+        Backing::Pipe { .. } | Backing::SocketPair { .. } | Backing::Net(_) => abi::Stat {
             dev: 1,
             ino: u64::MAX - 2,
             nlink: 1,
             mode: abi::S_IFIFO | 0o600,
+            blksize: 4096,
+            ..Default::default()
+        },
+        // Anonymous inodes (eventfd/timerfd/epoll).
+        Backing::EventFd(_) | Backing::TimerFd(_) | Backing::Epoll(_) => abi::Stat {
+            dev: 1,
+            ino: u64::MAX - 3,
+            nlink: 1,
+            mode: 0o600,
             blksize: 4096,
             ..Default::default()
         },
@@ -1009,15 +1078,17 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
     }
 }
 
-/// `poll`/`ppoll`. Nothing in this environment ever blocks, so readiness is
-/// reported immediately: readable/writable descriptors are ready (stdin at
-/// EOF is readable — a read returns 0 without blocking), invalid
-/// descriptors report POLLNVAL, and timeouts never matter.
+/// `poll`/`ppoll` with real readiness for pipes, sockets, eventfd, and
+/// timerfd; plain files and streams are always ready. Never blocks: a
+/// zero-ready result is returned to the caller (event loops re-poll).
 fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysResult {
     const POLLIN: u16 = 0x1;
     const POLLOUT: u16 = 0x4;
+    const POLLERR: u16 = 0x8;
+    const POLLHUP: u16 = 0x10;
     const POLLNVAL: u16 = 0x20;
 
+    let now = env.now_nanos(cpu);
     let nfds = nfds.min(1024) as usize;
     let mut records = read_mem(cpu, fds_ptr, nfds * 8)?;
     let mut ready = 0_u64;
@@ -1029,12 +1100,22 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
             Ok(entry) => {
                 let desc = entry.desc.borrow();
                 let mut bits = 0_u16;
-                if events & POLLIN != 0 && desc.readable() {
+                if events & POLLIN != 0 && desc.readable() && desc_read_ready(&desc, now) {
                     bits |= POLLIN;
                 }
-                if events & POLLOUT != 0 && desc.writable() {
+                if events & POLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
                     bits |= POLLOUT;
                 }
+                if let Backing::Pipe {
+                    inner,
+                    write_end: false,
+                } = &desc.backing
+                {
+                    if inner.borrow().writers == 0 {
+                        bits |= POLLHUP;
+                    }
+                }
+                let _ = POLLERR;
                 bits
             }
         };
@@ -1045,6 +1126,46 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
     }
     write_mem(cpu, fds_ptr, &records)?;
     Ok(ready)
+}
+
+/// Read-readiness of a description at deterministic time `now`.
+fn desc_read_ready(desc: &Description, now: u64) -> bool {
+    match read_watch_of(desc) {
+        Some(watch) => watch.ready(now),
+        None => true,
+    }
+}
+
+/// Write-readiness (pipes/socketpairs can fill; everything else accepts).
+fn desc_write_ready(desc: &Description) -> bool {
+    match &desc.backing {
+        Backing::Pipe {
+            inner,
+            write_end: true,
+        }
+        | Backing::SocketPair { tx: inner, .. } => {
+            let inner = inner.borrow();
+            inner.data.len() < crate::PIPE_CAPACITY || inner.readers == 0
+        }
+        _ => true,
+    }
+}
+
+/// The watch that becomes ready when a read on `desc` would make progress;
+/// None when reads never block.
+fn read_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
+    use crate::proc::Watch;
+    match &desc.backing {
+        Backing::Pipe {
+            inner,
+            write_end: false,
+        } => Some(Watch::PipeReadable(inner.clone())),
+        Backing::SocketPair { rx, .. } => Some(Watch::PipeReadable(rx.clone())),
+        Backing::EventFd(event) => Some(Watch::Event(event.clone())),
+        Backing::TimerFd(timer) => Some(Watch::Timer(timer.clone())),
+        Backing::Net(socket) => Some(Watch::NetReadable(socket.clone())),
+        _ => None,
+    }
 }
 
 // ── Memory management ───────────────────────────────────────────────────────
@@ -1351,8 +1472,13 @@ fn park_current(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState) {
 /// Restores the first ready task onto the CPU. Returns false when nothing
 /// is runnable.
 fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
-    let Some(index) = env.sched.find_ready() else {
-        return false;
+    let now = env.now_nanos(cpu);
+    let index = match env.sched.find_ready(now) {
+        Some(index) => index,
+        None => match resolve_stall(env, cpu) {
+            Some(index) => index,
+            None => return false,
+        },
     };
     let task = env.sched.parked.remove(index);
     // The instruction counter is global (energy, limits, deterministic
@@ -1624,104 +1750,273 @@ fn sys_pipe(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, flags: u64) -> SysR
     Ok(0)
 }
 
-/// `read` with pipe support: blocks (with restart) on an empty pipe that
-/// still has writers.
+/// `read` with support for every blocking-capable backing: pipes,
+/// socketpairs, eventfd, timerfd, and network sockets. Blocks with restart
+/// semantics when nothing is available.
 fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
+    use crate::proc::Watch;
+
     let desc = match env.proc.fds.borrow().get(fd) {
         Ok(entry) => entry.desc.clone(),
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let (pipe, nonblock) = {
+    enum Kind {
+        Plain,
+        Pipe(crate::fd::PipeRef),
+        Event(crate::fd::EventFdRef),
+        Timer(crate::fd::TimerFdRef),
+        Net(crate::fd::NetRef),
+    }
+    let (kind, nonblock) = {
         let desc = desc.borrow();
         if !desc.readable() {
             return Outcome::Ret(Err(abi::EBADF));
         }
-        match &desc.backing {
+        let nonblock = desc.flags & abi::O_NONBLOCK != 0;
+        let kind = match &desc.backing {
             Backing::Pipe {
                 inner,
                 write_end: false,
-            } => (
-                Some(std::rc::Rc::clone(inner)),
-                desc.flags & abi::O_NONBLOCK != 0,
-            ),
+            } => Kind::Pipe(std::rc::Rc::clone(inner)),
             Backing::Pipe { .. } => return Outcome::Ret(Err(abi::EBADF)),
-            _ => (None, false),
-        }
-    };
-    let Some(pipe) = pipe else {
-        return Outcome::Ret(sys_read(env, cpu, fd, buf, count));
+            Backing::SocketPair { rx, .. } => Kind::Pipe(std::rc::Rc::clone(rx)),
+            Backing::EventFd(event) => Kind::Event(std::rc::Rc::clone(event)),
+            Backing::TimerFd(timer) => Kind::Timer(std::rc::Rc::clone(timer)),
+            Backing::Net(socket) => Kind::Net(std::rc::Rc::clone(socket)),
+            Backing::Epoll(_) => return Outcome::Ret(Err(abi::EINVAL)),
+            _ => Kind::Plain,
+        };
+        (kind, nonblock)
     };
 
-    let chunk: Vec<u8> = {
-        let mut inner = pipe.borrow_mut();
-        if inner.data.is_empty() {
-            if inner.writers == 0 {
-                return Outcome::Ret(Ok(0)); // EOF
-            }
-            if nonblock {
-                return Outcome::Ret(Err(abi::EAGAIN));
-            }
-            drop(inner);
-            return block_and_switch(env, cpu, ParkState::PipeRead { pipe }, true);
+    let would_block = |env: &mut LinuxEnv, cpu: &mut Cpu, watch: Watch| -> Outcome {
+        if nonblock {
+            return Outcome::Ret(Err(abi::EAGAIN));
         }
-        let take = (count as usize).min(inner.data.len()).min(0x40_0000);
-        inner.data.drain(..take).collect()
+        block_and_switch(
+            env,
+            cpu,
+            ParkState::Waiting {
+                watches: vec![watch],
+                deadline: None,
+            },
+            true,
+        )
     };
-    if let Err(errno) = write_mem(cpu, buf, &chunk) {
-        return Outcome::Ret(Err(errno));
+
+    match kind {
+        Kind::Plain => Outcome::Ret(sys_read(env, cpu, fd, buf, count)),
+        Kind::Pipe(pipe) => {
+            let chunk: Vec<u8> = {
+                let mut inner = pipe.borrow_mut();
+                if inner.data.is_empty() {
+                    if inner.writers == 0 {
+                        return Outcome::Ret(Ok(0)); // EOF
+                    }
+                    drop(inner);
+                    return would_block(env, cpu, Watch::PipeReadable(pipe));
+                }
+                let take = (count as usize).min(inner.data.len()).min(0x40_0000);
+                inner.data.drain(..take).collect()
+            };
+            match write_mem(cpu, buf, &chunk) {
+                Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
+        Kind::Event(event) => {
+            if count < 8 {
+                return Outcome::Ret(Err(abi::EINVAL));
+            }
+            let value = {
+                let mut inner = event.borrow_mut();
+                if inner.count == 0 {
+                    drop(inner);
+                    return would_block(env, cpu, Watch::Event(event));
+                }
+                if inner.semaphore {
+                    inner.count -= 1;
+                    1_u64
+                } else {
+                    std::mem::take(&mut inner.count)
+                }
+            };
+            match write_mem(cpu, buf, &value.to_le_bytes()) {
+                Ok(()) => Outcome::Ret(Ok(8)),
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
+        Kind::Timer(timer) => {
+            if count < 8 {
+                return Outcome::Ret(Err(abi::EINVAL));
+            }
+            let now = env.now_nanos(cpu);
+            let expirations = {
+                let mut inner = timer.borrow_mut();
+                match inner.next_expiry {
+                    Some(expiry) if now >= expiry => match (now - expiry).checked_div(inner.interval)
+                    {
+                        Some(periods) => {
+                            let n = 1 + periods;
+                            inner.next_expiry = Some(expiry + n * inner.interval);
+                            n
+                        }
+                        None => {
+                            inner.next_expiry = None;
+                            1
+                        }
+                    },
+                    _ => {
+                        drop(inner);
+                        return would_block(env, cpu, Watch::Timer(timer));
+                    }
+                }
+            };
+            match write_mem(cpu, buf, &expirations.to_le_bytes()) {
+                Ok(()) => Outcome::Ret(Ok(8)),
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
+        Kind::Net(socket) => {
+            let result = {
+                let inner = socket.borrow();
+                let Some(handle) = inner.handle else {
+                    return Outcome::Ret(Err(abi::ENOTCONN));
+                };
+                match inner.kind {
+                    crate::fd::SocketKind::Tcp => {
+                        inner.broker.borrow_mut().tcp_recv(handle, count as usize)
+                    }
+                    crate::fd::SocketKind::Udp => {
+                        match inner
+                            .broker
+                            .borrow_mut()
+                            .udp_recv_from(handle, count as usize)
+                        {
+                            Ok(Some((bytes, _))) => Ok(crate::net::RecvOutcome::Data(bytes)),
+                            Ok(None) => Ok(crate::net::RecvOutcome::WouldBlock),
+                            Err(errno) => Err(errno),
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(crate::net::RecvOutcome::Data(bytes)) => match write_mem(cpu, buf, &bytes) {
+                    Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
+                    Err(errno) => Outcome::Ret(Err(errno)),
+                },
+                Ok(crate::net::RecvOutcome::Closed) => Outcome::Ret(Ok(0)),
+                Ok(crate::net::RecvOutcome::WouldBlock) => {
+                    would_block(env, cpu, Watch::NetReadable(socket))
+                }
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
     }
-    Outcome::Ret(Ok(chunk.len() as u64))
 }
 
-/// `write` with pipe support: EPIPE with no readers, partial writes when
-/// the buffer has some room, blocks (with restart) when it has none.
+/// `write` counterpart of [`outcome_read`].
 fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
+    use crate::proc::Watch;
+
     let desc = match env.proc.fds.borrow().get(fd) {
         Ok(entry) => entry.desc.clone(),
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let (pipe, nonblock) = {
+    enum Kind {
+        Plain,
+        Pipe(crate::fd::PipeRef),
+        Event(crate::fd::EventFdRef),
+        Net(crate::fd::NetRef),
+    }
+    let (kind, nonblock) = {
         let desc = desc.borrow();
         if !desc.writable() {
             return Outcome::Ret(Err(abi::EBADF));
         }
-        match &desc.backing {
+        let nonblock = desc.flags & abi::O_NONBLOCK != 0;
+        let kind = match &desc.backing {
             Backing::Pipe {
                 inner,
                 write_end: true,
-            } => (
-                Some(std::rc::Rc::clone(inner)),
-                desc.flags & abi::O_NONBLOCK != 0,
-            ),
+            } => Kind::Pipe(std::rc::Rc::clone(inner)),
             Backing::Pipe { .. } => return Outcome::Ret(Err(abi::EBADF)),
-            _ => (None, false),
-        }
-    };
-    let Some(pipe) = pipe else {
-        return Outcome::Ret(sys_write(env, cpu, fd, buf, count));
+            Backing::SocketPair { tx, .. } => Kind::Pipe(std::rc::Rc::clone(tx)),
+            Backing::EventFd(event) => Kind::Event(std::rc::Rc::clone(event)),
+            Backing::TimerFd(_) | Backing::Epoll(_) => return Outcome::Ret(Err(abi::EINVAL)),
+            Backing::Net(socket) => Kind::Net(std::rc::Rc::clone(socket)),
+            _ => Kind::Plain,
+        };
+        (kind, nonblock)
     };
 
-    let room = {
-        let inner = pipe.borrow();
-        if inner.readers == 0 {
-            // Signal delivery is not modeled; report the error directly.
-            return Outcome::Ret(Err(abi::EPIPE));
+    match kind {
+        Kind::Plain => Outcome::Ret(sys_write(env, cpu, fd, buf, count)),
+        Kind::Pipe(pipe) => {
+            let room = {
+                let inner = pipe.borrow();
+                if inner.readers == 0 {
+                    // Signal delivery is not modeled; report the error.
+                    return Outcome::Ret(Err(abi::EPIPE));
+                }
+                crate::PIPE_CAPACITY.saturating_sub(inner.data.len())
+            };
+            if room == 0 {
+                if nonblock {
+                    return Outcome::Ret(Err(abi::EAGAIN));
+                }
+                return block_and_switch(
+                    env,
+                    cpu,
+                    ParkState::Waiting {
+                        watches: vec![Watch::PipeWritable(pipe)],
+                        deadline: None,
+                    },
+                    true,
+                );
+            }
+            let take = (count as usize).min(room).min(0x40_0000);
+            let bytes = match read_mem(cpu, buf, take) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            pipe.borrow_mut().data.extend(bytes.iter().copied());
+            Outcome::Ret(Ok(take as u64))
         }
-        crate::PIPE_CAPACITY.saturating_sub(inner.data.len())
-    };
-    if room == 0 {
-        if nonblock {
-            return Outcome::Ret(Err(abi::EAGAIN));
+        Kind::Event(event) => {
+            if count < 8 {
+                return Outcome::Ret(Err(abi::EINVAL));
+            }
+            let bytes = match read_mem(cpu, buf, 8) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            let value = u64::from_le_bytes(bytes.try_into().expect("read_mem length"));
+            let mut inner = event.borrow_mut();
+            inner.count = inner.count.saturating_add(value);
+            Outcome::Ret(Ok(8))
         }
-        return block_and_switch(env, cpu, ParkState::PipeWrite { pipe }, true);
+        Kind::Net(socket) => {
+            let bytes = match read_mem(cpu, buf, (count as usize).min(0x40_0000)) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            let inner = socket.borrow();
+            let Some(handle) = inner.handle else {
+                return Outcome::Ret(Err(abi::ENOTCONN));
+            };
+            let result = match (inner.kind, inner.peer) {
+                (crate::fd::SocketKind::Tcp, _) => {
+                    inner.broker.borrow_mut().tcp_send(handle, &bytes)
+                }
+                (crate::fd::SocketKind::Udp, Some(peer)) => {
+                    inner.broker.borrow_mut().udp_send_to(handle, peer, &bytes)
+                }
+                (crate::fd::SocketKind::Udp, None) => Err(abi::EDESTADDRREQ),
+            };
+            Outcome::Ret(result.map(|n| n as u64))
+        }
     }
-    let take = (count as usize).min(room).min(0x40_0000);
-    let bytes = match read_mem(cpu, buf, take) {
-        Ok(bytes) => bytes,
-        Err(errno) => return Outcome::Ret(Err(errno)),
-    };
-    pipe.borrow_mut().data.extend(bytes.iter().copied());
-    Outcome::Ret(Ok(take as u64))
 }
 
 fn sys_futex(
@@ -1755,7 +2050,7 @@ fn sys_futex(
 }
 
 fn sys_yield(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
-    if env.sched.find_ready().is_none() {
+    if env.sched.find_ready(env.now_nanos(cpu)).is_none() {
         return Outcome::Ret(Ok(0));
     }
     cpu.write_var(env.regs.rax, 0_u64);
@@ -1833,4 +2128,752 @@ fn outcome_vectored(
         };
     }
     Outcome::Ret(Ok(0))
+}
+
+// ── Event loop and networking (milestone 5) ─────────────────────────────────
+
+use crate::fd::{EpollInner, EventFdInner, NetSocket, SocketKind, TimerFdInner};
+use crate::proc::Watch;
+
+const AF_UNIX: u64 = 1;
+const AF_INET: u64 = 2;
+const SOCK_TYPE_MASK: u64 = 0xff;
+const SOCK_STREAM: u64 = 1;
+const SOCK_DGRAM: u64 = 2;
+const SOCK_NONBLOCK: u64 = 0x800;
+const SOCK_CLOEXEC: u64 = 0x8_0000;
+
+const SHUT_WR: u64 = 1;
+const SHUT_RDWR: u64 = 2;
+
+const EPOLL_CTL_ADD: u64 = 1;
+const EPOLL_CTL_DEL: u64 = 2;
+const EPOLL_CTL_MOD: u64 = 3;
+const EPOLLIN: u32 = 0x1;
+const EPOLLOUT: u32 = 0x4;
+
+/// Resolves a total stall: every task is parked and none is ready. Waits on
+/// the host for network readiness, then warps the deterministic clock to
+/// the earliest timer deadline. Returns the index of a task that became
+/// ready, or None for a true deadlock.
+fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
+    let now = env.now_nanos(cpu);
+    let deadline = env.sched.earliest_deadline();
+
+    let handles = env.sched.net_watch_handles();
+    if !handles.is_empty() {
+        if let Some(broker) = env.net.clone() {
+            // Bound the host wait by the nearest guest deadline (nanoseconds
+            // of deterministic time map to host wall time here) or a hard
+            // cap that keeps a dead network from hanging the machine.
+            let cap = std::time::Duration::from_secs(30);
+            let timeout = match deadline {
+                Some(d) if d > now => std::time::Duration::from_nanos(d - now).min(cap),
+                _ => cap,
+            };
+            let woke = broker.borrow_mut().wait_ready(&handles, timeout);
+            if woke {
+                if let Some(index) = env.sched.find_ready(now) {
+                    return Some(index);
+                }
+            } else if deadline.is_none() {
+                tracing::error!(
+                    "network wait timed out after {timeout:?} with no guest timer armed"
+                );
+                return None;
+            }
+        }
+    }
+
+    // Nothing external woke us: advance deterministic time to the earliest
+    // deadline so timeouts and timers fire.
+    let deadline = deadline?;
+    if deadline > now {
+        env.warp_nanos += deadline - now;
+        tracing::debug!("time warp: +{} ns (idle until deadline)", deadline - now);
+    }
+    let now = env.now_nanos(cpu);
+    env.sched.find_ready(now)
+}
+
+fn parse_sockaddr_in(cpu: &mut Cpu, addr: u64, len: u64) -> Result<std::net::SocketAddrV4, u64> {
+    if len < 8 {
+        return Err(abi::EINVAL);
+    }
+    let bytes = read_mem(cpu, addr, 8)?;
+    let family = u16::from_le_bytes(bytes[..2].try_into().expect("slice length"));
+    if family as u64 != AF_INET {
+        return Err(abi::EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes(bytes[2..4].try_into().expect("slice length"));
+    let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
+    Ok(std::net::SocketAddrV4::new(ip, port))
+}
+
+fn write_sockaddr_in(
+    cpu: &mut Cpu,
+    addr_ptr: u64,
+    len_ptr: u64,
+    addr: std::net::SocketAddrV4,
+) -> Result<(), u64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    let mut out = [0_u8; 16];
+    out[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&addr.port().to_be_bytes());
+    out[4..8].copy_from_slice(&addr.ip().octets());
+    write_mem(cpu, addr_ptr, &out)?;
+    if len_ptr != 0 {
+        write_mem(cpu, len_ptr, &16_u32.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn net_of(env: &LinuxEnv, fd: u64) -> Result<crate::fd::NetRef, u64> {
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let backing = &desc.borrow().backing;
+    match backing {
+        Backing::Net(socket) => Ok(socket.clone()),
+        _ => Err(abi::ENOTSOCK),
+    }
+}
+
+fn install_fd(env: &mut LinuxEnv, backing: Backing, flags: u64, cloexec: bool) -> SysResult {
+    env.proc.fds.borrow_mut().insert(FdEntry {
+        desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
+            backing,
+            offset: 0,
+            flags,
+        })),
+        cloexec,
+    })
+}
+
+fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -> SysResult {
+    let Some(broker) = env.net.clone() else {
+        tracing::warn!("socket: network is denied (no broker attached)");
+        return Err(abi::EAFNOSUPPORT);
+    };
+    if domain != AF_INET {
+        tracing::warn!("socket: unsupported domain {domain}");
+        return Err(abi::EAFNOSUPPORT);
+    }
+    let kind = match sock_type & SOCK_TYPE_MASK {
+        SOCK_STREAM => SocketKind::Tcp,
+        SOCK_DGRAM => SocketKind::Udp,
+        other => {
+            tracing::warn!("socket: unsupported type {other}");
+            return Err(abi::EPROTONOSUPPORT);
+        }
+    };
+    let socket = NetSocket {
+        broker,
+        kind,
+        handle: None,
+        peer: None,
+    };
+    let flags = abi::O_RDWR | ((sock_type & SOCK_NONBLOCK != 0) as u64 * abi::O_NONBLOCK);
+    install_fd(
+        env,
+        Backing::Net(std::rc::Rc::new(std::cell::RefCell::new(socket))),
+        flags,
+        sock_type & SOCK_CLOEXEC != 0,
+    )
+}
+
+fn sys_connect(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
+    let socket = net_of(env, fd)?;
+    let target = parse_sockaddr_in(cpu, addr, len)?;
+    let mut inner = socket.borrow_mut();
+    match inner.kind {
+        SocketKind::Tcp => {
+            let handle = inner.broker.borrow_mut().tcp_connect(target)?;
+            inner.handle = Some(handle);
+        }
+        SocketKind::Udp => {
+            if inner.handle.is_none() {
+                let handle = inner.broker.borrow_mut().udp_open()?;
+                inner.handle = Some(handle);
+            }
+        }
+    }
+    inner.peer = Some(target);
+    Ok(0)
+}
+
+fn sys_sendto(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [fd, buf, len, _flags, addr, addrlen] = a;
+    if addr == 0 {
+        return outcome_write(env, cpu, fd, buf, len);
+    }
+    let socket = match net_of(env, fd) {
+        Ok(socket) => socket,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let target = match parse_sockaddr_in(cpu, addr, addrlen) {
+        Ok(target) => target,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let bytes = match read_mem(cpu, buf, (len as usize).min(0x1_0000)) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let mut inner = socket.borrow_mut();
+    if inner.kind != SocketKind::Udp {
+        return Outcome::Ret(Err(abi::EOPNOTSUPP));
+    }
+    let broker = inner.broker.clone();
+    if inner.handle.is_none() {
+        match broker.borrow_mut().udp_open() {
+            Ok(handle) => inner.handle = Some(handle),
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        }
+    }
+    let handle = inner.handle.expect("handle set above");
+    let result = broker.borrow_mut().udp_send_to(handle, target, &bytes);
+    Outcome::Ret(result.map(|n| n as u64))
+}
+
+fn sys_recvfrom(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [fd, buf, len, _flags, addr, addrlen] = a;
+    let socket = match net_of(env, fd) {
+        Ok(socket) => socket,
+        // Not a network socket: plain read (recv on a socketpair).
+        Err(_) => return outcome_read(env, cpu, fd, buf, len),
+    };
+    let is_udp = socket.borrow().kind == SocketKind::Udp;
+    if !is_udp {
+        return outcome_read(env, cpu, fd, buf, len);
+    }
+    let received = {
+        let (broker, handle) = {
+            let inner = socket.borrow();
+            let Some(handle) = inner.handle else {
+                return Outcome::Ret(Err(abi::ENOTCONN));
+            };
+            (inner.broker.clone(), handle)
+        };
+        let result = broker.borrow_mut().udp_recv_from(handle, len as usize);
+        result
+    };
+    match received {
+        Ok(Some((bytes, from))) => {
+            if let Err(errno) = write_mem(cpu, buf, &bytes) {
+                return Outcome::Ret(Err(errno));
+            }
+            if let Err(errno) = write_sockaddr_in(cpu, addr, addrlen, from) {
+                return Outcome::Ret(Err(errno));
+            }
+            Outcome::Ret(Ok(bytes.len() as u64))
+        }
+        Ok(None) => {
+            let nonblock = {
+                let desc = env
+                    .proc
+                    .fds
+                    .borrow()
+                    .get(fd)
+                    .map(|e| e.desc.borrow().flags & abi::O_NONBLOCK != 0)
+                    .unwrap_or(false);
+                desc
+            };
+            if nonblock {
+                return Outcome::Ret(Err(abi::EAGAIN));
+            }
+            block_and_switch(
+                env,
+                cpu,
+                ParkState::Waiting {
+                    watches: vec![Watch::NetReadable(socket)],
+                    deadline: None,
+                },
+                true,
+            )
+        }
+        Err(errno) => Outcome::Ret(Err(errno)),
+    }
+}
+
+fn sys_shutdown(env: &mut LinuxEnv, fd: u64, how: u64) -> SysResult {
+    let socket = net_of(env, fd)?;
+    let inner = socket.borrow();
+    if let (SocketKind::Tcp, Some(handle)) = (inner.kind, inner.handle) {
+        if how == SHUT_WR || how == SHUT_RDWR {
+            inner.broker.borrow_mut().tcp_shutdown_write(handle)?;
+        }
+    }
+    Ok(0)
+}
+
+fn sys_getpeername(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
+    let socket = net_of(env, fd)?;
+    let peer = socket.borrow().peer.ok_or(abi::ENOTCONN)?;
+    write_sockaddr_in(cpu, addr, len, peer)?;
+    Ok(0)
+}
+
+fn sys_getsockopt(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    let [fd, _level, optname, optval, optlen, _] = a;
+    net_of(env, fd)?;
+    const SO_ERROR: u64 = 4;
+    if optval != 0 {
+        // SO_ERROR reads back 0 (no pending error); every other option
+        // also reads as a zeroed 32-bit value.
+        let _ = optname == SO_ERROR;
+        write_mem(cpu, optval, &[0_u8; 4])?;
+        if optlen != 0 {
+            write_mem(cpu, optlen, &4_u32.to_le_bytes())?;
+        }
+    }
+    Ok(0)
+}
+
+fn sys_socketpair(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    let [domain, sock_type, _proto, sv, _, _] = a;
+    if domain != AF_UNIX {
+        return Err(abi::EAFNOSUPPORT);
+    }
+    if sock_type & SOCK_TYPE_MASK != SOCK_STREAM {
+        return Err(abi::EPROTONOSUPPORT);
+    }
+    use crate::fd::PipeInner;
+    let make_pipe = || {
+        std::rc::Rc::new(std::cell::RefCell::new(PipeInner {
+            data: Default::default(),
+            readers: 1,
+            writers: 1,
+        }))
+    };
+    let (ab, ba) = (make_pipe(), make_pipe());
+    let cloexec = sock_type & SOCK_CLOEXEC != 0;
+    let fd_a = install_fd(
+        env,
+        Backing::SocketPair {
+            rx: ba.clone(),
+            tx: ab.clone(),
+        },
+        abi::O_RDWR,
+        cloexec,
+    )?;
+    let fd_b = install_fd(
+        env,
+        Backing::SocketPair { rx: ab, tx: ba },
+        abi::O_RDWR,
+        cloexec,
+    )?;
+    let mut buf = [0_u8; 8];
+    buf[..4].copy_from_slice(&(fd_a as u32).to_le_bytes());
+    buf[4..].copy_from_slice(&(fd_b as u32).to_le_bytes());
+    write_mem(cpu, sv, &buf)?;
+    Ok(0)
+}
+
+fn sys_eventfd(env: &mut LinuxEnv, initval: u64, flags: u64) -> SysResult {
+    const EFD_SEMAPHORE: u64 = 1;
+    let event = EventFdInner {
+        count: initval,
+        semaphore: flags & EFD_SEMAPHORE != 0,
+    };
+    install_fd(
+        env,
+        Backing::EventFd(std::rc::Rc::new(std::cell::RefCell::new(event))),
+        abi::O_RDWR | (flags & abi::O_NONBLOCK),
+        flags & abi::O_CLOEXEC != 0,
+    )
+}
+
+fn read_timespec_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
+    let bytes = read_mem(cpu, addr, 16)?;
+    let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
+    let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
+    Ok((sec.max(0) as u64) * 1_000_000_000 + nsec.max(0) as u64)
+}
+
+fn sys_timerfd_create(env: &mut LinuxEnv, _clockid: u64, flags: u64) -> SysResult {
+    install_fd(
+        env,
+        Backing::TimerFd(std::rc::Rc::new(std::cell::RefCell::new(
+            TimerFdInner::default(),
+        ))),
+        abi::O_RDONLY | (flags & abi::O_NONBLOCK),
+        flags & abi::O_CLOEXEC != 0,
+    )
+}
+
+fn timer_of(env: &LinuxEnv, fd: u64) -> Result<crate::fd::TimerFdRef, u64> {
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let backing = &desc.borrow().backing;
+    match backing {
+        Backing::TimerFd(timer) => Ok(timer.clone()),
+        _ => Err(abi::EINVAL),
+    }
+}
+
+fn sys_timerfd_settime(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    const TFD_TIMER_ABSTIME: u64 = 1;
+    let [fd, flags, new_value, old_value, _, _] = a;
+    let timer = timer_of(env, fd)?;
+    let now = env.now_nanos(cpu);
+
+    if old_value != 0 {
+        let inner = timer.borrow();
+        let remaining = inner
+            .next_expiry
+            .map(|e| e.saturating_sub(now))
+            .unwrap_or(0);
+        let mut out = [0_u8; 32];
+        out[..8].copy_from_slice(&((inner.interval / 1_000_000_000) as i64).to_le_bytes());
+        out[8..16].copy_from_slice(&((inner.interval % 1_000_000_000) as i64).to_le_bytes());
+        out[16..24].copy_from_slice(&((remaining / 1_000_000_000) as i64).to_le_bytes());
+        out[24..32].copy_from_slice(&((remaining % 1_000_000_000) as i64).to_le_bytes());
+        write_mem(cpu, old_value, &out)?;
+    }
+
+    let interval = read_timespec_at(cpu, new_value)?;
+    let value = read_timespec_at(cpu, new_value + 16)?;
+    // itimerspec = { it_interval, it_value }.
+    let (interval, value) = (interval, value);
+    let mut inner = timer.borrow_mut();
+    if value == 0 {
+        inner.next_expiry = None;
+    } else {
+        inner.next_expiry = Some(if flags & TFD_TIMER_ABSTIME != 0 {
+            value
+        } else {
+            now + value
+        });
+    }
+    inner.interval = interval;
+    Ok(0)
+}
+
+fn sys_timerfd_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, curr: u64) -> SysResult {
+    let timer = timer_of(env, fd)?;
+    let now = env.now_nanos(cpu);
+    let inner = timer.borrow();
+    let remaining = inner
+        .next_expiry
+        .map(|e| e.saturating_sub(now))
+        .unwrap_or(0);
+    let mut out = [0_u8; 32];
+    out[..8].copy_from_slice(&((inner.interval / 1_000_000_000) as i64).to_le_bytes());
+    out[8..16].copy_from_slice(&((inner.interval % 1_000_000_000) as i64).to_le_bytes());
+    out[16..24].copy_from_slice(&((remaining / 1_000_000_000) as i64).to_le_bytes());
+    out[24..32].copy_from_slice(&((remaining % 1_000_000_000) as i64).to_le_bytes());
+    write_mem(cpu, curr, &out)?;
+    Ok(0)
+}
+
+fn epoll_of(env: &LinuxEnv, fd: u64) -> Result<crate::fd::EpollRef, u64> {
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let backing = &desc.borrow().backing;
+    match backing {
+        Backing::Epoll(epoll) => Ok(epoll.clone()),
+        _ => Err(abi::EINVAL),
+    }
+}
+
+fn sys_epoll_create(env: &mut LinuxEnv, flags: u64) -> SysResult {
+    install_fd(
+        env,
+        Backing::Epoll(std::rc::Rc::new(std::cell::RefCell::new(
+            EpollInner::default(),
+        ))),
+        abi::O_RDWR,
+        flags & abi::O_CLOEXEC != 0,
+    )
+}
+
+fn sys_epoll_ctl(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    let [epfd, op, fd, event_ptr, _, _] = a;
+    let epoll = epoll_of(env, epfd)?;
+    // The target must exist (except for DEL of an already-closed fd).
+    match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            env.proc.fds.borrow().get(fd)?;
+            let bytes = read_mem(cpu, event_ptr, 12)?;
+            let events = u32::from_le_bytes(bytes[..4].try_into().expect("slice length"));
+            let data = u64::from_le_bytes(bytes[4..12].try_into().expect("slice length"));
+            let mut inner = epoll.borrow_mut();
+            if op == EPOLL_CTL_ADD && inner.interests.contains_key(&fd) {
+                return Err(abi::EEXIST);
+            }
+            inner.interests.insert(fd, (events, data));
+            Ok(0)
+        }
+        EPOLL_CTL_DEL => {
+            epoll
+                .borrow_mut()
+                .interests
+                .remove(&fd)
+                .ok_or(abi::ENOENT)?;
+            Ok(0)
+        }
+        _ => Err(abi::EINVAL),
+    }
+}
+
+fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [epfd, events_ptr, max_events, timeout_ms, _, _] = a;
+    let epoll = match epoll_of(env, epfd) {
+        Ok(epoll) => epoll,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let max_events = (max_events as usize).clamp(1, 256);
+    let now = env.now_nanos(cpu);
+
+    // Evaluate readiness for every registered fd.
+    let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut watches: Vec<Watch> = Vec::new();
+    {
+        let inner = epoll.borrow();
+        let fds = env.proc.fds.borrow();
+        for (&fd, &(events, data)) in inner.interests.iter() {
+            let Ok(entry) = fds.get(fd) else { continue };
+            let desc = entry.desc.borrow();
+            let mut fired = 0_u32;
+            if events & EPOLLIN != 0 {
+                if desc.readable() && desc_read_ready(&desc, now) {
+                    fired |= EPOLLIN;
+                } else if let Some(watch) = read_watch_of(&desc) {
+                    watches.push(watch);
+                }
+            }
+            if events & EPOLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
+                fired |= EPOLLOUT;
+            }
+            if fired != 0 && ready.len() < max_events {
+                ready.push((fired, data));
+            }
+        }
+    }
+
+    if !ready.is_empty() {
+        let mut out = Vec::with_capacity(ready.len() * 12);
+        for (events, data) in &ready {
+            out.extend_from_slice(&events.to_le_bytes());
+            out.extend_from_slice(&data.to_le_bytes());
+        }
+        if let Err(errno) = write_mem(cpu, events_ptr, &out) {
+            return Outcome::Ret(Err(errno));
+        }
+        return Outcome::Ret(Ok(ready.len() as u64));
+    }
+
+    let timeout_ms = timeout_ms as u32 as i32;
+    if timeout_ms == 0 {
+        return Outcome::Ret(Ok(0));
+    }
+    let deadline = if timeout_ms > 0 {
+        Some(now + timeout_ms as u64 * 1_000_000)
+    } else {
+        None
+    };
+    block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true)
+}
+
+/// `select`/`pselect6` over readable/writable fd sets. Evaluates
+/// immediately; blocks with restart semantics when nothing is ready and
+/// the timeout allows it.
+fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) -> Outcome {
+    let [nfds, readfds, writefds, exceptfds, timeout_ptr, _] = a;
+    let nfds = nfds.min(1024) as usize;
+    let words = nfds.div_ceil(64);
+    let now = env.now_nanos(cpu);
+
+    let read_set = |cpu: &mut Cpu, ptr: u64| -> Result<Vec<u64>, u64> {
+        if ptr == 0 || words == 0 {
+            return Ok(vec![0; words]);
+        }
+        let bytes = read_mem(cpu, ptr, words * 8)?;
+        Ok(bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("chunk size")))
+            .collect())
+    };
+    let (rset, wset) = match (read_set(cpu, readfds), read_set(cpu, writefds)) {
+        (Ok(r), Ok(w)) => (r, w),
+        _ => return Outcome::Ret(Err(abi::EFAULT)),
+    };
+
+    let mut r_out = vec![0_u64; words];
+    let mut w_out = vec![0_u64; words];
+    let mut count = 0_u64;
+    let mut watches: Vec<Watch> = Vec::new();
+    {
+        let fds = env.proc.fds.borrow();
+        for fd in 0..nfds {
+            let (word, bit) = (fd / 64, 1_u64 << (fd % 64));
+            let want_read = rset.get(word).is_some_and(|w| w & bit != 0);
+            let want_write = wset.get(word).is_some_and(|w| w & bit != 0);
+            if !want_read && !want_write {
+                continue;
+            }
+            let Ok(entry) = fds.get(fd as u64) else {
+                return Outcome::Ret(Err(abi::EBADF));
+            };
+            let desc = entry.desc.borrow();
+            if want_read {
+                if desc.readable() && desc_read_ready(&desc, now) {
+                    r_out[word] |= bit;
+                    count += 1;
+                } else if let Some(watch) = read_watch_of(&desc) {
+                    watches.push(watch);
+                }
+            }
+            if want_write && desc.writable() && desc_write_ready(&desc) {
+                w_out[word] |= bit;
+                count += 1;
+            }
+        }
+    }
+
+    let timeout = if timeout_ptr == 0 {
+        None
+    } else if timespec {
+        match read_timespec_at(cpu, timeout_ptr) {
+            Ok(nanos) => Some(nanos),
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        }
+    } else {
+        // struct timeval { sec, usec }.
+        match read_mem(cpu, timeout_ptr, 16) {
+            Ok(bytes) => {
+                let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
+                let usec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
+                Some((sec.max(0) as u64) * 1_000_000_000 + (usec.max(0) as u64) * 1_000)
+            }
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        }
+    };
+
+    if count == 0 && timeout != Some(0) {
+        let deadline = timeout.map(|t| now + t);
+        return block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true);
+    }
+
+    let write_set = |cpu: &mut Cpu, ptr: u64, set: &[u64]| -> Result<(), u64> {
+        if ptr == 0 {
+            return Ok(());
+        }
+        let bytes: Vec<u8> = set.iter().flat_map(|w| w.to_le_bytes()).collect();
+        write_mem(cpu, ptr, &bytes)
+    };
+    if let Err(errno) = write_set(cpu, readfds, &r_out) {
+        return Outcome::Ret(Err(errno));
+    }
+    if let Err(errno) = write_set(cpu, writefds, &w_out) {
+        return Outcome::Ret(Err(errno));
+    }
+    if exceptfds != 0 {
+        let zeros = vec![0_u8; words * 8];
+        if let Err(errno) = write_mem(cpu, exceptfds, &zeros) {
+            return Outcome::Ret(Err(errno));
+        }
+    }
+    Outcome::Ret(Ok(count))
+}
+
+/// `sendfile(out, in, offset_ptr, count)`: copy from a VFS file to any
+/// writable fd. Partial copies are returned (callers loop), which keeps
+/// blocking restarts idempotent.
+fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [out_fd, in_fd, offset_ptr, count, _, _] = a;
+
+    let in_desc = match env.proc.fds.borrow().get(in_fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let (node, base_offset) = {
+        let desc = in_desc.borrow();
+        match &desc.backing {
+            Backing::File { node } => (*node, desc.offset),
+            _ => return Outcome::Ret(Err(abi::EINVAL)),
+        }
+    };
+    let offset = if offset_ptr != 0 {
+        match read_mem(cpu, offset_ptr, 8) {
+            Ok(bytes) => u64::from_le_bytes(bytes.try_into().expect("read_mem length")),
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        }
+    } else {
+        base_offset
+    };
+
+    let chunk: Vec<u8> = {
+        let NodeKind::File(data) = &env.vfs.node(node).kind else {
+            return Outcome::Ret(Err(abi::EIO));
+        };
+        let start = (offset as usize).min(data.len());
+        let end = (start + (count as usize).min(0x4_0000)).min(data.len());
+        data[start..end].to_vec()
+    };
+    if chunk.is_empty() {
+        return Outcome::Ret(Ok(0));
+    }
+
+    // Stage through a scratch buffer in guest memory? Not needed: write
+    // directly through the write path by borrowing its backing logic.
+    let written = {
+        let out_desc = match env.proc.fds.borrow().get(out_fd) {
+            Ok(entry) => entry.desc.clone(),
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        };
+        let mut desc = out_desc.borrow_mut();
+        if !desc.writable() {
+            return Outcome::Ret(Err(abi::EBADF));
+        }
+        match &desc.backing {
+            Backing::Pipe {
+                inner,
+                write_end: true,
+            } => {
+                let room = {
+                    let pipe = inner.borrow();
+                    if pipe.readers == 0 {
+                        return Outcome::Ret(Err(abi::EPIPE));
+                    }
+                    crate::PIPE_CAPACITY.saturating_sub(pipe.data.len())
+                };
+                if room == 0 {
+                    let pipe = inner.clone();
+                    drop(desc);
+                    return block_and_switch(
+                        env,
+                        cpu,
+                        ParkState::Waiting {
+                            watches: vec![Watch::PipeWritable(pipe)],
+                            deadline: None,
+                        },
+                        true,
+                    );
+                }
+                let take = chunk.len().min(room);
+                inner
+                    .borrow_mut()
+                    .data
+                    .extend(chunk[..take].iter().copied());
+                take
+            }
+            _ => {
+                let take = chunk.len();
+                match write_backing(env, &mut desc, &chunk) {
+                    Ok(n) => n as usize,
+                    Err(errno) => return Outcome::Ret(Err(errno)),
+                }
+                .min(take)
+            }
+        }
+    };
+
+    if offset_ptr != 0 {
+        let next = offset + written as u64;
+        if let Err(errno) = write_mem(cpu, offset_ptr, &next.to_le_bytes()) {
+            return Outcome::Ret(Err(errno));
+        }
+    } else {
+        in_desc.borrow_mut().offset = offset + written as u64;
+    }
+    Outcome::Ret(Ok(written as u64))
 }

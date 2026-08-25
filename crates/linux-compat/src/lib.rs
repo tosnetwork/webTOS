@@ -15,6 +15,7 @@
 
 pub mod abi;
 pub mod fd;
+pub mod net;
 pub mod proc;
 pub mod syscall;
 pub mod vfs;
@@ -91,6 +92,11 @@ pub struct LinuxEnv {
     pub(crate) sched: Scheduler,
     pub(crate) rng_state: u64,
     pub(crate) output: Vec<u8>,
+    /// Host network broker; None = network denied (the default).
+    pub(crate) net: Option<net::BrokerRef>,
+    /// Deterministic time-warp offset: advanced when the whole system is
+    /// idle waiting on a timer, so timeouts fire without busy-waiting.
+    pub(crate) warp_nanos: u64,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -104,8 +110,16 @@ impl LinuxEnv {
             sched: Scheduler::new(),
             rng_state: 0x9e37_79b9_7f4a_7c15,
             output: Vec::new(),
+            net: None,
+            warp_nanos: 0,
             exit_code: None,
         })
+    }
+
+    /// Attaches the host network broker. Without one, guest sockets fail
+    /// with `EAFNOSUPPORT` (network is denied by default).
+    pub fn set_network(&mut self, broker: net::BrokerRef) {
+        self.net = Some(broker);
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
@@ -133,12 +147,17 @@ impl LinuxEnv {
     }
 
     pub(crate) fn now(&self, cpu: &Cpu) -> (i64, i64) {
-        // Deterministic: one retired instruction ~ one nanosecond.
-        let nanos = cpu.icount() as i64;
+        let nanos = self.now_nanos(cpu) as i64;
         (
             EPOCH_BASE_SEC + nanos / 1_000_000_000,
             nanos % 1_000_000_000,
         )
+    }
+
+    /// Deterministic monotonic clock: one retired instruction is one
+    /// nanosecond, plus the idle time-warp offset.
+    pub(crate) fn now_nanos(&self, cpu: &Cpu) -> u64 {
+        cpu.icount().saturating_add(self.warp_nanos)
     }
 
     pub(crate) fn next_random(&mut self) -> u64 {
@@ -472,6 +491,11 @@ impl Machine {
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
         self.env().set_args(argv, envp);
+    }
+
+    /// Attaches a host network broker (network is denied without one).
+    pub fn set_network(&mut self, broker: net::BrokerRef) {
+        self.env().set_network(broker);
     }
 
     /// Loads a Linux ELF from the guest filesystem as a fresh root process.

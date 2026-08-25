@@ -47,9 +47,30 @@ milestone-1 `linux_min` environment.
 - shell pipelines and external commands work end to end (BusyBox `sh`
   spawning applets through `$PATH`, multi-stage pipelines, exit codes)
 
+## What it provides (milestone 5)
+
+- event-loop primitives: `eventfd`, `timerfd` (over the deterministic
+  clock), `epoll` (create/ctl/wait), `select`/`pselect6`, real readiness
+  in `poll`, `socketpair`, and `sendfile`
+- an idle **time warp**: when every task is blocked on a timer or
+  timeout, the deterministic clock jumps to the earliest deadline, so
+  timers fire without burning instructions
+- networking through an explicit host [`net::NetworkBroker`]: TCP
+  connect/send/recv/shutdown and UDP send/recv, `getpeername`,
+  `getsockopt(SO_ERROR)`. **Network is denied by default** — with no
+  broker attached, `socket(2)` fails with `EAFNOSUPPORT`. The bundled
+  `NativeBroker` (std::net) supports destination redirects that double
+  as an allowlist; the browser host will supply its own broker over
+  browser transports
+- gates: BusyBox `wget` fetching HTTP through the broker, `nslookup`
+  resolving over UDP DNS, and a denied-by-default check, plus C fixtures
+  for eventfd wakeups, timerfd through the time warp, and epoll across
+  processes
+
 Not modeled yet: signal delivery to handlers (fatal signals terminate,
-registration is recorded), process groups and sessions, and futex
-timeouts (time advances only with executed instructions).
+registration is recorded), process groups and sessions, listening
+sockets (client-only network), `sendmsg`/`recvmsg`, and network input
+recording for replay (planned with the receipts work).
 
 ## Testing
 

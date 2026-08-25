@@ -6,6 +6,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use crate::net::{BrokerRef, Handle};
 use crate::{abi, vfs::Dev};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,62 @@ pub struct PipeInner {
 
 pub type PipeRef = Rc<RefCell<PipeInner>>;
 
+/// eventfd counter state.
+#[derive(Debug, Default)]
+pub struct EventFdInner {
+    pub count: u64,
+    pub semaphore: bool,
+}
+
+pub type EventFdRef = Rc<RefCell<EventFdInner>>;
+
+/// timerfd state; times are deterministic nanoseconds (see `LinuxEnv::now`).
+#[derive(Debug, Default)]
+pub struct TimerFdInner {
+    /// Next expiry in absolute nanoseconds; None while disarmed.
+    pub next_expiry: Option<u64>,
+    /// Interval in nanoseconds (0 = one-shot).
+    pub interval: u64,
+}
+
+pub type TimerFdRef = Rc<RefCell<TimerFdInner>>;
+
+/// A guest network socket, mediated by the host broker.
+pub struct NetSocket {
+    pub broker: BrokerRef,
+    pub kind: SocketKind,
+    /// Broker endpoint; created lazily for UDP, at connect for TCP.
+    pub handle: Option<Handle>,
+    /// Destination set by `connect` (TCP peer, or default UDP target).
+    pub peer: Option<std::net::SocketAddrV4>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketKind {
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Debug for NetSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetSocket")
+            .field("kind", &self.kind)
+            .field("handle", &self.handle)
+            .field("peer", &self.peer)
+            .finish()
+    }
+}
+
+pub type NetRef = Rc<RefCell<NetSocket>>;
+
+/// epoll interest list: guest fd -> (events mask, user data).
+#[derive(Debug, Default)]
+pub struct EpollInner {
+    pub interests: std::collections::BTreeMap<u64, (u32, u64)>,
+}
+
+pub type EpollRef = Rc<RefCell<EpollInner>>;
+
 #[derive(Debug)]
 pub enum Backing {
     /// Host-visible standard stream. Stdin reads EOF; out/err append to the
@@ -42,6 +99,16 @@ pub enum Backing {
     Dev(Dev),
     /// One end of an in-memory pipe.
     Pipe { inner: PipeRef, write_end: bool },
+    /// One end of a socketpair: read from `rx`, write to `tx`.
+    SocketPair { rx: PipeRef, tx: PipeRef },
+    /// eventfd counter.
+    EventFd(EventFdRef),
+    /// timerfd over the deterministic clock.
+    TimerFd(TimerFdRef),
+    /// Network socket mediated by the host broker.
+    Net(NetRef),
+    /// epoll instance.
+    Epoll(EpollRef),
 }
 
 #[derive(Debug)]
@@ -67,13 +134,30 @@ impl Drop for Description {
         // The last descriptor of a pipe end closing changes the peer's
         // readiness (EOF for readers, EPIPE for writers); blocked tasks
         // re-check at the next scheduling point.
-        if let Backing::Pipe { inner, write_end } = &self.backing {
-            let mut inner = inner.borrow_mut();
-            if *write_end {
-                inner.writers = inner.writers.saturating_sub(1);
-            } else {
-                inner.readers = inner.readers.saturating_sub(1);
+        match &self.backing {
+            Backing::Pipe { inner, write_end } => {
+                let mut inner = inner.borrow_mut();
+                if *write_end {
+                    inner.writers = inner.writers.saturating_sub(1);
+                } else {
+                    inner.readers = inner.readers.saturating_sub(1);
+                }
             }
+            Backing::SocketPair { rx, tx } => {
+                {
+                    let mut rx = rx.borrow_mut();
+                    rx.readers = rx.readers.saturating_sub(1);
+                }
+                let mut tx = tx.borrow_mut();
+                tx.writers = tx.writers.saturating_sub(1);
+            }
+            Backing::Net(socket) => {
+                let socket = socket.borrow();
+                if let Some(handle) = socket.handle {
+                    socket.broker.borrow_mut().close(handle);
+                }
+            }
+            _ => {}
         }
     }
 }

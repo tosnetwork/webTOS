@@ -17,7 +17,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use icicle_cpu::CpuSnapshot;
 use icicle_mem::VirtualMemoryMap;
 
-use crate::fd::{FdTable, PipeRef};
+use crate::fd::{EventFdRef, FdTable, NetRef, PipeRef, TimerFdRef};
 use crate::SigAction;
 
 pub const ROOT_PID: u64 = 1000;
@@ -121,6 +121,49 @@ pub enum ParkState {
     PipeRead { pipe: PipeRef },
     /// Blocked writing a full pipe.
     PipeWrite { pipe: PipeRef },
+    /// Blocked until any watch is ready or the deadline passes
+    /// (blocking reads on eventfd/timerfd/sockets, epoll_wait, select).
+    Waiting {
+        watches: Vec<Watch>,
+        deadline: Option<u64>,
+    },
+}
+
+/// One readiness source a parked task may wait on.
+pub enum Watch {
+    PipeReadable(PipeRef),
+    PipeWritable(PipeRef),
+    Event(EventFdRef),
+    Timer(TimerFdRef),
+    /// Network socket readability, checked through the broker.
+    NetReadable(NetRef),
+    /// Immediately ready (regular files and similar).
+    Always,
+}
+
+impl Watch {
+    pub fn ready(&self, now: u64) -> bool {
+        match self {
+            Watch::PipeReadable(pipe) => {
+                let pipe = pipe.borrow();
+                !pipe.data.is_empty() || pipe.writers == 0
+            }
+            Watch::PipeWritable(pipe) => {
+                let pipe = pipe.borrow();
+                pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
+            }
+            Watch::Event(event) => event.borrow().count > 0,
+            Watch::Timer(timer) => timer.borrow().next_expiry.is_some_and(|t| now >= t),
+            Watch::NetReadable(socket) => {
+                let socket = socket.borrow();
+                match socket.handle {
+                    Some(handle) => socket.broker.borrow_mut().readable(handle),
+                    None => false,
+                }
+            }
+            Watch::Always => true,
+        }
+    }
 }
 
 pub struct ParkedTask {
@@ -204,7 +247,8 @@ impl Scheduler {
     }
 
     /// Index of the first ready task, in stable queue order (deterministic).
-    pub fn find_ready(&self) -> Option<usize> {
+    /// `now` is the deterministic clock in nanoseconds.
+    pub fn find_ready(&self, now: u64) -> Option<usize> {
         self.parked.iter().position(|task| match &task.state {
             ParkState::Ready => true,
             ParkState::Futex { woken, .. } => *woken,
@@ -220,6 +264,46 @@ impl Scheduler {
                 let pipe = pipe.borrow();
                 pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
             }
+            ParkState::Waiting { watches, deadline } => {
+                deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
+            }
         })
+    }
+
+    /// Earliest wake-up deadline among parked tasks (timerfd expiries and
+    /// wait timeouts), used to warp the deterministic clock when the whole
+    /// system is idle.
+    pub fn earliest_deadline(&self) -> Option<u64> {
+        self.parked
+            .iter()
+            .flat_map(|task| match &task.state {
+                ParkState::Waiting { watches, deadline } => {
+                    let timers = watches.iter().filter_map(|w| match w {
+                        Watch::Timer(t) => t.borrow().next_expiry,
+                        _ => None,
+                    });
+                    timers.chain(*deadline).collect::<Vec<_>>()
+                }
+                _ => Vec::new(),
+            })
+            .min()
+    }
+
+    /// Broker handles that parked tasks are waiting to read, for the idle
+    /// host wait.
+    pub fn net_watch_handles(&self) -> Vec<crate::net::Handle> {
+        self.parked
+            .iter()
+            .flat_map(|task| match &task.state {
+                ParkState::Waiting { watches, .. } => watches
+                    .iter()
+                    .filter_map(|w| match w {
+                        Watch::NetReadable(s) => s.borrow().handle,
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
     }
 }
