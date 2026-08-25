@@ -231,6 +231,15 @@ fn main() {
             },
         },
         Case {
+            name: "movmskps eax,xmm1 (0f 50 c1)",
+            code: &[0x0f, 0x50, 0xc1],
+            xmm_out: false,
+            reference: |_a, b| unsafe {
+                let m = _mm_movemask_ps(_mm_castsi128_ps(load(b)));
+                (m as u32) as u128
+            },
+        },
+        Case {
             name: "pcmpgtb xmm0,xmm1 (66 0f 64 c1)",
             code: &[0x66, 0x0f, 0x64, 0xc1],
             xmm_out: true,
@@ -297,6 +306,96 @@ fn main() {
             code: &[0x66, 0x0f, 0x38, 0x00, 0xc1],
             xmm_out: true,
             reference: |a, b| unsafe { store(_mm_shuffle_epi8(load(a), load(b))) },
+        },
+        Case {
+            name: "pmulhuw xmm0,xmm1 (66 0f e4 c1)",
+            code: &[0x66, 0x0f, 0xe4, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_mulhi_epu16(load(a), load(b))) },
+        },
+        Case {
+            name: "pmulhw xmm0,xmm1 (66 0f e5 c1)",
+            code: &[0x66, 0x0f, 0xe5, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_mulhi_epi16(load(a), load(b))) },
+        },
+        Case {
+            name: "pmulld xmm0,xmm1 (66 0f 38 40 c1)",
+            code: &[0x66, 0x0f, 0x38, 0x40, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_mullo_epi32(load(a), load(b))) },
+        },
+        Case {
+            name: "packsswb xmm0,xmm1 (66 0f 63 c1)",
+            code: &[0x66, 0x0f, 0x63, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_packs_epi16(load(a), load(b))) },
+        },
+        Case {
+            name: "packuswb xmm0,xmm1 (66 0f 67 c1)",
+            code: &[0x66, 0x0f, 0x67, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_packus_epi16(load(a), load(b))) },
+        },
+        Case {
+            name: "packssdw xmm0,xmm1 (66 0f 6b c1)",
+            code: &[0x66, 0x0f, 0x6b, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_packs_epi32(load(a), load(b))) },
+        },
+        Case {
+            name: "packusdw xmm0,xmm1 (66 0f 38 2b c1)",
+            code: &[0x66, 0x0f, 0x38, 0x2b, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_packus_epi32(load(a), load(b))) },
+        },
+        Case {
+            name: "pavgb xmm0,xmm1 (66 0f e0 c1)",
+            code: &[0x66, 0x0f, 0xe0, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_avg_epu8(load(a), load(b))) },
+        },
+        Case {
+            name: "pavgw xmm0,xmm1 (66 0f e3 c1)",
+            code: &[0x66, 0x0f, 0xe3, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_avg_epu16(load(a), load(b))) },
+        },
+        Case {
+            name: "punpcklqdq xmm0,xmm1 (66 0f 6c c1)",
+            code: &[0x66, 0x0f, 0x6c, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe { store(_mm_unpacklo_epi64(load(a), load(b))) },
+        },
+        Case {
+            name: "pabsb xmm0,xmm1 (66 0f 38 1c c1)",
+            code: &[0x66, 0x0f, 0x38, 0x1c, 0xc1],
+            xmm_out: true,
+            reference: |_a, b| unsafe { store(_mm_abs_epi8(load(b))) },
+        },
+        Case {
+            name: "pabsw xmm0,xmm1 (66 0f 38 1d c1)",
+            code: &[0x66, 0x0f, 0x38, 0x1d, 0xc1],
+            xmm_out: true,
+            reference: |_a, b| unsafe { store(_mm_abs_epi16(load(b))) },
+        },
+        Case {
+            name: "pabsd xmm0,xmm1 (66 0f 38 1e c1)",
+            code: &[0x66, 0x0f, 0x38, 0x1e, 0xc1],
+            xmm_out: true,
+            reference: |_a, b| unsafe { store(_mm_abs_epi32(load(b))) },
+        },
+        Case {
+            name: "psllw xmm0,3 (66 0f 71 f0 03)",
+            code: &[0x66, 0x0f, 0x71, 0xf0, 0x03],
+            xmm_out: true,
+            reference: |a, _b| unsafe { store(_mm_slli_epi16::<3>(load(a))) },
+        },
+        Case {
+            name: "psraw xmm0,3 (66 0f 71 e0 03)",
+            code: &[0x66, 0x0f, 0x71, 0xe0, 0x03],
+            xmm_out: true,
+            reference: |a, _b| unsafe { store(_mm_srai_epi16::<3>(load(a))) },
         },
         Case {
             name: "aesenc xmm0,xmm1 (66 0f 38 dc c1)",

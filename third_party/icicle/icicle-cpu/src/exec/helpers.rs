@@ -262,6 +262,7 @@ pub mod x86 {
         ("cpuid_Extended_Feature_Enumeration_info", cpuid_extended_feature_enumeration_info),
         ("cpuid", cpuid),
         ("movmskpd", movmskpd),
+        ("movmskps", movmskps),
         ("pinsrw", pinsrw), // Note: implemented in SLEIGH in Ghidra 10.3.
         ("pshuflw", pshuflw),
         ("pshufhw", pshufhw),
@@ -271,6 +272,21 @@ pub mod x86 {
         ("pshufb", pshufb),
         ("roundsd", roundsd),
         ("roundss", roundss),
+        ("pmulhuw", pmulhuw),
+        ("pmulhw", pmulhw),
+        ("pmulld", pmulld),
+        ("packsswb", packsswb),
+        ("packuswb", packuswb),
+        ("packssdw", packssdw),
+        ("packusdw", packusdw),
+        ("pavgb", pavgb),
+        ("pavgw", pavgw),
+        ("punpcklqdq", punpcklqdq),
+        ("pabsb", pabsb),
+        ("pabsw", pabsw),
+        ("pabsd", pabsd),
+        ("psllw", psllw),
+        ("psraw", psraw),
         // AES-NI (SSE form). Node/V8 and OpenSSL issue these unconditionally.
         ("aesenc", aesenc),
         ("aesenclast", aesenclast),
@@ -472,6 +488,17 @@ pub mod x86 {
         cpu.write_var(VarNode::new(dst.id, 8), result as u64);
     }
 
+    /// Extract the sign bit of each of the four packed single-precision floats
+    /// into the low four bits of the destination register.
+    fn movmskps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let src = cpu.read::<u128>(args[1]);
+        let result = ((src >> 31) & 0b0001) as u32
+            | ((src >> 62) & 0b0010) as u32
+            | ((src >> 93) & 0b0100) as u32
+            | ((src >> 124) & 0b1000) as u32;
+        cpu.write_var(VarNode::new(dst.id, 8), result as u64);
+    }
+
     /// Insert word
     #[allow(unused)]
     fn pinsrw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -573,6 +600,176 @@ pub mod x86 {
         for i in 0..16 {
             let c = ctrl[i];
             out[i] = if c & 0x80 != 0 { 0 } else { src[(c & 0x0f) as usize] };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    // --- Packed-integer SIMD ops the spec leaves as opaque pcodeops -------
+    // Verified against the native intrinsics in x64-engine/examples/sse_probe.
+
+    fn xmm_bytes(cpu: &mut Cpu, v: Value) -> [u8; 16] {
+        cpu.read::<u128>(v).to_le_bytes()
+    }
+
+    fn pmulhuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let x = u16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as u32;
+            let y = u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32;
+            out[2 * i..2 * i + 2].copy_from_slice(&(((x * y) >> 16) as u16).to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pmulhw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let x = i16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as i32;
+            let y = i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as i32;
+            out[2 * i..2 * i + 2].copy_from_slice(&(((x * y) >> 16) as i16).to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pmulld(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..4 {
+            let x = u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap());
+            let y = u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+            out[4 * i..4 * i + 4].copy_from_slice(&x.wrapping_mul(y).to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pack_words(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for (half, src) in [a, b].into_iter().enumerate() {
+            for i in 0..8 {
+                let w = i16::from_le_bytes([src[2 * i], src[2 * i + 1]]) as i32;
+                out[half * 8 + i] = if signed {
+                    w.clamp(-128, 127) as i8 as u8
+                } else {
+                    w.clamp(0, 255) as u8
+                };
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn packsswb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pack_words(cpu, dst, args, true);
+    }
+    fn packuswb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pack_words(cpu, dst, args, false);
+    }
+
+    fn pack_dwords(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for (half, src) in [a, b].into_iter().enumerate() {
+            for i in 0..4 {
+                let d = i32::from_le_bytes(src[4 * i..4 * i + 4].try_into().unwrap());
+                let w = if signed {
+                    d.clamp(-32768, 32767) as i16 as u16
+                } else {
+                    d.clamp(0, 65535) as u16
+                };
+                out[half * 8 + 2 * i..half * 8 + 2 * i + 2].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn packssdw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pack_dwords(cpu, dst, args, true);
+    }
+    fn packusdw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pack_dwords(cpu, dst, args, false);
+    }
+
+    /// Shift count for a packed-shift pcodeop: the low bits of the second
+    /// operand (an imm8, m64, or xmm). Saturated so callers can treat any
+    /// count past the element width as a full shift-out.
+    fn simd_shift_count(cpu: &mut Cpu, v: Value) -> u32 {
+        let raw: u128 = match v.size() {
+            16 => cpu.read::<u128>(v),
+            _ => {
+                let x: u64 = cpu.read_dynamic(v).zxt();
+                x as u128
+            }
+        };
+        raw.min(255) as u32
+    }
+
+    fn psllw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]);
+        for i in (0..dst.size).step_by(2) {
+            let w: u16 = cpu.read(args[0].slice(i, 2));
+            let r = if count >= 16 { 0 } else { w << count };
+            cpu.write_var(dst.slice(i, 2), r);
+        }
+    }
+
+    fn psraw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]);
+        for i in (0..dst.size).step_by(2) {
+            let w = cpu.read::<u16>(args[0].slice(i, 2)) as i16;
+            let r = if count >= 16 {
+                (w >> 15) as u16
+            } else {
+                (w >> count) as u16
+            };
+            cpu.write_var(dst.slice(i, 2), r);
+        }
+    }
+
+    // pavg* are invoked element-wise by the spec (one call per lane).
+    fn pavgb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let a: u8 = cpu.read(args[0]);
+        let b: u8 = cpu.read(args[1]);
+        cpu.write_var(dst, ((a as u16 + b as u16 + 1) >> 1) as u8);
+    }
+
+    fn pavgw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let a: u16 = cpu.read(args[0]);
+        let b: u16 = cpu.read(args[1]);
+        cpu.write_var(dst, ((a as u32 + b as u32 + 1) >> 1) as u16);
+    }
+
+    fn punpcklqdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&a[0..8]);
+        out[8..16].copy_from_slice(&b[0..8]);
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    /// pabs* take the source in the second operand; the first is the (unused)
+    /// destination register the pcodeop is written with.
+    fn pabsb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let s = xmm_bytes(cpu, args[1]);
+        let out: [u8; 16] = std::array::from_fn(|i| (s[i] as i8).unsigned_abs());
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+    fn pabsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let s = xmm_bytes(cpu, args[1]);
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let w = i16::from_le_bytes([s[2 * i], s[2 * i + 1]]).unsigned_abs();
+            out[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+    fn pabsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let s = xmm_bytes(cpu, args[1]);
+        let mut out = [0u8; 16];
+        for i in 0..4 {
+            let d = i32::from_le_bytes(s[4 * i..4 * i + 4].try_into().unwrap()).unsigned_abs();
+            out[4 * i..4 * i + 4].copy_from_slice(&d.to_le_bytes());
         }
         cpu.write_var(dst, u128::from_le_bytes(out));
     }
