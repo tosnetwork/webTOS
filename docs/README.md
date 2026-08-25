@@ -9,6 +9,8 @@ for kernel development and compatibility validation.
 
 - [Project overview](../README.md) - product direction, architecture, status,
   and native development commands
+- [White paper](WHITEPAPER.md) - product and vision paper: thesis, why now,
+  competitive landscape, moat, risks, and anticipated investor questions
 - [Product roadmap](../ROADMAP.md) - the primary webTOS plan from static
   `hello` and BusyBox through OpenFox, Codex, and Claude Code
 - [Architecture](TOS_ARCHITECTURE.md) - kernel subsystems and execution
