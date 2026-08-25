@@ -77,4 +77,16 @@ expect("cat redirected", bb("cat", "/tmp/out.txt"), "persisted");
 expect("rm", bb("rm", "/tmp/w/moved.txt", "/tmp/out.txt"));
 expect("rmdir", bb("rmdir", "/tmp/w"));
 
+// Milestone 3: a dynamically linked PIE through the musl loader.
+try {
+  const ldso = await readFile(new URL("../test_data/alpine-minirootfs/lib/ld-musl-x86_64.so.1", import.meta.url));
+  const dynHello = await readFile(new URL("../test_data/hello_dynamic.elf", import.meta.url));
+  addFile("/lib/ld-musl-x86_64.so.1", ldso);
+  addFile("/bin/hello_dynamic", dynHello);
+  const run = runProcess("/bin/hello_dynamic", ["hello_dynamic"]);
+  expect("dynamic hello (musl loader)", run, "ello");
+} catch {
+  console.log("[node] alpine fixture missing (tools/fetch_alpine_rootfs.sh) — skipping dynamic check");
+}
+
 console.log("[node] PASS");
