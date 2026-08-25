@@ -95,10 +95,10 @@ Three things, each found by running Node and fixing the next fault:
    icicle's two-operand p-code drops the imm8 mode (see
    `third_party/icicle/PROVENANCE.md` patch 8).
 
-AES-NI is deliberately **not** advertised in CPUID: the helpers exist for the
-code that issues AES unconditionally, but leaving the bit clear keeps other
-userspace (a guest TLS client) on its software-AES path rather than the
-VEX-AES/PCLMULQDQ encodings that are still not lifted.
+AES-NI **is** advertised in CPUID (the legacy, non-VEX encodings, which now
+have helpers). The guest TLS client takes its hardware-AES path — which also
+uses `pshufb` — and works. What stays unadvertised is AVX/AVX-512, so nothing
+selects the VEX-AES/PCLMULQDQ/XOP encodings that are still not lifted.
 
 All the added SIMD helpers are covered by `x64-engine/examples/sse_probe.rs`,
 which runs each instruction in the engine and compares it to the native

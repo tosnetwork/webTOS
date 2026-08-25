@@ -342,10 +342,14 @@ pub mod x86 {
 
         use cpuid::FeatureInformationEcx as Feature;
 
-        // Advertise SSE through SSE4.2 plus AES-NI (all lift and execute
-        // here) but deliberately not AVX/AVX-512: those encodings decode but
-        // their p-code semantics are not all validated, so userspace stays on
-        // the SSE paths. `avx`, `osxsave`, and `f16c` are left clear.
+        // Advertise SSE/SSE2/SSE3 and AES-NI, but deliberately not AVX or
+        // AVX-512: those encodings decode but their p-code semantics are not
+        // all validated, so userspace stays on the SSE paths. `avx`,
+        // `osxsave`, and `f16c` are left clear. SSE4 is also left clear (a
+        // Rust guest otherwise reaches inline `roundsd`, whose imm8 rounding
+        // mode icicle's two-operand p-code cannot carry). AES-NI *is*
+        // advertised: its round primitives have helpers, and a guest TLS
+        // client's hardware-AES path (which also uses `pshufb`) works.
         let ecx: u32 = (Feature::sse3
             | Feature::tm2
             | Feature::pdcm
