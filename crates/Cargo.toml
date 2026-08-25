@@ -18,3 +18,11 @@ tracing = { version = "0.1.40", default-features = false }
 inherits = "release"
 debug-assertions = true
 overflow-checks = true
+
+# opt-level 3 miscompiles the vendored SLEIGH interpreter on
+# wasm32-unknown-unknown (BusyBox `ls` hangs in an instruction loop that is
+# correct at opt-level 2 and in native builds). Pin 2 until the root cause
+# is isolated; the relcheck profile below reproduces the working build with
+# overflow checks for diagnostics.
+[profile.release]
+opt-level = 2

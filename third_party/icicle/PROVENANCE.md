@@ -25,5 +25,15 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    fully qualified `BitVecExt::` syntax to silence the
    `unstable_name_collisions` future-incompatibility warning.
 
-When updating this vendor copy, re-apply both patches and rerun the
-`x64-engine` test suite for native and `wasm32-unknown-unknown` targets.
+When updating this vendor copy, re-apply the patches and rerun the
+`x64-engine` and `linux-compat` test suites for native and
+`wasm32-unknown-unknown` targets.
+
+## Known issues
+
+- On `wasm32-unknown-unknown`, building the interpreter at `opt-level = 3`
+  miscompiles instruction semantics (BusyBox `ls` enters an endless loop
+  that is correct at `opt-level = 2`, in native builds, and with
+  `debug-assertions` enabled). The `crates/` workspace pins its release
+  profile to `opt-level = 2`; do not raise it without re-running the wasm
+  workload harness (`web/test_node.mjs`).
