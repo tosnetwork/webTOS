@@ -215,6 +215,9 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_FCNTL => sys_fcntl(env, a[0], a[1], a[2]),
         abi::SYS_IOCTL => sys_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FSYNC | abi::SYS_SYNC => Ok(0),
+        // Advisory locking. The guest is a single process with no competing
+        // lock holders, so acquiring/releasing always succeeds as a no-op.
+        abi::SYS_FLOCK => Ok(0),
 
         abi::SYS_SOCKET => sys_socket(env, a[0], a[1], a[2]),
         abi::SYS_CONNECT => sys_connect(env, cpu, a[0], a[1], a[2]),

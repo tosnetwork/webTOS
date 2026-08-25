@@ -76,6 +76,13 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    semantics are unvalidated); leaves 2..6 stay unqueried (max-leaf is 1) so
    the still-unimplemented cache/topology pcodeops are never reached.
 
+10. `icicle-mem/src/physical.rs`: raised `MAX_PAGES` from 50,000 (~195 MiB of
+    guest physical memory) to 262,144 (1 GiB). Pages are allocated lazily, so
+    this reserves nothing up front; it is a runaway-allocation backstop. Large
+    statically linked agent binaries exceed the old limit at load time — the
+    ~246 MiB Codex musl build needs ~63,000 pages for its segments alone,
+    before any runtime heap.
+
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and
 `wasm32-unknown-unknown` targets.

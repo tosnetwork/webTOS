@@ -64,6 +64,7 @@ pub const SYS_WAIT4: u64 = 61;
 pub const SYS_KILL: u64 = 62;
 pub const SYS_UNAME: u64 = 63;
 pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FLOCK: u64 = 73;
 pub const SYS_FSYNC: u64 = 74;
 pub const SYS_GETDENTS: u64 = 78;
 pub const SYS_GETCWD: u64 = 79;

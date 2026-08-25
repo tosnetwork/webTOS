@@ -13,11 +13,15 @@ pub const PAGE_SIZE: usize = 1 << OFFSET_BITS;
 
 pub const PAGE_MASK: u64 = (PAGE_SIZE - 1) as u64;
 
-/// For testing it is useful to have a limit on the maximum number of pages that we allow, to catch
-/// memory leaks during development (we may want to make this configurable in the future)
+/// An upper bound on the number of guest physical pages, a backstop against
+/// runaway allocation. Pages are allocated lazily, so this does not reserve
+/// memory up front. Each page costs two `PAGE_SIZE` buffers (data + perms) of
+/// host memory.
 ///
-/// Currently this limit is set so that the maximum corresponds to ~400 MB of host memory.
-pub const MAX_PAGES: usize = 50_000;
+/// Raised to 1 GiB of guest physical memory: large statically linked agent
+/// binaries (e.g. the ~246 MiB Codex musl build) exceed the previous ~195 MiB
+/// limit at load time, before any runtime heap.
+pub const MAX_PAGES: usize = 262_144;
 
 /// Represents an opaque index into physical memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
