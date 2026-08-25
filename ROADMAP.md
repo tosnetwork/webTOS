@@ -40,7 +40,7 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | ⬜ | 0% | — |
+| M7 Codex & Claude Code | 🔶 | ~10% | Node.js starts, inits V8 heap, reaches glibc CPU-feature detection; blocked on a SLEIGH instruction-decode gap; mmap hole-finding fixed |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 65%**.
@@ -360,7 +360,7 @@ Exit gate:
 - A 60-minute interactive soak test completes without kernel corruption or
   unbounded memory growth. 🔶 (bounded 25-round soak green; caught and fixed a cross-process physical-memory leak; full 60-min pending)
 
-## Milestone 7: Codex and Claude Code ⬜
+## Milestone 7: Codex and Claude Code 🔶
 
 **Outcome:** pinned releases of both coding agents are usable for sustained,
 interactive browser sessions.

@@ -39,6 +39,16 @@ When updating this vendor copy, re-apply the patches and rerun the
 
 ## Known issues
 
+- The x86 SLEIGH lifter mis-decodes the length of at least one instruction
+  reached during glibc's `init_cpu_features` when CPUID advertises a
+  max-basic-leaf above 1 (so leaf 2+ cache/topology descriptors are
+  walked). The symptom is a later fetch landing mid-instruction and
+  faulting. CPUID leaf handling in `icicle-cpu/src/exec/helpers.rs` is
+  therefore left at the upstream default (max basic leaf 1). Raising it
+  (needed for Node.js/V8, milestone 7) requires closing the decode gap
+  first, ideally with a differential-decode harness.
+
+
 - On `wasm32-unknown-unknown`, building the interpreter at `opt-level = 3`
   miscompiles instruction semantics (BusyBox `ls` enters an endless loop
   that is correct at `opt-level = 2`, in native builds, and with
