@@ -11,7 +11,7 @@
 > - Stage-5: `StateTransaction` (atomic multi-key commit/rollback) is NOT implemented. Only single-key put/get exists in `state.rs`.
 > - Stage-6: Package signing in `atp` CLI uses FNV-1a hash, NOT Ed25519. Deploy trust is not cryptographically sound.
 > - Stage-8: WASM host bindings are incomplete. Only 6 basic functions (yield, send, recv, exit, energy_get, log). Missing: `state_get`, `state_put`, `state_delete`, `contract_call`. Contracts cannot access persistent state or call other contracts through the WASM ABI.
-> - See `TODO-proof-contract-platform.md` for the plan to close these gaps.
+> - See `docs/plans/TODO-proof-contract-platform.md` for the plan to close these gaps.
 
 ---
 
@@ -433,7 +433,7 @@ Any language that compiles to WASM runs on TOS: Rust, C, C++, Go, Zig, AssemblyS
 **Success Condition**
 Any WASM module runs on TOS with full spec compliance, energy metering, and deterministic execution. Contract call dispatch routes to the correct export function via SHA-256 selector matching.
 
-`[IMPL: ⚠️ WASM execution and fuel metering work. Selector dispatch works. But WASM contracts cannot do real blockchain work because state access and inter-contract call host functions are not yet exposed. See TODO-proof-contract-platform.md Phase 1.]`
+`[IMPL: ⚠️ WASM execution and fuel metering work. Selector dispatch works. But WASM contracts cannot do real blockchain work because state access and inter-contract call host functions are not yet exposed. See docs/plans/TODO-proof-contract-platform.md Phase 1.]`
 
 #### Stage-9 — Deterministic Linux Compatibility Layer `[IMPL: ✅ Complete — 104 syscalls, 67/67 tests pass in QEMU]`
 
@@ -1315,7 +1315,7 @@ The following components from yellowpaper v1 are **out of scope** for the TOS VM
 | **RustPython** (v1 Stage-11) | RustPython is not mature enough. Python compiles to WASM or runs via Linux compat layer. |
 | **Ristretto JVM** (v1 Stage-11) | Replaced by Linux compat layer — unmodified OpenJDK runs deterministically via syscall translation. |
 | **revm / EVM** (v1 Stage-11) | Removed from scope. |
-| **SP1 zkVM** (v1 Stage-11) | Removed from v2 scope. Planned as a future extension: wrap wasbi WASM interpreter as SP1 guest program to produce ZK proofs alongside ExecutionReceipts. See `TODO-proof-contract-platform.md` Phase 4 for format compatibility notes. |
+| **SP1 zkVM** (v1 Stage-11) | Removed from v2 scope. Planned as a future extension: wrap wasbi WASM interpreter as SP1 guest program to produce ZK proofs alongside ExecutionReceipts. See `docs/plans/TODO-proof-contract-platform.md` Phase 4 for format compatibility notes. |
 
 **What is kept from v1 but simplified:**
 
@@ -1740,6 +1740,6 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 | 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
 | 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ✅ Complete |
 
-**Next milestone:** Close the three critical gaps in Stages 5, 6, and 8 so that WASM contracts can access persistent state, call other contracts, and deploy with cryptographic trust. See `TODO-proof-contract-platform.md` for the implementation plan.
+**Next milestone:** Close the three critical gaps in Stages 5, 6, and 8 so that WASM contracts can access persistent state, call other contracts, and deploy with cryptographic trust. See `docs/plans/TODO-proof-contract-platform.md` for the implementation plan.
 
 **TOS is complete when any program — whether WASM, native, or Linux-compatible — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**

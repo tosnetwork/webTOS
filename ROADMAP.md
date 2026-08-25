@@ -473,13 +473,13 @@ working throughout the migration.
 The existing plans remain useful for deep native Linux semantics, memory, and
 contract work, but they are subordinate to this roadmap:
 
-- [`TODO-linux-maturity.md`](TODO-linux-maturity.md)
-- [`TODO-linux-runtime.md`](TODO-linux-runtime.md)
-- [`TODO-linux-substrate-depth.md`](TODO-linux-substrate-depth.md)
-- [`TODO-memory-subsystem.md`](TODO-memory-subsystem.md)
-- [`TODO-professional-uptake.md`](TODO-professional-uptake.md)
-- [`TODO-runtime-semantics.md`](TODO-runtime-semantics.md)
-- [`TODO-proof-contract-platform.md`](TODO-proof-contract-platform.md)
+- [`TODO-linux-maturity.md`](docs/plans/TODO-linux-maturity.md)
+- [`TODO-linux-runtime.md`](docs/plans/TODO-linux-runtime.md)
+- [`TODO-linux-substrate-depth.md`](docs/plans/TODO-linux-substrate-depth.md)
+- [`TODO-memory-subsystem.md`](docs/plans/TODO-memory-subsystem.md)
+- [`TODO-professional-uptake.md`](docs/plans/TODO-professional-uptake.md)
+- [`TODO-runtime-semantics.md`](docs/plans/TODO-runtime-semantics.md)
+- [`TODO-proof-contract-platform.md`](docs/plans/TODO-proof-contract-platform.md)
 
 ## Definition of Done
 

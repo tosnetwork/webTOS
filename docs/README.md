@@ -11,37 +11,35 @@ for kernel development and compatibility validation.
   and native development commands
 - [Product roadmap](../ROADMAP.md) - the primary webTOS plan from static
   `hello` and BusyBox through OpenFox, Codex, and Claude Code
-- [Architecture](../TOS_ARCHITECTURE.md) - kernel subsystems and execution
+- [Architecture](TOS_ARCHITECTURE.md) - kernel subsystems and execution
   model inherited from the native TOS core
-- [Use cases](../USE-CASES.md) - agent and contract workload scenarios
+- [Use cases](USE-CASES.md) - agent and contract workload scenarios
 
 ## Guides and Examples
 
 - [Smart contract example](contract-example.md) - conceptual Wasm contract
   packaging, deployment, invocation, and receipt flow
-- [Real hardware testing](../REAL_HARDWARE_TEST.md) - native x86-64 reference
+- [Real hardware testing](REAL_HARDWARE_TEST.md) - native x86-64 reference
   validation; this is not the browser launch path
-- [Package manager](../PackageManager.md) - `.tos` package and installation
+- [Package manager](specs/PackageManager.md) - `.tos` package and installation
   model
 
 ## Runtime and Compatibility
 
-- [Linux compatibility](../LinuxCompat.md) - Linux x86-64 syscall, process,
+- [Linux compatibility](LinuxCompat.md) - Linux x86-64 syscall, process,
   VFS, memory, and networking translation
-- [WebAssembly runtime specification](../WASM-runtime-spec.md) - Wasm
+- [WebAssembly runtime specification](specs/WASM-runtime-spec.md) - Wasm
   execution classes and host ABI
 - [Wasm engine integration](wasm-engine-integration.md) - boundary between
   the standalone `wasbi` engine and the webTOS kernel
-- [Kernel policy runtime](../eBPF-lite-spec.md) - policy instructions,
+- [Kernel policy runtime](specs/eBPF-lite-spec.md) - policy instructions,
   helpers, maps, and attachment points
 
 ## Specifications
 
-- [Yellow Paper](../yellowpaper.md) - current detailed engineering
+- [Yellow Paper](specs/yellowpaper.md) - current detailed engineering
   specification
-- [Yellow Paper v2](../yellowpaper_v2.md) - retained design snapshot; verify
-  implementation claims against current source before relying on it
-- [Contract and proof platform plan](../TODO-proof-contract-platform.md) -
+- [Contract and proof platform plan](plans/TODO-proof-contract-platform.md) -
   forward-looking contract execution and proof work
 
 ## Engineering Roadmaps
@@ -50,12 +48,12 @@ for kernel development and compatibility validation.
 files are supporting implementation plans for the native Linux substrate and
 contract system; they are not descriptions of guaranteed current behavior:
 
-- [Linux maturity](../TODO-linux-maturity.md)
-- [Linux runtime](../TODO-linux-runtime.md)
-- [Linux substrate depth](../TODO-linux-substrate-depth.md)
-- [Memory subsystem](../TODO-memory-subsystem.md)
-- [Professional uptake](../TODO-professional-uptake.md)
-- [Runtime semantics](../TODO-runtime-semantics.md)
+- [Linux maturity](plans/TODO-linux-maturity.md)
+- [Linux runtime](plans/TODO-linux-runtime.md)
+- [Linux substrate depth](plans/TODO-linux-substrate-depth.md)
+- [Memory subsystem](plans/TODO-memory-subsystem.md)
+- [Professional uptake](plans/TODO-professional-uptake.md)
+- [Runtime semantics](plans/TODO-runtime-semantics.md)
 
 ## Naming and Status Conventions
 

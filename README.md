@@ -227,12 +227,12 @@ cd sdk/tos-cli && cargo build --release
   notes, and engineering roadmaps
 - [Roadmap](ROADMAP.md) - browser x86-64 architecture, workload milestones,
   acceptance gates, and release definition
-- [Yellow Paper](yellowpaper.md) - kernel architecture and execution model
-- [Linux Compatibility Notes](LinuxCompat.md) - Linux ABI translation and runtime bring-up
-- [WebAssembly Runtime Specification](WASM-runtime-spec.md) - Wasm execution and host ABI
+- [Yellow Paper](docs/specs/yellowpaper.md) - kernel architecture and execution model
+- [Linux Compatibility Notes](docs/LinuxCompat.md) - Linux ABI translation and runtime bring-up
+- [WebAssembly Runtime Specification](docs/specs/WASM-runtime-spec.md) - Wasm execution and host ABI
 - [Wasm Engine Integration](docs/wasm-engine-integration.md) - engine and
   kernel responsibility boundary
-- [Kernel Policy Specification](eBPF-lite-spec.md) - policy runtime, helpers, maps, and hooks
+- [Kernel Policy Specification](docs/specs/eBPF-lite-spec.md) - policy runtime, helpers, maps, and hooks
 
 ## License
 

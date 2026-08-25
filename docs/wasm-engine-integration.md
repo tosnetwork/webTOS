@@ -146,6 +146,6 @@ Changes to this integration should verify, at minimum:
 
 ## Related Documentation
 
-- [WebAssembly runtime specification](../WASM-runtime-spec.md)
+- [WebAssembly runtime specification](specs/WASM-runtime-spec.md)
 - [Smart contract example](contract-example.md)
 - [Documentation index](README.md)

@@ -5,7 +5,7 @@
 //! and the WASM binary payload. The manifest is fixed-size for `no_std`
 //! compatibility.
 //!
-//! See PackageManager.md for the full design document.
+//! See docs/specs/PackageManager.md for the full design document.
 
 extern crate alloc;
 use alloc::vec::Vec;
