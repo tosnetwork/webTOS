@@ -4,3 +4,5 @@ Cargo.lock
 base_image.runtime.manifest
 .codex
 .codex/
+/web/webtos_web.wasm
+/web/hello_linux.elf

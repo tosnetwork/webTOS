@@ -1,0 +1,12 @@
+[package]
+name = "webtos-web"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Browser execution host for the webTOS x64-engine: a C-ABI wasm module with embedded SLEIGH specifications"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+x64-engine = { path = "../x64-engine" }
