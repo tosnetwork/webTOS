@@ -77,6 +77,14 @@ expect("cat redirected", bb("cat", "/tmp/out.txt"), "persisted");
 expect("rm", bb("rm", "/tmp/w/moved.txt", "/tmp/out.txt"));
 expect("rmdir", bb("rmdir", "/tmp/w"));
 
+// Milestone 4: fork + copy-on-write + pipes + execve, all inside wasm.
+addFile("/bin/cat", busybox);
+expect(
+  "sh pipeline (fork/pipe/execve)",
+  bb("sh", "-c", "echo from-pipe | /bin/cat"),
+  "from-pipe",
+);
+
 // Milestone 3: a dynamically linked PIE through the musl loader.
 try {
   const ldso = await readFile(new URL("../test_data/alpine-minirootfs/lib/ld-musl-x86_64.so.1", import.meta.url));
