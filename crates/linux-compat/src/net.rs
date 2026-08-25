@@ -200,8 +200,11 @@ impl NetworkBroker for NativeBroker {
     }
 
     fn udp_open(&mut self) -> Result<Handle, u64> {
+        // Bind to the unspecified address, not loopback: a 127.0.0.1-bound
+        // socket cannot reach a public resolver (real DNS), only a loopback
+        // one. 0.0.0.0 lets the host pick the right source interface for both.
         let socket =
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| io_errno(&e))?;
+            std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| io_errno(&e))?;
         socket.set_nonblocking(true).map_err(|e| io_errno(&e))?;
         let handle = self.handle();
         self.udp.insert(handle, socket);

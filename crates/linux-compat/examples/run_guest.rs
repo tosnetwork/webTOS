@@ -1,6 +1,10 @@
 //! Debug runner: execute an ELF from the host filesystem inside the machine.
 //! Usage: run_guest <elf> [args...] (env: GUEST_ENV="K=V,K=V")
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use linux_compat::net::NativeBroker;
 use linux_compat::Machine;
 use x64_engine::EngineConfig;
 
@@ -13,6 +17,14 @@ fn main() {
     let ldef = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../third_party/ghidra-x86/languages/x86.ldefs");
     let mut machine = Machine::from_ldef(&ldef, &EngineConfig::default()).expect("build");
+
+    // GUEST_NET=1 attaches an allow-all native broker (real host outbound) and
+    // a resolv.conf pointing at a public resolver, so the guest can do real
+    // DNS + TCP. Without it, sockets are denied by default.
+    if std::env::var("GUEST_NET").is_ok() {
+        machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+        let _ = machine.add_file(b"/etc/resolv.conf", b"nameserver 8.8.8.8\n".to_vec(), 0o644);
+    }
 
     // GUEST_MOUNT="host_dir:guest_prefix,host_dir:guest_prefix" imports host
     // trees (e.g. the glibc runtime, a Node install) into the guest.
