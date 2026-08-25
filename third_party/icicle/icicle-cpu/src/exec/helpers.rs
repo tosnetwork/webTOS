@@ -345,11 +345,19 @@ pub mod x86 {
         // Advertise SSE/SSE2/SSE3 and AES-NI, but deliberately not AVX or
         // AVX-512: those encodings decode but their p-code semantics are not
         // all validated, so userspace stays on the SSE paths. `avx`,
-        // `osxsave`, and `f16c` are left clear. SSE4 is also left clear (a
-        // Rust guest otherwise reaches inline `roundsd`, whose imm8 rounding
-        // mode icicle's two-operand p-code cannot carry). AES-NI *is*
-        // advertised: its round primitives have helpers, and a guest TLS
-        // client's hardware-AES path (which also uses `pshufb`) works.
+        // `osxsave`, and `f16c` are left clear. AES-NI *is* advertised: its
+        // round primitives have helpers, and a guest TLS client's hardware-AES
+        // path (which also uses `pshufb`) works.
+        //
+        // SSE4 is left clear as a conservative choice, not a proven blocker
+        // (advertising it currently passes every test, Node included). SSE4.1/
+        // 4.2 add ~50 instructions — most notably the SSE4.2 string ops
+        // (`pcmpistri`/`pcmpestri`, used by glibc strlen/strchr) and packed
+        // rounds — that have no helpers here; keeping the bit clear avoids
+        // opting feature-detecting code onto those unvalidated paths, and onto
+        // more uses of `roundsd`/`roundss`, whose imm8 rounding mode icicle's
+        // two-operand p-code drops (so those helpers can only round to
+        // nearest — a silent approximation for floor/ceil/trunc).
         let ecx: u32 = (Feature::sse3
             | Feature::tm2
             | Feature::pdcm
