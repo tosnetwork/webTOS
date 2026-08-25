@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="webTOS.png" alt="webTOS — Operating System for AI Agents" width="360">
+</p>
+
 # webTOS
 
 <p align="center">
