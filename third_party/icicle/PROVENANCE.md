@@ -24,6 +24,11 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
 3. `icicle-cpu/src/exec/const_eval.rs`: `shift_left`/`shift_right` calls use
    fully qualified `BitVecExt::` syntax to silence the
    `unstable_name_collisions` future-incompatibility warning.
+4. `icicle-mem/src/mmu.rs`: added `Mmu::clear_code_cache`, which drops the
+   `executed` flags and `IN_CODE_CACHE` permission bits so the VM can
+   recover from self-modifying-code faults by flushing lifted blocks and
+   retrying the write (data sharing a page range with executed code, e.g.
+   OpenSSL initialization, hits this).
 
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and

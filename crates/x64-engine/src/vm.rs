@@ -147,6 +147,24 @@ impl InterpVm {
                     .len() as u64;
                 VmExit::UnhandledException((code, self.cpu.exception.value))
             }
+            ExceptionCode::SelfModifyingCode => {
+                // A write hit bytes that lifted blocks were built from
+                // (real self-modifying code, or plain data sharing a page
+                // range with executed code). Drop every lifted block and
+                // the executable-page marks, then retry the faulting
+                // instruction; the write proceeds and code is re-lifted on
+                // next execution.
+                tracing::debug!(
+                    "self-modifying code near {:#x}; flushing the code cache",
+                    self.cpu.exception.value
+                );
+                self.cpu.mem.clear_code_cache();
+                self.code.flush_code();
+                self.cpu.block_id = u64::MAX;
+                self.cpu.block_offset = 0;
+                let pc = self.cpu.read_pc();
+                self.handle_external_address(pc)
+            }
             ExceptionCode::Halt | ExceptionCode::Sleep => VmExit::Halt,
             ExceptionCode::OutOfMemory => VmExit::OutOfMemory,
             code => VmExit::UnhandledException((code, self.cpu.exception.value)),

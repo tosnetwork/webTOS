@@ -777,6 +777,34 @@ impl Mmu {
         self.mapping_changed = true;
     }
 
+    /// Clears all executable-page tracking (the `executed` flags and
+    /// `IN_CODE_CACHE` permission bits) so that writes over previously
+    /// executed bytes can proceed. The caller must flush any lifted or
+    /// translated blocks at the same time; pages are re-marked the next
+    /// time code executes from them.
+    pub fn clear_code_cache(&mut self) {
+        self.tlb.clear();
+        self.last_io_handler = None;
+        let indices: Vec<physical::Index> = self
+            .mapping
+            .iter()
+            .filter_map(|(_, _, entry)| match entry {
+                MemoryMapping::Physical(mapping) => Some(mapping.index),
+                _ => None,
+            })
+            .collect();
+        for index in indices {
+            let page = self.physical.get_mut(index);
+            if !page.executed {
+                continue;
+            }
+            page.executed = false;
+            for perm in page.data_mut().perm.iter_mut() {
+                *perm &= !perm::IN_CODE_CACHE;
+            }
+        }
+    }
+
     /// Clear the page modification log
     pub fn clear_page_modification_log(&mut self) {
         self.tlb.clear_write();
