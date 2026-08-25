@@ -75,7 +75,11 @@ pub trait ElfLoader {
             Err(e) => return Err(format!("failed to parse file: {}", e)),
         };
 
-        metadata.debug_info.add_file(data, metadata.binary.offset)?;
+        // Debug info is best-effort: unsupported formats (e.g. compressed
+        // DWARF in Go binaries) must not prevent the binary from running.
+        if let Err(e) = metadata.debug_info.add_file(data, metadata.binary.offset) {
+            tracing::debug!("ignoring debug info: {e}");
+        }
 
         Ok(metadata)
     }

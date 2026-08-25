@@ -128,10 +128,15 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_WAIT4 => sys_wait4(env, cpu, a[0], a[1], a[2]),
         abi::SYS_PIPE => sys_pipe(env, cpu, a[0], 0).into(),
         abi::SYS_PIPE2 => sys_pipe(env, cpu, a[0], a[1]).into(),
-        abi::SYS_FUTEX => sys_futex(env, cpu, a[0], a[1], a[2], a[5]),
+        abi::SYS_FUTEX => sys_futex(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
+        abi::SYS_NANOSLEEP => outcome_nanosleep(env, cpu, a[0], false),
+        abi::SYS_CLOCK_NANOSLEEP => {
+            const TIMER_ABSTIME: u64 = 1;
+            outcome_nanosleep(env, cpu, a[2], a[1] & TIMER_ABSTIME != 0)
+        }
         abi::SYS_POLL => outcome_poll(env, cpu, a[0], a[1], a[2], false),
         abi::SYS_PPOLL => outcome_poll(env, cpu, a[0], a[1], a[2], true),
         abi::SYS_SENDTO => sys_sendto(env, cpu, a),
@@ -310,20 +315,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             Ok(sec as u64)
         }
-        abi::SYS_NANOSLEEP => sys_nanosleep(env, cpu, a[0]),
-        abi::SYS_CLOCK_NANOSLEEP => {
-            const TIMER_ABSTIME: u64 = 1;
-            if a[1] & TIMER_ABSTIME != 0 {
-                let target = read_timespec_at(cpu, a[2])?;
-                let now = env.now_nanos(cpu);
-                if target > now {
-                    env.warp_nanos += target - now;
-                }
-                Ok(0)
-            } else {
-                sys_nanosleep(env, cpu, a[2])
-            }
-        }
 
         abi::SYS_GETPID | abi::SYS_GETPGRP | abi::SYS_GETPGID => Ok(env.proc.tgid),
         abi::SYS_GETTID => Ok(env.proc.pid),
@@ -337,6 +328,15 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         }
         abi::SYS_PRLIMIT64 => sys_prlimit64(cpu, a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
+        abi::SYS_PRCTL => {
+            const PR_SET_NAME: u64 = 15;
+            if a[0] == PR_SET_NAME {
+                Ok(0) // thread names are accepted (not displayed anywhere)
+            } else {
+                tracing::debug!("prctl: unsupported option {}", a[0]);
+                Err(abi::EINVAL)
+            }
+        }
         // One virtual CPU: a one-bit affinity mask, and the mask size (in
         // bytes) as the return value, per the kernel convention.
         abi::SYS_SCHED_GETAFFINITY => {
@@ -1485,15 +1485,15 @@ fn prepare_resume(env: &LinuxEnv, cpu: &mut Cpu, restart: bool) {
     cpu.block_offset = 0;
 }
 
-/// Parks the current task (CPU snapshot + memory map) with `state`.
+/// Parks the current task (CPU registers) with `state`. The address space
+/// stays in the MMU: sibling threads share it, and `schedule_next` swaps
+/// it out only when handing the CPU to a different thread group.
 fn park_current(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState) {
     let snapshot = cpu.snapshot();
-    let mem = cpu.mem.take_virtual_mapping();
     let proc = std::mem::replace(&mut env.proc, Process::initial());
     env.sched.parked.push(ParkedTask {
         proc,
         cpu: snapshot,
-        mem,
         state,
     });
 }
@@ -1510,13 +1510,46 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         },
     };
     let task = env.sched.parked.remove(index);
+    // A timed futex wait that reached its deadline without a wake returns
+    // -ETIMEDOUT (a wake would have left the pre-set 0 in place).
+    let timed_out = matches!(
+        &task.state,
+        ParkState::Futex { woken: false, deadline: Some(deadline), .. } if now >= *deadline
+    );
+
+    // Address spaces are per thread group: swap only on cross-group
+    // switches. The MMU currently holds the previous task's group map
+    // (env.proc was replaced by a placeholder when it parked, so the group
+    // id travels through `last_group`).
+    let prev_group = env.last_group;
+    let next_group = task.proc.tgid;
+    if prev_group != next_group {
+        let map = cpu.mem.take_virtual_mapping();
+        // Keep the map only while the group still has runnable members;
+        // zombie-only groups never run again.
+        if prev_group != 0 && env.sched.group_has_parked(prev_group) {
+            env.sched.group_maps.insert(prev_group, map);
+        }
+        // A group with no parked tasks and no zombie is gone; its map drops.
+        match env.sched.group_maps.remove(&next_group) {
+            Some(map) => cpu.mem.restore_virtual_mapping(map),
+            None => {
+                tracing::error!("missing address space for thread group {next_group}");
+                return false;
+            }
+        }
+    }
+    env.last_group = next_group;
+
     // The instruction counter is global (energy, limits, deterministic
     // time); it must never rewind on a task switch.
     let icount = cpu.icount;
-    cpu.mem.restore_virtual_mapping(task.mem);
     cpu.restore(&task.cpu);
     cpu.icount = icount;
     env.proc = task.proc;
+    if timed_out {
+        cpu.write_var(env.regs.rax, neg(abi::ETIMEDOUT));
+    }
     true
 }
 
@@ -1595,11 +1628,12 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
         child_proc.clear_child_tid = spec.child_tid;
     }
 
-    // Child memory: threads share the map; forks get a copy-on-write clone.
+    // Child memory: threads share the group map (nothing to clone); forks
+    // get a copy-on-write clone stored under the child's new group.
     let mut child_mem = if is_thread {
-        cpu.mem.mapping.clone()
+        None
     } else {
-        cpu.mem.snapshot_virtual_mapping()
+        Some(cpu.mem.snapshot_virtual_mapping())
     };
 
     // Build the child's parked CPU state: RAX = 0, resuming after the
@@ -1622,25 +1656,30 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
 
     if spec.flags & CLONE_CHILD_SETTID != 0 && spec.child_tid != 0 {
         let tid_bytes = (child_pid as u32).to_le_bytes();
-        if is_thread {
-            // Shared address space: write directly.
-            let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
-        } else {
-            // Write into the child's copy-on-write map.
-            let parent_map = cpu.mem.take_virtual_mapping();
-            cpu.mem.restore_virtual_mapping(child_mem);
-            let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
-            child_mem = cpu.mem.take_virtual_mapping();
-            cpu.mem.restore_virtual_mapping(parent_map);
+        match child_mem.take() {
+            None => {
+                // Shared address space: write directly.
+                let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+            }
+            Some(map) => {
+                // Write into the child's copy-on-write map.
+                let parent_map = cpu.mem.take_virtual_mapping();
+                cpu.mem.restore_virtual_mapping(map);
+                let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+                child_mem = Some(cpu.mem.take_virtual_mapping());
+                cpu.mem.restore_virtual_mapping(parent_map);
+            }
         }
     }
 
     // Linux-like ordering: the parent keeps running; the child is parked
     // ready. (With copy-on-write memory this is safe for vfork too.)
+    if let Some(map) = child_mem {
+        env.sched.group_maps.insert(child_pid, map);
+    }
     env.sched.parked.push(ParkedTask {
         proc: child_proc,
         cpu: child_cpu,
-        mem: child_mem,
         state: ParkState::Ready,
     });
     tracing::debug!(
@@ -2078,7 +2117,7 @@ fn sys_futex(
     addr: u64,
     op: u64,
     val: u64,
-    _mask: u64,
+    timeout_ptr: u64,
 ) -> Outcome {
     const FUTEX_CMD_MASK: u64 = 0x7f; // strips PRIVATE / CLOCK_REALTIME bits
     match op & FUTEX_CMD_MASK {
@@ -2090,9 +2129,54 @@ fn sys_futex(
             if current != val as u32 {
                 return Outcome::Ret(Err(abi::EAGAIN));
             }
-            // Timeouts are ignored: time only advances with executed
-            // instructions, so a timed wait either wakes or deadlocks.
-            block_and_switch(env, cpu, ParkState::Futex { addr, woken: false }, true)
+            {
+                if timeout_ptr == 0 {
+                    return block_and_switch(
+                        env,
+                        cpu,
+                        ParkState::Futex {
+                            addr,
+                            woken: false,
+                            deadline: None,
+                        },
+                        true,
+                    );
+                }
+                // Timed wait: compute the absolute deadline once (a restart
+                // would recompute a relative timeout forever), pre-set the
+                // woken return value, and resume after the syscall; the
+                // scheduler patches -ETIMEDOUT when the deadline fires
+                // without a wake.
+                let duration = match read_timespec_at(cpu, timeout_ptr) {
+                    Ok(nanos) => nanos,
+                    Err(errno) => return Outcome::Ret(Err(errno)),
+                };
+                const FUTEX_WAIT_ABSOLUTE: u64 = FUTEX_WAIT_BITSET;
+                let now = env.now_nanos(cpu);
+                let deadline = if op & FUTEX_CMD_MASK == FUTEX_WAIT_ABSOLUTE {
+                    duration.max(now)
+                } else {
+                    now + duration
+                };
+                cpu.write_var(env.regs.rax, 0_u64);
+                prepare_resume(env, cpu, false);
+                park_current(
+                    env,
+                    cpu,
+                    ParkState::Futex {
+                        addr,
+                        woken: false,
+                        deadline: Some(deadline),
+                    },
+                );
+                if schedule_next(env, cpu) {
+                    Outcome::Switched
+                } else {
+                    tracing::error!("deadlock: timed futex wait with no runnable task");
+                    env.record_exit(-1);
+                    Outcome::Exit(VmExit::Deadlock)
+                }
+            }
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => Outcome::Ret(Ok(env.sched.futex_wake(addr, val))),
         cmd => {
@@ -2110,9 +2194,27 @@ fn sys_yield(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
     block_and_switch(env, cpu, ParkState::Ready, false)
 }
 
-/// `kill`/`tgkill`. Self-directed fatal signals terminate the caller
-/// (handler delivery is not modeled); signals to parked tasks terminate
-/// them at once with 128 + signal semantics.
+/// True when `signal` must not terminate: its default action is to ignore
+/// it, or the process registered a handler (delivery is not modeled, so a
+/// handled signal degrades to a drop — Go uses SIGURG this way for
+/// best-effort preemption).
+fn signal_is_nonfatal(env: &LinuxEnv, signal: u64) -> bool {
+    const SIGCHLD: u64 = 17;
+    const SIGCONT: u64 = 18;
+    const SIGURG: u64 = 23;
+    const SIGWINCH: u64 = 28;
+    if matches!(signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH) {
+        return true;
+    }
+    // A registered non-default handler exists (SIG_DFL = 0 in slot 0).
+    env.proc
+        .sigactions
+        .get(&signal)
+        .is_some_and(|action| u64::from_le_bytes(action.0[..8].try_into().expect("size")) > 1)
+}
+
+/// `kill`/`tgkill`. Fatal signals terminate (handler delivery is not
+/// modeled); ignorable or handled signals are dropped with a log line.
 fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outcome {
     let target = target as u32 as i32 as i64;
     if signal == 0 {
@@ -2124,6 +2226,10 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
                 .iter()
                 .any(|t| t.proc.tgid as i64 == target);
         return Outcome::Ret(if exists { Ok(0) } else { Err(abi::ESRCH) });
+    }
+    if signal_is_nonfatal(env, signal) {
+        tracing::debug!("dropping non-fatal signal {signal} to {target} (no handler delivery)");
+        return Outcome::Ret(Ok(0));
     }
     if target == env.proc.tgid as i64 || target == env.proc.pid as i64 {
         tracing::warn!("task killed itself with signal {signal} (no handler delivery)");
@@ -2151,6 +2257,9 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
         } else {
             index += 1;
         }
+    }
+    if found && !env.sched.group_has_parked(target) {
+        env.sched.group_maps.remove(&target);
     }
     Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) })
 }
@@ -2729,12 +2838,20 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     if timeout_ms == 0 {
         return Outcome::Ret(Ok(0));
     }
-    let deadline = if timeout_ms > 0 {
-        Some(now + timeout_ms as u64 * 1_000_000)
-    } else {
-        None
-    };
-    block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true)
+    if timeout_ms > 0 {
+        let deadline = now + timeout_ms as u64 * 1_000_000;
+        return park_timeout_returning_zero(env, cpu, watches, deadline);
+    }
+    // Infinite wait: restart semantics re-evaluate readiness on wakeup.
+    block_and_switch(
+        env,
+        cpu,
+        ParkState::Waiting {
+            watches,
+            deadline: None,
+        },
+        true,
+    )
 }
 
 /// `select`/`pselect6` over readable/writable fd sets. Evaluates
@@ -2813,8 +2930,24 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
     };
 
     if count == 0 && timeout != Some(0) {
-        let deadline = timeout.map(|t| now + t);
-        return block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true);
+        match timeout {
+            Some(t) => {
+                // Sets were already written back zeroed; a zero return on
+                // wake is a valid (spurious-wakeup) select result.
+                return park_timeout_returning_zero(env, cpu, watches, now + t);
+            }
+            None => {
+                return block_and_switch(
+                    env,
+                    cpu,
+                    ParkState::Waiting {
+                        watches,
+                        deadline: None,
+                    },
+                    true,
+                );
+            }
+        }
     }
 
     let write_set = |cpu: &mut Cpu, ptr: u64, set: &[u64]| -> Result<(), u64> {
@@ -3014,24 +3147,18 @@ fn outcome_poll(
             }
         }
     }
-    let deadline = timeout.map(|t| now + t);
-    tracing::debug!(
-        "[{}] poll parks: {} watch(es) from {} fd record(s)",
-        env.proc.pid,
-        watches.len(),
-        records.len() / 8
-    );
-    block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true)
-}
-
-/// `nanosleep`: sleeping advances the deterministic clock by the requested
-/// duration (there is nothing else to wait for).
-fn sys_nanosleep(env: &mut LinuxEnv, cpu: &mut Cpu, req: u64) -> SysResult {
-    if req != 0 {
-        let duration = read_timespec_at(cpu, req)?;
-        env.warp_nanos += duration;
+    match timeout {
+        Some(t) => park_timeout_returning_zero(env, cpu, watches, now + t),
+        None => block_and_switch(
+            env,
+            cpu,
+            ParkState::Waiting {
+                watches,
+                deadline: None,
+            },
+            true,
+        ),
     }
-    Ok(0)
 }
 
 /// `utimensat`: applies the requested modification time to the node.
@@ -3128,4 +3255,71 @@ fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         return sys_recvfrom(env, cpu, [fd, base, len, 0, name, name_len]);
     }
     Outcome::Ret(Ok(0))
+}
+
+/// `nanosleep`/`clock_nanosleep`: park until the deadline so other tasks
+/// run during the sleep; when everything is idle, the scheduler warps the
+/// deterministic clock to the deadline. Zero-length sleeps still yield.
+fn outcome_nanosleep(env: &mut LinuxEnv, cpu: &mut Cpu, req: u64, absolute: bool) -> Outcome {
+    let duration = if req == 0 {
+        0
+    } else {
+        match read_timespec_at(cpu, req) {
+            Ok(nanos) => nanos,
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        }
+    };
+    let now = env.now_nanos(cpu);
+    let deadline = if absolute {
+        duration.max(now)
+    } else {
+        now + duration
+    };
+    cpu.write_var(env.regs.rax, 0_u64);
+    prepare_resume(env, cpu, false);
+    park_current(
+        env,
+        cpu,
+        ParkState::Waiting {
+            watches: Vec::new(),
+            deadline: Some(deadline),
+        },
+    );
+    if schedule_next(env, cpu) {
+        Outcome::Switched
+    } else {
+        tracing::error!("deadlock: sleep with no runnable task and no deadline progress");
+        env.record_exit(-1);
+        Outcome::Exit(VmExit::Deadlock)
+    }
+}
+
+/// Parks on `watches` with a timeout, returning 0 to the guest on wake
+/// (whether the deadline fired or a watch became ready — callers loop and
+/// the next invocation reports real readiness). Restart semantics cannot
+/// be used with relative timeouts: re-executing the syscall would re-arm
+/// the full timeout forever.
+fn park_timeout_returning_zero(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    watches: Vec<Watch>,
+    deadline: u64,
+) -> Outcome {
+    cpu.write_var(env.regs.rax, 0_u64);
+    prepare_resume(env, cpu, false);
+    park_current(
+        env,
+        cpu,
+        ParkState::Waiting {
+            watches,
+            deadline: Some(deadline),
+        },
+    );
+    if schedule_next(env, cpu) {
+        Outcome::Switched
+    } else {
+        tracing::error!("deadlock: timed wait with no runnable task");
+        env.record_exit(-1);
+        Outcome::Exit(VmExit::Deadlock)
+    }
 }

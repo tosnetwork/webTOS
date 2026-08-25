@@ -92,6 +92,7 @@ pub const SYS_SETSID: u64 = 112;
 pub const SYS_GETGROUPS: u64 = 115;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_SIGALTSTACK: u64 = 131;
+pub const SYS_PRCTL: u64 = 157;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_SETRLIMIT: u64 = 160;
 pub const SYS_SYNC: u64 = 162;

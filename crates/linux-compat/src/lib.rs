@@ -91,6 +91,8 @@ pub struct LinuxEnv {
     /// The task currently executing on the CPU.
     pub(crate) proc: Process,
     pub(crate) sched: Scheduler,
+    /// Thread group whose address space currently occupies the MMU.
+    pub(crate) last_group: u64,
     pub(crate) rng_state: u64,
     pub(crate) output: Vec<u8>,
     /// Host network broker; None = network denied (the default).
@@ -109,6 +111,7 @@ impl LinuxEnv {
             vfs: Vfs::new(),
             proc: Process::initial(),
             sched: Scheduler::new(),
+            last_group: proc::ROOT_PID,
             rng_state: 0x9e37_79b9_7f4a_7c15,
             output: Vec::new(),
             net: None,
@@ -379,6 +382,7 @@ impl Environment for LinuxEnv {
         self.proc.argv = argv;
         self.proc.envp = envp;
         self.sched = Scheduler::new();
+        self.last_group = proc::ROOT_PID;
         self.exit_code = None;
         self.start_image(cpu, path)
     }

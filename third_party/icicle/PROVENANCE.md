@@ -24,7 +24,10 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
 3. `icicle-cpu/src/exec/const_eval.rs`: `shift_left`/`shift_right` calls use
    fully qualified `BitVecExt::` syntax to silence the
    `unstable_name_collisions` future-incompatibility warning.
-4. `icicle-mem/src/mmu.rs`: added `Mmu::clear_code_cache`, which drops the
+4. `icicle-cpu/src/elf.rs`: debug-info loading is best-effort — errors
+   (e.g. compressed DWARF sections in Go binaries) are logged and ignored
+   instead of failing the load.
+5. `icicle-mem/src/mmu.rs`: added `Mmu::clear_code_cache`, which drops the
    `executed` flags and `IN_CODE_CACHE` permission bits so the VM can
    recover from self-modifying-code faults by flushing lifted blocks and
    retrying the write (data sharing a page range with executed code, e.g.

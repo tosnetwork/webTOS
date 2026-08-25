@@ -115,8 +115,14 @@ pub enum ParkState {
     /// `wait4`: waiting for a child to become a zombie. `pid` follows the
     /// wait4 convention (-1 = any child, >0 = that specific child).
     WaitChild { pid: i64 },
-    /// `FUTEX_WAIT` on `addr`; `woken` is set by `FUTEX_WAKE`.
-    Futex { addr: u64, woken: bool },
+    /// `FUTEX_WAIT` on `addr`; `woken` is set by `FUTEX_WAKE`. With a
+    /// deadline, expiry wakes the task and the scheduler patches the
+    /// return value to `-ETIMEDOUT`.
+    Futex {
+        addr: u64,
+        woken: bool,
+        deadline: Option<u64>,
+    },
     /// Blocked reading an empty pipe.
     PipeRead { pipe: PipeRef },
     /// Blocked writing a full pipe.
@@ -169,7 +175,6 @@ impl Watch {
 pub struct ParkedTask {
     pub proc: Process,
     pub cpu: Box<CpuSnapshot>,
-    pub mem: VirtualMemoryMap,
     pub state: ParkState,
 }
 
@@ -185,6 +190,10 @@ pub struct Zombie {
 pub struct Scheduler {
     pub parked: Vec<ParkedTask>,
     pub zombies: Vec<Zombie>,
+    /// Address spaces of thread groups that are entirely parked. The
+    /// running group's map lives in the CPU's MMU; sibling threads share
+    /// one map, so an mmap by any thread is visible to all of them.
+    pub group_maps: HashMap<u64, VirtualMemoryMap>,
     next_pid: u64,
 }
 
@@ -193,8 +202,14 @@ impl Scheduler {
         Self {
             parked: Vec::new(),
             zombies: Vec::new(),
+            group_maps: HashMap::new(),
             next_pid: ROOT_PID + 1,
         }
+    }
+
+    /// True if any parked task belongs to thread group `tgid`.
+    pub fn group_has_parked(&self, tgid: u64) -> bool {
+        self.parked.iter().any(|t| t.proc.tgid == tgid)
     }
 
     pub fn next_pid(&mut self) -> u64 {
@@ -235,6 +250,7 @@ impl Scheduler {
             if let ParkState::Futex {
                 addr: waiting,
                 woken: flag,
+                ..
             } = &mut task.state
             {
                 if *waiting == addr && !*flag {
@@ -251,7 +267,9 @@ impl Scheduler {
     pub fn find_ready(&self, now: u64) -> Option<usize> {
         self.parked.iter().position(|task| match &task.state {
             ParkState::Ready => true,
-            ParkState::Futex { woken, .. } => *woken,
+            ParkState::Futex {
+                woken, deadline, ..
+            } => *woken || deadline.is_some_and(|d| now >= d),
             ParkState::WaitChild { pid } => self
                 .zombies
                 .iter()
@@ -277,6 +295,10 @@ impl Scheduler {
         self.parked
             .iter()
             .flat_map(|task| match &task.state {
+                ParkState::Futex {
+                    deadline: Some(deadline),
+                    ..
+                } => vec![*deadline],
                 ParkState::Waiting { watches, deadline } => {
                     let timers = watches.iter().filter_map(|w| match w {
                         Watch::Timer(t) => t.borrow().next_expiry,
