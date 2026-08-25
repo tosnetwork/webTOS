@@ -303,7 +303,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
 
         abi::SYS_UNAME => sys_uname(cpu, a[0]),
         abi::SYS_GETRANDOM => sys_getrandom(env, cpu, a[0], a[1]),
-        abi::SYS_CLOCK_GETTIME => sys_clock_gettime(env, cpu, a[1]),
+        abi::SYS_CLOCK_GETTIME => sys_clock_gettime(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETRES => {
             if a[1] != 0 {
                 let res: [u8; 16] = encode_timespec(0, 1);
@@ -1421,8 +1421,16 @@ fn encode_timespec(sec: i64, nsec: i64) -> [u8; 16] {
     out
 }
 
-fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, ts: u64) -> SysResult {
-    let (sec, nsec) = env.now(cpu);
+fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) -> SysResult {
+    const CLOCK_MONOTONIC: u64 = 1;
+    const CLOCK_MONOTONIC_RAW: u64 = 4;
+    const CLOCK_BOOTTIME: u64 = 7;
+    // Monotonic clocks count from machine start (no wall-clock epoch); the
+    // realtime clocks are epoch-based.
+    let (sec, nsec) = match clock_id {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => env.now_monotonic(cpu),
+        _ => env.now(cpu),
+    };
     write_mem(cpu, ts, &encode_timespec(sec, nsec))?;
     Ok(0)
 }

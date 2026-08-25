@@ -208,6 +208,18 @@ impl LinuxEnv {
         )
     }
 
+    /// CLOCK_MONOTONIC as (sec, nsec): time since an arbitrary epoch (here,
+    /// machine start), *without* the wall-clock offset. A program that mixes a
+    /// monotonic deadline with the realtime clock must not see the ~55-year
+    /// epoch base on the monotonic side.
+    pub(crate) fn now_monotonic(&self, cpu: &Cpu) -> (i64, i64) {
+        let nanos = self.now_nanos(cpu);
+        (
+            (nanos / 1_000_000_000) as i64,
+            (nanos % 1_000_000_000) as i64,
+        )
+    }
+
     /// Deterministic monotonic clock: one retired instruction is one
     /// nanosecond, plus the idle time-warp offset.
     pub(crate) fn now_nanos(&self, cpu: &Cpu) -> u64 {
