@@ -2,8 +2,6 @@
   <img src="webTOS.png" alt="webTOS — Operating System for AI Agents" width="360">
 </p>
 
-# webTOS
-
 <p align="center">
   <strong>An AI-agent-first bare-metal operating system kernel that runs in the browser.</strong>
 </p>
