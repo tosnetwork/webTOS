@@ -215,32 +215,49 @@ impl LinuxEnv {
         let mut execfn = self.exe_path.clone();
         execfn.push(0);
         let execfn_ptr = push_bytes(cpu, &execfn)?;
+        let platform_ptr = push_bytes(cpu, b"x86_64\0")?;
 
         const AT_PHDR: u64 = 3;
         const AT_PHENT: u64 = 4;
         const AT_PHNUM: u64 = 5;
         const AT_PAGESZ: u64 = 6;
+        const AT_BASE: u64 = 7;
+        const AT_FLAGS: u64 = 8;
         const AT_ENTRY: u64 = 9;
         const AT_UID: u64 = 11;
         const AT_EUID: u64 = 12;
         const AT_GID: u64 = 13;
         const AT_EGID: u64 = 14;
+        const AT_PLATFORM: u64 = 15;
+        const AT_HWCAP: u64 = 16;
         const AT_CLKTCK: u64 = 17;
         const AT_SECURE: u64 = 23;
         const AT_RANDOM: u64 = 25;
         const AT_EXECFN: u64 = 31;
         const AT_NULL: u64 = 0;
 
+        // For a dynamically linked binary, execution starts in the
+        // interpreter and AT_BASE tells it where it was itself loaded; the
+        // remaining entries describe the main binary.
+        let interp_base = metadata
+            .interpreter
+            .as_ref()
+            .map_or(0, |interp| interp.base_ptr);
+
         let auxv: &[(u64, u64)] = &[
             (AT_PHDR, metadata.binary.phdr_ptr),
             (AT_PHENT, 56),
             (AT_PHNUM, metadata.binary.phdr_num),
             (AT_PAGESZ, PAGE_SIZE),
+            (AT_BASE, interp_base),
+            (AT_FLAGS, 0),
             (AT_ENTRY, metadata.binary.entry_ptr),
             (AT_UID, 0),
             (AT_EUID, 0),
             (AT_GID, 0),
             (AT_EGID, 0),
+            (AT_PLATFORM, platform_ptr),
+            (AT_HWCAP, 0),
             (AT_SECURE, 0),
             (AT_CLKTCK, 100),
             (AT_RANDOM, random_ptr),
@@ -302,9 +319,6 @@ impl Environment for LinuxEnv {
         );
 
         let metadata = self.load_elf(cpu, path)?;
-        if metadata.interpreter.is_some() {
-            return Err("dynamically linked binaries are not supported yet (milestone 3)".into());
-        }
 
         self.exe_path = if path.first() == Some(&b'/') {
             path.to_vec()
@@ -320,10 +334,22 @@ impl Environment for LinuxEnv {
             self.argv = vec![path.to_vec()];
         }
 
-        (cpu.arch.on_boot)(cpu, metadata.binary.entry_ptr);
+        // Dynamically linked binaries start in the interpreter; auxv points
+        // the loader at the main image.
+        let entry = metadata
+            .interpreter
+            .as_ref()
+            .map_or(metadata.binary.entry_ptr, |interp| interp.entry_ptr);
+        (cpu.arch.on_boot)(cpu, entry);
         self.setup_stack(cpu, &metadata)?;
 
-        let image_end = metadata.binary.base_ptr + metadata.binary.length;
+        let image_end = metadata.interpreter.as_ref().map_or(
+            metadata.binary.base_ptr + metadata.binary.length,
+            |interp| {
+                (metadata.binary.base_ptr + metadata.binary.length)
+                    .max(interp.base_ptr + interp.length)
+            },
+        );
         self.brk_end = align_up(image_end, PAGE_SIZE) + 0x10_0000;
         self.fds = FdTable::new();
         self.exit_code = None;
@@ -386,6 +412,55 @@ impl Machine {
     /// Adds a file to the guest filesystem (parent directories are created).
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
         self.env().add_file(path, bytes, mode)
+    }
+
+    /// Recursively copies a host directory tree into the guest filesystem,
+    /// preserving symlinks and executable bits. Native hosts only (the
+    /// browser host injects files individually).
+    pub fn add_host_tree(&mut self, host_dir: &Path, guest_prefix: &str) -> Result<(), String> {
+        fn walk(env: &mut LinuxEnv, host: &Path, guest: &str) -> Result<(), String> {
+            let entries =
+                std::fs::read_dir(host).map_err(|e| format!("{}: {e}", host.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let guest_path = format!("{}/{}", guest.trim_end_matches('/'), name);
+                let file_type = entry.file_type().map_err(|e| e.to_string())?;
+                if file_type.is_symlink() {
+                    let target = std::fs::read_link(entry.path()).map_err(|e| e.to_string())?;
+                    env.vfs
+                        .add_node(
+                            guest_path.as_bytes(),
+                            vfs::NodeKind::Symlink(target.to_string_lossy().as_bytes().to_vec()),
+                            0o777,
+                        )
+                        .map_err(|e| format!("{guest_path}: errno {e}"))?;
+                } else if file_type.is_dir() {
+                    env.vfs
+                        .mkdir_p(guest_path.as_bytes())
+                        .map_err(|e| format!("{guest_path}: errno {e}"))?;
+                    walk(env, &entry.path(), &guest_path)?;
+                } else if file_type.is_file() {
+                    let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
+                    #[cfg(unix)]
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        entry
+                            .metadata()
+                            .map_err(|e| e.to_string())?
+                            .permissions()
+                            .mode()
+                            & 0o777
+                    };
+                    #[cfg(not(unix))]
+                    let mode = 0o755;
+                    env.add_file(guest_path.as_bytes(), bytes, mode)?;
+                }
+            }
+            Ok(())
+        }
+        walk(self.env(), host_dir, guest_prefix)
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {

@@ -75,6 +75,22 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
         return Some(VmExit::Halt);
     }
 
+    // A fatal signal the process sends to itself (abort(), raise())
+    // terminates it, kernel-style, with 128 + signal. Handler delivery is
+    // not implemented, so termination is the honest outcome either way.
+    if nr == abi::SYS_KILL || nr == abi::SYS_TGKILL {
+        let (pid, signal) = if nr == abi::SYS_KILL {
+            (a0, a1)
+        } else {
+            (a0, a2)
+        };
+        if pid as u32 as i32 == PID as i32 && signal != 0 {
+            tracing::warn!("guest killed itself with signal {signal} (no handler delivery)");
+            env.record_exit(128 + signal as i32);
+            return Some(VmExit::Halt);
+        }
+    }
+
     let result = dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]);
     let value = match result {
         Ok(v) => v,
@@ -161,8 +177,19 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
         abi::SYS_MPROTECT => sys_mprotect(cpu, a[0], a[1], a[2]),
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
+        abi::SYS_POLL => sys_poll(env, cpu, a[0], a[1]),
+        abi::SYS_PPOLL => sys_poll(env, cpu, a[0], a[1]),
+
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
         abi::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(env, cpu, a[0], a[1], a[2]),
+        // Registration-only, like rt_sigaction: signals are never delivered
+        // in this environment, so the alternate stack is recorded and unused.
+        abi::SYS_SIGALTSTACK => {
+            if a[1] != 0 {
+                write_mem(cpu, a[1], &[0_u8; 24])?;
+            }
+            Ok(0)
+        }
 
         abi::SYS_ARCH_PRCTL => match a[0] {
             abi::ARCH_SET_FS => {
@@ -239,8 +266,12 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
 // ── Path helpers ────────────────────────────────────────────────────────────
 
 /// Resolves a `dirfd` to a VFS directory node.
+///
+/// The kernel ABI treats `dirfd` as a 32-bit int: callers may pass
+/// `AT_FDCWD` zero-extended (glibc) or sign-extended (musl), so compare in
+/// 32 bits.
 fn dir_of(env: &LinuxEnv, dirfd: u64) -> Result<usize, u64> {
-    if dirfd == abi::AT_FDCWD {
+    if dirfd as u32 as i32 == abi::AT_FDCWD as u32 as i32 {
         return Ok(env.cwd);
     }
     match env.fds.get(dirfd)?.desc.borrow().backing {
@@ -972,6 +1003,44 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             Err(abi::ENOTTY)
         }
     }
+}
+
+/// `poll`/`ppoll`. Nothing in this environment ever blocks, so readiness is
+/// reported immediately: readable/writable descriptors are ready (stdin at
+/// EOF is readable — a read returns 0 without blocking), invalid
+/// descriptors report POLLNVAL, and timeouts never matter.
+fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysResult {
+    const POLLIN: u16 = 0x1;
+    const POLLOUT: u16 = 0x4;
+    const POLLNVAL: u16 = 0x20;
+
+    let nfds = nfds.min(1024) as usize;
+    let mut records = read_mem(cpu, fds_ptr, nfds * 8)?;
+    let mut ready = 0_u64;
+    for record in records.chunks_exact_mut(8) {
+        let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
+        let events = u16::from_le_bytes(record[4..6].try_into().expect("chunk size"));
+        let revents = match env.fds.get(fd as u32 as u64) {
+            Err(_) => POLLNVAL,
+            Ok(entry) => {
+                let desc = entry.desc.borrow();
+                let mut bits = 0_u16;
+                if events & POLLIN != 0 && desc.readable() {
+                    bits |= POLLIN;
+                }
+                if events & POLLOUT != 0 && desc.writable() {
+                    bits |= POLLOUT;
+                }
+                bits
+            }
+        };
+        record[6..8].copy_from_slice(&revents.to_le_bytes());
+        if revents != 0 {
+            ready += 1;
+        }
+    }
+    write_mem(cpu, fds_ptr, &records)?;
+    Ok(ready)
 }
 
 // ── Memory management ───────────────────────────────────────────────────────
