@@ -1,9 +1,9 @@
 # TOS Yellow Paper
 
-**Version:** Draft v2.0
+**Version:** Draft v3.0
 **Status:** Engineering Yellow Paper
 **Language:** English
-**Purpose:** Implementation reference for building TOS — a hardware-level deterministic execution VM.
+**Purpose:** Implementation reference for building TOS — a deterministic execution VM for AI agents. The product target is the browser (webTOS); the native bare-metal substrate is retained as the reference implementation and test oracle during the migration.
 
 > **Implementation Status:** Stages 1–10 are structurally implemented. See `[IMPL]` markers throughout this document for per-item status. Last verified: 2026-04-03.
 >
@@ -12,12 +12,24 @@
 > - Stage-6: Package signing in `atp` CLI uses FNV-1a hash, NOT Ed25519. Deploy trust is not cryptographically sound.
 > - Stage-8: WASM host bindings are incomplete. Only 6 basic functions (yield, send, recv, exit, energy_get, log). Missing: `state_get`, `state_put`, `state_delete`, `contract_call`. Contracts cannot access persistent state or call other contracts through the WASM ABI.
 > - See `docs/plans/TODO-proof-contract-platform.md` for the plan to close these gaps.
+>
+> **Browser delivery status:** the items above describe the native substrate.
+> The browser execution model (webTOS) is specified in this document and
+> tracked milestone-by-milestone (M0–M8) in [`ROADMAP.md`](../../ROADMAP.md);
+> its current boundary is the `x64-engine` / `linux-compat` / `browser-host`
+> crate split.
 
 ---
 
 ## Abstract
 
-TOS is a **hardware-level deterministic execution virtual machine**. It runs directly on x86_64 hardware (or QEMU), providing isolated, metered, verifiable execution for smart contracts and WASM modules — without relying on any host operating system. Linux x86_64 programs (including JVM and Node.js) can also run via the deterministic Linux compatibility layer.
+TOS is a **deterministic execution virtual machine for AI agents**. It provides isolated, metered, verifiable execution for agents, WASM modules, and unmodified Linux x86_64 programs (including JVM and Node.js) via the deterministic Linux compatibility layer.
+
+One kernel model, one product target: webTOS is being migrated from the
+native kernel into a browser-hosted runtime.
+
+* **Browser (webTOS)** — the product target. Guest x86-64 instructions are executed by a software CPU engine compiled to WebAssembly; the kernel keeps its own scheduler, virtual memory model, VFS, capabilities, and execution records inside the browser. The browser is the deployment environment, not the operating-system model.
+* **Native substrate** — the origin and reference implementation. It runs directly on x86_64 hardware (or QEMU) without relying on any host operating system, supplies trace fixtures, and remains working as the differential-test oracle throughout the migration. It is not a separate product delivery.
 
 TOS is **not** an operating system in the traditional sense. It is a bare-metal execution substrate comparable to:
 
@@ -31,6 +43,19 @@ The core promise of TOS is:
 
 Contracts (agents) can be **persistently deployed** and **call each other** via mailbox IPC, forming a composable execution environment similar to on-chain smart contracts.
 
+The browser delivery has a concrete product goal: run unmodified Linux x86-64
+AI agent software locally in the browser, gated by real workloads rather than
+instruction or syscall counts:
+
+```text
+static hello
+    -> static BusyBox
+    -> dynamic Linux ELF
+    -> threads and event-driven networking
+    -> OpenFox
+    -> Codex and Claude Code
+```
+
 ### Design Principles
 
 1. **The architecture is designed from zero** — not inherited from legacy human-centric operating systems.
@@ -40,6 +65,7 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 5. **Metered execution** — every operation costs energy; no unbounded computation.
 6. **Verifiable execution** — every execution produces a receipt with cryptographic commitments.
 7. **External connectivity** — contracts communicate with the outside world via brokered TCP.
+8. **Browser delivery without weakening the model** — in webTOS, guest CPU execution and kernel state remain local to the browser; browser authority (storage, network, clipboard, credentials) enters only through capability-checked host adapters; verifiability rests on deterministic replay rather than hardware attestation.
 
 ### Terminology
 
@@ -47,6 +73,10 @@ Contracts (agents) can be **persistently deployed** and **call each other** via 
 * **TOS-0** — the privileged kernel substrate: boot, memory, traps, syscalls, scheduling, mailbox IPC, capability enforcement, energy accounting, audit.
 * **TOS-1** — the runtime host layer: WASM engine, native runtime, deterministic Linux compatibility layer.
 * **TOS-2** — the contract and system-service layer: deployed contracts, stated, policyd, netd.
+* **webTOS** — the browser delivery of TOS: the same kernel model hosted in a browser worker instead of on bare metal.
+* **x64-engine** — the browser-side x86-64 CPU: decoder, interpreter, sparse guest memory, and the structured `CpuExit` boundary. Owns instruction semantics only.
+* **linux-compat** — the portable rebuild of the deterministic Linux compatibility layer over `GuestMemory` and platform traits. Owns OS semantics.
+* **browser-host** — Web-facing platform adapters: workers, terminal, persistent storage, network broker, snapshots. Owns Web APIs.
 
 ---
 
@@ -88,6 +118,38 @@ Its first-class concepts are:
 | JVM (on Linux) | TOS with Linux compat layer | Runs unmodified OpenJDK deterministically via syscall translation |
 | Docker/VM isolation | TOS per-contract page tables | Hardware-enforced isolation at the page table level, not process-level |
 | Gas metering (EVM) | TOS energy budget | Unified across WASM, native, Linux-compat; tick-based preemption, no per-opcode overhead |
+
+### Deployment Targets
+
+| | Native substrate | Browser (webTOS) |
+|---|---|---|
+| Guest CPU | Real x86-64 hardware executes guest instructions | `x64-engine` software interpreter (wasm); hot-block translation to WebAssembly only after correctness gates pass |
+| Isolation | Ring-3 + per-contract page tables | Software-enforced: interpreted execution over sparse guest memory inside a sandboxed worker |
+| Persistence | virtio-blk / NVMe append-only store | Browser-backed storage through capability-checked adapters |
+| Network | netd + virtio-net / e1000 | Explicit network broker over browser-available transports |
+| Attestation | TPM 2.0 measured boot | Not claimed; verification rests on deterministic replay and receipts |
+| Role | Reference implementation, trace fixtures, differential-test oracle | Product delivery |
+
+The browser stack keeps the ownership rule with three narrow contracts:
+
+```text
+Linux x86-64 workload
+        |
+        v
+x64-engine        (CPU, decoder, interpreter, guest memory)
+        | CpuExit
+        v
+linux-compat      (ELF, syscalls, processes, VFS, VMAs, futex, epoll)
+        | HostPlatform
+        v
+browser-host      (workers, terminal, storage, network broker, snapshots)
+```
+
+The CPU engine owns instruction semantics, Linux compatibility owns OS
+semantics, and the browser host owns Web APIs. Linux semantics must not depend
+on native page tables, privileged registers, hardware drivers, or raw user
+pointers; they are expressed over portable interfaces such as `GuestMemory`,
+`TaskRuntime`, `Clock`, `Entropy`, `Storage`, and `Network`.
 
 ### The Execution Model
 
@@ -146,6 +208,12 @@ Its first-class concepts are:
 | 8 | WASM Runtime | Production WASM engine with fuel metering and selector dispatch |
 | 9 | Deterministic Linux Compatibility | 104 Linux syscalls with deterministic translation (67/67 tests pass) |
 | 10 | Production Runtime Depth | Dynamic linking, multi-threading, signals, file mmap for OpenJDK/Node.js |
+
+Stages 1–10 describe the native substrate. Browser delivery is organized as
+workload milestones M0–M8 in [`ROADMAP.md`](../../ROADMAP.md) (static hello →
+static BusyBox → dynamic Linux ELF → threads → event-driven networking →
+OpenFox → Codex and Claude Code → performance and release); those milestones
+reuse the Stage-9/10 semantics over the portable `linux-compat` layer.
 
 ### Stage-by-Stage Roadmap
 
@@ -439,6 +507,12 @@ Any WASM module runs on TOS with full spec compliance, energy metering, and dete
 
 **Purpose**
 Run any unmodified Linux x86_64 program on TOS with **deterministic execution guarantees**. This is the key differentiator: unlike traditional Linux compatibility layers that inherit Linux's non-determinism, TOS replaces every source of non-determinism at the syscall boundary with deterministic equivalents.
+
+The browser delivery rebuilds this layer as the portable `linux-compat` crate:
+the same deterministic replacements expressed over `GuestMemory` and platform
+traits instead of native page tables and privileged registers, so one set of
+Linux semantics serves both the native substrate and the `x64-engine` virtual
+CPU.
 
 **Core Idea**
 
@@ -899,7 +973,7 @@ All Stage-10 features maintain determinism:
 - Node.js runs a simple HTTP handler with deterministic event loop.
 - Two runs with identical input produce bit-identical execution traces.
 
-### The Three Eras of TOS
+### The Eras of TOS
 
 #### Era I — Execution Foundation (Stage-1 to Stage-4)
 
@@ -920,9 +994,20 @@ Any Linux program runs on TOS with deterministic guarantees.
 Stage-9: syscall translation layer (104 syscalls, 67/67 tests pass).
 Stage-10: runtime depth for real-world binaries (dynamic linking, threads, signals).
 
+#### Era IV — Browser Delivery (webTOS)
+
+The kernel model leaves the machine room: the same deterministic execution
+substrate is hosted in a browser worker, with guest x86-64 execution performed
+by `x64-engine` and Linux semantics served by the portable `linux-compat`
+layer.
+
+Focus: browser workers, terminal, persistent storage, network broker,
+snapshots, and pinned AI-agent workloads (OpenFox, Codex, Claude Code).
+Milestones and exit gates live in [`ROADMAP.md`](../../ROADMAP.md).
+
 ### One-Sentence Definition
 
-**TOS is a bare-metal deterministic execution VM where contracts are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt — running directly on hardware without any host operating system. WASM contracts run with proof-grade determinism (bit-identical replay). Linux x86_64 programs, including dynamically-linked runtimes like OpenJDK and Node.js, can also run on TOS with scheduling-level deterministic guarantees through the 104-syscall Linux compatibility layer.**
+**TOS is a deterministic execution VM where agents are deployed, isolated, metered, composable via mailbox calls, and every execution produces a cryptographically verifiable receipt. Its product delivery is webTOS — the model running inside the browser over a software x86-64 engine; the native substrate, which runs directly on hardware without any host operating system, serves as the reference implementation. WASM contracts run with proof-grade determinism (bit-identical replay). Linux x86_64 programs, including dynamically-linked runtimes like OpenJDK and Node.js, run with scheduling-level deterministic guarantees through the deterministic Linux compatibility layer.**
 
 ---
 
@@ -975,12 +1060,27 @@ Current execution VMs (EVM, WASM runtimes) run **inside** a host operating syste
 
 ### 1.2 The TOS Approach
 
-TOS eliminates the host OS entirely. The execution VM **is** the operating system:
+The execution VM **is** the operating system: TOS does not delegate isolation,
+metering, or verification semantics to a general-purpose host OS.
+
+On the native substrate:
 
 * isolation is enforced by **hardware page tables** (x86_64 ring-3 / ring-0 separation)
 * metering is unified across all runtimes via **timer-tick preemption** (no per-opcode overhead)
 * verification is anchored to **TPM hardware attestation** and **deterministic replay**
 * the attack surface is minimal: a small kernel with no legacy compatibility burden
+
+In the browser (webTOS), the host OS and browser are unavoidable, so the trust
+argument changes shape honestly rather than silently:
+
+* isolation is **software-enforced**: guest instructions are interpreted by
+  `x64-engine` over sparse guest memory inside a sandboxed worker; no guest
+  instruction executes natively on the host
+* metering is unchanged: the energy model is enforced by the kernel, not the host
+* verification is anchored to **deterministic replay and receipts only** —
+  hardware attestation is not claimed in the browser
+* browser authority (storage, network, credentials) enters only through
+  capability-checked host adapters
 
 ### 1.3 Comparison
 
@@ -993,7 +1093,7 @@ TOS eliminates the host OS entirely. The execution VM **is** the operating syste
 | Languages | Solidity only | Java/Kotlin/Scala | WASM (any) + native + Linux binaries via compat layer |
 | Storage | 256-bit slots | Filesystem | Merkle keyspaces |
 | Inter-contract calls | CALL opcode | Method calls | Mailbox IPC |
-| Host OS required | Yes (Linux) | Yes (Linux/Windows) | No (bare metal) |
+| Host OS required | Yes (Linux) | Yes (Linux/Windows) | No (native substrate); browser as untrusted deployment host (webTOS) |
 
 ---
 
@@ -1048,6 +1148,16 @@ Not:
 * fork/exec
 * raw socket
 * ambient authority
+
+### 2.6 The browser is a deployment environment, not the OS model
+
+webTOS runs in the browser but does not adopt the browser as its operating
+system. The kernel keeps its own scheduler, virtual memory model, process and
+agent state, virtual filesystem, capabilities, and execution records. Web APIs
+are reached only through the browser host layer, and ambient browser authority
+is never exposed directly to workloads. Correctness requirements do not relax
+in the browser: an unsupported syscall or instruction returns a defined error
+or trap — it never reports fake success.
 
 ---
 
@@ -1258,7 +1368,17 @@ TOS emits structured events for every significant action:
 
 ### 6.1 Why not use a host OS
 
-If TOS runs inside Linux, verification depends on trusting Linux — a 30M+ line codebase. TOS eliminates this dependency by being the only software between the hardware and the contracts.
+If TOS delegated its execution semantics to Linux, verification would depend
+on trusting Linux — a 30M+ line codebase. On the native substrate, TOS
+eliminates this dependency by being the only software between the hardware and
+the contracts.
+
+In the browser this argument cannot be made for isolation — the browser and
+host OS are in the trusted computing base for sandboxing — so webTOS does not
+make it. What carries over is the correctness and verifiability argument:
+guest execution semantics, scheduling, state transitions, and receipts are
+defined entirely by TOS code and are deterministic, so results can be verified
+by replay without trusting the particular browser or host that produced them.
 
 ### 6.2 Why not modify an existing VM
 
@@ -1386,16 +1506,23 @@ TOS evolves from a minimal kernel into a hardware-level execution VM that extern
 
 ### 28.1 What TOS Is
 
-* A hardware-level deterministic execution VM
-* A bare-metal substrate for smart contracts and verifiable computation
+* A deterministic execution VM for AI agents
+* A bare-metal substrate for smart contracts and verifiable computation — and,
+  as webTOS, the same substrate delivered inside the browser
 * A multi-runtime platform (WASM, native, Linux-compat) with unified metering
 * A system where every execution is isolated, metered, and produces a verifiable receipt
+* A local, zero-install execution environment for unmodified Linux AI-agent
+  software (OpenFox, Codex, Claude Code) running in a browser tab
 
 ### 28.2 What TOS Is Not
 
 * A desktop operating system
 * A Linux replacement
 * A general-purpose computing platform
+* A general PC emulator — webTOS is a focused Linux x86-64 userspace execution
+  environment, not a machine emulator
+* A remote compute service — in webTOS, guest CPU execution and kernel state
+  remain in the browser; no remote backend is required
 * A distributed consensus system (TOS is the execution layer; consensus is external)
 * A blockchain (TOS can be used by blockchains as an execution engine)
 
@@ -1721,7 +1848,7 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 
 ### 28.6 Closing Statement
 
-> TOS is a bare-metal execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. The VM runs directly on hardware — no host OS, no ambient authority. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
+> TOS is a deterministic execution VM. Contracts are deployed, isolated, metered, and composable. Every execution produces a verifiable receipt. On the native substrate the VM runs directly on hardware — no host OS, no ambient authority. As webTOS, the same VM runs inside the browser over a software x86-64 engine, and any supported browser becomes a local, zero-install execution environment for AI agents. External systems submit transactions via TCP and receive cryptographic proof of what happened. Coordinator nodes execute once; all other nodes verify in O(1) without re-execution.
 
 ---
 
@@ -1740,6 +1867,12 @@ A `LICENSES/` directory ships with each runtime package containing the applicabl
 | 9 | Deterministic Linux Compat | 104 syscalls, 67/67 tests pass | ✅ Complete |
 | 10 | Production Runtime Depth | Dynamic linking, threads, signals, file mmap | ✅ Complete |
 
-**Next milestone:** Close the three critical gaps in Stages 5, 6, and 8 so that WASM contracts can access persistent state, call other contracts, and deploy with cryptographic trust. See `docs/plans/TODO-proof-contract-platform.md` for the implementation plan.
+Browser delivery (webTOS) is tracked separately in
+[`ROADMAP.md`](../../ROADMAP.md) as workload milestones M0–M8: static hello →
+static BusyBox → dynamic Linux ELF → threads and process semantics →
+event-loop and networking → OpenFox → Codex and Claude Code → performance,
+security, and release.
 
-**TOS is complete when any program — whether WASM, native, or Linux-compatible — runs deterministically on bare metal, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results.**
+**Next milestone (native substrate):** Close the three critical gaps in Stages 5, 6, and 8 so that WASM contracts can access persistent state, call other contracts, and deploy with cryptographic trust. See `docs/plans/TODO-proof-contract-platform.md` for the implementation plan.
+
+**TOS is complete when any program — whether WASM, native, or Linux-compatible — runs deterministically in the browser with results that match the native reference, every execution produces a cryptographically verifiable receipt, and two runs with the same input produce bit-identical results. webTOS reaches its product goal when a supported browser can start a clean environment and run pinned OpenFox, Codex, and Claude Code workloads through real coding tasks.**
