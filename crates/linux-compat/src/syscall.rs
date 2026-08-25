@@ -218,6 +218,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         // Advisory locking. The guest is a single process with no competing
         // lock holders, so acquiring/releasing always succeeds as a no-op.
         abi::SYS_FLOCK => Ok(0),
+        abi::SYS_FTRUNCATE => sys_ftruncate(env, a[0], a[1]),
 
         abi::SYS_SOCKET => sys_socket(env, a[0], a[1], a[2]),
         abi::SYS_CONNECT => sys_connect(env, cpu, a[0], a[1], a[2]),
@@ -476,6 +477,28 @@ fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) ->
     let chunk = read_backing(env, &mut desc, count)?;
     write_mem(cpu, buf, &chunk)?;
     Ok(chunk.len() as u64)
+}
+
+/// Resizes a regular file to `length`, zero-filling any extension. The fd
+/// must be open for writing. Used for memfd/tempfile-backed IPC buffers.
+fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
+    const MAX_LEN: u64 = 1 << 30; // 1 GiB guard against a runaway size
+    if length > MAX_LEN {
+        return Err(abi::EFBIG);
+    }
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let desc = desc.borrow();
+    if desc.flags & abi::O_ACCMODE == abi::O_RDONLY {
+        return Err(abi::EINVAL);
+    }
+    let Backing::File { node } = desc.backing else {
+        return Err(abi::EINVAL);
+    };
+    let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind else {
+        return Err(abi::EIO);
+    };
+    data.resize(length as usize, 0);
+    Ok(0)
 }
 
 fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
