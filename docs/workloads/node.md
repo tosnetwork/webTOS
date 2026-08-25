@@ -1,14 +1,25 @@
 # Workload profile: Node.js (milestone 7 groundwork)
 
-**Status: not yet passing. Node.js (and therefore Codex and Claude Code,
-which run on it) starts, initializes V8's heap, and progresses into glibc's
-CPU-feature detection before hitting an instruction-decode gap. This file
-records how far it gets and what is left.**
+**Status: Node.js starts and runs. A stock `node --version` executes to a
+clean exit (`v24.13.0`); with the AVX-512-capable spec, `node -e <script>`
+loads, initializes V8's heap and segmented sandbox, and runs ~21M
+instructions into V8 startup. Full script execution is blocked on one
+remaining item — a pre-existing SSE2-path semantics bug, described at the
+end. This file records how far it gets and what is left.**
 
 Milestone 7 targets the Codex and Claude Code CLIs. Both are Node.js
 applications, so a stock `node` is the reduction: if `node script.js` runs,
 the CLIs become a packaging and syscall-coverage problem rather than a
 runtime-bring-up problem.
+
+Run it with the debug runner:
+
+```
+GUEST_MOUNT="/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu,/lib64:/lib64" \
+GUEST_EXE=/bin/node \
+cargo run --release -p linux-compat --example run_guest -- \
+  /path/to/node --version
+```
 
 ## How far Node gets today
 
@@ -28,111 +39,72 @@ trivial script, currently:
   now uses the memory subsystem's `find_free_memory` from an allocation
   hint. Gated by `large_anonymous_reservation_then_allocations_do_not_collide`.
 
-## The remaining blocker, now precisely identified: AVX-512
+## The original blocker (AVX-512 decode) — resolved by the spec upgrade
 
 A differential-decode harness (`cargo run -p x64-engine --example
-decode_diff -- FILE`) settled what the blocker is. It walks a binary's
-`.text`, decoding every instruction with both iced-x86 (the reference) and
-this engine's SLEIGH lifter, and compares the decoded length — a one-byte
-disagreement is what misaligns every later fetch.
+decode_diff -- FILE`) originally settled the first blocker: the older
+vendored (icicle-fork) spec rejected every VEX/EVEX/XOP instruction —
+2,343 on glibc (0.59%) and 104,299 on Node (1.02%) — with **zero** ordinary
+integer/memory/control-flow gaps. glibc's ifunc resolvers dispatch
+string/memory routines to AVX-512 and V8/OpenSSL take AVX-512 paths once the
+CPU appears to support them, so those rejections misaligned the fetch stream.
 
-Results are unambiguous:
+**The spec was upgraded to the NSA master language set** (which lifts the
+AVX families) and the icicle fork's helper-compatibility patches were
+re-applied on top of it — see `third_party/ghidra-x86/PROVENANCE.md` for the
+exact patch list (CPUID, XGETBV, SYSCALL flag packing, FXSAVE/FXRSTOR
+macros) plus the companion lifter fix in `third_party/icicle/PROVENANCE.md`
+(nested `export`). After the upgrade the decode diff is: glibc **0 gaps**,
+Node **0.0049%** (505/10.3M — VEX-AES / VEX-PCLMULQDQ / XOP only, none on
+the SSE path). All milestone 1–6 tests stay green, and glibc runs
+instruction-for-instruction identically to the fork spec for 3M+
+instructions (verified with `exec_diff_dyn`).
 
-| binary | instructions | length mismatches | rejected (all AVX/VEX) |
-|--------|-------------:|------------------:|-----------------------:|
-| glibc  |      395,499 |            **0**  |     2,343 (0.59%)      |
-| node   |   10,263,936 |            **0**  |   104,299 (1.02%)      |
+## How the patch set was found (bounded, not guesswork)
 
-There are **zero** length mismatches and **zero** rejections of ordinary
-integer, memory, or control-flow instructions. Every rejected instruction
-carries a VEX/EVEX/XOP prefix (0xC4/0xC5, 0x62, 0x8F) — the AVX, AVX2,
-AVX-512, and mask-register families (`vpxorq`, `vaesenc`, `kmovq`,
-`vpternlogq`, …). The vendored SLEIGH specification does not lift them.
+`exec_diff_dyn` runs the same dynamic glibc binary through the fork spec
+(reference) and the patched master spec (candidate) in lockstep and reports
+the first architectural-state divergence. Each divergence named exactly one
+instruction whose master form the icicle interpreter could not execute; the
+fork's construct for it was ported, and the harness was rerun. Four spec
+patches plus one lifter patch took glibc from a fault at ~2,900 instructions
+all the way to a clean exit with no divergence.
 
-Node crashes because glibc's ifunc resolvers dispatch string/memory
-routines (memcpy, memcmp) to AVX-512 implementations, and V8/OpenSSL take
-AVX-512 code paths, once the CPU appears to support them. Two routes close
-this:
+## The remaining blocker: a pre-existing SSE2-path semantics bug
 
-1. **Advertise no AVX in CPUID** so userspace never selects those paths.
-   This is the low-cost route (SSE2 baseline is enough for correctness) but
-   requires fixing the CPUID max-leaf handling that currently regresses
-   glibc/Go when raised — the regression is itself a symptom of code
-   dispatched into the unlifted vector families, so suppressing AVX in
-   CPUID and keeping the max-leaf high should be self-consistent.
-2. **Lift the AVX families** in the SLEIGH spec (they exist in Ghidra's
-   `avx*.sinc`; the icicle fork may need them enabled/completed). This is
-   the thorough route and is also needed for performance-sensitive
-   workloads, but it is a large undertaking.
+Node's V8 aborts full initialization unless CPUID advertises SSE2
+(`Check failed: cpu.has_sse2()`). But advertising SSE2 in the CPUID helper
+makes glibc's ld.so fail during symbol resolution and exit 127 very early
+(~83,400 instructions), because its ifunc resolver then selects an
+SSE2-optimized `memcmp`/`strcmp`/`memcpy` variant that this engine executes
+incorrectly. The bug is **pre-existing and spec-independent**: the fork spec
+fails identically at the same instruction count with SSE2 advertised, so it
+is a semantics error in one of the SSE2 vector instructions those routines
+use (`pcmpeqb`, `pmovmskb`, `movdqu`, `pminub`, …), not a decode gap and not
+caused by the spec upgrade.
 
-The decoder itself is sound: `decode_diff` and its regression test
-(`x64-engine/tests/decode_diff.rs`) assert zero non-AVX gaps.
-
-## The spec-upgrade route and its blocker
-
-Route 2 — upgrade the vendored Ghidra x86 spec to a version that lifts the
-AVX families — was carried far enough to know exactly what stops it:
-
-- A parser fix (committed) lets the icicle SLEIGH compiler ingest a recent
-  Ghidra x86 language set (it previously failed on `cmpccxadd.sinc`, which
-  ends with `@endif` and no trailing newline).
-- With the upgraded spec, the decode diff is essentially perfect: glibc has
-  **zero** gaps and Node drops from ~1% to ~0.005% (a handful of VEX
-  crypto/XOP variants remain).
-- **But the upgraded (upstream master) spec regresses execution.** The
-  upstream Ghidra x86 spec is not the fork icicle's helpers were written
-  against: icicle's fork carries several *helper-compatibility* patches that
-  upstream does not, and adopting master silently reverts every one of them.
-  An execution-differential harness (`exec_diff`, below) and a per-workload
-  trace pinned three so far, each a different failure once the earlier one
-  is patched:
-
-  1. **Lifter nested export** (`JNZ rel8`, `75 f7`). Master wraps the jump
-     target as `jccRel8: rel8 is rel8 { export rel8; }`; the icicle lifter
-     dereferenced that nested `export` of an `*[ram]` operand, so `goto`
-     landed on pointer-shaped garbage — the "PageFault to a huge address"
-     symptom. **Fixed** in `resolve_export` (vendored lifter patch #7); the
-     `exec_diff` divergence at that instruction is gone.
-  2. **CPUID** (`0f a2`). icicle's helpers write four dwords directly into a
-     16-byte varnode; icicle's fork spec rewrote CPUID to `tmp:16 =
-     cpuid_*(EAX, ECX); EAX = tmp[0,32]; …`. Master reverted to upstream's
-     pointer form `tmpptr = cpuid(EAX); EAX = *tmpptr`, so the helper sees
-     `dst.size != 16`, bails, leaves `tmpptr = 0`, and glibc's
-     `init_cpu_features` reads null.
-  3. **XGETBV** (`0f 01 d0`). Master's form calls an `xinuse()` pcodeop that
-     icicle has no helper for; it returns 0, zeroing `XCR0`. icicle's fork
-     reads `XCR0` directly.
-
-  Porting patches 2 and 3 onto master lets glibc advance ~30× further
-  (icount 2,900 → 91,000) but it then selects `_dl_runtime_resolve_fxsave`
-  and executes `fxsave` (`0f ae /0`, no REX.W) — which *both* specs define
-  only for `LONGMODE_OFF`, so it traps in 64-bit mode. Under the fork spec
-  glibc instead selects the `xsave` resolver (defined for long mode) and
-  runs to exit 0, which means yet another feature-detection instruction
-  still diverges between the two specs. The list is open-ended.
-
-So Route 2 is not one focused lifter fix; it is re-porting an unbounded set
-of icicle's fork patches onto upstream master (and separately, master lacks
-the fork's EVEX-decode infrastructure, so the reverse graft — adding just
-`avx512.sinc` to the fork spec — fails to compile: `EVEX_NONE` / `vexMode=2`
-and the mask/Zmm/broadcast operands live only in master's `ia.sinc`). The
-lifter fix above is real and kept, but AVX-512 by spec upgrade is a large,
-open-ended effort.
-
-**Route 1 (advertise no AVX in CPUID) is the bounded alternative** and does
-not touch the spec at all: keep the working fork spec, and make the CPUID
-helper report an SSE2 baseline with no AVX/AVX-512/OSXSAVE bits so glibc
-ifunc, V8, and OpenSSL never dispatch into the unlifted vector families.
-This is the recommended next step for getting Node to run.
+Because the fault surfaces as a *wrong result* (not a trap), locating it
+needs a reference the differential harnesses do not yet have — the two
+specs agree, so `exec_diff_dyn` cannot see it. The next step is a real-CPU
+reference (single-step the routine natively and compare XMM/flag state, or
+unit-test the specific SSE2 ops against known vectors). Until then CPUID
+advertises only a scalar/x87 baseline (no SSE2), so `node --version` runs to
+a clean exit but a full `node -e <script>` stops at the `has_sse2` check.
 
 ## Tools
 
 - `x64-engine/examples/decode_diff.rs` — compares decoded *length* against
   iced-x86 over an ELF's `.text`; finds instructions the lifter sizes wrong
   or rejects.
-- `x64-engine/examples/exec_diff.rs` — runs a static ELF through two specs
-  in lockstep and reports the first execution-state divergence; finds
-  instructions whose *semantics* differ between specs.
+- `x64-engine/examples/exec_diff.rs` — runs a *static* ELF through two specs
+  in lockstep and reports the first execution-state divergence.
+- `linux-compat/examples/exec_diff_dyn.rs` — the same idea for a
+  *dynamically linked* ELF, driving the real loader and syscall layer, so it
+  reaches divergences deep in glibc/V8 startup. Used to find the spec patch
+  set above.
+- `linux-compat/examples/run_guest.rs` — runs a host ELF in the machine with
+  `GUEST_MOUNT`/`GUEST_COPY`/`GUEST_EXE`; prints the faulting instruction on
+  a non-clean exit.
 
 ## Not started
 

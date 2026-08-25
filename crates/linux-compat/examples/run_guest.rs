@@ -52,5 +52,13 @@ fn main() {
     let exit = machine.run();
     let output = machine.take_output();
     print!("{}", String::from_utf8_lossy(&output));
+    if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
+        let vm = machine.vm_mut();
+        let rip = vm.cpu.read_pc();
+        let mut buf = [0u8; 16];
+        let _ = vm.cpu.mem.read_bytes(rip, &mut buf, icicle_mem::perm::NONE);
+        let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
+        eprintln!("[runner] fault rip={rip:#x} bytes: {hex}");
+    }
     eprintln!("[runner] exit={exit:?} icount={}", machine.icount());
 }
