@@ -40,11 +40,11 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~15% | Node starts and inits V8; blocker pinned by a differential-decode harness to the AVX-512/VEX families (zero non-AVX decode gaps across 10.6 M instructions); mmap hole-finding fixed |
+| M7 Codex & Claude Code | 🔶 | ~30% | **Node.js runtime runs scripts** (V8 init + array/string/JSON/Math correct, ~90 M instrs). Reached by upgrading the SLEIGH spec to lift AVX-512, adding AES-NI/pshufb/psadbw/roundsd helpers (verified vs native intrinsics), and an SSE2 CPUID baseline. The two CLIs, PTY/resize, Git, and authenticated HTTPS from Node are not started |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 65%**.
-The native test suites (33 native cases plus the 17-check wasm harness) gate every
+Weighted by engineering effort, overall completion is **roughly 68%**.
+The native test suites (40 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
 
@@ -369,28 +369,46 @@ Each agent receives a separate workload manifest and compatibility report.
 Runtime dependencies must be discovered from the pinned release rather than
 assumed from historical packaging.
 
+**Runtime foundation (done).** Both agents are Node.js applications, so a
+stock Node running is the reduction. A stock `node` (v24, glibc) now runs
+scripts to a clean exit — `node -e "console.log(...)"` executes and array/
+string/`JSON`/`Math` output is correct (~90 M instructions). This required,
+on top of milestones 1–6: upgrading the vendored Ghidra x86 SLEIGH spec to
+lift the AVX-512 family, adding software helpers for the SIMD pcodeops Node/
+V8/OpenSSL issue directly (AES-NI, `pshufb`, `psadbw`, `roundsd`/`roundss`,
+all verified against native intrinsics), and advertising an SSE2 CPUID
+baseline. AVX/AVX-512 *execution* semantics stay unvalidated, so CPUID keeps
+userspace on the SSE paths. See `docs/workloads/node.md`.
+
 Work:
 
 - Support installation or prepackaged images without requiring host shell
-  access.
+  access. 🔶 (a host Node tree can be mounted via `run_guest`; no packaged
+  Codex/Claude Code image yet)
 - Complete PTY behavior, terminal resize, signals, subprocess trees, pipes,
   temporary files, file watching, Git operations, and authenticated HTTPS.
-- Mount a repository with explicit read/write capabilities.
-- Provide controlled environment variables and secret handles.
+  🔶 (signals, pipes, subprocess trees, temp files land in M4–M6; PTY,
+  terminal resize, file watching, Git, and authenticated HTTPS from Node are
+  not started)
+- Mount a repository with explicit read/write capabilities. ⬜
+- Provide controlled environment variables and secret handles. 🔶 (env + M6
+  secret injection exist; per-agent handles not wired)
 - Test tool execution, cancellation, interrupted network calls, context
-  persistence, browser reload, and checkpoint resume.
+  persistence, browser reload, and checkpoint resume. ⬜
 - Maintain per-version instruction, syscall, and performance regression data.
+  ⬜
 
 Exit gate for each agent:
 
-- Version and help commands run from a clean browser profile.
-- Authentication can be supplied without baking secrets into an image.
+- Version and help commands run from a clean browser profile. ⬜ (blocked on
+  the agent images; the Node runtime under them runs)
+- Authentication can be supplied without baking secrets into an image. ⬜
 - The agent reads a repository, edits a file, runs a command, and reports the
-  result through the terminal.
-- Child processes, cancellation, and terminal resize behave correctly.
+  result through the terminal. ⬜
+- Child processes, cancellation, and terminal resize behave correctly. ⬜
 - A checkpointed session resumes after browser reload with filesystem state
-  intact.
-- A multi-hour soak test has bounded memory, storage, and event-log growth.
+  intact. ⬜
+- A multi-hour soak test has bounded memory, storage, and event-log growth. ⬜
 
 The milestone is complete only when both agent profiles pass independently.
 
