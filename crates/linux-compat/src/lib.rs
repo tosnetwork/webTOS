@@ -45,7 +45,7 @@ pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
 
 /// Deterministic wall-clock base (fixed, not host time; bump this constant
 /// occasionally so certificate validity windows stay plausible).
-const EPOCH_BASE_SEC: i64 = 1_790_000_000; // 2026-09-21
+pub(crate) const EPOCH_BASE_SEC: i64 = 1_790_000_000; // 2026-09-21
 
 pub(crate) struct Regs {
     pub rax: pcode::VarNode,
@@ -197,10 +197,14 @@ impl LinuxEnv {
     }
 
     pub(crate) fn now(&self, cpu: &Cpu) -> (i64, i64) {
-        let nanos = self.now_nanos(cpu) as i64;
+        // u64 arithmetic before the split so the nanosecond field is always in
+        // [0, 1e9) — a large monotonic value must never produce a negative
+        // `tv_nsec` (which Rust's `Timespec::new` rejects as an invalid
+        // timestamp).
+        let nanos = self.now_nanos(cpu);
         (
-            EPOCH_BASE_SEC + nanos / 1_000_000_000,
-            nanos % 1_000_000_000,
+            EPOCH_BASE_SEC.saturating_add((nanos / 1_000_000_000) as i64),
+            (nanos % 1_000_000_000) as i64,
         )
     }
 

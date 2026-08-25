@@ -2221,9 +2221,21 @@ fn sys_futex(
                     Err(errno) => return Outcome::Ret(Err(errno)),
                 };
                 const FUTEX_WAIT_ABSOLUTE: u64 = FUTEX_WAIT_BITSET;
+                const FUTEX_CLOCK_REALTIME: u64 = 0x100;
                 let now = env.now_nanos(cpu);
                 let deadline = if op & FUTEX_CMD_MASK == FUTEX_WAIT_ABSOLUTE {
-                    duration.max(now)
+                    // Absolute deadline. `pthread_cond_timedwait` sets
+                    // FUTEX_CLOCK_REALTIME, so the value is on the CLOCK_REALTIME
+                    // scale (epoch-based); convert it to the internal monotonic
+                    // scale before comparing, or the epoch offset (~1.79e18 ns)
+                    // would be charged to the idle time-warp.
+                    let abs = if op & FUTEX_CLOCK_REALTIME != 0 {
+                        let base = (crate::EPOCH_BASE_SEC as u64).saturating_mul(1_000_000_000);
+                        duration.saturating_sub(base)
+                    } else {
+                        duration
+                    };
+                    abs.max(now)
                 } else {
                     now + duration
                 };
