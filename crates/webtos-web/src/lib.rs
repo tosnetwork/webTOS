@@ -1,17 +1,22 @@
-//! Browser execution host boundary for the webTOS x64-engine.
+//! Browser execution host boundary for the webTOS Linux runtime.
 //!
-//! Exposes a small C ABI over one engine instance so the wasm module needs no
-//! JS binding generator. All pointers are offsets into the module's linear
-//! memory; lengths are u32 so no BigInt support is required. The wasm module
-//! is single-threaded, so the thread-local state is effectively global.
+//! Exposes a small C ABI over one Linux machine (x64-engine interpreter +
+//! linux-compat environment) so the wasm module needs no JS binding
+//! generator. All pointers are offsets into the module's linear memory;
+//! lengths are u32 so no BigInt support is required. The wasm module is
+//! single-threaded, so the thread-local state is effectively global.
 //!
-//! Call sequence: `wtw_init` -> (`wtw_alloc` + copy + `wtw_load`) ->
-//! `wtw_run` in fuel slices, draining output with `wtw_output_*` after each
-//! slice. Any `-1` return leaves a message readable via `wtw_error_*`.
+//! Call sequence per process: `wtw_init` once; then `wtw_add_file` for the
+//! guest image and root filesystem, `wtw_arg`/`wtw_env` to stage argv and
+//! envp, `wtw_load` with the guest path, and `wtw_run` in fuel slices,
+//! draining output with `wtw_output_*` after each slice. The filesystem
+//! persists across `wtw_load` calls. Any `-1` return leaves a message
+//! readable via `wtw_error_*`.
 
 use std::cell::RefCell;
 
-use x64_engine::{CpuExit, Engine, EngineConfig};
+use linux_compat::Machine;
+use x64_engine::{CpuExit, EngineConfig};
 
 mod spec {
     include!(concat!(env!("OUT_DIR"), "/spec_files.rs"));
@@ -26,10 +31,10 @@ pub const STATUS_INTERRUPTED: i32 = 4;
 pub const STATUS_OUT_OF_MEMORY: i32 = 5;
 pub const STATUS_UNHANDLED: i32 = 6;
 
-const GUEST_PATH: &[u8] = b"guest.elf";
-
 struct HostState {
-    engine: Option<Engine>,
+    machine: Option<Machine>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
     /// Last drained guest output; kept alive so the pointer handed to JS
     /// stays valid until the next drain.
     output: Vec<u8>,
@@ -38,12 +43,16 @@ struct HostState {
 }
 
 thread_local! {
-    static STATE: RefCell<HostState> = RefCell::new(HostState {
-        engine: None,
-        output: Vec::new(),
-        error: String::new(),
-        allocations: Vec::new(),
-    });
+    static STATE: RefCell<HostState> = const {
+        RefCell::new(HostState {
+            machine: None,
+            argv: Vec::new(),
+            envp: Vec::new(),
+            output: Vec::new(),
+            error: String::new(),
+            allocations: Vec::new(),
+        })
+    };
 }
 
 fn with_state<R>(f: impl FnOnce(&mut HostState) -> R) -> R {
@@ -55,9 +64,15 @@ fn fail(state: &mut HostState, message: impl Into<String>) -> i32 {
     -1
 }
 
+/// Copies `[ptr, ptr+len)` out of linear memory.
+///
+/// Safety contract: `ptr` must come from `wtw_alloc` (module-owned memory).
+unsafe fn slice_arg(ptr: u32, len: u32) -> Vec<u8> {
+    unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec()
+}
+
 /// Allocates `len` bytes inside the module and returns the offset, so the
-/// host can copy input (e.g. an ELF image) into wasm memory. Buffers live
-/// until `wtw_reset`.
+/// host can copy input into wasm memory. Buffers live until `wtw_reset`.
 #[no_mangle]
 pub extern "C" fn wtw_alloc(len: u32) -> u32 {
     with_state(|state| {
@@ -68,7 +83,7 @@ pub extern "C" fn wtw_alloc(len: u32) -> u32 {
     })
 }
 
-/// Builds the engine from the embedded SLEIGH specification. Returns 0 on
+/// Builds the machine from the embedded SLEIGH specification. Returns 0 on
 /// success.
 #[no_mangle]
 pub extern "C" fn wtw_init() -> i32 {
@@ -77,29 +92,63 @@ pub extern "C" fn wtw_init() -> i32 {
             .iter()
             .map(|&(name, content)| (name.to_owned(), content.to_owned()))
             .collect();
-        match Engine::new_linux_minimal_from_files(files, &EngineConfig::default()) {
-            Ok(engine) => {
-                state.engine = Some(engine);
+        match Machine::from_spec_files(files, &EngineConfig::default()) {
+            Ok(machine) => {
+                state.machine = Some(machine);
                 0
             }
-            Err(e) => fail(state, format!("engine build failed: {e}")),
+            Err(e) => fail(state, format!("machine build failed: {e}")),
         }
     })
 }
 
-/// Loads the static ELF image at `[ptr, ptr+len)` in wasm memory. Returns 0
-/// on success.
+/// Adds a file to the guest filesystem (parent directories are created).
 #[no_mangle]
-pub extern "C" fn wtw_load(ptr: u32, len: u32) -> i32 {
+pub extern "C" fn wtw_add_file(path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) -> i32 {
     with_state(|state| {
-        let Some(engine) = state.engine.as_mut() else {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_add_file called before wtw_init");
+        };
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let data = unsafe { slice_arg(data_ptr, data_len) };
+        match machine.add_file(&path, data, 0o755) {
+            Ok(()) => 0,
+            Err(e) => fail(state, e),
+        }
+    })
+}
+
+/// Appends one argv entry for the next `wtw_load`.
+#[no_mangle]
+pub extern "C" fn wtw_arg(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        state.argv.push(unsafe { slice_arg(ptr, len) });
+        0
+    })
+}
+
+/// Appends one envp entry (`KEY=value`) for the next `wtw_load`.
+#[no_mangle]
+pub extern "C" fn wtw_env(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        state.envp.push(unsafe { slice_arg(ptr, len) });
+        0
+    })
+}
+
+/// Loads the static ELF at `path` in the guest filesystem, consuming the
+/// staged argv/envp. The filesystem persists from any previous process.
+#[no_mangle]
+pub extern "C" fn wtw_load(path_ptr: u32, path_len: u32) -> i32 {
+    with_state(|state| {
+        let argv = std::mem::take(&mut state.argv);
+        let envp = std::mem::take(&mut state.envp);
+        let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_load called before wtw_init");
         };
-        // Safety: `ptr` must come from `wtw_alloc` (module-owned memory).
-        let bytes =
-            unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec();
-        engine.preload_file(GUEST_PATH, bytes);
-        match engine.load(GUEST_PATH) {
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        machine.set_args(argv, envp);
+        match machine.load(&path) {
             Ok(()) => 0,
             Err(e) => fail(state, format!("ELF load failed: {e}")),
         }
@@ -112,12 +161,12 @@ pub extern "C" fn wtw_load(ptr: u32, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_run(fuel: u32) -> i32 {
     with_state(|state| {
-        let Some(engine) = state.engine.as_mut() else {
+        let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_run called before wtw_init");
         };
-        engine.vm_mut().icount_limit = engine.icount().saturating_add(fuel as u64);
-        let exit = engine.run();
-        state.output = engine.take_output();
+        machine.vm_mut().icount_limit = machine.icount().saturating_add(fuel as u64);
+        let exit = machine.run();
+        state.output = machine.take_output();
         match exit {
             CpuExit::InstructionLimit => STATUS_RUNNING,
             CpuExit::Halt { .. } => STATUS_HALT,
@@ -170,9 +219,9 @@ pub extern "C" fn wtw_error_len() -> u32 {
 pub extern "C" fn wtw_exit_code() -> i32 {
     with_state(|state| {
         state
-            .engine
+            .machine
             .as_mut()
-            .and_then(|engine| engine.exit_code())
+            .and_then(|machine| machine.exit_code())
             .unwrap_or(-1)
     })
 }
@@ -180,20 +229,27 @@ pub extern "C" fn wtw_exit_code() -> i32 {
 /// Retired guest instruction count, low 32 bits.
 #[no_mangle]
 pub extern "C" fn wtw_icount_lo() -> u32 {
-    with_state(|state| state.engine.as_ref().map_or(0, |e| e.icount() as u32))
+    with_state(|state| state.machine.as_ref().map_or(0, |m| m.icount() as u32))
 }
 
 /// Retired guest instruction count, high 32 bits.
 #[no_mangle]
 pub extern "C" fn wtw_icount_hi() -> u32 {
-    with_state(|state| state.engine.as_ref().map_or(0, |e| (e.icount() >> 32) as u32))
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |m| (m.icount() >> 32) as u32)
+    })
 }
 
-/// Drops the engine and all host-visible buffers.
+/// Drops the machine and all host-visible buffers.
 #[no_mangle]
 pub extern "C" fn wtw_reset() {
     with_state(|state| {
-        state.engine = None;
+        state.machine = None;
+        state.argv.clear();
+        state.envp.clear();
         state.output.clear();
         state.error.clear();
         state.allocations.clear();

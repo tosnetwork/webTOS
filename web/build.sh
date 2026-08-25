@@ -6,7 +6,12 @@ cd "$(dirname "$0")/.."
 (cd crates && cargo build -p webtos-web --target wasm32-unknown-unknown --release)
 cp crates/target/wasm32-unknown-unknown/release/webtos_web.wasm web/
 cp test_data/hello_linux.elf web/
+if [ -f test_data/busybox-musl ]; then
+    cp test_data/busybox-musl web/
+else
+    echo "note: test_data/busybox-musl missing; run tools/fetch_busybox.sh for the BusyBox demo"
+fi
 
-echo "Staged web/webtos_web.wasm and web/hello_linux.elf."
+echo "Staged web/webtos_web.wasm and guest images."
 echo "Serve with:  python3 -m http.server -d web 8080"
 echo "Then open:   http://localhost:8080/"

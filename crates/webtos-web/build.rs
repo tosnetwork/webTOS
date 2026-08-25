@@ -4,8 +4,8 @@
 use std::{fmt::Write as _, path::PathBuf};
 
 fn main() {
-    let languages = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../third_party/ghidra-x86/languages");
+    let languages =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ghidra-x86/languages");
     println!("cargo:rerun-if-changed={}", languages.display());
 
     let mut entries = Vec::new();

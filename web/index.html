@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>webTOS — x86-64 in the browser</title>
+<title>webTOS — Linux x86-64 in the browser</title>
 <style>
   :root { color-scheme: dark; }
   body {
@@ -15,64 +15,128 @@
   #status { color: #8b93a3; min-height: 1.5em; }
   #terminal {
     background: #05070b; border: 1px solid #1d2331; border-radius: 8px;
-    padding: 1rem; min-height: 12rem; white-space: pre-wrap; overflow-x: auto;
+    padding: 1rem; min-height: 16rem; white-space: pre-wrap; overflow-x: auto;
     font: 13px/1.45 ui-monospace, "Cascadia Mono", monospace; color: #c9e4b4;
   }
-  #run {
-    background: #1b2c4f; color: #d6dbe4;
-    border: 1px solid #2c4a86; border-radius: 6px; padding: .5rem 1.1rem;
-    font: inherit; cursor: pointer; margin-block: 1rem;
+  #prompt-row { display: flex; gap: .5rem; margin-block: 1rem; }
+  #cmd {
+    flex: 1; background: #05070b; color: #d6dbe4; border: 1px solid #2c4a86;
+    border-radius: 6px; padding: .5rem .8rem;
+    font: 13px ui-monospace, "Cascadia Mono", monospace;
   }
-  #run:disabled { opacity: .5; cursor: default; }
+  #run {
+    background: #1b2c4f; color: #d6dbe4; border: 1px solid #2c4a86;
+    border-radius: 6px; padding: .5rem 1.1rem; font: inherit; cursor: pointer;
+  }
+  #run:disabled, #cmd:disabled { opacity: .5; cursor: default; }
   .meta { color: #8b93a3; font-size: .85rem; }
+  .prompt { color: #6aa5ff; }
 </style>
 </head>
 <body>
-<h1><span>webTOS</span> — Linux x86-64 ELF running locally in your browser</h1>
+<h1><span>webTOS</span> — BusyBox on a Linux x86-64 runtime, locally in your browser</h1>
 <p class="meta">
-  A static x86-64 Linux binary is executed instruction-by-instruction by the
-  webTOS <code>x64-engine</code> (wasm) inside a Web Worker. No server-side
-  compute; the CPU emulation and Linux syscall handling run in this tab.
+  A static musl BusyBox binary is executed instruction-by-instruction by the
+  webTOS <code>x64-engine</code> + <code>linux-compat</code> stack (wasm) in a
+  Web Worker. The filesystem is in-memory and persists across commands. Try:
+  <code>echo hello</code>, <code>ls /</code>, <code>mkdir /tmp/a</code>,
+  <code>sh -c 'echo hi > /tmp/x && ls /tmp'</code>, <code>cat /etc/motd</code>.
 </p>
-<button id="run">Run hello_linux.elf</button>
-<div id="status"></div>
+<div id="prompt-row">
+  <input id="cmd" placeholder="busybox command, e.g.  ls /" disabled>
+  <button id="run" disabled>Run</button>
+</div>
+<div id="status">starting worker…</div>
 <div id="terminal"></div>
 
 <script type="module">
   const statusEl = document.getElementById("status");
   const term = document.getElementById("terminal");
   const button = document.getElementById("run");
+  const cmd = document.getElementById("cmd");
+
+  const append = (text) => {
+    term.textContent += text;
+    term.scrollTop = term.scrollHeight;
+  };
+  // BusyBox emits ANSI color escapes; strip them for the plain-text view.
+  const strip = (s) => s.replace(/\[[0-9;]*m/g, "");
 
   const worker = new Worker(new URL("./worker.js", import.meta.url));
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "status") statusEl.textContent = msg.text;
-    if (msg.type === "output") term.textContent += msg.text;
+    if (msg.type === "ready") {
+      button.disabled = false;
+      cmd.disabled = false;
+      cmd.focus();
+      statusEl.textContent += " — filesystem ready, BusyBox at /bin/busybox";
+    }
+    if (msg.type === "output") append(strip(msg.text));
     if (msg.type === "error") {
       statusEl.textContent = `error: ${msg.text}`;
       button.disabled = false;
+      cmd.disabled = false;
     }
     if (msg.type === "done") {
       statusEl.textContent =
         msg.status === 1
-          ? `guest exited with code ${msg.exitCode} after ${msg.icount} instructions`
-          : `guest stopped (status ${msg.status}): ${msg.error}`;
+          ? `exit ${msg.exitCode} · ${msg.icount.toLocaleString()} instructions total`
+          : `stopped (status ${msg.status}): ${msg.error}`;
       button.disabled = false;
+      cmd.disabled = false;
+      cmd.focus();
     }
   };
 
-  button.addEventListener("click", async () => {
-    button.disabled = true;
-    term.textContent = "";
-    statusEl.textContent = "fetching guest ELF…";
-    const response = await fetch("./hello_linux.elf");
-    if (!response.ok) {
-      statusEl.textContent = "hello_linux.elf not found — run web/build.sh first";
-      button.disabled = false;
-      return;
+  async function fetchBytes(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    return response.arrayBuffer();
+  }
+
+  (async () => {
+    try {
+      statusEl.textContent = "fetching BusyBox image…";
+      const busybox = await fetchBytes("./busybox-musl");
+      const motd = new TextEncoder().encode("welcome to webTOS\n").buffer;
+      worker.postMessage(
+        {
+          type: "boot",
+          files: [
+            { path: "/bin/busybox", bytes: busybox },
+            { path: "/etc/motd", bytes: motd },
+          ],
+        },
+        [busybox],
+      );
+    } catch (e) {
+      statusEl.textContent = `${e} — run web/build.sh first (and tools/fetch_busybox.sh)`;
     }
-    const elf = await response.arrayBuffer();
-    worker.postMessage({ type: "start", elf }, [elf]);
+  })();
+
+  function runCommand() {
+    const line = cmd.value.trim();
+    if (!line) return;
+    button.disabled = true;
+    cmd.disabled = true;
+    append(`$ busybox ${line}\n`);
+    // Quote-aware split: sh -c 'echo hi > /x' arrives as one argument.
+    const argv = ["busybox"];
+    for (const m of line.matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)) {
+      argv.push(m[1] ?? m[2] ?? m[3]);
+    }
+    worker.postMessage({
+      type: "exec",
+      path: "/bin/busybox",
+      argv,
+      envp: ["PATH=/bin:/usr/bin", "HOME=/home"],
+    });
+  }
+
+  button.addEventListener("click", runCommand);
+  cmd.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") runCommand();
   });
 </script>
 </body>
