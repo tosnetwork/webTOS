@@ -33,18 +33,18 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~50% | fixtures exist ad hoc; no trace format or dashboards |
+| M0 Lock the baseline | 🔶 | ~40% | fixtures exist; native QEMU harnesses not re-run since the pivot; no trace format or dashboards |
 | M1 Static `hello` | ✅ | ~90% | native + wasm gates green; three-browser matrix pending |
 | M2 Static BusyBox | ✅ | ~95% | applet gates green incl. reload persistence (FS snapshots + OPFS) |
-| M3 Dynamic userland | ✅ | ~95% | musl and glibc loaders green, native + wasm |
-| M4 Threads & processes | ✅ | ~85% | single-worker model green incl. determinism; multi-worker deferred |
-| M5 Event loop & networking | 🔶 | ~80% | HTTP/HTTPS (guest TLS)/DNS/epoll/denied-by-default green; recording, reconnect pending |
+| M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
+| M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
+| M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | ⬜ | 0% | — |
 | M7 Codex & Claude Code | ⬜ | 0% | — |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 55%**.
-The native test suites (28 native cases plus the wasm harness) gate every
+The native test suites (33 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
 
