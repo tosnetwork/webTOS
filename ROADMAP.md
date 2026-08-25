@@ -40,10 +40,10 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~30% | **Node.js runtime runs scripts** (V8 init + array/string/JSON/Math correct, ~90 M instrs). Reached by upgrading the SLEIGH spec to lift AVX-512, adding AES-NI/pshufb/psadbw/roundsd helpers (verified vs native intrinsics), and an SSE2 CPUID baseline. The two CLIs, PTY/resize, Git, and authenticated HTTPS from Node are not started |
+| M7 Codex & Claude Code | 🔶 | ~35% | **Node.js runtime runs scripts** and a **stock static Codex binary (247 MB) runs its CLI paths** (`--version`, `--help`, `exec --help`, `login status` → "Not logged in", clean exits). Reached by the AVX-512 spec upgrade, SIMD helpers (AES-NI/pshufb/psadbw/roundsd, verified vs native intrinsics), an SSE2 CPUID baseline, a 1 GiB guest-memory cap, and `flock`. Interactive TUI/PTY, real `exec` (model calls + repo edits), Git, and authenticated HTTPS are not started |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 68%**.
+Weighted by engineering effort, overall completion is **roughly 69%**.
 The native test suites (40 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -380,11 +380,19 @@ all verified against native intrinsics), and advertising an SSE2 CPUID
 baseline. AVX/AVX-512 *execution* semantics stay unvalidated, so CPUID keeps
 userspace on the SSE paths. See `docs/workloads/node.md`.
 
+A stock statically linked **Codex** binary (`codex-cli` 0.149.1, a 247 MB
+`x86_64-unknown-linux-musl` build) runs directly on top of this: `--version`,
+`--help`, and `exec --help` print correctly, and `login status` reports "Not
+logged in" and exits — all from a clean profile. It needed a larger guest
+physical-memory cap (its segments are ~246 MiB) and a `flock` no-op. What is
+*not* yet exercised is the interactive TUI (needs a PTY), a real `exec` run
+(model API calls over authenticated HTTPS, repository edits), and Git.
+
 Work:
 
 - Support installation or prepackaged images without requiring host shell
-  access. 🔶 (a host Node tree can be mounted via `run_guest`; no packaged
-  Codex/Claude Code image yet)
+  access. 🔶 (host Node and a static Codex binary run via `run_guest`; no
+  packaged, browser-delivered agent image yet)
 - Complete PTY behavior, terminal resize, signals, subprocess trees, pipes,
   temporary files, file watching, Git operations, and authenticated HTTPS.
   🔶 (signals, pipes, subprocess trees, temp files land in M4–M6; PTY,
