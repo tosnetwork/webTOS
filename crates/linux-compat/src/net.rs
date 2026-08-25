@@ -59,6 +59,9 @@ pub trait NetworkBroker {
     /// error to report).
     fn readable(&mut self, handle: Handle) -> bool;
 
+    /// The local address of an endpoint, when known.
+    fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4>;
+
     fn close(&mut self, handle: Handle);
 
     /// Blocks the host until any of `handles` is readable or `timeout`
@@ -257,6 +260,18 @@ impl NetworkBroker for NativeBroker {
             };
         }
         false
+    }
+
+    fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {
+        let addr = if let Some(stream) = self.tcp.get(&handle) {
+            stream.local_addr().ok()
+        } else {
+            self.udp.get(&handle).and_then(|s| s.local_addr().ok())
+        };
+        match addr {
+            Some(SocketAddr::V4(addr)) => Some(addr),
+            _ => None,
+        }
     }
 
     fn close(&mut self, handle: Handle) {

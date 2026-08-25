@@ -67,10 +67,18 @@ milestone-1 `linux_min` environment.
   for eventfd wakeups, timerfd through the time warp, and epoll across
   processes
 
+Also provided after review hardening: `sendmsg`/`recvmsg` (iovec +
+name; control messages are refused, `msg_controllen` reads back zero),
+honest `getsockname` (real broker-side local address), a one-CPU
+`sched_getaffinity`, `EPOLLHUP` on half-closed pipes, time-advancing
+`nanosleep`, and a real `utimensat`. Adversarial gates cover
+copy-on-write isolation across `fork`, shared open-file-description
+offsets, and pipe backpressure (2 MiB through a 1 MiB pipe).
+
 Not modeled yet: signal delivery to handlers (fatal signals terminate,
 registration is recorded), process groups and sessions, listening
-sockets (client-only network), `sendmsg`/`recvmsg`, and network input
-recording for replay (planned with the receipts work).
+sockets (client-only network), control messages (`SCM_RIGHTS`), and
+network input recording for replay (planned with the receipts work).
 
 ## Testing
 

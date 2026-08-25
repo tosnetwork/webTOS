@@ -206,7 +206,8 @@ browser refactor begins.
 Work:
 
 - Record the current native build, Linux maturity, and runtime validation
-  results from a clean checkout. ✅
+  results from a clean checkout. 🔶 (harnesses exist; not re-run since the
+  browser pivot — the native kernel build itself is verified)
 - Extract small ELF fixtures for static, PIE, dynamic, TLS, signal, futex,
   filesystem, and socket behavior. 🔶 (test_data + test-compiled fixtures; not versioned as a formal set)
 - Create an instruction trace format containing registers, flags, memory
@@ -218,7 +219,7 @@ Work:
 
 Exit gate:
 
-- Native reference tests are reproducible. ✅
+- Native reference tests are reproducible. 🔶 (kernel builds; QEMU validation harnesses not re-run since the pivot)
 - Fixtures and expected traces are versioned. 🔶
 - Every later milestone can run without depending on a full root filesystem. ✅
 
@@ -281,7 +282,7 @@ Work:
 - Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)
 - Port signals, alternate signal stacks, and signal return frames to virtual
   CPU state. 🔶 (registration + fatal-signal semantics; no handler delivery)
-- Build versioned minimal root images with explicit licenses and manifests. ✅ (pinned Alpine minirootfs fixture)
+- Build versioned minimal root images with explicit licenses and manifests. 🔶 (Alpine minirootfs pinned by sha256; no per-package license manifest yet)
 
 Exit gate:
 

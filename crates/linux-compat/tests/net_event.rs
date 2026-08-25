@@ -401,8 +401,15 @@ fn spawn_tls_server() -> Option<(SocketAddrV4, KillOnDrop)> {
     if !cert.exists() || !key.exists() {
         let status = Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
-                "-addext", "subjectAltName=IP:10.0.0.2",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "3650",
+                "-addext",
+                "subjectAltName=IP:10.0.0.2",
             ])
             .arg("-keyout")
             .arg(&key)

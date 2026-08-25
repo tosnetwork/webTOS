@@ -272,3 +272,116 @@ fn scheduling_is_deterministic_across_runs() {
         runs[0].icount, runs[1].icount
     );
 }
+
+#[test]
+fn fork_memory_is_copy_on_write_isolated() {
+    // The most dangerous silent failure: if COW is broken, parent and child
+    // share writable pages and corrupt each other without any error.
+    let source = r#"
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static volatile long shared_global = 1;
+int main(void) {
+    char stack_local = 'A';
+    pid_t pid = fork();
+    if (pid < 0) return 9;
+    if (pid == 0) {
+        shared_global = 2;      // must NOT be visible to the parent
+        stack_local = 'B';
+        _exit(shared_global == 2 && stack_local == 'B' ? 7 : 8);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return 3;
+    if (WEXITSTATUS(status) != 7) return 4;
+    printf("parent sees global=%ld local=%c\n", shared_global, stack_local);
+    return (shared_global == 1 && stack_local == 'A') ? 0 : 5;
+}
+"#;
+    let Some(image) = compile_c("cow", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "cow");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("parent sees global=1 local=A"),
+        "COW isolation broken: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn fork_shares_open_file_descriptions() {
+    // Linux semantics: after fork, parent and child share file offsets.
+    let source = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    int fd = open("/etc/data.txt", O_RDONLY);
+    if (fd < 0) return 1;
+    char buf[6] = {0};
+    if (read(fd, buf, 5) != 5) return 2; // consume "AAAAA"
+    pid_t pid = fork();
+    if (pid < 0) return 3;
+    if (pid == 0) {
+        char child_buf[6] = {0};
+        if (read(fd, child_buf, 5) != 5) _exit(4); // must be "BBBBB"
+        _exit(strcmp(child_buf, "BBBBB") == 0 ? 7 : 5);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WEXITSTATUS(status) != 7) return 6;
+    char tail[6] = {0};
+    if (read(fd, tail, 5) != 5) return 7; // shared offset: now "CCCCC"
+    printf("parent tail=%s\n", tail);
+    return strcmp(tail, "CCCCC") == 0 ? 0 : 8;
+}
+"#;
+    let Some(image) = compile_c("fdshare", source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fdshare", image, 0o755)
+        .expect("add fixture");
+    machine
+        .add_file(b"/etc/data.txt", b"AAAAABBBBBCCCCC".to_vec(), 0o644)
+        .expect("add data");
+    machine.set_args(vec![b"fdshare".to_vec()], vec![]);
+    machine.load(b"/bin/fdshare").expect("ELF load failed");
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    let run = Run {
+        exit,
+        output,
+        icount: machine.icount(),
+    };
+    expect_clean(&run);
+    assert!(
+        run.output.contains("parent tail=CCCCC"),
+        "shared offset broken: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn pipe_backpressure_blocks_and_drains() {
+    // `yes` floods the pipe far past its capacity; `head -c` drains a fixed
+    // amount. Exercises blocking writes, partial writes, EPIPE shutdown.
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let run = run_sh(&mut machine, "yes | head -c 2097152 | wc -c");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("2097152"),
+        "backpressure roundtrip lost data: {:?}",
+        run.output
+    );
+}

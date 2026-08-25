@@ -136,6 +136,8 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_PPOLL => outcome_poll(env, cpu, a[0], a[1], a[2], true),
         abi::SYS_SENDTO => sys_sendto(env, cpu, a),
         abi::SYS_RECVFROM => sys_recvfrom(env, cpu, a),
+        abi::SYS_SENDMSG => sys_sendmsg(env, cpu, a),
+        abi::SYS_RECVMSG => sys_recvmsg(env, cpu, a),
         abi::SYS_EPOLL_WAIT | abi::SYS_EPOLL_PWAIT => sys_epoll_wait(env, cpu, a),
         abi::SYS_SELECT => sys_select(env, cpu, a, false),
         abi::SYS_PSELECT6 => sys_select(env, cpu, a, true),
@@ -213,14 +215,20 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_SHUTDOWN => sys_shutdown(env, a[0], a[1]),
         abi::SYS_GETPEERNAME => sys_getpeername(env, cpu, a[0], a[1], a[2]),
         abi::SYS_GETSOCKNAME => {
-            // Local addresses are broker-side; report the unspecified addr.
-            write_sockaddr_in(
-                cpu,
-                a[1],
-                a[2],
-                std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0),
-            )?;
-            net_of(env, a[0]).map(|_| 0)
+            let socket = net_of(env, a[0])?;
+            let local = {
+                let inner = socket.borrow();
+                inner
+                    .handle
+                    .and_then(|handle| inner.broker.borrow_mut().local_addr(handle))
+            };
+            // Before connect/bind there is no endpoint yet: unspecified.
+            let local = local.unwrap_or(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0,
+            ));
+            write_sockaddr_in(cpu, a[1], a[2], local)?;
+            Ok(0)
         }
         abi::SYS_SETSOCKOPT => net_of(env, a[0]).map(|_| 0),
         abi::SYS_GETSOCKOPT => sys_getsockopt(env, cpu, a),
@@ -238,10 +246,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             tracing::warn!("listening sockets are not supported (client-only network)");
             Err(abi::EOPNOTSUPP)
         }
-        abi::SYS_SENDMSG | abi::SYS_RECVMSG => {
-            tracing::warn!("sendmsg/recvmsg are not implemented yet");
-            Err(abi::ENOSYS)
-        }
+
         abi::SYS_EVENTFD => sys_eventfd(env, a[0], 0),
         abi::SYS_EVENTFD2 => sys_eventfd(env, a[0], a[1]),
         abi::SYS_TIMERFD_CREATE => sys_timerfd_create(env, a[0], a[1]),
@@ -332,6 +337,18 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         }
         abi::SYS_PRLIMIT64 => sys_prlimit64(cpu, a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
+        // One virtual CPU: a one-bit affinity mask, and the mask size (in
+        // bytes) as the return value, per the kernel convention.
+        abi::SYS_SCHED_GETAFFINITY => {
+            let size = (a[1] as usize).min(128);
+            if size < 8 {
+                return Err(abi::EINVAL);
+            }
+            let mut mask = vec![0_u8; size];
+            mask[0] = 1;
+            write_mem(cpu, a[2], &mask)?;
+            Ok(8)
+        }
 
         abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ => Err(abi::ENOSYS),
         abi::SYS_RT_SIGRETURN => Err(abi::ENOSYS),
@@ -2187,6 +2204,7 @@ const EPOLL_CTL_DEL: u64 = 2;
 const EPOLL_CTL_MOD: u64 = 3;
 const EPOLLIN: u32 = 0x1;
 const EPOLLOUT: u32 = 0x4;
+const EPOLLHUP: u32 = 0x10;
 
 /// Resolves a total stall: every task is parked and none is ready. Waits on
 /// the host for network readiness, then warps the deterministic clock to
@@ -2676,6 +2694,16 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
                     watches.push(watch);
                 }
             }
+            // Hang-up is reported regardless of the requested events.
+            if let Backing::Pipe {
+                inner,
+                write_end: false,
+            } = &desc.backing
+            {
+                if inner.borrow().writers == 0 {
+                    fired |= EPOLLHUP;
+                }
+            }
             if events & EPOLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
                 fired |= EPOLLOUT;
             }
@@ -3044,4 +3072,60 @@ fn sys_utimensat(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     };
     env.vfs.node_mut(node).mtime_sec = mtime;
     Ok(0)
+}
+
+/// Reads a `struct msghdr`: (name ptr, name len, iov ptr, iov count).
+/// Control messages are not modeled and are reported as absent.
+fn read_msghdr(cpu: &mut Cpu, msg: u64) -> Result<(u64, u64, u64, u64), u64> {
+    let bytes = read_mem(cpu, msg, 56)?;
+    let field = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().expect("slice length"));
+    Ok((field(0), field(8) & 0xffff_ffff, field(16), field(24)))
+}
+
+/// `sendmsg`: name + iovec gather (control data unsupported and refused).
+fn sys_sendmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [fd, msg, _flags, _, _, _] = a;
+    let (name, name_len, iov, iovcnt) = match read_msghdr(cpu, msg) {
+        Ok(parts) => parts,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    // First non-empty segment only (short sends are valid; callers loop).
+    let entries = match iter_iov(cpu, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    for (base, len) in entries {
+        if len == 0 {
+            continue;
+        }
+        if name != 0 {
+            return sys_sendto(env, cpu, [fd, base, len, 0, name, name_len]);
+        }
+        return outcome_write(env, cpu, fd, base, len);
+    }
+    Outcome::Ret(Ok(0))
+}
+
+/// `recvmsg`: name + iovec scatter (first segment; control data absent —
+/// msg_controllen is zeroed so callers do not read stale lengths).
+fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [fd, msg, _flags, _, _, _] = a;
+    let (name, name_len, iov, iovcnt) = match read_msghdr(cpu, msg) {
+        Ok(parts) => parts,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    if let Err(errno) = write_mem(cpu, msg + 40, &0_u64.to_le_bytes()) {
+        return Outcome::Ret(Err(errno)); // msg_controllen = 0
+    }
+    let entries = match iter_iov(cpu, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    for (base, len) in entries {
+        if len == 0 {
+            continue;
+        }
+        return sys_recvfrom(env, cpu, [fd, base, len, 0, name, name_len]);
+    }
+    Outcome::Ret(Ok(0))
 }

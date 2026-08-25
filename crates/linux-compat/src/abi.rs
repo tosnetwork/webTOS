@@ -99,6 +99,7 @@ pub const SYS_GETTID: u64 = 186;
 pub const SYS_TIME: u64 = 201;
 pub const SYS_FUTEX: u64 = 202;
 pub const SYS_EPOLL_CREATE: u64 = 213;
+pub const SYS_SCHED_GETAFFINITY: u64 = 204;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_SET_TID_ADDRESS: u64 = 218;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
