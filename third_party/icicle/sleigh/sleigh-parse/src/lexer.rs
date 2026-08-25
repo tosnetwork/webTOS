@@ -184,11 +184,16 @@ pub(crate) struct Lexer {
 
     /// The offset of the most recent character processed
     prev: u32,
+
+    /// Whether the synthetic end-of-line at this source's boundary has been
+    /// emitted (see `Parser::lexer_next`). Prevents a spurious blank line for
+    /// sources that already end in a newline.
+    pub(crate) emitted_boundary_line: bool,
 }
 
 impl Lexer {
     pub fn new(src: SourceId) -> Self {
-        Self { src, line_start: 0, offset: 0, token_start: 0, prev: 0 }
+        Self { src, line_start: 0, offset: 0, token_start: 0, prev: 0, emitted_boundary_line: false }
     }
 
     /// Lex the next token from the input stream

@@ -32,6 +32,16 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    recover from self-modifying-code faults by flushing lifted blocks and
    retrying the write (data sharing a page range with executed code, e.g.
    OpenSSL initialization, hits this).
+6. `sleigh/sleigh-parse/src/{lexer.rs,parser.rs}`: emit a synthetic
+   end-of-line token at a source's boundary (a new `Lexer.emitted_boundary_line`
+   flag drives it in `Parser::lexer_next`). A SLEIGH source, or an included
+   file, may end without a trailing newline; directives and constructors
+   expect a line terminator, so the file boundary now supplies one. Without
+   this, compiling a recent Ghidra x86 language set fails on
+   `cmpccxadd.sinc`, which ends with `@endif` and no newline. Enables
+   compiling newer specifications; the AVX-512 spec upgrade itself is not
+   yet applied (it changes the execution semantics of existing instructions
+   and needs an execution-differential pass first).
 
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and

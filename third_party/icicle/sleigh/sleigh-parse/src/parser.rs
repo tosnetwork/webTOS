@@ -267,8 +267,19 @@ impl Parser {
 
             let Some(token) = lexer.next_token(&src.content, self.lexer_mode)
             else {
-                // We are done with this source, remove it from the stack, and continue with the
-                // next entry
+                // This source is exhausted. Emit a synthetic end-of-line
+                // before popping it: a file (or included file) is a sequence
+                // of lines, and its last line may lack a trailing newline
+                // (Ghidra's `cmpccxadd.sinc` ends with `@endif` and no
+                // newline). Directives and constructors expect a line
+                // terminator, so the file boundary supplies one. Guard with
+                // `emitted_boundary_line` so a source with a real trailing
+                // newline does not produce a spurious blank line.
+                let span = lexer.current_span();
+                if !lexer.emitted_boundary_line {
+                    lexer.emitted_boundary_line = true;
+                    return Some(Token { kind: TokenKind::Line, span });
+                }
                 self.lexers.pop();
                 continue;
             };
