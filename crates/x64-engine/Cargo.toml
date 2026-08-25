@@ -1,0 +1,16 @@
+[package]
+name = "x64-engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "x86-64 user-mode execution engine for webTOS: interpreter-only VM over the vendored icicle CPU core"
+
+[dependencies]
+icicle-cpu = { workspace = true }
+icicle-mem = { workspace = true }
+pcode = { workspace = true }
+sleigh-compile = { workspace = true }
+sleigh-parse = { workspace = true }
+sleigh-runtime = { workspace = true }
+target-lexicon = { workspace = true }
+tracing = { workspace = true }

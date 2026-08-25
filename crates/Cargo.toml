@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["x64-engine"]
+
+[workspace.dependencies]
+icicle-cpu = { path = "../third_party/icicle/icicle-cpu" }
+icicle-mem = { path = "../third_party/icicle/icicle-mem" }
+pcode = { path = "../third_party/icicle/sleigh/pcode" }
+sleigh-runtime = { path = "../third_party/icicle/sleigh/sleigh-runtime" }
+sleigh-parse = { path = "../third_party/icicle/sleigh/sleigh-parse" }
+sleigh-compile = { path = "../third_party/icicle/sleigh/sleigh-compile" }
+target-lexicon = "0.13.3"
+tracing = { version = "0.1.40", default-features = false }
