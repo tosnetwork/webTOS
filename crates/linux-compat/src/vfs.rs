@@ -76,7 +76,7 @@ pub struct Resolved {
 }
 
 pub struct Vfs {
-    nodes: Vec<Node>,
+    pub(crate) nodes: Vec<Node>,
 }
 
 impl Vfs {
@@ -449,6 +449,33 @@ const SNAPSHOT_MAGIC: &[u8; 4] = b"WTFS";
 const SNAPSHOT_VERSION: u32 = 1;
 
 impl Vfs {
+    /// Applies literal substitutions to every regular file's contents.
+    /// Used for secret injection (`${name}` -> value) and its inverse
+    /// (redaction before serialization).
+    pub fn rewrite_files(&mut self, subs: &[(String, String)]) {
+        if subs.is_empty() {
+            return;
+        }
+        for node in &mut self.nodes {
+            if let NodeKind::File(data) = &mut node.kind {
+                let Ok(text) = std::str::from_utf8(data) else {
+                    continue; // never touch binary files
+                };
+                let mut replaced = text.to_string();
+                let mut changed = false;
+                for (from, to) in subs {
+                    if replaced.contains(from.as_str()) {
+                        replaced = replaced.replace(from.as_str(), to);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    *data = replaced.into_bytes();
+                }
+            }
+        }
+    }
+
     /// Serializes the whole tree to a stable binary image (node indexes are
     /// preserved, so open guest state must not be carried across a
     /// restore — snapshots are taken between guest processes).

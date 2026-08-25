@@ -68,6 +68,7 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     let a3: u64 = cpu.read_var(env.regs.r10);
     let a4: u64 = cpu.read_var(env.regs.r8);
     let a5: u64 = cpu.read_var(env.regs.r9);
+    env.record_syscall(nr, cpu.icount());
 
     match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
         Outcome::Ret(result) => {

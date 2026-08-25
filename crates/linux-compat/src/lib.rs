@@ -97,6 +97,13 @@ pub struct LinuxEnv {
     pub(crate) output: Vec<u8>,
     /// Host network broker; None = network denied (the default).
     pub(crate) net: Option<net::BrokerRef>,
+    /// Secrets injected by the host: `name -> value`. `${name}` in guest
+    /// files is expanded to the value in memory, and redacted back to
+    /// `${name}` when the filesystem is serialized, so secrets never enter
+    /// a snapshot.
+    pub(crate) secrets: std::collections::BTreeMap<String, String>,
+    /// Recent syscall numbers (bounded ring) for crash diagnostics.
+    pub(crate) syscall_trail: std::collections::VecDeque<(u64, u64)>,
     /// Deterministic time-warp offset: advanced when the whole system is
     /// idle waiting on a timer, so timeouts fire without busy-waiting.
     pub(crate) warp_nanos: u64,
@@ -115,6 +122,8 @@ impl LinuxEnv {
             rng_state: 0x9e37_79b9_7f4a_7c15,
             output: Vec::new(),
             net: None,
+            secrets: std::collections::BTreeMap::new(),
+            syscall_trail: std::collections::VecDeque::with_capacity(64),
             warp_nanos: 0,
             exit_code: None,
         })
@@ -124,6 +133,35 @@ impl LinuxEnv {
     /// with `EAFNOSUPPORT` (network is denied by default).
     pub fn set_network(&mut self, broker: net::BrokerRef) {
         self.net = Some(broker);
+    }
+
+    /// Registers a secret. `${name}` in any guest file is expanded to
+    /// `value` in memory (see `expand_secrets`), and redacted back to the
+    /// placeholder in serialized snapshots, so the value never persists.
+    pub fn set_secret(&mut self, name: &str, value: &str) {
+        self.secrets.insert(name.to_string(), value.to_string());
+    }
+
+    /// Expands `${name}` placeholders in every regular file using the
+    /// registered secrets. Call after seeding files and before `load`.
+    pub fn expand_secrets(&mut self) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        let subs: Vec<(String, String)> = self
+            .secrets
+            .iter()
+            .map(|(name, value)| (format!("${{{name}}}"), value.clone()))
+            .collect();
+        self.vfs.rewrite_files(&subs);
+    }
+
+    /// The reverse map (`value -> ${name}`) used to redact snapshots.
+    pub(crate) fn secret_redactions(&self) -> Vec<(String, String)> {
+        self.secrets
+            .iter()
+            .map(|(name, value)| (value.clone(), format!("${{{name}}}")))
+            .collect()
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
@@ -148,6 +186,14 @@ impl LinuxEnv {
 
     pub(crate) fn record_exit(&mut self, code: i32) {
         self.exit_code = Some(code);
+    }
+
+    /// Records a syscall in the bounded diagnostic trail.
+    pub(crate) fn record_syscall(&mut self, nr: u64, icount: u64) {
+        if self.syscall_trail.len() >= 64 {
+            self.syscall_trail.pop_front();
+        }
+        self.syscall_trail.push_back((nr, icount));
     }
 
     pub(crate) fn now(&self, cpu: &Cpu) -> (i64, i64) {
@@ -184,7 +230,19 @@ impl LinuxEnv {
     /// prepares registers and the initial stack. Shared by `load` (initial
     /// process) and `execve`.
     pub(crate) fn start_image(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<(), String> {
-        cpu.mem.reset_virtual();
+        // `reset_virtual` drops the mapping but leaks the physical pages
+        // (the engine never frees them individually), so a long-lived
+        // machine running many processes would exhaust memory. When no
+        // other task is alive we can reclaim everything with `clear`
+        // (keeping only the shared zero page); with siblings parked, their
+        // maps still reference physical pages, so we must not clear — an
+        // execve inside a multi-process guest keeps the (bounded) leak.
+        let others_alive = !self.sched.parked.is_empty() || !self.sched.group_maps.is_empty();
+        if others_alive {
+            cpu.mem.reset_virtual();
+        } else {
+            cpu.mem.clear();
+        }
         cpu.reset();
 
         // Null page: faults with a permission error instead of unmapped.
@@ -503,10 +561,31 @@ impl Machine {
         self.env().set_network(broker);
     }
 
-    /// Serializes the guest filesystem (for reload persistence). Take
-    /// snapshots between guest processes, not while one is running.
+    /// Registers a secret injected into guest files at `expand_secrets`
+    /// time and redacted from snapshots. See [`LinuxEnv::set_secret`].
+    pub fn set_secret(&mut self, name: &str, value: &str) {
+        self.env().set_secret(name, value);
+    }
+
+    /// Expands `${name}` secret placeholders in guest files. Call after
+    /// seeding files and before `load`.
+    pub fn expand_secrets(&mut self) {
+        self.env().expand_secrets();
+    }
+
+    /// Serializes the guest filesystem (for reload persistence). Secret
+    /// values are redacted back to their `${name}` placeholders first, so
+    /// snapshots never carry injected credentials. Take snapshots between
+    /// guest processes, not while one is running.
     pub fn export_fs(&mut self) -> Vec<u8> {
-        self.env().vfs.serialize()
+        let redactions = self.env().secret_redactions();
+        if !redactions.is_empty() {
+            self.env().vfs.rewrite_files(&redactions);
+        }
+        let image = self.env().vfs.serialize();
+        // Restore the in-memory values so the running machine keeps working.
+        self.env().expand_secrets();
+        image
     }
 
     /// Replaces the guest filesystem with a serialized snapshot.
@@ -538,6 +617,68 @@ impl Machine {
 
     pub fn icount(&self) -> u64 {
         self.vm.cpu.icount()
+    }
+
+    /// Produces a crash bundle for a non-clean exit: a compact, secret-free
+    /// diagnostic (exit classification, faulting RIP, instruction count,
+    /// executable path, and the tail of the syscall trail). Returns None
+    /// when the machine exited cleanly.
+    pub fn crash_bundle(&mut self, exit: &CpuExit) -> Option<String> {
+        if matches!(exit, CpuExit::Halt { code: Some(0) }) {
+            return None;
+        }
+        let rip = self.vm.cpu.read_pc();
+        let icount = self.vm.cpu.icount();
+        let exe = {
+            let env = self.env();
+            String::from_utf8_lossy(&env.proc.exe_path).into_owned()
+        };
+        let trail: Vec<String> = self
+            .env()
+            .syscall_trail
+            .iter()
+            .map(|(nr, ic)| format!("{nr}@{ic}"))
+            .collect();
+        let mut bundle = String::new();
+        bundle.push_str(
+            "webtos-crash-bundle v1
+",
+        );
+        bundle.push_str(&format!(
+            "engine: x64-engine {}
+",
+            env!("CARGO_PKG_VERSION")
+        ));
+        bundle.push_str(&format!(
+            "exit: {exit:?}
+"
+        ));
+        bundle.push_str(&format!(
+            "rip: {rip:#x}
+"
+        ));
+        bundle.push_str(&format!(
+            "icount: {icount}
+"
+        ));
+        bundle.push_str(&format!(
+            "exe: {exe}
+"
+        ));
+        bundle.push_str(&format!(
+            "syscall_trail (most recent last): {}
+",
+            trail.join(" ")
+        ));
+        // Secrets are never in the trail or the fields above; nothing to
+        // redact, but assert the invariant if a value happens to appear.
+        for value in self.env().secrets.values() {
+            debug_assert!(
+                !bundle.contains(value.as_str()),
+                "secret leaked into crash bundle"
+            );
+        }
+        Some(bundle)
     }
 
     pub fn vm_mut(&mut self) -> &mut InterpVm {
