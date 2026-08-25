@@ -1,0 +1,9 @@
+# Override the kernel-wide cargo config (custom target + build-std=core/alloc)
+# for host-side crates. build-std cannot be disabled by a child config (the
+# parent list always merges), so build the full std from source instead.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = []

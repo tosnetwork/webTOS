@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "icicle-cpu",
+    "icicle-mem",
+    "sleigh/pcode",
+    "sleigh/sleigh-parse",
+    "sleigh/sleigh-compile",
+    "sleigh/sleigh-runtime",
+]
+
+[workspace.dependencies]
+anyhow = "1.0.82"
+target-lexicon = "0.13.3"
+tracing = { version = "0.1.40", default-features = false }
+object = { version = "0.38.1", default-features = false, features = ["write", "read_core", "elf"] }
+gimli = { version = "0.33.0", features = ["endian-reader"] }
+serde = { version = "1.0.197", features = ["derive"] }
+bytemuck = "1"
+pcode = { path = "./sleigh/pcode" }
+ahash = { version = "0.8.11", default-features = false, features = ["std", "compile-time-rng"] }
+sleigh-runtime = { path = "./sleigh/sleigh-runtime" }
+sleigh-compile = { path = "./sleigh/sleigh-compile" }
+
+[profile.release]
+debug = 1

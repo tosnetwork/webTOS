@@ -1,0 +1,22 @@
+[package]
+name = "icicle-cpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+icicle-mem = { path = "../icicle-mem" }
+anyhow = { workspace = true }
+ahash = { workspace = true }
+pcode = { workspace = true }
+sleigh-runtime = { workspace = true }
+target-lexicon = { workspace = true }
+tracing = { workspace = true }
+object = { workspace = true }
+gimli = { workspace = true }
+bytemuck = { workspace = true }
+addr2line = "0.26.0"
+bitflags = "2.5.0"
+half = "2.4.1"
+
+[dev-dependencies]
+quickcheck = { version = "1.0.3", default-features = false }
