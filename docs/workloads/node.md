@@ -79,22 +79,51 @@ AVX families — was carried far enough to know exactly what stops it:
 - With the upgraded spec, the decode diff is essentially perfect: glibc has
   **zero** gaps and Node drops from ~1% to ~0.005% (a handful of VEX
   crypto/XOP variants remain).
-- **But the upgraded spec regresses execution of milestone 1–6 workloads.**
-  An execution-differential harness (`exec_diff`, below) runs the same
-  static binary through the old and new specs in lockstep and reports the
-  first architectural-state divergence. It pins the regression precisely:
-  a short conditional jump (`75 f7`, `JNZ rel8`) computes a garbage target
-  under the new spec. The new spec wraps the jump target through an extra
-  `jccRel8: rel8 is rel8 { export rel8; }` sub-table; the icicle lifter
-  handles that nested `export` of an already-dereferenced `*[ram]` operand
-  differently from Ghidra's intent, so `goto` lands on a pointer-shaped
-  garbage value — which is exactly the "PageFault to a huge address"
-  symptom the milestone-1–6 tests showed.
+- **But the upgraded (upstream master) spec regresses execution.** The
+  upstream Ghidra x86 spec is not the fork icicle's helpers were written
+  against: icicle's fork carries several *helper-compatibility* patches that
+  upstream does not, and adopting master silently reverts every one of them.
+  An execution-differential harness (`exec_diff`, below) and a per-workload
+  trace pinned three so far, each a different failure once the earlier one
+  is patched:
 
-So the spec upgrade is gated on the icicle lifter's handling of nested
-`export` sub-tables, not on the AVX definitions themselves. That is a
-focused lifter fix, verifiable end to end with `exec_diff` (old spec as the
-reference), and is the concrete next step for AVX-512 support.
+  1. **Lifter nested export** (`JNZ rel8`, `75 f7`). Master wraps the jump
+     target as `jccRel8: rel8 is rel8 { export rel8; }`; the icicle lifter
+     dereferenced that nested `export` of an `*[ram]` operand, so `goto`
+     landed on pointer-shaped garbage — the "PageFault to a huge address"
+     symptom. **Fixed** in `resolve_export` (vendored lifter patch #7); the
+     `exec_diff` divergence at that instruction is gone.
+  2. **CPUID** (`0f a2`). icicle's helpers write four dwords directly into a
+     16-byte varnode; icicle's fork spec rewrote CPUID to `tmp:16 =
+     cpuid_*(EAX, ECX); EAX = tmp[0,32]; …`. Master reverted to upstream's
+     pointer form `tmpptr = cpuid(EAX); EAX = *tmpptr`, so the helper sees
+     `dst.size != 16`, bails, leaves `tmpptr = 0`, and glibc's
+     `init_cpu_features` reads null.
+  3. **XGETBV** (`0f 01 d0`). Master's form calls an `xinuse()` pcodeop that
+     icicle has no helper for; it returns 0, zeroing `XCR0`. icicle's fork
+     reads `XCR0` directly.
+
+  Porting patches 2 and 3 onto master lets glibc advance ~30× further
+  (icount 2,900 → 91,000) but it then selects `_dl_runtime_resolve_fxsave`
+  and executes `fxsave` (`0f ae /0`, no REX.W) — which *both* specs define
+  only for `LONGMODE_OFF`, so it traps in 64-bit mode. Under the fork spec
+  glibc instead selects the `xsave` resolver (defined for long mode) and
+  runs to exit 0, which means yet another feature-detection instruction
+  still diverges between the two specs. The list is open-ended.
+
+So Route 2 is not one focused lifter fix; it is re-porting an unbounded set
+of icicle's fork patches onto upstream master (and separately, master lacks
+the fork's EVEX-decode infrastructure, so the reverse graft — adding just
+`avx512.sinc` to the fork spec — fails to compile: `EVEX_NONE` / `vexMode=2`
+and the mask/Zmm/broadcast operands live only in master's `ia.sinc`). The
+lifter fix above is real and kept, but AVX-512 by spec upgrade is a large,
+open-ended effort.
+
+**Route 1 (advertise no AVX in CPUID) is the bounded alternative** and does
+not touch the spec at all: keep the working fork spec, and make the CPUID
+helper report an SSE2 baseline with no AVX/AVX-512/OSXSAVE bits so glibc
+ifunc, V8, and OpenSSL never dispatch into the unlifted vector families.
+This is the recommended next step for getting Node to run.
 
 ## Tools
 

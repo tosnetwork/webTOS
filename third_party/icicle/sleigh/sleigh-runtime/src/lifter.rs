@@ -480,7 +480,13 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
 
     fn resolve_export(&mut self, inner: Export) -> Result<Operand> {
         match inner {
-            Export::Value(value) => Ok(self.resolve_value(value)?.into()),
+            // Export the operand as-is: when `value` names a sub-table
+            // whose export is a RAM reference (e.g. `rel8` in
+            // `jccRel8: rel8 is rel8 { export rel8; }`), the reference must
+            // be forwarded, not dereferenced. `resolve_value` would emit a
+            // load and export the loaded bytes, turning a jump target into
+            // the value stored at that address.
+            Export::Value(value) => self.resolve_operand(value),
             Export::RamRef(ptr, size) => Ok(Operand::Pointer(self.resolve_value(ptr)?, 0, size)),
             Export::RegisterRef(offset, size) => match self.resolve_value(offset)? {
                 ResolvedValue::Var(_) => Err(Error::InvalidExport(self.subtable.constructor.id)),

@@ -43,6 +43,20 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    yet applied (it changes the execution semantics of existing instructions
    and needs an execution-differential pass first).
 
+7. `sleigh/sleigh-runtime/src/lifter.rs`: `resolve_export` forwards an
+   `Export::Value` sub-table operand as-is (`resolve_operand`) instead of
+   resolving it to a value (`resolve_value`). When a constructor exports a
+   sub-table whose own export is a RAM reference — e.g. a newer Ghidra x86
+   set wraps short conditional jumps as `jccRel8: rel8 is rel8 { export
+   rel8; }`, where `rel8` exports `*[ram]:8` — the nested export must
+   forward the reference. Resolving to a value emitted a load, so `goto`
+   landed on the *bytes stored at* the target rather than the target,
+   producing a pointer-shaped garbage jump (the "PageFault to a huge
+   address" symptom). Verified with `exec_diff`: the `JNZ rel8` divergence
+   between the old and a newer spec disappears. Only exercised by specs that
+   use the nested-export form; the vendored fork spec does not, so this is
+   inert until an AVX-512-capable spec is adopted.
+
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and
 `wasm32-unknown-unknown` targets.
