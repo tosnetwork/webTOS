@@ -1074,6 +1074,48 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
 }
 
 fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64) -> SysResult {
+    // General fd ioctls, valid on any descriptor. These must be handled
+    // before the tty gate: FIONBIO in particular is how a runtime sets a
+    // socket or pipe non-blocking, and returning ENOTTY there breaks it.
+    match request {
+        abi::FIONBIO => {
+            let val = i32::from_le_bytes(read_mem(cpu, arg, 4)?.try_into().expect("4 bytes"));
+            let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+            let mut desc = desc.borrow_mut();
+            if val != 0 {
+                desc.flags |= abi::O_NONBLOCK;
+            } else {
+                desc.flags &= !abi::O_NONBLOCK;
+            }
+            return Ok(0);
+        }
+        abi::FIOCLEX => {
+            env.proc.fds.borrow_mut().get_mut(fd)?.cloexec = true;
+            return Ok(0);
+        }
+        abi::FIONCLEX => {
+            env.proc.fds.borrow_mut().get_mut(fd)?.cloexec = false;
+            return Ok(0);
+        }
+        abi::FIONREAD => {
+            let fds = env.proc.fds.borrow();
+            let desc = fds.get(fd)?.desc.borrow();
+            let n: u32 = match &desc.backing {
+                Backing::Pipe {
+                    inner,
+                    write_end: false,
+                } => inner.borrow().data.len() as u32,
+                Backing::SocketPair { rx, .. } => rx.borrow().data.len() as u32,
+                _ => 0,
+            };
+            drop(desc);
+            drop(fds);
+            write_mem(cpu, arg, &n.to_le_bytes())?;
+            return Ok(0);
+        }
+        _ => {}
+    }
+
     let is_tty = matches!(
         env.proc.fds.borrow().get(fd)?.desc.borrow().backing,
         Backing::Std(StdStream::Out) | Backing::Std(StdStream::Err) | Backing::Dev(Dev::Tty)

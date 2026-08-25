@@ -183,6 +183,42 @@ int main(void) {
     );
 }
 
+/// `FIONBIO` is a general fd ioctl (set non-blocking), not tty-specific: it
+/// must succeed on a pipe/socket and actually flip `O_NONBLOCK`, not return
+/// `ENOTTY`. A real Codex binary sets it on an internal pipe and unwraps the
+/// result; returning ENOTTY there panicked it.
+#[test]
+fn fionbio_sets_nonblocking_on_a_pipe() {
+    let source = r#"
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+int main(void) {
+    int fds[2];
+    if (pipe(fds)) return 1;
+    int on = 1;
+    if (ioctl(fds[0], FIONBIO, &on) != 0) return 2;   /* must not ENOTTY */
+    if (!(fcntl(fds[0], F_GETFL) & O_NONBLOCK)) return 3;
+    int off = 0;
+    if (ioctl(fds[0], FIONBIO, &off) != 0) return 4;
+    if (fcntl(fds[0], F_GETFL) & O_NONBLOCK) return 5;
+    printf("fionbio ok\n");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("fionbio", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "fionbio");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("fionbio ok"),
+        "output: {:?}",
+        run.output
+    );
+}
+
 #[test]
 fn timerfd_fires_through_the_time_warp() {
     let source = r#"

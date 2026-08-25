@@ -225,6 +225,11 @@ pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TIOCSWINSZ: u64 = 0x5414;
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
+// General fd ioctls, valid on any descriptor (not tty-specific).
+pub const FIONREAD: u64 = 0x541B;
+pub const FIONBIO: u64 = 0x5421;
+pub const FIONCLEX: u64 = 0x5450;
+pub const FIOCLEX: u64 = 0x5451;
 
 // ── mmap(2) ─────────────────────────────────────────────────────────────────
 pub const PROT_READ: u64 = 0x1;
