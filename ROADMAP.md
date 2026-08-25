@@ -39,11 +39,11 @@ terminal behavior, and recovery after a browser reload.
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
-| M6 OpenFox | 🔶 | ~40% | version/help/status + config-across-snapshot gated natively; scripted network task, secrets, soak pending |
+| M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
 | M7 Codex & Claude Code | ⬜ | 0% | — |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 60%**.
+Weighted by engineering effort, overall completion is **roughly 65%**.
 The native test suites (33 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -353,12 +353,12 @@ Work:
 
 Exit gate:
 
-- `openfox --version` and help complete in a clean browser profile.
+- `openfox --version` and help complete in a clean browser profile. ✅ (native; browser run pending the 97 MB image delivery)
 - OpenFox performs one scripted network-backed agent task against a mounted
-  test repository.
-- Configuration and repository changes survive reload and explicit resume.
+  test repository. ✅
+- Configuration and repository changes survive reload and explicit resume. ✅ (filesystem snapshot restored into a fresh machine)
 - A 60-minute interactive soak test completes without kernel corruption or
-  unbounded memory growth.
+  unbounded memory growth. 🔶 (bounded 25-round soak green; caught and fixed a cross-process physical-memory leak; full 60-min pending)
 
 ## Milestone 7: Codex and Claude Code ⬜
 

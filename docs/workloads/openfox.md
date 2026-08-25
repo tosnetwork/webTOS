@@ -1,6 +1,8 @@
 # Workload profile: OpenFox
 
-**Status: version, help, and configuration-persistence gates pass natively.**
+**Status: all milestone-6 workload gates pass natively — version, help,
+configuration persistence, the scripted network agent task, secret
+injection, crash bundles, and a compressed soak.**
 
 OpenFox is the first real agent workload (roadmap milestone 6): a static Go
 binary (~97 MB with embedded assets) exercising the whole Go runtime on the
@@ -45,12 +47,37 @@ Static + pure-Go olm means the guest needs no shared libraries.
   after seeding `~/.openfox/config.json` + workspace, a filesystem
   snapshot restored into a brand-new machine still shows both present —
   the reload-persistence semantics of the milestone gate.
+- **Scripted agent task**: a test-owned OpenAI-compatible mock behind the
+  broker scripts a two-turn exchange — the model requests the `read_file`
+  tool, OpenFox actually reads `NOTES.md` from the mounted workspace, the
+  file content travels back over the network as the tool result, and the
+  final answer reaches the terminal. Asserted on both sides (guest output
+  and the mock's recorded request bodies). The mock answers plain JSON or
+  SSE depending on the request's `stream` flag.
 
 Each invocation retires ~60 M instructions (a few seconds native).
 
+## Secrets, crash bundles, and the soak
+
+- **Secret injection**: `Machine::set_secret` registers a value; `${name}`
+  placeholders in guest files expand to it in memory (`expand_secrets`),
+  and `export_fs` redacts the value back to `${name}` before serializing,
+  so a filesystem snapshot never carries the key. The scripted-task gate
+  asserts the snapshot holds the placeholder (not the key) while the key
+  still reaches the model endpoint's Authorization header.
+- **Crash bundles**: `Machine::crash_bundle` produces a compact,
+  secret-free diagnostic for any non-clean exit — exit classification,
+  faulting RIP, instruction count, executable path, and the tail of a
+  bounded syscall trail. A clean exit produces none.
+- **Soak**: `openfox_soak_is_bounded` (run with `--ignored`) executes 25
+  OpenFox commands on one machine and asserts the filesystem does not grow
+  without bound between rounds. This caught a real cross-process physical
+  memory leak: `reset_virtual` dropped the mapping but never reclaimed
+  physical pages, so a long-lived machine exhausted memory; `start_image`
+  now fully clears physical memory when no other task is alive.
+
 ## Not yet covered
 
-- The scripted network-backed agent task (needs an LLM endpoint mock
-  behind the broker), secret injection, crash bundles, the 60-minute
-  soak, and browser delivery of the 97 MB image (interpreter throughput
-  makes this a post-M8 concern).
+- Browser delivery of the 97 MB image (interpreter throughput makes this a
+  post-M8 concern) and the full 60-minute interactive soak (the bounded
+  25-round soak is the CI-friendly proxy).
