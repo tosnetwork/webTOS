@@ -13,6 +13,7 @@
 //! full webTOS `linux_compat` layer replaces it in later milestones.
 
 pub mod build;
+pub mod decode;
 pub mod linux_min;
 pub mod vm;
 
