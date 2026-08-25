@@ -1481,6 +1481,7 @@ use crate::proc::{ParkState, ParkedTask, Process, Zombie, ROOT_PID};
 const SYSCALL_INSN_LEN: u64 = 2;
 
 const CLONE_VM: u64 = 0x100;
+const CLONE_VFORK: u64 = 0x4000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
@@ -1672,7 +1673,13 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 
 fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome {
     let child_pid = env.sched.next_pid();
-    let is_thread = spec.flags & CLONE_VM != 0;
+    // A vfork clone (`CLONE_VM | CLONE_VFORK`, e.g. glibc posix_spawn) sets
+    // CLONE_VM but is not a thread: it is a child process that runs to execve
+    // or exit. Give it a copy-on-write address space (like fork) rather than
+    // sharing the group map — the child only sets up fds and execs, which
+    // replaces its memory, so the copy is never mutated concurrently with the
+    // parent, and it remains a waitable child rather than a thread sibling.
+    let is_thread = spec.flags & CLONE_VM != 0 && spec.flags & CLONE_VFORK == 0;
 
     if spec.flags & CLONE_PARENT_SETTID != 0
         && spec.parent_tid != 0

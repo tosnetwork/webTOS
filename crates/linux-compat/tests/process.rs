@@ -220,6 +220,58 @@ fn shell_spawns_external_commands() {
     assert_eq!(run.output, "external-command-works\n");
 }
 
+/// `posix_spawn` uses `clone(CLONE_VM | CLONE_VFORK | SIGCHLD)`. That child
+/// shares the parent's address space and must run to `execve` (or exit)
+/// before the parent proceeds. Misclassifying it as a thread ran both
+/// concurrently on the shared stack and corrupted the child (observed with a
+/// real Codex binary: a `PageFault` on a garbage pointer right after such a
+/// clone). Treating a vfork clone as a copy-on-write fork isolates them.
+#[test]
+fn posix_spawn_runs_a_child_to_completion() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let source = r#"
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/wait.h>
+extern char **environ;
+int main(void) {
+    pid_t pid;
+    char *argv[] = { "/bin/echo", "spawned-child-ran", 0 };
+    int rc = posix_spawn(&pid, "/bin/echo", 0, 0, argv, environ);
+    if (rc != 0) { printf("spawn failed rc=%d\n", rc); return 1; }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) { printf("wait failed\n"); return 2; }
+    printf("parent-status=%d\n", WEXITSTATUS(status));
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("spawner", source, &[]) else {
+        return;
+    };
+    machine
+        .add_file(b"/bin/spawner", image, 0o755)
+        .expect("add spawner");
+    machine.set_args(
+        vec![b"spawner".to_vec()],
+        vec![b"PATH=/bin:/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine.load(b"/bin/spawner").expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "spawner did not exit cleanly; output: {output:?}"
+    );
+    assert!(
+        output.contains("spawned-child-ran") && output.contains("parent-status=0"),
+        "posix_spawn child did not run to completion; output: {output:?}"
+    );
+}
+
 #[test]
 fn shell_pipelines_flow_between_processes() {
     let Some(mut machine) = alpine_machine() else {
