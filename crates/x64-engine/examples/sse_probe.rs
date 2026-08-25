@@ -398,6 +398,66 @@ fn main() {
             reference: |a, _b| unsafe { store(_mm_srai_epi16::<3>(load(a))) },
         },
         Case {
+            name: "divpd xmm0,xmm1 (66 0f 5e c1)",
+            code: &[0x66, 0x0f, 0x5e, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_div_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            },
+        },
+        Case {
+            name: "divps xmm0,xmm1 (0f 5e c1)",
+            code: &[0x0f, 0x5e, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castps_si128(_mm_div_ps(
+                    _mm_castsi128_ps(load(a)),
+                    _mm_castsi128_ps(load(b)),
+                )))
+            },
+        },
+        Case {
+            name: "maxpd xmm0,xmm1 (66 0f 5f c1)",
+            code: &[0x66, 0x0f, 0x5f, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_max_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            },
+        },
+        Case {
+            name: "minpd xmm0,xmm1 (66 0f 5d c1)",
+            code: &[0x66, 0x0f, 0x5d, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_min_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            },
+        },
+        Case {
+            name: "sqrtpd xmm0,xmm1 (66 0f 51 c1)",
+            code: &[0x66, 0x0f, 0x51, 0xc1],
+            xmm_out: true,
+            reference: |_a, b| unsafe {
+                store(_mm_castpd_si128(_mm_sqrt_pd(_mm_castsi128_pd(load(b)))))
+            },
+        },
+        Case {
+            name: "sqrtps xmm0,xmm1 (0f 51 c1)",
+            code: &[0x0f, 0x51, 0xc1],
+            xmm_out: true,
+            reference: |_a, b| unsafe {
+                store(_mm_castps_si128(_mm_sqrt_ps(_mm_castsi128_ps(load(b)))))
+            },
+        },
+        Case {
             name: "aesenc xmm0,xmm1 (66 0f 38 dc c1)",
             code: &[0x66, 0x0f, 0x38, 0xdc, 0xc1],
             xmm_out: true,

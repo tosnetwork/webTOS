@@ -287,6 +287,14 @@ pub mod x86 {
         ("pabsd", pabsd),
         ("psllw", psllw),
         ("psraw", psraw),
+        ("divpd", divpd),
+        ("divps", divps),
+        ("maxpd", maxpd),
+        ("maxps", maxps),
+        ("minpd", minpd),
+        ("minps", minps),
+        ("sqrtpd", sqrtpd),
+        ("sqrtps", sqrtps),
         // AES-NI (SSE form). Node/V8 and OpenSSL issue these unconditionally.
         ("aesenc", aesenc),
         ("aesenclast", aesenclast),
@@ -772,6 +780,61 @@ pub mod x86 {
             out[4 * i..4 * i + 4].copy_from_slice(&d.to_le_bytes());
         }
         cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    // --- Packed floating-point SIMD ops (whole-register pcodeops) ---------
+    // SSE max/min return the second operand on unordered/equal, matching
+    // `(a OP b) ? a : b`.
+
+    fn f64x2_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f64, f64) -> f64) {
+        let a = xmm_bytes(cpu, args[0]);
+        let b = xmm_bytes(cpu, args[1]);
+        let mut out = [0u8; 16];
+        for i in 0..2 {
+            let x = f64::from_bits(u64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap()));
+            let y = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
+            out[8 * i..8 * i + 8].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn f32x4_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f32, f32) -> f32) {
+        let a = xmm_bytes(cpu, args[0]);
+        let b = xmm_bytes(cpu, args[1]);
+        let mut out = [0u8; 16];
+        for i in 0..4 {
+            let x = f32::from_bits(u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap()));
+            let y = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
+            out[4 * i..4 * i + 4].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn divpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f64x2_binop(cpu, dst, args, |x, y| x / y);
+    }
+    fn divps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f32x4_binop(cpu, dst, args, |x, y| x / y);
+    }
+    fn maxpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f64x2_binop(cpu, dst, args, |x, y| if x > y { x } else { y });
+    }
+    fn maxps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f32x4_binop(cpu, dst, args, |x, y| if x > y { x } else { y });
+    }
+    fn minpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f64x2_binop(cpu, dst, args, |x, y| if x < y { x } else { y });
+    }
+    fn minps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f32x4_binop(cpu, dst, args, |x, y| if x < y { x } else { y });
+    }
+
+    // sqrt takes its source in the second operand (like pabs).
+    fn sqrtpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f64x2_binop(cpu, dst, [args[1], args[1]], |x, _| x.sqrt());
+    }
+    fn sqrtps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f32x4_binop(cpu, dst, [args[1], args[1]], |x, _| x.sqrt());
     }
 
     fn psadbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
