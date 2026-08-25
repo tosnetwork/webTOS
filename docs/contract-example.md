@@ -1,6 +1,15 @@
-# TOS Smart Contract Example
+# webTOS Smart Contract Example
 
-This document walks through a complete example of writing, building, deploying, and calling a smart contract on TOS. It is **not** a specification or recommendation — it is one possible approach using the existing TOS infrastructure.
+**Status: conceptual example.**
+
+This document walks through one possible flow for writing, packaging,
+deploying, and calling a smart contract on webTOS. It explains the existing
+kernel interfaces, but the code below is not a copy-and-run SDK tutorial: the
+host-call functions are placeholders until the SDK exposes stable wrappers.
+
+The `.tos` package suffix and the `tos` Wasm import namespace are kernel ABI
+names. They remain unchanged while the product and browser runtime use the
+webTOS name.
 
 ## Example: A Token Contract
 
@@ -10,21 +19,21 @@ This document walks through a complete example of writing, building, deploying, 
 // src/lib.rs
 // Compile: cargo build --target wasm32-unknown-unknown --release
 
-/// Read a u64 from the TOS keyspace.
+/// Read a u64 from the webTOS keyspace.
 fn state_get(key: u64) -> u64 {
     let mut buf = [0u8; 8];
     unsafe {
-        // TOS host call: sys_state_get(key, buf_ptr, buf_len)
+        // webTOS host call: sys_state_get(key, buf_ptr, buf_len)
         core::arch::wasm32::unreachable(); // placeholder — real SDK provides this
     }
     u64::from_le_bytes(buf)
 }
 
-/// Write a u64 to the TOS keyspace.
+/// Write a u64 to the webTOS keyspace.
 fn state_put(key: u64, value: u64) {
     let bytes = value.to_le_bytes();
     unsafe {
-        // TOS host call: sys_state_put(key, buf_ptr, buf_len)
+        // webTOS host call: sys_state_put(key, buf_ptr, buf_len)
         core::arch::wasm32::unreachable(); // placeholder
     }
 }
@@ -41,7 +50,7 @@ fn state_put(key: u64, value: u64) {
 /// The WASM export name "transfer" maps to selector SHA-256("transfer")[:4].
 #[no_mangle]
 pub extern "C" fn transfer(input_len: i32) -> i32 {
-    // Input is pre-written to linear memory at offset 0 by the TOS runtime.
+    // Input is pre-written to linear memory at offset 0 by the webTOS runtime.
     let mem = unsafe { core::slice::from_raw_parts(0 as *const u8, input_len as usize) };
 
     let caller_key = u64::from_le_bytes(mem[0..8].try_into().unwrap());
@@ -97,9 +106,8 @@ pub extern "C" fn balance_of(input_len: i32) -> i32 {
 # Compile to WASM
 cargo build --target wasm32-unknown-unknown --release
 
-# Package as .tos file
-atp build --input target/wasm32-unknown-unknown/release/token.wasm \
-          --name token --version 1.0.0
+# Package as a .tos file using the current CLI
+atp build target/wasm32-unknown-unknown/release/token.wasm -o token.tos
 
 # Sign with Ed25519
 atp sign token.tos
@@ -107,7 +115,10 @@ atp sign token.tos
 
 ### 3. Deploy
 
-Send a TCP request to the TOS VM:
+Submit a deployment request through the webTOS host interface. The native
+reference build currently transports this request over TCP; the browser host
+will expose the same logical request without making TCP part of the contract
+ABI.
 
 ```
 Request {
@@ -120,7 +131,7 @@ Request {
 }
 ```
 
-TOS returns:
+webTOS returns:
 
 ```
 Response {
@@ -142,7 +153,7 @@ The `contract_id` (SHA-256 of the code) is used for all subsequent calls.
 Request {
     request_type: Call (2),
     contract_id: <from deploy response>,
-    entry_point: "transfer",           // TOS computes selector = SHA-256("transfer")[:4]
+    entry_point: "transfer",           // webTOS computes SHA-256("transfer")[:4]
     input: [
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // caller key = 1
         0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // recipient key = 2
@@ -153,7 +164,7 @@ Request {
 }
 ```
 
-TOS returns:
+webTOS returns:
 
 ```
 Response {
@@ -188,7 +199,8 @@ Response {
 
 ### 5. Verify
 
-Any node can verify the execution without re-running it:
+A verifier can retrieve the signed execution receipt and the associated state
+proof without trusting the executor:
 
 ```
 Request { request_type: GetReceipt (5), input: [receipt_index...] }
@@ -198,10 +210,12 @@ Request { request_type: GetProof (6), input: [proof_index...] }
 → ProofBundle with Merkle sibling hashes
 ```
 
-Verification steps (all O(1)):
+Verification steps:
+
 1. Check Ed25519 signature over receipt hash.
 2. Recompute receipt hash from fields, compare with `receipt_id`.
-3. Optionally verify Merkle inclusion proof for a specific state key.
+3. Optionally verify the Merkle path for a specific state key. This step is
+   proportional to the tree depth, rather than constant time.
 
 ### 6. Inter-Contract Call
 
@@ -218,7 +232,8 @@ The energy for Contract B's execution is deducted from Contract A's budget (call
 
 ### 7. Optional: Manifest File
 
-A `manifest.toml` can document the contract interface for client tooling. It is not required by TOS — it is a convenience for developers.
+A `manifest.toml` can document the contract interface for client tooling. It
+is not currently required by the webTOS kernel; it is a developer convenience.
 
 ```toml
 [contract]
@@ -267,7 +282,7 @@ The same logic can be written as a Linux C program instead of WASM:
 ```c
 // token.c — compile with: gcc -nostdlib -static -o token token.c
 void _start() {
-    // Read input from keyspace key 0xFFFF (pre-loaded by TOS)
+    // Read input from keyspace key 0xFFFF (pre-loaded by webTOS)
     // Parse function selector from first 4 bytes
     // Dispatch to transfer() or balance_of()
     // Write output to keyspace
@@ -275,7 +290,11 @@ void _start() {
 }
 ```
 
-This runs under the Linux compatibility layer (`RuntimeKind::LinuxCompat`) with 104 deterministic syscalls. Energy metering is at the tick level (not per-instruction like WASM), so the `runtime_class` in the receipt is `ReplayGradeNative` instead of `ProofGradeWasm`.
+In the native reference environment this runs under the Linux compatibility
+layer (`RuntimeKind::LinuxCompat`). Bringing this path to the browser also
+requires the x86-64 Web execution engine. Energy metering is at the tick level,
+not per instruction as it is for Wasm, so the receipt uses
+`ReplayGradeNative` instead of `ProofGradeWasm`.
 
 | Approach | Determinism | Energy Precision | Language Support |
 |----------|-------------|-----------------|-----------------|
