@@ -7,7 +7,7 @@ description = "TOS Stage-1: AI-native minimal operating system kernel"
 
 [dependencies]
 libm = "0.2"
-wasbi = { git = "https://github.com/tosnetwork/wasbi.git", branch = "main", features = ["spec-test-internals"] }
+wasbi = { path = "third_party/wasbi", features = ["spec-test-internals"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
 rand_core = { version = "0.6", default-features = false }
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
