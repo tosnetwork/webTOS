@@ -35,15 +35,15 @@ terminal behavior, and recovery after a browser reload.
 |-----------|-------|------------|----------|
 | M0 Lock the baseline | 🔶 | ~50% | fixtures exist ad hoc; no trace format or dashboards |
 | M1 Static `hello` | ✅ | ~90% | native + wasm gates green; three-browser matrix pending |
-| M2 Static BusyBox | ✅ | ~85% | applet gates green; browser-reload persistence pending |
+| M2 Static BusyBox | ✅ | ~95% | applet gates green incl. reload persistence (FS snapshots + OPFS) |
 | M3 Dynamic userland | ✅ | ~95% | musl and glibc loaders green, native + wasm |
 | M4 Threads & processes | ✅ | ~85% | single-worker model green incl. determinism; multi-worker deferred |
-| M5 Event loop & networking | 🔶 | ~70% | HTTP/DNS/epoll/denied-by-default green; HTTPS, recording, reconnect pending |
+| M5 Event loop & networking | 🔶 | ~80% | HTTP/HTTPS (guest TLS)/DNS/epoll/denied-by-default green; recording, reconnect pending |
 | M6 OpenFox | ⬜ | 0% | — |
 | M7 Codex & Claude Code | ⬜ | 0% | — |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 50–55%**.
+Weighted by engineering effort, overall completion is **roughly 55%**.
 The native test suites (28 native cases plus the wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -256,7 +256,7 @@ Work:
 - Port `brk`, anonymous `mmap`, `mprotect`, `munmap`, `read`, `write`,
   `openat`, `close`, `stat`, `getdents`, `ioctl`, and related fd behavior. ✅
 - Implement browser-backed files, directories, permissions, and standard
-  streams. 🔶 (in-memory VFS injected from the host; no OPFS persistence yet)
+  streams. ✅ (in-memory VFS; snapshots persist to OPFS)
 - Provide `argv`, environment, current directory, and a minimal `/proc` and
   `/dev` view. ✅ (`/proc/self/exe`; fuller /proc pending)
 - Support BusyBox applets first, then shell pipelines and redirection. ✅
@@ -264,7 +264,7 @@ Work:
 Exit gate:
 
 - `echo`, `cat`, `ls`, `mkdir`, `cp`, `mv`, `rm`, and `sh` smoke tests pass. ✅
-- Files persist across browser reload. ⬜ (persist across guest processes; browser-reload persistence needs OPFS)
+- Files persist across browser reload. ✅ (filesystem snapshots restore across module instances; OPFS-wired in the demo)
 - Shell pipelines and exit codes behave consistently with the native fixture. ✅
 
 ## Milestone 3: Dynamic Linux Userland ✅
@@ -323,13 +323,13 @@ Work:
   against browser-host readiness events. ✅ (against the broker readiness interface)
 - Implement DNS and socket mediation through an explicit network broker. ✅
 - Support authenticated HTTPS from guest userland without exposing browser
-  credentials to unrelated agents. ⬜ (guest TLS untested; credential design pending)
+  credentials to unrelated agents. 🔶 (guest TLS with full certificate-chain, SAN, and validity verification against a guest-installed trust anchor; credential injection pending)
 - Record network inputs for replay and receipt classification. ⬜
 - Define offline, denied, timeout, reconnect, and proxy-failure behavior. 🔶 (denied and timeout defined; reconnect and proxy pending)
 
 Exit gate:
 
-- HTTP, HTTPS, DNS, pipe, and epoll fixture suites pass. 🔶 (HTTP, DNS, pipe, epoll green; HTTPS pending)
+- HTTP, HTTPS, DNS, pipe, and epoll fixture suites pass. ✅
 - A long-running event loop survives transient network failure and browser
   tab suspension. ⬜
 - Network access is denied by default without the appropriate capability. ✅
