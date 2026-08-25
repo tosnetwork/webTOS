@@ -388,3 +388,134 @@ fn network_is_denied_without_a_broker() {
         "no data must flow without a broker"
     );
 }
+
+/// Spawns `openssl s_server -WWW` with a fresh self-signed certificate,
+/// serving files from a temp directory. Returns (address, child guard).
+fn spawn_tls_server() -> Option<(SocketAddrV4, KillOnDrop)> {
+    let dir = std::env::temp_dir().join("webtos-m5-tls");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::write(dir.join("hello.txt"), "hello-from-webtos-tls\n").ok()?;
+
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    if !cert.exists() || !key.exists() {
+        let status = Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                "-addext", "subjectAltName=IP:10.0.0.2",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args(["-subj", "/CN=10.0.0.2"])
+            .status();
+        match status {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!("skipping: openssl unavailable for certificate generation");
+                return None;
+            }
+        }
+    }
+
+    // Grab a free port; a small race with s_server binding it is acceptable
+    // in a test.
+    let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .ok()?
+        .local_addr()
+        .ok()?
+        .port();
+    let child = Command::new("openssl")
+        .args(["s_server", "-quiet", "-naccept", "8", "-WWW"])
+        .args(["-accept", &format!("127.0.0.1:{port}")])
+        .arg("-cert")
+        .arg(&cert)
+        .arg("-key")
+        .arg(&key)
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(_) => {
+            eprintln!("skipping: openssl s_server unavailable");
+            return None;
+        }
+    };
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+
+    // Wait until the server accepts connections.
+    for _ in 0..100 {
+        if std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::V4(addr),
+            std::time::Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            return Some((addr, KillOnDrop(child)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("skipping: openssl s_server did not come up");
+    None
+}
+
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn wget_fetches_https_through_guest_tls() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let Some((server, _guard)) = spawn_tls_server() else {
+        return;
+    };
+
+    // wget spawns the ssl_client applet (dynamic musl + OpenSSL 3 from the
+    // rootfs), which performs the TLS handshake inside the guest over the
+    // broker's TCP stream — the host never sees plaintext HTTP. The test
+    // certificate is installed as the guest's trust anchor so the chain is
+    // actually verified (no --no-check-certificate).
+    let cert = std::fs::read(std::env::temp_dir().join("webtos-m5-tls/cert.pem"))
+        .expect("test certificate");
+    // Install the anchor both as the default CA file and in the hashed
+    // certificate directory (the two default OpenSSL lookup paths).
+    let hash = Command::new("openssl")
+        .args(["x509", "-noout", "-subject_hash", "-in"])
+        .arg(std::env::temp_dir().join("webtos-m5-tls/cert.pem"))
+        .output()
+        .expect("openssl x509");
+    let hash = String::from_utf8_lossy(&hash.stdout).trim().to_string();
+    machine
+        .add_file(b"/etc/ssl/cert.pem", cert.clone(), 0o644)
+        .expect("install trust anchor");
+    machine
+        .add_file(format!("/etc/ssl/certs/{hash}.0").as_bytes(), cert, 0o644)
+        .expect("install hashed trust anchor");
+
+    let mut broker = NativeBroker::new();
+    broker.redirect(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 443), server);
+    broker.restrict_to_redirects();
+    machine.set_network(Rc::new(RefCell::new(broker)));
+
+    let run = run_argv(
+        &mut machine,
+        "/usr/bin/wget",
+        &["wget", "-q", "-O", "-", "https://10.0.0.2/hello.txt"],
+    );
+    expect_clean(&run);
+    assert_eq!(
+        run.output, "hello-from-webtos-tls\n",
+        "wget https output: {:?}",
+        run.output
+    );
+}

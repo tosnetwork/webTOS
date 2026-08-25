@@ -158,7 +158,10 @@ impl NetworkBroker for NativeBroker {
         let stream = self.tcp.get_mut(&handle).ok_or(abi::EBADF)?;
         loop {
             match stream.write(bytes) {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    tracing::debug!("broker: tcp[{handle}] sent {n} bytes");
+                    return Ok(n);
+                }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     // Sends are small; wait for the kernel buffer briefly.
                     std::thread::sleep(Duration::from_millis(1));
@@ -172,8 +175,12 @@ impl NetworkBroker for NativeBroker {
         let stream = self.tcp.get_mut(&handle).ok_or(abi::EBADF)?;
         let mut buf = vec![0_u8; max.min(0x10_0000)];
         match stream.read(&mut buf) {
-            Ok(0) => Ok(RecvOutcome::Closed),
+            Ok(0) => {
+                tracing::debug!("broker: tcp[{handle}] peer closed");
+                Ok(RecvOutcome::Closed)
+            }
             Ok(n) => {
+                tracing::debug!("broker: tcp[{handle}] recv {n} bytes (asked {max})");
                 buf.truncate(n);
                 Ok(RecvOutcome::Data(buf))
             }

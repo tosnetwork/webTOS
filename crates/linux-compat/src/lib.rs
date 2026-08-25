@@ -43,8 +43,9 @@ pub(crate) const MMAP_BASE: u64 = 0x6000_0000_0000;
 /// A pipe write blocks once this much data is buffered.
 pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
 
-/// Deterministic wall-clock base (fixed, not host time).
-const EPOCH_BASE_SEC: i64 = 1_755_000_000;
+/// Deterministic wall-clock base (fixed, not host time; bump this constant
+/// occasionally so certificate validity windows stay plausible).
+const EPOCH_BASE_SEC: i64 = 1_790_000_000; // 2026-09-21
 
 pub(crate) struct Regs {
     pub rax: pcode::VarNode,
@@ -496,6 +497,18 @@ impl Machine {
     /// Attaches a host network broker (network is denied without one).
     pub fn set_network(&mut self, broker: net::BrokerRef) {
         self.env().set_network(broker);
+    }
+
+    /// Serializes the guest filesystem (for reload persistence). Take
+    /// snapshots between guest processes, not while one is running.
+    pub fn export_fs(&mut self) -> Vec<u8> {
+        self.env().vfs.serialize()
+    }
+
+    /// Replaces the guest filesystem with a serialized snapshot.
+    pub fn import_fs(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.env().vfs = vfs::Vfs::deserialize(bytes)?;
+        Ok(())
     }
 
     /// Loads a Linux ELF from the guest filesystem as a fresh root process.

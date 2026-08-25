@@ -132,6 +132,8 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
+        abi::SYS_POLL => outcome_poll(env, cpu, a[0], a[1], a[2], false),
+        abi::SYS_PPOLL => outcome_poll(env, cpu, a[0], a[1], a[2], true),
         abi::SYS_SENDTO => sys_sendto(env, cpu, a),
         abi::SYS_RECVFROM => sys_recvfrom(env, cpu, a),
         abi::SYS_EPOLL_WAIT | abi::SYS_EPOLL_PWAIT => sys_epoll_wait(env, cpu, a),
@@ -187,7 +189,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_FCHMODAT => sys_chmodat(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FCHMOD => sys_fchmod(env, a[0], a[1]),
         abi::SYS_CHOWN | abi::SYS_FCHOWNAT => Ok(0), // single-user: uid/gid stay 0
-        abi::SYS_UTIMENSAT => Ok(0),
+        abi::SYS_UTIMENSAT => sys_utimensat(env, cpu, a),
         abi::SYS_UMASK => {
             let old = env.proc.umask;
             env.proc.umask = (a[0] as u32) & 0o777;
@@ -258,9 +260,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_MADVISE => Ok(0),
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
-        abi::SYS_POLL => sys_poll(env, cpu, a[0], a[1]),
-        abi::SYS_PPOLL => sys_poll(env, cpu, a[0], a[1]),
-
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
         abi::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(env, cpu, a[0], a[1], a[2]),
         // Registration-only, like rt_sigaction: signals are never delivered
@@ -306,7 +305,20 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             Ok(sec as u64)
         }
-        abi::SYS_NANOSLEEP | abi::SYS_CLOCK_NANOSLEEP => Ok(0),
+        abi::SYS_NANOSLEEP => sys_nanosleep(env, cpu, a[0]),
+        abi::SYS_CLOCK_NANOSLEEP => {
+            const TIMER_ABSTIME: u64 = 1;
+            if a[1] & TIMER_ABSTIME != 0 {
+                let target = read_timespec_at(cpu, a[2])?;
+                let now = env.now_nanos(cpu);
+                if target > now {
+                    env.warp_nanos += target - now;
+                }
+                Ok(0)
+            } else {
+                sys_nanosleep(env, cpu, a[2])
+            }
+        }
 
         abi::SYS_GETPID | abi::SYS_GETPGRP | abi::SYS_GETPGID => Ok(env.proc.tgid),
         abi::SYS_GETTID => Ok(env.proc.pid),
@@ -1566,37 +1578,60 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
         child_proc.clear_child_tid = spec.child_tid;
     }
 
-    // Parent: resumes after the syscall with the child pid in RAX.
-    cpu.write_var(env.regs.rax, child_pid);
-    prepare_resume(env, cpu, false);
-
     // Child memory: threads share the map; forks get a copy-on-write clone.
-    let child_mem = if is_thread {
+    let mut child_mem = if is_thread {
         cpu.mem.mapping.clone()
     } else {
         cpu.mem.snapshot_virtual_mapping()
     };
 
-    park_current(env, cpu, ParkState::Ready);
-
-    // Continue as the child.
-    cpu.mem.restore_virtual_mapping(child_mem);
-    env.proc = child_proc;
+    // Build the child's parked CPU state: RAX = 0, resuming after the
+    // syscall, with its own stack/TLS when requested.
+    let parent_rax: u64 = cpu.read_var(env.regs.rax);
+    let parent_sp: u64 = cpu.read_var(env.regs.rsp);
+    let parent_fs: u64 = cpu.read_var(env.regs.fs_offset);
+    cpu.write_var(env.regs.rax, 0_u64);
     if spec.new_sp != 0 {
         cpu.write_var(env.regs.rsp, spec.new_sp);
     }
     if spec.flags & CLONE_SETTLS != 0 {
         cpu.write_var(env.regs.fs_offset, spec.tls);
     }
+    prepare_resume(env, cpu, false);
+    let child_cpu = cpu.snapshot();
+    cpu.write_var(env.regs.rax, parent_rax);
+    cpu.write_var(env.regs.rsp, parent_sp);
+    cpu.write_var(env.regs.fs_offset, parent_fs);
+
     if spec.flags & CLONE_CHILD_SETTID != 0 && spec.child_tid != 0 {
-        let _ = write_mem(cpu, spec.child_tid, &(child_pid as u32).to_le_bytes());
+        let tid_bytes = (child_pid as u32).to_le_bytes();
+        if is_thread {
+            // Shared address space: write directly.
+            let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+        } else {
+            // Write into the child's copy-on-write map.
+            let parent_map = cpu.mem.take_virtual_mapping();
+            cpu.mem.restore_virtual_mapping(child_mem);
+            let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+            child_mem = cpu.mem.take_virtual_mapping();
+            cpu.mem.restore_virtual_mapping(parent_map);
+        }
     }
+
+    // Linux-like ordering: the parent keeps running; the child is parked
+    // ready. (With copy-on-write memory this is safe for vfork too.)
+    env.sched.parked.push(ParkedTask {
+        proc: child_proc,
+        cpu: child_cpu,
+        mem: child_mem,
+        state: ParkState::Ready,
+    });
     tracing::debug!(
         "spawned {} {child_pid} from {}",
         if is_thread { "thread" } else { "process" },
-        env.proc.ppid,
+        env.proc.tgid,
     );
-    Outcome::Ret(Ok(0))
+    Outcome::Ret(Ok(child_pid))
 }
 
 /// Reads a NUL-terminated array of string pointers (argv/envp layout).
@@ -1854,18 +1889,19 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             let expirations = {
                 let mut inner = timer.borrow_mut();
                 match inner.next_expiry {
-                    Some(expiry) if now >= expiry => match (now - expiry).checked_div(inner.interval)
-                    {
-                        Some(periods) => {
-                            let n = 1 + periods;
-                            inner.next_expiry = Some(expiry + n * inner.interval);
-                            n
+                    Some(expiry) if now >= expiry => {
+                        match (now - expiry).checked_div(inner.interval) {
+                            Some(periods) => {
+                                let n = 1 + periods;
+                                inner.next_expiry = Some(expiry + n * inner.interval);
+                                n
+                            }
+                            None => {
+                                inner.next_expiry = None;
+                                1
+                            }
                         }
-                        None => {
-                            inner.next_expiry = None;
-                            1
-                        }
-                    },
+                    }
                     _ => {
                         drop(inner);
                         return would_block(env, cpu, Watch::Timer(timer));
@@ -2876,4 +2912,136 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         in_desc.borrow_mut().offset = offset + written as u64;
     }
     Outcome::Ret(Ok(written as u64))
+}
+
+/// Blocking `poll`/`ppoll`: evaluate immediately; when nothing is ready and
+/// the timeout permits, park on the watch set (restart semantics re-run the
+/// evaluation on wakeup). `timeout_arg` is milliseconds for poll (-1 =
+/// infinite) or a timespec pointer for ppoll (0 = infinite).
+fn outcome_poll(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    fds_ptr: u64,
+    nfds: u64,
+    timeout_arg: u64,
+    is_ppoll: bool,
+) -> Outcome {
+    let ready = match sys_poll(env, cpu, fds_ptr, nfds) {
+        Ok(ready) => ready,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let now = env.now_nanos(cpu);
+    let timeout = if is_ppoll {
+        if timeout_arg == 0 {
+            None
+        } else {
+            match read_timespec_at(cpu, timeout_arg) {
+                Ok(nanos) => Some(nanos),
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            }
+        }
+    } else {
+        let ms = timeout_arg as u32 as i32;
+        if ms < 0 {
+            None
+        } else {
+            Some(ms as u64 * 1_000_000)
+        }
+    };
+    if ready > 0 || timeout == Some(0) {
+        return Outcome::Ret(Ok(ready));
+    }
+
+    // Build the watch set from the requested events.
+    const POLLIN: u16 = 0x1;
+    const POLLOUT: u16 = 0x4;
+    let mut watches: Vec<Watch> = Vec::new();
+    let records = match read_mem(cpu, fds_ptr, nfds.min(1024) as usize * 8) {
+        Ok(records) => records,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    {
+        let fds = env.proc.fds.borrow();
+        for record in records.chunks_exact(8) {
+            let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
+            let events = u16::from_le_bytes(record[4..6].try_into().expect("chunk size"));
+            let Ok(entry) = fds.get(fd as u32 as u64) else {
+                continue;
+            };
+            let desc = entry.desc.borrow();
+            if events & POLLIN != 0 {
+                if let Some(watch) = read_watch_of(&desc) {
+                    watches.push(watch);
+                }
+            }
+            if events & POLLOUT != 0 {
+                if let Backing::Pipe {
+                    inner,
+                    write_end: true,
+                }
+                | Backing::SocketPair { tx: inner, .. } = &desc.backing
+                {
+                    watches.push(Watch::PipeWritable(inner.clone()));
+                }
+            }
+        }
+    }
+    let deadline = timeout.map(|t| now + t);
+    tracing::debug!(
+        "[{}] poll parks: {} watch(es) from {} fd record(s)",
+        env.proc.pid,
+        watches.len(),
+        records.len() / 8
+    );
+    block_and_switch(env, cpu, ParkState::Waiting { watches, deadline }, true)
+}
+
+/// `nanosleep`: sleeping advances the deterministic clock by the requested
+/// duration (there is nothing else to wait for).
+fn sys_nanosleep(env: &mut LinuxEnv, cpu: &mut Cpu, req: u64) -> SysResult {
+    if req != 0 {
+        let duration = read_timespec_at(cpu, req)?;
+        env.warp_nanos += duration;
+    }
+    Ok(0)
+}
+
+/// `utimensat`: applies the requested modification time to the node.
+fn sys_utimensat(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    const UTIME_NOW: i64 = 0x3fff_ffff;
+    const UTIME_OMIT: i64 = 0x3fff_fffe;
+    let [dirfd, path_ptr, times_ptr, flags, _, _] = a;
+
+    let node = if path_ptr == 0 {
+        // futimens form: dirfd is a real fd.
+        match env.proc.fds.borrow().get(dirfd)?.desc.borrow().backing {
+            Backing::File { node } | Backing::Dir { node, .. } => node,
+            _ => return Ok(0), // non-VFS objects have no timestamps
+        }
+    } else {
+        let path = path_arg(cpu, path_ptr)?;
+        let base = dir_of(env, dirfd)?;
+        let follow = flags & abi::AT_SYMLINK_NOFOLLOW == 0;
+        env.vfs
+            .resolve(base, &path, follow)?
+            .node
+            .ok_or(abi::ENOENT)?
+    };
+
+    let (now_sec, _) = env.now(cpu);
+    // times = [atime, mtime]; only mtime is stored.
+    let mtime = if times_ptr == 0 {
+        now_sec
+    } else {
+        let bytes = read_mem(cpu, times_ptr + 16, 16)?;
+        let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
+        let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
+        match nsec {
+            UTIME_OMIT => return Ok(0),
+            UTIME_NOW => now_sec,
+            _ => sec,
+        }
+    };
+    env.vfs.node_mut(node).mtime_sec = mtime;
+    Ok(0)
 }
