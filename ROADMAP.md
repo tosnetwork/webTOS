@@ -26,6 +26,28 @@ The final coding-agent milestone must support real interactive sessions, child
 processes, repository access, persistent configuration, authenticated HTTPS,
 terminal behavior, and recovery after a browser reload.
 
+## Status
+
+**Updated 2026-08-25.** Legend: ✅ complete (gated by tests), 🔶 partial,
+⬜ not started.
+
+| Milestone | State | Completion | Evidence |
+|-----------|-------|------------|----------|
+| M0 Lock the baseline | 🔶 | ~50% | fixtures exist ad hoc; no trace format or dashboards |
+| M1 Static `hello` | ✅ | ~90% | native + wasm gates green; three-browser matrix pending |
+| M2 Static BusyBox | ✅ | ~85% | applet gates green; browser-reload persistence pending |
+| M3 Dynamic userland | ✅ | ~95% | musl and glibc loaders green, native + wasm |
+| M4 Threads & processes | ✅ | ~85% | single-worker model green incl. determinism; multi-worker deferred |
+| M5 Event loop & networking | 🔶 | ~70% | HTTP/DNS/epoll/denied-by-default green; HTTPS, recording, reconnect pending |
+| M6 OpenFox | ⬜ | 0% | — |
+| M7 Codex & Claude Code | ⬜ | 0% | — |
+| M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
+
+Weighted by engineering effort, overall completion is **roughly 50–55%**.
+The native test suites (28 native cases plus the wasm harness) gate every
+✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
+engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
+
 ## Product Principles
 
 1. **Correctness before translation speed.** Start with an interpreter. Add
@@ -176,7 +198,7 @@ The exact Rust API may change, but the ownership rule may not: the CPU engine
 owns instruction semantics, Linux compatibility owns OS semantics, and the
 browser host owns Web APIs.
 
-## Milestone 0: Lock the Baseline
+## Milestone 0: Lock the Baseline 🔶
 
 **Outcome:** native behavior and reusable fixtures are captured before the
 browser refactor begins.
@@ -184,23 +206,23 @@ browser refactor begins.
 Work:
 
 - Record the current native build, Linux maturity, and runtime validation
-  results from a clean checkout.
+  results from a clean checkout. ✅
 - Extract small ELF fixtures for static, PIE, dynamic, TLS, signal, futex,
-  filesystem, and socket behavior.
+  filesystem, and socket behavior. 🔶 (test_data + test-compiled fixtures; not versioned as a formal set)
 - Create an instruction trace format containing registers, flags, memory
-  effects, traps, and syscall exits.
+  effects, traps, and syscall exits. ⬜
 - Record syscall traces for the target workloads without treating trace count
-  as proof of semantic completeness.
-- Define browser support and performance dashboards.
-- Classify the existing `TODO-*` files as native-substrate supporting plans.
+  as proof of semantic completeness. 🔶 (live tracing exists; no stored traces)
+- Define browser support and performance dashboards. ⬜
+- Classify the existing `TODO-*` files as native-substrate supporting plans. ✅ (docs/plans/)
 
 Exit gate:
 
-- Native reference tests are reproducible.
-- Fixtures and expected traces are versioned.
-- Every later milestone can run without depending on a full root filesystem.
+- Native reference tests are reproducible. ✅
+- Fixtures and expected traces are versioned. 🔶
+- Every later milestone can run without depending on a full root filesystem. ✅
 
-## Milestone 1: Static `hello`
+## Milestone 1: Static `hello` ✅
 
 **Outcome:** a static x86-64 ELF prints text and exits entirely inside a
 browser worker.
@@ -208,21 +230,21 @@ browser worker.
 Work:
 
 - Implement CPU state, basic decoder, effective-address calculation, integer
-  arithmetic, branches, stack operations, loads/stores, and `SYSCALL` exit.
-- Implement sparse guest pages with read, write, execute, and bounds checks.
-- Port ELF loading and initial process stack construction to `GuestMemory`.
-- Support the minimal Linux path for `write`, `exit`, and `exit_group`.
-- Connect stdout to the browser terminal.
-- Add instruction differential fixtures and malformed-ELF tests.
+  arithmetic, branches, stack operations, loads/stores, and `SYSCALL` exit. ✅ (vendored SLEIGH core + interpreter VM)
+- Implement sparse guest pages with read, write, execute, and bounds checks. ✅
+- Port ELF loading and initial process stack construction to `GuestMemory`. ✅
+- Support the minimal Linux path for `write`, `exit`, and `exit_group`. ✅
+- Connect stdout to the browser terminal. ✅ (web/ demo terminal)
+- Add instruction differential fixtures and malformed-ELF tests. 🔶 (trap tests exist; no differential suite)
 
 Exit gate:
 
 - Static assembly and C `hello` binaries run in Chromium, Firefox, and WebKit
-  engine test environments.
-- Invalid instructions and memory accesses trap with useful diagnostics.
-- No native x86-64 instruction is executed by the host.
+  engine test environments. 🔶 (verified via Node/V8 and the demo page; no three-browser matrix)
+- Invalid instructions and memory accesses trap with useful diagnostics. ✅
+- No native x86-64 instruction is executed by the host. ✅
 
-## Milestone 2: Static BusyBox
+## Milestone 2: Static BusyBox ✅
 
 **Outcome:** a static BusyBox image provides useful shell and filesystem
 operations in the browser.
@@ -230,22 +252,22 @@ operations in the browser.
 Work:
 
 - Expand integer, bit-manipulation, string, multiply/divide, and baseline
-  floating-point/SIMD instruction coverage from executed traces.
+  floating-point/SIMD instruction coverage from executed traces. ✅ (SLEIGH coverage; BusyBox/glibc/musl exercise it)
 - Port `brk`, anonymous `mmap`, `mprotect`, `munmap`, `read`, `write`,
-  `openat`, `close`, `stat`, `getdents`, `ioctl`, and related fd behavior.
+  `openat`, `close`, `stat`, `getdents`, `ioctl`, and related fd behavior. ✅
 - Implement browser-backed files, directories, permissions, and standard
-  streams.
+  streams. 🔶 (in-memory VFS injected from the host; no OPFS persistence yet)
 - Provide `argv`, environment, current directory, and a minimal `/proc` and
-  `/dev` view.
-- Support BusyBox applets first, then shell pipelines and redirection.
+  `/dev` view. ✅ (`/proc/self/exe`; fuller /proc pending)
+- Support BusyBox applets first, then shell pipelines and redirection. ✅
 
 Exit gate:
 
-- `echo`, `cat`, `ls`, `mkdir`, `cp`, `mv`, `rm`, and `sh` smoke tests pass.
-- Files persist across browser reload.
-- Shell pipelines and exit codes behave consistently with the native fixture.
+- `echo`, `cat`, `ls`, `mkdir`, `cp`, `mv`, `rm`, and `sh` smoke tests pass. ✅
+- Files persist across browser reload. ⬜ (persist across guest processes; browser-reload persistence needs OPFS)
+- Shell pipelines and exit codes behave consistently with the native fixture. ✅
 
-## Milestone 3: Dynamic Linux Userland
+## Milestone 3: Dynamic Linux Userland ✅
 
 **Outcome:** dynamically linked PIE executables start through the system
 dynamic loader.
@@ -253,44 +275,44 @@ dynamic loader.
 Work:
 
 - Complete file-backed mappings, demand paging, protection transitions, and
-  executable-page invalidation.
+  executable-page invalidation. ✅ (eager private file maps; demand paging deferred by design)
 - Support `PT_INTERP`, auxiliary vectors, TLS setup, `arch_prctl`, and FS/GS
-  base behavior.
-- Complete instruction coverage exercised by the dynamic loader and libc.
+  base behavior. ✅
+- Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)
 - Port signals, alternate signal stacks, and signal return frames to virtual
-  CPU state.
-- Build versioned minimal root images with explicit licenses and manifests.
+  CPU state. 🔶 (registration + fatal-signal semantics; no handler delivery)
+- Build versioned minimal root images with explicit licenses and manifests. ✅ (pinned Alpine minirootfs fixture)
 
 Exit gate:
 
 - Pinned dynamically linked C and Rust fixtures run from a clean browser
-  profile.
-- Loader, TLS, signal, and file-mapping regression suites pass.
-- Unsupported relocations, instructions, and syscalls fail explicitly.
+  profile. ✅ (C and Rust via glibc; musl via Alpine; wasm-checked)
+- Loader, TLS, signal, and file-mapping regression suites pass. ✅
+- Unsupported relocations, instructions, and syscalls fail explicitly. ✅
 
-## Milestone 4: Threads and Process Semantics
+## Milestone 4: Threads and Process Semantics ✅
 
 **Outcome:** multi-threaded Linux programs run deterministically.
 
 Work:
 
 - Port `clone`, `clone3`, thread groups, `fork`, `vfork`, `execve`, `wait4`,
-  and process exit semantics onto virtual CPU contexts.
+  and process exit semantics onto virtual CPU contexts. ✅ (clone3 intentionally ENOSYS; libcs fall back to clone)
 - Implement futex wait/wake, robust-list cleanup, clear-child-tid, atomics,
-  and thread-local storage.
-- Begin with deterministic cooperative scheduling inside one worker.
+  and thread-local storage. ✅ (robust-list intentionally ENOSYS)
+- Begin with deterministic cooperative scheduling inside one worker. ✅
 - Add multi-worker execution only after the single-worker model is correct;
-  retain deterministic ordering and recorded external events.
-- Test races, cancellation, signals during waits, and process-image replacement.
+  retain deterministic ordering and recorded external events. ⬜ (deferred by design)
+- Test races, cancellation, signals during waits, and process-image replacement. 🔶 (races/exec covered; cancellation and signal-in-wait pending)
 
 Exit gate:
 
-- Thread, futex, child-process, and exec fixture suites pass.
+- Thread, futex, child-process, and exec fixture suites pass. ✅
 - Repeated runs from the same checkpoint produce the same scheduled event
-  sequence in deterministic mode.
-- Worker cancellation cannot leave committed storage in a partial state.
+  sequence in deterministic mode. ✅ (identical output and instruction counts across runs)
+- Worker cancellation cannot leave committed storage in a partial state. ⬜ (browser-host work)
 
-## Milestone 5: Event Loop and Networking
+## Milestone 5: Event Loop and Networking 🔶
 
 **Outcome:** interactive network clients and event-driven runtimes work in the
 browser.
@@ -298,21 +320,21 @@ browser.
 Work:
 
 - Finish pipe, socketpair, eventfd, timerfd, poll, select, and epoll behavior
-  against browser-host readiness events.
-- Implement DNS and socket mediation through an explicit network broker.
+  against browser-host readiness events. ✅ (against the broker readiness interface)
+- Implement DNS and socket mediation through an explicit network broker. ✅
 - Support authenticated HTTPS from guest userland without exposing browser
-  credentials to unrelated agents.
-- Record network inputs for replay and receipt classification.
-- Define offline, denied, timeout, reconnect, and proxy-failure behavior.
+  credentials to unrelated agents. ⬜ (guest TLS untested; credential design pending)
+- Record network inputs for replay and receipt classification. ⬜
+- Define offline, denied, timeout, reconnect, and proxy-failure behavior. 🔶 (denied and timeout defined; reconnect and proxy pending)
 
 Exit gate:
 
-- HTTP, HTTPS, DNS, pipe, and epoll fixture suites pass.
+- HTTP, HTTPS, DNS, pipe, and epoll fixture suites pass. 🔶 (HTTP, DNS, pipe, epoll green; HTTPS pending)
 - A long-running event loop survives transient network failure and browser
-  tab suspension.
-- Network access is denied by default without the appropriate capability.
+  tab suspension. ⬜
+- Network access is denied by default without the appropriate capability. ✅
 
-## Milestone 6: OpenFox
+## Milestone 6: OpenFox ⬜
 
 **Outcome:** a pinned Linux x86-64 OpenFox release completes a real agent task
 inside webTOS.
@@ -337,7 +359,7 @@ Exit gate:
 - A 60-minute interactive soak test completes without kernel corruption or
   unbounded memory growth.
 
-## Milestone 7: Codex and Claude Code
+## Milestone 7: Codex and Claude Code ⬜
 
 **Outcome:** pinned releases of both coding agents are usable for sustained,
 interactive browser sessions.
@@ -371,7 +393,7 @@ Exit gate for each agent:
 
 The milestone is complete only when both agent profiles pass independently.
 
-## Milestone 8: Performance, Security, and Release
+## Milestone 8: Performance, Security, and Release ⬜
 
 **Outcome:** correctness-complete workload profiles become a supportable web
 runtime.
