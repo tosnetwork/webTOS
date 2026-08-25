@@ -81,11 +81,15 @@ pub type NetRef = Rc<RefCell<NetSocket>>;
 #[derive(Debug, Default)]
 pub struct EpollInner {
     pub interests: std::collections::BTreeMap<u64, (u32, u64)>,
-    /// Edge-triggered (`EPOLLET`) fds whose readiness edge has been delivered
-    /// and not yet re-armed. A fd here is suppressed while it stays ready; it
-    /// re-arms when a wait observes it not-ready (then a fresh ready state is
-    /// a new edge). Cleared for a fd on `EPOLL_CTL_MOD`/`DEL`.
-    pub edge_fired: std::collections::BTreeSet<u64>,
+    /// Edge-triggered (`EPOLLET`) suppression, tracked per direction. Maps a
+    /// guest fd to the mask of directions (`EPOLLIN`/`EPOLLOUT`) whose readiness
+    /// edge has been delivered and not yet re-armed. A direction is suppressed
+    /// while it stays ready; it re-arms when a wait observes that direction
+    /// not-ready (then a fresh ready state is a new edge). Keeping the read and
+    /// write edges separate is essential: a delivered writable (connect) edge
+    /// must not suppress a later readable edge on the same fd. Cleared for a fd
+    /// on `EPOLL_CTL_MOD`/`DEL`.
+    pub edge_fired: std::collections::BTreeMap<u64, u32>,
 }
 
 pub type EpollRef = Rc<RefCell<EpollInner>>;

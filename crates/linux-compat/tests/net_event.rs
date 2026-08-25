@@ -183,6 +183,59 @@ int main(void) {
     );
 }
 
+/// Edge-triggered epoll must track the read and write edges *separately*. A
+/// socket registered `EPOLLIN|EPOLLOUT|EPOLLET` fires its writable edge first
+/// (an empty send buffer is writable). If that delivered OUT edge suppressed
+/// the whole fd, the readable edge that arrives later — the TLS ServerHello on
+/// a freshly connected socket — would never be reported, and the reactor would
+/// park watching nothing and time the handshake out. Conflating the directions
+/// is exactly the failure seen bringing up a real HTTPS client: connect →
+/// ClientHello → (ServerHello arrives, never delivered) → timeout → close.
+#[test]
+fn epoll_edge_read_and_write_are_independent() {
+    let source = r#"
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) return 1;
+    struct epoll_event out[8];
+    int ep = epoll_create1(0);
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLET; ev.data.u64 = 9;
+    epoll_ctl(ep, EPOLL_CTL_ADD, sv[0], &ev);
+
+    /* Empty send buffer -> writable edge fires; not readable yet. */
+    int n1 = epoll_wait(ep, out, 8, 0);
+    int w1 = (n1 == 1) && (out[0].events & EPOLLOUT) && !(out[0].events & EPOLLIN);
+    /* Still writable, no new edge. */
+    int n2 = epoll_wait(ep, out, 8, 0);
+    /* Peer writes: a fresh readable edge must fire even though the writable
+       edge already fired on this same fd. */
+    char b = 'x';
+    if (write(sv[1], &b, 1) != 1) return 2;
+    int n3 = epoll_wait(ep, out, 8, 0);
+    int r3 = (n3 == 1) && (out[0].events & EPOLLIN);
+
+    printf("w1=%d n2=%d r3=%d\n", w1, n2, r3);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("epoll_rw_edge", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll_rw_edge");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("w1=1 n2=0 r3=1"),
+        "read/write edges not independent; output: {:?}",
+        run.output
+    );
+}
+
 /// `FIONBIO` is a general fd ioctl (set non-blocking), not tty-specific: it
 /// must succeed on a pipe/socket and actually flip `O_NONBLOCK`, not return
 /// `ENOTTY`. A real Codex binary sets it on an internal pipe and unwraps the

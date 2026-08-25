@@ -2905,10 +2905,10 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     let mut ready: Vec<(u32, u64)> = Vec::new();
     let mut watches: Vec<Watch> = Vec::new();
     // Edge-triggered bookkeeping applied after the scan (the interest map is
-    // borrowed immutably during it): fds to mark as having fired an edge, and
-    // fds observed not-ready that should re-arm.
-    let mut mark_fired: Vec<u64> = Vec::new();
-    let mut rearm: Vec<u64> = Vec::new();
+    // borrowed immutably during it), tracked per direction so a delivered
+    // writable edge never masks a fresh readable edge on the same fd. Each
+    // entry is the new suppression mask for that fd.
+    let mut new_fired: Vec<(u64, u32)> = Vec::new();
     {
         let inner = epoll.borrow();
         let fds = env.proc.fds.borrow();
@@ -2936,34 +2936,39 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
             if events & EPOLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
                 fired |= EPOLLOUT;
             }
-            // Edge-triggered: suppress a fd whose edge already fired and is
-            // still ready; re-arm one observed not-ready.
             let is_et = events & EPOLLET != 0;
             if is_et {
-                if fired == 0 {
-                    rearm.push(fd);
-                    continue;
+                // Edge tracking, per condition. Each ready condition (readable,
+                // writable, hang-up) is delivered once and then suppressed while
+                // it stays ready; it re-arms the moment it is observed not-ready.
+                // Tracking the conditions independently is essential: a delivered
+                // writable edge (an empty send buffer on a fresh connect) must not
+                // mask the readable edge that arrives later (the peer's first
+                // bytes) on the same fd. `fired` only ever carries IN/OUT/HUP, so
+                // the whole value is the set of currently-ready conditions.
+                let prev = inner.edge_fired.get(&fd).copied().unwrap_or(0);
+                let report = fired & !prev;
+                if fired != prev {
+                    new_fired.push((fd, fired));
                 }
-                if inner.edge_fired.contains(&fd) {
-                    continue;
+                if report != 0 && ready.len() < max_events {
+                    ready.push((report, data));
                 }
+                continue;
             }
             if fired != 0 && ready.len() < max_events {
                 ready.push((fired, data));
-                // Only record the delivered edge once it is actually reported.
-                if is_et {
-                    mark_fired.push(fd);
-                }
             }
         }
     }
-    if !mark_fired.is_empty() || !rearm.is_empty() {
+    if !new_fired.is_empty() {
         let mut inner = epoll.borrow_mut();
-        for fd in mark_fired {
-            inner.edge_fired.insert(fd);
-        }
-        for fd in rearm {
-            inner.edge_fired.remove(&fd);
+        for (fd, mask) in new_fired {
+            if mask == 0 {
+                inner.edge_fired.remove(&fd);
+            } else {
+                inner.edge_fired.insert(fd, mask);
+            }
         }
     }
 
