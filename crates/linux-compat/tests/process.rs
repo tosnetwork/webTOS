@@ -385,3 +385,41 @@ fn pipe_backpressure_blocks_and_drains() {
         run.output
     );
 }
+
+#[test]
+fn large_anonymous_reservation_then_allocations_do_not_collide() {
+    // A big PROT_NONE reservation (as V8's sandbox does) followed by smaller
+    // mappings must not overlap: the mmap allocator has to find real holes,
+    // not bump linearly into the reservation.
+    let source = r#"
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+int main(void) {
+    size_t big = 256UL << 20; // 256 MiB
+    void *reserve = mmap(NULL, big, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserve == MAP_FAILED) { printf("reserve failed\n"); return 1; }
+    // Several writable mappings afterwards must each be usable and distinct.
+    char *a = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *b = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED || b == MAP_FAILED) { printf("alloc failed\n"); return 2; }
+    memset(a, 0xAA, 4096);
+    memset(b, 0xBB, 65536);
+    if ((unsigned char)a[0] != 0xAA || (unsigned char)b[65535] != 0xBB) { printf("corrupt\n"); return 3; }
+    // The small mappings must not fall inside the reservation.
+    if (a >= (char *)reserve && a < (char *)reserve + big) { printf("a inside reserve\n"); return 4; }
+    printf("mmap-holes-ok reserve=%p a=%p b=%p\n", reserve, (void *)a, (void *)b);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("mmaptest", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "mmaptest");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("mmap-holes-ok"),
+        "output: {:?}",
+        run.output
+    );
+}

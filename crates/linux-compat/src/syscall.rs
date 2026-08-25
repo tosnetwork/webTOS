@@ -1226,7 +1226,21 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         cpu.mem.unmap_memory_len(target, len);
         target
     } else {
-        env.alloc_mmap(len)
+        // Find an actual free hole at or above the allocation hint; a plain
+        // bump allocator collides with existing mappings once the guest
+        // reserves large regions (V8's 256 MiB sandbox does exactly this).
+        let hint = env.proc.mmap_next;
+        match cpu.mem.find_free_memory(icicle_cpu::mem::AllocLayout {
+            addr: Some(hint),
+            size: len,
+            align: PAGE_SIZE,
+        }) {
+            Ok(target) => {
+                env.proc.mmap_next = target + len + PAGE_SIZE;
+                target
+            }
+            Err(_) => return Err(abi::ENOMEM),
+        }
     };
 
     let file_bytes = if flags & abi::MAP_ANONYMOUS == 0 {
@@ -1258,13 +1272,15 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         },
     );
     if !ok {
+        tracing::warn!("mmap: map_memory_len failed for {len:#x} at {target:#x}");
         return Err(abi::ENOMEM);
     }
     if let Some(bytes) = file_bytes {
         write_mem(cpu, target, &bytes)?;
     }
     let final_perm = prot_to_perm(prot);
-    if cpu.mem.update_perm(target, len, final_perm).is_err() {
+    if let Err(e) = cpu.mem.update_perm(target, len, final_perm) {
+        tracing::warn!("mmap: update_perm failed for {len:#x} at {target:#x}: {e:?}");
         return Err(abi::ENOMEM);
     }
     Ok(target)

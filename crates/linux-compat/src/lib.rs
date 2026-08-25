@@ -220,6 +220,7 @@ impl LinuxEnv {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn alloc_mmap(&mut self, len: u64) -> u64 {
         let target = self.proc.mmap_next;
         self.proc.mmap_next += align_up(len, PAGE_SIZE) + PAGE_SIZE;
