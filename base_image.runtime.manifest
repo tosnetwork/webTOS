@@ -13,7 +13,7 @@
 /usr/lib/jvm/java-11-openjdk-amd64/lib/jli/libjli.so = /usr/lib/jvm/java-11-openjdk-amd64/lib/jli/libjli.so
 /lib/x86_64-linux-gnu/libc.so.6 = /usr/lib/x86_64-linux-gnu/libc.so.6
 /lib64/ld-linux-x86-64.so.2 = /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
-/lib/x86_64-linux-gnu/libstdc++.so.6 = /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.30
+/lib/x86_64-linux-gnu/libstdc++.so.6 = /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35
 /lib/x86_64-linux-gnu/libm.so.6 = /usr/lib/x86_64-linux-gnu/libm.so.6
 /lib/x86_64-linux-gnu/libgcc_s.so.1 = /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 
