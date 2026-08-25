@@ -32,10 +32,24 @@ milestone-1 `linux_min` environment.
   and kernel-style self-termination for fatal signals (`abort()` exits with
   128 + signal)
 
-Process management (`fork`, `execve`, `wait4`, pipes) is the milestone-4
-boundary and is intentionally absent: BusyBox applets run as consecutive
-single processes over the persistent filesystem, and `sh` works for
-builtins and redirection.
+## What it provides (milestone 4)
+
+- processes and threads over a deterministic cooperative scheduler: one
+  virtual CPU, every other task parked with its CPU snapshot and memory
+  map; the first ready task in queue order always runs next, so repeated
+  runs produce identical output and instruction counts
+- `fork` with copy-on-write memory, threads (`CLONE_VM`) with a shared
+  map, `execve` (image replacement with close-on-exec), `wait4` and
+  zombies, pipes with blocking readers/writers, futex wait/wake,
+  `sched_yield`, and clear-child-tid wakeups (`pthread_join`)
+- blocking syscalls use restart semantics: the parked task re-executes
+  the syscall instruction on wakeup, so no continuation state is stored
+- shell pipelines and external commands work end to end (BusyBox `sh`
+  spawning applets through `$PATH`, multi-stage pipelines, exit codes)
+
+Not modeled yet: signal delivery to handlers (fatal signals terminate,
+registration is recorded), process groups and sessions, and futex
+timeouts (time advances only with executed instructions).
 
 ## Testing
 

@@ -69,51 +69,75 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     let a4: u64 = cpu.read_var(env.regs.r8);
     let a5: u64 = cpu.read_var(env.regs.r9);
 
-    if nr == abi::SYS_EXIT || nr == abi::SYS_EXIT_GROUP {
-        env.record_exit(a0 as i32);
-        tracing::debug!("guest exited with code {}", a0 as i32);
-        return Some(VmExit::Halt);
-    }
-
-    // A fatal signal the process sends to itself (abort(), raise())
-    // terminates it, kernel-style, with 128 + signal. Handler delivery is
-    // not implemented, so termination is the honest outcome either way.
-    if nr == abi::SYS_KILL || nr == abi::SYS_TGKILL {
-        let (pid, signal) = if nr == abi::SYS_KILL {
-            (a0, a1)
-        } else {
-            (a0, a2)
-        };
-        if pid as u32 as i32 == PID as i32 && signal != 0 {
-            tracing::warn!("guest killed itself with signal {signal} (no handler delivery)");
-            env.record_exit(128 + signal as i32);
-            return Some(VmExit::Halt);
+    match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
+        Outcome::Ret(result) => {
+            let value = match result {
+                Ok(v) => v,
+                Err(errno) => neg(errno),
+            };
+            tracing::trace!(
+                "[{}:{}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {value:#x}",
+                env.proc.pid,
+                cpu.icount()
+            );
+            cpu.write_var(env.regs.rax, value);
+            // Resume at the instruction after `syscall`.
+            let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
+            cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
+            None
         }
+        // The CPU already holds the full state of whichever task runs next
+        // (including its pending exception); do not touch RAX.
+        Outcome::Switched => {
+            tracing::trace!("[{}] resumed after syscall {nr} switch", env.proc.pid);
+            None
+        }
+        Outcome::Exit(exit) => Some(exit),
     }
-
-    let result = dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]);
-    let value = match result {
-        Ok(v) => v,
-        Err(errno) => neg(errno),
-    };
-    tracing::trace!(
-        "[{}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {value:#x}",
-        cpu.icount()
-    );
-    cpu.write_var(env.regs.rax, value);
-
-    // Resume at the instruction after `syscall`.
-    let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
-    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
-    None
 }
 
-fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResult {
+/// Result of dispatching one syscall.
+pub(crate) enum Outcome {
+    /// Write the value (or negative errno) to RAX and resume after the
+    /// syscall instruction.
+    Ret(SysResult),
+    /// The current task was parked (or replaced); the CPU holds another
+    /// task's state.
+    Switched,
+    /// Stop the whole machine.
+    Exit(VmExit),
+}
+
+impl From<SysResult> for Outcome {
+    fn from(result: SysResult) -> Self {
+        Outcome::Ret(result)
+    }
+}
+
+fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome {
     match nr {
-        abi::SYS_READ => sys_read(env, cpu, a[0], a[1], a[2]),
-        abi::SYS_WRITE => sys_write(env, cpu, a[0], a[1], a[2]),
-        abi::SYS_READV => sys_readv(env, cpu, a[0], a[1], a[2]),
-        abi::SYS_WRITEV => sys_writev(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_EXIT => task_exit(env, cpu, encode_exit_status(a[0]), false),
+        abi::SYS_EXIT_GROUP => task_exit(env, cpu, encode_exit_status(a[0]), true),
+        abi::SYS_READ => outcome_read(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_WRITE => outcome_write(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_READV => outcome_vectored(env, cpu, a[0], a[1], a[2], false),
+        abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
+        abi::SYS_FORK | abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
+        abi::SYS_CLONE => sys_clone_impl(env, cpu, CloneSpec::from_clone_args(a)),
+        abi::SYS_EXECVE => sys_execve(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_WAIT4 => sys_wait4(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_PIPE => sys_pipe(env, cpu, a[0], 0).into(),
+        abi::SYS_PIPE2 => sys_pipe(env, cpu, a[0], a[1]).into(),
+        abi::SYS_FUTEX => sys_futex(env, cpu, a[0], a[1], a[2], a[5]),
+        abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
+        abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
+        abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
+        _ => dispatch_simple(env, cpu, nr, a).into(),
+    }
+}
+
+fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResult {
+    match nr {
         abi::SYS_PREAD64 => sys_pread(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_PWRITE64 => sys_pwrite(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_OPEN => sys_openat(env, cpu, abi::AT_FDCWD, a[0], a[1], a[2]),
@@ -126,7 +150,7 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
             a[1],
         ),
         abi::SYS_OPENAT => sys_openat(env, cpu, a[0], a[1], a[2], a[3]),
-        abi::SYS_CLOSE => env.fds.close(a[0]).map(|_| 0),
+        abi::SYS_CLOSE => env.proc.fds.borrow_mut().close(a[0]).map(|_| 0),
         abi::SYS_LSEEK => sys_lseek(env, a[0], a[1], a[2]),
         abi::SYS_GETDENTS64 => sys_getdents64(env, cpu, a[0], a[1], a[2]),
         abi::SYS_GETDENTS => Err(abi::ENOSYS), // legacy; modern userlands use getdents64
@@ -159,12 +183,19 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
         abi::SYS_CHOWN | abi::SYS_FCHOWNAT => Ok(0), // single-user: uid/gid stay 0
         abi::SYS_UTIMENSAT => Ok(0),
         abi::SYS_UMASK => {
-            let old = env.umask;
-            env.umask = (a[0] as u32) & 0o777;
+            let old = env.proc.umask;
+            env.proc.umask = (a[0] as u32) & 0o777;
             Ok(old as u64)
         }
         abi::SYS_DUP => sys_dup(env, a[0], 0, false),
-        abi::SYS_DUP2 => sys_dup2(env, a[0], a[1]),
+        abi::SYS_DUP2 => sys_dup2(env, a[0], a[1], false),
+        abi::SYS_DUP3 => {
+            if a[0] == a[1] {
+                Err(abi::EINVAL)
+            } else {
+                sys_dup2(env, a[0], a[1], a[2] & abi::O_CLOEXEC != 0)
+            }
+        }
         abi::SYS_FCNTL => sys_fcntl(env, a[0], a[1], a[2]),
         abi::SYS_IOCTL => sys_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FSYNC | abi::SYS_SYNC => Ok(0),
@@ -227,33 +258,20 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
         }
         abi::SYS_NANOSLEEP | abi::SYS_CLOCK_NANOSLEEP => Ok(0),
 
-        abi::SYS_GETPID | abi::SYS_GETTID | abi::SYS_GETPGRP => Ok(PID),
-        abi::SYS_GETPGID => Ok(PID),
-        abi::SYS_GETPPID => Ok(1),
+        abi::SYS_GETPID | abi::SYS_GETPGRP | abi::SYS_GETPGID => Ok(env.proc.tgid),
+        abi::SYS_GETTID => Ok(env.proc.pid),
+        abi::SYS_GETPPID => Ok(env.proc.ppid),
         abi::SYS_GETUID | abi::SYS_GETGID | abi::SYS_GETEUID | abi::SYS_GETEGID => Ok(0),
         abi::SYS_GETGROUPS => Ok(0),
-        abi::SYS_SETSID => Ok(PID),
-        abi::SYS_SET_TID_ADDRESS => Ok(PID),
+        abi::SYS_SETSID => Ok(env.proc.tgid),
+        abi::SYS_SET_TID_ADDRESS => {
+            env.proc.clear_child_tid = a[0];
+            Ok(env.proc.pid)
+        }
         abi::SYS_PRLIMIT64 => sys_prlimit64(cpu, a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
 
-        // Single-process boundary (milestone 4 work): report honestly.
-        abi::SYS_FORK | abi::SYS_VFORK | abi::SYS_CLONE => {
-            tracing::warn!("process creation is not supported yet (milestone 4)");
-            Err(abi::ENOSYS)
-        }
-        abi::SYS_EXECVE => {
-            tracing::warn!("execve is not supported yet (milestone 4)");
-            Err(abi::ENOSYS)
-        }
-        abi::SYS_WAIT4 => Err(abi::ECHILD),
-        abi::SYS_PIPE | abi::SYS_PIPE2 => {
-            tracing::warn!("pipes are not supported yet (milestone 4)");
-            Err(abi::ENOSYS)
-        }
-        abi::SYS_KILL | abi::SYS_TGKILL => Err(abi::ESRCH),
-
-        abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ | abi::SYS_FUTEX => Err(abi::ENOSYS),
+        abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ => Err(abi::ENOSYS),
         abi::SYS_RT_SIGRETURN => Err(abi::ENOSYS),
 
         _ => {
@@ -272,9 +290,9 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResul
 /// 32 bits.
 fn dir_of(env: &LinuxEnv, dirfd: u64) -> Result<usize, u64> {
     if dirfd as u32 as i32 == abi::AT_FDCWD as u32 as i32 {
-        return Ok(env.cwd);
+        return Ok(env.proc.cwd);
     }
-    match env.fds.get(dirfd)?.desc.borrow().backing {
+    match env.proc.fds.borrow().get(dirfd)?.desc.borrow().backing {
         Backing::Dir { node, .. } => Ok(node),
         _ => Err(abi::ENOTDIR),
     }
@@ -305,6 +323,8 @@ fn read_backing(
             Ok(chunk)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
+        // Pipes are handled by `outcome_read` before reaching here.
+        Backing::Pipe { .. } => Err(abi::EINVAL),
         Backing::Dev(dev) => match dev {
             Dev::Null | Dev::Tty => Ok(Vec::new()),
             Dev::Zero => Ok(vec![0; buf_len]),
@@ -348,11 +368,13 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             Ok(bytes.len() as u64)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
+        // Pipes are handled by `outcome_write` before reaching here.
+        Backing::Pipe { .. } => Err(abi::EINVAL),
     }
 }
 
 fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     if !desc.readable() {
         return Err(abi::EBADF);
@@ -364,7 +386,7 @@ fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) ->
 }
 
 fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let count = count.min(0x40_0000) as usize;
     let bytes = read_mem(cpu, buf, count)?;
@@ -385,32 +407,6 @@ fn iter_iov(cpu: &mut Cpu, iov: u64, iovcnt: u64) -> Result<Vec<(u64, u64)>, u64
         .collect())
 }
 
-fn sys_writev(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, iov: u64, iovcnt: u64) -> SysResult {
-    let mut total = 0_u64;
-    for (base, len) in iter_iov(cpu, iov, iovcnt)? {
-        if len == 0 {
-            continue;
-        }
-        total += sys_write(env, cpu, fd, base, len)?;
-    }
-    Ok(total)
-}
-
-fn sys_readv(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, iov: u64, iovcnt: u64) -> SysResult {
-    let mut total = 0_u64;
-    for (base, len) in iter_iov(cpu, iov, iovcnt)? {
-        if len == 0 {
-            continue;
-        }
-        let n = sys_read(env, cpu, fd, base, len)?;
-        total += n;
-        if n < len {
-            break;
-        }
-    }
-    Ok(total)
-}
-
 fn sys_pread(
     env: &mut LinuxEnv,
     cpu: &mut Cpu,
@@ -419,7 +415,7 @@ fn sys_pread(
     count: u64,
     pos: u64,
 ) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let Backing::File { .. } = desc.backing else {
         return Err(abi::ESPIPE);
@@ -441,7 +437,7 @@ fn sys_pwrite(
     count: u64,
     pos: u64,
 ) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let Backing::File { .. } = desc.backing else {
         return Err(abi::ESPIPE);
@@ -478,7 +474,7 @@ fn sys_openat(
             if flags & abi::O_CREAT == 0 {
                 return Err(abi::ENOENT);
             }
-            let mode = (mode as u32) & 0o777 & !env.umask;
+            let mode = (mode as u32) & 0o777 & !env.proc.umask;
             env.vfs.create(
                 resolved.parent,
                 &resolved.name,
@@ -518,11 +514,11 @@ fn sys_openat(
         })),
         cloexec: flags & abi::O_CLOEXEC != 0,
     };
-    env.fds.insert(entry)
+    env.proc.fds.borrow_mut().insert(entry)
 }
 
 fn sys_lseek(env: &mut LinuxEnv, fd: u64, offset: u64, whence: u64) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let size = match &mut desc.backing {
         Backing::File { node } => env.vfs.node(*node).size(),
@@ -535,7 +531,7 @@ fn sys_lseek(env: &mut LinuxEnv, fd: u64, offset: u64, whence: u64) -> SysResult
             return Err(abi::EINVAL);
         }
         Backing::Dev(_) => 0,
-        Backing::Std(_) => return Err(abi::ESPIPE),
+        Backing::Std(_) | Backing::Pipe { .. } => return Err(abi::ESPIPE),
     };
     let base = match whence {
         abi::SEEK_SET => 0_i64,
@@ -552,7 +548,7 @@ fn sys_lseek(env: &mut LinuxEnv, fd: u64, offset: u64, whence: u64) -> SysResult
 }
 
 fn sys_getdents64(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, dirp: u64, count: u64) -> SysResult {
-    let desc = env.fds.get(fd)?.desc.clone();
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let Backing::Dir { node, cookie } = &mut desc.backing else {
         return Err(abi::ENOTDIR);
@@ -606,8 +602,8 @@ fn stat_of_node(env: &LinuxEnv, node: usize) -> abi::Stat {
 }
 
 fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
-    let entry = env.fds.get(fd)?;
-    let desc = entry.desc.borrow();
+    let ofd = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let desc = ofd.borrow();
     Ok(match &desc.backing {
         Backing::File { node } | Backing::Dir { node, .. } => stat_of_node(env, *node),
         Backing::Std(_) | Backing::Dev(Dev::Tty) => abi::Stat {
@@ -624,6 +620,14 @@ fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
             ino: u64::MAX - 1,
             nlink: 1,
             mode: abi::S_IFCHR | 0o666,
+            blksize: 4096,
+            ..Default::default()
+        },
+        Backing::Pipe { .. } => abi::Stat {
+            dev: 1,
+            ino: u64::MAX - 2,
+            nlink: 1,
+            mode: abi::S_IFIFO | 0o600,
             blksize: 4096,
             ..Default::default()
         },
@@ -729,7 +733,7 @@ fn sys_readlinkat(
 ) -> SysResult {
     let path = path_arg(cpu, path_ptr)?;
     let target = if path == b"/proc/self/exe" {
-        env.exe_path.clone()
+        env.proc.exe_path.clone()
     } else {
         let base = dir_of(env, dirfd)?;
         let resolved = env.vfs.resolve(base, &path, false)?;
@@ -759,7 +763,7 @@ fn sys_mkdirat(
     if resolved.node.is_some() {
         return Err(abi::EEXIST);
     }
-    let mode = (mode as u32) & 0o777 & !env.umask;
+    let mode = (mode as u32) & 0o777 & !env.proc.umask;
     env.vfs
         .create(
             resolved.parent,
@@ -859,19 +863,19 @@ fn sys_symlinkat(
 
 fn sys_chdir(env: &mut LinuxEnv, cpu: &mut Cpu, path_ptr: u64) -> SysResult {
     let path = path_arg(cpu, path_ptr)?;
-    let resolved = env.vfs.resolve(env.cwd, &path, true)?;
+    let resolved = env.vfs.resolve(env.proc.cwd, &path, true)?;
     let node = resolved.node.ok_or(abi::ENOENT)?;
     if !env.vfs.is_dir(node) {
         return Err(abi::ENOTDIR);
     }
-    env.cwd = node;
+    env.proc.cwd = node;
     Ok(0)
 }
 
 fn sys_fchdir(env: &mut LinuxEnv, fd: u64) -> SysResult {
-    match env.fds.get(fd)?.desc.borrow().backing {
+    match env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
         Backing::Dir { node, .. } => {
-            env.cwd = node;
+            env.proc.cwd = node;
             Ok(0)
         }
         _ => Err(abi::ENOTDIR),
@@ -879,7 +883,7 @@ fn sys_fchdir(env: &mut LinuxEnv, fd: u64) -> SysResult {
 }
 
 fn sys_getcwd(env: &mut LinuxEnv, cpu: &mut Cpu, buf: u64, size: u64) -> SysResult {
-    let mut path = env.vfs.abs_path_of(env.cwd);
+    let mut path = env.vfs.abs_path_of(env.proc.cwd);
     path.push(0);
     if (size as usize) < path.len() {
         return Err(abi::ERANGE);
@@ -904,7 +908,7 @@ fn sys_chmodat(
 }
 
 fn sys_fchmod(env: &mut LinuxEnv, fd: u64, mode: u64) -> SysResult {
-    let node = match env.fds.get(fd)?.desc.borrow().backing {
+    let node = match env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
         Backing::File { node } | Backing::Dir { node, .. } => node,
         _ => return Ok(0),
     };
@@ -915,8 +919,8 @@ fn sys_fchmod(env: &mut LinuxEnv, fd: u64, mode: u64) -> SysResult {
 // ── Descriptor management ───────────────────────────────────────────────────
 
 fn sys_dup(env: &mut LinuxEnv, fd: u64, min: u64, cloexec: bool) -> SysResult {
-    let entry = env.fds.get(fd)?.clone();
-    env.fds.insert_from(
+    let entry = env.proc.fds.borrow().get(fd)?.clone();
+    env.proc.fds.borrow_mut().insert_from(
         min as usize,
         FdEntry {
             desc: entry.desc,
@@ -925,16 +929,16 @@ fn sys_dup(env: &mut LinuxEnv, fd: u64, min: u64, cloexec: bool) -> SysResult {
     )
 }
 
-fn sys_dup2(env: &mut LinuxEnv, fd: u64, new_fd: u64) -> SysResult {
-    let entry = env.fds.get(fd)?.clone();
+fn sys_dup2(env: &mut LinuxEnv, fd: u64, new_fd: u64, cloexec: bool) -> SysResult {
+    let entry = env.proc.fds.borrow().get(fd)?.clone();
     if fd == new_fd {
         return Ok(new_fd);
     }
-    env.fds.insert_at(
+    env.proc.fds.borrow_mut().insert_at(
         new_fd,
         FdEntry {
             desc: entry.desc,
-            cloexec: false,
+            cloexec,
         },
     )
 }
@@ -943,18 +947,18 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
     match cmd {
         abi::F_DUPFD => sys_dup(env, fd, arg, false),
         abi::F_DUPFD_CLOEXEC => sys_dup(env, fd, arg, true),
-        abi::F_GETFD => Ok(if env.fds.get(fd)?.cloexec {
+        abi::F_GETFD => Ok(if env.proc.fds.borrow().get(fd)?.cloexec {
             abi::FD_CLOEXEC
         } else {
             0
         }),
         abi::F_SETFD => {
-            env.fds.get_mut(fd)?.cloexec = arg & abi::FD_CLOEXEC != 0;
+            env.proc.fds.borrow_mut().get_mut(fd)?.cloexec = arg & abi::FD_CLOEXEC != 0;
             Ok(0)
         }
-        abi::F_GETFL => Ok(env.fds.get(fd)?.desc.borrow().flags),
+        abi::F_GETFL => Ok(env.proc.fds.borrow().get(fd)?.desc.borrow().flags),
         abi::F_SETFL => {
-            let desc = env.fds.get(fd)?.desc.clone();
+            let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
             let mut desc = desc.borrow_mut();
             let keep = desc.flags & abi::O_ACCMODE;
             desc.flags = keep | (arg & (abi::O_APPEND | abi::O_NONBLOCK));
@@ -969,7 +973,7 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
 
 fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64) -> SysResult {
     let is_tty = matches!(
-        env.fds.get(fd)?.desc.borrow().backing,
+        env.proc.fds.borrow().get(fd)?.desc.borrow().backing,
         Backing::Std(StdStream::Out) | Backing::Std(StdStream::Err) | Backing::Dev(Dev::Tty)
     );
     if !is_tty {
@@ -1020,7 +1024,7 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
     for record in records.chunks_exact_mut(8) {
         let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
         let events = u16::from_le_bytes(record[4..6].try_into().expect("chunk size"));
-        let revents = match env.fds.get(fd as u32 as u64) {
+        let revents = match env.proc.fds.borrow().get(fd as u32 as u64) {
             Err(_) => POLLNVAL,
             Ok(entry) => {
                 let desc = entry.desc.borrow();
@@ -1079,7 +1083,7 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             tracing::warn!("mmap: MAP_SHARED file mappings are not supported");
             return Err(abi::ENOSYS);
         }
-        let node = match env.fds.get(fd)?.desc.borrow().backing {
+        let node = match env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
             Backing::File { node } => node,
             _ => return Err(abi::EBADF),
         };
@@ -1124,11 +1128,11 @@ fn sys_mprotect(cpu: &mut Cpu, addr: u64, len: u64, prot: u64) -> SysResult {
 }
 
 fn sys_brk(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> SysResult {
-    if addr == 0 || addr <= env.brk_end {
-        return Ok(env.brk_end);
+    if addr == 0 || addr <= env.proc.brk_end {
+        return Ok(env.proc.brk_end);
     }
     let new_end = align_up(addr, PAGE_SIZE);
-    let cur_end = align_up(env.brk_end, PAGE_SIZE);
+    let cur_end = align_up(env.proc.brk_end, PAGE_SIZE);
     if new_end > cur_end {
         let ok = cpu.mem.map_memory_len(
             cur_end,
@@ -1139,10 +1143,10 @@ fn sys_brk(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> SysResult {
             },
         );
         if !ok {
-            return Ok(env.brk_end);
+            return Ok(env.proc.brk_end);
         }
     }
-    env.brk_end = addr;
+    env.proc.brk_end = addr;
     Ok(addr)
 }
 
@@ -1156,14 +1160,19 @@ fn sys_rt_sigaction(
     old: u64,
 ) -> SysResult {
     if old != 0 {
-        let previous = env.sigactions.get(&signal).copied().unwrap_or_default();
+        let previous = env
+            .proc
+            .sigactions
+            .get(&signal)
+            .copied()
+            .unwrap_or_default();
         write_mem(cpu, old, &previous.0)?;
     }
     if new != 0 {
         let bytes = read_mem(cpu, new, 32)?;
         let mut action = SigAction::default();
         action.0.copy_from_slice(&bytes);
-        env.sigactions.insert(signal, action);
+        env.proc.sigactions.insert(signal, action);
     }
     Ok(0)
 }
@@ -1176,15 +1185,15 @@ fn sys_rt_sigprocmask(
     old: u64,
 ) -> SysResult {
     if old != 0 {
-        write_mem(cpu, old, &env.sigmask.to_le_bytes())?;
+        write_mem(cpu, old, &env.proc.sigmask.to_le_bytes())?;
     }
     if new != 0 {
         let bytes = read_mem(cpu, new, 8)?;
         let mask = u64::from_le_bytes(bytes.try_into().expect("read_mem length"));
-        env.sigmask = match how {
-            0 => env.sigmask | mask,  // SIG_BLOCK
-            1 => env.sigmask & !mask, // SIG_UNBLOCK
-            2 => mask,                // SIG_SETMASK
+        env.proc.sigmask = match how {
+            0 => env.proc.sigmask | mask,  // SIG_BLOCK
+            1 => env.proc.sigmask & !mask, // SIG_UNBLOCK
+            2 => mask,                     // SIG_SETMASK
             _ => return Err(abi::EINVAL),
         };
     }
@@ -1248,4 +1257,580 @@ fn sys_prlimit64(cpu: &mut Cpu, new: u64, old: u64) -> SysResult {
     }
     let _ = new; // limits are accepted but not enforced
     Ok(0)
+}
+
+// ── Processes, threads, and scheduling (milestone 4) ────────────────────────
+
+use crate::proc::{ParkState, ParkedTask, Process, Zombie, ROOT_PID};
+
+/// `syscall` encodes as `0f 05`; rewinding NEXT_PC by its length makes the
+/// guest re-execute the instruction, giving blocking syscalls restart
+/// semantics (the condition is re-checked on wakeup).
+const SYSCALL_INSN_LEN: u64 = 2;
+
+const CLONE_VM: u64 = 0x100;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+const WNOHANG: u64 = 1;
+
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+
+fn encode_exit_status(code: u64) -> i32 {
+    ((code as i32) & 0xff) << 8
+}
+
+pub(crate) struct CloneSpec {
+    flags: u64,
+    new_sp: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    tls: u64,
+}
+
+impl CloneSpec {
+    pub(crate) fn fork() -> Self {
+        Self {
+            flags: 0,
+            new_sp: 0,
+            parent_tid: 0,
+            child_tid: 0,
+            tls: 0,
+        }
+    }
+
+    /// x86-64 argument order: flags, new_sp, parent_tid, child_tid, tls.
+    pub(crate) fn from_clone_args(a: [u64; 6]) -> Self {
+        Self {
+            flags: a[0],
+            new_sp: a[1],
+            parent_tid: a[2],
+            child_tid: a[3],
+            tls: a[4],
+        }
+    }
+}
+
+/// Prepares the current CPU state so that, when this task is next resumed,
+/// it continues after the syscall (`restart = false`) or re-executes it
+/// (`restart = true`).
+fn prepare_resume(env: &LinuxEnv, cpu: &mut Cpu, restart: bool) {
+    let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
+    let resume = if restart {
+        next_pc - SYSCALL_INSN_LEN
+    } else {
+        next_pc
+    };
+    let _ = &env.regs; // resume state is register-only
+    cpu.write_var(cpu.arch.reg_next_pc, resume);
+    cpu.write_pc(resume);
+    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, resume);
+    cpu.pending_exception = None;
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
+}
+
+/// Parks the current task (CPU snapshot + memory map) with `state`.
+fn park_current(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState) {
+    let snapshot = cpu.snapshot();
+    let mem = cpu.mem.take_virtual_mapping();
+    let proc = std::mem::replace(&mut env.proc, Process::initial());
+    env.sched.parked.push(ParkedTask {
+        proc,
+        cpu: snapshot,
+        mem,
+        state,
+    });
+}
+
+/// Restores the first ready task onto the CPU. Returns false when nothing
+/// is runnable.
+fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
+    let Some(index) = env.sched.find_ready() else {
+        return false;
+    };
+    let task = env.sched.parked.remove(index);
+    // The instruction counter is global (energy, limits, deterministic
+    // time); it must never rewind on a task switch.
+    let icount = cpu.icount;
+    cpu.mem.restore_virtual_mapping(task.mem);
+    cpu.restore(&task.cpu);
+    cpu.icount = icount;
+    env.proc = task.proc;
+    true
+}
+
+/// Parks the current task and hands the CPU to the next ready one.
+fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart: bool) -> Outcome {
+    prepare_resume(env, cpu, restart);
+    park_current(env, cpu, state);
+    if schedule_next(env, cpu) {
+        Outcome::Switched
+    } else {
+        tracing::error!("deadlock: every task is blocked; halting");
+        env.record_exit(-1);
+        Outcome::Exit(VmExit::Deadlock)
+    }
+}
+
+/// Terminates the current task. Threads disappear silently (after their
+/// clear-child-tid futex wake); process main threads become zombies and
+/// wake their parent. The root process ends the machine.
+fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -> Outcome {
+    // pthread_join waits on this address.
+    if env.proc.clear_child_tid != 0 {
+        let addr = env.proc.clear_child_tid;
+        let _ = write_mem(cpu, addr, &0_u32.to_le_bytes());
+        env.sched.futex_wake(addr, u64::MAX);
+    }
+
+    let (pid, tgid, ppid) = (env.proc.pid, env.proc.tgid, env.proc.ppid);
+    if exit_group {
+        // Kill sibling threads (same thread group) that are parked.
+        env.sched.parked.retain(|t| t.proc.tgid != tgid);
+    }
+
+    let group_leader = pid == tgid;
+    if tgid == ROOT_PID && (exit_group || group_leader) {
+        env.record_exit(status >> 8);
+        tracing::debug!("root process exited with status {status:#x}");
+        return Outcome::Exit(VmExit::Halt);
+    }
+
+    if group_leader || exit_group {
+        env.sched.zombies.push(Zombie {
+            pid: tgid,
+            ppid,
+            status,
+        });
+    }
+    tracing::debug!("task {pid} exited (status {status:#x})");
+
+    if schedule_next(env, cpu) {
+        Outcome::Switched
+    } else {
+        tracing::error!("deadlock: last runnable task exited but the root is still parked");
+        env.record_exit(-1);
+        Outcome::Exit(VmExit::Deadlock)
+    }
+}
+
+fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome {
+    let child_pid = env.sched.next_pid();
+    let is_thread = spec.flags & CLONE_VM != 0;
+
+    if spec.flags & CLONE_PARENT_SETTID != 0
+        && spec.parent_tid != 0
+        && write_mem(cpu, spec.parent_tid, &(child_pid as u32).to_le_bytes()).is_err()
+    {
+        return Outcome::Ret(Err(abi::EFAULT));
+    }
+
+    let mut child_proc = if is_thread {
+        env.proc.thread_sibling(child_pid)
+    } else {
+        env.proc.fork_child(child_pid)
+    };
+    if spec.flags & CLONE_CHILD_CLEARTID != 0 {
+        child_proc.clear_child_tid = spec.child_tid;
+    }
+
+    // Parent: resumes after the syscall with the child pid in RAX.
+    cpu.write_var(env.regs.rax, child_pid);
+    prepare_resume(env, cpu, false);
+
+    // Child memory: threads share the map; forks get a copy-on-write clone.
+    let child_mem = if is_thread {
+        cpu.mem.mapping.clone()
+    } else {
+        cpu.mem.snapshot_virtual_mapping()
+    };
+
+    park_current(env, cpu, ParkState::Ready);
+
+    // Continue as the child.
+    cpu.mem.restore_virtual_mapping(child_mem);
+    env.proc = child_proc;
+    if spec.new_sp != 0 {
+        cpu.write_var(env.regs.rsp, spec.new_sp);
+    }
+    if spec.flags & CLONE_SETTLS != 0 {
+        cpu.write_var(env.regs.fs_offset, spec.tls);
+    }
+    if spec.flags & CLONE_CHILD_SETTID != 0 && spec.child_tid != 0 {
+        let _ = write_mem(cpu, spec.child_tid, &(child_pid as u32).to_le_bytes());
+    }
+    tracing::debug!(
+        "spawned {} {child_pid} from {}",
+        if is_thread { "thread" } else { "process" },
+        env.proc.ppid,
+    );
+    Outcome::Ret(Ok(0))
+}
+
+/// Reads a NUL-terminated array of string pointers (argv/envp layout).
+fn read_string_vec(cpu: &mut Cpu, mut ptr: u64) -> Result<Vec<Vec<u8>>, u64> {
+    let mut out = Vec::new();
+    if ptr == 0 {
+        return Ok(out);
+    }
+    while out.len() < 4096 {
+        let entry = read_mem(cpu, ptr, 8)?;
+        let addr = u64::from_le_bytes(entry.try_into().expect("read_mem length"));
+        if addr == 0 {
+            return Ok(out);
+        }
+        out.push(read_cstr(cpu, addr)?);
+        ptr += 8;
+    }
+    Err(abi::E2BIG)
+}
+
+fn sys_execve(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> Outcome {
+    let (path, argv, envp) = match (|| {
+        Ok::<_, u64>((
+            path_arg(cpu, path_ptr)?,
+            read_string_vec(cpu, argv_ptr)?,
+            read_string_vec(cpu, envp_ptr)?,
+        ))
+    })() {
+        Ok(v) => v,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+
+    // Validate before the point of no return: the file must exist and be an
+    // ELF we could plausibly run.
+    let node = match env.vfs.resolve(env.proc.cwd, &path, true) {
+        Ok(resolved) => match resolved.node {
+            Some(node) => node,
+            None => return Outcome::Ret(Err(abi::ENOENT)),
+        },
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    match &env.vfs.node(node).kind {
+        NodeKind::File(data) if data.len() >= 4 && data[..4] == *b"\x7fELF" => {}
+        NodeKind::File(_) => return Outcome::Ret(Err(abi::ENOEXEC)),
+        NodeKind::Dir(_) => return Outcome::Ret(Err(abi::EISDIR)),
+        _ => return Outcome::Ret(Err(abi::EACCES)),
+    }
+
+    // Point of no return: replace the process image.
+    env.proc.argv = argv;
+    env.proc.envp = envp;
+    env.proc.sigactions.clear();
+    env.proc.fds.borrow_mut().close_cloexec();
+
+    // The instruction counter must survive the CPU reset inside the loader.
+    let icount = cpu.icount;
+    let result = env.start_image(cpu, &path);
+    cpu.icount = icount;
+
+    match result {
+        Ok(()) => {
+            // Fresh registers; enter the new image at its entry point.
+            let entry = cpu.read_pc();
+            cpu.exception = Exception::new(ExceptionCode::ExternalAddr, entry);
+            cpu.pending_exception = None;
+            cpu.block_id = u64::MAX;
+            cpu.block_offset = 0;
+            tracing::debug!("pid {} execve {}", env.proc.pid, path.escape_ascii());
+            Outcome::Switched
+        }
+        Err(e) => {
+            // The old image is already gone; the process cannot continue.
+            tracing::error!("execve failed after commit: {e}");
+            task_exit(env, cpu, encode_exit_status(127), true)
+        }
+    }
+}
+
+fn sys_wait4(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    pid: u64,
+    status_ptr: u64,
+    options: u64,
+) -> Outcome {
+    let filter = pid as u32 as i32 as i64;
+    if filter == 0 || filter < -1 {
+        // Process groups are not modeled; treat as "any child".
+    }
+    let filter = if filter > 0 { filter } else { -1 };
+
+    if let Some(zombie) = env.sched.take_zombie(env.proc.tgid, filter) {
+        if status_ptr != 0 {
+            if let Err(errno) = write_mem(cpu, status_ptr, &zombie.status.to_le_bytes()) {
+                return Outcome::Ret(Err(errno));
+            }
+        }
+        return Outcome::Ret(Ok(zombie.pid));
+    }
+    if !env.sched.has_child(env.proc.tgid, filter) {
+        return Outcome::Ret(Err(abi::ECHILD));
+    }
+    if options & WNOHANG != 0 {
+        return Outcome::Ret(Ok(0));
+    }
+    block_and_switch(env, cpu, ParkState::WaitChild { pid: filter }, true)
+}
+
+fn sys_pipe(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, flags: u64) -> SysResult {
+    use crate::fd::PipeInner;
+
+    let inner: crate::fd::PipeRef = std::rc::Rc::new(std::cell::RefCell::new(PipeInner {
+        data: Default::default(),
+        readers: 1,
+        writers: 1,
+    }));
+    let cloexec = flags & abi::O_CLOEXEC != 0;
+    let make = |write_end: bool| FdEntry {
+        desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
+            backing: Backing::Pipe {
+                inner: std::rc::Rc::clone(&inner),
+                write_end,
+            },
+            offset: 0,
+            flags: if write_end {
+                abi::O_WRONLY
+            } else {
+                abi::O_RDONLY
+            } | (flags & abi::O_NONBLOCK),
+        })),
+        cloexec,
+    };
+    let read_fd = env.proc.fds.borrow_mut().insert(make(false))?;
+    let write_fd = env.proc.fds.borrow_mut().insert(make(true))?;
+
+    let mut buf = [0_u8; 8];
+    buf[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
+    buf[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
+    if let Err(errno) = write_mem(cpu, fds_ptr, &buf) {
+        let mut fds = env.proc.fds.borrow_mut();
+        let _ = fds.close(read_fd);
+        let _ = fds.close(write_fd);
+        return Err(errno);
+    }
+    Ok(0)
+}
+
+/// `read` with pipe support: blocks (with restart) on an empty pipe that
+/// still has writers.
+fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let (pipe, nonblock) = {
+        let desc = desc.borrow();
+        if !desc.readable() {
+            return Outcome::Ret(Err(abi::EBADF));
+        }
+        match &desc.backing {
+            Backing::Pipe {
+                inner,
+                write_end: false,
+            } => (
+                Some(std::rc::Rc::clone(inner)),
+                desc.flags & abi::O_NONBLOCK != 0,
+            ),
+            Backing::Pipe { .. } => return Outcome::Ret(Err(abi::EBADF)),
+            _ => (None, false),
+        }
+    };
+    let Some(pipe) = pipe else {
+        return Outcome::Ret(sys_read(env, cpu, fd, buf, count));
+    };
+
+    let chunk: Vec<u8> = {
+        let mut inner = pipe.borrow_mut();
+        if inner.data.is_empty() {
+            if inner.writers == 0 {
+                return Outcome::Ret(Ok(0)); // EOF
+            }
+            if nonblock {
+                return Outcome::Ret(Err(abi::EAGAIN));
+            }
+            drop(inner);
+            return block_and_switch(env, cpu, ParkState::PipeRead { pipe }, true);
+        }
+        let take = (count as usize).min(inner.data.len()).min(0x40_0000);
+        inner.data.drain(..take).collect()
+    };
+    if let Err(errno) = write_mem(cpu, buf, &chunk) {
+        return Outcome::Ret(Err(errno));
+    }
+    Outcome::Ret(Ok(chunk.len() as u64))
+}
+
+/// `write` with pipe support: EPIPE with no readers, partial writes when
+/// the buffer has some room, blocks (with restart) when it has none.
+fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let (pipe, nonblock) = {
+        let desc = desc.borrow();
+        if !desc.writable() {
+            return Outcome::Ret(Err(abi::EBADF));
+        }
+        match &desc.backing {
+            Backing::Pipe {
+                inner,
+                write_end: true,
+            } => (
+                Some(std::rc::Rc::clone(inner)),
+                desc.flags & abi::O_NONBLOCK != 0,
+            ),
+            Backing::Pipe { .. } => return Outcome::Ret(Err(abi::EBADF)),
+            _ => (None, false),
+        }
+    };
+    let Some(pipe) = pipe else {
+        return Outcome::Ret(sys_write(env, cpu, fd, buf, count));
+    };
+
+    let room = {
+        let inner = pipe.borrow();
+        if inner.readers == 0 {
+            // Signal delivery is not modeled; report the error directly.
+            return Outcome::Ret(Err(abi::EPIPE));
+        }
+        crate::PIPE_CAPACITY.saturating_sub(inner.data.len())
+    };
+    if room == 0 {
+        if nonblock {
+            return Outcome::Ret(Err(abi::EAGAIN));
+        }
+        return block_and_switch(env, cpu, ParkState::PipeWrite { pipe }, true);
+    }
+    let take = (count as usize).min(room).min(0x40_0000);
+    let bytes = match read_mem(cpu, buf, take) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    pipe.borrow_mut().data.extend(bytes.iter().copied());
+    Outcome::Ret(Ok(take as u64))
+}
+
+fn sys_futex(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    op: u64,
+    val: u64,
+    _mask: u64,
+) -> Outcome {
+    const FUTEX_CMD_MASK: u64 = 0x7f; // strips PRIVATE / CLOCK_REALTIME bits
+    match op & FUTEX_CMD_MASK {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            let current = match read_mem(cpu, addr, 4) {
+                Ok(bytes) => u32::from_le_bytes(bytes.try_into().expect("read_mem length")),
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            if current != val as u32 {
+                return Outcome::Ret(Err(abi::EAGAIN));
+            }
+            // Timeouts are ignored: time only advances with executed
+            // instructions, so a timed wait either wakes or deadlocks.
+            block_and_switch(env, cpu, ParkState::Futex { addr, woken: false }, true)
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => Outcome::Ret(Ok(env.sched.futex_wake(addr, val))),
+        cmd => {
+            tracing::warn!("unimplemented futex op {cmd}");
+            Outcome::Ret(Err(abi::ENOSYS))
+        }
+    }
+}
+
+fn sys_yield(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
+    if env.sched.find_ready().is_none() {
+        return Outcome::Ret(Ok(0));
+    }
+    cpu.write_var(env.regs.rax, 0_u64);
+    block_and_switch(env, cpu, ParkState::Ready, false)
+}
+
+/// `kill`/`tgkill`. Self-directed fatal signals terminate the caller
+/// (handler delivery is not modeled); signals to parked tasks terminate
+/// them at once with 128 + signal semantics.
+fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outcome {
+    let target = target as u32 as i32 as i64;
+    if signal == 0 {
+        // Existence probe.
+        let exists = target == env.proc.tgid as i64
+            || env
+                .sched
+                .parked
+                .iter()
+                .any(|t| t.proc.tgid as i64 == target);
+        return Outcome::Ret(if exists { Ok(0) } else { Err(abi::ESRCH) });
+    }
+    if target == env.proc.tgid as i64 || target == env.proc.pid as i64 {
+        tracing::warn!("task killed itself with signal {signal} (no handler delivery)");
+        return task_exit(env, cpu, 128 + signal as i32, true);
+    }
+    if target <= 0 {
+        // Group signals are not modeled.
+        return Outcome::Ret(Err(abi::ESRCH));
+    }
+
+    let target = target as u64;
+    let mut found = false;
+    let mut index = 0;
+    while index < env.sched.parked.len() {
+        if env.sched.parked[index].proc.tgid == target {
+            let task = env.sched.parked.remove(index);
+            found = true;
+            if task.proc.pid == task.proc.tgid {
+                env.sched.zombies.push(Zombie {
+                    pid: task.proc.tgid,
+                    ppid: task.proc.ppid,
+                    status: 128 + signal as i32,
+                });
+            }
+        } else {
+            index += 1;
+        }
+    }
+    Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) })
+}
+
+/// `readv`/`writev` via the pipe-aware single-buffer path: exactly one
+/// non-empty segment is processed per call (a short transfer, which POSIX
+/// permits; callers loop). This keeps blocking restarts idempotent.
+fn outcome_vectored(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    fd: u64,
+    iov: u64,
+    iovcnt: u64,
+    write: bool,
+) -> Outcome {
+    let entries = match iter_iov(cpu, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    for (base, len) in entries {
+        if len == 0 {
+            continue;
+        }
+        return if write {
+            outcome_write(env, cpu, fd, base, len)
+        } else {
+            outcome_read(env, cpu, fd, base, len)
+        };
+    }
+    Outcome::Ret(Ok(0))
 }

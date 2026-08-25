@@ -15,6 +15,19 @@ pub enum StdStream {
     Err,
 }
 
+/// Shared buffer between the two ends of a pipe. Endpoint counts track live
+/// open file descriptions, not descriptors: `dup` and `fork` share
+/// descriptions, so the counts change only when a description is created or
+/// dropped.
+#[derive(Debug, Default)]
+pub struct PipeInner {
+    pub data: std::collections::VecDeque<u8>,
+    pub readers: u32,
+    pub writers: u32,
+}
+
+pub type PipeRef = Rc<RefCell<PipeInner>>;
+
 #[derive(Debug)]
 pub enum Backing {
     /// Host-visible standard stream. Stdin reads EOF; out/err append to the
@@ -27,6 +40,8 @@ pub enum Backing {
     Dir { node: usize, cookie: u64 },
     /// Character device.
     Dev(Dev),
+    /// One end of an in-memory pipe.
+    Pipe { inner: PipeRef, write_end: bool },
 }
 
 #[derive(Debug)]
@@ -47,6 +62,22 @@ impl Description {
     }
 }
 
+impl Drop for Description {
+    fn drop(&mut self) {
+        // The last descriptor of a pipe end closing changes the peer's
+        // readiness (EOF for readers, EPIPE for writers); blocked tasks
+        // re-check at the next scheduling point.
+        if let Backing::Pipe { inner, write_end } = &self.backing {
+            let mut inner = inner.borrow_mut();
+            if *write_end {
+                inner.writers = inner.writers.saturating_sub(1);
+            } else {
+                inner.readers = inner.readers.saturating_sub(1);
+            }
+        }
+    }
+}
+
 pub type Ofd = Rc<RefCell<Description>>;
 
 #[derive(Clone)]
@@ -57,6 +88,16 @@ pub struct FdEntry {
 
 pub struct FdTable {
     entries: Vec<Option<FdEntry>>,
+}
+
+impl Clone for FdTable {
+    /// `fork` semantics: the child gets its own descriptor table, but every
+    /// entry shares the parent's open file descriptions (offsets included).
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+        }
+    }
 }
 
 const FD_LIMIT: usize = 1024;
@@ -131,6 +172,15 @@ impl FdTable {
         }
         self.entries[fd] = Some(entry);
         Ok(fd as u64)
+    }
+
+    /// Drops every descriptor marked close-on-exec (used by `execve`).
+    pub fn close_cloexec(&mut self) {
+        for slot in &mut self.entries {
+            if slot.as_ref().is_some_and(|entry| entry.cloexec) {
+                *slot = None;
+            }
+        }
     }
 
     pub fn close(&mut self, fd: u64) -> Result<(), u64> {

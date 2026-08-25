@@ -2,18 +2,20 @@
 //!
 //! Implements the operating-system side of the Linux ABI over the
 //! `x64-engine` virtual CPU: an in-memory VFS, file descriptors with Linux
-//! open-file-description semantics, process state, and the syscall surface
-//! required by static userlands such as BusyBox (roadmap milestone 2).
+//! open-file-description semantics, and processes, threads, pipes, and
+//! futexes over a deterministic cooperative scheduler (roadmap milestones
+//! 2–4). Dynamically linked binaries start through the system dynamic
+//! loader (milestone 3).
 //!
 //! Unsupported syscalls return `-ENOSYS` with a log line — never fake
-//! success. Process management (`fork`, `execve`, `wait4`, pipes) is the
-//! milestone-4 boundary and is intentionally absent.
+//! success.
 //!
 //! This crate supersedes the milestone-1 `linux_min` environment and is the
 //! portable rebuild of the native kernel's `src/linux_compat` substrate.
 
 pub mod abi;
 pub mod fd;
+pub mod proc;
 pub mod syscall;
 pub mod vfs;
 
@@ -30,13 +32,15 @@ use x64_engine::{
     classify_exit, CpuExit, EngineConfig, InterpVm,
 };
 
-use fd::FdTable;
+use proc::{Process, Scheduler};
 use vfs::{NodeKind, Vfs};
 
-const PAGE_SIZE: u64 = 0x1000;
+pub(crate) const PAGE_SIZE: u64 = 0x1000;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
 const STACK_SIZE: u64 = 0x80_0000; // 8 MiB
-const MMAP_BASE: u64 = 0x6000_0000_0000;
+pub(crate) const MMAP_BASE: u64 = 0x6000_0000_0000;
+/// A pipe write blocks once this much data is buffered.
+pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
 
 /// Deterministic wall-clock base (fixed, not host time).
 const EPOCH_BASE_SEC: i64 = 1_755_000_000;
@@ -77,23 +81,17 @@ impl Regs {
 
 /// Stored `rt_sigaction` registration (handler, flags, restorer, mask).
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SigAction(pub [u8; 32]);
+pub struct SigAction(pub [u8; 32]);
 
 pub struct LinuxEnv {
     pub(crate) regs: Regs,
     pub vfs: Vfs,
-    pub(crate) fds: FdTable,
-    pub(crate) cwd: usize,
-    pub(crate) umask: u32,
-    pub(crate) brk_end: u64,
-    pub(crate) mmap_next: u64,
+    /// The task currently executing on the CPU.
+    pub(crate) proc: Process,
+    pub(crate) sched: Scheduler,
     pub(crate) rng_state: u64,
-    pub(crate) sigactions: HashMap<u64, SigAction>,
-    pub(crate) sigmask: u64,
-    pub(crate) exe_path: Vec<u8>,
-    argv: Vec<Vec<u8>>,
-    envp: Vec<Vec<u8>>,
     pub(crate) output: Vec<u8>,
+    /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
 
@@ -102,25 +100,17 @@ impl LinuxEnv {
         Ok(Self {
             regs: Regs::resolve(cpu)?,
             vfs: Vfs::new(),
-            fds: FdTable::new(),
-            cwd: vfs::ROOT,
-            umask: 0o022,
-            brk_end: 0,
-            mmap_next: MMAP_BASE,
+            proc: Process::initial(),
+            sched: Scheduler::new(),
             rng_state: 0x9e37_79b9_7f4a_7c15,
-            sigactions: HashMap::new(),
-            sigmask: 0,
-            exe_path: Vec::new(),
-            argv: Vec::new(),
-            envp: Vec::new(),
             output: Vec::new(),
             exit_code: None,
         })
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
-        self.argv = argv;
-        self.envp = envp;
+        self.proc.argv = argv;
+        self.proc.envp = envp;
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
@@ -162,9 +152,63 @@ impl LinuxEnv {
     }
 
     pub(crate) fn alloc_mmap(&mut self, len: u64) -> u64 {
-        let target = self.mmap_next;
-        self.mmap_next += align_up(len, PAGE_SIZE) + PAGE_SIZE;
+        let target = self.proc.mmap_next;
+        self.proc.mmap_next += align_up(len, PAGE_SIZE) + PAGE_SIZE;
         target
+    }
+
+    /// Loads `path` into a fresh address space for the current task and
+    /// prepares registers and the initial stack. Shared by `load` (initial
+    /// process) and `execve`.
+    pub(crate) fn start_image(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<(), String> {
+        cpu.mem.reset_virtual();
+        cpu.reset();
+
+        // Null page: faults with a permission error instead of unmapped.
+        cpu.mem.map_memory_len(
+            0,
+            PAGE_SIZE,
+            Mapping {
+                perm: perm::NONE,
+                value: 0,
+            },
+        );
+
+        let metadata = self.load_elf(cpu, path)?;
+
+        self.proc.exe_path = if path.first() == Some(&b'/') {
+            path.to_vec()
+        } else {
+            let mut abs = self.vfs.abs_path_of(self.proc.cwd);
+            if abs != b"/" {
+                abs.push(b'/');
+            }
+            abs.extend_from_slice(path);
+            abs
+        };
+        if self.proc.argv.is_empty() {
+            self.proc.argv = vec![path.to_vec()];
+        }
+
+        // Dynamically linked binaries start in the interpreter; auxv points
+        // the loader at the main image.
+        let entry = metadata
+            .interpreter
+            .as_ref()
+            .map_or(metadata.binary.entry_ptr, |interp| interp.entry_ptr);
+        (cpu.arch.on_boot)(cpu, entry);
+        self.setup_stack(cpu, &metadata)?;
+
+        let image_end = metadata.interpreter.as_ref().map_or(
+            metadata.binary.base_ptr + metadata.binary.length,
+            |interp| {
+                (metadata.binary.base_ptr + metadata.binary.length)
+                    .max(interp.base_ptr + interp.length)
+            },
+        );
+        self.proc.brk_end = align_up(image_end, PAGE_SIZE) + 0x10_0000;
+        self.proc.mmap_next = MMAP_BASE;
+        Ok(())
     }
 
     /// Builds the initial process stack per the System V x86-64 ABI.
@@ -195,14 +239,14 @@ impl LinuxEnv {
             Ok(write_top)
         };
 
-        let mut argv_ptrs = Vec::with_capacity(self.argv.len());
-        for arg in &self.argv {
+        let mut argv_ptrs = Vec::with_capacity(self.proc.argv.len());
+        for arg in &self.proc.argv {
             let mut bytes = arg.clone();
             bytes.push(0);
             argv_ptrs.push(push_bytes(cpu, &bytes)?);
         }
-        let mut envp_ptrs = Vec::with_capacity(self.envp.len());
-        for env in &self.envp {
+        let mut envp_ptrs = Vec::with_capacity(self.proc.envp.len());
+        for env in &self.proc.envp {
             let mut bytes = env.clone();
             bytes.push(0);
             envp_ptrs.push(push_bytes(cpu, &bytes)?);
@@ -212,7 +256,7 @@ impl LinuxEnv {
         random[..8].copy_from_slice(&self.next_random().to_le_bytes());
         random[8..].copy_from_slice(&self.next_random().to_le_bytes());
         let random_ptr = push_bytes(cpu, &random)?;
-        let mut execfn = self.exe_path.clone();
+        let mut execfn = self.proc.exe_path.clone();
         execfn.push(0);
         let execfn_ptr = push_bytes(cpu, &execfn)?;
         let platform_ptr = push_bytes(cpu, b"x86_64\0")?;
@@ -266,7 +310,7 @@ impl LinuxEnv {
         ];
 
         let mut vectors: Vec<u64> = Vec::new();
-        vectors.push(self.argv.len() as u64);
+        vectors.push(self.proc.argv.len() as u64);
         vectors.extend(&argv_ptrs);
         vectors.push(0);
         vectors.extend(&envp_ptrs);
@@ -291,7 +335,7 @@ impl ElfLoader for LinuxEnv {
     fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, String> {
         let resolved = self
             .vfs
-            .resolve(self.cwd, path, true)
+            .resolve(self.proc.cwd, path, true)
             .map_err(|e| format!("cannot resolve {}: errno {e}", path.escape_ascii()))?;
         let node = resolved
             .node
@@ -305,55 +349,18 @@ impl ElfLoader for LinuxEnv {
 
 impl Environment for LinuxEnv {
     fn load(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<(), String> {
-        cpu.mem.reset_virtual();
-        cpu.reset();
-
-        // Null page: faults with a permission error instead of unmapped.
-        cpu.mem.map_memory_len(
-            0,
-            PAGE_SIZE,
-            Mapping {
-                perm: perm::NONE,
-                value: 0,
-            },
+        // A fresh root process; the filesystem persists across loads, any
+        // tasks from a previous run do not.
+        let (argv, envp) = (
+            std::mem::take(&mut self.proc.argv),
+            std::mem::take(&mut self.proc.envp),
         );
-
-        let metadata = self.load_elf(cpu, path)?;
-
-        self.exe_path = if path.first() == Some(&b'/') {
-            path.to_vec()
-        } else {
-            let mut abs = self.vfs.abs_path_of(self.cwd);
-            if abs != b"/" {
-                abs.push(b'/');
-            }
-            abs.extend_from_slice(path);
-            abs
-        };
-        if self.argv.is_empty() {
-            self.argv = vec![path.to_vec()];
-        }
-
-        // Dynamically linked binaries start in the interpreter; auxv points
-        // the loader at the main image.
-        let entry = metadata
-            .interpreter
-            .as_ref()
-            .map_or(metadata.binary.entry_ptr, |interp| interp.entry_ptr);
-        (cpu.arch.on_boot)(cpu, entry);
-        self.setup_stack(cpu, &metadata)?;
-
-        let image_end = metadata.interpreter.as_ref().map_or(
-            metadata.binary.base_ptr + metadata.binary.length,
-            |interp| {
-                (metadata.binary.base_ptr + metadata.binary.length)
-                    .max(interp.base_ptr + interp.length)
-            },
-        );
-        self.brk_end = align_up(image_end, PAGE_SIZE) + 0x10_0000;
-        self.fds = FdTable::new();
+        self.proc = Process::initial();
+        self.proc.argv = argv;
+        self.proc.envp = envp;
+        self.sched = Scheduler::new();
         self.exit_code = None;
-        Ok(())
+        self.start_image(cpu, path)
     }
 
     fn handle_exception(&mut self, cpu: &mut Cpu) -> Option<VmExit> {
@@ -467,7 +474,7 @@ impl Machine {
         self.env().set_args(argv, envp);
     }
 
-    /// Loads a static ELF from the guest filesystem.
+    /// Loads a Linux ELF from the guest filesystem as a fresh root process.
     pub fn load(&mut self, path: &[u8]) -> Result<(), String> {
         let InterpVm { cpu, env, .. } = &mut self.vm;
         env.load(cpu, path)

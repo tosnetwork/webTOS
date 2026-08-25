@@ -8,6 +8,7 @@ description = "Portable Linux x86-64 userspace layer for webTOS: VFS, file descr
 [dependencies]
 x64-engine = { path = "../x64-engine" }
 icicle-cpu = { workspace = true }
+icicle-mem = { workspace = true }
 pcode = { workspace = true }
 tracing = { workspace = true }
 
