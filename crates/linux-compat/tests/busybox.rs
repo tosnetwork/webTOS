@@ -215,3 +215,30 @@ fn shell_redirection_persists_across_processes() {
     expect_clean(&run);
     assert_eq!(run.output, "persisted\n", "redirect roundtrip failed");
 }
+
+#[test]
+fn filesystem_snapshot_survives_a_new_machine() {
+    // Reload persistence: what a browser refresh does — serialize the
+    // filesystem, start a brand-new machine, restore, and read back.
+    let Some(image) = busybox() else { return };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+
+    let run = run_sequence(
+        &mut machine,
+        &["sh", "-c", "echo persisted-across-reload > /home/state.txt"],
+    );
+    expect_clean(&run);
+    let snapshot = machine.export_fs();
+
+    let mut reborn =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    reborn.import_fs(&snapshot).expect("snapshot import failed");
+    // BusyBox itself came from the snapshot — nothing is re-injected.
+    let run = run_sequence(&mut reborn, &["cat", "/home/state.txt"]);
+    expect_clean(&run);
+    assert_eq!(run.output, "persisted-across-reload\n");
+}

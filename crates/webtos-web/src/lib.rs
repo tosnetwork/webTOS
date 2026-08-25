@@ -35,6 +35,8 @@ struct HostState {
     machine: Option<Machine>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
+    /// Last exported filesystem snapshot; kept alive for the reader.
+    fs_image: Vec<u8>,
     /// Last drained guest output; kept alive so the pointer handed to JS
     /// stays valid until the next drain.
     output: Vec<u8>,
@@ -48,6 +50,7 @@ thread_local! {
             machine: None,
             argv: Vec::new(),
             envp: Vec::new(),
+            fs_image: Vec::new(),
             output: Vec::new(),
             error: String::new(),
             allocations: Vec::new(),
@@ -189,6 +192,45 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
     })
 }
 
+/// Serializes the guest filesystem for persistence; read the image via
+/// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
+#[no_mangle]
+pub extern "C" fn wtw_fs_export() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_fs_export called before wtw_init");
+        };
+        state.fs_image = machine.export_fs();
+        0
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_fs_ptr() -> u32 {
+    with_state(|state| state.fs_image.as_ptr() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_fs_len() -> u32 {
+    with_state(|state| state.fs_image.len() as u32)
+}
+
+/// Replaces the guest filesystem with a snapshot previously produced by
+/// `wtw_fs_export` (typically loaded from browser storage after a reload).
+#[no_mangle]
+pub extern "C" fn wtw_fs_import(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_fs_import called before wtw_init");
+        };
+        let bytes = unsafe { slice_arg(ptr, len) };
+        match machine.import_fs(&bytes) {
+            Ok(()) => 0,
+            Err(e) => fail(state, format!("filesystem import failed: {e}")),
+        }
+    })
+}
+
 /// Offset of the output drained by the last `wtw_run`.
 #[no_mangle]
 pub extern "C" fn wtw_output_ptr() -> u32 {
@@ -250,6 +292,7 @@ pub extern "C" fn wtw_reset() {
         state.machine = None;
         state.argv.clear();
         state.envp.clear();
+        state.fs_image.clear();
         state.output.clear();
         state.error.clear();
         state.allocations.clear();

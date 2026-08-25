@@ -45,6 +45,8 @@
 <div id="prompt-row">
   <input id="cmd" placeholder="busybox command, e.g.  ls /" disabled>
   <button id="run" disabled>Run</button>
+  <button id="save" disabled title="Snapshot the filesystem to browser storage; it is restored on reload">Save FS</button>
+  <button id="forget" disabled title="Delete the saved snapshot">Reset FS</button>
 </div>
 <div id="status">starting worker…</div>
 <div id="terminal"></div>
@@ -54,6 +56,8 @@
   const term = document.getElementById("terminal");
   const button = document.getElementById("run");
   const cmd = document.getElementById("cmd");
+  const save = document.getElementById("save");
+  const forget = document.getElementById("forget");
 
   const append = (text) => {
     term.textContent += text;
@@ -69,14 +73,21 @@
     if (msg.type === "ready") {
       button.disabled = false;
       cmd.disabled = false;
+      save.disabled = false;
+      forget.disabled = false;
       cmd.focus();
-      statusEl.textContent += " — filesystem ready, BusyBox at /bin/busybox";
+      statusEl.textContent += msg.restored
+        ? " — previous session restored, BusyBox at /bin/busybox"
+        : " — filesystem ready, BusyBox at /bin/busybox";
     }
     if (msg.type === "output") append(strip(msg.text));
     if (msg.type === "error") {
       statusEl.textContent = `error: ${msg.text}`;
       button.disabled = false;
       cmd.disabled = false;
+    }
+    if (msg.type === "persisted") {
+      statusEl.textContent = `filesystem saved (${msg.bytes.toLocaleString()} bytes) — survives reload`;
     }
     if (msg.type === "done") {
       statusEl.textContent =
@@ -135,6 +146,8 @@
   }
 
   button.addEventListener("click", runCommand);
+  save.addEventListener("click", () => worker.postMessage({ type: "persist" }));
+  forget.addEventListener("click", () => worker.postMessage({ type: "forget" }));
   cmd.addEventListener("keydown", (e) => {
     if (e.key === "Enter") runCommand();
   });

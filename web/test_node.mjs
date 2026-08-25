@@ -97,4 +97,42 @@ try {
   console.log("[node] alpine fixture missing (tools/fetch_alpine_rootfs.sh) — skipping dynamic check");
 }
 
+// Reload persistence: snapshot the filesystem, boot a brand-new module
+// instance (what a browser refresh does), restore, and read back.
+{
+  const run = bb("sh", "-c", "echo survived-the-reload > /home/state.txt");
+  expect("write state before reload", run);
+  if (e.wtw_fs_export() !== 0) throw new Error(`fs export: ${err()}`);
+  const snapshot = mem().slice(e.wtw_fs_ptr(), e.wtw_fs_ptr() + e.wtw_fs_len());
+  console.log(`[node] snapshot: ${snapshot.length.toLocaleString()} bytes`);
+
+  const fresh = await WebAssembly.instantiate(await readFile(wasmPath), {});
+  const f = fresh.instance.exports;
+  const fmem = () => new Uint8Array(f.memory.buffer);
+  const ftext = (ptr, len) => new TextDecoder().decode(fmem().slice(ptr, ptr + len));
+  const ferr = () => ftext(f.wtw_error_ptr(), f.wtw_error_len());
+  const fput = (bytes) => {
+    const data = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    const ptr = f.wtw_alloc(data.length);
+    fmem().set(data, ptr);
+    return [ptr, data.length];
+  };
+  if (f.wtw_init() !== 0) throw new Error(`reborn init: ${ferr()}`);
+  if (f.wtw_fs_import(...fput(snapshot)) !== 0) throw new Error(`fs import: ${ferr()}`);
+  for (const a of ["busybox", "cat", "/home/state.txt"]) f.wtw_arg(...fput(a));
+  f.wtw_env(...fput("PATH=/bin"));
+  if (f.wtw_load(...fput("/bin/busybox")) !== 0) throw new Error(`reborn load: ${ferr()}`);
+  let status;
+  let output = "";
+  do {
+    status = f.wtw_run(5_000_000);
+    output += ftext(f.wtw_output_ptr(), f.wtw_output_len());
+  } while (status === 0);
+  if (status !== 1 || f.wtw_exit_code() !== 0 || !output.includes("survived-the-reload")) {
+    console.error(`[node] FAILED reload persistence: ${JSON.stringify(output)} ${ferr()}`);
+    process.exit(1);
+  }
+  console.log(`[node] ok: reload persistence -> ${JSON.stringify(output)}`);
+}
+
 console.log("[node] PASS");

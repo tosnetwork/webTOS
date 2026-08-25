@@ -442,3 +442,146 @@ impl Default for Vfs {
         Self::new()
     }
 }
+
+// ── Whole-filesystem snapshots (browser reload persistence) ─────────────────
+
+const SNAPSHOT_MAGIC: &[u8; 4] = b"WTFS";
+const SNAPSHOT_VERSION: u32 = 1;
+
+impl Vfs {
+    /// Serializes the whole tree to a stable binary image (node indexes are
+    /// preserved, so open guest state must not be carried across a
+    /// restore — snapshots are taken between guest processes).
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4096);
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for node in &self.nodes {
+            out.extend_from_slice(&(node.parent as u64).to_le_bytes());
+            out.extend_from_slice(&node.mode.to_le_bytes());
+            out.extend_from_slice(&node.nlink.to_le_bytes());
+            out.extend_from_slice(&node.mtime_sec.to_le_bytes());
+            match &node.kind {
+                NodeKind::Dir(entries) => {
+                    out.push(1);
+                    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                    for (name, &child) in entries {
+                        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                        out.extend_from_slice(name);
+                        out.extend_from_slice(&(child as u64).to_le_bytes());
+                    }
+                }
+                NodeKind::File(data) => {
+                    out.push(2);
+                    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                    out.extend_from_slice(data);
+                }
+                NodeKind::Symlink(target) => {
+                    out.push(3);
+                    out.extend_from_slice(&(target.len() as u16).to_le_bytes());
+                    out.extend_from_slice(target);
+                }
+                NodeKind::CharDev(dev) => {
+                    out.push(4);
+                    out.push(match dev {
+                        Dev::Null => 0,
+                        Dev::Zero => 1,
+                        Dev::Tty => 2,
+                        Dev::Random => 3,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Restores a tree serialized by [`Vfs::serialize`].
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, String> {
+        struct Reader<'a>(&'a [u8]);
+        impl<'a> Reader<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+                if self.0.len() < n {
+                    return Err("truncated filesystem image".into());
+                }
+                let (head, rest) = self.0.split_at(n);
+                self.0 = rest;
+                Ok(head)
+            }
+            fn u8(&mut self) -> Result<u8, String> {
+                Ok(self.take(1)?[0])
+            }
+            fn u16(&mut self) -> Result<u16, String> {
+                Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("size")))
+            }
+            fn u32(&mut self) -> Result<u32, String> {
+                Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("size")))
+            }
+            fn u64(&mut self) -> Result<u64, String> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("size")))
+            }
+        }
+
+        let mut r = Reader(bytes);
+        if r.take(4)? != SNAPSHOT_MAGIC {
+            return Err("not a filesystem image".into());
+        }
+        if r.u32()? != SNAPSHOT_VERSION {
+            return Err("unsupported filesystem image version".into());
+        }
+        let count = r.u32()? as usize;
+        if count == 0 || count > 4_000_000 {
+            return Err("implausible filesystem image".into());
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let parent = r.u64()? as usize;
+            let mode = r.u32()?;
+            let nlink = r.u64()?;
+            let mtime_sec = i64::from_le_bytes(r.take(8)?.try_into().expect("size"));
+            let kind = match r.u8()? {
+                1 => {
+                    let entries = r.u32()? as usize;
+                    let mut map = BTreeMap::new();
+                    for _ in 0..entries {
+                        let len = r.u16()? as usize;
+                        let name = r.take(len)?.to_vec();
+                        let child = r.u64()? as usize;
+                        if child >= count {
+                            return Err("corrupt filesystem image: bad child index".into());
+                        }
+                        map.insert(name, child);
+                    }
+                    NodeKind::Dir(map)
+                }
+                2 => {
+                    let len = r.u64()? as usize;
+                    NodeKind::File(r.take(len)?.to_vec())
+                }
+                3 => {
+                    let len = r.u16()? as usize;
+                    NodeKind::Symlink(r.take(len)?.to_vec())
+                }
+                4 => NodeKind::CharDev(match r.u8()? {
+                    0 => Dev::Null,
+                    1 => Dev::Zero,
+                    2 => Dev::Tty,
+                    3 => Dev::Random,
+                    other => return Err(format!("unknown device tag {other}")),
+                }),
+                other => return Err(format!("unknown node tag {other}")),
+            };
+            if parent >= count {
+                return Err("corrupt filesystem image: bad parent index".into());
+            }
+            nodes.push(Node {
+                kind,
+                mode,
+                nlink,
+                mtime_sec,
+                parent,
+            });
+        }
+        Ok(Self { nodes })
+    }
+}
