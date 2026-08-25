@@ -1,11 +1,11 @@
 # Workload profile: Node.js (milestone 7 groundwork)
 
-**Status: Node.js starts and runs. A stock `node --version` executes to a
-clean exit (`v24.13.0`); with the AVX-512-capable spec, `node -e <script>`
-loads, initializes V8's heap and segmented sandbox, and runs ~21M
-instructions into V8 startup. Full script execution is blocked on one
-remaining item — a pre-existing SSE2-path semantics bug, described at the
-end. This file records how far it gets and what is left.**
+**Status: Node.js runs. A stock `node -e "console.log(...)"` executes the
+script and exits cleanly (~90M instructions); `node --version` prints
+`v24.13.0`. Scripts exercising arrays, string methods, `JSON`, and `Math`
+produce correct output. This was reached on the AVX-512-capable spec plus a
+set of p-code-op helpers and a CPUID SSE2 baseline (below). This file records
+how it works and what remains.**
 
 Milestone 7 targets the Codex and Claude Code CLIs. Both are Node.js
 applications, so a stock `node` is the reduction: if `node script.js` runs,
@@ -70,26 +70,48 @@ fork's construct for it was ported, and the harness was rerun. Four spec
 patches plus one lifter patch took glibc from a fault at ~2,900 instructions
 all the way to a clean exit with no divergence.
 
-## The remaining blocker: a pre-existing SSE2-path semantics bug
+## What brought Node up (after the spec upgrade)
 
-Node's V8 aborts full initialization unless CPUID advertises SSE2
-(`Check failed: cpu.has_sse2()`). But advertising SSE2 in the CPUID helper
-makes glibc's ld.so fail during symbol resolution and exit 127 very early
-(~83,400 instructions), because its ifunc resolver then selects an
-SSE2-optimized `memcmp`/`strcmp`/`memcpy` variant that this engine executes
-incorrectly. The bug is **pre-existing and spec-independent**: the fork spec
-fails identically at the same instruction count with SSE2 advertised, so it
-is a semantics error in one of the SSE2 vector instructions those routines
-use (`pcmpeqb`, `pmovmskb`, `movdqu`, `pminub`, …), not a decode gap and not
-caused by the spec upgrade.
+Three things, each found by running Node and fixing the next fault:
 
-Because the fault surfaces as a *wrong result* (not a trap), locating it
-needs a reference the differential harnesses do not yet have — the two
-specs agree, so `exec_diff_dyn` cannot see it. The next step is a real-CPU
-reference (single-step the routine natively and compare XMM/flag state, or
-unit-test the specific SSE2 ops against known vectors). Until then CPUID
-advertises only a scalar/x87 baseline (no SSE2), so `node --version` runs to
-a clean exit but a full `node -e <script>` stops at the `has_sse2` check.
+1. **CPUID SSE2 baseline.** V8 aborts (`Check failed: cpu.has_sse2()`) unless
+   it can read the SSE2 feature bit. Two changes in the CPUID helper: raise
+   max-basic-leaf from 0 to 1 (so software reads leaf 1 at all), and set the
+   SSE2 baseline in leaf 1 EDX. AVX is still not advertised, so V8/glibc stay
+   on SSE paths. Max-leaf stays at 1 so the unimplemented cache/topology
+   leaves are never queried. (Advertising SSE2 also makes glibc's ifunc
+   resolver select SSE2 `memcmp`/`strcmp` — those are correct here; an earlier
+   report of a wrong-result bug there was a harness artifact, since ruled out
+   by the conformance probe below.)
+
+2. **AES-NI helpers.** Node/V8 and OpenSSL issue `aeskeygenassist`/`aesenc`/…
+   unconditionally (not gated on the CPUID AES bit). The spec leaves them as
+   opaque pcodeops, so they trapped. Software implementations were added and
+   verified against the native AES-NI intrinsics.
+
+3. **`pshufb`, `psadbw`, `roundsd`/`roundss` helpers.** Surfaced the same way
+   by the guest TLS client (`pshufb`) and by a Rust guest's float rounding
+   (`roundsd`). `roundsd`/`roundss` round to nearest-ties-even because
+   icicle's two-operand p-code drops the imm8 mode (see
+   `third_party/icicle/PROVENANCE.md` patch 8).
+
+AES-NI is deliberately **not** advertised in CPUID: the helpers exist for the
+code that issues AES unconditionally, but leaving the bit clear keeps other
+userspace (a guest TLS client) on its software-AES path rather than the
+VEX-AES/PCLMULQDQ encodings that are still not lifted.
+
+All the added SIMD helpers are covered by `x64-engine/examples/sse_probe.rs`,
+which runs each instruction in the engine and compares it to the native
+intrinsic over many random inputs.
+
+## Remaining
+
+- **AVX/AVX-512 execution.** The encodings decode (zero gaps on glibc) but
+  their p-code semantics are unvalidated, so CPUID keeps userspace on SSE.
+- **VEX-AES / PCLMULQDQ / XOP** are still unlifted (the ~0.0049% Node decode
+  residual); reached only if AES-NI is advertised, which it is not.
+- Codex and Claude Code images, PTY behavior, Git, and authenticated HTTPS
+  from the CLIs — the next milestone-7 work now that Node runs.
 
 ## Tools
 
@@ -105,9 +127,6 @@ a clean exit but a full `node -e <script>` stops at the `has_sse2` check.
 - `linux-compat/examples/run_guest.rs` — runs a host ELF in the machine with
   `GUEST_MOUNT`/`GUEST_COPY`/`GUEST_EXE`; prints the faulting instruction on
   a non-clean exit.
-
-## Not started
-
-- Codex and Claude Code images, PTY behavior, Git operations, authenticated
-  HTTPS from the CLIs, and the per-agent regression data the roadmap asks
-  for — all blocked on Node running first.
+- `x64-engine/examples/sse_probe.rs` — runs one SSE/AES-NI instruction in the
+  engine and compares against the native intrinsic over random inputs;
+  conformance-checks the added SIMD helpers.

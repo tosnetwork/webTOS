@@ -57,6 +57,25 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    use the nested-export form; the vendored fork spec does not, so this is
    inert until an AVX-512-capable spec is adopted.
 
+8. `icicle-cpu/src/exec/helpers.rs`: added p-code-op helpers the spec leaves
+   as opaque `pcodeop`s but that real workloads (Node/V8, OpenSSL, TLS
+   clients, Rust std) issue directly, so without them they trap as
+   unimplemented: the AES-NI round primitives (`aesenc`, `aesenclast`,
+   `aesdec`, `aesdeclast`, `aesimc`, `aeskeygenassist`), `pshufb`, `psadbw`,
+   and scalar `roundsd`/`roundss`. All are verified against the native x86-64
+   intrinsics by `x64-engine/examples/sse_probe.rs`. Note: `roundsd`/`roundss`
+   round to nearest-ties-even unconditionally — icicle's p-code carries only
+   two operands, so the instruction's imm8 rounding-mode is dropped during
+   lifting; the IEEE/MXCSR default is used.
+
+9. `icicle-cpu/src/exec/helpers.rs`: CPUID now advertises an SSE/SSE2/SSE3
+   baseline. `cpuid_basic_info` reports max-basic-leaf 1 (was 0) so software
+   reads leaf 1 at all — V8 aborts (`Check failed: cpu.has_sse2()`) otherwise;
+   leaf 1 EDX gains the SSE2 baseline (`FeatureInformationEdx`) and ECX keeps
+   SSE3/AES-NI. AVX/AVX-512 are still not advertised (their execution
+   semantics are unvalidated); leaves 2..6 stay unqueried (max-leaf is 1) so
+   the still-unimplemented cache/topology pcodeops are never reached.
+
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and
 `wasm32-unknown-unknown` targets.
