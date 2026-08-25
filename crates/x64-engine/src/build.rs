@@ -125,21 +125,35 @@ pub fn build_x64_vm_from_files(
     for &(name, value) in INITIAL_CONTEXT {
         let field = sleigh
             .get_context_field(name)
-            .ok_or(BuildError::SpecCompileError(format!("missing context field: {name}")))?;
+            .ok_or(BuildError::SpecCompileError(format!(
+                "missing context field: {name}"
+            )))?;
         field.field.set(&mut initial_ctx, value as i64);
     }
 
-    let get = |name: &'static str| sleigh.get_varnode(name).ok_or(BuildError::MissingVarnode(name));
+    let get = |name: &'static str| {
+        sleigh
+            .get_varnode(name)
+            .ok_or(BuildError::MissingVarnode(name))
+    };
     let int_args = ["RDI", "RSI", "RDX", "RCX", "R8", "R9"]
         .into_iter()
         .map(|name| {
-            sleigh.get_varnode(name).ok_or(BuildError::SpecCompileError(format!(
-                "missing calling-convention register: {name}"
-            )))
+            sleigh
+                .get_varnode(name)
+                .ok_or(BuildError::SpecCompileError(format!(
+                    "missing calling-convention register: {name}"
+                )))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let spec = SpecOutput { initial_ctx, pc: get("RIP")?, sp: get("RSP")?, int_args, sleigh };
+    let spec = SpecOutput {
+        initial_ctx,
+        pc: get("RIP")?,
+        sp: get("RSP")?,
+        int_args,
+        sleigh,
+    };
     finish_vm(spec, config)
 }
 
@@ -171,7 +185,11 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         isa_mode_context: vec![spec.initial_ctx],
         reg_init: vec![],
         temporaries,
-        calling_cov: CallCov { integers: spec.int_args, stack_align: 4, stack_offset: 0 },
+        calling_cov: CallCov {
+            integers: spec.int_args,
+            stack_align: 4,
+            stack_offset: 0,
+        },
         on_boot,
         sleigh: spec.sleigh,
     };

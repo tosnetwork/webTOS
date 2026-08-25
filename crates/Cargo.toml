@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["x64-engine", "webtos-web"]
+members = ["x64-engine", "linux-compat", "webtos-web"]
 
 [workspace.dependencies]
 icicle-cpu = { path = "../third_party/icicle/icicle-cpu" }
@@ -11,3 +11,10 @@ sleigh-parse = { path = "../third_party/icicle/sleigh/sleigh-parse" }
 sleigh-compile = { path = "../third_party/icicle/sleigh/sleigh-compile" }
 target-lexicon = "0.13.3"
 tracing = { version = "0.1.40", default-features = false }
+
+# Release speed with overflow checks: catches 32-bit truncation bugs in the
+# wasm build without the debug-profile slowdown.
+[profile.relcheck]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

@@ -91,8 +91,8 @@ fn in_memory_spec_source_matches_ldef_path() {
     use x64_engine::linux_min::MinimalLinux;
 
     // Feed the engine the same language files the browser host will embed.
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../third_party/ghidra-x86/languages");
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ghidra-x86/languages");
     let mut files = std::collections::HashMap::new();
     for entry in std::fs::read_dir(&dir).expect("language dir missing") {
         let entry = entry.expect("dir entry");
@@ -103,8 +103,8 @@ fn in_memory_spec_source_matches_ldef_path() {
         }
     }
 
-    let mut vm = build_x64_vm_from_files(files, &EngineConfig::default())
-        .expect("from-files build failed");
+    let mut vm =
+        build_x64_vm_from_files(files, &EngineConfig::default()).expect("from-files build failed");
     let env = MinimalLinux::new(&vm.cpu).expect("env setup failed");
     vm.set_env(env);
 

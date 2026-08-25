@@ -160,54 +160,59 @@ impl Engine {
     }
 
     fn translate_exit(&mut self, exit: VmExit) -> CpuExit {
-        match exit {
-            VmExit::Halt => CpuExit::Halt {
-                code: self.exit_code(),
+        let code = self.exit_code();
+        classify_exit(&self.vm, exit, code)
+    }
+}
+
+/// Maps a raw [`VmExit`] to the stable [`CpuExit`] boundary. `exit_code` is
+/// the guest exit code recorded by the environment, if any.
+pub fn classify_exit(vm: &InterpVm, exit: VmExit, exit_code: Option<i32>) -> CpuExit {
+    match exit {
+        VmExit::Halt => CpuExit::Halt { code: exit_code },
+        VmExit::InstructionLimit => CpuExit::InstructionLimit,
+        VmExit::Breakpoint => CpuExit::Breakpoint {
+            rip: vm.cpu.read_pc(),
+        },
+        VmExit::Interrupted => CpuExit::Interrupted,
+        VmExit::OutOfMemory => CpuExit::OutOfMemory,
+        VmExit::UnhandledException((code, value)) => match code {
+            ExceptionCode::ReadUnmapped
+            | ExceptionCode::ReadPerm
+            | ExceptionCode::ReadUnaligned
+            | ExceptionCode::ReadWatch
+            | ExceptionCode::ReadUninitialized => CpuExit::PageFault {
+                address: value,
+                access: AccessKind::Read,
             },
-            VmExit::InstructionLimit => CpuExit::InstructionLimit,
-            VmExit::Breakpoint => CpuExit::Breakpoint {
-                rip: self.vm.cpu.read_pc(),
+            ExceptionCode::WriteUnmapped
+            | ExceptionCode::WritePerm
+            | ExceptionCode::WriteWatch
+            | ExceptionCode::WriteUnaligned => CpuExit::PageFault {
+                address: value,
+                access: AccessKind::Write,
             },
-            VmExit::Interrupted => CpuExit::Interrupted,
-            VmExit::OutOfMemory => CpuExit::OutOfMemory,
-            VmExit::UnhandledException((code, value)) => match code {
-                ExceptionCode::ReadUnmapped
-                | ExceptionCode::ReadPerm
-                | ExceptionCode::ReadUnaligned
-                | ExceptionCode::ReadWatch
-                | ExceptionCode::ReadUninitialized => CpuExit::PageFault {
-                    address: value,
-                    access: AccessKind::Read,
-                },
-                ExceptionCode::WriteUnmapped
-                | ExceptionCode::WritePerm
-                | ExceptionCode::WriteWatch
-                | ExceptionCode::WriteUnaligned => CpuExit::PageFault {
-                    address: value,
-                    access: AccessKind::Write,
-                },
-                ExceptionCode::ExecViolation => CpuExit::PageFault {
-                    address: value,
-                    access: AccessKind::Execute,
-                },
-                ExceptionCode::InvalidInstruction
-                | ExceptionCode::InvalidOpSize
-                | ExceptionCode::InvalidFloatSize
-                | ExceptionCode::UnimplementedOp => CpuExit::IllegalInstruction {
-                    rip: self.vm.cpu.read_pc(),
-                },
-                code => CpuExit::Unhandled { code, value },
+            ExceptionCode::ExecViolation => CpuExit::PageFault {
+                address: value,
+                access: AccessKind::Execute,
             },
-            // The remaining variants (Running, Killed, Deadlock, Unimplemented)
-            // are internal conditions; report them without translation.
-            other => CpuExit::Unhandled {
-                code: ExceptionCode::from_u32(self.vm.cpu.exception.code),
-                value: {
-                    let _ = other;
-                    self.vm.cpu.exception.value
-                },
+            ExceptionCode::InvalidInstruction
+            | ExceptionCode::InvalidOpSize
+            | ExceptionCode::InvalidFloatSize
+            | ExceptionCode::UnimplementedOp => CpuExit::IllegalInstruction {
+                rip: vm.cpu.read_pc(),
             },
-        }
+            code => CpuExit::Unhandled { code, value },
+        },
+        // The remaining variants (Running, Killed, Deadlock, Unimplemented)
+        // are internal conditions; report them without translation.
+        other => CpuExit::Unhandled {
+            code: ExceptionCode::from_u32(vm.cpu.exception.code),
+            value: {
+                let _ = other;
+                vm.cpu.exception.value
+            },
+        },
     }
 }
 
