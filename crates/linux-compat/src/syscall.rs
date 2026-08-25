@@ -2334,6 +2334,9 @@ const EPOLL_CTL_MOD: u64 = 3;
 const EPOLLIN: u32 = 0x1;
 const EPOLLOUT: u32 = 0x4;
 const EPOLLHUP: u32 = 0x10;
+/// Edge-triggered: report a fd only on a not-ready→ready transition, not on
+/// every wait while it stays ready.
+const EPOLLET: u32 = 0x8000_0000;
 
 /// Resolves a total stall: every task is parked and none is ready. Waits on
 /// the host for network readiness, then warps the deterministic clock to
@@ -2783,14 +2786,14 @@ fn sys_epoll_ctl(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
                 return Err(abi::EEXIST);
             }
             inner.interests.insert(fd, (events, data));
+            // A fresh ADD or a re-arming MOD starts disarmed (no edge owed).
+            inner.edge_fired.remove(&fd);
             Ok(0)
         }
         EPOLL_CTL_DEL => {
-            epoll
-                .borrow_mut()
-                .interests
-                .remove(&fd)
-                .ok_or(abi::ENOENT)?;
+            let mut inner = epoll.borrow_mut();
+            inner.interests.remove(&fd).ok_or(abi::ENOENT)?;
+            inner.edge_fired.remove(&fd);
             Ok(0)
         }
         _ => Err(abi::EINVAL),
@@ -2809,6 +2812,11 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     // Evaluate readiness for every registered fd.
     let mut ready: Vec<(u32, u64)> = Vec::new();
     let mut watches: Vec<Watch> = Vec::new();
+    // Edge-triggered bookkeeping applied after the scan (the interest map is
+    // borrowed immutably during it): fds to mark as having fired an edge, and
+    // fds observed not-ready that should re-arm.
+    let mut mark_fired: Vec<u64> = Vec::new();
+    let mut rearm: Vec<u64> = Vec::new();
     {
         let inner = epoll.borrow();
         let fds = env.proc.fds.borrow();
@@ -2836,9 +2844,34 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
             if events & EPOLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
                 fired |= EPOLLOUT;
             }
+            // Edge-triggered: suppress a fd whose edge already fired and is
+            // still ready; re-arm one observed not-ready.
+            let is_et = events & EPOLLET != 0;
+            if is_et {
+                if fired == 0 {
+                    rearm.push(fd);
+                    continue;
+                }
+                if inner.edge_fired.contains(&fd) {
+                    continue;
+                }
+            }
             if fired != 0 && ready.len() < max_events {
                 ready.push((fired, data));
+                // Only record the delivered edge once it is actually reported.
+                if is_et {
+                    mark_fired.push(fd);
+                }
             }
+        }
+    }
+    if !mark_fired.is_empty() || !rearm.is_empty() {
+        let mut inner = epoll.borrow_mut();
+        for fd in mark_fired {
+            inner.edge_fired.insert(fd);
+        }
+        for fd in rearm {
+            inner.edge_fired.remove(&fd);
         }
     }
 

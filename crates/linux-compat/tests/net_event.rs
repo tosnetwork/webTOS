@@ -122,6 +122,67 @@ int main(void) {
     );
 }
 
+/// Edge-triggered epoll (`EPOLLET`): a fd that stays readable must fire only
+/// once per not-ready→ready transition, not on every wait. This is what
+/// mio/tokio relies on — without it, an async runtime's wakeup eventfd is
+/// reported ready on every `epoll_wait`, spinning the reactor forever
+/// (observed running a real Codex binary: millions of `epoll_pwait` calls,
+/// each returning the same fd, no progress). Level-triggered interest, by
+/// contrast, must keep reporting while the fd stays ready.
+#[test]
+fn epoll_edge_triggered_fires_once_per_edge() {
+    let source = r#"
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+int main(void) {
+    struct epoll_event out[8];
+    uint64_t one = 1, got = 0;
+
+    /* Edge-triggered: fires once, then silent until re-armed. */
+    int efd = eventfd(0, EFD_NONBLOCK);
+    int ep = epoll_create1(0);
+    struct epoll_event ev; ev.events = EPOLLIN | EPOLLET; ev.data.u64 = 42;
+    epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev);
+    write(efd, &one, sizeof(one));            /* not-ready -> ready edge */
+    int n1 = epoll_wait(ep, out, 8, 0);       /* edge delivered */
+    int n2 = epoll_wait(ep, out, 8, 0);       /* still ready, no new edge */
+    /* Re-arm the way a reactor does: drain to not-ready, observe it, then a
+       fresh edge fires again. */
+    if (read(efd, &got, sizeof(got)) != sizeof(got)) return 10;
+    int arm = epoll_wait(ep, out, 8, 0);      /* observes not-ready, re-arms */
+    write(efd, &one, sizeof(one));            /* fresh not-ready -> ready */
+    int n3 = epoll_wait(ep, out, 8, 0);
+
+    /* Level-triggered: keeps reporting while ready. */
+    int lfd = eventfd(0, EFD_NONBLOCK);
+    int lp = epoll_create1(0);
+    struct epoll_event lv; lv.events = EPOLLIN; lv.data.u64 = 7;
+    epoll_ctl(lp, EPOLL_CTL_ADD, lfd, &lv);
+    write(lfd, &one, sizeof(one));
+    int m1 = epoll_wait(lp, out, 8, 0);
+    int m2 = epoll_wait(lp, out, 8, 0);
+
+    printf("ET n1=%d n2=%d arm=%d rearm=%d LT m1=%d m2=%d\n",
+           n1, n2, arm, n3, m1, m2);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("epollet", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epollet");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("ET n1=1 n2=0 arm=0 rearm=1 LT m1=1 m2=1"),
+        "edge/level epoll semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
 #[test]
 fn timerfd_fires_through_the_time_warp() {
     let source = r#"
