@@ -366,12 +366,15 @@ pub mod x86 {
 
         use cpuid::FeatureInformationEcx as Feature;
 
-        // Advertise SSE/SSE2/SSE3 and AES-NI, but deliberately not AVX or
-        // AVX-512: those encodings decode but their p-code semantics are not
-        // all validated, so userspace stays on the SSE paths. `avx`,
-        // `osxsave`, and `f16c` are left clear. AES-NI *is* advertised: its
-        // round primitives have helpers, and a guest TLS client's hardware-AES
-        // path (which also uses `pshufb`) works.
+        // Advertise SSE/SSE2/SSE3, AES-NI, and PCLMULQDQ, but deliberately not
+        // AVX or AVX-512: those encodings decode but their p-code semantics are
+        // not all validated, so userspace stays on the SSE paths. `avx`,
+        // `osxsave`, and `f16c` are left clear. AES-NI and PCLMULQDQ *are*
+        // advertised: their primitives are supported here (the AES round ops
+        // as helpers, PCLMULQDQ as an inlined SLEIGH macro, both verified
+        // against the native intrinsics), so a TLS client can use the
+        // hardware AES-GCM (AES-NI + carryless-multiply GHASH) SSE path
+        // instead of a software fallback. AVX-only fused GCM stays off.
         //
         // SSE4 is left clear as a conservative choice, not a proven blocker
         // (advertising it currently passes every test, Node included). SSE4.1/
@@ -383,6 +386,7 @@ pub mod x86 {
         // two-operand p-code drops (so those helpers can only round to
         // nearest — a silent approximation for floor/ceil/trunc).
         let ecx: u32 = (Feature::sse3
+            | Feature::pclmulqdq
             | Feature::tm2
             | Feature::pdcm
             | Feature::popcnt
