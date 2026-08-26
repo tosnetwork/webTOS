@@ -40,10 +40,10 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~50% | **A real Codex `exec` run completes end to end**: the stock static binary authenticates, speaks TLS to the OpenAI API, sends a prompt, prints the model's reply, and exits 0 (2.37 B instructions). On top of the earlier CLI-path work this took real SIGCHLD delivery + `rt_sigreturn`, vfork parent suspension, kernel-faithful edge-triggered epoll re-arming (pipes/eventfds/sockets), 41 more SIMD helpers (SSE4.1/SSSE3 + saturating arithmetic, verified vs native intrinsics), a configurable wall-clock base, and a configurable memory cap. Interactive TUI/PTY, repo edits, Git, browser delivery, and Claude Code are not started |
+| M7 Codex & Claude Code | 🔶 | ~58% | **A real Codex `exec` run edits a file, runs a shell command, and prints the model's summary, exiting 0.** Beyond the authenticated round-trip this took real process groups (`setpgid`/`kill -pgid`), true 80-bit x87 software floating point (musl's printf relied on 64-bit-mantissa exactness), `mremap`, an argv/envp size fix, three network-ABI write-back fixes, and — the last crash — keying the translated-block cache by address space so an exec'd child's blocks are never reused in the parent at the same virtual address. Interactive TUI/PTY, Git, browser delivery, and Claude Code are not started |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 71%**.
+Weighted by engineering effort, overall completion is **roughly 72%**.
 The native test suites (40 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -402,8 +402,25 @@ CPUID checks; all verified against native intrinsics); a configurable
 wall-clock base (real certificate and token validity need real time); and a
 configurable physical-memory cap (`GUEST_MEM_MB`). A Node-based mock of the
 agent pipeline (`mock codex` against a local mock API) isolated the memory
-and clock failures. What is *not* yet exercised is the interactive TUI
-(needs a PTY), repository edits driven by the model, and Git.
+and clock failures.
+
+**Model-driven repository edits now work.** The same binary applies a patch
+that creates a file in the workspace, runs `/bin/sh -lc` to verify it, reads
+the output, and prints the model's natural-language summary before exiting 0.
+This took real process groups (`setpgid`/`getpgid`/`setsid`, group-directed
+`kill -pgid`), `PR_SET_PDEATHSIG`, `fcntl` record locks, datagram/seqpacket
+socketpairs, a 128 KiB argv/envp string cap, true 80-bit x87 extended-
+precision software floating point (the f80 type was reinterpreted as f64 and
+the lifter lowered every 80-bit op to f64 — musl's printf digit loop relies
+on the full 64-bit mantissa and walked off the stack without it; also
+`FPREM`/`FIST` control-word rounding), `mremap`, 64 KiB-aligned mmap, three
+network-ABI write-back fixes (`recvmsg` name length, `write_sockaddr_in`
+socklen, per-thread `brk`/`mmap` cursors made address-space-shared), and
+finally keying the translated-block cache by address space rather than
+virtual address alone — an exec'd child's lifted blocks were being reused in
+the parent at the same VA, surfacing as a stale value read from a stack slot
+that crashed the session on the way out. What is *not* yet exercised is the
+interactive TUI (needs a PTY), Git, and Claude Code.
 
 Work:
 
@@ -414,9 +431,12 @@ Work:
   temporary files, file watching, Git operations, and authenticated HTTPS.
   🔶 (signals incl. real SIGCHLD delivery, pipes, subprocess trees incl.
   vfork semantics, temp files, and authenticated HTTPS are exercised by the
-  real Codex `exec` run; PTY, terminal resize, file watching, and Git are
+  real Codex `exec` run, which also drives model-authored file edits and
+  child shell commands; PTY, terminal resize, file watching, and Git are
   not started)
-- Mount a repository with explicit read/write capabilities. ⬜
+- Mount a repository with explicit read/write capabilities. 🔶 (host
+  directories mount read/write via `run_guest`; a repository with real Git
+  history is the next target)
 - Provide controlled environment variables and secret handles. 🔶 (env + M6
   secret injection exist; per-agent handles not wired)
 - Test tool execution, cancellation, interrupted network calls, context
