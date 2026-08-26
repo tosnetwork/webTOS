@@ -130,6 +130,7 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_PIPE => sys_pipe(env, cpu, a[0], 0).into(),
         abi::SYS_PIPE2 => sys_pipe(env, cpu, a[0], a[1]).into(),
         abi::SYS_FUTEX => sys_futex(env, cpu, a[0], a[1], a[2], a[3]),
+        abi::SYS_RT_SIGRETURN => sys_rt_sigreturn(env, cpu),
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
@@ -356,7 +357,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         }
 
         abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ => Err(abi::ENOSYS),
-        abi::SYS_RT_SIGRETURN => Err(abi::ENOSYS),
 
         _ => {
             tracing::warn!("unimplemented syscall {nr} -> ENOSYS");
@@ -1398,6 +1398,7 @@ fn sys_rt_sigaction(
         let previous = env
             .proc
             .sigactions
+            .borrow()
             .get(&signal)
             .copied()
             .unwrap_or_default();
@@ -1407,7 +1408,7 @@ fn sys_rt_sigaction(
         let bytes = read_mem(cpu, new, 32)?;
         let mut action = SigAction::default();
         action.0.copy_from_slice(&bytes);
-        env.proc.sigactions.insert(signal, action);
+        env.proc.sigactions.borrow_mut().insert(signal, action);
     }
     Ok(0)
 }
@@ -1644,6 +1645,12 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     if timed_out {
         cpu.write_var(env.regs.rax, neg(abi::ETIMEDOUT));
     }
+    // A task woken with a pending signal enters its handler before resuming
+    // whatever it was doing. The interrupted syscall was parked to restart, so
+    // when the handler returns via `rt_sigreturn` the wait is simply retried.
+    if env.proc.pending_signals != 0 {
+        deliver_signal(env, cpu);
+    }
     true
 }
 
@@ -1705,12 +1712,175 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
     // write end is still held open when readiness is evaluated.
     env.proc.fds = std::rc::Rc::new(std::cell::RefCell::new(crate::fd::FdTable::new()));
 
+    // A child becoming a zombie raises SIGCHLD in the parent. Async runtimes
+    // (tokio) reap children through a SIGCHLD handler that writes a wakeup
+    // pipe, so without delivering the signal a parent that spawned a process
+    // and is not sitting in `wait4` never learns the child exited.
+    if group_leader || exit_group {
+        notify_parent_sigchld(env, ppid);
+    }
+
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {
         tracing::error!("deadlock: last runnable task exited but the root is still parked");
         env.record_exit(-1);
         Outcome::Exit(VmExit::Deadlock)
+    }
+}
+
+/// Marks SIGCHLD pending on a thread of `parent_tgid` so it is delivered when
+/// that thread next runs. Chooses a thread that has SIGCHLD unblocked; the
+/// disposition table is process-wide, so any such thread can run the handler.
+/// Does nothing when the parent installed no SIGCHLD handler (the default
+/// disposition for SIGCHLD is to ignore it) or when every thread blocks it.
+fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
+    const SIGCHLD: u64 = 17;
+    const SIGCHLD_BIT: u64 = 1 << (SIGCHLD - 1);
+    // Is a user handler installed for SIGCHLD in the parent group? The
+    // disposition table is shared, so read it from any group member.
+    let has_handler = env
+        .sched
+        .parked
+        .iter()
+        .find(|t| t.proc.tgid == parent_tgid)
+        .map(|t| &t.proc.sigactions)
+        .or({
+            if env.proc.tgid == parent_tgid {
+                Some(&env.proc.sigactions)
+            } else {
+                None
+            }
+        })
+        .is_some_and(|acts| {
+            acts.borrow()
+                .get(&SIGCHLD)
+                .is_some_and(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")) > 1)
+        });
+    if !has_handler {
+        return;
+    }
+    // Prefer the group's main thread (pid == tgid); fall back to any sibling
+    // that does not block SIGCHLD. A thread already handling the signal (bit
+    // set) keeps it — setting it again is idempotent.
+    let mut candidate: Option<usize> = None;
+    for (i, t) in env.sched.parked.iter().enumerate() {
+        if t.proc.tgid != parent_tgid || t.proc.sigmask & SIGCHLD_BIT != 0 {
+            continue;
+        }
+        if t.proc.pid == parent_tgid {
+            candidate = Some(i);
+            break;
+        }
+        if candidate.is_none() {
+            candidate = Some(i);
+        }
+    }
+    if let Some(i) = candidate {
+        env.sched.parked[i].proc.pending_signals |= SIGCHLD_BIT;
+    }
+}
+
+/// Redirects the current CPU into the lowest-numbered pending signal's
+/// handler, saving the interrupted state so `rt_sigreturn` can resume it. The
+/// interrupted syscall was parked to resume (blocking waits pre-set their
+/// return value), so after the handler returns the wait is re-evaluated and,
+/// if still not satisfied, simply re-parks. Only signals with a real user
+/// handler reach a pending state, so a missing or default disposition here is
+/// treated as a no-op rather than a fault.
+fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
+    const SIG_DFL: u64 = 0;
+    const SIG_IGN: u64 = 1;
+    let pending = env.proc.pending_signals;
+    if pending == 0 {
+        return;
+    }
+    let sig = pending.trailing_zeros() as u64 + 1;
+    let bit = 1_u64 << (sig - 1);
+    env.proc.pending_signals &= !bit;
+
+    let Some(action) = env.proc.sigactions.borrow().get(&sig).copied() else {
+        return;
+    };
+    let handler = u64::from_le_bytes(action.0[0..8].try_into().expect("size"));
+    let flags = u64::from_le_bytes(action.0[8..16].try_into().expect("size"));
+    let restorer = u64::from_le_bytes(action.0[16..24].try_into().expect("size"));
+    let sa_mask = u64::from_le_bytes(action.0[24..32].try_into().expect("size"));
+    if handler == SIG_DFL || handler == SIG_IGN {
+        return;
+    }
+
+    // Save the interrupted state and current mask for rt_sigreturn, which
+    // restores from this snapshot rather than parsing the stack frame.
+    env.proc.signal_saved.push(cpu.snapshot());
+    env.proc.signal_saved_mask.push(env.proc.sigmask);
+    // Block the delivered signal (unless SA_NODEFER) plus the handler's mask
+    // while it runs.
+    const SA_NODEFER: u64 = 0x4000_0000;
+    if flags & SA_NODEFER == 0 {
+        env.proc.sigmask |= bit;
+    }
+    env.proc.sigmask |= sa_mask;
+
+    // Build a minimal signal frame on the thread's own stack. A real handler
+    // gets (signo, &siginfo, &ucontext); tokio's SIGCHLD handler only writes a
+    // wakeup byte and ignores the latter two, so zeroed structures suffice.
+    // The handler returns into `restorer`, whose `rt_sigreturn` we service.
+    let mut sp: u64 = cpu.read_var(env.regs.rsp);
+    sp = sp.saturating_sub(128); // skip the x86-64 red zone
+    sp = sp.saturating_sub(128);
+    let siginfo_ptr = sp;
+    let mut siginfo = [0_u8; 128];
+    siginfo[0..4].copy_from_slice(&(sig as u32).to_le_bytes()); // si_signo
+    let _ = write_mem(cpu, siginfo_ptr, &siginfo);
+    sp = sp.saturating_sub(256);
+    let ucontext_ptr = sp;
+    let _ = write_mem(cpu, ucontext_ptr, &[0_u8; 256]);
+    // The ABI wants (rsp + 8) % 16 == 0 at handler entry: align to 16 then push
+    // the 8-byte return address.
+    sp &= !15_u64;
+    sp = sp.saturating_sub(8);
+    if write_mem(cpu, sp, &restorer.to_le_bytes()).is_err() {
+        // Cannot set up the frame; abandon delivery and leave the saved state
+        // to be discarded on the next rt_sigreturn-less resume.
+        env.proc.signal_saved.pop();
+        env.proc.sigmask = env.proc.signal_saved_mask.pop().unwrap_or(env.proc.sigmask);
+        return;
+    }
+
+    cpu.write_var(env.regs.rsp, sp);
+    cpu.write_var(env.regs.rdi, sig);
+    cpu.write_var(env.regs.rsi, siginfo_ptr);
+    cpu.write_var(env.regs.rdx, ucontext_ptr);
+    cpu.write_pc(handler);
+    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, handler);
+    cpu.pending_exception = None;
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
+}
+
+/// `rt_sigreturn`: restore the state saved when the current handler was
+/// entered. The restored snapshot carries the interrupted syscall's resume
+/// point, so execution continues exactly where the signal interrupted it.
+fn sys_rt_sigreturn(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
+    match (
+        env.proc.signal_saved.pop(),
+        env.proc.signal_saved_mask.pop(),
+    ) {
+        (Some(snapshot), Some(mask)) => {
+            // The instruction counter is global and must not rewind.
+            let icount = cpu.icount;
+            cpu.restore(&snapshot);
+            cpu.icount = icount;
+            env.proc.sigmask = mask;
+            // The CPU now holds the fully restored pre-signal state (including
+            // its resume exception); do not touch RAX.
+            Outcome::Switched
+        }
+        _ => {
+            // No handler frame outstanding: nothing to return from.
+            Outcome::Ret(Ok(0))
+        }
     }
 }
 
@@ -1857,7 +2027,7 @@ fn sys_execve(
     // Point of no return: replace the process image.
     env.proc.argv = argv;
     env.proc.envp = envp;
-    env.proc.sigactions.clear();
+    env.proc.sigactions.borrow_mut().clear();
     env.proc.fds.borrow_mut().close_cloexec();
 
     // The instruction counter must survive the CPU reset inside the loader.
@@ -2333,6 +2503,7 @@ fn signal_is_nonfatal(env: &LinuxEnv, signal: u64) -> bool {
     // A registered non-default handler exists (SIG_DFL = 0 in slot 0).
     env.proc
         .sigactions
+        .borrow()
         .get(&signal)
         .is_some_and(|action| u64::from_le_bytes(action.0[..8].try_into().expect("size")) > 1)
 }

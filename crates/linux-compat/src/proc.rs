@@ -36,8 +36,21 @@ pub struct Process {
     pub umask: u32,
     pub brk_end: u64,
     pub mmap_next: u64,
-    pub sigactions: HashMap<u64, SigAction>,
+    /// Signal dispositions are process-wide (shared by every thread in the
+    /// group), matching Linux: registering a handler on one thread makes it
+    /// visible to the whole process. `fork` gets its own copy; a new thread
+    /// shares the table.
+    pub sigactions: Rc<RefCell<HashMap<u64, SigAction>>>,
     pub sigmask: u64,
+    /// Signals pending delivery to *this* thread (bit `sig - 1`). Only ever
+    /// holds signals that have a user handler and are unblocked for the
+    /// thread, so a set bit means "deliverable now". Not inherited.
+    pub pending_signals: u64,
+    /// Saved CPU state for each signal handler currently running on this
+    /// thread (innermost last), restored by `rt_sigreturn`. Paired with the
+    /// sigmask to reinstate when the handler returns.
+    pub signal_saved: Vec<Box<CpuSnapshot>>,
+    pub signal_saved_mask: Vec<u64>,
     pub exe_path: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
@@ -57,8 +70,11 @@ impl Process {
             umask: 0o022,
             brk_end: 0,
             mmap_next: crate::MMAP_BASE,
-            sigactions: HashMap::new(),
+            sigactions: Rc::new(RefCell::new(HashMap::new())),
             sigmask: 0,
+            pending_signals: 0,
+            signal_saved: Vec::new(),
+            signal_saved_mask: Vec::new(),
             exe_path: Vec::new(),
             argv: Vec::new(),
             envp: Vec::new(),
@@ -77,8 +93,12 @@ impl Process {
             umask: self.umask,
             brk_end: self.brk_end,
             mmap_next: self.mmap_next,
-            sigactions: self.sigactions.clone(),
+            // A new process gets its own copy of the signal dispositions.
+            sigactions: Rc::new(RefCell::new(self.sigactions.borrow().clone())),
             sigmask: self.sigmask,
+            pending_signals: 0,
+            signal_saved: Vec::new(),
+            signal_saved_mask: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -98,8 +118,12 @@ impl Process {
             umask: self.umask,
             brk_end: self.brk_end,
             mmap_next: self.mmap_next,
-            sigactions: self.sigactions.clone(),
+            // Threads share one signal-disposition table.
+            sigactions: Rc::clone(&self.sigactions),
             sigmask: self.sigmask,
+            pending_signals: 0,
+            signal_saved: Vec::new(),
+            signal_saved_mask: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -265,25 +289,33 @@ impl Scheduler {
     /// Index of the first ready task, in stable queue order (deterministic).
     /// `now` is the deterministic clock in nanoseconds.
     pub fn find_ready(&self, now: u64) -> Option<usize> {
-        self.parked.iter().position(|task| match &task.state {
-            ParkState::Ready => true,
-            ParkState::Futex {
-                woken, deadline, ..
-            } => *woken || deadline.is_some_and(|d| now >= d),
-            ParkState::WaitChild { pid } => self
-                .zombies
-                .iter()
-                .any(|z| z.ppid == task.proc.tgid && (*pid == -1 || z.pid == *pid as u64)),
-            ParkState::PipeRead { pipe } => {
-                let pipe = pipe.borrow();
-                !pipe.data.is_empty() || pipe.writers == 0
+        self.parked.iter().position(|task| {
+            // A deliverable pending signal interrupts any blocking wait. Every
+            // park state below is interruptible, so a set bit makes the task
+            // runnable regardless of what it was waiting for.
+            if task.proc.pending_signals != 0 {
+                return true;
             }
-            ParkState::PipeWrite { pipe } => {
-                let pipe = pipe.borrow();
-                pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
-            }
-            ParkState::Waiting { watches, deadline } => {
-                deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
+            match &task.state {
+                ParkState::Ready => true,
+                ParkState::Futex {
+                    woken, deadline, ..
+                } => *woken || deadline.is_some_and(|d| now >= d),
+                ParkState::WaitChild { pid } => self
+                    .zombies
+                    .iter()
+                    .any(|z| z.ppid == task.proc.tgid && (*pid == -1 || z.pid == *pid as u64)),
+                ParkState::PipeRead { pipe } => {
+                    let pipe = pipe.borrow();
+                    !pipe.data.is_empty() || pipe.writers == 0
+                }
+                ParkState::PipeWrite { pipe } => {
+                    let pipe = pipe.borrow();
+                    pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
+                }
+                ParkState::Waiting { watches, deadline } => {
+                    deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
+                }
             }
         })
     }
