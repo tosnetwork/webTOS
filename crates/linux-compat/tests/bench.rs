@@ -201,3 +201,67 @@ fn bench_guest_memory_footprint() {
         "shell startup footprint"
     );
 }
+/// What an `execve` costs when the image is already in memory and its blocks
+/// have already been lifted by another process.
+///
+/// The shell here *is* BusyBox and so is every command it runs, so by the
+/// time the first `/bin/true` starts, every block of its startup path has
+/// been lifted once already. It is re-lifted anyway: `fork` and `execve` each
+/// take a fresh address-space id, and the block cache keys on that, so the
+/// work is repeated per process. The marginal figure below is the size of
+/// that repetition — compare its instructions-per-second against the
+/// sustained rate from `bench_compute_md5sum` on the same machine.
+#[test]
+#[ignore = "measurement, not a gate; run with --ignored --nocapture"]
+fn bench_execve_relift_cost() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let mut points = Vec::new();
+    for execs in [1_usize, 16] {
+        let mut machine = Machine::from_ldef(&ldef_path(), &EngineConfig::default())
+            .expect("machine build failed");
+        machine
+            .add_file(b"/bin/busybox", image.clone(), 0o755)
+            .expect("add busybox");
+        for applet in ["sh", "true"] {
+            machine
+                .add_symlink(format!("/bin/{applet}").as_bytes(), b"/bin/busybox")
+                .expect("applet link");
+        }
+        let script = format!("i=0; while [ $i -lt {execs} ]; do /bin/true; i=$((i+1)); done");
+        machine.set_args(
+            vec![b"sh".to_vec(), b"-c".to_vec(), script.into_bytes()],
+            vec![b"PATH=/bin".to_vec()],
+        );
+        machine.load(b"/bin/sh").expect("ELF load failed");
+        machine.vm_mut().icount_limit = machine.icount() + 40_000_000_000;
+
+        let before = machine.icount();
+        let start = Instant::now();
+        let exit = machine.run();
+        let seconds = start.elapsed().as_secs_f64();
+        assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "shell loop failed");
+        let run = Measured {
+            icount: machine.icount() - before,
+            seconds,
+            output: String::new(),
+        };
+        run.report(&format!("shell + {execs} execs"));
+        points.push(run);
+    }
+
+    let (one, many) = (&points[0], &points[1]);
+    let instructions = many.icount - one.icount;
+    let seconds = many.seconds - one.seconds;
+    let each = 15.0;
+    println!(
+        "[bench] {:<28} {:>13} instructions  {:>7.2} s  {:>8.1} M inst/s (per extra execve: {:.0} instructions, {:.1} ms)",
+        "execve marginal",
+        instructions,
+        seconds,
+        instructions as f64 / seconds / 1e6,
+        instructions as f64 / each,
+        seconds * 1000.0 / each,
+    );
+}
