@@ -1977,6 +1977,48 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     true
 }
 
+/// True when the machine's only reason to be idle is a task blocked reading
+/// the host-driven stdio pty with no keystrokes queued. An interactive
+/// program waiting for the user to type is not a deadlock.
+fn blocked_on_terminal_input(env: &LinuxEnv) -> bool {
+    let Some(stdio) = env.stdio_pty.as_ref() else {
+        return false;
+    };
+    if !env.stdio_input.is_empty() {
+        return false;
+    }
+    env.sched.parked.iter().any(|task| match &task.state {
+        ParkState::Waiting { watches, deadline } => {
+            deadline.is_none()
+                && watches.iter().any(|watch| {
+                    matches!(watch, Watch::PtyReadable(pty, false) if std::rc::Rc::ptr_eq(pty, stdio))
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Classifies a total stall: an interactive pause the host can end by typing,
+/// or a genuine deadlock. `reason` describes the deadlock for diagnostics.
+fn stall_outcome(env: &mut LinuxEnv, reason: &str, dump: bool) -> Outcome {
+    if blocked_on_terminal_input(env) {
+        env.terminal_input_wait = true;
+        return Outcome::Exit(VmExit::Interrupted);
+    }
+    tracing::error!("deadlock: {reason}");
+    if dump {
+        dump_parked(env);
+    }
+    env.record_exit(-1);
+    Outcome::Exit(VmExit::Deadlock)
+}
+
+/// Puts a ready task back on the CPU after an interactive pause. Returns
+/// false when nothing is runnable yet (the host still owes input).
+pub(crate) fn resume_parked(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
+    schedule_next(env, cpu)
+}
+
 /// Parks the current task and hands the CPU to the next ready one.
 fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart: bool) -> Outcome {
     prepare_resume(env, cpu, restart);
@@ -1984,10 +2026,7 @@ fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {
-        tracing::error!("deadlock: every task is blocked; halting");
-        dump_parked(env);
-        env.record_exit(-1);
-        Outcome::Exit(VmExit::Deadlock)
+        stall_outcome(env, "every task is blocked; halting", true)
     }
 }
 
@@ -2226,10 +2265,11 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {
-        tracing::error!("deadlock: last runnable task exited but the root is still parked");
-        dump_parked(env);
-        env.record_exit(-1);
-        Outcome::Exit(VmExit::Deadlock)
+        stall_outcome(
+            env,
+            "last runnable task exited but the root is still parked",
+            true,
+        )
     }
 }
 
@@ -2242,7 +2282,7 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// user handler for it and does not block it. Used for terminal-generated
 /// signals (e.g. SIGWINCH to the foreground group on a resize). Does nothing
 /// when `pgrp` is 0 or no member handles the signal.
-fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64) {
+pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64) {
     if pgrp == 0 {
         return;
     }
@@ -3126,9 +3166,7 @@ fn sys_futex(
                 if schedule_next(env, cpu) {
                     Outcome::Switched
                 } else {
-                    tracing::error!("deadlock: timed futex wait with no runnable task");
-                    env.record_exit(-1);
-                    Outcome::Exit(VmExit::Deadlock)
+                    stall_outcome(env, "timed futex wait with no runnable task", false)
                 }
             }
         }
@@ -4431,9 +4469,11 @@ fn outcome_nanosleep(env: &mut LinuxEnv, cpu: &mut Cpu, req: u64, absolute: bool
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {
-        tracing::error!("deadlock: sleep with no runnable task and no deadline progress");
-        env.record_exit(-1);
-        Outcome::Exit(VmExit::Deadlock)
+        stall_outcome(
+            env,
+            "sleep with no runnable task and no deadline progress",
+            false,
+        )
     }
 }
 
@@ -4461,8 +4501,6 @@ fn park_timeout_returning_zero(
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {
-        tracing::error!("deadlock: timed wait with no runnable task");
-        env.record_exit(-1);
-        Outcome::Exit(VmExit::Deadlock)
+        stall_outcome(env, "timed wait with no runnable task", false)
     }
 }

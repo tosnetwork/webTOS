@@ -182,9 +182,18 @@ persistence around it.
 rustup target add wasm32-unknown-unknown
 tools/fetch_busybox.sh              # BusyBox demo image (GPL-2.0, not vendored)
 tools/fetch_alpine_rootfs.sh        # musl loader for the dynamic-linking checks
+tools/fetch_xterm.sh                # terminal emulator for the shell demo (MIT)
 bash web/build.sh                   # build the wasm module and stage the images
-python3 -m http.server -d web 8080  # then open http://localhost:8080/
+python3 -m http.server -d web 8080
 ```
+
+Two pages: `/` runs one-shot BusyBox commands against a filesystem that
+survives reload, and `/terminal.html` is an interactive BusyBox shell on a
+pseudoterminal — it echoes what you type, forks and execs commands through
+pipelines, runs the full-screen `vi` editor, and repaints when the window is
+resized (a host resize is a SIGWINCH to the guest's foreground group). A guest
+blocked on a terminal read pauses the run rather than deadlocking it; the next
+keystroke resumes the same process where it stopped.
 
 Two harnesses gate it:
 
@@ -198,12 +207,22 @@ node web/test_browsers.mjs          # all three engines; --engines= to narrow
 
 `web/test_browsers.mjs` drives the demo page the way a user does — BusyBox
 applets, a snapshot, a real page reload, a read-back of the restored
-filesystem — then runs the static and dynamically linked fixtures through the
-worker protocol directly, and finally reruns the page in a profile without
-persistent storage to confirm the host reports the missing capability instead
-of failing at the first click. It ends by comparing per-command instruction
-counts across the three engines: identical input must retire an identical
-instruction stream everywhere.
+filesystem — runs the static and dynamically linked fixtures through the
+worker protocol directly, drives the interactive terminal (a shell prompt, a
+pipeline, the full-screen editor, and a resize that repaints without a
+keystroke), and finally reruns the page in a profile without persistent
+storage to confirm the host reports the missing capability instead of failing
+at the first click. It ends by comparing per-command instruction counts across
+the three engines: identical input must retire an identical instruction stream
+everywhere.
+
+The native suite pins its target in `crates/.cargo/config.toml`, so on a macOS
+or ARM development machine run it against the host instead — tests whose
+fixtures need an x86-64 Linux toolchain skip themselves:
+
+```bash
+cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
+```
 
 ## Native Development
 

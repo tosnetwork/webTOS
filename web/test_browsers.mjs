@@ -5,8 +5,10 @@
 // Phase A drives the real demo page (web/index.html) exactly as a user would:
 // BusyBox applets, "Save FS", a browser reload, and a read-back of the
 // restored filesystem. Phase B drives web/worker.js directly on a blank page
-// to cover the static and dynamically linked hello binaries. Phase C reruns
-// the demo in a storage-less profile to prove the host degrades cleanly.
+// to cover the static and dynamically linked hello binaries. Phase C drives
+// the interactive terminal — a real shell on a pty, a full-screen editor, and
+// a window resize. Phase D reruns the one-shot demo in a storage-less profile
+// to prove the host degrades cleanly.
 // Finally the run compares per-command instruction counts across engines:
 // the same input must retire the same instruction stream on every engine.
 //
@@ -47,6 +49,7 @@ const MIME = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
   ".wasm": "application/wasm",
   ".json": "application/json",
 };
@@ -134,6 +137,150 @@ const workerDriver = async (input) => {
   worker.terminate();
   return { bootMs, restored: readyMsg.restored === true, runs };
 };
+
+// --------------------------------------------------------------- terminal
+
+/// The rendered terminal screen, as the user sees it.
+const readScreen = (page) =>
+  page.evaluate(() => {
+    const buffer = window.webtos.term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buffer.length; i += 1) {
+      lines.push(buffer.getLine(i)?.translateToString(true) ?? "");
+    }
+    return lines.join("\n");
+  });
+
+const terminalSize = (page) =>
+  page.evaluate(() => [window.webtos.term.cols, window.webtos.term.rows]);
+
+/// Types a command line and waits for `expect` to appear on the screen. The
+/// guest parks between individual keystrokes, so screen content — not the
+/// run state — is what says a command finished.
+async function typeLine(page, line, expect) {
+  await page.keyboard.type(line);
+  await page.keyboard.press("Enter");
+  return waitForScreen(page, expect);
+}
+
+/// Waits until the rendered screen contains `expect`, then returns it.
+async function waitForScreen(page, expect) {
+  await page.waitForFunction(
+    (needle) => {
+      const buffer = window.webtos.term.buffer.active;
+      for (let i = 0; i < buffer.length; i += 1) {
+        if ((buffer.getLine(i)?.translateToString(true) ?? "").includes(needle)) return true;
+      }
+      return false;
+    },
+    expect,
+    { timeout: EXEC_TIMEOUT },
+  );
+  return readScreen(page);
+}
+
+/// A full-screen program fills the window height with `~` filler, so the
+/// filler count tracks the size the guest believes the terminal to be.
+const countFiller = (page) =>
+  page.evaluate(() => {
+    const buffer = window.webtos.term.buffer.active;
+    let filler = 0;
+    for (let i = 0; i < buffer.length; i += 1) {
+      if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
+    }
+    return filler;
+  });
+
+async function runTerminalPhase(page, origin, name, record) {
+  await page.goto(`${origin}/web/terminal.html`);
+  const vendored = await page.evaluate(() => typeof window.Terminal === "function");
+  if (!vendored) {
+    record("terminal: emulator vendored", false, "run tools/fetch_xterm.sh");
+    return;
+  }
+  await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
+    timeout: EXEC_TIMEOUT,
+  });
+  const [cols, rows] = await terminalSize(page);
+  record("terminal: interactive shell reaches a prompt", true, `${cols}x${rows}`);
+
+  const echoed = await typeLine(page, `echo hello-from-${name}`, `hello-from-${name}`);
+  record(
+    "terminal: the shell echoes and runs a command",
+    echoed.includes(`echo hello-from-${name}`) && echoed.includes(`hello-from-${name}`),
+    "typed line echoed by the line discipline, output printed by the guest",
+  );
+
+  const piped = await typeLine(page, "ls /bin | head -3", "busybox");
+  record(
+    "terminal: pipeline across processes",
+    piped.includes("busybox") && piped.includes("cat"),
+    "fork + execve + pipe, from a shell on a pty",
+  );
+
+  await typeLine(page, "vi /root/notes.txt", "This file lives in the guest");
+  await page
+    .waitForFunction(
+      () => {
+        const buffer = window.webtos.term.buffer.active;
+        let filler = 0;
+        for (let i = 0; i < buffer.length; i += 1) {
+          if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
+        }
+        return filler > 2;
+      },
+      undefined,
+      { timeout: EXEC_TIMEOUT },
+    )
+    .catch(() => {});
+  const paintedFiller = await countFiller(page);
+  record(
+    "terminal: full-screen editor paints",
+    paintedFiller > 2,
+    `${paintedFiller} filler rows at ${rows} rows`,
+  );
+
+  // Shrink the window with nothing typed: SIGWINCH must reach the guest and
+  // it must repaint smaller on its own.
+  const viewport = page.viewportSize();
+  await page.setViewportSize({
+    width: Math.max(360, Math.round(viewport.width * 0.6)),
+    height: Math.max(240, Math.round(viewport.height * 0.5)),
+  });
+  await page.waitForFunction((before) => window.webtos.term.rows < before, rows, {
+    timeout: EXEC_TIMEOUT,
+  });
+  const [, smallRows] = await terminalSize(page);
+  await page
+    .waitForFunction(
+      (before) => {
+        const buffer = window.webtos.term.buffer.active;
+        let filler = 0;
+        for (let i = 0; i < buffer.length; i += 1) {
+          if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
+        }
+        return filler > 0 && filler < before;
+      },
+      paintedFiller,
+      { timeout: EXEC_TIMEOUT },
+    )
+    .catch(() => {});
+  const repainted = await countFiller(page);
+  record(
+    "terminal: SIGWINCH repaints without a keystroke",
+    repainted > 0 && repainted < paintedFiller,
+    `${paintedFiller} filler rows at ${rows} rows -> ${repainted} at ${smallRows}`,
+  );
+
+  await page.keyboard.type(":q!");
+  await page.keyboard.press("Enter");
+  const back = await typeLine(page, "echo back-in-the-shell", "back-in-the-shell");
+  record(
+    "terminal: the editor quits back to the shell",
+    back.includes("back-in-the-shell"),
+    "prompt restored and commands run again",
+  );
+}
 
 // ------------------------------------------------------------- browser side
 
@@ -264,6 +411,9 @@ async function runEngine(name, origin) {
       record(run.label, ok, ok ? `${run.icount.toLocaleString()} instructions` : `status=${run.status} exit=${run.exitCode} ${run.error} ${JSON.stringify(run.output.slice(0, 80))}`);
     }
 
+    // ---- Phase C: the interactive terminal.
+    await runTerminalPhase(page, origin, name, record);
+
   } catch (e) {
     record("engine run completed", false, String(e));
   } finally {
@@ -271,7 +421,7 @@ async function runEngine(name, origin) {
     await rm(profile, { recursive: true, force: true });
   }
 
-  // ---- Phase C: a profile with no persistent storage (a private window).
+  // ---- Phase D: a profile with no persistent storage (a private window).
   // The runtime must still boot and run; only the snapshot buttons stand down.
   const browser = await playwright[name].launch({ headless: !headed });
   try {

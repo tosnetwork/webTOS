@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webTOS — a Linux terminal in the tab</title>
+<link rel="stylesheet" href="./vendor/xterm/xterm.css">
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 1.5rem 2rem 2rem; background: #0b0e14; color: #d6dbe4;
+    font: 15px/1.5 system-ui, sans-serif; display: flex; flex-direction: column;
+    height: 100vh; box-sizing: border-box; gap: .75rem;
+  }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0; }
+  h1 span { color: #6aa5ff; }
+  .meta { color: #8b93a3; font-size: .85rem; margin: 0; }
+  .meta a { color: #6aa5ff; }
+  #status { color: #8b93a3; font-size: .85rem; min-height: 1.4em; }
+  #screen {
+    flex: 1; min-height: 0; background: #05070b;
+    border: 1px solid #1d2331; border-radius: 8px; padding: .6rem;
+  }
+  #missing {
+    display: none; background: #1b1206; border: 1px solid #4a3410;
+    border-radius: 8px; padding: 1rem; font: 13px ui-monospace, monospace;
+  }
+</style>
+</head>
+<body>
+<h1><span>webTOS</span> — an interactive Linux shell, on a terminal, in this tab</h1>
+<p class="meta">
+  BusyBox <code>sh</code> runs on a pseudoterminal inside the wasm Linux
+  runtime: it sees a real tty, echoes what you type, forks and execs commands,
+  and repaints when you resize this window. Try <code>ls -l /bin</code>,
+  <code>vi /root/notes.txt</code> (a full-screen editor — <code>:q!</code> to
+  leave), <code>echo hi &gt; /root/f &amp;&amp; cat /root/f</code>.
+  <a href="./index.html">One-shot command demo →</a>
+</p>
+<div id="missing">
+  vendor/xterm is missing. Run <code>tools/fetch_xterm.sh</code> to fetch the
+  pinned terminal emulator, then reload.
+</div>
+<div id="status">starting worker…</div>
+<div id="screen"></div>
+
+<script src="./vendor/xterm/xterm.js"></script>
+<script src="./vendor/xterm/addon-fit.js"></script>
+<script type="module">
+  const statusEl = document.getElementById("status");
+  const screen = document.getElementById("screen");
+
+  if (typeof Terminal !== "function") {
+    document.getElementById("missing").style.display = "block";
+    statusEl.textContent = "terminal emulator not vendored";
+    throw new Error("xterm.js missing");
+  }
+
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, "Cascadia Mono", Menlo, monospace',
+    fontSize: 13,
+    cursorBlink: true,
+    theme: { background: "#05070b", foreground: "#d6dbe4", cursor: "#6aa5ff" },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(screen);
+  fit.fit();
+  // The browser matrix drives this page; it reads the rendered screen and
+  // the live state from here rather than scraping the DOM canvas.
+  window.webtos = { term, state: "starting" };
+
+  const worker = new Worker(new URL("./worker.js", import.meta.url));
+  let live = false;
+
+  worker.onmessage = (event) => {
+    const msg = event.data;
+    if (msg.type === "status") statusEl.textContent = msg.text;
+    if (msg.type === "ready") {
+      statusEl.textContent += msg.restored
+        ? " — previous session restored"
+        : " — filesystem ready";
+      // The guest's terminal is created at the size the tab actually has.
+      worker.postMessage({
+        type: "spawn",
+        path: "/bin/busybox",
+        argv: ["sh", "-i"],
+        envp: [
+          "PATH=/bin:/usr/bin",
+          "HOME=/root",
+          "TERM=xterm-256color",
+          "PS1=webtos:\\w$ ",
+        ],
+        rows: term.rows,
+        cols: term.cols,
+      });
+      live = true;
+      window.webtos.state = "running";
+    }
+    if (msg.type === "output") term.write(msg.text);
+    if (msg.type === "waiting") {
+      window.webtos.state = "waiting";
+      statusEl.textContent = statusLine("waiting for input");
+    }
+    if (msg.type === "done") {
+      live = false;
+      window.webtos.state = "exited";
+      term.write("\r\n");
+      statusEl.textContent =
+        msg.status === 1
+          ? `shell exited ${msg.exitCode} · ${msg.icount.toLocaleString()} instructions — reload to start again`
+          : `stopped (status ${msg.status}): ${msg.error}`;
+    }
+    if (msg.type === "error") {
+      window.webtos.state = "error";
+      statusEl.textContent = `error: ${msg.text}`;
+    }
+  };
+
+  const statusLine = (state) =>
+    `${state} · terminal ${term.cols}x${term.rows}`;
+
+  // Keystrokes (and xterm's own replies to the guest's cursor-position
+  // queries) go straight to the pty master.
+  term.onData((data) => {
+    if (live) worker.postMessage({ type: "input", data });
+  });
+
+  // A resize is a SIGWINCH to the guest's foreground group; a full-screen
+  // program repaints itself without the user typing anything.
+  const applySize = () => {
+    fit.fit();
+    if (live) worker.postMessage({ type: "resize", rows: term.rows, cols: term.cols });
+    statusEl.textContent = statusLine(live ? "running" : "idle");
+  };
+  window.addEventListener("resize", applySize);
+
+  async function fetchBytes(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    return response.arrayBuffer();
+  }
+
+  (async () => {
+    try {
+      statusEl.textContent = "fetching BusyBox image…";
+      const busybox = await fetchBytes("./busybox-musl");
+      const notes = new TextEncoder().encode(
+        "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
+      ).buffer;
+      // One image, many commands: BusyBox picks its applet from argv[0], so
+      // each name on PATH is a link to the same binary.
+      const applets = [
+        "sh", "ls", "cat", "echo", "vi", "grep", "wc", "head", "tail",
+        "mkdir", "rm", "cp", "mv", "touch", "date", "uname", "ps", "env",
+      ];
+      worker.postMessage(
+        {
+          type: "boot",
+          files: [
+            { path: "/bin/busybox", bytes: busybox },
+            { path: "/root/notes.txt", bytes: notes },
+          ],
+          links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
+        },
+        [busybox, notes],
+      );
+    } catch (e) {
+      statusEl.textContent = `${e} — run web/build.sh first (and tools/fetch_busybox.sh)`;
+    }
+  })();
+
+  term.focus();
+</script>
+</body>
+</html>

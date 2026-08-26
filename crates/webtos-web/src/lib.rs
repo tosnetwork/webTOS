@@ -12,6 +12,14 @@
 //! draining output with `wtw_output_*` after each slice. The filesystem
 //! persists across `wtw_load` calls. Any `-1` return leaves a message
 //! readable via `wtw_error_*`.
+//!
+//! For an interactive workload, call `wtw_pty_install` between `wtw_load` and
+//! the first `wtw_run`: stdin/stdout/stderr then sit on a pty whose master the
+//! host holds, so the guest takes its terminal path. `wtw_run` reports
+//! `STATUS_AWAITING_INPUT` when the guest blocks on a read the host has not
+//! answered; the host yields to the event loop, delivers keystrokes with
+//! `wtw_pty_input`, and calls `wtw_run` again. `wtw_pty_resize` reports a new
+//! window size and raises SIGWINCH so a full-screen program redraws.
 
 use std::cell::RefCell;
 
@@ -30,6 +38,9 @@ pub const STATUS_ILLEGAL_INSTRUCTION: i32 = 3;
 pub const STATUS_INTERRUPTED: i32 = 4;
 pub const STATUS_OUT_OF_MEMORY: i32 = 5;
 pub const STATUS_UNHANDLED: i32 = 6;
+/// The guest is blocked reading the terminal and the host owes it input.
+/// Not an error: feed `wtw_pty_input` and call `wtw_run` again.
+pub const STATUS_AWAITING_INPUT: i32 = 7;
 
 struct HostState {
     machine: Option<Machine>,
@@ -40,6 +51,9 @@ struct HostState {
     /// Last drained guest output; kept alive so the pointer handed to JS
     /// stays valid until the next drain.
     output: Vec<u8>,
+    /// Whether stdio is a host-driven pty, which changes where `wtw_run`
+    /// collects guest output from.
+    pty: bool,
     error: String,
     allocations: Vec<Box<[u8]>>,
 }
@@ -52,6 +66,7 @@ thread_local! {
             envp: Vec::new(),
             fs_image: Vec::new(),
             output: Vec::new(),
+            pty: false,
             error: String::new(),
             allocations: Vec::new(),
         })
@@ -121,6 +136,28 @@ pub extern "C" fn wtw_add_file(path_ptr: u32, path_len: u32, data_ptr: u32, data
     })
 }
 
+/// Adds a symlink to the guest filesystem, so one multi-call image (BusyBox
+/// and friends) can appear on `PATH` under each of its command names.
+#[no_mangle]
+pub extern "C" fn wtw_add_symlink(
+    path_ptr: u32,
+    path_len: u32,
+    target_ptr: u32,
+    target_len: u32,
+) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_add_symlink called before wtw_init");
+        };
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let target = unsafe { slice_arg(target_ptr, target_len) };
+        match machine.add_symlink(&path, &target) {
+            Ok(()) => 0,
+            Err(e) => fail(state, e),
+        }
+    })
+}
+
 /// Appends one argv entry for the next `wtw_load`.
 #[no_mangle]
 pub extern "C" fn wtw_arg(ptr: u32, len: u32) -> i32 {
@@ -169,12 +206,23 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
         };
         machine.vm_mut().icount_limit = machine.icount().saturating_add(fuel as u64);
         let exit = machine.run();
+        // With stdio on a pty the guest's writes land in the pty, not the
+        // plain output buffer; exactly one of the two is ever non-empty.
         state.output = machine.take_output();
+        if state.pty {
+            state.output.extend(machine.drain_terminal_output());
+        }
         match exit {
             CpuExit::InstructionLimit => STATUS_RUNNING,
             CpuExit::Halt { .. } => STATUS_HALT,
             CpuExit::Breakpoint { .. } => STATUS_RUNNING,
-            CpuExit::Interrupted => STATUS_INTERRUPTED,
+            CpuExit::Interrupted => {
+                if machine.awaiting_terminal_input() {
+                    STATUS_AWAITING_INPUT
+                } else {
+                    STATUS_INTERRUPTED
+                }
+            }
             CpuExit::OutOfMemory => STATUS_OUT_OF_MEMORY,
             CpuExit::PageFault { address, access } => {
                 state.error = format!("page fault: {access:?} at {address:#x}");
@@ -189,6 +237,59 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
                 STATUS_UNHANDLED
             }
         }
+    })
+}
+
+/// Puts the loaded process's stdin/stdout/stderr on a host-driven pty of
+/// `rows` x `cols`, so `isatty` is true and the guest runs its interactive
+/// terminal path. Call after `wtw_load`, before the first `wtw_run`.
+#[no_mangle]
+pub extern "C" fn wtw_pty_install(rows: u32, cols: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_pty_install called before wtw_init");
+        };
+        if rows == 0 || cols == 0 {
+            return fail(state, "terminal size must be non-zero");
+        }
+        machine.install_pty_stdio(
+            rows.min(u16::MAX as u32) as u16,
+            cols.min(u16::MAX as u32) as u16,
+        );
+        state.pty = true;
+        0
+    })
+}
+
+/// Queues keystrokes for the terminal. They reach the guest when it next
+/// blocks reading, so this may be called between `wtw_run` slices.
+#[no_mangle]
+pub extern "C" fn wtw_pty_input(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_pty_input called before wtw_init");
+        };
+        let bytes = unsafe { slice_arg(ptr, len) };
+        machine.feed_terminal_input(&bytes);
+        0
+    })
+}
+
+/// Reports a new terminal size and raises SIGWINCH on the foreground group.
+#[no_mangle]
+pub extern "C" fn wtw_pty_resize(rows: u32, cols: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_pty_resize called before wtw_init");
+        };
+        if rows == 0 || cols == 0 {
+            return fail(state, "terminal size must be non-zero");
+        }
+        machine.resize_terminal(
+            rows.min(u16::MAX as u32) as u16,
+            cols.min(u16::MAX as u32) as u16,
+        );
+        0
     })
 }
 
@@ -294,6 +395,7 @@ pub extern "C" fn wtw_reset() {
         state.envp.clear();
         state.fs_image.clear();
         state.output.clear();
+        state.pty = false;
         state.error.clear();
         state.allocations.clear();
     });

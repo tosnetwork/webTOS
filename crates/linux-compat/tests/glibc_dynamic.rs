@@ -1,7 +1,9 @@
 //! Milestone-3 stress: dynamically linked binaries against the host glibc
 //! (its loader exercises far more of the ABI than musl). The fixtures are
-//! compiled on the host by the test itself, so these tests are native-only
-//! and skip when no compiler is available.
+//! compiled on the host by the test itself and the runtime is borrowed from
+//! the host, so these tests only run on an x86-64 Linux machine and skip
+//! elsewhere (a macOS or ARM host compiles the fixture for its own platform
+//! and has no glibc loader to donate).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,22 +16,43 @@ fn ldef_path() -> PathBuf {
         .join("../../third_party/ghidra-x86/languages/x86.ldefs")
 }
 
+const GLIBC_RUNTIME: [&str; 3] = [
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/x86_64-linux-gnu/libc.so.6",
+    "/lib/x86_64-linux-gnu/libgcc_s.so.1",
+];
+
+/// True when this host has an x86-64 glibc runtime to donate to the guest.
+fn host_has_glibc() -> bool {
+    GLIBC_RUNTIME.iter().all(|lib| Path::new(lib).is_file())
+}
+
 /// Copies the host glibc runtime (loader + shared libraries) into the guest.
 fn add_glibc(machine: &mut Machine) -> Result<(), String> {
-    for lib in [
-        "/lib64/ld-linux-x86-64.so.2",
-        "/lib/x86_64-linux-gnu/libc.so.6",
-        "/lib/x86_64-linux-gnu/libgcc_s.so.1",
-    ] {
+    for lib in GLIBC_RUNTIME {
         let bytes = std::fs::read(lib).map_err(|e| format!("{lib}: {e}"))?;
         machine.add_file(lib.as_bytes(), bytes, 0o755)?;
     }
     Ok(())
 }
 
+/// An ELF64 little-endian image for EM_X86_64. A compiler on a macOS or ARM
+/// host happily produces something the guest cannot run, so the format is
+/// checked rather than assumed.
+fn is_x86_64_elf(image: &[u8]) -> bool {
+    image.len() > 20 && &image[..4] == b"\x7fELF" && image[4] == 2 && image[18] == 0x3e
+}
+
 fn compile(cmd: &mut Command, out: &Path) -> Option<Vec<u8>> {
     match cmd.status() {
-        Ok(status) if status.success() => Some(std::fs::read(out).expect("compiler output")),
+        Ok(status) if status.success() => {
+            let image = std::fs::read(out).expect("compiler output");
+            if !is_x86_64_elf(&image) {
+                eprintln!("skipping: host compiler does not target x86-64 Linux ({cmd:?})");
+                return None;
+            }
+            Some(image)
+        }
         _ => {
             eprintln!("skipping: fixture compiler unavailable ({cmd:?})");
             None
@@ -67,6 +90,10 @@ struct Run {
 
 #[test]
 fn glibc_dynamic_c_hello() {
+    if !host_has_glibc() {
+        eprintln!("skipping: host has no x86-64 glibc runtime to donate");
+        return;
+    }
     let dir = std::env::temp_dir().join("webtos-glibc-fixture");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let src = dir.join("hello.c");
@@ -92,6 +119,10 @@ fn glibc_dynamic_c_hello() {
 
 #[test]
 fn glibc_dynamic_rust_hello() {
+    if !host_has_glibc() {
+        eprintln!("skipping: host has no x86-64 glibc runtime to donate");
+        return;
+    }
     let dir = std::env::temp_dir().join("webtos-glibc-fixture");
     std::fs::create_dir_all(&dir).expect("temp dir");
     let src = dir.join("hello.rs");

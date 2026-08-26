@@ -11,7 +11,11 @@ if [ -f test_data/busybox-musl ]; then
 else
     echo "note: test_data/busybox-musl missing; run tools/fetch_busybox.sh for the BusyBox demo"
 fi
+if [ ! -f web/vendor/xterm/xterm.js ]; then
+    echo "note: web/vendor/xterm missing; run tools/fetch_xterm.sh for the terminal demo"
+fi
 
 echo "Staged web/webtos_web.wasm and guest images."
 echo "Serve with:  python3 -m http.server -d web 8080"
-echo "Then open:   http://localhost:8080/"
+echo "Then open:   http://localhost:8080/           (one-shot commands)"
+echo "             http://localhost:8080/terminal.html  (interactive shell)"

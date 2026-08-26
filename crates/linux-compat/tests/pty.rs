@@ -287,3 +287,144 @@ int main(void) {
         "terminal output: {rendered:?}"
     );
 }
+
+/// The pinned BusyBox image, or None when it has not been fetched.
+fn busybox() -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/busybox-musl");
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!(
+                "skipping: {} missing (run tools/fetch_busybox.sh)",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// The browser terminal's core loop: a guest blocked on a terminal read is
+/// waiting for the user, not deadlocked. `run` returns with
+/// `awaiting_terminal_input`, the host types, and the next `run` continues
+/// from exactly where the guest stopped. Without this a tab hosting an
+/// interactive program would halt the moment it asked for a keystroke.
+#[test]
+fn stdio_pty_pauses_for_input_and_resumes() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    machine.set_args(
+        vec![b"busybox".to_vec(), b"cat".to_vec()],
+        vec![b"PATH=/bin".to_vec()],
+    );
+    machine.load(b"/bin/busybox").expect("ELF load failed");
+    machine.install_pty_stdio(40, 120);
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+
+    // No keystrokes queued: `cat` blocks on its first read and the machine
+    // pauses instead of reporting a deadlock.
+    let exit = machine.run();
+    assert_eq!(exit, CpuExit::Interrupted, "expected an interactive pause");
+    assert!(
+        machine.awaiting_terminal_input(),
+        "pause should be attributed to terminal input"
+    );
+    assert_eq!(machine.exit_code(), None, "a pause is not an exit");
+
+    // The user types. The same process resumes and echoes the line back.
+    machine.feed_terminal_input(b"typed-in-the-browser\n");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let rendered = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert!(
+        rendered.contains("typed-in-the-browser"),
+        "terminal output after typing: {rendered:?}"
+    );
+
+    // `cat` has no more input, so it parks again rather than exiting.
+    assert_eq!(exit, CpuExit::Interrupted, "output: {rendered:?}");
+    assert!(machine.awaiting_terminal_input());
+}
+
+/// A real full-screen program in the terminal. `busybox vi` takes the
+/// alternate screen, paints the file with `~` filler to the window height,
+/// and parks waiting for a keystroke. A host-side resize (the user resizing
+/// the browser window) reaches it as SIGWINCH, and it repaints at the new
+/// size without the user typing anything — the redraw is the evidence that
+/// the guest both received the signal and read back the new TIOCGWINSZ.
+#[test]
+fn host_resize_repaints_a_full_screen_program() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    machine
+        .add_file(b"/tmp/note.txt", b"alpha\nbeta\n".to_vec(), 0o644)
+        .expect("add file");
+    machine.set_args(
+        vec![
+            b"busybox".to_vec(),
+            b"vi".to_vec(),
+            b"/tmp/note.txt".to_vec(),
+        ],
+        vec![
+            b"PATH=/bin".to_vec(),
+            b"TERM=xterm".to_vec(),
+            b"HOME=/root".to_vec(),
+        ],
+    );
+    machine.load(b"/bin/busybox").expect("ELF load failed");
+    machine.install_pty_stdio(10, 40);
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+
+    assert_eq!(machine.run(), CpuExit::Interrupted, "vi should await input");
+    assert!(machine.awaiting_terminal_input());
+    let first = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert!(
+        first.contains("\u{1b}[?1049h") && first.contains("alpha"),
+        "vi did not paint the alternate screen: {first:?}"
+    );
+    // A 10-row window: rows 3..9 are filler and row 10 is the status line.
+    assert!(
+        first.contains("\u{1b}[9;1H~") && first.contains("\u{1b}[10;1H"),
+        "vi painted the wrong height: {first:?}"
+    );
+
+    // The user resizes the window. Nothing is typed.
+    machine.resize_terminal(6, 20);
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    assert_eq!(machine.run(), CpuExit::Interrupted);
+    let repaint = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert!(
+        repaint.contains("\u{1b}[5;1H~") && repaint.contains("\u{1b}[6;1H"),
+        "vi did not repaint at 6 rows: {repaint:?}"
+    );
+    assert!(
+        !repaint.contains("\u{1b}[9;1H"),
+        "vi still painted the old height: {repaint:?}"
+    );
+
+    // It is still interactive afterwards: quitting exits cleanly.
+    machine.feed_terminal_input(b":q!\r");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let tail = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "quit: {tail:?}");
+}

@@ -142,9 +142,17 @@ pub struct LinuxEnv {
     /// the pending terminal input to feed the guest when it blocks reading it.
     pub(crate) stdio_pty: Option<fd::PtyRef>,
     pub(crate) stdio_input: std::collections::VecDeque<u8>,
+    /// Set when the machine went idle only because a task is blocked reading
+    /// the stdio pty with no host keystrokes queued. That is an interactive
+    /// pause, not a deadlock: the run stops so the host can collect input,
+    /// and the next `run` puts the task back on the CPU.
+    pub(crate) terminal_input_wait: bool,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
+
+/// Terminal-generated signal for a window-size change.
+const SIGWINCH: u64 = 28;
 
 impl LinuxEnv {
     pub fn new(cpu: &Cpu) -> Result<Self, String> {
@@ -165,6 +173,7 @@ impl LinuxEnv {
             next_pty_id: 0,
             stdio_pty: None,
             stdio_input: std::collections::VecDeque::new(),
+            terminal_input_wait: false,
             exit_code: None,
         })
     }
@@ -259,11 +268,48 @@ impl LinuxEnv {
         }
     }
 
+    /// Reports a new terminal size from the host (the user resized the
+    /// window) and notifies the foreground group with SIGWINCH, exactly as
+    /// the guest's own `TIOCSWINSZ` does, so a full-screen program redraws.
+    /// Does nothing when stdio is not a pty.
+    pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        let Some(pty) = self.stdio_pty.clone() else {
+            return;
+        };
+        let pgrp = {
+            let mut pty = pty.borrow_mut();
+            if pty.winsize[0] == rows && pty.winsize[1] == cols {
+                return;
+            }
+            pty.winsize[0] = rows;
+            pty.winsize[1] = cols;
+            pty.activity += 1;
+            pty.fg_pgrp
+        };
+        syscall::deliver_signal_to_pgrp(self, pgrp, SIGWINCH);
+    }
+
+    /// True when the last run stopped because an interactive guest is waiting
+    /// for the host to supply terminal input.
+    pub fn awaiting_terminal_input(&self) -> bool {
+        self.terminal_input_wait
+    }
+
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
         self.vfs
             .add_node(path, NodeKind::File(bytes), mode)
             .map(|_| ())
             .map_err(|e| format!("cannot add {}: errno {e}", path.escape_ascii()))
+    }
+
+    /// Adds a symlink at `path` pointing at `target`. Multi-call binaries
+    /// select their behaviour from `argv[0]`, so a link is how one image
+    /// becomes many commands on `PATH`.
+    pub fn add_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), String> {
+        self.vfs
+            .add_node(path, NodeKind::Symlink(target.to_vec()), 0o777)
+            .map(|_| ())
+            .map_err(|e| format!("cannot link {}: errno {e}", path.escape_ascii()))
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {
@@ -554,6 +600,12 @@ impl Environment for LinuxEnv {
         self.sched = Scheduler::new();
         self.last_group = proc::ROOT_PID;
         self.exit_code = None;
+        // A fresh root process gets fresh stdio: any terminal the previous
+        // one ran on is gone, so the host must install one again to make this
+        // process interactive.
+        self.stdio_pty = None;
+        self.stdio_input.clear();
+        self.terminal_input_wait = false;
         self.start_image(cpu, path)
     }
 
@@ -613,6 +665,11 @@ impl Machine {
     /// Adds a file to the guest filesystem (parent directories are created).
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
         self.env().add_file(path, bytes, mode)
+    }
+
+    /// Adds a symlink to the guest filesystem.
+    pub fn add_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), String> {
+        self.env().add_symlink(path, target)
     }
 
     /// Recursively copies a host directory tree into the guest filesystem,
@@ -690,6 +747,20 @@ impl Machine {
         self.env().drain_terminal_output()
     }
 
+    /// Reports a terminal resize from the host, delivering SIGWINCH to the
+    /// foreground group.
+    pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        self.env().resize_terminal(rows, cols);
+    }
+
+    /// True when [`run`](Self::run) stopped because the guest is blocked
+    /// reading the terminal and the host has queued no keystrokes. Feed input
+    /// with [`feed_terminal_input`](Self::feed_terminal_input) and call `run`
+    /// again to continue.
+    pub fn awaiting_terminal_input(&mut self) -> bool {
+        self.env().awaiting_terminal_input()
+    }
+
     /// Attaches a host network broker (network is denied without one).
     /// Sets the guest's CLOCK_REALTIME base (unix seconds at machine
     /// start). Call before `load` when the guest will validate real
@@ -743,6 +814,21 @@ impl Machine {
 
     /// Runs until the workload exits or faults.
     pub fn run(&mut self) -> CpuExit {
+        // A previous run paused with the guest blocked on terminal input.
+        // Put a task back on the CPU now that the host may have typed; with
+        // still nothing to read, stay paused rather than spinning.
+        if self.env().terminal_input_wait {
+            self.env().terminal_input_wait = false;
+            let InterpVm { cpu, env, .. } = &mut self.vm;
+            let env = env
+                .as_mut_any()
+                .downcast_mut::<LinuxEnv>()
+                .expect("machine environment is always LinuxEnv");
+            if !syscall::resume_parked(env, cpu) {
+                env.terminal_input_wait = true;
+                return CpuExit::Interrupted;
+            }
+        }
         let exit = self.vm.run();
         let code = self.env().exit_code();
         classify_exit(&self.vm, exit, code)

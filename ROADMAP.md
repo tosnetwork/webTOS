@@ -40,12 +40,12 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~68% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. Browser delivery and the Claude Code profile are the remaining agent work |
+| M7 Codex & Claude Code | 🔶 | ~70% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines. Delivering the agent images to the browser and the Claude Code profile are the remaining agent work |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 73%**.
-The native test suites (48 native cases plus the 17-check wasm harness and the
-14-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
+The native test suites (50 native cases plus the 17-check wasm harness and the
+20-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
 `crates/linux-compat` are the delivered engine and OS layers, `crates/webtos-web`
 + `web/` the current browser host.
 
@@ -80,7 +80,7 @@ design, but not the browser CPU execution half.
 | Linux compatibility | Substantial process, VFS, memory, signal, futex, socket, poll, and epoll implementation exists | Eight modules still depend directly on native x86-64 facilities |
 | Wasm agents | Standalone engine integration and kernel host bridge exist | Add browser worker lifecycle and browser host adapters |
 | x86-64 execution | Native hardware executes guest instructions | Build the x86-64 interpreter and later a hot-block translator |
-| Browser host | Not yet present | Build workers, terminal, persistence, networking, image loading, and snapshots |
+| Browser host | Workers, terminal, and OPFS persistence exist and are gated in three engines | Networking, large-image delivery, and checkpoints remain |
 | Runtime validation | Native Java, Node.js, Python, and Linux maturity harnesses exist | Add browser-native workload and recovery gates |
 
 This means webTOS can reuse the upper execution stack, but it cannot be
@@ -157,7 +157,9 @@ This layer must use interfaces such as `GuestMemory`, `VirtualAddressSpace`,
 Responsibilities:
 
 - worker lifecycle, scheduling wakeups, cancellation, and crash isolation
-- terminal input/output and resize events
+- terminal input/output and resize events ✅ (`web/terminal.html`: an
+  interactive shell on a pty, keystrokes and resize into the guest, rendered
+  output back out)
 - browser-backed packages, files, keyspaces, and checkpoints
 - network mediation through browser-available transports
 - application images, dependency manifests, and version pinning
@@ -236,7 +238,8 @@ Work:
 - Implement sparse guest pages with read, write, execute, and bounds checks. ✅
 - Port ELF loading and initial process stack construction to `GuestMemory`. ✅
 - Support the minimal Linux path for `write`, `exit`, and `exit_group`. ✅
-- Connect stdout to the browser terminal. ✅ (web/ demo terminal)
+- Connect stdout to the browser terminal. ✅ (web/ demo terminal, and a real
+  pty-backed terminal at web/terminal.html)
 - Add instruction differential fixtures and malformed-ELF tests. 🔶 (trap tests exist; no differential suite)
 
 Exit gate:
@@ -467,9 +470,10 @@ Exit gate for each agent:
   result through the terminal. 🔶 (Codex `exec` does this natively via
   `run_guest`; the browser-profile path remains)
 - Child processes, cancellation, and terminal resize behave correctly. 🔶
-  (child processes and vfork spawns work; terminal resize delivers SIGWINCH;
-  Codex's interactive TUI quits cleanly on Ctrl-C — natively, not yet in a
-  browser profile)
+  (child processes and vfork spawns work; terminal resize delivers SIGWINCH,
+  and a full-screen program repaints from a browser window resize with nothing
+  typed — gated in Chromium, Firefox, and WebKit; Codex's interactive TUI
+  quits cleanly on Ctrl-C natively, not yet in a browser profile)
 - A checkpointed session resumes after browser reload with filesystem state
   intact. ⬜
 - A multi-hour soak test has bounded memory, storage, and event-log growth. ⬜
