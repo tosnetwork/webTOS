@@ -25,6 +25,11 @@ pub struct PipeInner {
     pub data: std::collections::VecDeque<u8>,
     pub readers: u32,
     pub writers: u32,
+    /// Monotone change counter, bumped on every write, read, and end close.
+    /// Edge-triggered epoll re-arms a delivered edge when this moves, so a
+    /// new write is a new edge even while the pipe stays readable (matching
+    /// the kernel, where each wakeup re-queues the epoll item).
+    pub activity: u64,
 }
 
 pub type PipeRef = Rc<RefCell<PipeInner>>;
@@ -34,6 +39,8 @@ pub type PipeRef = Rc<RefCell<PipeInner>>;
 pub struct EventFdInner {
     pub count: u64,
     pub semaphore: bool,
+    /// Monotone change counter; see [`PipeInner::activity`].
+    pub activity: u64,
 }
 
 pub type EventFdRef = Rc<RefCell<EventFdInner>>;
@@ -89,7 +96,10 @@ pub struct EpollInner {
     /// write edges separate is essential: a delivered writable (connect) edge
     /// must not suppress a later readable edge on the same fd. Cleared for a fd
     /// on `EPOLL_CTL_MOD`/`DEL`.
-    pub edge_fired: std::collections::BTreeMap<u64, u32>,
+    /// Value is `(delivered direction mask, backing activity at delivery)`.
+    /// A direction's edge stays suppressed only while the backing's activity
+    /// counter is unchanged; any new write/read/close re-arms it.
+    pub edge_fired: std::collections::BTreeMap<u64, (u32, u64)>,
 }
 
 pub type EpollRef = Rc<RefCell<EpollInner>>;
@@ -151,14 +161,17 @@ impl Drop for Description {
                 } else {
                     inner.readers = inner.readers.saturating_sub(1);
                 }
+                inner.activity += 1;
             }
             Backing::SocketPair { rx, tx } => {
                 {
                     let mut rx = rx.borrow_mut();
                     rx.readers = rx.readers.saturating_sub(1);
+                    rx.activity += 1;
                 }
                 let mut tx = tx.borrow_mut();
                 tx.writers = tx.writers.saturating_sub(1);
+                tx.activity += 1;
             }
             Backing::Net(socket) => {
                 let socket = socket.borrow();
@@ -213,6 +226,14 @@ impl FdTable {
         Self {
             entries: vec![std(StdStream::In), std(StdStream::Out), std(StdStream::Err)],
         }
+    }
+
+    /// Iterates over occupied descriptors as `(fd, entry)`, for diagnostics.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &FdEntry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, e)| e.as_ref().map(|e| (fd as u64, e)))
     }
 
     pub fn get(&self, fd: u64) -> Result<&FdEntry, u64> {

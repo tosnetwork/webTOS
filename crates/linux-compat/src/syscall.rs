@@ -1250,6 +1250,39 @@ fn desc_write_ready(desc: &Description) -> bool {
     }
 }
 
+/// The activity counter of `desc`'s backing (pipes, socketpairs, eventfds):
+/// a monotone value that moves on every write/read/close. Zero for backings
+/// without one.
+fn backing_activity(desc: &Description) -> u64 {
+    match &desc.backing {
+        Backing::Pipe { inner, .. } => inner.borrow().activity,
+        Backing::SocketPair { rx, tx } => rx.borrow().activity + tx.borrow().activity,
+        Backing::EventFd(event) => event.borrow().activity,
+        _ => 0,
+    }
+}
+
+/// The watch that fires when `desc`'s activity counter moves; None for
+/// backings without a counter.
+fn activity_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
+    use crate::proc::Watch;
+    match &desc.backing {
+        Backing::Pipe { inner, .. } => {
+            Some(Watch::PipeActivity(inner.clone(), inner.borrow().activity))
+        }
+        // Either direction of a socketpair re-arms on its own pipe's counter;
+        // watch the receive side (sends by the peer land there) and the send
+        // side (drains by the peer land there) separately.
+        Backing::SocketPair { rx, .. } => {
+            Some(Watch::PipeActivity(rx.clone(), rx.borrow().activity))
+        }
+        Backing::EventFd(event) => {
+            Some(Watch::EventActivity(event.clone(), event.borrow().activity))
+        }
+        _ => None,
+    }
+}
+
 /// The watch that becomes ready when a read on `desc` would make progress;
 /// None when reads never block.
 fn read_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
@@ -1672,9 +1705,159 @@ fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart
         Outcome::Switched
     } else {
         tracing::error!("deadlock: every task is blocked; halting");
+        dump_parked(env);
         env.record_exit(-1);
         Outcome::Exit(VmExit::Deadlock)
     }
+}
+
+/// Logs every parked task's blocking reason and signal state; called only on
+/// the fatal deadlock paths so a hang in a real workload is diagnosable.
+fn dump_parked(env: &LinuxEnv) {
+    for task in &env.sched.parked {
+        let state = match &task.state {
+            ParkState::Ready => "Ready".to_string(),
+            ParkState::WaitChild { pid } => format!("WaitChild(pid={pid})"),
+            ParkState::Futex { addr, deadline, .. } => {
+                format!("Futex(addr={addr:#x}, deadline={deadline:?})")
+            }
+            ParkState::PipeRead { pipe } => {
+                let p = pipe.borrow();
+                format!(
+                    "PipeRead(len={}, writers={}, readers={})",
+                    p.data.len(),
+                    p.writers,
+                    p.readers
+                )
+            }
+            ParkState::PipeWrite { pipe } => {
+                let p = pipe.borrow();
+                format!(
+                    "PipeWrite(len={}, writers={}, readers={})",
+                    p.data.len(),
+                    p.writers,
+                    p.readers
+                )
+            }
+            ParkState::Waiting { watches, deadline } => {
+                let kinds: Vec<String> = watches
+                    .iter()
+                    .map(|w| match w {
+                        crate::proc::Watch::PipeReadable(p) => {
+                            let p = p.borrow();
+                            format!("pipeR(len={},w={})", p.data.len(), p.writers)
+                        }
+                        crate::proc::Watch::PipeWritable(p) => {
+                            let p = p.borrow();
+                            format!("pipeW(len={},r={})", p.data.len(), p.readers)
+                        }
+                        crate::proc::Watch::Event(e) => {
+                            format!("event(count={})", e.borrow().count)
+                        }
+                        crate::proc::Watch::Timer(t) => {
+                            format!("timer(next={:?})", t.borrow().next_expiry)
+                        }
+                        crate::proc::Watch::NetReadable(_) => "net".to_string(),
+                        crate::proc::Watch::PipeActivity(p, seen) => {
+                            format!("pipeAct(now={},seen={seen})", p.borrow().activity)
+                        }
+                        crate::proc::Watch::EventActivity(e, seen) => {
+                            format!("eventAct(now={},seen={seen})", e.borrow().activity)
+                        }
+                        crate::proc::Watch::Always => "always".to_string(),
+                    })
+                    .collect();
+                format!(
+                    "Waiting(watches=[{}], deadline={deadline:?})",
+                    kinds.join(",")
+                )
+            }
+            ParkState::VforkDone { done } => format!("VforkDone(done={})", done.get()),
+        };
+        tracing::error!(
+            "  parked pid={} tgid={} ppid={} sigmask={:#x} pending={:#x} state={state}",
+            task.proc.pid,
+            task.proc.tgid,
+            task.proc.ppid,
+            task.proc.sigmask,
+            task.proc.pending_signals,
+        );
+    }
+    for z in &env.sched.zombies {
+        tracing::error!("  zombie pid={} ppid={} status={}", z.pid, z.ppid, z.status);
+    }
+    // One fd-table dump per thread group (threads share the table).
+    let mut seen: Vec<*const ()> = Vec::new();
+    for task in &env.sched.parked {
+        let table_ptr = std::rc::Rc::as_ptr(&task.proc.fds) as *const ();
+        if seen.contains(&table_ptr) {
+            continue;
+        }
+        seen.push(table_ptr);
+        tracing::error!("  fd table of tgid={}:", task.proc.tgid);
+        for (fd, entry) in task.proc.fds.borrow().iter() {
+            let desc = entry.desc.borrow();
+            let kind = match &desc.backing {
+                Backing::Std(s) => format!("std({s:?})"),
+                Backing::File { node } => format!("file(node={node})"),
+                Backing::Dir { node, .. } => format!("dir(node={node})"),
+                Backing::Dev(d) => format!("dev({d:?})"),
+                Backing::Pipe { inner, write_end } => {
+                    let p = inner.borrow();
+                    format!(
+                        "pipe({}, ptr={:p}, len={}, r={}, w={})",
+                        if *write_end { "wr" } else { "rd" },
+                        std::rc::Rc::as_ptr(inner),
+                        p.data.len(),
+                        p.readers,
+                        p.writers
+                    )
+                }
+                Backing::SocketPair { rx, tx } => format!(
+                    "socketpair(rx={:p}, tx={:p})",
+                    std::rc::Rc::as_ptr(rx),
+                    std::rc::Rc::as_ptr(tx)
+                ),
+                Backing::EventFd(e) => format!("eventfd(count={})", e.borrow().count),
+                Backing::TimerFd(t) => format!("timerfd(next={:?})", t.borrow().next_expiry),
+                Backing::Net(n) => {
+                    let n = n.borrow();
+                    format!(
+                        "net({:?}, handle={:?}, peer={:?})",
+                        n.kind, n.handle, n.peer
+                    )
+                }
+                Backing::Epoll(ep) => {
+                    let ep = ep.borrow();
+                    let interests: Vec<String> = ep
+                        .interests
+                        .iter()
+                        .map(|(fd, (ev, _))| format!("{fd}:{ev:#x}"))
+                        .collect();
+                    let fired: Vec<String> = ep
+                        .edge_fired
+                        .iter()
+                        .map(|(fd, (m, act))| format!("{fd}:{m:#x}@{act}"))
+                        .collect();
+                    format!(
+                        "epoll(interests=[{}], edge_fired=[{}])",
+                        interests.join(","),
+                        fired.join(",")
+                    )
+                }
+            };
+            tracing::error!("    fd {fd}: {kind}");
+        }
+    }
+    let trail: Vec<String> = env
+        .syscall_trail
+        .iter()
+        .map(|(pid, nr, ic)| format!("{pid}:{nr}@{ic}"))
+        .collect();
+    tracing::error!(
+        "  syscall trail (pid:nr@icount, most recent last): {}",
+        trail.join(" ")
+    );
 }
 
 /// Terminates the current task. Threads disappear silently (after their
@@ -1740,6 +1923,7 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
         Outcome::Switched
     } else {
         tracing::error!("deadlock: last runnable task exited but the root is still parked");
+        dump_parked(env);
         env.record_exit(-1);
         Outcome::Exit(VmExit::Deadlock)
     }
@@ -2128,6 +2312,7 @@ fn sys_pipe(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, flags: u64) -> SysR
     use crate::fd::PipeInner;
 
     let inner: crate::fd::PipeRef = std::rc::Rc::new(std::cell::RefCell::new(PipeInner {
+        activity: 0,
         data: Default::default(),
         readers: 1,
         writers: 1,
@@ -2230,6 +2415,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                     return would_block(env, cpu, Watch::PipeReadable(pipe));
                 }
                 let take = (count as usize).min(inner.data.len()).min(0x40_0000);
+                inner.activity += 1;
                 inner.data.drain(..take).collect()
             };
             match write_mem(cpu, buf, &chunk) {
@@ -2247,6 +2433,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                     drop(inner);
                     return would_block(env, cpu, Watch::Event(event));
                 }
+                inner.activity += 1;
                 if inner.semaphore {
                     inner.count -= 1;
                     1_u64
@@ -2394,7 +2581,11 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
-            pipe.borrow_mut().data.extend(bytes.iter().copied());
+            {
+                let mut inner = pipe.borrow_mut();
+                inner.data.extend(bytes.iter().copied());
+                inner.activity += 1;
+            }
             Outcome::Ret(Ok(take as u64))
         }
         Kind::Event(event) => {
@@ -2408,6 +2599,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
             let value = u64::from_le_bytes(bytes.try_into().expect("read_mem length"));
             let mut inner = event.borrow_mut();
             inner.count = inner.count.saturating_add(value);
+            inner.activity += 1;
             Outcome::Ret(Ok(8))
         }
         Kind::Net(socket) => {
@@ -2944,6 +3136,7 @@ fn sys_socketpair(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             data: Default::default(),
             readers: 1,
             writers: 1,
+            activity: 0,
         }))
     };
     let (ab, ba) = (make_pipe(), make_pipe());
@@ -2975,6 +3168,7 @@ fn sys_eventfd(env: &mut LinuxEnv, initval: u64, flags: u64) -> SysResult {
     let event = EventFdInner {
         count: initval,
         semaphore: flags & EFD_SEMAPHORE != 0,
+        activity: 0,
     };
     install_fd(
         env,
@@ -3131,7 +3325,7 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     // borrowed immutably during it), tracked per direction so a delivered
     // writable edge never masks a fresh readable edge on the same fd. Each
     // entry is the new suppression mask for that fd.
-    let mut new_fired: Vec<(u64, u32)> = Vec::new();
+    let mut new_fired: Vec<(u64, u32, u64)> = Vec::new();
     {
         let inner = epoll.borrow();
         let fds = env.proc.fds.borrow();
@@ -3163,19 +3357,32 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
             if is_et {
                 // Edge tracking, per condition. Each ready condition (readable,
                 // writable, hang-up) is delivered once and then suppressed while
-                // it stays ready; it re-arms the moment it is observed not-ready.
-                // Tracking the conditions independently is essential: a delivered
-                // writable edge (an empty send buffer on a fresh connect) must not
-                // mask the readable edge that arrives later (the peer's first
-                // bytes) on the same fd. `fired` only ever carries IN/OUT/HUP, so
-                // the whole value is the set of currently-ready conditions.
-                let prev = inner.edge_fired.get(&fd).copied().unwrap_or(0);
+                // it stays ready with no new activity; it re-arms the moment it
+                // is observed not-ready OR the backing's activity counter moves
+                // (a new write to a still-readable pipe/eventfd is a new edge,
+                // exactly as the kernel re-queues the epoll item on every
+                // wakeup — async runtimes drain their waker only when it is
+                // reported, so suppressing it until empty loses wakeups).
+                // Tracking the conditions independently is essential: a
+                // delivered writable edge (an empty send buffer on a fresh
+                // connect) must not mask the readable edge that arrives later
+                // (the peer's first bytes) on the same fd.
+                let act = backing_activity(&desc);
+                let (prev_mask, prev_act) = inner.edge_fired.get(&fd).copied().unwrap_or((0, act));
+                let prev = if act == prev_act { prev_mask } else { 0 };
                 let report = fired & !prev;
-                if fired != prev {
-                    new_fired.push((fd, fired));
+                if fired != prev_mask || act != prev_act {
+                    new_fired.push((fd, fired, act));
                 }
                 if report != 0 && ready.len() < max_events {
                     ready.push((report, data));
+                } else if fired != 0 {
+                    // Ready but suppressed: nothing to report now, yet fresh
+                    // activity must wake a parked waiter so the new edge is
+                    // seen. Watch the activity counter itself.
+                    if let Some(watch) = activity_watch_of(&desc) {
+                        watches.push(watch);
+                    }
                 }
                 continue;
             }
@@ -3186,11 +3393,11 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     }
     if !new_fired.is_empty() {
         let mut inner = epoll.borrow_mut();
-        for (fd, mask) in new_fired {
+        for (fd, mask, act) in new_fired {
             if mask == 0 {
                 inner.edge_fired.remove(&fd);
             } else {
-                inner.edge_fired.insert(fd, mask);
+                inner.edge_fired.insert(fd, (mask, act));
             }
         }
     }

@@ -182,6 +182,12 @@ pub enum Watch {
     Timer(TimerFdRef),
     /// Network socket readability, checked through the broker.
     NetReadable(NetRef),
+    /// Fires when the pipe's activity counter moves past the recorded value
+    /// (a new write, read, or end close). Used for edge-triggered epoll fds
+    /// whose delivered edge is suppressed: only fresh activity re-arms them.
+    PipeActivity(PipeRef, u64),
+    /// Same as [`Watch::PipeActivity`] for an eventfd.
+    EventActivity(EventFdRef, u64),
     /// Immediately ready (regular files and similar).
     Always,
 }
@@ -206,6 +212,8 @@ impl Watch {
                     None => false,
                 }
             }
+            Watch::PipeActivity(pipe, seen) => pipe.borrow().activity != *seen,
+            Watch::EventActivity(event, seen) => event.borrow().activity != *seen,
             Watch::Always => true,
         }
     }

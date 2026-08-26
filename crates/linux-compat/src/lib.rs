@@ -102,8 +102,9 @@ pub struct LinuxEnv {
     /// `${name}` when the filesystem is serialized, so secrets never enter
     /// a snapshot.
     pub(crate) secrets: std::collections::BTreeMap<String, String>,
-    /// Recent syscall numbers (bounded ring) for crash diagnostics.
-    pub(crate) syscall_trail: std::collections::VecDeque<(u64, u64)>,
+    /// Recent syscalls, as `(pid, nr, icount)` (bounded ring), for crash
+    /// and deadlock diagnostics.
+    pub(crate) syscall_trail: std::collections::VecDeque<(u64, u64, u64)>,
     /// Deterministic time-warp offset: advanced when the whole system is
     /// idle waiting on a timer, so timeouts fire without busy-waiting.
     pub(crate) warp_nanos: u64,
@@ -123,7 +124,7 @@ impl LinuxEnv {
             output: Vec::new(),
             net: None,
             secrets: std::collections::BTreeMap::new(),
-            syscall_trail: std::collections::VecDeque::with_capacity(64),
+            syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
             exit_code: None,
         })
@@ -190,10 +191,10 @@ impl LinuxEnv {
 
     /// Records a syscall in the bounded diagnostic trail.
     pub(crate) fn record_syscall(&mut self, nr: u64, icount: u64) {
-        if self.syscall_trail.len() >= 64 {
+        if self.syscall_trail.len() >= 128 {
             self.syscall_trail.pop_front();
         }
-        self.syscall_trail.push_back((nr, icount));
+        self.syscall_trail.push_back((self.proc.pid, nr, icount));
     }
 
     pub(crate) fn now(&self, cpu: &Cpu) -> (i64, i64) {
@@ -660,7 +661,7 @@ impl Machine {
             .env()
             .syscall_trail
             .iter()
-            .map(|(nr, ic)| format!("{nr}@{ic}"))
+            .map(|(pid, nr, ic)| format!("{pid}:{nr}@{ic}"))
             .collect();
         let mut bundle = String::new();
         bundle.push_str(
