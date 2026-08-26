@@ -111,24 +111,57 @@ guest does not fit beside everything else, and `wtw_set_guest_memory_mb` exists
 so a host can say what its budget is and have the guest fail an allocation
 cleanly rather than have the module die when the browser refuses to grow.
 
-### Instruction counts do not measure everything
+### Process startup was a translation problem
 
 `busybox true` retires 2,713 instructions and takes 20 ms; a five-stage shell
-pipeline retires 124k instructions and takes well over a second. Almost none of that
-time is spent executing guest code — it is spent lifting each new image's
-basic blocks, which no instruction count shows. Process startup is therefore a
-translation problem, not an execution one, and caching lifted blocks across
-`execve` of the same image would pay for itself long before a faster
-interpreter loop would.
+pipeline retires 124k instructions and takes over a second. Almost none of that
+time was spent executing guest code.
+
+`bench_execve_relift_cost` measured it. A BusyBox shell runs `/bin/true` —
+which is the same BusyBox image — 1 or 16 times, so by the time the first one
+starts, every block of its startup path has already been lifted by the shell
+itself. It was re-lifted anyway:
+
+| Per extra `execve` | Instructions | Wall time | Rate |
+|---|---|---|---|
+| Before | 22,272 | 48.8 ms | 0.5 M inst/s |
+| After | 22,272 | 1.8–2.3 ms | 10–12 M inst/s |
+
+The five-stage shell pipeline moved with it, 1.06 s to 0.28 s.
+
+Blocks are keyed by `(virtual address, isa mode, address-space id)`, and
+`fork` and `execve` each take a fresh address-space id — necessary, because
+two images put different code at the same address, and reusing one for the
+other was a real bug. But it made identity *which process is looking*, when
+what matters is *what the memory contains*: about 98% of an `execve` was
+re-lifting blocks lifted moments earlier for another process.
+
+The engine now keeps a second index of lifted groups, keyed by address and ISA
+mode but not by address space, and reuses one only when the guest bytes at
+that address still match the ones it was lifted from. Lifting is a pure
+function of the bytes, the address and the context, so identical input gives
+an identical block, and a different image at the same address can never match.
+The hot path is untouched: the index is consulted only when the
+per-address-space map misses, which is exactly when a lift was about to
+happen. **About 20x**, with identical instruction counts — the guest does the
+same work; the engine stops repeating itself. What remains per exec is genuine
+setup: address-space teardown, ELF loading, stack construction.
+
+The change also let a real bug be fixed rather than worked around. The
+root-process load path reset every image to address-space id 0, so a second
+image loaded into a live machine keyed its blocks identically to the first —
+and the two static fixtures in this repository share a load address, so
+`guest_ps` printed `hello`'s output. Each load now takes its own address
+space. Without the content-addressed index that would have cost 18 ms of
+re-lifting per load; with it, a repeated load still runs in 0.1 ms.
 
 ## What this says about milestone 8
 
 In priority order, on the evidence above:
 
-1. **Attack translation cost, not just execution.** An `execve` runs 70x below
-   sustained rate, and about 98% of it is re-lifting. Key the block cache by
-   the backing image rather than by a per-process address-space id, so
-   processes that run the same binary share the work.
+1. ~~**Attack translation cost.**~~ Done: a content-addressed lift cache took
+   `execve` from 48.8 ms to about 2 ms. What is left per exec is address-space
+   teardown and ELF loading — a different problem, and a smaller one.
 2. **Then hot-block translation.** The interpreter is the floor for
    long-running compute: an agent's 20-second command is 200-odd million
    instructions, and no amount of host tuning turns that into 2 seconds.

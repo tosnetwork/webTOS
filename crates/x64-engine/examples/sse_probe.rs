@@ -40,7 +40,7 @@ impl Probe {
         const DATA_ADDR: u64 = 0x2000;
         self.vm.cpu.mem.reset_virtual();
         self.vm.cpu.reset();
-        self.vm.code.flush_code();
+        self.vm.flush_code();
         self.vm.cpu.block_id = u64::MAX;
         self.vm.cpu.mem.map_memory_len(
             CODE_ADDR,
@@ -89,7 +89,7 @@ impl Probe {
         self.vm.cpu.reset();
         // Flush the lifted-block cache: every run maps code at the same
         // address, so a stale block would otherwise be reused.
-        self.vm.code.flush_code();
+        self.vm.flush_code();
         self.vm.cpu.block_id = u64::MAX;
         self.vm.cpu.mem.map_memory_len(
             CODE_ADDR,
@@ -903,7 +903,7 @@ fn main() {
     {
         probe.vm.cpu.mem.reset_virtual();
         probe.vm.cpu.reset();
-        probe.vm.code.flush_code();
+        probe.vm.flush_code();
         probe.vm.cpu.block_id = u64::MAX;
         probe.vm.cpu.mem.map_memory_len(
             CODE_ADDR,

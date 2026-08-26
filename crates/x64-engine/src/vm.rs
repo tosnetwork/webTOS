@@ -13,17 +13,35 @@ use icicle_cpu::{
 
 /// Guest address of the basic block currently executing in the interpreter.
 /// A diagnostic mirror for memory-write hooks, which cannot see the CPU.
-pub static CURRENT_BLOCK_START: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static CURRENT_BLOCK_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Current guest address-space id. The OS layer bumps it whenever the memory
 /// behind the guest's virtual addresses changes wholesale (execve, or a
 /// switch to a different address space), so the VA-keyed block cache never
 /// reuses a block lifted from a different image at the same VA.
-pub static CURRENT_ASID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static CURRENT_ASID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Instruction count mirror, updated alongside [`CURRENT_BLOCK_START`].
-pub static CURRENT_ICOUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static CURRENT_ICOUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A block group already lifted at some virtual address, kept so a different
+/// address space can reuse it rather than lift the same bytes again.
+struct LiftedCode {
+    group: lifter::BlockGroup,
+    /// The SLEIGH context the group was lifted under.
+    context: u64,
+    /// The guest bytes it was lifted from. Lifting is a pure function of the
+    /// bytes, the address and the context, so identical inputs produce an
+    /// identical block — and requiring the bytes to still match is what stops
+    /// a different image at the same address from ever being mistaken for
+    /// this one.
+    source: Vec<u8>,
+}
+
+/// Longest group whose source is kept for reuse. A group that chains many
+/// blocks is rare and would cost more to remember than re-lifting costs.
+const MAX_LIFTED_SOURCE: usize = 64 * 1024;
+/// Distinct images remembered at one address. More than a handful means
+/// address reuse is churning, and verifying each candidate stops being cheap.
+const MAX_LIFTED_CANDIDATES: usize = 4;
 
 pub struct InterpVm {
     pub cpu: Box<Cpu>,
@@ -37,6 +55,14 @@ pub struct InterpVm {
     pub interrupt_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     next_timer: u64,
     prev_isa_mode: u8,
+    /// Lifted groups indexed by `(vaddr, isa_mode)` and *not* by address
+    /// space, so a process can find code another process already lifted from
+    /// the same bytes at the same address. `code.map` stays keyed per address
+    /// space and remains the hot path; this is consulted only when that
+    /// misses, which is exactly when a lift was about to happen anyway.
+    lifted: std::collections::HashMap<(u64, u64), Vec<LiftedCode>>,
+    /// The context `update_context` last installed in the lifter.
+    lift_context: u64,
 }
 
 impl InterpVm {
@@ -50,6 +76,8 @@ impl InterpVm {
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             next_timer: 0,
             prev_isa_mode: u8::MAX,
+            lifted: std::collections::HashMap::new(),
+            lift_context: 0,
         }
     }
 
@@ -104,8 +132,17 @@ impl InterpVm {
     pub fn reset(&mut self) {
         self.cpu.reset();
         self.cpu.mem.clear();
-        self.code.flush_code();
+        self.flush_code();
         self.prev_isa_mode = u8::MAX;
+    }
+
+    /// Drops every lifted block, including the content-addressed index.
+    /// Prefer this to `vm.code.flush_code()`: emptying `code.blocks` on its
+    /// own leaves the index holding block numbers that no longer mean
+    /// anything.
+    pub fn flush_code(&mut self) {
+        self.code.flush_code();
+        self.lifted.clear();
     }
 
     pub fn get_current_block(&self) -> Option<(u64, u64)> {
@@ -178,7 +215,7 @@ impl InterpVm {
                     self.cpu.exception.value
                 );
                 self.cpu.mem.clear_code_cache();
-                self.code.flush_code();
+                self.flush_code();
                 self.cpu.block_id = u64::MAX;
                 self.cpu.block_offset = 0;
                 let pc = self.cpu.read_pc();
@@ -398,6 +435,18 @@ impl InterpVm {
 
     pub fn lift(&mut self, addr: u64) -> Result<lifter::BlockGroup, lifter::DecodeError> {
         self.update_context();
+        let isa_mode = self.cpu.isa_mode() as u64;
+
+        // Another address space may have lifted exactly this code here
+        // already — the common case when a shell execs the same binary again,
+        // or when two processes run the same image. Reuse is only allowed
+        // when the bytes still match, so this cannot resurrect the bug the
+        // address-space id was added to fix.
+        if let Some(group) = self.reuse_lifted(addr, isa_mode) {
+            let key = self.get_block_key(addr);
+            self.code.map.insert(key, group);
+            return Ok(group);
+        }
 
         let mut ctx = lifter::Context::new(&mut *self.cpu, &mut self.code, addr);
         let group = self.lifter.lift_block(&mut ctx)?;
@@ -439,13 +488,86 @@ impl InterpVm {
 
         let key = self.get_block_key(addr);
         self.code.map.insert(key, group);
+        self.remember_lifted(addr, isa_mode, group);
 
         Ok(group)
+    }
+
+    /// A group already lifted at this address from the bytes now in memory,
+    /// under the same context, or None.
+    fn reuse_lifted(&mut self, addr: u64, isa_mode: u64) -> Option<lifter::BlockGroup> {
+        // Disjoint field borrows: the candidate list is read while guest
+        // memory is read through the CPU.
+        let InterpVm {
+            lifted,
+            cpu,
+            code,
+            lift_context,
+            ..
+        } = self;
+        let candidates = lifted.get(&(addr, isa_mode))?;
+        let mut buf = Vec::new();
+        for candidate in candidates {
+            if candidate.context != *lift_context {
+                continue;
+            }
+            buf.clear();
+            buf.resize(candidate.source.len(), 0);
+            if cpu
+                .mem
+                .read_bytes(candidate.group.start, &mut buf, icicle_cpu::mem::perm::NONE)
+                .is_err()
+            {
+                continue;
+            }
+            if buf != candidate.source {
+                continue;
+            }
+            // The recorded block numbers must still name this group. They
+            // would not if the table were flushed behind this index's back.
+            let group = candidate.group;
+            if code
+                .blocks
+                .get(group.blocks.0)
+                .is_some_and(|block| block.start == group.start)
+                && code.blocks.len() >= group.blocks.1
+            {
+                return Some(group);
+            }
+        }
+        None
+    }
+
+    /// Remembers a freshly lifted group so another address space can reuse it.
+    fn remember_lifted(&mut self, addr: u64, isa_mode: u64, group: lifter::BlockGroup) {
+        let len = group.end.saturating_sub(group.start) as usize;
+        if len == 0 || len > MAX_LIFTED_SOURCE {
+            return;
+        }
+        let mut source = vec![0_u8; len];
+        if self
+            .cpu
+            .mem
+            .read_bytes(group.start, &mut source, icicle_cpu::mem::perm::NONE)
+            .is_err()
+        {
+            return;
+        }
+        let context = self.lift_context;
+        let entry = self.lifted.entry((addr, isa_mode)).or_default();
+        if entry.len() < MAX_LIFTED_CANDIDATES {
+            entry.push(LiftedCode {
+                group,
+                context,
+                source,
+            });
+        }
     }
 
     fn update_context(&mut self) {
         // Use the context from the last block.
         if let Some(block) = self.code.blocks.get(self.cpu.block_id as usize) {
+            self.lift_context = block.context;
             self.lifter.set_context(block.context);
         }
 
@@ -455,7 +577,10 @@ impl InterpVm {
             tracing::debug!("ISA mode change {} -> {isa_mode}", self.prev_isa_mode);
             self.prev_isa_mode = isa_mode;
             match self.cpu.arch.isa_mode_context.get(isa_mode as usize) {
-                Some(ctx) => self.lifter.set_context(*ctx),
+                Some(ctx) => {
+                    self.lift_context = *ctx;
+                    self.lifter.set_context(*ctx);
+                }
                 None => {
                     tracing::error!("Unknown or unsupported ISA mode: {}", self.prev_isa_mode);
                     self.cpu.exception.code = ExceptionCode::InternalError as u32;

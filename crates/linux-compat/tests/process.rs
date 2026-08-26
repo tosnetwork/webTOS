@@ -732,3 +732,54 @@ int main(void) {
         "exec'd child polluted the parent's block cache; output: {output:?}"
     );
 }
+
+/// Two different static binaries commonly share a load address — every
+/// fixture built by this repository's linker script starts at 0x40000000 —
+/// so a block cache that keys on the address alone hands the second program
+/// the first one's code. It did: `guest_ps` printed `hello`'s output.
+///
+/// Each loaded image now takes its own address space, and the engine's
+/// content-addressed lift cache reuses a block only when the bytes at that
+/// address still match the ones it was lifted from. This runs the two
+/// fixtures alternately, so a stale block in either direction shows up as one
+/// program printing the other's output.
+#[test]
+fn two_images_at_one_address_do_not_share_lifted_code() {
+    init_logging();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data");
+    let hello = std::fs::read(dir.join("hello_linux.elf")).expect("hello fixture");
+    let ps = std::fs::read(dir.join("guest_ps.elf")).expect("ps fixture");
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/hello", hello, 0o755)
+        .expect("add hello");
+    machine.add_file(b"/bin/ps", ps, 0o755).expect("add ps");
+
+    for (path, expected, forbidden) in [
+        (&b"/bin/hello"[..], "Hello", "PID"),
+        (&b"/bin/ps"[..], "PID", "Hello"),
+        (&b"/bin/hello"[..], "Hello", "PID"),
+        (&b"/bin/ps"[..], "PID", "Hello"),
+    ] {
+        let name = String::from_utf8_lossy(path).into_owned();
+        machine.set_args(vec![b"prog".to_vec()], vec![b"PATH=/bin".to_vec()]);
+        machine.load(path).expect("ELF load failed");
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        let exit = machine.run();
+        let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+        assert_eq!(
+            exit,
+            CpuExit::Halt { code: Some(0) },
+            "{name} did not exit cleanly: {output:?}"
+        );
+        assert!(
+            output.contains(expected),
+            "{name} printed {output:?}, which is not its own output"
+        );
+        assert!(
+            !output.contains(forbidden),
+            "{name} printed the other image's output: {output:?}"
+        );
+    }
+}

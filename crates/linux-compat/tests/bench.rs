@@ -265,3 +265,35 @@ fn bench_execve_relift_cost() {
         seconds * 1000.0 / each,
     );
 }
+
+/// The same image loaded again into a live machine. Each load takes a fresh
+/// address space, so nothing is found under the previous one's key; the win
+/// here comes from the content-addressed lift cache recognising the bytes.
+#[test]
+#[ignore = "measurement, not a gate; run with --ignored --nocapture"]
+fn bench_reload_same_image() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    for run in 0..4 {
+        machine.set_args(
+            vec![b"busybox".to_vec(), b"true".to_vec()],
+            vec![b"PATH=/bin".to_vec()],
+        );
+        machine.load(b"/bin/busybox").expect("ELF load failed");
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        let start = Instant::now();
+        let exit = machine.run();
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(exit, CpuExit::Halt { code: Some(0) });
+        println!(
+            "[bench] {:<28} load {run}: {ms:>7.1} ms",
+            "reload same image"
+        );
+    }
+}

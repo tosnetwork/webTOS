@@ -656,6 +656,13 @@ impl Environment for LinuxEnv {
         self.stdio_pty = None;
         self.stdio_input.clear();
         self.terminal_input_wait = false;
+        // And a fresh address space, exactly as `execve` does. `Process::initial`
+        // hands out id 0 every time, so without this a second image loaded into
+        // the same machine keys its blocks identically to the first — and two
+        // static binaries commonly share a load address, which meant the second
+        // one ran the first one's code.
+        self.proc.asid = crate::alloc_asid();
+        x64_engine::vm::CURRENT_ASID.store(self.proc.asid, std::sync::atomic::Ordering::Relaxed);
         self.start_image(cpu, path)
     }
 

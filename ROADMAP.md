@@ -41,11 +41,11 @@ terminal behavior, and recovery after a browser reload.
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~74% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | ⬜ | ~12% | wasm opt pin and deterministic scheduling, plus a measured baseline with a control module: native and per-engine throughput, translation cost, and the linear-memory ceiling (`docs/performance.md`) |
+| M8 Performance & release | 🔶 | ~18% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 74%**. The weights are a judgement
+Weighted by engineering effort, **roughly 75%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -58,15 +58,15 @@ call, so here is the arithmetic rather than the assertion:
 | M5 Event loop & networking | 13% | 90% | 11.7 |
 | M6 OpenFox | 12% | 92% | 11.0 |
 | M7 Codex & Claude Code | 20% | 74% | 14.8 |
-| M8 Performance & release | 14% | 12% | 1.7 |
-| **Total** | **100%** | | **74.5** |
+| M8 Performance & release | 14% | 18% | 2.5 |
+| **Total** | **100%** | | **75.3** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 17 of the 25 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (57 cases, plus 6 soak and measurement runs invoked
+The native test suites (58 cases, plus 7 soak and measurement runs invoked
 explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
 27-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
@@ -101,11 +101,15 @@ what is left is the agent itself.
 
 Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
 
-- **Reuse lifted blocks across processes that share an image.** Measured: an
-  `execve` of an image whose blocks are already lifted still costs 22k
-  instructions and 49 ms — about 70x below the interpreter's sustained rate,
-  because the cache is keyed per address space rather than per image.
+- ~~**Reuse lifted blocks across processes that share an image.**~~ Done: the
+  engine indexes lifted groups by address and content as well as by address
+  space, so a process reuses what another already lifted from the same bytes.
+  An `execve` went from 48.8 ms to about 2 ms, and a five-stage shell pipeline from 1.06 s to 0.28 s. It also fixed a live bug — two
+  images loaded into one machine shared a load address and so shared blocks,
+  and the second one ran the first one's code.
 - **Hot-block translation**, once the semantics are stable enough to risk it.
+  This is now the first unclaimed item: with lifting largely paid for once,
+  the interpreter loop is what a long-running command spends its time in.
 - **Split the interpreter's cold half** (float and 80-bit paths). A risk
   rather than a defect: no engine has been shown to decline the 61.8 KiB
   function, and the fix is mechanical if one ever does.
@@ -625,7 +629,7 @@ Exit gate for each agent:
 
 The milestone is complete only when both agent profiles pass independently.
 
-## Milestone 8: Performance, Security, and Release ⬜
+## Milestone 8: Performance, Security, and Release 🔶
 
 **Outcome:** correctness-complete workload profiles become a supportable web
 runtime.
@@ -643,7 +647,8 @@ cache share 4 GiB rather than how much a tab allows.
 Work:
 
 - Keep lifted blocks across processes that share an image, so a short-lived
-  process does not pay to translate what has already been translated.
+  process does not pay to translate what has already been translated. ✅
+  (content-addressed lift cache; `execve` 48.8 ms -> ~2 ms)
 - Profile executed blocks and translate only proven hot paths to WebAssembly.
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results.
