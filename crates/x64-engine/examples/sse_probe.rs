@@ -495,6 +495,326 @@ fn main() {
             xmm_out: true,
             reference: |_a, b| unsafe { store(_mm_aeskeygenassist_si128::<1>(load(b))) },
         },
+        Case {
+            name: "pblendw xmm0,xmm1,0xa5",
+            code: &[0x66, 0x0f, 0x3a, 0x0e, 0xc1, 0xa5],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_blend_epi16(a, b, 0xa5))
+            },
+        },
+        Case {
+            name: "pblendvb xmm0,xmm1 (mask=xmm0)",
+            code: &[0x66, 0x0f, 0x38, 0x10, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_blendv_epi8(a, b, a))
+            },
+        },
+        Case {
+            name: "blendvps xmm0,xmm1 (mask=xmm0)",
+            code: &[0x66, 0x0f, 0x38, 0x14, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _mm_castsi128_ps(a))))
+            },
+        },
+        Case {
+            name: "blendvpd xmm0,xmm1 (mask=xmm0)",
+            code: &[0x66, 0x0f, 0x38, 0x15, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_castpd_si128(_mm_blendv_pd(_mm_castsi128_pd(a), _mm_castsi128_pd(b), _mm_castsi128_pd(a))))
+            },
+        },
+        Case {
+            name: "pmovzxbw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x30, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu8_epi16(b))
+            },
+        },
+        Case {
+            name: "pmovzxbd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x31, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu8_epi32(b))
+            },
+        },
+        Case {
+            name: "pmovzxbq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x32, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu8_epi64(b))
+            },
+        },
+        Case {
+            name: "pmovzxwd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x33, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu16_epi32(b))
+            },
+        },
+        Case {
+            name: "pmovzxwq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x34, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu16_epi64(b))
+            },
+        },
+        Case {
+            name: "pmovzxdq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x35, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepu32_epi64(b))
+            },
+        },
+        Case {
+            name: "pmovsxbw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x20, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi8_epi16(b))
+            },
+        },
+        Case {
+            name: "pmovsxbd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x21, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi8_epi32(b))
+            },
+        },
+        Case {
+            name: "pmovsxbq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x22, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi8_epi64(b))
+            },
+        },
+        Case {
+            name: "pmovsxwd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x23, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi16_epi32(b))
+            },
+        },
+        Case {
+            name: "pmovsxwq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x24, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi16_epi64(b))
+            },
+        },
+        Case {
+            name: "pmovsxdq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x25, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_cvtepi32_epi64(b))
+            },
+        },
+        Case {
+            name: "pmuldq xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x28, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_mul_epi32(a, b))
+            },
+        },
+        Case {
+            name: "pmulhrsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x0b, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_mulhrs_epi16(a, b))
+            },
+        },
+        Case {
+            name: "pmaddubsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x04, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_maddubs_epi16(a, b))
+            },
+        },
+        Case {
+            name: "psignb xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x08, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_sign_epi8(a, b))
+            },
+        },
+        Case {
+            name: "psignw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x09, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_sign_epi16(a, b))
+            },
+        },
+        Case {
+            name: "psignd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x0a, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_sign_epi32(a, b))
+            },
+        },
+        Case {
+            name: "phaddw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x01, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hadd_epi16(a, b))
+            },
+        },
+        Case {
+            name: "phaddd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x02, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hadd_epi32(a, b))
+            },
+        },
+        Case {
+            name: "phaddsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x03, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hadds_epi16(a, b))
+            },
+        },
+        Case {
+            name: "phsubw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x05, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hsub_epi16(a, b))
+            },
+        },
+        Case {
+            name: "phsubd xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x06, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hsub_epi32(a, b))
+            },
+        },
+        Case {
+            name: "phsubsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x07, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_hsubs_epi16(a, b))
+            },
+        },
+        Case {
+            name: "phminposuw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0x38, 0x41, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_minpos_epu16(b))
+            },
+        },
+        Case {
+            name: "insertps xmm0,xmm1,0x9c",
+            code: &[0x66, 0x0f, 0x3a, 0x21, 0xc1, 0x9c],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_castps_si128(_mm_insert_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), 0x9c)))
+            },
+        },
+        Case {
+            name: "roundps xmm0,xmm1,1 (floor)",
+            code: &[0x66, 0x0f, 0x3a, 0x08, 0xc1, 0x01],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_castps_si128(_mm_round_ps(_mm_castsi128_ps(b), 0x1)))
+            },
+        },
+        Case {
+            name: "roundpd xmm0,xmm1,2 (ceil)",
+            code: &[0x66, 0x0f, 0x3a, 0x09, 0xc1, 0x02],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_castpd_si128(_mm_round_pd(_mm_castsi128_pd(b), 0x2)))
+            },
+        },
     ];
 
     let mut probe = Probe::new();

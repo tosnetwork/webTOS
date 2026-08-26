@@ -295,6 +295,42 @@ pub mod x86 {
         ("minps", minps),
         ("sqrtpd", sqrtpd),
         ("sqrtps", sqrtps),
+        // SSE4.1 / SSSE3 ops the spec leaves opaque. Compilers targeting the
+        // x86-64-v2 baseline emit these unconditionally, without a CPUID
+        // check, so static binaries hit them even when CPUID stays quiet.
+        ("pblendw", pblendw),
+        ("pblendvb", pblendvb),
+        ("blendvps", blendvps),
+        ("blendvpd", blendvpd),
+        ("pmovzxbw", pmovzxbw),
+        ("pmovzxbd", pmovzxbd),
+        ("pmovzxbq", pmovzxbq),
+        ("pmovzxwd", pmovzxwd),
+        ("pmovzxwq", pmovzxwq),
+        ("pmovzxdq", pmovzxdq),
+        ("pmovsxbw", pmovsxbw),
+        ("pmovsxbd", pmovsxbd),
+        ("pmovsxbq", pmovsxbq),
+        ("pmovsxwd", pmovsxwd),
+        ("pmovsxwq", pmovsxwq),
+        ("pmovsxdq", pmovsxdq),
+        ("pmuldq", pmuldq),
+        ("pmulhrsw", pmulhrsw),
+        ("pmaddubsw", pmaddubsw),
+        ("psignb", psignb),
+        ("psignw", psignw),
+        ("psignd", psignd),
+        ("phaddw", phaddw),
+        ("phaddd", phaddd),
+        ("phaddsw", phaddsw),
+        ("phsubw", phsubw),
+        ("phsubd", phsubd),
+        ("phsubsw", phsubsw),
+        ("phminposuw", phminposuw),
+        ("insertps", insertps),
+        ("extractps", extractps),
+        ("roundps", roundps),
+        ("roundpd", roundpd),
         // AES-NI (SSE form). Node/V8 and OpenSSL issue these unconditionally.
         ("aesenc", aesenc),
         ("aesenclast", aesenclast),
@@ -839,6 +875,344 @@ pub mod x86 {
     }
     fn sqrtps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f32x4_binop(cpu, dst, [args[1], args[1]], |x, _| x.sqrt());
+    }
+
+    // --- SSE4.1 / SSSE3 -------------------------------------------------
+
+    fn pblendw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // Third operand (imm8) arrives via the pcode arg slot.
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mask = cpu.args[0] as u8;
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let src = if mask >> i & 1 == 0 { &a } else { &b };
+            out[2 * i..2 * i + 2].copy_from_slice(&src[2 * i..2 * i + 2]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pblendvb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // Third operand (the implicit XMM0 mask) arrives via the arg slot.
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mask = cpu.args[0].to_le_bytes();
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = if mask[i] & 0x80 != 0 { b[i] } else { a[i] };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn blendv_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane: usize) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mask = cpu.args[0].to_le_bytes();
+        let mut out = [0u8; 16];
+        for i in (0..16).step_by(lane) {
+            let take_b = mask[i + lane - 1] & 0x80 != 0; // sign bit of the lane
+            let src = if take_b { &b } else { &a };
+            out[i..i + lane].copy_from_slice(&src[i..i + lane]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn blendvps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        blendv_lanes(cpu, dst, args, 4);
+    }
+
+    fn blendvpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        blendv_lanes(cpu, dst, args, 8);
+    }
+
+    /// Packed move-with-extend: widen `count` elements of `from` bytes each
+    /// to `16 / count` bytes, zero- or sign-extending. The source operand
+    /// may be a narrow memory value, so only the needed low bytes are read.
+    fn pmov_extend(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        src: Value,
+        from: usize,
+        count: usize,
+        signed: bool,
+    ) {
+        let need = (from * count).min(src.size() as usize);
+        let mut src_bytes = [0u8; 16];
+        for (i, slot) in src_bytes.iter_mut().enumerate().take(need) {
+            *slot = cpu.read::<u8>(src.slice(i as u8, 1));
+        }
+        let to = 16 / count;
+        let mut out = [0u8; 16];
+        for i in 0..count {
+            let chunk = &src_bytes[from * i..from * i + from];
+            let fill = if signed && chunk[from - 1] & 0x80 != 0 { 0xff } else { 0 };
+            let lane = &mut out[to * i..to * i + to];
+            lane.fill(fill);
+            lane[..from].copy_from_slice(chunk);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pmovzxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 8, false);
+    }
+    fn pmovzxbd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 4, false);
+    }
+    fn pmovzxbq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 2, false);
+    }
+    fn pmovzxwd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 2, 4, false);
+    }
+    fn pmovzxwq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 2, 2, false);
+    }
+    fn pmovzxdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 4, 2, false);
+    }
+    fn pmovsxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 8, true);
+    }
+    fn pmovsxbd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 4, true);
+    }
+    fn pmovsxbq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 1, 2, true);
+    }
+    fn pmovsxwd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 2, 4, true);
+    }
+    fn pmovsxwq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 2, 2, true);
+    }
+    fn pmovsxdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[1], 4, 2, true);
+    }
+
+    fn pmuldq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // Signed multiply of dwords 0 and 2 into two 64-bit products.
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..2 {
+            let x = i32::from_le_bytes(a[8 * i..8 * i + 4].try_into().unwrap()) as i64;
+            let y = i32::from_le_bytes(b[8 * i..8 * i + 4].try_into().unwrap()) as i64;
+            out[8 * i..8 * i + 8].copy_from_slice(&x.wrapping_mul(y).to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pmulhrsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let x = i16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as i32;
+            let y = i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as i32;
+            let r = ((x * y >> 14) + 1) >> 1;
+            out[2 * i..2 * i + 2].copy_from_slice(&(r as i16).to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn pmaddubsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // Unsigned bytes of a times signed bytes of b, adjacent pairs
+        // summed with signed saturation.
+        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in 0..8 {
+            let lo = a[2 * i] as i32 * (b[2 * i] as i8) as i32;
+            let hi = a[2 * i + 1] as i32 * (b[2 * i + 1] as i8) as i32;
+            let sum = (lo + hi).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            out[2 * i..2 * i + 2].copy_from_slice(&sum.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    /// Reads a signed `lane`-byte element starting at `bytes[at]`.
+    fn lane_i64(bytes: &[u8; 16], at: usize, lane: usize) -> i64 {
+        let mut w = [0u8; 8];
+        w[..lane].copy_from_slice(&bytes[at..at + lane]);
+        if bytes[at + lane - 1] & 0x80 != 0 {
+            w[lane..].fill(0xff);
+        }
+        i64::from_le_bytes(w)
+    }
+
+    fn psign_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane: usize) {
+        let size = (dst.size as usize).min(16);
+        let read = |cpu: &mut Cpu, v: Value| {
+            let mut bytes = [0u8; 16];
+            for (i, slot) in bytes.iter_mut().enumerate().take(size) {
+                *slot = cpu.read::<u8>(v.slice(i as u8, 1));
+            }
+            bytes
+        };
+        let (a, b) = (read(cpu, args[0]), read(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in (0..size).step_by(lane) {
+            let mut x = lane_i64(&a, i, lane);
+            if b[i..i + lane].iter().all(|&v| v == 0) {
+                x = 0;
+            } else if b[i + lane - 1] & 0x80 != 0 {
+                x = x.wrapping_neg();
+            }
+            out[i..i + lane].copy_from_slice(&x.to_le_bytes()[..lane]);
+        }
+        for (off, byte) in out[..size].iter().enumerate() {
+            cpu.write_var::<u8>(dst.slice(off as u8, 1), *byte);
+        }
+    }
+
+    fn psignb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        psign_lanes(cpu, dst, args, 1);
+    }
+    fn psignw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        psign_lanes(cpu, dst, args, 2);
+    }
+    fn psignd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        psign_lanes(cpu, dst, args, 4);
+    }
+
+    /// Horizontal add/sub over `lane`-byte signed elements of the operand
+    /// pair, with optional saturation (word lanes only). Handles both the
+    /// 8-byte MMX and 16-byte XMM forms via the destination size.
+    fn phop_lanes(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        lane: usize,
+        sub: bool,
+        saturate: bool,
+    ) {
+        let size = (dst.size as usize).min(16);
+        let read = |cpu: &mut Cpu, v: Value| {
+            let mut bytes = [0u8; 16];
+            for (i, slot) in bytes.iter_mut().enumerate().take(size) {
+                *slot = cpu.read::<u8>(v.slice(i as u8, 1));
+            }
+            bytes
+        };
+        let (a, b) = (read(cpu, args[0]), read(cpu, args[1]));
+        let lanes = size / lane;
+        let mut out = [0u8; 16];
+        for i in 0..lanes {
+            // First half of the results pairs up a; second half pairs up b.
+            let (src, base) = if i < lanes / 2 { (&a, 2 * i) } else { (&b, 2 * (i - lanes / 2)) };
+            let x = lane_i64(src, lane * base, lane);
+            let y = lane_i64(src, lane * (base + 1), lane);
+            let mut r = if sub { x - y } else { x + y };
+            if saturate {
+                r = r.clamp(i16::MIN as i64, i16::MAX as i64);
+            }
+            out[lane * i..lane * i + lane].copy_from_slice(&r.to_le_bytes()[..lane]);
+        }
+        for (off, byte) in out[..size].iter().enumerate() {
+            cpu.write_var::<u8>(dst.slice(off as u8, 1), *byte);
+        }
+    }
+
+    fn phaddw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 2, false, false);
+    }
+    fn phaddd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 4, false, false);
+    }
+    fn phaddsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 2, false, true);
+    }
+    fn phsubw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 2, true, false);
+    }
+    fn phsubd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 4, true, false);
+    }
+    fn phsubsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        phop_lanes(cpu, dst, args, 2, true, true);
+    }
+
+    fn phminposuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // Single-operand op: the source is the only input.
+        let src = xmm_bytes(cpu, args[0]);
+        let mut best = (u16::MAX, 0u16);
+        for i in 0..8 {
+            let w = u16::from_le_bytes([src[2 * i], src[2 * i + 1]]);
+            if w < best.0 {
+                best = (w, i as u16);
+            }
+        }
+        cpu.write_var(dst, best.0 as u128 | (best.1 as u128) << 16);
+    }
+
+    fn insertps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let a = xmm_bytes(cpu, args[0]);
+        let imm = cpu.args[0] as u8;
+        // Register source: dword selected by bits 7:6; memory source: the
+        // 32-bit value itself.
+        let src = if args[1].size() >= 16 {
+            let b = xmm_bytes(cpu, args[1]);
+            let idx = (imm >> 6 & 3) as usize;
+            u32::from_le_bytes(b[4 * idx..4 * idx + 4].try_into().unwrap())
+        } else {
+            cpu.read::<u32>(args[1].slice(0, 4))
+        };
+        let mut out = a;
+        let dst_idx = (imm >> 4 & 3) as usize;
+        out[4 * dst_idx..4 * dst_idx + 4].copy_from_slice(&src.to_le_bytes());
+        for i in 0..4 {
+            if imm >> i & 1 != 0 {
+                out[4 * i..4 * i + 4].fill(0);
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn extractps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // dst is a 4- or 8-byte GPR/memory location; zero-extended dword.
+        let src = xmm_bytes(cpu, args[0]);
+        let imm = cpu.read::<u64>(args[1]) as u8;
+        let idx = (imm & 3) as usize;
+        let value = u32::from_le_bytes(src[4 * idx..4 * idx + 4].try_into().unwrap());
+        match dst.size {
+            8 => cpu.write_var(dst, value as u64),
+            _ => cpu.write_var(dst, value),
+        }
+    }
+
+    fn roundp_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
+        let b = xmm_bytes(cpu, args[1]);
+        // Bit 2 selects MXCSR rounding, which this machine keeps at the
+        // default (nearest-even); bits 1:0 give the explicit mode.
+        let imm = cpu.args[0] as u8;
+        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
+        let round64 = |v: f64| -> f64 {
+            match mode {
+                0 => v.round_ties_even(),
+                1 => v.floor(),
+                2 => v.ceil(),
+                _ => v.trunc(),
+            }
+        };
+        let mut out = [0u8; 16];
+        if double {
+            for i in 0..2 {
+                let v =
+                    f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
+                out[8 * i..8 * i + 8].copy_from_slice(&round64(v).to_bits().to_le_bytes());
+            }
+        } else {
+            for i in 0..4 {
+                let v =
+                    f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
+                let r = round64(v as f64) as f32;
+                out[4 * i..4 * i + 4].copy_from_slice(&r.to_bits().to_le_bytes());
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(out));
+    }
+
+    fn roundps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        roundp_lanes(cpu, dst, args, false);
+    }
+
+    fn roundpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        roundp_lanes(cpu, dst, args, true);
     }
 
     fn psadbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
