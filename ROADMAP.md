@@ -28,7 +28,7 @@ terminal behavior, and recovery after a browser reload.
 
 ## Status
 
-**Updated 2026-08-25.** Legend: ✅ complete (gated by tests), 🔶 partial,
+**Updated 2026-08-26.** Legend: ✅ complete (gated by tests), 🔶 partial,
 ⬜ not started.
 
 | Milestone | State | Completion | Evidence |
@@ -40,10 +40,10 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~35% | **Node.js runtime runs scripts** and a **stock static Codex binary (247 MB) runs its CLI paths** (`--version`, `--help`, `exec --help`, `login status` → "Not logged in", clean exits). Reached by the AVX-512 spec upgrade, SIMD helpers (AES-NI/pshufb/psadbw/roundsd, verified vs native intrinsics), an SSE2 CPUID baseline, a 1 GiB guest-memory cap, and `flock`. Interactive TUI/PTY, real `exec` (model calls + repo edits), Git, and authenticated HTTPS are not started |
+| M7 Codex & Claude Code | 🔶 | ~50% | **A real Codex `exec` run completes end to end**: the stock static binary authenticates, speaks TLS to the OpenAI API, sends a prompt, prints the model's reply, and exits 0 (2.37 B instructions). On top of the earlier CLI-path work this took real SIGCHLD delivery + `rt_sigreturn`, vfork parent suspension, kernel-faithful edge-triggered epoll re-arming (pipes/eventfds/sockets), 41 more SIMD helpers (SSE4.1/SSSE3 + saturating arithmetic, verified vs native intrinsics), a configurable wall-clock base, and a configurable memory cap. Interactive TUI/PTY, repo edits, Git, browser delivery, and Claude Code are not started |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 69%**.
+Weighted by engineering effort, overall completion is **roughly 71%**.
 The native test suites (40 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -384,9 +384,26 @@ A stock statically linked **Codex** binary (`codex-cli` 0.149.1, a 247 MB
 `x86_64-unknown-linux-musl` build) runs directly on top of this: `--version`,
 `--help`, and `exec --help` print correctly, and `login status` reports "Not
 logged in" and exits — all from a clean profile. It needed a larger guest
-physical-memory cap (its segments are ~246 MiB) and a `flock` no-op. What is
-*not* yet exercised is the interactive TUI (needs a PTY), a real `exec` run
-(model API calls over authenticated HTTPS, repository edits), and Git.
+physical-memory cap (its segments are ~246 MiB) and a `flock` no-op.
+
+**A real, authenticated `exec` run now completes end to end**: with real
+credentials mounted, the same binary discovers the CA store, performs the
+TLS handshakes, downloads its cloud configuration, sends the prompt to the
+OpenAI API, prints the model's reply, and exits 0 (2.37 B instructions).
+Getting there fixed, in order: real SIGCHLD delivery with `rt_sigreturn`
+(async runtimes reap children via a self-pipe handler, not `wait4`); vfork
+parent suspension until the child execs or exits (posix_spawn's error
+protocol); kernel-faithful edge-triggered epoll — a delivered edge re-arms
+on new pipe/eventfd/socket activity, not only when observed not-ready
+(two lost-wakeup deadlocks, found via a deadlock dump that now prints every
+parked task, fd table, and a syscall trail); 33 SSE4.1/SSSE3 helpers plus
+the 8 saturating packed add/sub ops (x86-64-v2 binaries issue them without
+CPUID checks; all verified against native intrinsics); a configurable
+wall-clock base (real certificate and token validity need real time); and a
+configurable physical-memory cap (`GUEST_MEM_MB`). A Node-based mock of the
+agent pipeline (`mock codex` against a local mock API) isolated the memory
+and clock failures. What is *not* yet exercised is the interactive TUI
+(needs a PTY), repository edits driven by the model, and Git.
 
 Work:
 
@@ -395,8 +412,9 @@ Work:
   packaged, browser-delivered agent image yet)
 - Complete PTY behavior, terminal resize, signals, subprocess trees, pipes,
   temporary files, file watching, Git operations, and authenticated HTTPS.
-  🔶 (signals, pipes, subprocess trees, temp files land in M4–M6; PTY,
-  terminal resize, file watching, Git, and authenticated HTTPS from Node are
+  🔶 (signals incl. real SIGCHLD delivery, pipes, subprocess trees incl.
+  vfork semantics, temp files, and authenticated HTTPS are exercised by the
+  real Codex `exec` run; PTY, terminal resize, file watching, and Git are
   not started)
 - Mount a repository with explicit read/write capabilities. ⬜
 - Provide controlled environment variables and secret handles. 🔶 (env + M6
@@ -410,7 +428,10 @@ Exit gate for each agent:
 
 - Version and help commands run from a clean browser profile. ⬜ (blocked on
   the agent images; the Node runtime under them runs)
-- Authentication can be supplied without baking secrets into an image. ⬜
+- Authentication can be supplied without baking secrets into an image. 🔶
+  (real credentials mount at runtime from a host directory and drive an
+  authenticated model call; per-agent secret handles and the browser path
+  are pending)
 - The agent reads a repository, edits a file, runs a command, and reports the
   result through the terminal. ⬜
 - Child processes, cancellation, and terminal resize behave correctly. ⬜
