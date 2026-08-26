@@ -125,9 +125,10 @@ interpreter loop would.
 
 In priority order, on the evidence above:
 
-1. **Attack translation cost, not just execution.** Startup and short-lived
-   processes are dominated by lifting. Keeping lifted blocks across processes
-   that share an image is the obvious first move.
+1. **Attack translation cost, not just execution.** An `execve` runs 70x below
+   sustained rate, and about 98% of it is re-lifting. Key the block cache by
+   the backing image rather than by a per-process address-space id, so
+   processes that run the same binary share the work.
 2. **Then hot-block translation.** The interpreter is the floor for
    long-running compute: an agent's 20-second command is 200-odd million
    instructions, and no amount of host tuning turns that into 2 seconds.

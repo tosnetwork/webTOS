@@ -101,8 +101,10 @@ what is left is the agent itself.
 
 Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
 
-- **Reuse lifted blocks across processes that share an image.** Process
-  startup is dominated by translation, not execution; this is the first move.
+- **Reuse lifted blocks across processes that share an image.** Measured: an
+  `execve` of an image whose blocks are already lifted still costs 22k
+  instructions and 49 ms — about 70x below the interpreter's sustained rate,
+  because the cache is keyed per address space rather than per image.
 - **Hot-block translation**, once the semantics are stable enough to risk it.
 - **Split the interpreter's cold half** (float and 80-bit paths). A risk
   rather than a defect: no engine has been shown to decline the 61.8 KiB
