@@ -28,26 +28,133 @@ terminal behavior, and recovery after a browser reload.
 
 ## Status
 
-**Updated 2026-08-26.** Legend: ✅ complete (gated by tests), 🔶 partial,
+**Updated 2026-08-27.** Legend: ✅ complete (gated by tests), 🔶 partial,
 ⬜ not started.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~40% | fixtures exist; native QEMU harnesses not re-run since the pivot; no trace format or dashboards |
+| M0 Lock the baseline | 🔶 | ~45% | fixtures exist; native QEMU harnesses not re-run since the pivot; no trace format; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
-| M7 Codex & Claude Code | 🔶 | ~72% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Delivering the agent images to the browser and the Claude Code profile are the remaining agent work |
+| M7 Codex & Claude Code | 🔶 | ~74% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
 | M8 Performance & release | ⬜ | ~12% | wasm opt pin and deterministic scheduling, plus a measured baseline with a control module: native and per-engine throughput, translation cost, and the linear-memory ceiling (`docs/performance.md`) |
 
-Weighted by engineering effort, overall completion is **roughly 73%**.
-The native test suites (54 native cases plus the 17-check wasm harness and the
-27-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
-`crates/linux-compat` are the delivered engine and OS layers, `crates/webtos-web`
-+ `web/` the current browser host.
+### Overall completion
+
+Weighted by engineering effort, **roughly 74%**. The weights are a judgement
+call, so here is the arithmetic rather than the assertion:
+
+| Milestone | Weight | Done | Contribution |
+|---|---|---|---|
+| M0 Lock the baseline | 5% | 45% | 2.3 |
+| M1 Static `hello` | 5% | 95% | 4.8 |
+| M2 Static BusyBox | 8% | 97% | 7.8 |
+| M3 Dynamic userland | 10% | 90% | 9.0 |
+| M4 Threads & processes | 13% | 88% | 11.4 |
+| M5 Event loop & networking | 13% | 90% | 11.7 |
+| M6 OpenFox | 12% | 92% | 11.0 |
+| M7 Codex & Claude Code | 20% | 74% | 14.8 |
+| M8 Performance & release | 14% | 12% | 1.7 |
+| **Total** | **100%** | | **74.5** |
+
+The two heaviest remaining items are the back half of M7 and nearly all of M8,
+which together account for about 17 of the 25 points outstanding. Progress from
+here is slower per point than it has been: the milestones that moved quickly
+were the ones where a workload either ran or did not.
+
+The native test suites (57 cases, plus 6 soak and measurement runs invoked
+explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
+27-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
+browser host.
+
+## What Remains
+
+The milestone sections below carry the detail. This is the same work grouped
+by what it unblocks, because the outstanding items do not line up with the
+milestone numbering any more.
+
+### The agent goal (M7, and the M6 tail)
+
+The product goal is a coding agent in a tab. Everything below it now works;
+what is left is the agent itself.
+
+- **Carry Codex into the browser.** The delivery mechanism exists and is
+  proven at 52 MB with OpenFox. Codex is ~258 MB, wants a large guest, and
+  needs credentials that must not be baked into an image — so this is a
+  memory-budget and secret-handle problem, not a transport one.
+- **Per-agent secret handles.** Credentials mount from a host directory
+  today; the browser path and per-agent scoping are not wired.
+- **The Claude Code profile.** Not started; the Node runtime beneath it runs.
+- **Repository access with real history**, beyond the host `git` binary
+  running against a mounted tree.
+- **Cancellation, interrupted calls, and checkpoint resume** are untested as a
+  set, and a checkpointed session has never been resumed after a reload.
+- **The long soaks**: 60 minutes for OpenFox, multi-hour for an agent, both
+  with bounded memory, storage, and event-log growth.
+
+### Making it usable rather than possible (M8)
+
+Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
+
+- **Reuse lifted blocks across processes that share an image.** Process
+  startup is dominated by translation, not execution; this is the first move.
+- **Hot-block translation**, once the semantics are stable enough to risk it.
+- **Split the interpreter's cold half** (float and 80-bit paths). A risk
+  rather than a defect: no engine has been shown to decline the 61.8 KiB
+  function, and the fix is mechanical if one ever does.
+- **Quotas** over memory, CPU, storage, network, and the event log, budgeting
+  guest pages, image bytes, and the block cache against one 4 GiB space.
+- **Fuzzing** of decoding, memory translation, ELF loading, syscalls, image
+  parsing, snapshot restore, and host messages.
+- **Signed manifests, reproducible images, dependency licenses**, and a
+  security audit of credential boundaries and snapshot contents.
+
+### Evidence the project does not yet keep (M0, and cross-cutting)
+
+- **An instruction trace format** and stored reference traces. Determinism is
+  gated today by comparing runs to each other, not to a recorded baseline.
+- **Versioned fixtures.** They exist; they are not a formal, pinned set.
+- **Native QEMU validation** has not been re-run since the browser pivot.
+- **A compatibility dashboard** across engines and pinned workload versions.
+  The measurement harnesses exist; nothing publishes them.
+
+### Not scoped by any milestone
+
+The mission promises "webTOS-owned isolation, scheduling, storage, networking
+policy, resource accounting, and execution records". The first four are
+delivered on the browser line. The last two are not, and no milestone from M0
+to M8 fully covers them:
+
+- **Resource accounting.** M8 lists quotas, but energy accounting per agent —
+  which the native kernel in `src/` has — has no browser counterpart and no
+  gate.
+- **Execution records.** Principle 6 says CPU execution, scheduling, external
+  input, storage commits, and receipts are one system. Determinism is gated by
+  comparing runs to each other; nothing produces a receipt a third party could
+  replay against. M5's "record network inputs for replay and receipt
+  classification" is the only line item, and it is not started.
+
+Joining the agent kernel's model to the Linux runtime is the largest unscoped
+piece of work in the project, and it is what separates webTOS from a Linux
+emulator that happens to run in a tab. It needs a milestone of its own before
+it can be estimated honestly, which is why it is absent from the 74% above
+rather than dragging it down.
+
+### Deferred on purpose
+
+- **Multi-worker execution.** The single-worker deterministic model is the
+  baseline, and multi-worker may not be attempted until it is provably
+  correct.
+- **Worker cancellation leaving storage consistent** is browser-host work that
+  has not started.
+- **Alternate signal stacks.** `sigaltstack` records and ignores; a handler
+  asking for `SA_ONSTACK` runs on the interrupted stack. No workload has
+  needed it yet, which is why it is here rather than above.
 
 ## Product Principles
 
@@ -70,22 +177,34 @@ The native test suites (54 native cases plus the 17-check wasm harness and the
 
 ## Current Baseline
 
-The repository already contains much of the operating-system half of the
-design, but not the browser CPU execution half.
+The repository holds two stacks, and it is worth being clear about which one
+the milestones above measure.
 
-| Component | Current state | Browser gap |
-|-----------|---------------|-------------|
-| Agent kernel | Scheduler, capabilities, mailboxes, energy, events, keyspaces, checkpoints, and receipts exist | Introduce a platform-neutral kernel host boundary |
-| ELF64 loading | Native x86-64 executable and dynamic ELF support exists | Load into sparse guest memory instead of native page tables |
-| Linux compatibility | Substantial process, VFS, memory, signal, futex, socket, poll, and epoll implementation exists | Eight modules still depend directly on native x86-64 facilities |
-| Wasm agents | Standalone engine integration and kernel host bridge exist | Add browser worker lifecycle and browser host adapters |
-| x86-64 execution | Native hardware executes guest instructions | Build the x86-64 interpreter and later a hot-block translator |
-| Browser host | Workers, terminal, OPFS persistence, relayed networking, and streamed image delivery exist and are gated in three engines | Checkpoints and packaging remain |
-| Runtime validation | Native Java, Node.js, Python, and Linux maturity harnesses exist | Add browser-native workload and recovery gates |
+`crates/` is the browser line and the subject of this roadmap: `x64-engine`
+(interpreter, decoder, guest memory), `linux-compat` (ELF, syscalls,
+processes, VFS, signals, futex, sockets, epoll, pseudoterminals), and
+`webtos-web` + `web/` (the wasm module and its browser host). It compiles to
+`wasm32-unknown-unknown` and executes unmodified Linux x86-64 binaries in
+Chromium, Firefox, and WebKit.
 
-This means webTOS can reuse the upper execution stack, but it cannot be
-compiled to WebAssembly as-is and execute Linux x86-64 programs. The central
-new component is the x86-64 execution engine.
+`src/` is the original bare-metal TOS kernel — agent scheduler, capabilities,
+mailboxes, energy accounting, keyspaces, checkpoints, receipts, and a Wasm
+contract engine — which still builds and boots under QEMU. Its concepts are
+where the browser line is headed, but none of its code is on the browser path
+today.
+
+| Component | Where it stands |
+|-----------|-----------------|
+| x86-64 execution | Interpreter runs guest instructions in wasm; hot-block translation is milestone 8 |
+| ELF64 loading | Static and dynamic (musl and glibc loaders) into sparse guest memory |
+| Linux compatibility | Processes, VFS, memory, signals, futex, sockets, poll/epoll, pseudoterminals — all portable, no native x86-64 dependency |
+| Browser host | Workers, terminal, OPFS persistence, relayed networking, and streamed image delivery, gated in three engines |
+| Agent kernel (`src/`) | Scheduler, capabilities, mailboxes, energy, events, keyspaces, checkpoints, receipts — native only; no platform-neutral host boundary yet |
+| Runtime validation | Native Java, Node.js, Python, and Linux maturity harnesses; browser workload and recovery gates are partial |
+
+The central new component, the x86-64 execution engine, exists. What is not
+yet joined up is the agent kernel's model — capabilities, energy, receipts —
+with the Linux runtime that now works in the browser.
 
 ## Target Architecture
 
@@ -292,7 +411,11 @@ Work:
   base behavior. ✅
 - Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)
 - Port signals, alternate signal stacks, and signal return frames to virtual
-  CPU state. 🔶 (registration + fatal-signal semantics; no handler delivery)
+  CPU state. 🔶 (registration, fatal-signal semantics, and real handler
+  delivery with `rt_sigreturn` — SIGCHLD to a parent not in `wait4`, SIGWINCH
+  to a terminal's foreground group, both gated; `sigaltstack` is still
+  registration-only, so a handler asking for SA_ONSTACK runs on the
+  interrupted stack)
 - Build versioned minimal root images with explicit licenses and manifests. 🔶 (Alpine minirootfs pinned by sha256; no per-package license manifest yet)
 
 Exit gate:
@@ -452,8 +575,9 @@ the guest — `status`, `diff`, `add`, `commit`, and `log` all work, gated by
 Work:
 
 - Support installation or prepackaged images without requiring host shell
-  access. 🔶 (host Node and a static Codex binary run via `run_guest`; no
-  packaged, browser-delivered agent image yet)
+  access. 🔶 (host Node and a static Codex binary run via `run_guest`; images
+  stream into the browser and cache in OPFS, demonstrated with OpenFox; no
+  signed or versioned image package yet)
 - Complete PTY behavior, terminal resize, signals, subprocess trees, pipes,
   temporary files, file watching, Git operations, and authenticated HTTPS.
   🔶 (signals incl. real SIGCHLD delivery, pipes, subprocess trees incl.
@@ -477,8 +601,10 @@ Work:
 
 Exit gate for each agent:
 
-- Version and help commands run from a clean browser profile. ⬜ (blocked on
-  the agent images; the Node runtime under them runs)
+- Version and help commands run from a clean browser profile. 🔶 (the
+  delivery mechanism exists and is proven — the OpenFox image streams into a
+  clean profile and runs in all three engines. Codex is five times larger and
+  has not been carried through it yet)
 - Authentication can be supplied without baking secrets into an image. 🔶
   (real credentials mount at runtime from a host directory and drive an
   authenticated model call; per-agent secret handles and the browser path

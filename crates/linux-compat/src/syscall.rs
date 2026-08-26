@@ -319,8 +319,12 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
 
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
         abi::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(env, cpu, a[0], a[1], a[2]),
-        // Registration-only, like rt_sigaction: signals are never delivered
-        // in this environment, so the alternate stack is recorded and unused.
+        // Registration-only. Handlers themselves do run (see `deliver_signal`),
+        // but always on the interrupted stack: a handler installed with
+        // SA_ONSTACK gets the normal stack rather than the alternate one it
+        // asked for. Runtimes use the alternate stack to survive a fault on a
+        // small or exhausted goroutine/thread stack, so this is a real gap,
+        // not a no-op — it just has not been reached by a workload yet.
         abi::SYS_SIGALTSTACK => {
             if a[1] != 0 {
                 write_mem(cpu, a[1], &[0_u8; 24])?;
