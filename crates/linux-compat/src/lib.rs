@@ -43,9 +43,11 @@ pub(crate) const MMAP_BASE: u64 = 0x6000_0000_0000;
 /// A pipe write blocks once this much data is buffered.
 pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
 
-/// Deterministic wall-clock base (fixed, not host time; bump this constant
-/// occasionally so certificate validity windows stay plausible).
-pub(crate) const EPOCH_BASE_SEC: i64 = 1_790_000_000; // 2026-09-21
+/// Default CLOCK_REALTIME base: a fixed instant so runs are reproducible
+/// when the host does not supply the real wall clock. Hosts that talk to
+/// real services (TLS certificate validity, token expiry) should override
+/// it via [`Machine::set_wall_clock_base`].
+pub(crate) const EPOCH_BASE_SEC: i64 = 1_790_000_000;
 
 pub(crate) struct Regs {
     pub rax: pcode::VarNode,
@@ -108,6 +110,10 @@ pub struct LinuxEnv {
     /// Deterministic time-warp offset: advanced when the whole system is
     /// idle waiting on a timer, so timeouts fire without busy-waiting.
     pub(crate) warp_nanos: u64,
+    /// CLOCK_REALTIME base (unix seconds at machine start). Defaults to a
+    /// fixed instant for reproducibility; hosts override it with the real
+    /// wall clock when the guest talks to real services.
+    pub(crate) epoch_base_sec: i64,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -126,6 +132,7 @@ impl LinuxEnv {
             secrets: std::collections::BTreeMap::new(),
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
+            epoch_base_sec: EPOCH_BASE_SEC,
             exit_code: None,
         })
     }
@@ -134,6 +141,10 @@ impl LinuxEnv {
     /// with `EAFNOSUPPORT` (network is denied by default).
     pub fn set_network(&mut self, broker: net::BrokerRef) {
         self.net = Some(broker);
+    }
+
+    pub fn set_wall_clock_base(&mut self, unix_sec: i64) {
+        self.epoch_base_sec = unix_sec;
     }
 
     /// Registers a secret. `${name}` in any guest file is expanded to
@@ -204,7 +215,8 @@ impl LinuxEnv {
         // timestamp).
         let nanos = self.now_nanos(cpu);
         (
-            EPOCH_BASE_SEC.saturating_add((nanos / 1_000_000_000) as i64),
+            self.epoch_base_sec
+                .saturating_add((nanos / 1_000_000_000) as i64),
             (nanos % 1_000_000_000) as i64,
         )
     }
@@ -581,6 +593,13 @@ impl Machine {
     }
 
     /// Attaches a host network broker (network is denied without one).
+    /// Sets the guest's CLOCK_REALTIME base (unix seconds at machine
+    /// start). Call before `load` when the guest will validate real
+    /// certificates or tokens; leaving the default keeps runs reproducible.
+    pub fn set_wall_clock_base(&mut self, unix_sec: i64) {
+        self.env().set_wall_clock_base(unix_sec);
+    }
+
     pub fn set_network(&mut self, broker: net::BrokerRef) {
         self.env().set_network(broker);
     }

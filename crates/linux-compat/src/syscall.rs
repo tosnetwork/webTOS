@@ -2683,7 +2683,7 @@ fn sys_futex(
                     // scale before comparing, or the epoch offset (~1.79e18 ns)
                     // would be charged to the idle time-warp.
                     let abs = if op & FUTEX_CLOCK_REALTIME != 0 {
-                        let base = (crate::EPOCH_BASE_SEC as u64).saturating_mul(1_000_000_000);
+                        let base = (env.epoch_base_sec as u64).saturating_mul(1_000_000_000);
                         duration.saturating_sub(base)
                     } else {
                         duration
