@@ -40,10 +40,10 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~65% | **A real Codex `exec` run edits a file, runs a shell command, and prints the model's summary, exiting 0.** Beyond the authenticated round-trip this took real process groups (`setpgid`/`kill -pgid`), true 80-bit x87 software floating point (musl's printf relied on 64-bit-mantissa exactness), `mremap`, an argv/envp size fix, three network-ABI write-back fixes, and — the last crash — keying the translated-block cache by address space so an exec'd child's blocks are never reused in the parent at the same virtual address. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. Pseudoterminals work (openpty/forkpty, SIGWINCH on resize) and the guest can run on a host-driven stdio pty (isatty true, keystrokes fed in, rendered output drained) — the browser-terminal model for an interactive agent. Browser delivery and Claude Code are not started |
+| M7 Codex & Claude Code | 🔶 | ~68% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. Browser delivery and the Claude Code profile are the remaining agent work |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
-Weighted by engineering effort, overall completion is **roughly 72%**.
+Weighted by engineering effort, overall completion is **roughly 73%**.
 The native test suites (48 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
@@ -440,9 +440,10 @@ Work:
   vfork semantics, temp files, and authenticated HTTPS are exercised by the
   real Codex `exec` run, which also drives model-authored file edits and
   child shell commands; the host `git` binary runs status/diff/add/commit/
-  log in the guest (gated by `tests/git.rs`); PTY, terminal resize, and file
-  watching are not started; pseudoterminals — openpty/forkpty, /dev/ptmx,
-  /dev/pts, controlling terminal, termios, and window size — now work)
+  log in the guest (gated by `tests/git.rs`); pseudoterminals —
+  openpty/forkpty, /dev/ptmx, /dev/pts, controlling terminal, termios, window
+  size, and SIGWINCH-on-resize — work, and the real Codex TUI renders and
+  takes input on a host-driven stdio pty; file watching is not started)
 - Mount a repository with explicit read/write capabilities. 🔶 (host
   directories mount read/write via `run_guest`; a repository with real Git
   history is the next target)
@@ -462,8 +463,12 @@ Exit gate for each agent:
   authenticated model call; per-agent secret handles and the browser path
   are pending)
 - The agent reads a repository, edits a file, runs a command, and reports the
-  result through the terminal. ⬜
-- Child processes, cancellation, and terminal resize behave correctly. ⬜
+  result through the terminal. 🔶 (Codex `exec` does this natively via
+  `run_guest`; the browser-profile path remains)
+- Child processes, cancellation, and terminal resize behave correctly. 🔶
+  (child processes and vfork spawns work; terminal resize delivers SIGWINCH;
+  Codex's interactive TUI quits cleanly on Ctrl-C — natively, not yet in a
+  browser profile)
 - A checkpointed session resumes after browser reload with filesystem state
   intact. ⬜
 - A multi-hour soak test has bounded memory, storage, and event-log growth. ⬜
