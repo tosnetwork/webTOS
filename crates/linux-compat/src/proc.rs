@@ -21,7 +21,7 @@ use std::{
 use icicle_cpu::CpuSnapshot;
 use icicle_mem::VirtualMemoryMap;
 
-use crate::fd::{EventFdRef, FdTable, NetRef, PipeRef, TimerFdRef};
+use crate::fd::{EventFdRef, FdTable, NetRef, PipeRef, PtyRef, TimerFdRef};
 use crate::SigAction;
 
 pub const ROOT_PID: u64 = 1000;
@@ -204,6 +204,11 @@ pub enum Watch {
     PipeActivity(PipeRef, u64),
     /// Same as [`Watch::PipeActivity`] for an eventfd.
     EventActivity(EventFdRef, u64),
+    /// Readability of a pty end (`master = true` watches slave-to-master
+    /// output; `false` watches master-to-slave input).
+    PtyReadable(PtyRef, bool),
+    /// Fires when a pty's activity counter moves past the recorded value.
+    PtyActivity(PtyRef, u64),
     /// Immediately ready (regular files and similar).
     Always,
 }
@@ -230,6 +235,15 @@ impl Watch {
             }
             Watch::PipeActivity(pipe, seen) => pipe.borrow().activity != *seen,
             Watch::EventActivity(event, seen) => event.borrow().activity != *seen,
+            Watch::PtyReadable(pty, master) => {
+                let pty = pty.borrow();
+                if *master {
+                    !pty.s2m.is_empty() || (pty.slave_ever_opened && pty.slaves == 0)
+                } else {
+                    !pty.m2s.is_empty() || pty.masters == 0
+                }
+            }
+            Watch::PtyActivity(pty, seen) => pty.borrow().activity != *seen,
             Watch::Always => true,
         }
     }

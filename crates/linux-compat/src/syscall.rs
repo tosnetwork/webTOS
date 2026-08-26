@@ -474,9 +474,11 @@ fn read_backing(
         | Backing::EventFd(_)
         | Backing::TimerFd(_)
         | Backing::Net(_)
+        | Backing::PtyMaster(_)
+        | Backing::PtySlave(_)
         | Backing::Epoll(_) => Err(abi::EINVAL),
         Backing::Dev(dev) => match dev {
-            Dev::Null | Dev::Tty => Ok(Vec::new()),
+            Dev::Null | Dev::Tty | Dev::Ptmx => Ok(Vec::new()),
             Dev::Zero => Ok(vec![0; buf_len]),
             Dev::Random => {
                 let mut out = vec![0_u8; buf_len];
@@ -518,7 +520,8 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             Ok(bytes.len() as u64)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
-        // Handled by `outcome_write` before reaching here.
+        // Handled by `outcome_write`/`outcome_read` before reaching here.
+        Backing::PtyMaster(_) | Backing::PtySlave(_) => Err(abi::EINVAL),
         Backing::Pipe { .. }
         | Backing::SocketPair { .. }
         | Backing::EventFd(_)
@@ -640,6 +643,37 @@ fn sys_openat(
     let follow = flags & abi::O_NOFOLLOW == 0;
     let resolved = env.vfs.resolve(base, &path, follow)?;
 
+    // `/dev/pts/<id>` slave devices are dynamic (no VFS node): a slave open
+    // looks the pty up by id. The parent must be the `/dev/pts` directory and
+    // the name a decimal id.
+    if resolved.node.is_none() {
+        if let Ok(pts_dir) = env.vfs.resolve(crate::vfs::ROOT, b"/dev/pts", true) {
+            if pts_dir.node == Some(resolved.parent) {
+                if let Ok(id) = std::str::from_utf8(&resolved.name)
+                    .unwrap_or("")
+                    .parse::<u64>()
+                {
+                    let pty = env.ptys.get(&id).cloned().ok_or(abi::ENOENT)?;
+                    {
+                        let mut pty = pty.borrow_mut();
+                        pty.slaves += 1;
+                        pty.slave_ever_opened = true;
+                        pty.activity += 1;
+                    }
+                    let entry = FdEntry {
+                        desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
+                            backing: Backing::PtySlave(pty),
+                            offset: 0,
+                            flags: flags & (abi::O_ACCMODE | abi::O_APPEND | abi::O_NONBLOCK),
+                        })),
+                        cloexec: flags & abi::O_CLOEXEC != 0,
+                    };
+                    return env.proc.fds.borrow_mut().insert(entry);
+                }
+            }
+        }
+    }
+
     let node = match resolved.node {
         Some(node) => {
             if flags & abi::O_CREAT != 0 && flags & abi::O_EXCL != 0 {
@@ -678,6 +712,14 @@ fn sys_openat(
                 }
             }
             Backing::File { node }
+        }
+        NodeKind::CharDev(Dev::Ptmx) => {
+            // Opening the pty multiplexor allocates a fresh master.
+            let id = env.next_pty_id;
+            env.next_pty_id += 1;
+            let pty = std::rc::Rc::new(std::cell::RefCell::new(crate::fd::Pty::new(id)));
+            env.ptys.insert(id, std::rc::Rc::clone(&pty));
+            Backing::PtyMaster(pty)
         }
         NodeKind::CharDev(dev) => Backing::Dev(*dev),
         NodeKind::Symlink(_) => return Err(abi::ELOOP), // O_NOFOLLOW on a symlink
@@ -783,15 +825,17 @@ fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
     let desc = ofd.borrow();
     Ok(match &desc.backing {
         Backing::File { node } | Backing::Dir { node, .. } => stat_of_node(env, *node),
-        Backing::Std(_) | Backing::Dev(Dev::Tty) => abi::Stat {
-            dev: 1,
-            ino: u64::MAX,
-            nlink: 1,
-            mode: abi::S_IFCHR | 0o620,
-            rdev: (136 << 8),
-            blksize: 1024,
-            ..Default::default()
-        },
+        Backing::Std(_) | Backing::Dev(Dev::Tty) | Backing::PtyMaster(_) | Backing::PtySlave(_) => {
+            abi::Stat {
+                dev: 1,
+                ino: u64::MAX,
+                nlink: 1,
+                mode: abi::S_IFCHR | 0o620,
+                rdev: (136 << 8),
+                blksize: 1024,
+                ..Default::default()
+            }
+        }
         Backing::Dev(_) => abi::Stat {
             dev: 1,
             ino: u64::MAX - 1,
@@ -1204,6 +1248,52 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         _ => {}
     }
 
+    // Pseudoterminal ioctls carry per-pty termios and window size.
+    let pty = match &env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
+        Backing::PtyMaster(pty) | Backing::PtySlave(pty) => Some(std::rc::Rc::clone(pty)),
+        _ => None,
+    };
+    if let Some(pty) = pty {
+        match request {
+            abi::TIOCGPTN => {
+                let id = pty.borrow().id as u32;
+                write_mem(cpu, arg, &id.to_le_bytes())?;
+                return Ok(0);
+            }
+            abi::TIOCSPTLCK => return Ok(0), // slave unlock: always unlocked
+            abi::TCGETS => {
+                let termios = pty.borrow().termios;
+                write_mem(cpu, arg, &termios)?;
+                return Ok(0);
+            }
+            abi::TCSETS | abi::TCSETSW => {
+                let bytes = read_mem(cpu, arg, 36)?;
+                pty.borrow_mut().termios.copy_from_slice(&bytes);
+                return Ok(0);
+            }
+            abi::TIOCGWINSZ => {
+                let ws = pty.borrow().winsize;
+                let bytes: Vec<u8> = ws.iter().flat_map(|v| v.to_le_bytes()).collect();
+                write_mem(cpu, arg, &bytes)?;
+                return Ok(0);
+            }
+            abi::TIOCSWINSZ => {
+                let bytes = read_mem(cpu, arg, 8)?;
+                let mut pty = pty.borrow_mut();
+                for (i, w) in pty.winsize.iter_mut().enumerate() {
+                    *w = u16::from_le_bytes(bytes[2 * i..2 * i + 2].try_into().expect("size"));
+                }
+                pty.activity += 1;
+                return Ok(0);
+            }
+            abi::TIOCSPGRP | abi::TIOCGPGRP | abi::TIOCSCTTY | abi::TIOCNOTTY => return Ok(0),
+            _ => {
+                tracing::debug!("pty ioctl: unsupported request {request:#x}");
+                return Err(abi::ENOTTY);
+            }
+        }
+    }
+
     let is_tty = matches!(
         env.proc.fds.borrow().get(fd)?.desc.borrow().backing,
         Backing::Std(StdStream::Out) | Backing::Std(StdStream::Err) | Backing::Dev(Dev::Tty)
@@ -1229,7 +1319,12 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             write_mem(cpu, arg, &termios)?;
             Ok(0)
         }
-        abi::TCSETS | abi::TCSETSW | abi::TIOCSWINSZ | abi::TIOCSPGRP => Ok(0),
+        abi::TCSETS
+        | abi::TCSETSW
+        | abi::TIOCSWINSZ
+        | abi::TIOCSPGRP
+        | abi::TIOCSCTTY
+        | abi::TIOCNOTTY => Ok(0),
         abi::TIOCGPGRP => {
             write_mem(cpu, arg, &(PID as u32).to_le_bytes())?;
             Ok(0)
@@ -1323,6 +1418,7 @@ fn backing_activity(desc: &Description) -> u64 {
         Backing::SocketPair { rx, tx } => rx.borrow().activity + tx.borrow().activity,
         Backing::EventFd(event) => event.borrow().activity,
         Backing::Net(socket) => socket.borrow().activity,
+        Backing::PtyMaster(pty) | Backing::PtySlave(pty) => pty.borrow().activity,
         _ => 0,
     }
 }
@@ -1344,6 +1440,9 @@ fn activity_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
         Backing::EventFd(event) => {
             Some(Watch::EventActivity(event.clone(), event.borrow().activity))
         }
+        Backing::PtyMaster(pty) | Backing::PtySlave(pty) => {
+            Some(Watch::PtyActivity(pty.clone(), pty.borrow().activity))
+        }
         _ => None,
     }
 }
@@ -1361,6 +1460,8 @@ fn read_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
         Backing::EventFd(event) => Some(Watch::Event(event.clone())),
         Backing::TimerFd(timer) => Some(Watch::Timer(timer.clone())),
         Backing::Net(socket) => Some(Watch::NetReadable(socket.clone())),
+        Backing::PtyMaster(pty) => Some(Watch::PtyReadable(pty.clone(), true)),
+        Backing::PtySlave(pty) => Some(Watch::PtyReadable(pty.clone(), false)),
         _ => None,
     }
 }
@@ -1915,6 +2016,12 @@ fn dump_parked(env: &LinuxEnv) {
                         crate::proc::Watch::EventActivity(e, seen) => {
                             format!("eventAct(now={},seen={seen})", e.borrow().activity)
                         }
+                        crate::proc::Watch::PtyReadable(_, m) => {
+                            format!("ptyR(master={m})")
+                        }
+                        crate::proc::Watch::PtyActivity(p, seen) => {
+                            format!("ptyAct(now={},seen={seen})", p.borrow().activity)
+                        }
                         crate::proc::Watch::Always => "always".to_string(),
                     })
                     .collect();
@@ -1976,6 +2083,24 @@ fn dump_parked(env: &LinuxEnv) {
                     format!(
                         "net({:?}, handle={:?}, peer={:?})",
                         n.kind, n.handle, n.peer
+                    )
+                }
+                Backing::PtyMaster(p) => {
+                    let p = p.borrow();
+                    format!(
+                        "ptymaster(id={}, s2m={}, m2s={})",
+                        p.id,
+                        p.s2m.len(),
+                        p.m2s.len()
+                    )
+                }
+                Backing::PtySlave(p) => {
+                    let p = p.borrow();
+                    format!(
+                        "ptyslave(id={}, s2m={}, m2s={})",
+                        p.id,
+                        p.s2m.len(),
+                        p.m2s.len()
                     )
                 }
                 Backing::Epoll(ep) => {
@@ -2539,6 +2664,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
         Event(crate::fd::EventFdRef),
         Timer(crate::fd::TimerFdRef),
         Net(crate::fd::NetRef),
+        Pty(crate::fd::PtyRef, bool),
     }
     let (kind, nonblock) = {
         let desc = desc.borrow();
@@ -2556,6 +2682,8 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             Backing::EventFd(event) => Kind::Event(std::rc::Rc::clone(event)),
             Backing::TimerFd(timer) => Kind::Timer(std::rc::Rc::clone(timer)),
             Backing::Net(socket) => Kind::Net(std::rc::Rc::clone(socket)),
+            Backing::PtyMaster(pty) => Kind::Pty(std::rc::Rc::clone(pty), true),
+            Backing::PtySlave(pty) => Kind::Pty(std::rc::Rc::clone(pty), false),
             Backing::Epoll(_) => return Outcome::Ret(Err(abi::EINVAL)),
             _ => Kind::Plain,
         };
@@ -2691,6 +2819,43 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
         }
+        Kind::Pty(pty, master) => {
+            // A master drains slave output (`s2m`); a slave drains master
+            // input (`m2s`). An empty queue is EOF once the other end is gone,
+            // otherwise it blocks.
+            let chunk: Vec<u8> = {
+                let mut inner = pty.borrow_mut();
+                let queue_empty = if master {
+                    inner.s2m.is_empty()
+                } else {
+                    inner.m2s.is_empty()
+                };
+                if queue_empty {
+                    let eof = if master {
+                        inner.slave_ever_opened && inner.slaves == 0
+                    } else {
+                        inner.masters == 0
+                    };
+                    if eof {
+                        return Outcome::Ret(Ok(0));
+                    }
+                    drop(inner);
+                    return would_block(env, cpu, Watch::PtyReadable(pty, master));
+                }
+                inner.activity += 1;
+                let queue = if master {
+                    &mut inner.s2m
+                } else {
+                    &mut inner.m2s
+                };
+                let take = (count as usize).min(queue.len()).min(0x40_0000);
+                queue.drain(..take).collect()
+            };
+            match write_mem(cpu, buf, &chunk) {
+                Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
     }
 }
 
@@ -2707,6 +2872,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
         Pipe(crate::fd::PipeRef),
         Event(crate::fd::EventFdRef),
         Net(crate::fd::NetRef),
+        Pty(crate::fd::PtyRef, bool),
     }
     let (kind, nonblock) = {
         let desc = desc.borrow();
@@ -2724,6 +2890,8 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
             Backing::EventFd(event) => Kind::Event(std::rc::Rc::clone(event)),
             Backing::TimerFd(_) | Backing::Epoll(_) => return Outcome::Ret(Err(abi::EINVAL)),
             Backing::Net(socket) => Kind::Net(std::rc::Rc::clone(socket)),
+            Backing::PtyMaster(pty) => Kind::Pty(std::rc::Rc::clone(pty), true),
+            Backing::PtySlave(pty) => Kind::Pty(std::rc::Rc::clone(pty), false),
             _ => Kind::Plain,
         };
         (kind, nonblock)
@@ -2803,6 +2971,31 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 socket.borrow_mut().activity += 1;
             }
             Outcome::Ret(result.map(|n| n as u64))
+        }
+        Kind::Pty(pty, master) => {
+            let bytes = match read_mem(cpu, buf, (count as usize).min(0x40_0000)) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            let mut inner = pty.borrow_mut();
+            // A master write is terminal input (raw, into `m2s`). A slave
+            // write is terminal output (into `s2m`), expanding `\n` to `\r\n`
+            // when the line discipline has OPOST|ONLCR.
+            if master {
+                inner.m2s.extend(bytes.iter().copied());
+            } else if inner.onlcr() {
+                for &b in &bytes {
+                    if b == b'\n' {
+                        inner.s2m.push_back(b'\r');
+                    }
+                    inner.s2m.push_back(b);
+                }
+            } else {
+                inner.s2m.extend(bytes.iter().copied());
+            }
+            inner.activity += 1;
+            let _ = nonblock;
+            Outcome::Ret(Ok(bytes.len() as u64))
         }
     }
 }

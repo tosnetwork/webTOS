@@ -230,6 +230,11 @@ pub const TCSETS: u64 = 0x5402;
 pub const TCSETSW: u64 = 0x5403;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TIOCSWINSZ: u64 = 0x5414;
+pub const TIOCSPTLCK: u64 = 0x4004_5431; // unlock pty slave (arg: int*)
+pub const TIOCGPTN: u64 = 0x8004_5430; // get pty number (arg: uint*)
+pub const TIOCGPTPEER: u64 = 0x5441; // open peer of a pty master
+pub const TIOCSCTTY: u64 = 0x540E; // set controlling terminal
+pub const TIOCNOTTY: u64 = 0x5422; // drop controlling terminal
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 // General fd ioctls, valid on any descriptor (not tty-specific).

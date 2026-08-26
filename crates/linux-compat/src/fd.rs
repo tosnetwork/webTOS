@@ -34,6 +34,63 @@ pub struct PipeInner {
 
 pub type PipeRef = Rc<RefCell<PipeInner>>;
 
+/// A pseudoterminal pair. `m2s` carries master writes to the slave (terminal
+/// input); `s2m` carries slave writes to the master (terminal output, subject
+/// to `OPOST`/`ONLCR`). One `Pty` is shared by both the master and slave
+/// descriptors.
+#[derive(Debug)]
+pub struct Pty {
+    pub id: u64,
+    pub m2s: std::collections::VecDeque<u8>,
+    pub s2m: std::collections::VecDeque<u8>,
+    /// 36-byte `struct termios` (little-endian fields), settable via TCSETS.
+    pub termios: [u8; 36],
+    /// `struct winsize` as [rows, cols, xpixel, ypixel].
+    pub winsize: [u16; 4],
+    /// Live master descriptors; the slave sees EOF/hangup once this hits 0.
+    pub masters: u32,
+    /// Live slave descriptors; the master sees EOF once this hits 0 (after a
+    /// slave has existed).
+    pub slaves: u32,
+    /// Set once a slave has been opened, so a master read before any slave
+    /// exists blocks rather than reporting EOF.
+    pub slave_ever_opened: bool,
+    /// Monotone change counter; edge-triggered epoll re-arms on it.
+    pub activity: u64,
+}
+
+impl Pty {
+    pub fn new(id: u64) -> Self {
+        // Cooked-mode defaults matching openpty(): ICRNL|IXON, OPOST|ONLCR,
+        // CS8|CREAD, ISIG|ICANON|ECHO|ECHOE|ECHOK.
+        let mut termios = [0_u8; 36];
+        termios[0..4].copy_from_slice(&0x0500_u32.to_le_bytes());
+        termios[4..8].copy_from_slice(&0x0005_u32.to_le_bytes());
+        termios[8..12].copy_from_slice(&0x00bf_u32.to_le_bytes());
+        termios[12..16].copy_from_slice(&0x8a3b_u32.to_le_bytes());
+        Self {
+            id,
+            m2s: std::collections::VecDeque::new(),
+            s2m: std::collections::VecDeque::new(),
+            termios,
+            winsize: [24, 80, 0, 0],
+            masters: 1,
+            slaves: 0,
+            slave_ever_opened: false,
+            activity: 0,
+        }
+    }
+
+    /// True when `OPOST` (c_oflag bit 0) and `ONLCR` (c_oflag bit 2) are set,
+    /// so a slave-written `\n` is expanded to `\r\n` on the way to the master.
+    pub fn onlcr(&self) -> bool {
+        let oflag = u32::from_le_bytes(self.termios[4..8].try_into().expect("size"));
+        oflag & 0x1 != 0 && oflag & 0x4 != 0
+    }
+}
+
+pub type PtyRef = Rc<RefCell<Pty>>;
+
 /// eventfd counter state.
 #[derive(Debug, Default)]
 pub struct EventFdInner {
@@ -133,6 +190,11 @@ pub enum Backing {
     Net(NetRef),
     /// epoll instance.
     Epoll(EpollRef),
+    /// Pseudoterminal master (`/dev/ptmx`): writes are terminal input, reads
+    /// drain terminal output.
+    PtyMaster(PtyRef),
+    /// Pseudoterminal slave (`/dev/pts/N`): the process side of the terminal.
+    PtySlave(PtyRef),
 }
 
 #[derive(Debug)]
@@ -183,6 +245,16 @@ impl Drop for Description {
                 if let Some(handle) = socket.handle {
                     socket.broker.borrow_mut().close(handle);
                 }
+            }
+            Backing::PtyMaster(pty) => {
+                let mut pty = pty.borrow_mut();
+                pty.masters = pty.masters.saturating_sub(1);
+                pty.activity += 1;
+            }
+            Backing::PtySlave(pty) => {
+                let mut pty = pty.borrow_mut();
+                pty.slaves = pty.slaves.saturating_sub(1);
+                pty.activity += 1;
             }
             _ => {}
         }

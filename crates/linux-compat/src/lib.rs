@@ -135,6 +135,9 @@ pub struct LinuxEnv {
     /// fixed instant for reproducibility; hosts override it with the real
     /// wall clock when the guest talks to real services.
     pub(crate) epoch_base_sec: i64,
+    /// Live pseudoterminals, keyed by id (`/dev/pts/<id>`), for slave lookup.
+    pub(crate) ptys: std::collections::BTreeMap<u64, fd::PtyRef>,
+    pub(crate) next_pty_id: u64,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -154,6 +157,8 @@ impl LinuxEnv {
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
             epoch_base_sec: EPOCH_BASE_SEC,
+            ptys: std::collections::BTreeMap::new(),
+            next_pty_id: 0,
             exit_code: None,
         })
     }

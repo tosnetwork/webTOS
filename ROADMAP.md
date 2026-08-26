@@ -40,11 +40,11 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
-| M7 Codex & Claude Code | 🔶 | ~58% | **A real Codex `exec` run edits a file, runs a shell command, and prints the model's summary, exiting 0.** Beyond the authenticated round-trip this took real process groups (`setpgid`/`kill -pgid`), true 80-bit x87 software floating point (musl's printf relied on 64-bit-mantissa exactness), `mremap`, an argv/envp size fix, three network-ABI write-back fixes, and — the last crash — keying the translated-block cache by address space so an exec'd child's blocks are never reused in the parent at the same virtual address. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. Interactive TUI/PTY, browser delivery, and Claude Code are not started |
+| M7 Codex & Claude Code | 🔶 | ~62% | **A real Codex `exec` run edits a file, runs a shell command, and prints the model's summary, exiting 0.** Beyond the authenticated round-trip this took real process groups (`setpgid`/`kill -pgid`), true 80-bit x87 software floating point (musl's printf relied on 64-bit-mantissa exactness), `mremap`, an argv/envp size fix, three network-ABI write-back fixes, and — the last crash — keying the translated-block cache by address space so an exec'd child's blocks are never reused in the parent at the same virtual address. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. Pseudoterminals work (openpty/forkpty: /dev/ptmx, /dev/pts, TIOCGPTN/TIOCSCTTY, per-pty termios/winsize, ONLCR). Browser delivery and Claude Code, and wiring a real agent TUI onto a pty, are not started |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 72%**.
-The native test suites (46 native cases plus the 17-check wasm harness) gate every
+The native test suites (48 native cases plus the 17-check wasm harness) gate every
 ✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
 engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
 
@@ -420,7 +420,11 @@ finally keying the translated-block cache by address space rather than
 virtual address alone — an exec'd child's lifted blocks were being reused in
 the parent at the same VA, surfacing as a stale value read from a stack slot
 that crashed the session on the way out. What is *not* yet exercised is the
-interactive TUI (needs a PTY) and Claude Code. The host `git` binary (a
+Claude Code, and wiring an agent's interactive TUI onto a pty. Pseudoterminals
+themselves now work: `/dev/ptmx` allocates a master, `/dev/pts/<n>` opens the
+slave, and openpty()/forkpty() move data both ways with per-pty termios and
+window size, ONLCR output processing, and a controlling terminal (setsid +
+TIOCSCTTY), gated by `crates/linux-compat/tests/pty.rs`. The host `git` binary (a
 glibc dynamic executable) additionally runs real repository operations in
 the guest — `status`, `diff`, `add`, `commit`, and `log` all work, gated by
 `crates/linux-compat/tests/git.rs`.
@@ -437,7 +441,8 @@ Work:
   real Codex `exec` run, which also drives model-authored file edits and
   child shell commands; the host `git` binary runs status/diff/add/commit/
   log in the guest (gated by `tests/git.rs`); PTY, terminal resize, and file
-  watching are not started)
+  watching are not started; pseudoterminals — openpty/forkpty, /dev/ptmx,
+  /dev/pts, controlling terminal, termios, and window size — now work)
 - Mount a repository with explicit read/write capabilities. 🔶 (host
   directories mount read/write via `run_guest`; a repository with real Git
   history is the next target)

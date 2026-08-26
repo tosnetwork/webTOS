@@ -18,6 +18,8 @@ pub enum Dev {
     Zero,
     Tty,
     Random,
+    /// `/dev/ptmx`: opening it allocates a new pseudoterminal master.
+    Ptmx,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +94,7 @@ impl Vfs {
         };
         // Standard skeleton every Linux userland expects.
         for dir in [
-            "/bin", "/dev", "/etc", "/home", "/tmp", "/usr", "/usr/bin", "/var",
+            "/bin", "/dev", "/dev/pts", "/etc", "/home", "/tmp", "/usr", "/usr/bin", "/var",
         ] {
             let _ = vfs.mkdir_p(dir.as_bytes());
         }
@@ -101,6 +103,7 @@ impl Vfs {
             ("/dev/zero", Dev::Zero),
             ("/dev/tty", Dev::Tty),
             ("/dev/urandom", Dev::Random),
+            ("/dev/ptmx", Dev::Ptmx),
         ] {
             let _ = vfs.add_node(path.as_bytes(), NodeKind::CharDev(dev), 0o666);
         }
@@ -516,6 +519,7 @@ impl Vfs {
                         Dev::Zero => 1,
                         Dev::Tty => 2,
                         Dev::Random => 3,
+                        Dev::Ptmx => 5,
                     });
                 }
             }
@@ -594,6 +598,7 @@ impl Vfs {
                     1 => Dev::Zero,
                     2 => Dev::Tty,
                     3 => Dev::Random,
+                    5 => Dev::Ptmx,
                     other => return Err(format!("unknown device tag {other}")),
                 }),
                 other => return Err(format!("unknown node tag {other}")),
