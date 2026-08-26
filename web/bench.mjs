@@ -69,7 +69,7 @@ async function startServer() {
 // Runs entirely inside the page: Playwright serializes it, so it closes over
 // nothing but its argument.
 const benchmark = async (input) => {
-  const { wasmUrl, busyboxUrl, sizesMiB } = input;
+  const { wasmUrl, busyboxUrl, controlUrl, sizesMiB } = input;
   const FUEL = 50_000_000;
 
   const busybox = new Uint8Array(await (await fetch(busyboxUrl)).arrayBuffer());
@@ -157,6 +157,25 @@ const benchmark = async (input) => {
   // What this tab is willing to give the module. wasm32 caps a linear memory
   // at 4 GiB by construction; engines stop earlier, and that ceiling is what
   // decides which workloads fit.
+  // The control: a few hundred bytes with one hot loop, measured before the
+  // memory probe disturbs anything. It separates "this engine's wasm compiler
+  // is slow" from "this engine declined our 60 KB interpreter function" — the
+  // two look identical in the numbers above.
+  let control = null;
+  if (controlUrl) {
+    try {
+      const { instance: tiny } = await WebAssembly.instantiateStreaming(fetch(controlUrl), {});
+      tiny.exports.mix(1_000_000); // let the engine tier up before timing
+      const rounds = 200_000_000;
+      const controlStart = performance.now();
+      const checksum = tiny.exports.mix(rounds);
+      const controlSeconds = (performance.now() - controlStart) / 1000;
+      control = { rounds, seconds: controlSeconds, checksum };
+    } catch {
+      control = null; // Not staged; the rest of the run still stands.
+    }
+  }
+
   const beforeGrowMiB = heapMiB();
   const STEP_PAGES = 4096; // 256 MiB
   for (;;) {
@@ -169,7 +188,7 @@ const benchmark = async (input) => {
   }
   const ceilingMiB = heapMiB();
 
-  return { instantiateMs, buildMs, runs, beforeGrowMiB, ceilingMiB };
+  return { instantiateMs, buildMs, runs, control, beforeGrowMiB, ceilingMiB };
 };
 
 // -------------------------------------------------------------------- main
@@ -177,6 +196,7 @@ const benchmark = async (input) => {
 const { server, origin } = await startServer();
 const wasmUrl = `${origin}/web/webtos_web.wasm`;
 const busyboxUrl = `${origin}/web/busybox-musl`;
+const controlUrl = `${origin}/web/bench_control.wasm`;
 const rows = [];
 
 try {
@@ -193,6 +213,7 @@ try {
       const result = await page.evaluate(benchmark, {
         wasmUrl,
         busyboxUrl,
+        controlUrl,
         sizesMiB: [1, 4],
       });
       rows.push({ name, ...result });
@@ -219,6 +240,16 @@ try {
           `${seconds.toFixed(2).padStart(7)} s  ` +
           `${(instructions / seconds / 1e6).toFixed(1).padStart(8)} M inst/s (fixed cost removed)`,
       );
+      if (result.control) {
+        const { rounds, seconds, checksum } = result.control;
+        console.log(
+          `[bench] ${"control module".padEnd(28)} ${String(rounds).padStart(13)} iterations  ` +
+            `${seconds.toFixed(2).padStart(7)} s  ` +
+            `${(rounds / seconds / 1e6).toFixed(1).padStart(8)} M iter/s  (checksum ${checksum})`,
+        );
+      } else {
+        console.log(`[bench] ${"control module".padEnd(28)} not staged (run web/build.sh)`);
+      }
       console.log(
         `[bench] ${"linear memory ceiling".padEnd(28)} ${result.ceilingMiB.toFixed(0).padStart(7)} MiB ` +
           `(grown from ${result.beforeGrowMiB.toFixed(0)} MiB)`,
@@ -234,16 +265,24 @@ try {
 
 if (rows.length > 1) {
   console.log("\n=== summary ===");
-  console.log("engine     build      md5sum 4 MiB   marginal        heap ceiling");
+  console.log("engine     build      md5sum 4 MiB   marginal        control          heap ceiling");
   for (const row of rows) {
     const [small, large] = row.runs;
     const marginal =
       (large.instructions - small.instructions) / (large.seconds - small.seconds) / 1e6;
+    const control = row.control
+      ? `${(row.control.rounds / row.control.seconds / 1e6).toFixed(0)} M iter/s`
+      : "n/a";
     console.log(
       `${row.name.padEnd(10)} ${`${row.buildMs.toFixed(0)} ms`.padEnd(10)} ` +
         `${`${large.seconds.toFixed(2)} s`.padEnd(14)} ` +
         `${`${marginal.toFixed(1)} M inst/s`.padEnd(15)} ` +
+        `${control.padEnd(16)} ` +
         `${row.ceilingMiB.toFixed(0)} MiB`,
     );
   }
+  console.log(
+    "\nA slow engine in both columns is a slow wasm compiler; slow only in the\n" +
+      "middle would point at the interpreter's own shape.",
+  );
 }

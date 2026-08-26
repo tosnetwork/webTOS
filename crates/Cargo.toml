@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["x64-engine", "linux-compat", "webtos-web"]
+members = ["x64-engine", "linux-compat", "webtos-web", "bench-control"]
 
 [workspace.dependencies]
 icicle-cpu = { path = "../third_party/icicle/icicle-cpu" }

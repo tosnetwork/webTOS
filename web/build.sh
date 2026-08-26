@@ -3,8 +3,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-(cd crates && cargo build -p webtos-web --target wasm32-unknown-unknown --release)
+(cd crates && cargo build -p webtos-web -p bench-control --target wasm32-unknown-unknown --release)
 cp crates/target/wasm32-unknown-unknown/release/webtos_web.wasm web/
+# The measurement control (web/bench.mjs); a few hundred bytes.
+cp crates/target/wasm32-unknown-unknown/release/bench_control.wasm web/
 cp test_data/hello_linux.elf web/
 if [ -f test_data/busybox-musl ]; then
     cp test_data/busybox-musl web/

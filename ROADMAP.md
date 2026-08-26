@@ -41,7 +41,7 @@ terminal behavior, and recovery after a browser reload.
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~72% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Delivering the agent images to the browser and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | ⬜ | ~10% | wasm opt pin and deterministic scheduling, plus a measured baseline: native and per-engine throughput, translation cost, and the linear-memory ceiling (`docs/performance.md`) |
+| M8 Performance & release | ⬜ | ~12% | wasm opt pin and deterministic scheduling, plus a measured baseline with a control module: native and per-engine throughput, translation cost, and the linear-memory ceiling (`docs/performance.md`) |
 
 Weighted by engineering effort, overall completion is **roughly 73%**.
 The native test suites (54 native cases plus the 17-check wasm harness and the
@@ -223,7 +223,8 @@ Work:
   as proof of semantic completeness. 🔶 (live tracing exists; no stored traces)
 - Define browser support and performance dashboards. 🔶 (`web/bench.mjs` and
   `crates/linux-compat/tests/bench.rs` measure the same workloads in a browser
-  and natively; no dashboard yet)
+  and natively, against a control module that separates a slow engine from a
+  slow runtime; no dashboard yet)
 - Classify the existing `TODO-*` files as native-substrate supporting plans. ✅ (docs/plans/)
 
 Exit gate:
@@ -503,16 +504,16 @@ runtime.
 
 A measured baseline exists before any of this work starts — see
 [`docs/performance.md`](docs/performance.md). Three findings shape the order
-below: Chromium and WebKit run the interpreter at about half native speed
-while Firefox runs it at an eighth of *them*; process startup is dominated by
-lifting blocks rather than executing them; and every engine grants the module
-the full wasm32 address space, so the memory question is how guest pages, image
-bytes, and the block cache share 4 GiB rather than how much a tab allows.
+below: Chromium and WebKit run the interpreter within a small factor of native
+speed, and the engine that does not is explained by its own wasm compiler
+rather than by anything in webTOS (a few-hundred-byte control module shows the
+same spread); process startup is dominated by lifting blocks rather than
+executing them; and every engine grants the module the full wasm32 address
+space, so the memory question is how guest pages, image bytes, and the block
+cache share 4 GiB rather than how much a tab allows.
 
 Work:
 
-- Investigate the ~8x spread between browser engines on identical bytecode
-  before tuning the interpreter itself.
 - Keep lifted blocks across processes that share an image, so a short-lived
   process does not pay to translate what has already been translated.
 - Profile executed blocks and translate only proven hot paths to WebAssembly.

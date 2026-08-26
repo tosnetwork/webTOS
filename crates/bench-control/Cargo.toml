@@ -1,0 +1,9 @@
+[package]
+name = "bench-control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A minimal wasm module used as a control when measuring browser engines"
+
+[lib]
+crate-type = ["cdylib"]
