@@ -85,6 +85,29 @@ fn main() {
     machine.set_args(argv, envp);
     machine.load(guest_exe.as_bytes()).expect("load");
     machine.vm_mut().icount_limit = 20_000_000_000;
+    // WATCH_GUEST_WRITE=hexaddr: MMU-level write hook on the 8 bytes at
+    // that guest address. Every write (guest instruction or host) reports
+    // the value and the guest basic block executing at the time.
+    if let Ok(spec) = std::env::var("WATCH_GUEST_WRITE") {
+        let target = u64::from_str_radix(spec.trim_start_matches("0x"), 16).expect("watch addr");
+        machine.vm_mut().cpu.mem.add_write_hook(
+            target,
+            target + 8,
+            Box::new(move |_mem: &mut icicle_mem::Mmu, addr: u64, value: &[u8]| {
+                let block =
+                    x64_engine::vm::CURRENT_BLOCK_START.load(std::sync::atomic::Ordering::Relaxed);
+                let icount =
+                    x64_engine::vm::CURRENT_ICOUNT.load(std::sync::atomic::Ordering::Relaxed);
+                let pid = linux_compat::CURRENT_PID.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[guest-watch] pid={pid} ic={icount} write {addr:#x} len={} val={:02x?} in-block={block:#x}",
+                    value.len(),
+                    &value[..value.len().min(16)]
+                );
+            }),
+        );
+    }
+
     // GUEST_BREAK="hexaddr,hexaddr": single-shot breakpoints. Each hit dumps
     // the GPRs (and FAULT_PEEK targets) and execution continues.
     if let Ok(spec) = std::env::var("GUEST_BREAK") {
@@ -100,6 +123,33 @@ fn main() {
         };
         {
             let vm = machine.vm_mut();
+            // Sticky breakpoints (BREAK_STICKY=1) stay armed and fire on every
+            // pass. A DEREF_FILTER=reg only prints a hit when that register
+            // points at a would-be-corrupt Rust enum tag (top byte 0x80, low
+            // 32 bits > 3), which pinpoints the last dispatch before the jump.
+            let sticky = std::env::var_os("BREAK_STICKY").is_some();
+            let show = match std::env::var("DEREF_FILTER") {
+                Ok(reg) => {
+                    let ptr = vm
+                        .cpu
+                        .arch
+                        .sleigh
+                        .get_varnode(&reg)
+                        .map(|v| vm.cpu.read_reg(v))
+                        .unwrap_or(0);
+                    let mut buf = [0u8; 8];
+                    let _ = vm.cpu.mem.read_bytes(ptr, &mut buf, icicle_mem::perm::NONE);
+                    let low = u32::from_le_bytes(buf[..4].try_into().unwrap());
+                    buf[7] == 0x80 && low > 3
+                }
+                Err(_) => true,
+            };
+            if !sticky {
+                vm.code.breakpoints.remove(&rip);
+            }
+            if !show {
+                continue;
+            }
             let mut regs = String::new();
             for name in [
                 "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11",
@@ -110,6 +160,19 @@ fn main() {
                 }
             }
             eprintln!("[runner] breakpoint rip={rip:#x} {regs}");
+            // Dump the 16 bytes each named register points at, to see what a
+            // dereference like `mov (%rdi),...` actually reads.
+            if let Ok(regspec) = std::env::var("BREAK_DEREF") {
+                for name in regspec.split(',').filter(|p| !p.is_empty()) {
+                    if let Some(var) = vm.cpu.arch.sleigh.get_varnode(name) {
+                        let ptr: u64 = vm.cpu.read_reg(var);
+                        let mut buf = [0u8; 16];
+                        let _ = vm.cpu.mem.read_bytes(ptr, &mut buf, icicle_mem::perm::NONE);
+                        let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
+                        eprintln!("[runner]   [{name}={ptr:#x}]: {hex}");
+                    }
+                }
+            }
             if let Ok(spec) = std::env::var("FAULT_PEEK") {
                 for part in spec.split(',').filter(|p| !p.is_empty()) {
                     let addr = u64::from_str_radix(part.trim_start_matches("0x"), 16).unwrap_or(0);
@@ -122,7 +185,6 @@ fn main() {
                     eprintln!("[runner] peek {addr:#x}: {hex}");
                 }
             }
-            vm.code.breakpoints.remove(&rip);
         }
     };
     let output = machine.take_output();

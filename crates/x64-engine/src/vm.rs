@@ -11,6 +11,14 @@ use icicle_cpu::{
     InternalError, ValueSource, VmExit,
 };
 
+/// Guest address of the basic block currently executing in the interpreter.
+/// A diagnostic mirror for memory-write hooks, which cannot see the CPU.
+pub static CURRENT_BLOCK_START: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Instruction count mirror, updated alongside [`CURRENT_BLOCK_START`].
+pub static CURRENT_ICOUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub struct InterpVm {
     pub cpu: Box<Cpu>,
     pub env: Box<dyn EnvironmentAny>,
@@ -265,6 +273,11 @@ impl InterpVm {
 
     fn run_block_interpreter(&mut self) {
         self.cpu.exception.clear();
+        if let Some((id, _)) = self.get_current_block() {
+            if let Some(b) = self.code.blocks.get(id as usize) {
+                CURRENT_BLOCK_START.store(b.start, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         let (mut block_id, mut offset) = match self.get_current_block() {
             Some(value) => value,
@@ -367,6 +380,8 @@ impl InterpVm {
                 Some(block) => block,
                 None => return self.corrupted_block_map(block_id),
             };
+            CURRENT_BLOCK_START.store(block.start, std::sync::atomic::Ordering::Relaxed);
+            CURRENT_ICOUNT.store(self.cpu.icount(), std::sync::atomic::Ordering::Relaxed);
         }
     }
 

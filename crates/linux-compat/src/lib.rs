@@ -36,6 +36,10 @@ use x64_engine::{
 use proc::{Process, Scheduler};
 use vfs::{NodeKind, Vfs};
 
+/// Diagnostic mirror of the currently scheduled task's pid, for memory-write
+/// hooks that cannot reach the environment.
+pub static CURRENT_PID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
 // 16 MiB: the kernel's default RLIMIT_STACK is 8 MiB, but argv/envp/auxv

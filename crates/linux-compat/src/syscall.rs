@@ -1812,6 +1812,29 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     cpu.restore(&task.cpu);
     cpu.icount = icount;
     env.proc = task.proc;
+    crate::CURRENT_PID.store(env.proc.pid, std::sync::atomic::Ordering::Relaxed);
+    // SWAP_WATCH=hexaddr: read the 8 bytes at that guest VA in whichever
+    // address space is now installed. A value that changes across a swap,
+    // with no write hook firing, exposes wrong address-space bookkeeping.
+    {
+        use std::sync::OnceLock;
+        static SWAP_WATCH: OnceLock<Option<u64>> = OnceLock::new();
+        let w = SWAP_WATCH.get_or_init(|| {
+            std::env::var("SWAP_WATCH")
+                .ok()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        });
+        if let Some(w) = *w {
+            let mut buf = [0u8; 8];
+            let _ = cpu.mem.read_bytes(w, &mut buf, perm::NONE);
+            eprintln!(
+                "[swap] ic={} pid={} tgid={} prev_group={prev_group} val={buf:02x?}",
+                cpu.icount(),
+                env.proc.pid,
+                env.proc.tgid,
+            );
+        }
+    }
     if timed_out {
         cpu.write_var(env.regs.rax, neg(abi::ETIMEDOUT));
     }
@@ -2229,6 +2252,16 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
     // replaces its memory, so the copy is never mutated concurrently with the
     // parent, and it remains a waitable child rather than a thread sibling.
     let is_thread = spec.flags & CLONE_VM != 0 && spec.flags & CLONE_VFORK == 0;
+    if std::env::var_os("CLONE_TRACE").is_some() {
+        eprintln!(
+            "[clone] parent_pid={} flags={:#x} VM={} VFORK={} THREAD={} -> child_pid={child_pid} is_thread={is_thread}",
+            env.proc.pid,
+            spec.flags,
+            spec.flags & CLONE_VM != 0,
+            spec.flags & CLONE_VFORK != 0,
+            spec.flags & 0x10000 != 0,
+        );
+    }
 
     if spec.flags & CLONE_PARENT_SETTID != 0
         && spec.parent_tid != 0
