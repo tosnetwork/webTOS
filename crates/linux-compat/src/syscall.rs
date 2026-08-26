@@ -1399,14 +1399,14 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // Hand out 64 KiB-aligned addresses: allocators that want aligned
         // segments (mimalloc probes for 16 KiB alignment) otherwise retry
         // `mmap` a few times and give up, and address space is free here.
-        let hint = env.proc.mmap_next;
+        let hint = env.proc.mmap_next.get();
         match cpu.mem.find_free_memory(icicle_cpu::mem::AllocLayout {
             addr: Some(hint),
             size: len,
             align: 0x1_0000,
         }) {
             Ok(target) => {
-                env.proc.mmap_next = target + len + PAGE_SIZE;
+                env.proc.mmap_next.set(target + len + PAGE_SIZE);
                 target
             }
             Err(_) => return Err(abi::ENOMEM),
@@ -1485,7 +1485,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // In-place growth is never attempted; the caller must allow a move.
         return Err(abi::ENOMEM);
     }
-    let hint = env.proc.mmap_next;
+    let hint = env.proc.mmap_next.get();
     let target = cpu
         .mem
         .find_free_memory(icicle_cpu::mem::AllocLayout {
@@ -1511,7 +1511,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         .map_err(|_| abi::EFAULT)?;
     write_mem(cpu, target, &buf)?;
     cpu.mem.unmap_memory_len(old_addr, old_size);
-    env.proc.mmap_next = target + new_size + PAGE_SIZE;
+    env.proc.mmap_next.set(target + new_size + PAGE_SIZE);
     Ok(target)
 }
 
@@ -1524,11 +1524,11 @@ fn sys_mprotect(cpu: &mut Cpu, addr: u64, len: u64, prot: u64) -> SysResult {
 }
 
 fn sys_brk(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> SysResult {
-    if addr == 0 || addr <= env.proc.brk_end {
-        return Ok(env.proc.brk_end);
+    if addr == 0 || addr <= env.proc.brk_end.get() {
+        return Ok(env.proc.brk_end.get());
     }
     let new_end = align_up(addr, PAGE_SIZE);
-    let cur_end = align_up(env.proc.brk_end, PAGE_SIZE);
+    let cur_end = align_up(env.proc.brk_end.get(), PAGE_SIZE);
     if new_end > cur_end {
         let ok = cpu.mem.map_memory_len(
             cur_end,
@@ -1539,10 +1539,10 @@ fn sys_brk(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> SysResult {
             },
         );
         if !ok {
-            return Ok(env.proc.brk_end);
+            return Ok(env.proc.brk_end.get());
         }
     }
-    env.proc.brk_end = addr;
+    env.proc.brk_end.set(addr);
     Ok(addr)
 }
 
@@ -3136,7 +3136,15 @@ fn write_sockaddr_in(
     out[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
     out[2..4].copy_from_slice(&addr.port().to_be_bytes());
     out[4..8].copy_from_slice(&addr.ip().octets());
-    write_mem(cpu, addr_ptr, &out)?;
+    // The caller's socklen bounds the write (the address is truncated when
+    // the buffer is short); the full length is reported back regardless.
+    let cap = if len_ptr != 0 {
+        let bytes = read_mem(cpu, len_ptr, 4)?;
+        u32::from_le_bytes(bytes.try_into().expect("read_mem length")) as usize
+    } else {
+        out.len()
+    };
+    write_mem(cpu, addr_ptr, &out[..out.len().min(cap)])?;
     if len_ptr != 0 {
         write_mem(cpu, len_ptr, &16_u32.to_le_bytes())?;
     }
@@ -4070,7 +4078,20 @@ fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         if len == 0 {
             continue;
         }
-        return sys_recvfrom(env, cpu, [fd, base, len, 0, name, name_len]);
+        // `recvfrom` takes a socklen_t *pointer*; the msghdr carries the
+        // buffer length by value, so the address length is written back into
+        // msg_namelen (offset 8) here instead. Passing the scalar through
+        // would make recvfrom scribble 4 bytes at that guest address.
+        let cap_name = if name != 0 && name_len >= 16 { name } else { 0 };
+        let out = sys_recvfrom(env, cpu, [fd, base, len, 0, cap_name, 0]);
+        if let Outcome::Ret(Ok(_)) = out {
+            if cap_name != 0 {
+                if let Err(errno) = write_mem(cpu, msg + 8, &16_u32.to_le_bytes()) {
+                    return Outcome::Ret(Err(errno));
+                }
+            }
+        }
+        return out;
     }
     Outcome::Ret(Ok(0))
 }

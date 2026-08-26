@@ -258,8 +258,10 @@ impl LinuxEnv {
 
     #[allow(dead_code)]
     pub(crate) fn alloc_mmap(&mut self, len: u64) -> u64 {
-        let target = self.proc.mmap_next;
-        self.proc.mmap_next += align_up(len, PAGE_SIZE) + PAGE_SIZE;
+        let target = self.proc.mmap_next.get();
+        self.proc
+            .mmap_next
+            .set(target + align_up(len, PAGE_SIZE) + PAGE_SIZE);
         target
     }
 
@@ -324,8 +326,10 @@ impl LinuxEnv {
                     .max(interp.base_ptr + interp.length)
             },
         );
-        self.proc.brk_end = align_up(image_end, PAGE_SIZE) + 0x10_0000;
-        self.proc.mmap_next = MMAP_BASE;
+        self.proc
+            .brk_end
+            .set(align_up(image_end, PAGE_SIZE) + 0x10_0000);
+        self.proc.mmap_next.set(MMAP_BASE);
         Ok(())
     }
 

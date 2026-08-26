@@ -41,8 +41,12 @@ pub struct Process {
     pub fds: Rc<RefCell<FdTable>>,
     pub cwd: usize,
     pub umask: u32,
-    pub brk_end: u64,
-    pub mmap_next: u64,
+    /// Program-break end and mmap search cursor. Address-space state, so
+    /// threads (`CLONE_VM`) share them; `fork` gets an independent copy. A
+    /// per-thread copy leaves siblings growing `brk` from a stale end, which
+    /// violates the kernel contract.
+    pub brk_end: Rc<Cell<u64>>,
+    pub mmap_next: Rc<Cell<u64>>,
     /// Signal dispositions are process-wide (shared by every thread in the
     /// group), matching Linux: registering a handler on one thread makes it
     /// visible to the whole process. `fork` gets its own copy; a new thread
@@ -80,8 +84,8 @@ impl Process {
             fds: Rc::new(RefCell::new(FdTable::new())),
             cwd: crate::vfs::ROOT,
             umask: 0o022,
-            brk_end: 0,
-            mmap_next: crate::MMAP_BASE,
+            brk_end: Rc::new(Cell::new(0)),
+            mmap_next: Rc::new(Cell::new(crate::MMAP_BASE)),
             sigactions: Rc::new(RefCell::new(HashMap::new())),
             sigmask: 0,
             pending_signals: 0,
@@ -105,8 +109,8 @@ impl Process {
             fds: Rc::new(RefCell::new(self.fds.borrow().clone())),
             cwd: self.cwd,
             umask: self.umask,
-            brk_end: self.brk_end,
-            mmap_next: self.mmap_next,
+            brk_end: Rc::new(Cell::new(self.brk_end.get())),
+            mmap_next: Rc::new(Cell::new(self.mmap_next.get())),
             // A new process gets its own copy of the signal dispositions.
             sigactions: Rc::new(RefCell::new(self.sigactions.borrow().clone())),
             sigmask: self.sigmask,
@@ -132,8 +136,8 @@ impl Process {
             fds: Rc::clone(&self.fds),
             cwd: self.cwd,
             umask: self.umask,
-            brk_end: self.brk_end,
-            mmap_next: self.mmap_next,
+            brk_end: Rc::clone(&self.brk_end),
+            mmap_next: Rc::clone(&self.mmap_next),
             // Threads share one signal-disposition table.
             sigactions: Rc::clone(&self.sigactions),
             sigmask: self.sigmask,

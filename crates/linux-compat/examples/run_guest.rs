@@ -85,7 +85,46 @@ fn main() {
     machine.set_args(argv, envp);
     machine.load(guest_exe.as_bytes()).expect("load");
     machine.vm_mut().icount_limit = 20_000_000_000;
-    let exit = machine.run();
+    // GUEST_BREAK="hexaddr,hexaddr": single-shot breakpoints. Each hit dumps
+    // the GPRs (and FAULT_PEEK targets) and execution continues.
+    if let Ok(spec) = std::env::var("GUEST_BREAK") {
+        for part in spec.split(',').filter(|p| !p.is_empty()) {
+            let addr = u64::from_str_radix(part.trim_start_matches("0x"), 16).expect("GUEST_BREAK");
+            machine.vm_mut().code.breakpoints.insert(addr);
+        }
+    }
+    let exit = loop {
+        let exit = machine.run();
+        let x64_engine::CpuExit::Breakpoint { rip } = exit else {
+            break exit;
+        };
+        {
+            let vm = machine.vm_mut();
+            let mut regs = String::new();
+            for name in [
+                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11",
+                "R12", "R13", "R14", "R15",
+            ] {
+                if let Some(var) = vm.cpu.arch.sleigh.get_varnode(name) {
+                    regs.push_str(&format!("{name}={:#x} ", vm.cpu.read_reg(var)));
+                }
+            }
+            eprintln!("[runner] breakpoint rip={rip:#x} {regs}");
+            if let Ok(spec) = std::env::var("FAULT_PEEK") {
+                for part in spec.split(',').filter(|p| !p.is_empty()) {
+                    let addr = u64::from_str_radix(part.trim_start_matches("0x"), 16).unwrap_or(0);
+                    let mut buf = [0u8; 16];
+                    let _ = vm
+                        .cpu
+                        .mem
+                        .read_bytes(addr, &mut buf, icicle_mem::perm::NONE);
+                    let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
+                    eprintln!("[runner] peek {addr:#x}: {hex}");
+                }
+            }
+            vm.code.breakpoints.remove(&rip);
+        }
+    };
     let output = machine.take_output();
     print!("{}", String::from_utf8_lossy(&output));
     if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
