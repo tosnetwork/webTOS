@@ -845,6 +845,24 @@ impl Machine {
         env.network_wait_budget_ms(cpu)
     }
 
+    /// Raises or lowers the guest's physical-memory cap, in mebibytes. The
+    /// default is 1 GiB; a large runtime forking under load needs more, and a
+    /// browser tab may have less to give. Returns false when the guest has
+    /// already allocated past the requested cap.
+    pub fn set_guest_memory_mb(&mut self, mb: usize) -> bool {
+        // The MMU counts 4 KiB pages.
+        self.vm.cpu.mem.set_capacity(mb.saturating_mul(256))
+    }
+
+    /// The guest's physical-memory cap and what it has actually allocated, in
+    /// mebibytes — what a host needs to report pressure or refuse a workload.
+    pub fn guest_memory_mb(&self) -> (usize, usize) {
+        (
+            self.vm.cpu.mem.total_pages() / 256,
+            self.vm.cpu.mem.capacity() / 256,
+        )
+    }
+
     /// Attaches a host network broker (network is denied without one).
     /// Sets the guest's CLOCK_REALTIME base (unix seconds at machine
     /// start). Call before `load` when the guest will validate real

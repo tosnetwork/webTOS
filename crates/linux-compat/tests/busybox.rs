@@ -296,7 +296,11 @@ fn a_file_delivered_in_pieces_reads_back_byte_for_byte() {
     let exit = machine.run();
     let read_back = machine.take_output();
 
-    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "cat did not exit cleanly");
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "cat did not exit cleanly"
+    );
     assert_eq!(
         read_back.len(),
         payload.len(),

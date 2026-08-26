@@ -41,7 +41,7 @@ terminal behavior, and recovery after a browser reload.
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~72% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Delivering the agent images to the browser and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
+| M8 Performance & release | ⬜ | ~10% | wasm opt pin and deterministic scheduling, plus a measured baseline: native and per-engine throughput, translation cost, and the linear-memory ceiling (`docs/performance.md`) |
 
 Weighted by engineering effort, overall completion is **roughly 73%**.
 The native test suites (54 native cases plus the 17-check wasm harness and the
@@ -221,7 +221,9 @@ Work:
   effects, traps, and syscall exits. ⬜
 - Record syscall traces for the target workloads without treating trace count
   as proof of semantic completeness. 🔶 (live tracing exists; no stored traces)
-- Define browser support and performance dashboards. ⬜
+- Define browser support and performance dashboards. 🔶 (`web/bench.mjs` and
+  `crates/linux-compat/tests/bench.rs` measure the same workloads in a browser
+  and natively; no dashboard yet)
 - Classify the existing `TODO-*` files as native-substrate supporting plans. ✅ (docs/plans/)
 
 Exit gate:
@@ -499,14 +501,28 @@ The milestone is complete only when both agent profiles pass independently.
 **Outcome:** correctness-complete workload profiles become a supportable web
 runtime.
 
+A measured baseline exists before any of this work starts — see
+[`docs/performance.md`](docs/performance.md). Three findings shape the order
+below: Chromium and WebKit run the interpreter at about half native speed
+while Firefox runs it at an eighth of *them*; process startup is dominated by
+lifting blocks rather than executing them; and every engine grants the module
+the full wasm32 address space, so the memory question is how guest pages, image
+bytes, and the block cache share 4 GiB rather than how much a tab allows.
+
 Work:
 
+- Investigate the ~8x spread between browser engines on identical bytecode
+  before tuning the interpreter itself.
+- Keep lifted blocks across processes that share an image, so a short-lived
+  process does not pay to translate what has already been translated.
 - Profile executed blocks and translate only proven hot paths to WebAssembly.
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results.
 - Fuzz instruction decoding, memory translation, ELF loading, syscalls, image
   parsing, snapshot restore, and browser messages.
-- Define memory, CPU, storage, network, and event-log quotas per agent.
+- Define memory, CPU, storage, network, and event-log quotas per agent,
+  budgeting guest pages, image bytes, and the block cache against one address
+  space (`wtw_set_guest_memory_mb` is the guest half of that).
 - Add signed workload manifests, reproducible images, dependency licenses,
   security policy, and vulnerability response procedures.
 - Add compatibility dashboards for supported browsers and pinned workload
@@ -559,7 +575,7 @@ bounded memory, and actionable diagnostics are the gates.
 |------|--------|------------|
 | Long-tail x86-64 instructions | Target applications fail late in startup | Trace pinned workloads, add precise illegal-instruction reports, grow fixtures incrementally |
 | Native architecture coupling | Linux compatibility cannot run over virtual CPU state | Introduce `GuestMemory` and platform traits before porting modules |
-| Browser memory limits | Large runtimes exhaust contiguous WebAssembly memory | Use sparse guest pages, quotas, eviction, and measured workload images |
+| Browser memory limits | Large runtimes exhaust contiguous WebAssembly memory. Measured: every engine grants ~3.9 GiB, so the limit is architectural, not per-browser | Use sparse guest pages, quotas, eviction, and measured workload images |
 | Threading differences | Futex and cancellation bugs cause hangs | Single-worker deterministic baseline before multi-worker optimization |
 | Browser networking restrictions | Linux socket behavior cannot map directly | Explicit network broker, clear capability model, integration fixtures |
 | Dynamic code invalidation | Translated blocks execute stale instructions | Version executable pages and invalidate blocks on writes or protection changes |

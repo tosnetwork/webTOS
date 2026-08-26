@@ -374,6 +374,51 @@ pub extern "C" fn wtw_pty_resize(rows: u32, cols: u32) -> i32 {
     })
 }
 
+/// Sets the guest's physical-memory cap, in mebibytes (default 1 GiB). A tab
+/// has less to give than a workstation, and wasm32 caps the module's whole
+/// linear memory at 4 GiB, so a host that knows its budget should say so:
+/// the guest then fails an allocation cleanly instead of the module dying
+/// when the browser refuses to grow. Returns -1 when the guest has already
+/// allocated past the requested cap.
+#[no_mangle]
+pub extern "C" fn wtw_set_guest_memory_mb(mb: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_guest_memory_mb called before wtw_init");
+        };
+        if machine.set_guest_memory_mb(mb as usize) {
+            0
+        } else {
+            fail(
+                state,
+                "cannot shrink below what the guest already allocated",
+            )
+        }
+    })
+}
+
+/// Mebibytes of guest physical memory allocated so far.
+#[no_mangle]
+pub extern "C" fn wtw_guest_memory_used_mb() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |machine| machine.guest_memory_mb().0 as u32)
+    })
+}
+
+/// The guest's physical-memory cap, in mebibytes.
+#[no_mangle]
+pub extern "C" fn wtw_guest_memory_cap_mb() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |machine| machine.guest_memory_mb().1 as u32)
+    })
+}
+
 // ----------------------------------------------------------------- network
 
 /// Attaches the host-driven network broker. Until this is called the guest

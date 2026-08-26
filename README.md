@@ -263,6 +263,11 @@ first click. It ends by comparing per-command instruction counts across
 the three engines: identical input must retire an identical instruction stream
 everywhere.
 
+Measurements, as opposed to gates, live in `web/bench.mjs` and
+`crates/linux-compat/tests/bench.rs`: the same guest workloads in a browser and
+natively, so the two can be read against each other. What they currently
+report, and what it implies, is in [`docs/performance.md`](docs/performance.md).
+
 The native suite pins its target in `crates/.cargo/config.toml`, so on a macOS
 or ARM development machine run it against the host instead — tests whose
 fixtures need an x86-64 Linux toolchain skip themselves:

@@ -220,14 +220,14 @@ const terminalSize = (page) =>
 /// so screen content, not the run state, is what says a command finished.
 /// The pattern must not match the echoed command itself: the line discipline
 /// prints what was typed before the guest has run any of it.
-async function typeLine(page, line, expect) {
+async function typeLine(page, line, expect, timeout = EXEC_TIMEOUT) {
   await page.keyboard.type(line);
   await page.keyboard.press("Enter");
-  return waitForScreen(page, expect);
+  return waitForScreen(page, expect, timeout);
 }
 
 /// Waits until a rendered line matches `expect`, then returns the screen.
-async function waitForScreen(page, expect) {
+async function waitForScreen(page, expect, timeout = EXEC_TIMEOUT) {
   await page.waitForFunction(
     (pattern) => {
       const regex = new RegExp(pattern);
@@ -238,7 +238,7 @@ async function waitForScreen(page, expect) {
       return false;
     },
     expect,
-    { timeout: EXEC_TIMEOUT },
+    { timeout },
   );
   return readScreen(page);
 }
@@ -293,8 +293,11 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
       `${(images.agentSize / (1 << 20)).toFixed(0)} MB streamed into the guest filesystem`,
     );
 
-    // The point of delivering it: it runs.
-    const ran = await typeLine(page, "openfox --help; echo agent$?", "^agent[0-9]+$");
+    // The point of delivering it: it runs. A Go runtime starting up is a few
+    // hundred million guest instructions, which is twenty seconds of
+    // interpreter in the quick engines and minutes in the slow one — see
+    // docs/performance.md. The budget is set from that, not from hope.
+    const ran = await typeLine(page, "openfox --help; echo agent$?", "^agent[0-9]+$", 600_000);
     record(
       "images: the agent image runs in the browser",
       /openfox/i.test(ran) && /^agent0$/m.test(ran),

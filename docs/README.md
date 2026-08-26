@@ -28,6 +28,10 @@ for kernel development and compatibility validation.
 
 ## Runtime and Compatibility
 
+- [Performance and memory](performance.md) - what the interpreter costs
+  natively and per browser engine, what a tab grants it, and what that implies
+  for milestone 8
+
 - [Linux compatibility](LinuxCompat.md) - Linux x86-64 syscall, process,
   VFS, memory, and networking translation
 - [WebAssembly runtime specification](specs/WASM-runtime-spec.md) - Wasm
