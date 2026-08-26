@@ -522,3 +522,141 @@ int main(void) {
         run.output
     );
 }
+
+/// Async runtimes (tokio) do not sit in `wait4`: they install a SIGCHLD
+/// handler that writes a self-pipe and block on that pipe. Without real
+/// signal delivery the parent never learns its child exited and hangs
+/// forever (observed with a real Codex binary deadlocking on process
+/// spawns).
+#[test]
+fn sigchld_self_pipe_wakes_a_parent_not_in_wait() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let source = r#"
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+extern char **environ;
+static int wake[2];
+static void on_sigchld(int sig) {
+    (void)sig;
+    char byte = 'c';
+    write(wake[1], &byte, 1);
+}
+int main(void) {
+    if (pipe(wake) != 0) { printf("pipe failed\n"); return 1; }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigchld;
+    if (sigaction(SIGCHLD, &sa, 0) != 0) { printf("sigaction failed\n"); return 2; }
+    pid_t pid;
+    char *argv[] = { "/bin/echo", "child-ran", 0 };
+    int rc = posix_spawn(&pid, "/bin/echo", 0, 0, argv, environ);
+    if (rc != 0) { printf("spawn failed rc=%d\n", rc); return 3; }
+    /* Block on the self-pipe, not wait4: only SIGCHLD delivery can wake us. */
+    char buf;
+    if (read(wake[0], &buf, 1) != 1) { printf("wakeup read failed\n"); return 4; }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) { printf("reap failed\n"); return 5; }
+    printf("reaped-status=%d\n", WEXITSTATUS(status));
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("sigchld_pipe", source, &[]) else {
+        return;
+    };
+    machine
+        .add_file(b"/bin/sigchld_pipe", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"sigchld_pipe".to_vec()],
+        vec![b"PATH=/bin:/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine.load(b"/bin/sigchld_pipe").expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "parent was not woken by SIGCHLD; output: {output:?}"
+    );
+    assert!(
+        output.contains("child-ran") && output.contains("reaped-status=0"),
+        "SIGCHLD self-pipe wakeup did not reap the child; output: {output:?}"
+    );
+}
+
+/// A `posix_spawn` whose `execve` fails: the vfork child exits without ever
+/// replacing its image. The suspended parent must still be released (by the
+/// child's exit) and must still receive SIGCHLD so it can reap the failure
+/// without sitting in `wait4` (the exact shape of the Codex spawn deadlock).
+#[test]
+fn failed_exec_releases_vfork_parent_and_raises_sigchld() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let source = r#"
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+extern char **environ;
+static int wake[2];
+static void on_sigchld(int sig) {
+    (void)sig;
+    char byte = 'c';
+    write(wake[1], &byte, 1);
+}
+int main(void) {
+    if (pipe(wake) != 0) { printf("pipe failed\n"); return 1; }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigchld;
+    if (sigaction(SIGCHLD, &sa, 0) != 0) { printf("sigaction failed\n"); return 2; }
+    pid_t pid;
+    char *argv[] = { "/bin/does-not-exist", 0 };
+    int rc = posix_spawn(&pid, "/bin/does-not-exist", 0, 0, argv, environ);
+    if (rc != 0) {
+        /* Error detected synchronously: equally valid. */
+        printf("spawn-error=%d\n", rc);
+        return 0;
+    }
+    char buf;
+    if (read(wake[0], &buf, 1) != 1) { printf("wakeup read failed\n"); return 4; }
+    int status = 0;
+    if (waitpid(pid, &status, WNOHANG) != pid) { printf("reap failed\n"); return 5; }
+    printf("exec-failed-status=%d\n", WEXITSTATUS(status));
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("spawn_fail", source, &[]) else {
+        return;
+    };
+    machine
+        .add_file(b"/bin/spawn_fail", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"spawn_fail".to_vec()],
+        vec![b"PATH=/bin:/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine.load(b"/bin/spawn_fail").expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "failed exec left the parent stuck; output: {output:?}"
+    );
+    assert!(
+        output.contains("spawn-error=") || output.contains("exec-failed-status="),
+        "failed exec was not reported to the parent; output: {output:?}"
+    );
+}

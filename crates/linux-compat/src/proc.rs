@@ -12,7 +12,11 @@
 //! `take_virtual_mapping`/`restore_virtual_mapping`, so page contents are
 //! never copied on a switch.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+};
 
 use icicle_cpu::CpuSnapshot;
 use icicle_mem::VirtualMemoryMap;
@@ -57,6 +61,10 @@ pub struct Process {
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: zeroed and futex-woken
     /// when this task exits (pthread_join relies on it).
     pub clear_child_tid: u64,
+    /// Set on a vfork child: fired (once) when the child replaces its image
+    /// via `execve` or exits, releasing the parent parked in
+    /// [`ParkState::VforkDone`]. Never inherited across fork/clone.
+    pub vfork_done: Option<Rc<Cell<bool>>>,
 }
 
 impl Process {
@@ -79,6 +87,7 @@ impl Process {
             argv: Vec::new(),
             envp: Vec::new(),
             clear_child_tid: 0,
+            vfork_done: None,
         }
     }
 
@@ -103,6 +112,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            vfork_done: None,
         }
     }
 
@@ -128,6 +138,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            vfork_done: None,
         }
     }
 }
@@ -157,6 +168,10 @@ pub enum ParkState {
         watches: Vec<Watch>,
         deadline: Option<u64>,
     },
+    /// vfork/posix_spawn parent: suspended until the child replaces its
+    /// image via `execve` or exits (`done` fires). Like the kernel's vfork
+    /// wait, this is not interruptible by signals.
+    VforkDone { done: Rc<Cell<bool>> },
 }
 
 /// One readiness source a parked task may wait on.
@@ -290,10 +305,12 @@ impl Scheduler {
     /// `now` is the deterministic clock in nanoseconds.
     pub fn find_ready(&self, now: u64) -> Option<usize> {
         self.parked.iter().position(|task| {
-            // A deliverable pending signal interrupts any blocking wait. Every
-            // park state below is interruptible, so a set bit makes the task
-            // runnable regardless of what it was waiting for.
-            if task.proc.pending_signals != 0 {
+            // A deliverable pending signal interrupts any blocking wait
+            // except the uninterruptible vfork suspension: a vfork parent
+            // must not observe anything (including a handler running on its
+            // borrowed stack semantics) until the child execs or exits.
+            if task.proc.pending_signals != 0 && !matches!(task.state, ParkState::VforkDone { .. })
+            {
                 return true;
             }
             match &task.state {
@@ -316,6 +333,7 @@ impl Scheduler {
                 ParkState::Waiting { watches, deadline } => {
                     deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
                 }
+                ParkState::VforkDone { done } => done.get(),
             }
         })
     }

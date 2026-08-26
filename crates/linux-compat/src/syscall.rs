@@ -123,7 +123,8 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_WRITE => outcome_write(env, cpu, a[0], a[1], a[2]),
         abi::SYS_READV => outcome_vectored(env, cpu, a[0], a[1], a[2], false),
         abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
-        abi::SYS_FORK | abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
+        abi::SYS_FORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
+        abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::vfork()),
         abi::SYS_CLONE => sys_clone_impl(env, cpu, CloneSpec::from_clone_args(a)),
         abi::SYS_EXECVE => sys_execve(env, cpu, a[0], a[1], a[2]),
         abi::SYS_WAIT4 => sys_wait4(env, cpu, a[0], a[1], a[2]),
@@ -1549,6 +1550,15 @@ impl CloneSpec {
         }
     }
 
+    /// Bare `vfork`: a fork whose parent suspends until the child execs or
+    /// exits.
+    pub(crate) fn vfork() -> Self {
+        Self {
+            flags: CLONE_VFORK,
+            ..Self::fork()
+        }
+    }
+
     /// x86-64 argument order: flags, new_sp, parent_tid, child_tid, tls.
     pub(crate) fn from_clone_args(a: [u64; 6]) -> Self {
         Self {
@@ -1671,6 +1681,12 @@ fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart
 /// clear-child-tid futex wake); process main threads become zombies and
 /// wake their parent. The root process ends the machine.
 fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -> Outcome {
+    // An exiting vfork child that never reached execve (e.g. posix_spawn
+    // whose exec failed) still releases its suspended parent.
+    if let Some(done) = env.proc.vfork_done.take() {
+        done.set(true);
+    }
+
     // pthread_join waits on this address.
     if env.proc.clear_child_tid != 0 {
         let addr = env.proc.clear_child_tid;
@@ -1954,8 +1970,16 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
         }
     }
 
-    // Linux-like ordering: the parent keeps running; the child is parked
-    // ready. (With copy-on-write memory this is safe for vfork too.)
+    // A vfork parent suspends until the child execs or exits; the child
+    // carries the release flag and fires it from `execve`/`task_exit`.
+    let vfork_done = if spec.flags & CLONE_VFORK != 0 {
+        let done = std::rc::Rc::new(std::cell::Cell::new(false));
+        child_proc.vfork_done = Some(std::rc::Rc::clone(&done));
+        Some(done)
+    } else {
+        None
+    };
+
     if let Some(map) = child_mem {
         env.sched.group_maps.insert(child_pid, map);
     }
@@ -1969,7 +1993,19 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
         if is_thread { "thread" } else { "process" },
         env.proc.tgid,
     );
-    Outcome::Ret(Ok(child_pid))
+
+    match vfork_done {
+        // Park the parent with its return value (the child pid) pre-set;
+        // when the child execs or exits the parent resumes right after the
+        // syscall.
+        Some(done) => {
+            cpu.write_var(env.regs.rax, child_pid);
+            block_and_switch(env, cpu, ParkState::VforkDone { done }, false)
+        }
+        // Linux-like ordering: the parent keeps running; the child is
+        // parked ready.
+        None => Outcome::Ret(Ok(child_pid)),
+    }
 }
 
 /// Reads a NUL-terminated array of string pointers (argv/envp layout).
@@ -2028,6 +2064,10 @@ fn sys_execve(
     env.proc.argv = argv;
     env.proc.envp = envp;
     env.proc.sigactions.borrow_mut().clear();
+    // The new image releases a suspended vfork parent.
+    if let Some(done) = env.proc.vfork_done.take() {
+        done.set(true);
+    }
     env.proc.fds.borrow_mut().close_cloexec();
 
     // The instruction counter must survive the CPU reset inside the loader.
