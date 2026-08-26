@@ -34,8 +34,8 @@ terminal behavior, and recovery after a browser reload.
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
 | M0 Lock the baseline | 🔶 | ~40% | fixtures exist; native QEMU harnesses not re-run since the pivot; no trace format or dashboards |
-| M1 Static `hello` | ✅ | ~90% | native + wasm gates green; three-browser matrix pending |
-| M2 Static BusyBox | ✅ | ~95% | applet gates green incl. reload persistence (FS snapshots + OPFS) |
+| M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
+| M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~85% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green; recording, reconnect, soak pending |
@@ -44,9 +44,10 @@ terminal behavior, and recovery after a browser reload.
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 73%**.
-The native test suites (48 native cases plus the 17-check wasm harness) gate every
-✅ above; `crates/x64-engine` and `crates/linux-compat` are the delivered
-engine and OS layers, `crates/webtos-web` + `web/` the current browser host.
+The native test suites (48 native cases plus the 17-check wasm harness and the
+14-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
+`crates/linux-compat` are the delivered engine and OS layers, `crates/webtos-web`
++ `web/` the current browser host.
 
 ## Product Principles
 
@@ -241,7 +242,7 @@ Work:
 Exit gate:
 
 - Static assembly and C `hello` binaries run in Chromium, Firefox, and WebKit
-  engine test environments. 🔶 (verified via Node/V8 and the demo page; no three-browser matrix)
+  engine test environments. ✅ (`web/test_browsers.mjs`; the three engines retire an identical instruction stream)
 - Invalid instructions and memory accesses trap with useful diagnostics. ✅
 - No native x86-64 instruction is executed by the host. ✅
 
@@ -265,7 +266,7 @@ Work:
 Exit gate:
 
 - `echo`, `cat`, `ls`, `mkdir`, `cp`, `mv`, `rm`, and `sh` smoke tests pass. ✅
-- Files persist across browser reload. ✅ (filesystem snapshots restore across module instances; OPFS-wired in the demo)
+- Files persist across browser reload. ✅ (a real reload in Chromium, Firefox, and WebKit restores the OPFS snapshot and reads the state back)
 - Shell pipelines and exit codes behave consistently with the native fixture. ✅
 
 ## Milestone 3: Dynamic Linux Userland ✅
@@ -287,7 +288,7 @@ Work:
 Exit gate:
 
 - Pinned dynamically linked C and Rust fixtures run from a clean browser
-  profile. ✅ (C and Rust via glibc; musl via Alpine; wasm-checked)
+  profile. ✅ (C and Rust via glibc; musl via Alpine; the musl fixture runs from a clean profile in all three engines)
 - Loader, TLS, signal, and file-mapping regression suites pass. ✅
 - Unsupported relocations, instructions, and syscalls fail explicitly. ✅
 

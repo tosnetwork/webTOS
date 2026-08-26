@@ -95,4 +95,5 @@ cargo test -p linux-compat    # skips gracefully when fixtures are absent
 The glibc tests compile their fixtures with the host `gcc`/`rustc` and skip
 when no compiler is available.
 
-The same workload runs inside the wasm module via `node web/test_node.mjs`.
+The same workload runs inside the wasm module via `node web/test_node.mjs`,
+and in Chromium, Firefox, and WebKit via `node web/test_browsers.mjs`.

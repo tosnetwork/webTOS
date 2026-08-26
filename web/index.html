@@ -73,12 +73,17 @@
     if (msg.type === "ready") {
       button.disabled = false;
       cmd.disabled = false;
-      save.disabled = false;
-      forget.disabled = false;
+      // Snapshots need the origin-private filesystem; a private window has
+      // none, so the buttons say so rather than failing when clicked.
+      save.disabled = !msg.storage;
+      forget.disabled = !msg.storage;
       cmd.focus();
       statusEl.textContent += msg.restored
         ? " — previous session restored, BusyBox at /bin/busybox"
         : " — filesystem ready, BusyBox at /bin/busybox";
+      if (!msg.storage) {
+        statusEl.textContent += " — browser storage unavailable; Save FS disabled";
+      }
     }
     if (msg.type === "output") append(strip(msg.text));
     if (msg.type === "error") {

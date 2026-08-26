@@ -3,12 +3,28 @@
 //               { type: "exec", path, argv: [..], envp: [..] }
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //               { type: "forget" }    -- delete the OPFS snapshot
-// Messages out: { type: "status", text }, { type: "ready", restored },
+// Messages out: { type: "status", text }, { type: "ready", restored, storage },
 //               { type: "output", text },
 //               { type: "done", status, error, exitCode, icount },
 //               { type: "persisted", bytes }, { type: "error", text }
 
 const SNAPSHOT_FILE = "webtos-fs.bin";
+
+// Whether this browsing context may use the origin-private filesystem at all.
+// WebKit refuses it outright when the profile has no on-disk storage (a
+// private window), so the host reports the capability up front instead of
+// failing at the first "Save".
+let storageReady = false;
+
+async function opfsProbe() {
+  try {
+    if (typeof navigator === "undefined" || !navigator.storage) return false;
+    await navigator.storage.getDirectory();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function opfsRead(name) {
   try {
@@ -61,10 +77,9 @@ async function boot(files) {
   if (exports.wtw_init() !== 0) throw new Error(`machine init failed: ${lastError()}`);
 
   // Restore the filesystem persisted before the last reload, if any.
+  storageReady = await opfsProbe();
   let restored = false;
-  const snapshot = typeof navigator !== "undefined" && navigator.storage
-    ? await opfsRead(SNAPSHOT_FILE)
-    : null;
+  const snapshot = storageReady ? await opfsRead(SNAPSHOT_FILE) : null;
   if (snapshot && snapshot.length > 0) {
     if (exports.wtw_fs_import(...put(snapshot)) === 0) {
       restored = true;
@@ -84,10 +99,13 @@ async function boot(files) {
     text: `machine ready in ${(performance.now() - t0).toFixed(0)} ms` +
       (restored ? " — filesystem restored from the previous session" : ""),
   });
-  postMessage({ type: "ready", restored });
+  postMessage({ type: "ready", restored, storage: storageReady });
 }
 
 async function persist() {
+  if (!storageReady) {
+    throw new Error("browser storage is unavailable here (private window or blocked storage)");
+  }
   if (exports.wtw_fs_export() !== 0) throw new Error(`export failed: ${lastError()}`);
   const bytes = mem().slice(
     exports.wtw_fs_ptr(),
@@ -130,6 +148,7 @@ self.onmessage = async (event) => {
     if (msg.type === "exec") exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "persist") await persist();
     if (msg.type === "forget") {
+      if (!storageReady) throw new Error("browser storage is unavailable here");
       await opfsDelete(SNAPSHOT_FILE);
       postMessage({ type: "status", text: "saved filesystem deleted" });
     }

@@ -172,6 +172,39 @@ Browser delivery work:
 - Browser terminal, image loading, snapshots, and packaging
 - Workload profiles for OpenFox, Codex, and Claude Code
 
+## Browser Host
+
+The browser host runs the same engine in a Web Worker: `crates/webtos-web`
+exports a C-ABI wasm module and `web/` hosts the worker, terminal, and OPFS
+persistence around it.
+
+```bash
+rustup target add wasm32-unknown-unknown
+tools/fetch_busybox.sh              # BusyBox demo image (GPL-2.0, not vendored)
+tools/fetch_alpine_rootfs.sh        # musl loader for the dynamic-linking checks
+bash web/build.sh                   # build the wasm module and stage the images
+python3 -m http.server -d web 8080  # then open http://localhost:8080/
+```
+
+Two harnesses gate it:
+
+```bash
+node web/test_node.mjs              # the wasm module under Node/V8, no browser
+
+cd web && npm install               # Playwright, for the browser matrix
+npx playwright install              # Chromium, Firefox, and WebKit engines
+node web/test_browsers.mjs          # all three engines; --engines= to narrow
+```
+
+`web/test_browsers.mjs` drives the demo page the way a user does — BusyBox
+applets, a snapshot, a real page reload, a read-back of the restored
+filesystem — then runs the static and dynamically linked fixtures through the
+worker protocol directly, and finally reruns the page in a profile without
+persistent storage to confirm the host reports the missing capability instead
+of failing at the first click. It ends by comparing per-command instruction
+counts across the three engines: identical input must retire an identical
+instruction stream everywhere.
+
 ## Native Development
 
 The native build remains the reference environment while the browser host is

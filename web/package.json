@@ -1,0 +1,13 @@
+{
+  "name": "webtos-web-tests",
+  "private": true,
+  "description": "Browser-matrix harness for the webTOS browser host",
+  "type": "module",
+  "scripts": {
+    "test:node": "node test_node.mjs",
+    "test:browsers": "node test_browsers.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  }
+}
