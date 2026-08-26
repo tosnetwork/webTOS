@@ -566,7 +566,13 @@ impl Machine {
             }
             Ok(())
         }
-        walk(self.env(), host_dir, guest_prefix)
+        // Create the mountpoint itself so mounting an empty host directory
+        // still yields an (empty) guest directory, not a missing path.
+        let env = self.env();
+        env.vfs
+            .mkdir_p(guest_prefix.as_bytes())
+            .map_err(|e| format!("{guest_prefix}: errno {e}"))?;
+        walk(env, host_dir, guest_prefix)
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
