@@ -3355,6 +3355,26 @@ const EPOLLET: u32 = 0x8000_0000;
 /// ready, or None for a true deadlock.
 fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
     let now = env.now_nanos(cpu);
+
+    // Host terminal input: if the guest is blocked reading the stdio pty and
+    // the host has queued keystrokes, deliver them and wake. This is what lets
+    // an interactive program on a pty make progress instead of deadlocking.
+    if !env.stdio_input.is_empty() {
+        if let Some(pty) = env.stdio_pty.clone() {
+            let waiting = pty.borrow().m2s.is_empty();
+            if waiting {
+                let bytes: Vec<u8> = env.stdio_input.drain(..).collect();
+                let mut p = pty.borrow_mut();
+                p.m2s.extend(bytes);
+                p.activity += 1;
+                drop(p);
+                if let Some(index) = env.sched.find_ready(now) {
+                    return Some(index);
+                }
+            }
+        }
+    }
+
     let deadline = env.sched.earliest_deadline();
 
     let handles = env.sched.net_watch_handles();

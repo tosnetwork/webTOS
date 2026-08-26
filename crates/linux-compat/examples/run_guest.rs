@@ -8,6 +8,36 @@ use linux_compat::net::NativeBroker;
 use linux_compat::Machine;
 use x64_engine::EngineConfig;
 
+/// Expands `\n`, `\r`, `\t`, `\xNN`, and `\\` in a terminal-input script.
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chars = s.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => out.push(b'\n'),
+            Some(b'r') => out.push(b'\r'),
+            Some(b't') => out.push(b'\t'),
+            Some(b'\\') => out.push(b'\\'),
+            Some(b'x') => {
+                let hi = chars.next().unwrap_or(b'0');
+                let lo = chars.next().unwrap_or(b'0');
+                let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(hex(hi) << 4 | hex(lo));
+            }
+            Some(other) => {
+                out.push(b'\\');
+                out.push(other);
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -84,6 +114,26 @@ fn main() {
     }
     machine.set_args(argv, envp);
     machine.load(guest_exe.as_bytes()).expect("load");
+
+    // GUEST_PTY=1 runs the guest on an interactive terminal (stdin/stdout a
+    // host-driven pty). GUEST_PTY_INPUT provides the keystrokes to feed
+    // (`\n`/`\t`/`\xNN` escapes recognized); rendered output is printed after
+    // the run. GUEST_PTY_SIZE=ROWSxCOLS overrides the 40x120 default.
+    let pty_stdio = std::env::var_os("GUEST_PTY").is_some();
+    if pty_stdio {
+        let (rows, cols) = std::env::var("GUEST_PTY_SIZE")
+            .ok()
+            .and_then(|s| {
+                let (r, c) = s.split_once('x')?;
+                Some((r.parse().ok()?, c.parse().ok()?))
+            })
+            .unwrap_or((40u16, 120u16));
+        machine.install_pty_stdio(rows, cols);
+        if let Ok(script) = std::env::var("GUEST_PTY_INPUT") {
+            machine.feed_terminal_input(&unescape(&script));
+        }
+    }
+
     machine.vm_mut().icount_limit = 20_000_000_000;
     // WATCH_GUEST_WRITE=hexaddr: MMU-level write hook on the 8 bytes at
     // that guest address. Every write (guest instruction or host) reports
@@ -214,6 +264,10 @@ fn main() {
     };
     let output = machine.take_output();
     print!("{}", String::from_utf8_lossy(&output));
+    if pty_stdio {
+        let rendered = machine.drain_terminal_output();
+        print!("{}", String::from_utf8_lossy(&rendered));
+    }
     if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
         let (exe, pid) = machine.current_task();
         let vm = machine.vm_mut();

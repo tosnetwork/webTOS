@@ -229,3 +229,61 @@ int main(void) {
         "resize sequence: {out:?}"
     );
 }
+
+/// The "browser terminal" model: stdin/stdout are a host-driven pty, so
+/// isatty() is true and the program runs its interactive path. The host feeds
+/// keystrokes and reads rendered output. Exercises Machine::install_pty_stdio,
+/// feed_terminal_input, drain_terminal_output, and the stall-time input
+/// injection that keeps a blocked terminal read from deadlocking.
+#[test]
+fn stdio_pty_drives_an_interactive_program() {
+    let source = r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(void) {
+    dprintf(1, "tty=%d\n", isatty(0));
+    char buf[128];
+    int n = 0;
+    while (n < (int)sizeof(buf) - 1) {
+        char c;
+        int r = read(0, &c, 1);
+        if (r <= 0) break;
+        buf[n++] = c;
+        if (c == '\n') break;
+    }
+    buf[n] = 0;
+    dprintf(1, "echo:%s", buf);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("stdiopty", source, &[]) else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![b"fixture".to_vec()], vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine.install_pty_stdio(40, 120);
+    machine.feed_terminal_input(b"hello-terminal\n");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let rendered = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "stdio pty: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("tty=1") && rendered.contains("echo:hello-terminal"),
+        "terminal output: {rendered:?}"
+    );
+}

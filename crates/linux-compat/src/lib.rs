@@ -138,6 +138,10 @@ pub struct LinuxEnv {
     /// Live pseudoterminals, keyed by id (`/dev/pts/<id>`), for slave lookup.
     pub(crate) ptys: std::collections::BTreeMap<u64, fd::PtyRef>,
     pub(crate) next_pty_id: u64,
+    /// When stdio is a pty (the "browser terminal" model), the shared pty and
+    /// the pending terminal input to feed the guest when it blocks reading it.
+    pub(crate) stdio_pty: Option<fd::PtyRef>,
+    pub(crate) stdio_input: std::collections::VecDeque<u8>,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -159,6 +163,8 @@ impl LinuxEnv {
             epoch_base_sec: EPOCH_BASE_SEC,
             ptys: std::collections::BTreeMap::new(),
             next_pty_id: 0,
+            stdio_pty: None,
+            stdio_input: std::collections::VecDeque::new(),
             exit_code: None,
         })
     }
@@ -205,6 +211,52 @@ impl LinuxEnv {
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
         self.proc.argv = argv;
         self.proc.envp = envp;
+    }
+
+    /// Puts the process's stdin/stdout/stderr on a fresh pty slave, with the
+    /// master held by the host (the "browser terminal"). `isatty` then reports
+    /// true and the guest runs its interactive terminal path; the host feeds
+    /// keystrokes with [`feed_terminal_input`] and reads rendered output with
+    /// [`drain_terminal_output`].
+    pub fn install_pty_stdio(&mut self, rows: u16, cols: u16) {
+        use crate::fd::{Backing, Description, FdEntry, Pty};
+        let id = self.next_pty_id;
+        self.next_pty_id += 1;
+        let mut pty = Pty::new(id);
+        pty.winsize = [rows, cols, 0, 0];
+        pty.slaves = 3; // fds 0, 1, 2
+        pty.slave_ever_opened = true;
+        pty.fg_pgrp = self.proc.pgid;
+        let pty = std::rc::Rc::new(std::cell::RefCell::new(pty));
+        self.ptys.insert(id, std::rc::Rc::clone(&pty));
+        self.stdio_pty = Some(std::rc::Rc::clone(&pty));
+        let mut fds = self.proc.fds.borrow_mut();
+        for (fd, flags) in [(0, abi::O_RDONLY), (1, abi::O_WRONLY), (2, abi::O_WRONLY)] {
+            let entry = FdEntry {
+                desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
+                    backing: Backing::PtySlave(std::rc::Rc::clone(&pty)),
+                    offset: 0,
+                    flags,
+                })),
+                cloexec: false,
+            };
+            let _ = fds.insert_at(fd, entry);
+        }
+    }
+
+    /// Queues host keystrokes for the stdio pty; delivered when the guest
+    /// blocks reading it (see the stall resolver).
+    pub fn feed_terminal_input(&mut self, bytes: &[u8]) {
+        self.stdio_input.extend(bytes.iter().copied());
+    }
+
+    /// Drains everything the guest has written to the stdio pty (terminal
+    /// output the host would render).
+    pub fn drain_terminal_output(&mut self) -> Vec<u8> {
+        match &self.stdio_pty {
+            Some(pty) => pty.borrow_mut().s2m.drain(..).collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
@@ -620,6 +672,22 @@ impl Machine {
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
         self.env().set_args(argv, envp);
+    }
+
+    /// Runs the guest's stdin/stdout/stderr over a host-driven pty (so the
+    /// guest sees an interactive terminal). Call after `load`, before `run`.
+    pub fn install_pty_stdio(&mut self, rows: u16, cols: u16) {
+        self.env().install_pty_stdio(rows, cols);
+    }
+
+    /// Queues terminal input (keystrokes) for the stdio pty.
+    pub fn feed_terminal_input(&mut self, bytes: &[u8]) {
+        self.env().feed_terminal_input(bytes);
+    }
+
+    /// Drains rendered terminal output written by the guest to the stdio pty.
+    pub fn drain_terminal_output(&mut self) -> Vec<u8> {
+        self.env().drain_terminal_output()
     }
 
     /// Attaches a host network broker (network is denied without one).
