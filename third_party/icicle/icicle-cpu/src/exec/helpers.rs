@@ -355,6 +355,9 @@ pub mod x86 {
         ("fsin", fsin),
         ("fcos", fcos),
         ("fptan", fptan),
+        ("fprem", fprem),
+        ("fprem1", fprem1),
+        ("fist_round", fist_round),
         ("f2xm1", f2xm1),
         ("fscale", fscale),
     ];
@@ -1495,44 +1498,90 @@ pub mod x86 {
     fn unlock(_: &mut Cpu, _: VarNode, _: [Value; 2]) {}
 
     /// Compute the approximate of the sine of the source operand and store it in the destination
+    /// Reads an x87 operand: 80-bit extended, or a narrower float spilled
+    /// to memory.
+    fn x87_read(cpu: &mut Cpu, v: Value) -> f64 {
+        match v.size() {
+            10 => crate::exec::interpreter::f80_to_f64(cpu.read::<[u8; 10]>(v)),
+            8 => f64::from_bits(cpu.read::<u64>(v)),
+            _ => f32::from_bits(cpu.read::<u32>(v.slice(0, 4))) as f64,
+        }
+    }
+
+    /// Writes an x87 result in the destination's own width.
+    fn x87_write(cpu: &mut Cpu, dst: VarNode, value: f64) {
+        match dst.size {
+            10 => cpu.write_var(dst, crate::exec::interpreter::f64_to_f80(value)),
+            8 => cpu.write_var(dst, value.to_bits()),
+            _ => cpu.write_var(dst, (value as f32).to_bits()),
+        }
+    }
+
     fn fsin(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        // Input is an 80-bit floating point number, but we treat it as a f64.
-        let x = f64::from_bits(cpu.read::<u64>(args[0].slice(0, 8)));
-        let result = x.sin();
-        cpu.write_var(dst.truncate(8), result.to_bits());
+        let x = x87_read(cpu, args[0]);
+        x87_write(cpu, dst, x.sin());
     }
 
     /// Compute the approximate of the cosine of the source operand and store it in the destination
     fn fcos(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        // Input is an 80-bit floating point number, but we treat it as a f64.
-        let x = f64::from_bits(cpu.read::<u64>(args[0].truncate(8)));
-        let result = x.cos();
-        cpu.write_var(dst.truncate(8), result.to_bits());
+        let x = x87_read(cpu, args[0]);
+        x87_write(cpu, dst, x.cos());
     }
 
     /// Compute the approximate of the tangent of the source operand and store it in the destination
     fn fptan(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        // Input is an 80-bit floating point number, but we treat it as a f64.
-        let x = f64::from_bits(cpu.read::<u64>(args[0].truncate(8)));
-        let result = x.tan();
-        cpu.write_var(dst.truncate(8), result.to_bits());
+        let x = x87_read(cpu, args[0]);
+        x87_write(cpu, dst, x.tan());
+    }
+
+    /// `fist`/`fistp`: converts ST0 to an integer honoring the rounding
+    /// control field of the FPU control word (second operand, via the arg
+    /// slot): 0 nearest-even, 1 down, 2 up, 3 truncate.
+    fn fist_round(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        use crate::exec::interpreter::softfp80::{self, RoundMode};
+        let x = softfp80::parse(cpu.read::<[u8; 10]>(args[0]));
+        let rc = match args[1].size() {
+            2 => (cpu.read::<u16>(args[1]) >> 10) & 3,
+            _ => (cpu.args[0] as u16 >> 10) & 3,
+        };
+        let mode = match rc {
+            0 => RoundMode::NearestTiesEven,
+            1 => RoundMode::Floor,
+            2 => RoundMode::Ceil,
+            _ => RoundMode::Trunc,
+        };
+        let v = softfp80::to_i128(softfp80::round_int(x, mode));
+        match dst.size {
+            2 => cpu.write_var(dst, v as i16),
+            4 => cpu.write_var(dst, v as i32),
+            _ => cpu.write_var(dst, v as i64),
+        }
+    }
+
+    /// x87 partial remainder (truncating quotient, C2 cleared by the spec).
+    fn fprem(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (x87_read(cpu, args[0]), x87_read(cpu, args[1]));
+        x87_write(cpu, dst, a % b);
+    }
+
+    /// x87 IEEE remainder (round-to-nearest quotient).
+    fn fprem1(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (a, b) = (x87_read(cpu, args[0]), x87_read(cpu, args[1]));
+        let q = (a / b).round_ties_even();
+        x87_write(cpu, dst, a - q * b);
     }
 
     /// Compute ST0 = 2^(ST0) - 1
     fn f2xm1(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        // Input is an 80-bit floating point number, but we treat it as a f64.
-        let st0 = f64::from_bits(cpu.read::<u64>(args[0].truncate(8)));
-        let result = st0.exp2() - 1.0;
-        cpu.write_var(dst.truncate(8), result.to_bits());
+        let st0 = x87_read(cpu, args[0]);
+        x87_write(cpu, dst, st0.exp2() - 1.0);
     }
 
     /// Compute ST0 = ST0 * 2^(trunc(ST1))
     fn fscale(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        // Input is an 80-bit floating point number, but we treat it as a f64.
-        let st0 = f64::from_bits(cpu.read::<u64>(args[0].truncate(8)));
-        let st1 = f64::from_bits(cpu.read::<u64>(args[1].truncate(8)));
-        let result = st0 * st1.trunc().exp2();
-        cpu.write_var(dst.truncate(8), result.to_bits());
+        let st0 = x87_read(cpu, args[0]);
+        let st1 = x87_read(cpu, args[1]);
+        x87_write(cpu, dst, st0 * (2f64).powi(st1.trunc().clamp(-2000.0, 2000.0) as i32));
     }
 
     pub mod cpuid {

@@ -5737,42 +5737,39 @@ define pcodeop ffree;
     C3 = 0; 
 }          
 
+define pcodeop fist_round;
+
 :FIST m16       is vexMode=0 & byte=0xDF; (mod != 0b11 & reg_opcode=2) ... & m16            
 { 
     FPUInstructionPointer = inst_start;
-    tmp:10 = round(ST0);
-    m16 = trunc(tmp); 
+    m16 = fist_round(ST0, FPUControlWord);
 }                    
 
 :FIST m32       is vexMode=0 & byte=0xDB; (mod != 0b11 & reg_opcode=2) ... & m32            
 { 
     FPUInstructionPointer = inst_start;
-    tmp:10 = round(ST0); 
-    m32 = trunc(tmp); 
+    m32 = fist_round(ST0, FPUControlWord);
 }            
 
 :FISTP m16      is vexMode=0 & byte=0xDF; reg_opcode=3 ... & m16            
 { 
     FPUInstructionPointer = inst_start;
-    tmp:10 = round(ST0); 
-    fpop(); 
-    m16 = trunc(tmp); 
+    m16 = fist_round(ST0, FPUControlWord);
+    fpop();
 }                
 
 :FISTP m32      is vexMode=0 & byte=0xDB; reg_opcode=3 ... & m32
 { 
     FPUInstructionPointer = inst_start;
-    tmp:10 = round(ST0);
+    m32 = fist_round(ST0, FPUControlWord);
     fpop();
-    m32 = trunc(tmp); 
 }                
 
 :FISTP m64      is vexMode=0 & byte=0xDF; reg_opcode=7 ... & m64  
 {
     FPUInstructionPointer = inst_start;
-    tmp:10 = round(ST0); 
-    fpop(); 
-    m64 = trunc(tmp); 
+    m64 = fist_round(ST0, FPUControlWord);
+    fpop();
 }                
 
 :FISTTP m16     is vexMode=0 & byte=0xDF; reg_opcode=1 ... & m16 
@@ -5954,22 +5951,23 @@ define pcodeop fpatan;
     fpop(); 
 }
 
+define pcodeop fprem;
+define pcodeop fprem1;
+
 :FPREM          is vexMode=0 & byte=0xD9; byte=0xF8
 {
     FPUInstructionPointer = inst_start;
-    local tmp = ST0 f/ ST1;
-    tmp = trunc(tmp);
-    tmp = tmp f* ST1;
-    ST0 = ST0 f- tmp;
+    ST0 = fprem(ST0, ST1);
+    C2 = 0;
+    FPUStatusWord = FPUStatusWord & 0xfbff;
 }
 
 :FPREM1         is vexMode=0 & byte=0xD9; byte=0xF5
 {
     FPUInstructionPointer = inst_start;
-    local tmp = ST0 f/ ST1;
-    tmp = round(tmp);
-    tmp = tmp f* ST1;
-    ST0 = ST0 f- tmp;
+    ST0 = fprem1(ST0, ST1);
+    C2 = 0;
+    FPUStatusWord = FPUStatusWord & 0xfbff;
 }
 
 define pcodeop fptan;

@@ -56,6 +56,46 @@ fn rewrite_one(i: usize, instructions: &[pcode::Instruction], out: &mut pcode::B
         return;
     }
 
+    // 80-bit float operations pass through unchanged: the interpreter
+    // executes them exactly in software extended precision. Lowering them to
+    // f64 here loses 11 mantissa bits, which x87-era code observably relies
+    // on (e.g. printf's digit-peeling loop never terminates without them).
+    let f80 = |v: pcode::Value| v.size() == 10;
+    match inst.op {
+        Op::FloatAdd | Op::FloatSub | Op::FloatMul | Op::FloatDiv
+            if x.size == 10 && f80(a) && f80(b) =>
+        {
+            out.push(inst);
+            return;
+        }
+        Op::FloatNegate
+        | Op::FloatAbs
+        | Op::FloatSqrt
+        | Op::FloatCeil
+        | Op::FloatFloor
+        | Op::FloatRound
+            if x.size == 10 && f80(a) =>
+        {
+            out.push(inst);
+            return;
+        }
+        Op::FloatEqual | Op::FloatNotEqual | Op::FloatLess | Op::FloatLessEqual
+            if f80(a) && f80(b) =>
+        {
+            out.push(inst);
+            return;
+        }
+        Op::FloatToInt if f80(a) => {
+            out.push(inst);
+            return;
+        }
+        Op::IntToFloat if x.size == 10 && a.size() <= 8 => {
+            out.push(inst);
+            return;
+        }
+        _ => {}
+    }
+
     // Rewrite operations on non-natively sized inputs/outputs
     match inst.op {
         // Copy/Load/Store operations have special cases for non-native sizes.

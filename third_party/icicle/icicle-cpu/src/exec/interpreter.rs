@@ -54,7 +54,10 @@ where
             match output.size {
                 4 => exec.write_var::<u32>(output, FromFloat::from_float(value as f32)),
                 8 => exec.write_var::<u64>(output, FromFloat::from_float(value as f64)),
-                10 => exec.write_var::<[u8; 10]>(output, FromFloat::from_float(value as f64)),
+                10 => exec.write_var::<[u8; 10]>(
+                    output,
+                    softfp80::pack(softfp80::from_i128(value as i128)),
+                ),
                 size => exec.exception(ExceptionCode::InvalidFloatSize, size as u64),
             }
         }};
@@ -210,7 +213,15 @@ where
 
         (Op::FloatToInt, _, (4, 0)) => float_to_int!(exec.read::<u32>(a)),
         (Op::FloatToInt, _, (8, 0)) => float_to_int!(exec.read::<u64>(a)),
-        (Op::FloatToInt, _, (10, 0)) => float_to_int!(exec.read::<[u8; 10]>(a)),
+        (Op::FloatToInt, _, (10, 0)) => {
+            let v = softfp80::to_i128(softfp80::parse(exec.read::<[u8; 10]>(a)));
+            match output.size {
+                2 => exec.write_var(output, v as i16),
+                4 => exec.write_var(output, v as i32),
+                8 => exec.write_var(output, v as i64),
+                size => return exec.exception(ExceptionCode::InvalidFloatSize, size as u64),
+            }
+        }
         (Op::FloatToInt, ..) => exec.invalid_op_size(0),
 
         (Op::IntAdd, 1, (1, 1)) => binary_op!(IntAdd, u8),
@@ -866,6 +877,76 @@ impl_bool_op! { BoolAnd,    (a, b, a & b != 0) }
 impl_bool_op! { BoolOr,     (a, b, a | b != 0) }
 impl_bool_op! { BoolXor,    (a, b, a ^ b != 0) }
 
+/// Converts an 80-bit x87 extended value to f64 (with rounding; extended
+/// values outside f64 range overflow to infinity or underflow toward zero).
+pub(crate) fn f80_to_f64(v: [u8; 10]) -> f64 {
+    let mant = u64::from_le_bytes(v[..8].try_into().unwrap());
+    let se = u16::from_le_bytes(v[8..10].try_into().unwrap());
+    let neg = se & 0x8000 != 0;
+    let exp = (se & 0x7fff) as i32;
+    let magnitude = if exp == 0x7fff {
+        if mant << 1 == 0 {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        }
+    } else if mant == 0 && exp == 0 {
+        0.0
+    } else {
+        // Denormals (exp == 0, no integer bit) use the 2^-16382 scale,
+        // which is the same as treating the exponent field as 1.
+        let e = if exp == 0 { 1 } else { exp };
+        ldexp(mant as f64, e - 16383 - 63)
+    };
+    if neg {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// `x * 2^e` in steps, so extended-range exponents can still land on
+/// (sub)normal f64 values instead of under/overflowing in one jump.
+fn ldexp(mut x: f64, mut e: i32) -> f64 {
+    while e > 1000 {
+        x *= 2f64.powi(1000);
+        e -= 1000;
+    }
+    while e < -1000 {
+        x *= 2f64.powi(-1000);
+        e += 1000;
+    }
+    x * 2f64.powi(e)
+}
+
+/// Converts an f64 to the 80-bit x87 extended format (exact: every f64 is
+/// representable, including subnormals, which become normal extendeds).
+pub(crate) fn f64_to_f80(v: f64) -> [u8; 10] {
+    let bits = v.to_bits();
+    let sign = ((bits >> 63) as u16) << 15;
+    let exp64 = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (exp80, mant): (u16, u64) = if exp64 == 0x7ff {
+        // Infinity keeps a bare integer bit; NaN keeps its payload, quieted.
+        (0x7fff, if frac == 0 { 1 << 63 } else { (0b11 << 62) | (frac << 11) })
+    } else if exp64 == 0 {
+        if frac == 0 {
+            (0, 0)
+        } else {
+            // An f64 subnormal (frac * 2^-1074) normalizes: shifting the
+            // fraction to the integer bit gives mant * 2^(15372 - lz - 16446).
+            let lz = frac.leading_zeros();
+            ((15372 - lz) as u16, frac << lz)
+        }
+    } else {
+        ((exp64 - 1023 + 16383) as u16, (1 << 63) | (frac << 11))
+    };
+    let mut out = [0u8; 10];
+    out[..8].copy_from_slice(&mant.to_le_bytes());
+    out[8..10].copy_from_slice(&(sign | exp80).to_le_bytes());
+    out
+}
+
 trait ToFloat {
     type FloatType;
     fn to_float(self) -> Self::FloatType;
@@ -924,16 +1005,14 @@ impl ToFloat for [u8; 10] {
     type FloatType = f64;
     #[inline(always)]
     fn to_float(self) -> f64 {
-        f64::from_bits(u64::from_le_bytes(self[..8].try_into().unwrap()))
+        f80_to_f64(self)
     }
 }
 
 impl FromFloat<[u8; 10]> for f64 {
     #[inline(always)]
     fn from_float(self) -> [u8; 10] {
-        let mut v = [0u8; 10];
-        v[..8].copy_from_slice(&self.to_bits().to_le_bytes());
-        v
+        f64_to_f80(self)
     }
 }
 
@@ -951,8 +1030,7 @@ impl Float80Ext for f80 {
     }
 
     fn to_f64(&self) -> f64 {
-        // @fixme: not implement correctly
-        f64::from_bits(u64::from_le_bytes(self[..8].try_into().unwrap()))
+        f80_to_f64(*self)
     }
 }
 
@@ -974,10 +1052,7 @@ impl ToFloat80 for f32 {
 
 impl ToFloat80 for f64 {
     fn to_f80(&self) -> f80 {
-        // @fixme: not implement correctly.
-        let mut v = [0u8; 10];
-        v[..8].copy_from_slice(&self.to_bits().to_le_bytes());
-        v
+        f64_to_f80(*self)
     }
 }
 
@@ -988,7 +1063,7 @@ trait FloatOp<T>: Sized {
 
 macro_rules! impl_float_op {
     ($struct:ident, ($a:ident, $b:ident, $impl:expr)) => {
-        impl_float_op! { $struct, ($a, $b, $impl), u32, u64, [u8; 10] }
+        impl_float_op! { $struct, ($a, $b, $impl), u32, u64 }
     };
 
     ($struct:ident, ($a:ident, $b:ident, $impl:expr), $( $ty:ty ),*) => {
@@ -1010,6 +1085,23 @@ impl_float_op! { FloatAdd,    (a, b, a + b) }
 impl_float_op! { FloatSub,    (a, b, a - b) }
 impl_float_op! { FloatMul,    (a, b, a * b) }
 impl_float_op! { FloatDiv,    (a, b, a / b) }
+
+// 80-bit operands use the exact softfp80 path: an f64 round-trip loses 11
+// mantissa bits, which x87-era code observably relies on.
+macro_rules! impl_soft80_binop {
+    ($struct:ident, $f:path) => {
+        impl FloatOp<[u8; 10]> for $struct {
+            #[inline(always)]
+            fn eval(a: [u8; 10], b: [u8; 10]) -> [u8; 10] {
+                softfp80::pack($f(softfp80::parse(a), softfp80::parse(b)))
+            }
+        }
+    };
+}
+impl_soft80_binop! { FloatAdd, softfp80::add }
+impl_soft80_binop! { FloatSub, softfp80::sub }
+impl_soft80_binop! { FloatMul, softfp80::mul }
+impl_soft80_binop! { FloatDiv, softfp80::div }
 
 /// Represents an operation that takes a single input producing a float output of the same size
 trait FloatSingleOp<T>: Sized {
@@ -1033,13 +1125,6 @@ macro_rules! impl_float_single_op {
                 ($impl).from_float()
             }
         }
-        impl FloatSingleOp<[u8; 10]> for $struct {
-            #[inline(always)]
-            fn eval($a: [u8; 10]) -> [u8; 10] {
-                let $a = $a.to_float();
-                ($impl).from_float()
-            }
-        }
     };
 }
 
@@ -1049,6 +1134,37 @@ impl_float_single_op! { FloatSqrt,   (a, a.sqrt()) }
 impl_float_single_op! { FloatCeil,   (a, a.ceil()) }
 impl_float_single_op! { FloatFloor,  (a, a.floor()) }
 impl_float_single_op! { FloatRound,  (a, a.round()) }
+
+impl FloatSingleOp<[u8; 10]> for FloatNegate {
+    fn eval(mut a: [u8; 10]) -> [u8; 10] {
+        a[9] ^= 0x80; // exact: flip the sign bit
+        a
+    }
+}
+impl FloatSingleOp<[u8; 10]> for FloatAbs {
+    fn eval(mut a: [u8; 10]) -> [u8; 10] {
+        a[9] &= 0x7f;
+        a
+    }
+}
+impl FloatSingleOp<[u8; 10]> for FloatSqrt {
+    fn eval(a: [u8; 10]) -> [u8; 10] {
+        // f64 precision suffices for sqrt consumers seen so far.
+        f64_to_f80(f80_to_f64(a).sqrt())
+    }
+}
+macro_rules! impl_soft80_round {
+    ($struct:ident, $mode:expr) => {
+        impl FloatSingleOp<[u8; 10]> for $struct {
+            fn eval(a: [u8; 10]) -> [u8; 10] {
+                softfp80::pack(softfp80::round_int(softfp80::parse(a), $mode))
+            }
+        }
+    };
+}
+impl_soft80_round! { FloatCeil, softfp80::RoundMode::Ceil }
+impl_soft80_round! { FloatFloor, softfp80::RoundMode::Floor }
+impl_soft80_round! { FloatRound, softfp80::RoundMode::NearestTiesAway }
 
 trait FloatCmpOp<T>: Sized {
     fn eval(a: T, b: T) -> bool;
@@ -1071,13 +1187,6 @@ macro_rules! impl_float_cmp_op {
                 $impl
             }
         }
-        impl FloatCmpOp<[u8; 10]> for $struct {
-            fn eval($a: [u8; 10], $b: [u8; 10]) -> bool {
-                let $a = $a.to_float();
-                let $b = $b.to_float();
-                $impl
-            }
-        }
     };
 }
 
@@ -1085,3 +1194,410 @@ impl_float_cmp_op! { FloatEqual,     (a, b, a == b) }
 impl_float_cmp_op! { FloatNotEqual,  (a, b, a != b) }
 impl_float_cmp_op! { FloatLess,      (a, b, a <  b) }
 impl_float_cmp_op! { FloatLessEqual, (a, b, a <= b) }
+
+macro_rules! impl_soft80_cmp {
+    ($struct:ident, |$ord:ident| $impl:expr) => {
+        impl FloatCmpOp<[u8; 10]> for $struct {
+            fn eval(a: [u8; 10], b: [u8; 10]) -> bool {
+                let $ord = softfp80::cmp(softfp80::parse(a), softfp80::parse(b));
+                $impl
+            }
+        }
+    };
+}
+impl_soft80_cmp! { FloatEqual, |o| o == Some(std::cmp::Ordering::Equal) }
+impl_soft80_cmp! { FloatNotEqual, |o| !matches!(o, Some(std::cmp::Ordering::Equal)) }
+impl_soft80_cmp! { FloatLess, |o| o == Some(std::cmp::Ordering::Less) }
+impl_soft80_cmp! { FloatLessEqual, |o| matches!(o, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)) }
+
+/// True 80-bit x87 extended-precision software float. The f64-backed
+/// emulation loses 11 mantissa bits, which breaks code that relies on
+/// 64-bit-mantissa exactness (musl's fmt_fp digit-peeling loop never
+/// terminates and walks a pointer off the stack). Values are normalized to
+/// `mant` (integer bit 63 set) times 2^(exp-63); arithmetic runs in 128-bit
+/// workspaces with round-to-nearest-even.
+pub(crate) mod softfp80 {
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    pub enum X87 {
+        Zero(bool),
+        Inf(bool),
+        Nan,
+        Num { sign: bool, exp: i32, mant: u64 },
+    }
+    use X87::*;
+
+    pub fn parse(v: [u8; 10]) -> X87 {
+        let mant = u64::from_le_bytes(v[..8].try_into().unwrap());
+        let se = u16::from_le_bytes(v[8..10].try_into().unwrap());
+        let sign = se & 0x8000 != 0;
+        let e = (se & 0x7fff) as i32;
+        if e == 0x7fff {
+            return if mant << 1 == 0 { Inf(sign) } else { Nan };
+        }
+        if mant == 0 {
+            // True zero, or a pseudo-zero (e != 0, mant 0): treat as zero.
+            return Zero(sign);
+        }
+        // Denormals (e == 0) scale as if e were 1; unnormals normalize.
+        let lz = mant.leading_zeros() as i32;
+        let e0 = if e == 0 { 1 } else { e };
+        Num {
+            sign,
+            exp: e0 - 16383 - lz,
+            mant: mant << lz,
+        }
+    }
+
+    fn enc(sign: bool, e: u16, mant: u64) -> [u8; 10] {
+        let mut out = [0u8; 10];
+        out[..8].copy_from_slice(&mant.to_le_bytes());
+        out[8..10].copy_from_slice(&(((sign as u16) << 15) | e).to_le_bytes());
+        out
+    }
+
+    pub fn pack(x: X87) -> [u8; 10] {
+        match x {
+            Zero(s) => enc(s, 0, 0),
+            Inf(s) => enc(s, 0x7fff, 1 << 63),
+            Nan => enc(false, 0x7fff, 0xC000_0000_0000_0000),
+            Num { sign, exp, mant } => {
+                let be = exp + 16383;
+                if be >= 0x7fff {
+                    return enc(sign, 0x7fff, 1 << 63); // overflow -> inf
+                }
+                if be < 1 {
+                    // Denormal: shift right, rounding to nearest-even.
+                    let sh = 1 - be;
+                    if sh > 64 {
+                        return enc(sign, 0, 0);
+                    }
+                    let acc = (mant as u128) << (64 - sh as u32);
+                    let hi = (acc >> 64) as u64;
+                    let low = acc as u64;
+                    let (m, carry) = round_ne(hi, low, 0);
+                    if carry || m >> 63 == 1 {
+                        return enc(sign, 1, if carry { 1 << 63 } else { m });
+                    }
+                    return enc(sign, 0, m);
+                }
+                enc(sign, be as u16, mant)
+            }
+        }
+    }
+
+    /// Rounds `hi` given the dropped bits `low` (plus a sticky flag).
+    /// Returns (mantissa, carried-out-of-64-bits).
+    fn round_ne(hi: u64, low: u64, sticky: u64) -> (u64, bool) {
+        let half = 1u64 << 63;
+        let round_up = low > half || (low == half && sticky != 0) || (low == half && hi & 1 == 1);
+        if round_up {
+            match hi.checked_add(1) {
+                Some(v) => (v, false),
+                None => (1 << 63, true),
+            }
+        } else {
+            (hi, false)
+        }
+    }
+
+    /// Builds a normalized number from `value = acc * 2^scale` (acc != 0).
+    fn norm128(sign: bool, scale: i32, acc: u128) -> X87 {
+        debug_assert!(acc != 0);
+        let lz = acc.leading_zeros() as i32;
+        let acc_n = acc << lz;
+        let hi = (acc_n >> 64) as u64;
+        let low = acc_n as u64;
+        let (mant, carry) = round_ne(hi, low, 0);
+        let exp = scale - lz + 127 + carry as i32;
+        Num { sign, exp, mant }
+    }
+
+    fn neg(x: X87) -> X87 {
+        match x {
+            Zero(s) => Zero(!s),
+            Inf(s) => Inf(!s),
+            Nan => Nan,
+            Num { sign, exp, mant } => Num { sign: !sign, exp, mant },
+        }
+    }
+
+    pub fn add(a: X87, b: X87) -> X87 {
+        match (a, b) {
+            (Nan, _) | (_, Nan) => Nan,
+            (Inf(sa), Inf(sb)) => {
+                if sa == sb {
+                    Inf(sa)
+                } else {
+                    Nan
+                }
+            }
+            (Inf(s), _) | (_, Inf(s)) => Inf(s),
+            (Zero(sa), Zero(sb)) => Zero(sa && sb),
+            (Zero(_), n) | (n, Zero(_)) => n,
+            (
+                Num { sign: sa, exp: ea, mant: ma },
+                Num { sign: sb, exp: eb, mant: mb },
+            ) => {
+                // Order by magnitude so the first operand dominates.
+                let (sa, ea, ma, sb, eb, mb) = if (ea, ma) >= (eb, mb) {
+                    (sa, ea, ma, sb, eb, mb)
+                } else {
+                    (sb, eb, mb, sa, ea, ma)
+                };
+                let shift = (ea - eb) as u32;
+                let big = (ma as u128) << 63;
+                let small_full = (mb as u128) << 63;
+                let (small, sticky) = if shift == 0 {
+                    (small_full, false)
+                } else if shift >= 128 {
+                    (0, true)
+                } else {
+                    (
+                        small_full >> shift,
+                        small_full << (128 - shift) != 0,
+                    )
+                };
+                let scale = ea - 126;
+                if sa == sb {
+                    let acc = big + small + sticky as u128;
+                    norm128(sa, scale, acc)
+                } else {
+                    // The sticky bit borrows from the difference.
+                    let acc = big - small - sticky as u128;
+                    if acc == 0 {
+                        Zero(false)
+                    } else {
+                        norm128(sa, scale, acc)
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn sub(a: X87, b: X87) -> X87 {
+        add(a, neg(b))
+    }
+
+    pub fn mul(a: X87, b: X87) -> X87 {
+        match (a, b) {
+            (Nan, _) | (_, Nan) => Nan,
+            (Inf(sa), Inf(sb)) => Inf(sa != sb),
+            (Inf(s), Zero(_)) | (Zero(_), Inf(s)) => {
+                let _ = s;
+                Nan
+            }
+            (Inf(sa), Num { sign, .. }) | (Num { sign, .. }, Inf(sa)) => Inf(sa != sign),
+            (Zero(sa), Zero(sb)) => Zero(sa != sb),
+            (Zero(sa), Num { sign, .. }) | (Num { sign, .. }, Zero(sa)) => Zero(sa != sign),
+            (
+                Num { sign: sa, exp: ea, mant: ma },
+                Num { sign: sb, exp: eb, mant: mb },
+            ) => {
+                let p = (ma as u128) * (mb as u128);
+                norm128(sa != sb, ea + eb - 126, p)
+            }
+        }
+    }
+
+    pub fn div(a: X87, b: X87) -> X87 {
+        match (a, b) {
+            (Nan, _) | (_, Nan) => Nan,
+            (Inf(_), Inf(_)) | (Zero(_), Zero(_)) => Nan,
+            (Inf(sa), Num { sign, .. }) | (Inf(sa), Zero(sign)) => Inf(sa != sign),
+            (Num { sign, .. }, Inf(sa)) => Zero(sa != sign),
+            (Zero(sa), Num { sign, .. }) => Zero(sa != sign),
+            (Zero(sa), Inf(sb)) => Zero(sa != sb),
+            (Num { sign: sa, .. }, Zero(sb)) => Inf(sa != sb),
+            (
+                Num { sign: sa, exp: ea, mant: ma },
+                Num { sign: sb, exp: eb, mant: mb },
+            ) => {
+                let num = (ma as u128) << 63;
+                let den = mb as u128;
+                let q = num / den;
+                let rem = num % den;
+                // One extra quotient bit plus sticky for correct rounding.
+                let acc = (q << 1) | (rem != 0) as u128;
+                norm128(sa != sb, ea - eb - 64, acc)
+            }
+        }
+    }
+
+    /// Total comparison; None when unordered (NaN involved).
+    pub fn cmp(a: X87, b: X87) -> Option<std::cmp::Ordering> {
+        let key = |x: X87| -> Option<(i32, i64, u64)> {
+            // (class, signed exponent, mantissa) with sign folded in.
+            match x {
+                Nan => None,
+                Zero(_) => Some((0, 0, 0)),
+                Inf(s) => Some(if s { (-2, 0, 0) } else { (2, 0, 0) }),
+                Num { sign, exp, mant } => {
+                    if sign {
+                        Some((-1, -(exp as i64), u64::MAX - mant))
+                    } else {
+                        Some((1, exp as i64, mant))
+                    }
+                }
+            }
+        };
+        Some(key(a)?.cmp(&key(b)?))
+    }
+
+    pub enum RoundMode {
+        Ceil,
+        Floor,
+        NearestTiesAway,
+        NearestTiesEven,
+        Trunc,
+    }
+
+    /// Rounds to an integral value, exactly.
+    pub fn round_int(x: X87, mode: RoundMode) -> X87 {
+        let Num { sign, exp, mant } = x else { return x };
+        if exp >= 63 {
+            return x; // already integral
+        }
+        let (int_part, frac_nonzero, frac_half_or_more) = if exp < 0 {
+            (0u64, mant != 0, exp == -1 && mant != 0)
+        } else {
+            let sh = (63 - exp) as u32;
+            let ip = mant >> sh;
+            let frac = mant << (64 - sh);
+            (ip, frac != 0, frac >> 63 == 1)
+        };
+        let exactly_half = frac_half_or_more && {
+            // The half flag alone cannot distinguish 0.5 from 0.5+eps.
+            if exp < 0 {
+                exp == -1 && mant == 1 << 63
+            } else {
+                (mant << (64 - (63 - exp) as u32)) << 1 == 0
+            }
+        };
+        let bump = match mode {
+            RoundMode::Trunc => false,
+            RoundMode::Ceil => !sign && frac_nonzero,
+            RoundMode::Floor => sign && frac_nonzero,
+            RoundMode::NearestTiesAway => frac_half_or_more,
+            RoundMode::NearestTiesEven => {
+                frac_half_or_more && (!exactly_half || int_part & 1 == 1)
+            }
+        };
+        let value = int_part + bump as u64;
+        if value == 0 {
+            return Zero(sign);
+        }
+        let lz = value.leading_zeros() as i32;
+        Num {
+            sign,
+            exp: 63 - lz,
+            mant: value << lz,
+        }
+    }
+
+    /// Truncates toward zero into an i128 (saturating).
+    pub fn to_i128(x: X87) -> i128 {
+        match x {
+            Zero(_) => 0,
+            Nan => 0,
+            Inf(s) => {
+                if s {
+                    i128::MIN
+                } else {
+                    i128::MAX
+                }
+            }
+            Num { sign, exp, mant } => {
+                let mag: i128 = if exp < 0 {
+                    0
+                } else if exp <= 63 {
+                    (mant >> (63 - exp)) as i128
+                } else if exp <= 126 {
+                    (mant as i128) << (exp - 63)
+                } else if sign {
+                    return i128::MIN;
+                } else {
+                    return i128::MAX;
+                };
+                if sign {
+                    -mag
+                } else {
+                    mag
+                }
+            }
+        }
+    }
+
+    /// Exact conversion from a signed integer.
+    pub fn from_i128(v: i128) -> X87 {
+        if v == 0 {
+            return Zero(false);
+        }
+        let sign = v < 0;
+        let mag = v.unsigned_abs();
+        norm128(sign, 0, mag)
+    }
+}
+
+#[cfg(test)]
+mod softfp80_tests {
+    use super::softfp80::*;
+    use super::{f64_to_f80, f80_to_f64};
+
+    fn from_f64(v: f64) -> X87 {
+        parse(f64_to_f80(v))
+    }
+
+    #[test]
+    fn roundtrip_f64() {
+        for v in [0.0, -0.0, 1.0, 1.5, -2.5e-10, 1e300, 4.9e-324, f64::MAX] {
+            assert_eq!(f80_to_f64(pack(parse(f64_to_f80(v)))), v, "{v}");
+        }
+    }
+
+    #[test]
+    fn exact_small_arithmetic() {
+        let two = from_f64(2.0);
+        let three = from_f64(3.0);
+        assert_eq!(pack(add(two, three)), f64_to_f80(5.0));
+        assert_eq!(pack(mul(two, three)), f64_to_f80(6.0));
+        assert_eq!(pack(sub(two, three)), f64_to_f80(-1.0));
+        assert_eq!(f80_to_f64(pack(div(three, two))), 1.5);
+    }
+
+    #[test]
+    fn fmt_fp_digit_peel_terminates() {
+        // musl's %e loop: *z = (u32)y; y = 1e9 * (y - *z); relies on 64-bit
+        // mantissa exactness to reach exactly zero.
+        let billion = from_i128(1_000_000_000);
+        let mut y = from_f64(std::f64::consts::PI);
+        for _ in 0..6 {
+            let z = to_i128(y) as u64 as i128;
+            y = mul(billion, sub(y, from_i128(z)));
+            if matches!(y, X87::Zero(_)) {
+                return;
+            }
+        }
+        panic!("digit peel did not terminate: {y:?}");
+    }
+
+    #[test]
+    fn compare_orders_signs() {
+        let a = from_f64(-1.0);
+        let b = from_f64(1.0);
+        assert_eq!(cmp(a, b), Some(std::cmp::Ordering::Less));
+        assert_eq!(cmp(b, b), Some(std::cmp::Ordering::Equal));
+        assert_eq!(cmp(parse(pack(X87::Nan)), b), None);
+    }
+
+    #[test]
+    fn round_modes() {
+        let v = from_f64(-2.5);
+        assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Ceil))), -2.0);
+        assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Floor))), -3.0);
+        assert_eq!(
+            f80_to_f64(pack(round_int(v, RoundMode::NearestTiesAway))),
+            -3.0
+        );
+        assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Trunc))), -2.0);
+    }
+}
