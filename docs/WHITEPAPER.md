@@ -2,7 +2,7 @@
 
 **An Operating System for AI Agents, Delivered by the Browser**
 
-**Version:** Draft v1.0 · 2026-08-25
+**Version:** Draft v1.1 · 2026-08-26
 **Status:** Product and vision white paper
 **Companions:** [Yellow Paper](specs/yellowpaper.md) (engineering specification) ·
 [ROADMAP](../ROADMAP.md) (milestones and exit gates)
@@ -180,14 +180,23 @@ prompt does not pass a gate.
   CPython-class workloads under QEMU, with validation harnesses in-repo.
 - **The browser x86-64 engine is running.** A pure-Rust software CPU
   (interpreter over a production-grade instruction decoder) compiles to
-  WebAssembly and executes static Linux binaries; the first milestone
-  (static `hello` end-to-end through the wasm host) is verified, with the
-  cross-browser gate in progress.
-- **The BusyBox milestone is in active development:** an in-memory VFS, Linux
-  file-descriptor semantics, and the syscall surface for a static userland.
-- Everything beyond that — dynamic linking in the browser, threads,
-  networking, and the agent workloads themselves — is roadmap, with exit
-  criteria already written down.
+  WebAssembly and executes static Linux binaries; the static-`hello` and
+  BusyBox milestones are verified native and in the wasm host, with the
+  cross-browser matrix in progress.
+- **The Linux userland is deep.** Dynamic linking through the real musl and
+  glibc loaders; copy-on-write fork, vfork semantics, threads, futexes, and
+  real signal delivery over a deterministic cooperative scheduler; brokered
+  networking (denied by default) with guest TLS; filesystem snapshots that
+  persist across reload.
+- **A real coding agent completes real work.** The stock, statically linked
+  Codex CLI (0.149.1) runs an authenticated `exec` end to end: it discovers
+  the CA store, performs TLS handshakes, calls the OpenAI API, prints the
+  model's reply, and exits cleanly — 2.37 billion instructions, natively
+  under `run_guest`. OpenFox completes a scripted network agent task; a
+  stock Node.js v24 runs scripts.
+- What remains is roadmap with exit criteria written down: the interactive
+  TUI (PTY), model-driven repository edits, Git, browser-side delivery of
+  the large agent images, and Claude Code.
 
 Principles that govern all of it: correctness before speed (interpreter
 first, translation later); no silent compatibility lies (unsupported means a
@@ -442,14 +451,14 @@ Full details with exit criteria live in [ROADMAP](../ROADMAP.md):
 
 | Milestone | Outcome | Status |
 |---|---|---|
-| M0 | Native baseline locked; fixtures and traces versioned | Done (native reference in-repo) |
-| M1 | Static `hello` in a browser worker | Engine + wasm host verified; cross-browser gate in progress |
-| M2 | Static BusyBox: shell, files, persistence across reload | In development |
-| M3 | Dynamic Linux ELF via the real loader | Roadmap |
-| M4 | Threads, fork/exec, deterministic scheduling | Roadmap |
-| M5 | Event loops, brokered networking, HTTPS | Roadmap |
-| M6 | OpenFox completes a real agent task | Roadmap |
-| M7 | Codex and Claude Code: sustained interactive sessions | Roadmap |
+| M0 | Native baseline locked; fixtures and traces versioned | Partial (fixtures exist; trace format pending) |
+| M1 | Static `hello` in a browser worker | Done; cross-browser matrix in progress |
+| M2 | Static BusyBox: shell, files, persistence across reload | Done (native + wasm gates green) |
+| M3 | Dynamic Linux ELF via the real loader | Done (musl and glibc, native + wasm) |
+| M4 | Threads, fork/exec, deterministic scheduling | Done incl. determinism and adversarial gates |
+| M5 | Event loops, brokered networking, HTTPS | Largely done (guest TLS verified; recording/soak pending) |
+| M6 | OpenFox completes a real agent task | Done natively; browser image delivery pending |
+| M7 | Codex and Claude Code: sustained interactive sessions | ~50%: authenticated Codex `exec` completes end to end natively; PTY, repo edits, Git, and Claude Code pending |
 | M8 | Performance tiers, fuzzing, quotas, signed releases | Roadmap |
 
 Verification is the point: the repository builds, the native suites run, the
