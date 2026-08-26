@@ -331,6 +331,15 @@ pub mod x86 {
         ("extractps", extractps),
         ("roundps", roundps),
         ("roundpd", roundpd),
+        // MMX/SSE2 saturating packed arithmetic (also opaque in the spec).
+        ("paddsb", paddsb),
+        ("paddsw", paddsw),
+        ("paddusb", paddusb),
+        ("paddusw", paddusw),
+        ("psubsb", psubsb),
+        ("psubsw", psubsw),
+        ("psubusb", psubusb),
+        ("psubusw", psubusw),
         // AES-NI (SSE form). Node/V8 and OpenSSL issue these unconditionally.
         ("aesenc", aesenc),
         ("aesenclast", aesenclast),
@@ -1213,6 +1222,78 @@ pub mod x86 {
 
     fn roundpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         roundp_lanes(cpu, dst, args, true);
+    }
+
+    /// Saturating packed add/sub over `lane`-byte elements (1 or 2 bytes),
+    /// signed or unsigned. Handles both the 8-byte MMX and 16-byte XMM
+    /// forms via the destination size.
+    fn satop_lanes(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        lane: usize,
+        signed: bool,
+        sub: bool,
+    ) {
+        let size = (dst.size as usize).min(16);
+        let read = |cpu: &mut Cpu, v: Value| {
+            let mut bytes = [0u8; 16];
+            for (i, slot) in bytes.iter_mut().enumerate().take(size) {
+                *slot = cpu.read::<u8>(v.slice(i as u8, 1));
+            }
+            bytes
+        };
+        let (a, b) = (read(cpu, args[0]), read(cpu, args[1]));
+        let mut out = [0u8; 16];
+        for i in (0..size).step_by(lane) {
+            let (x, y) = if signed {
+                (lane_i64(&a, i, lane), lane_i64(&b, i, lane))
+            } else {
+                let mut w = [0u8; 8];
+                w[..lane].copy_from_slice(&a[i..i + lane]);
+                let x = i64::from_le_bytes(w);
+                w = [0u8; 8];
+                w[..lane].copy_from_slice(&b[i..i + lane]);
+                (x, i64::from_le_bytes(w))
+            };
+            let r = if sub { x - y } else { x + y };
+            let (lo, hi) = match (signed, lane) {
+                (true, 1) => (i8::MIN as i64, i8::MAX as i64),
+                (true, _) => (i16::MIN as i64, i16::MAX as i64),
+                (false, 1) => (0, u8::MAX as i64),
+                (false, _) => (0, u16::MAX as i64),
+            };
+            let r = r.clamp(lo, hi);
+            out[i..i + lane].copy_from_slice(&r.to_le_bytes()[..lane]);
+        }
+        for (off, byte) in out[..size].iter().enumerate() {
+            cpu.write_var::<u8>(dst.slice(off as u8, 1), *byte);
+        }
+    }
+
+    fn paddsb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 1, true, false);
+    }
+    fn paddsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 2, true, false);
+    }
+    fn paddusb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 1, false, false);
+    }
+    fn paddusw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 2, false, false);
+    }
+    fn psubsb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 1, true, true);
+    }
+    fn psubsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 2, true, true);
+    }
+    fn psubusb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 1, false, true);
+    }
+    fn psubusw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        satop_lanes(cpu, dst, args, 2, false, true);
     }
 
     fn psadbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {

@@ -815,6 +815,86 @@ fn main() {
                 store(_mm_castpd_si128(_mm_round_pd(_mm_castsi128_pd(b), 0x2)))
             },
         },
+        Case {
+            name: "paddsb xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xec, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_adds_epi8(a, b))
+            },
+        },
+        Case {
+            name: "paddsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xed, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_adds_epi16(a, b))
+            },
+        },
+        Case {
+            name: "paddusb xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xdc, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_adds_epu8(a, b))
+            },
+        },
+        Case {
+            name: "paddusw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xdd, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_adds_epu16(a, b))
+            },
+        },
+        Case {
+            name: "psubsb xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xe8, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_subs_epi8(a, b))
+            },
+        },
+        Case {
+            name: "psubsw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xe9, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_subs_epi16(a, b))
+            },
+        },
+        Case {
+            name: "psubusb xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xd8, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_subs_epu8(a, b))
+            },
+        },
+        Case {
+            name: "psubusw xmm0,xmm1",
+            code: &[0x66, 0x0f, 0xd9, 0xc1],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                let (a, b) = (load(a), load(b));
+                let _ = a;
+                store(_mm_subs_epu16(a, b))
+            },
+        },
     ];
 
     let mut probe = Probe::new();
