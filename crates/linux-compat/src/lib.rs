@@ -40,6 +40,16 @@ use vfs::{NodeKind, Vfs};
 /// hooks that cannot reach the environment.
 pub static CURRENT_PID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
 
+/// Allocates fresh address-space ids. Id 0 is the initial process; `fork` and
+/// `execve` take a new id (a new/replaced address space), while threads share
+/// their group's id. The block cache keys on it so a block lifted from one
+/// image is never reused at the same VA in another.
+pub(crate) static NEXT_ASID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn alloc_asid() -> u64 {
+    NEXT_ASID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
 // 16 MiB: the kernel's default RLIMIT_STACK is 8 MiB, but argv/envp/auxv

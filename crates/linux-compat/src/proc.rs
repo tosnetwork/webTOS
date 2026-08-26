@@ -68,6 +68,9 @@ pub struct Process {
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: zeroed and futex-woken
     /// when this task exits (pthread_join relies on it).
     pub clear_child_tid: u64,
+    /// Address-space id (see [`crate::alloc_asid`]). Threads share it; fork
+    /// and execve take a fresh one. Keys the block cache per address space.
+    pub asid: u64,
     /// Set on a vfork child: fired (once) when the child replaces its image
     /// via `execve` or exits, releasing the parent parked in
     /// [`ParkState::VforkDone`]. Never inherited across fork/clone.
@@ -95,6 +98,7 @@ impl Process {
             argv: Vec::new(),
             envp: Vec::new(),
             clear_child_tid: 0,
+            asid: 0,
             vfork_done: None,
         }
     }
@@ -121,6 +125,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            asid: crate::alloc_asid(),
             vfork_done: None,
         }
     }
@@ -148,6 +153,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            asid: self.asid,
             vfork_done: None,
         }
     }

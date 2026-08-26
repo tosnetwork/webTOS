@@ -660,3 +660,75 @@ int main(void) {
         "failed exec was not reported to the parent; output: {output:?}"
     );
 }
+
+/// Smoke test for repeated spawn+exec with parent continuity: the parent
+/// recomputes a recognizable value after each child execs and exits, so a
+/// child's image must not disturb the parent's execution. Related to the
+/// per-address-space block-cache keying (blocks are keyed by address-space
+/// id, not virtual address alone, so an exec'd child's blocks never run in
+/// the parent at the same VA); the decisive end-to-end check for that fix is
+/// a real coding agent completing an exec-heavy session cleanly.
+#[test]
+fn exec_child_does_not_pollute_parent_block_cache() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let source = r#"
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/wait.h>
+extern char **environ;
+
+__attribute__((noinline)) static unsigned mix(unsigned x) {
+    for (int i = 0; i < 64; i++) x = x * 1664525u + 1013904223u;
+    return x;
+}
+
+int main(void) {
+    unsigned want = mix(12345u);
+    for (int i = 0; i < 8; i++) {
+        pid_t pid;
+        char *argv[] = { "/bin/busybox", "true", 0 };
+        if (posix_spawn(&pid, "/bin/busybox", 0, 0, argv, environ) != 0) {
+            printf("spawn failed\n");
+            return 1;
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid) {
+            printf("wait failed\n");
+            return 2;
+        }
+        unsigned got = mix(12345u);
+        if (got != want) {
+            printf("cache polluted at iter %d: %u != %u\n", i, got, want);
+            return 3;
+        }
+    }
+    printf("parent-cache-stable\n");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("cachepollute", source, &[]) else {
+        return;
+    };
+    machine
+        .add_file(b"/bin/cachepollute", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"cachepollute".to_vec()],
+        vec![b"PATH=/bin:/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine.load(b"/bin/cachepollute").expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 8_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "parent did not finish cleanly; output: {output:?}"
+    );
+    assert!(
+        output.contains("parent-cache-stable"),
+        "exec'd child polluted the parent's block cache; output: {output:?}"
+    );
+}

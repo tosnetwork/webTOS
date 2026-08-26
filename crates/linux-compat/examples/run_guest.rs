@@ -108,6 +108,31 @@ fn main() {
         );
     }
 
+    // WATCH_GUEST_READ=hexaddr: MMU read hook on 8 bytes at that guest VA.
+    // Reports the value the load returns and the block executing, so a read
+    // that returns something other than the byte in memory is visible.
+    if let Ok(spec) = std::env::var("WATCH_GUEST_READ") {
+        let target = u64::from_str_radix(spec.trim_start_matches("0x"), 16).expect("read addr");
+        struct ReadWatch;
+        impl icicle_mem::ReadAfterHook for ReadWatch {
+            fn read(&mut self, _mem: &mut icicle_mem::Mmu, addr: u64, value: &[u8]) {
+                let block =
+                    x64_engine::vm::CURRENT_BLOCK_START.load(std::sync::atomic::Ordering::Relaxed);
+                let ic = x64_engine::vm::CURRENT_ICOUNT.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "[guest-read] ic={ic} read {addr:#x} len={} val={:02x?} in-block={block:#x}",
+                    value.len(),
+                    &value[..value.len().min(16)]
+                );
+            }
+        }
+        machine
+            .vm_mut()
+            .cpu
+            .mem
+            .add_read_after_hook(target, target + 8, Box::new(ReadWatch));
+    }
+
     // GUEST_BREAK="hexaddr,hexaddr": single-shot breakpoints. Each hit dumps
     // the GPRs (and FAULT_PEEK targets) and execution continues.
     if let Ok(spec) = std::env::var("GUEST_BREAK") {

@@ -15,6 +15,12 @@ use icicle_cpu::{
 /// A diagnostic mirror for memory-write hooks, which cannot see the CPU.
 pub static CURRENT_BLOCK_START: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Current guest address-space id. The OS layer bumps it whenever the memory
+/// behind the guest's virtual addresses changes wholesale (execve, or a
+/// switch to a different address space), so the VA-keyed block cache never
+/// reuses a block lifted from a different image at the same VA.
+pub static CURRENT_ASID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Instruction count mirror, updated alongside [`CURRENT_BLOCK_START`].
 pub static CURRENT_ICOUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -115,7 +121,12 @@ impl InterpVm {
 
     fn get_block_key(&self, vaddr: u64) -> BlockKey {
         let isa_mode = self.cpu.isa_mode() as u64;
-        BlockKey { vaddr, isa_mode }
+        let asid = CURRENT_ASID.load(std::sync::atomic::Ordering::Relaxed);
+        BlockKey {
+            vaddr,
+            isa_mode,
+            asid,
+        }
     }
 
     fn handle_exception(&mut self) -> VmExit {

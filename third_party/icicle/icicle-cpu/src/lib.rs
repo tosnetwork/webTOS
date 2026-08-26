@@ -33,6 +33,10 @@ pub use lifter::DecodeError;
 pub struct BlockKey {
     pub vaddr: u64,
     pub isa_mode: u64,
+    /// Address-space id: distinguishes blocks lifted from different process
+    /// images that occupy the same virtual address, so a cached block is
+    /// never reused across an execve or a cross-address-space switch.
+    pub asid: u64,
 }
 
 /// Keeps track of all the code in the program that the emulator has discovered.
