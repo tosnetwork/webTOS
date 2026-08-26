@@ -103,6 +103,46 @@ fn main() {
         let _ = vm.cpu.mem.read_bytes(rip, &mut buf, icicle_mem::perm::NONE);
         let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
         eprintln!("[runner] fault pid={pid} exe={exe} rip={rip:#x} rsp={rsp:#x} bytes: {hex}");
+        eprintln!(
+            "[runner] syscall trail (pid:nr@icount): {}",
+            machine.syscall_trail().join(" ")
+        );
+        // FAULT_STACK=N prints N qwords from the faulting RSP, flagging
+        // values that look like return addresses into the program image.
+        if let Ok(n) = std::env::var("FAULT_STACK") {
+            let n: u64 = n.parse().unwrap_or(64);
+            let vm = machine.vm_mut();
+            for i in 0..n {
+                let addr = rsp + i * 8;
+                let mut buf = [0u8; 8];
+                if vm
+                    .cpu
+                    .mem
+                    .read_bytes(addr, &mut buf, icicle_mem::perm::NONE)
+                    .is_err()
+                {
+                    break;
+                }
+                let v = u64::from_le_bytes(buf);
+                if (0x1000..0x1000_0000).contains(&v) {
+                    eprintln!("[runner] stack[{i:>3}] {addr:#x}: {v:#x} <- code?");
+                }
+            }
+        }
+        // FAULT_PEEK="addr,addr" prints 16 bytes at each hex address.
+        if let Ok(spec) = std::env::var("FAULT_PEEK") {
+            let vm = machine.vm_mut();
+            for part in spec.split(',').filter(|p| !p.is_empty()) {
+                let addr = u64::from_str_radix(part.trim_start_matches("0x"), 16).unwrap_or(0);
+                let mut buf = [0u8; 16];
+                let _ = vm
+                    .cpu
+                    .mem
+                    .read_bytes(addr, &mut buf, icicle_mem::perm::NONE);
+                let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
+                eprintln!("[runner] peek {addr:#x}: {hex}");
+            }
+        }
     }
     eprintln!("[runner] exit={exit:?} icount={}", machine.icount());
 }

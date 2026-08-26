@@ -20,6 +20,7 @@ pub const SYS_LSEEK: u64 = 8;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_MPROTECT: u64 = 10;
 pub const SYS_MUNMAP: u64 = 11;
+pub const SYS_MREMAP: u64 = 25;
 pub const SYS_BRK: u64 = 12;
 pub const SYS_MADVISE: u64 = 28;
 pub const SYS_RT_SIGACTION: u64 = 13;

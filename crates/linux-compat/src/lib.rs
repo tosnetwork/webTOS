@@ -43,7 +43,10 @@ const STACK_TOP: u64 = 0x7fff_ff00_0000;
 // faulted exactly 8 bytes below an 8 MiB stack. Pages are demand-allocated,
 // so the extra headroom costs address space only.
 const STACK_SIZE: u64 = 0x100_0000; // 16 MiB
-pub(crate) const MMAP_BASE: u64 = 0x6000_0000_0000;
+                                    // 64 GiB: above any program image and brk region, but low enough for
+                                    // allocators whose segment maps cover a bounded address range (mimalloc
+                                    // rejects OS memory beyond its map and aborts on the resulting NULL).
+pub(crate) const MMAP_BASE: u64 = 0x10_0000_0000;
 /// A pipe write blocks once this much data is buffered.
 pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
 
@@ -662,6 +665,15 @@ impl Machine {
             String::from_utf8_lossy(&env.proc.exe_path).into_owned(),
             env.proc.pid,
         )
+    }
+
+    /// The recent-syscall diagnostic trail as `pid:nr@icount` strings.
+    pub fn syscall_trail(&mut self) -> Vec<String> {
+        self.env()
+            .syscall_trail
+            .iter()
+            .map(|(pid, nr, ic)| format!("{pid}:{nr}@{ic}"))
+            .collect()
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {

@@ -288,12 +288,31 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_EPOLL_CREATE | abi::SYS_EPOLL_CREATE1 => sys_epoll_create(env, a[1]),
         abi::SYS_EPOLL_CTL => sys_epoll_ctl(env, cpu, a),
 
-        abi::SYS_MMAP => sys_mmap(env, cpu, a),
-        abi::SYS_MUNMAP => match cpu.mem.unmap_memory_len(a[0], a[1]) {
-            true => Ok(0),
-            false => Err(abi::EINVAL),
-        },
+        abi::SYS_MMAP => {
+            let r = sys_mmap(env, cpu, a);
+            if std::env::var_os("MMAP_TRACE").is_some() {
+                eprintln!(
+                    "[mmap] pid={} addr={:#x} len={:#x} prot={:#x} flags={:#x} -> {:x?}",
+                    env.proc.pid, a[0], a[1], a[2], a[3], r
+                );
+            }
+            r
+        }
+        abi::SYS_MUNMAP => {
+            let ok = cpu.mem.unmap_memory_len(a[0], a[1]);
+            if std::env::var_os("MMAP_TRACE").is_some() {
+                eprintln!(
+                    "[munmap] pid={} addr={:#x} len={:#x} -> {ok}",
+                    env.proc.pid, a[0], a[1]
+                );
+            }
+            match ok {
+                true => Ok(0),
+                false => Err(abi::EINVAL),
+            }
+        }
         abi::SYS_MPROTECT => sys_mprotect(cpu, a[0], a[1], a[2]),
+        abi::SYS_MREMAP => sys_mremap(env, cpu, a),
         // Advisory only; taking no action is a valid implementation.
         abi::SYS_MADVISE => Ok(0),
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
@@ -1377,11 +1396,14 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // Find an actual free hole at or above the allocation hint; a plain
         // bump allocator collides with existing mappings once the guest
         // reserves large regions (V8's 256 MiB sandbox does exactly this).
+        // Hand out 64 KiB-aligned addresses: allocators that want aligned
+        // segments (mimalloc probes for 16 KiB alignment) otherwise retry
+        // `mmap` a few times and give up, and address space is free here.
         let hint = env.proc.mmap_next;
         match cpu.mem.find_free_memory(icicle_cpu::mem::AllocLayout {
             addr: Some(hint),
             size: len,
-            align: PAGE_SIZE,
+            align: 0x1_0000,
         }) {
             Ok(target) => {
                 env.proc.mmap_next = target + len + PAGE_SIZE;
@@ -1431,6 +1453,65 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         tracing::warn!("mmap: update_perm failed for {len:#x} at {target:#x}: {e:?}");
         return Err(abi::ENOMEM);
     }
+    Ok(target)
+}
+
+/// `mremap`: resizes a mapping. Shrinking truncates in place; growing
+/// allocates a fresh region, copies the old contents across, and unmaps the
+/// old one (requires MREMAP_MAYMOVE, which allocators pass). Without this,
+/// a large realloc returns NULL and Rust guests abort in
+/// handle_alloc_error.
+fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+    let [old_addr, old_size, new_size, flags, _new_addr, _] = a;
+    if old_addr & (PAGE_SIZE - 1) != 0 || new_size == 0 || old_size == 0 {
+        return Err(abi::EINVAL);
+    }
+    if flags & MREMAP_FIXED != 0 {
+        tracing::warn!("mremap: MREMAP_FIXED is not supported");
+        return Err(abi::EINVAL);
+    }
+    let old_size = align_up(old_size, PAGE_SIZE);
+    let new_size = align_up(new_size, PAGE_SIZE);
+    if new_size <= old_size {
+        if new_size < old_size {
+            cpu.mem
+                .unmap_memory_len(old_addr + new_size, old_size - new_size);
+        }
+        return Ok(old_addr);
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        // In-place growth is never attempted; the caller must allow a move.
+        return Err(abi::ENOMEM);
+    }
+    let hint = env.proc.mmap_next;
+    let target = cpu
+        .mem
+        .find_free_memory(icicle_cpu::mem::AllocLayout {
+            addr: Some(hint),
+            size: new_size,
+            align: PAGE_SIZE,
+        })
+        .map_err(|_| abi::ENOMEM)?;
+    let ok = cpu.mem.map_memory_len(
+        target,
+        new_size,
+        icicle_cpu::mem::Mapping {
+            perm: perm::READ | perm::WRITE | perm::INIT,
+            value: 0,
+        },
+    );
+    if !ok {
+        return Err(abi::ENOMEM);
+    }
+    let mut buf = vec![0u8; old_size as usize];
+    cpu.mem
+        .read_bytes(old_addr, &mut buf, perm::NONE)
+        .map_err(|_| abi::EFAULT)?;
+    write_mem(cpu, target, &buf)?;
+    cpu.mem.unmap_memory_len(old_addr, old_size);
+    env.proc.mmap_next = target + new_size + PAGE_SIZE;
     Ok(target)
 }
 
