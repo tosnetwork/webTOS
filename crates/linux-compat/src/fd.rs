@@ -57,6 +57,10 @@ pub struct Pty {
     pub slave_ever_opened: bool,
     /// Monotone change counter; edge-triggered epoll re-arms on it.
     pub activity: u64,
+    /// Foreground process group: set by the controlling process (TIOCSCTTY)
+    /// or TIOCSPGRP, and the target for terminal-generated signals such as
+    /// SIGWINCH on a window-size change.
+    pub fg_pgrp: u64,
 }
 
 impl Pty {
@@ -78,6 +82,7 @@ impl Pty {
             slaves: 0,
             slave_ever_opened: false,
             activity: 0,
+            fg_pgrp: 0,
         }
     }
 

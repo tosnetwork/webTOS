@@ -138,3 +138,94 @@ int main(void) {
     assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "forkpty: {out:?}");
     assert!(out.contains("child-on-tty"), "forkpty output: {out:?}");
 }
+
+/// A TUI on a pty must be told about window-size changes: the parent resizes
+/// the master with TIOCSWINSZ, the kernel raises SIGWINCH on the slave's
+/// foreground group, and the child re-reads the new size — then keeps taking
+/// input. This is the terminal-resize behavior an interactive agent needs.
+#[test]
+fn pty_resize_delivers_sigwinch_to_the_foreground_group() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <pty.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+
+static volatile sig_atomic_t got_winch = 0;
+static void on_winch(int s) { (void)s; got_winch = 1; }
+
+static int child_main(void) {
+    struct termios t;
+    tcgetattr(0, &t);
+    cfmakeraw(&t);
+    tcsetattr(0, TCSANOW, &t);
+    signal(SIGWINCH, on_winch);
+    struct winsize ws;
+    ioctl(0, TIOCGWINSZ, &ws);
+    dprintf(1, "START %d %d\n", ws.ws_row, ws.ws_col);
+    while (!got_winch) {
+        char b;
+        int n = read(0, &b, 1);
+        if (n == 1) dprintf(1, "KEY %d\n", (int)(unsigned char)b);
+        if (got_winch) break;
+    }
+    ioctl(0, TIOCGWINSZ, &ws);
+    dprintf(1, "WINCH %d %d\n", ws.ws_row, ws.ws_col);
+    char b;
+    if (read(0, &b, 1) == 1) dprintf(1, "KEY %d\n", (int)(unsigned char)b);
+    return 0;
+}
+
+static int read_line(int fd, char *buf, int max) {
+    int n = 0;
+    while (n < max - 1) {
+        char c; int r = read(fd, &c, 1);
+        if (r <= 0) break;
+        buf[n++] = c;
+        if (c == '\n') break;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+int main(void) {
+    int m;
+    struct winsize init = { 24, 80, 0, 0 };
+    pid_t p = forkpty(&m, NULL, NULL, &init);
+    if (p < 0) { perror("forkpty"); return 1; }
+    if (p == 0) { _exit(child_main()); }
+    char line[128];
+    read_line(m, line, sizeof line);
+    printf("%s", line);
+    struct winsize ws = { 40, 120, 0, 0 };
+    ioctl(m, TIOCSWINSZ, &ws);
+    char key = 'A';
+    if (write(m, &key, 1) != 1) perror("write");
+    for (int i = 0; i < 8; i++) {
+        if (read_line(m, line, sizeof line) <= 0) break;
+        printf("%s", line);
+        if (strncmp(line, "WINCH", 5) == 0) {
+            key = 'Z';
+            if (write(m, &key, 1) != 1) perror("write");
+        }
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("ptyresize", source, &["-lutil"]) else {
+        return;
+    };
+    let (exit, out) = run(image);
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "resize: {out:?}");
+    assert!(
+        out.contains("START 24 80") && out.contains("WINCH 40 120") && out.contains("KEY 90"),
+        "resize sequence: {out:?}"
+    );
+}

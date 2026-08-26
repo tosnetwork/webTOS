@@ -659,6 +659,11 @@ fn sys_openat(
                         pty.slaves += 1;
                         pty.slave_ever_opened = true;
                         pty.activity += 1;
+                        // Default the foreground group to the opener until a
+                        // controlling process claims it (TIOCSCTTY).
+                        if pty.fg_pgrp == 0 {
+                            pty.fg_pgrp = env.proc.pgid;
+                        }
                     }
                     let entry = FdEntry {
                         desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
@@ -1279,14 +1284,37 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             }
             abi::TIOCSWINSZ => {
                 let bytes = read_mem(cpu, arg, 8)?;
-                let mut pty = pty.borrow_mut();
-                for (i, w) in pty.winsize.iter_mut().enumerate() {
-                    *w = u16::from_le_bytes(bytes[2 * i..2 * i + 2].try_into().expect("size"));
-                }
-                pty.activity += 1;
+                let pgrp = {
+                    let mut pty = pty.borrow_mut();
+                    for (i, w) in pty.winsize.iter_mut().enumerate() {
+                        *w = u16::from_le_bytes(bytes[2 * i..2 * i + 2].try_into().expect("size"));
+                    }
+                    pty.activity += 1;
+                    pty.fg_pgrp
+                };
+                // A window-size change notifies the foreground group so a TUI
+                // can redraw. SIGWINCH == 28.
+                deliver_signal_to_pgrp(env, pgrp, 28);
                 return Ok(0);
             }
-            abi::TIOCSPGRP | abi::TIOCGPGRP | abi::TIOCSCTTY | abi::TIOCNOTTY => return Ok(0),
+            abi::TIOCSCTTY => {
+                // The caller claims this pty as its controlling terminal and
+                // becomes the foreground group.
+                pty.borrow_mut().fg_pgrp = env.proc.pgid;
+                return Ok(0);
+            }
+            abi::TIOCSPGRP => {
+                let bytes = read_mem(cpu, arg, 4)?;
+                pty.borrow_mut().fg_pgrp =
+                    u32::from_le_bytes(bytes.try_into().expect("size")) as u64;
+                return Ok(0);
+            }
+            abi::TIOCGPGRP => {
+                let pgrp = pty.borrow().fg_pgrp as u32;
+                write_mem(cpu, arg, &pgrp.to_le_bytes())?;
+                return Ok(0);
+            }
+            abi::TIOCNOTTY => return Ok(0),
             _ => {
                 tracing::debug!("pty ioctl: unsupported request {request:#x}");
                 return Err(abi::ENOTTY);
@@ -2210,6 +2238,31 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// disposition table is process-wide, so any such thread can run the handler.
 /// Does nothing when the parent installed no SIGCHLD handler (the default
 /// disposition for SIGCHLD is to ignore it) or when every thread blocks it.
+/// Marks `signal` pending on every task in process group `pgrp` that has a
+/// user handler for it and does not block it. Used for terminal-generated
+/// signals (e.g. SIGWINCH to the foreground group on a resize). Does nothing
+/// when `pgrp` is 0 or no member handles the signal.
+fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64) {
+    if pgrp == 0 {
+        return;
+    }
+    let bit = 1_u64 << (signal - 1);
+    let has_handler =
+        |acts: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, SigAction>>>| {
+            acts.borrow()
+                .get(&signal)
+                .is_some_and(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")) > 1)
+        };
+    if env.proc.pgid == pgrp && env.proc.sigmask & bit == 0 && has_handler(&env.proc.sigactions) {
+        env.proc.pending_signals |= bit;
+    }
+    for t in &mut env.sched.parked {
+        if t.proc.pgid == pgrp && t.proc.sigmask & bit == 0 && has_handler(&t.proc.sigactions) {
+            t.proc.pending_signals |= bit;
+        }
+    }
+}
+
 fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
     const SIGCHLD: u64 = 17;
     const SIGCHLD_BIT: u64 = 1 << (SIGCHLD - 1);
