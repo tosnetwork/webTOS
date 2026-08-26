@@ -6,18 +6,24 @@
 // BusyBox applets, "Save FS", a browser reload, and a read-back of the
 // restored filesystem. Phase B drives web/worker.js directly on a blank page
 // to cover the static and dynamically linked hello binaries. Phase C drives
-// the interactive terminal — a real shell on a pty, a full-screen editor, and
-// a window resize. Phase D reruns the one-shot demo in a storage-less profile
-// to prove the host degrades cleanly.
+// the interactive terminal — a real shell on a pty, a full-screen editor, a
+// window resize, and a real HTTP fetch through the network gateway. Phase D
+// reruns the one-shot demo in a storage-less profile to prove the host
+// degrades cleanly.
+//
+// The run starts its own gateway, allowing exactly one destination: its own
+// static server. That is what makes both network checks meaningful — one
+// destination reachable, everything else refused.
 // Finally the run compares per-command instruction counts across engines:
 // the same input must retire the same instruction stream on every engine.
 //
 // Phases A and B need an on-disk profile: WebKit denies the origin-private
 // filesystem outright to a browsing context that has no persistent storage.
 //
-// Setup:  cd web && npm install && npx playwright install
+// Setup:  npm install && npx playwright install
 // Usage:  node web/test_browsers.mjs [--engines=chromium,firefox,webkit] [--headed]
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, extname } from "node:path";
@@ -41,7 +47,7 @@ let playwright;
 try {
   playwright = await import("playwright");
 } catch {
-  console.error("playwright is not installed. Run:  cd web && npm install && npx playwright install");
+  console.error("playwright is not installed. Run:  npm install && npx playwright install");
   process.exit(2);
 }
 
@@ -57,6 +63,8 @@ const MIME = {
 // A blank same-origin document: phase B needs a page whose only worker is the
 // one the test creates, so the demo page's own worker cannot race it on OPFS.
 const BLANK = "<!doctype html><meta charset=utf-8><title>webTOS test</title>";
+/// Served at /__net_probe: the body a guest must fetch over a real socket.
+const NET_PROBE = "net-probe-ok";
 
 async function startServer() {
   const server = createServer(async (req, res) => {
@@ -64,6 +72,11 @@ async function startServer() {
     if (path === "/__blank.html") {
       res.writeHead(200, { "content-type": MIME[".html"] });
       res.end(BLANK);
+      return;
+    }
+    if (path === "/__net_probe") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(NET_PROBE);
       return;
     }
     // normalize() collapses ".." before the join, so the served tree is the
@@ -82,6 +95,35 @@ async function startServer() {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
+}
+
+/// Starts the relay with a single rule: the harness's own static server. It
+/// prints the port it bound, which is how `--port 0` becomes usable here.
+async function startGateway(allow) {
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL("../tools/webtos_gateway.mjs", import.meta.url)), "--port", "0", "--allow", allow],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const refusals = [];
+  let buffered = "";
+  const port = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("gateway did not start")), 20_000);
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      for (const line of buffered.split("\n")) {
+        if (line.includes("REFUSED")) refusals.push(line.trim());
+        const match = /gateway on ws:\/\/127\.0\.0\.1:(\d+)/.exec(line);
+        if (match) {
+          clearTimeout(timer);
+          resolve(Number(match[1]));
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => reject(new Error(`gateway: ${chunk}`)));
+    child.on("exit", (code) => reject(new Error(`gateway exited with ${code}`)));
+  });
+  return { child, port, url: `ws://127.0.0.1:${port}`, refusals };
 }
 
 // ---------------------------------------------------------------- page side
@@ -154,22 +196,25 @@ const readScreen = (page) =>
 const terminalSize = (page) =>
   page.evaluate(() => [window.webtos.term.cols, window.webtos.term.rows]);
 
-/// Types a command line and waits for `expect` to appear on the screen. The
-/// guest parks between individual keystrokes, so screen content — not the
-/// run state — is what says a command finished.
+/// Types a command line and waits for `expect` — a regular expression source
+/// — to match a rendered line. The guest parks between individual keystrokes,
+/// so screen content, not the run state, is what says a command finished.
+/// The pattern must not match the echoed command itself: the line discipline
+/// prints what was typed before the guest has run any of it.
 async function typeLine(page, line, expect) {
   await page.keyboard.type(line);
   await page.keyboard.press("Enter");
   return waitForScreen(page, expect);
 }
 
-/// Waits until the rendered screen contains `expect`, then returns it.
+/// Waits until a rendered line matches `expect`, then returns the screen.
 async function waitForScreen(page, expect) {
   await page.waitForFunction(
-    (needle) => {
+    (pattern) => {
+      const regex = new RegExp(pattern);
       const buffer = window.webtos.term.buffer.active;
       for (let i = 0; i < buffer.length; i += 1) {
-        if ((buffer.getLine(i)?.translateToString(true) ?? "").includes(needle)) return true;
+        if (regex.test(buffer.getLine(i)?.translateToString(true) ?? "")) return true;
       }
       return false;
     },
@@ -179,20 +224,23 @@ async function waitForScreen(page, expect) {
   return readScreen(page);
 }
 
-/// A full-screen program fills the window height with `~` filler, so the
-/// filler count tracks the size the guest believes the terminal to be.
-const countFiller = (page) =>
+/// Where the editor's status line sits, and how tall the terminal is. A
+/// full-screen program paints its status line on the last row, so the pair
+/// says whether the guest is painting at the size the window actually has.
+/// Counting `~` filler instead would depend on the engine's cell size: a
+/// short enough window has no filler rows at all.
+const statusRow = (page) =>
   page.evaluate(() => {
     const buffer = window.webtos.term.buffer.active;
-    let filler = 0;
+    let row = -1;
     for (let i = 0; i < buffer.length; i += 1) {
-      if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
+      if ((buffer.getLine(i)?.translateToString(true) ?? "").includes("/root/notes.txt")) row = i;
     }
-    return filler;
+    return { row, rows: window.webtos.term.rows };
   });
 
-async function runTerminalPhase(page, origin, name, record) {
-  await page.goto(`${origin}/web/terminal.html`);
+async function runTerminalPhase(page, origin, name, record, gateway) {
+  await page.goto(`${origin}/web/terminal.html?gateway=${encodeURIComponent(gateway.url)}`);
   const vendored = await page.evaluate(() => typeof window.Terminal === "function");
   if (!vendored) {
     record("terminal: emulator vendored", false, "run tools/fetch_xterm.sh");
@@ -211,74 +259,113 @@ async function runTerminalPhase(page, origin, name, record) {
     "typed line echoed by the line discipline, output printed by the guest",
   );
 
-  const piped = await typeLine(page, "ls /bin | head -3", "busybox");
+  const piped = await typeLine(page, "ls /bin | head -3", "^busybox");
   record(
     "terminal: pipeline across processes",
     piped.includes("busybox") && piped.includes("cat"),
     "fork + execve + pipe, from a shell on a pty",
   );
 
-  await typeLine(page, "vi /root/notes.txt", "This file lives in the guest");
+  // A full-screen program is launched in a deliberately short window and the
+  // window is then grown. Growing is the honest test: xterm adds blank rows
+  // at the bottom, and only a guest that was told the window changed fills
+  // them in. Shrinking proves nothing — rows just disappear either way.
+  const viewport = page.viewportSize();
+  const cellHeight = await page.evaluate(
+    () => document.getElementById("screen").clientHeight / window.webtos.term.rows,
+  );
+  const shortHeight = Math.round(viewport.height - Math.max(6, rows * 0.4) * cellHeight);
+  await page.setViewportSize({ width: viewport.width, height: shortHeight });
   await page
-    .waitForFunction(
-      () => {
-        const buffer = window.webtos.term.buffer.active;
-        let filler = 0;
-        for (let i = 0; i < buffer.length; i += 1) {
-          if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
-        }
-        return filler > 2;
-      },
-      undefined,
-      { timeout: EXEC_TIMEOUT },
-    )
+    .waitForFunction((before) => window.webtos.term.rows < before, rows, { timeout: 60_000 })
     .catch(() => {});
-  const paintedFiller = await countFiller(page);
+
+  await typeLine(page, "vi /root/notes.txt", "This file lives in the guest");
+  const bottomIsStatus = () =>
+    page
+      .waitForFunction(
+        () => {
+          const buffer = window.webtos.term.buffer.active;
+          const last = buffer.getLine(window.webtos.term.rows - 1);
+          return (last?.translateToString(true) ?? "").includes("/root/notes.txt");
+        },
+        undefined,
+        { timeout: 60_000 },
+      )
+      .catch(() => {});
+
+  await bottomIsStatus();
+  const painted = await statusRow(page);
   record(
     "terminal: full-screen editor paints",
-    paintedFiller > 2,
-    `${paintedFiller} filler rows at ${rows} rows`,
+    painted.row === painted.rows - 1 && painted.rows > 2,
+    `status line on row ${painted.row + 1} of ${painted.rows}`,
   );
 
-  // Shrink the window with nothing typed: SIGWINCH must reach the guest and
-  // it must repaint smaller on its own.
-  const viewport = page.viewportSize();
-  await page.setViewportSize({
-    width: Math.max(360, Math.round(viewport.width * 0.6)),
-    height: Math.max(240, Math.round(viewport.height * 0.5)),
-  });
-  await page.waitForFunction((before) => window.webtos.term.rows < before, rows, {
-    timeout: EXEC_TIMEOUT,
-  });
-  const [, smallRows] = await terminalSize(page);
+  // Nothing is typed. The window grows; the guest must notice and repaint.
+  await page.setViewportSize(viewport);
   await page
-    .waitForFunction(
-      (before) => {
-        const buffer = window.webtos.term.buffer.active;
-        let filler = 0;
-        for (let i = 0; i < buffer.length; i += 1) {
-          if (buffer.getLine(i)?.translateToString(true).trim() === "~") filler += 1;
-        }
-        return filler > 0 && filler < before;
-      },
-      paintedFiller,
-      { timeout: EXEC_TIMEOUT },
-    )
+    .waitForFunction((before) => window.webtos.term.rows > before, painted.rows, {
+      timeout: 60_000,
+    })
     .catch(() => {});
-  const repainted = await countFiller(page);
+  await bottomIsStatus();
+  const repainted = await statusRow(page);
   record(
     "terminal: SIGWINCH repaints without a keystroke",
-    repainted > 0 && repainted < paintedFiller,
-    `${paintedFiller} filler rows at ${rows} rows -> ${repainted} at ${smallRows}`,
+    repainted.rows > painted.rows && repainted.row === repainted.rows - 1,
+    `status line followed the window: row ${painted.row + 1}/${painted.rows} -> ${repainted.row + 1}/${repainted.rows}`,
   );
 
   await page.keyboard.type(":q!");
   await page.keyboard.press("Enter");
-  const back = await typeLine(page, "echo back-in-the-shell", "back-in-the-shell");
+  // Leaving the alternate screen is how the editor says it is gone; typing at
+  // the shell before that races the editor for the same keystrokes.
+  const left = await page
+    .waitForFunction(() => window.webtos.term.buffer.active.type === "normal", undefined, {
+      timeout: 60_000,
+    })
+    .then(() => true)
+    .catch(() => false);
+  const back = left ? await typeLine(page, "echo back-in-the-shell", "^back-in-the-shell") : "";
   record(
     "terminal: the editor quits back to the shell",
     back.includes("back-in-the-shell"),
-    "prompt restored and commands run again",
+    left ? "prompt restored and commands run again" : "editor never left the alternate screen",
+  );
+
+  // The guest opens a real TCP connection: BusyBox wget, its own HTTP, over
+  // a socket the relay holds. Only the harness's own server is allowed.
+  // The status goes on a line of its own, because wget's body has no
+  // trailing newline. Each command gets its own marker so the wait cannot
+  // match a status still on screen from an earlier one, and the pattern is
+  // anchored so it cannot match the echoed command, which carries `$s`.
+  const port = new URL(origin).port;
+  const fetched = await typeLine(
+    page,
+    `wget -q -O - ${origin}/__net_probe; s=$?; echo; echo fetched$s`,
+    "^fetched[0-9]+$",
+  );
+  record(
+    "network: the guest fetches over a relayed socket",
+    fetched.includes("net-probe-ok") && /^fetched0$/m.test(fetched),
+    `wget reached 127.0.0.1:${port} through the gateway`,
+  );
+
+  // Everything else is refused. The gateway's own port is a live listener
+  // the policy does not name, so this fails on policy, not on reachability.
+  const refused = await typeLine(
+    page,
+    `wget -T 3 -q -O - http://127.0.0.1:${gateway.port}/__net_probe; s=$?; echo; echo refused$s`,
+    "^refused[0-9]+$",
+  );
+  // Only what this command produced: the successful fetch above is still on
+  // screen, and its body would otherwise look like a leak.
+  const tail = refused.slice(refused.lastIndexOf("wget -T 3"));
+  record(
+    "network: a destination outside the allowlist is refused",
+    /^refused[1-9][0-9]*$/m.test(tail) && !tail.includes("net-probe-ok"),
+    `gateway refused 127.0.0.1:${gateway.port}`,
   );
 }
 
@@ -292,7 +379,7 @@ const icountOf = (status) => {
   return match ? Number(match[1].replace(/,/g, "")) : null;
 };
 
-async function runEngine(name, origin) {
+async function runEngine(name, origin, gateway) {
   const checks = [];
   const fingerprint = {};
   const record = (label, ok, detail = "") => {
@@ -311,6 +398,11 @@ async function runEngine(name, origin) {
 
   const profile = await mkdtemp(join(tmpdir(), `webtos-${name}-`));
   const context = await playwright[name].launchPersistentContext(profile, { headless: !headed });
+  // Every navigation here boots a machine: fetching the module, compiling the
+  // SLEIGH specification, and restoring a filesystem. Firefox takes ten
+  // seconds over that, so the default 30 s navigation timeout is too tight.
+  context.setDefaultTimeout(EXEC_TIMEOUT);
+  context.setDefaultNavigationTimeout(EXEC_TIMEOUT);
   const page = watch(context.pages()[0] ?? (await context.newPage()));
 
   try {
@@ -353,6 +445,15 @@ async function runEngine(name, origin) {
 
     const write = await runCommand("sh -c 'echo survived-the-reload > /home/state.txt'");
     record("write state before reload", write.status.startsWith("exit 0"), write.status);
+
+    // This page never asks for a network, so the guest must not have one —
+    // even though the server it names is listening and the gateway allows it.
+    const offline = await runCommand(`wget -T 2 -q -O - ${origin}/__net_probe`);
+    record(
+      "no network unless the host grants one",
+      !offline.output.includes("net-probe-ok") && !offline.status.startsWith("exit 0"),
+      offline.status,
+    );
 
     // ---- Phase A2: persist to OPFS, reload the tab, read the state back.
     await page.click("#save");
@@ -411,8 +512,8 @@ async function runEngine(name, origin) {
       record(run.label, ok, ok ? `${run.icount.toLocaleString()} instructions` : `status=${run.status} exit=${run.exitCode} ${run.error} ${JSON.stringify(run.output.slice(0, 80))}`);
     }
 
-    // ---- Phase C: the interactive terminal.
-    await runTerminalPhase(page, origin, name, record);
+    // ---- Phase C: the interactive terminal, including its network.
+    await runTerminalPhase(page, origin, name, record, gateway);
 
   } catch (e) {
     record("engine run completed", false, String(e));
@@ -425,7 +526,10 @@ async function runEngine(name, origin) {
   // The runtime must still boot and run; only the snapshot buttons stand down.
   const browser = await playwright[name].launch({ headless: !headed });
   try {
-    const ephemeral = watch(await (await browser.newContext()).newPage());
+    const ephemeralContext = await browser.newContext();
+    ephemeralContext.setDefaultTimeout(EXEC_TIMEOUT);
+    ephemeralContext.setDefaultNavigationTimeout(EXEC_TIMEOUT);
+    const ephemeral = watch(await ephemeralContext.newPage());
     await ephemeral.goto(`${origin}/web/index.html`);
     await ephemeral.waitForSelector("#run:not([disabled])", { timeout: EXEC_TIMEOUT });
     const status = (await ephemeral.textContent("#status")).trim();
@@ -458,18 +562,25 @@ async function runEngine(name, origin) {
 // -------------------------------------------------------------------- main
 
 const { server, origin } = await startServer();
+const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 const summary = [];
 const fingerprints = {};
 try {
   for (const name of engines) {
     console.log(`\n=== ${name} ===`);
-    const { checks, fingerprint } = await runEngine(name, origin);
+    const { checks, fingerprint } = await runEngine(name, origin, gateway);
     const failed = checks.filter((c) => !c.ok);
     summary.push({ name, total: checks.length, failed: failed.length });
     fingerprints[name] = fingerprint;
   }
 } finally {
+  gateway.child.kill();
   server.close();
+}
+
+if (gateway.refusals.length > 0) {
+  console.log(`\n=== gateway refusals (${gateway.refusals.length}) ===`);
+  for (const line of gateway.refusals.slice(0, 6)) console.log(line);
 }
 
 // Determinism: identical input must retire an identical instruction stream on

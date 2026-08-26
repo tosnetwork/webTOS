@@ -23,7 +23,7 @@
 
 use std::cell::RefCell;
 
-use linux_compat::Machine;
+use linux_compat::{net::HostBroker, Machine};
 use x64_engine::{CpuExit, EngineConfig};
 
 mod spec {
@@ -41,6 +41,12 @@ pub const STATUS_UNHANDLED: i32 = 6;
 /// The guest is blocked reading the terminal and the host owes it input.
 /// Not an error: feed `wtw_pty_input` and call `wtw_run` again.
 pub const STATUS_AWAITING_INPUT: i32 = 7;
+/// The guest is blocked on the network and the host owes it socket activity.
+/// Not an error: carry out the pending commands, deliver results, run again.
+pub const STATUS_AWAITING_NETWORK: i32 = 8;
+/// `wtw_net_budget_ms` when the guest armed no timer: the host may wait as
+/// long as it wants.
+pub const NET_BUDGET_UNBOUNDED: u32 = u32::MAX;
 
 struct HostState {
     machine: Option<Machine>,
@@ -54,8 +60,15 @@ struct HostState {
     /// Whether stdio is a host-driven pty, which changes where `wtw_run`
     /// collects guest output from.
     pty: bool,
+    /// The host-driven network broker, once `wtw_net_enable` attached one.
+    net: Option<std::rc::Rc<std::cell::RefCell<HostBroker>>>,
+    /// Last drained broker command stream; kept alive for the reader.
+    net_commands: Vec<u8>,
     error: String,
     allocations: Vec<Box<[u8]>>,
+    /// Staging buffer for bytes the host hands in repeatedly. See
+    /// [`wtw_scratch`].
+    scratch: Vec<u8>,
 }
 
 thread_local! {
@@ -67,8 +80,11 @@ thread_local! {
             fs_image: Vec::new(),
             output: Vec::new(),
             pty: false,
+            net: None,
+            net_commands: Vec::new(),
             error: String::new(),
             allocations: Vec::new(),
+            scratch: Vec::new(),
         })
     };
 }
@@ -98,6 +114,26 @@ pub extern "C" fn wtw_alloc(len: u32) -> u32 {
         let ptr = buf.as_ptr() as u32;
         state.allocations.push(buf);
         ptr
+    })
+}
+
+/// Returns the offset of a single staging buffer of at least `len` bytes.
+///
+/// Unlike [`wtw_alloc`], whose buffers live until `wtw_reset`, this one is
+/// reused: every call may overwrite it, and growing it moves it, so the host
+/// must call this immediately before writing and pass the result straight to
+/// one call. Every API that takes bytes copies them, so nothing outlives the
+/// call. This is the path for input that repeats without bound — keystrokes
+/// and received packets — where per-call allocations would grow the module's
+/// memory for as long as the session lasts.
+#[no_mangle]
+pub extern "C" fn wtw_scratch(len: u32) -> u32 {
+    with_state(|state| {
+        let len = len as usize;
+        if state.scratch.len() < len {
+            state.scratch.resize(len, 0);
+        }
+        state.scratch.as_ptr() as u32
     })
 }
 
@@ -217,7 +253,9 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
             CpuExit::Halt { .. } => STATUS_HALT,
             CpuExit::Breakpoint { .. } => STATUS_RUNNING,
             CpuExit::Interrupted => {
-                if machine.awaiting_terminal_input() {
+                if machine.awaiting_network() {
+                    STATUS_AWAITING_NETWORK
+                } else if machine.awaiting_terminal_input() {
                     STATUS_AWAITING_INPUT
                 } else {
                     STATUS_INTERRUPTED
@@ -291,6 +329,150 @@ pub extern "C" fn wtw_pty_resize(rows: u32, cols: u32) -> i32 {
         );
         0
     })
+}
+
+// ----------------------------------------------------------------- network
+
+/// Attaches the host-driven network broker. Until this is called the guest
+/// has no network at all: `socket(2)` fails with `EAFNOSUPPORT`. The module
+/// still opens nothing itself — every connection is a command for the host,
+/// which enforces its own policy on what may be reached.
+#[no_mangle]
+pub extern "C" fn wtw_net_enable() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_net_enable called before wtw_init");
+        };
+        let broker = std::rc::Rc::new(std::cell::RefCell::new(HostBroker::new()));
+        machine.set_network(broker.clone());
+        state.net = Some(broker);
+        0
+    })
+}
+
+fn with_broker(state: &mut HostState, f: impl FnOnce(&mut HostBroker)) -> i32 {
+    match state.net.clone() {
+        Some(broker) => {
+            f(&mut broker.borrow_mut());
+            0
+        }
+        None => fail(state, "network is not enabled"),
+    }
+}
+
+/// Moves the pending broker commands into the module's read buffer and
+/// returns their length; read them at `wtw_net_cmd_ptr`. See
+/// `linux_compat::net::HostBroker::take_commands` for the encoding.
+#[no_mangle]
+pub extern "C" fn wtw_net_take() -> i32 {
+    with_state(|state| match state.net.clone() {
+        Some(broker) => {
+            state.net_commands = broker.borrow_mut().take_commands();
+            state.net_commands.len() as i32
+        }
+        None => fail(state, "network is not enabled"),
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_net_cmd_ptr() -> u32 {
+    with_state(|state| state.net_commands.as_ptr() as u32)
+}
+
+/// Reports a connection open. `ip`/`port` carry the local address the host
+/// assigned, or zero when it has none to report.
+#[no_mangle]
+pub extern "C" fn wtw_net_connected(handle: u32, ip: u32, port: u32) -> i32 {
+    with_state(|state| {
+        with_broker(state, |broker| {
+            broker.deliver_connected(handle as u64, socket_addr(ip, port));
+        })
+    })
+}
+
+/// Delivers stream bytes received from the peer.
+#[no_mangle]
+pub extern "C" fn wtw_net_data(handle: u32, ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let bytes = unsafe { slice_arg(ptr, len) };
+        with_broker(state, |broker| {
+            broker.deliver_data(handle as u64, &bytes);
+        })
+    })
+}
+
+/// Delivers one datagram and the address it came from.
+#[no_mangle]
+pub extern "C" fn wtw_net_datagram(handle: u32, ip: u32, port: u32, ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let bytes = unsafe { slice_arg(ptr, len) };
+        let from = socket_addr(ip, port)
+            .unwrap_or_else(|| std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
+        with_broker(state, |broker| {
+            broker.deliver_datagram(handle as u64, from, &bytes);
+        })
+    })
+}
+
+/// Reports that the peer closed the stream.
+#[no_mangle]
+pub extern "C" fn wtw_net_closed(handle: u32) -> i32 {
+    with_state(|state| {
+        with_broker(state, |broker| {
+            broker.deliver_closed(handle as u64);
+        })
+    })
+}
+
+/// Reports a transport failure the guest should see, as a Linux errno. A
+/// destination the host refuses is reported here, typically `ENETUNREACH`.
+#[no_mangle]
+pub extern "C" fn wtw_net_error(handle: u32, errno: u32) -> i32 {
+    with_state(|state| {
+        with_broker(state, |broker| {
+            broker.deliver_error(handle as u64, errno as u64);
+        })
+    })
+}
+
+/// Tells the machine the host waited for network activity and none arrived,
+/// so the next stall may advance guest time and let socket timeouts fire.
+#[no_mangle]
+pub extern "C" fn wtw_net_expire() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_net_expire called before wtw_init");
+        };
+        machine.expire_network_wait();
+        0
+    })
+}
+
+/// How long the host may wait for network activity before the guest's own
+/// earliest timer fires, in milliseconds, or `NET_BUDGET_UNBOUNDED` when the
+/// guest armed no timer.
+#[no_mangle]
+pub extern "C" fn wtw_net_budget_ms() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_mut()
+            .and_then(|machine| machine.network_wait_budget_ms())
+            .map_or(NET_BUDGET_UNBOUNDED, |ms| {
+                ms.min(NET_BUDGET_UNBOUNDED as u64 - 1) as u32
+            })
+    })
+}
+
+/// A zero address means "the host did not report one".
+fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
+    if ip == 0 && port == 0 {
+        return None;
+    }
+    Some(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::from(ip),
+        port as u16,
+    ))
 }
 
 /// Serializes the guest filesystem for persistence; read the image via
@@ -396,7 +578,10 @@ pub extern "C" fn wtw_reset() {
         state.fs_image.clear();
         state.output.clear();
         state.pty = false;
+        state.net = None;
+        state.net_commands.clear();
         state.error.clear();
         state.allocations.clear();
+        state.scratch = Vec::new();
     });
 }

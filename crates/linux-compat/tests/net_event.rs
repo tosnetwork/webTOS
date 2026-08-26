@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 
-use linux_compat::net::NativeBroker;
+use linux_compat::net::{HostBroker, NativeBroker};
 use linux_compat::Machine;
 use x64_engine::{CpuExit, EngineConfig};
 
@@ -675,4 +675,314 @@ fn wget_fetches_https_through_guest_tls() {
         "wget https output: {:?}",
         run.output
     );
+}
+
+// ------------------------------------------------- host-driven broker gates
+
+/// A test stand-in for the browser host: it decodes the broker's command
+/// stream, performs each operation on real sockets, and feeds results back.
+/// Destinations outside `allow` are refused without a connection attempt,
+/// which is the deny-by-default policy the browser gateway enforces.
+struct BrokerHost {
+    allow: Vec<SocketAddrV4>,
+    /// Guest-visible destination -> where the host actually sends it. The
+    /// browser gateway resolves names and picks the real endpoint the same
+    /// way; the guest never learns of the rewrite.
+    redirects: std::collections::HashMap<SocketAddrV4, SocketAddrV4>,
+    tcp: std::collections::HashMap<u64, std::net::TcpStream>,
+    udp: std::collections::HashMap<u64, std::net::UdpSocket>,
+    refused: Vec<SocketAddrV4>,
+}
+
+impl BrokerHost {
+    fn new(allow: Vec<SocketAddrV4>) -> Self {
+        Self {
+            allow,
+            redirects: std::collections::HashMap::new(),
+            tcp: std::collections::HashMap::new(),
+            udp: std::collections::HashMap::new(),
+            refused: Vec::new(),
+        }
+    }
+
+    fn redirect(&mut self, from: SocketAddrV4, to: SocketAddrV4) {
+        self.redirects.insert(from, to);
+        self.allow.push(from);
+    }
+
+    /// Applies policy: an allowed destination resolves to where the host
+    /// will really send it; anything else is recorded and refused.
+    fn permitted(&mut self, addr: SocketAddrV4) -> Option<SocketAddrV4> {
+        if !self.allow.contains(&addr) {
+            self.refused.push(addr);
+            return None;
+        }
+        Some(self.redirects.get(&addr).copied().unwrap_or(addr))
+    }
+
+    /// Decodes and performs one batch of commands. Mirrors the encoding in
+    /// `HostBroker::take_commands`, so a change there fails here first.
+    fn perform(&mut self, stream: &[u8], broker: &Rc<RefCell<HostBroker>>) {
+        let mut i = 0;
+        let u32_at = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().expect("u32"));
+        let addr_at = |s: &[u8], i: usize| {
+            SocketAddrV4::new(
+                Ipv4Addr::new(s[i], s[i + 1], s[i + 2], s[i + 3]),
+                u16::from_be_bytes(s[i + 4..i + 6].try_into().expect("port")),
+            )
+        };
+        while i < stream.len() {
+            let op = stream[i];
+            let handle = u32_at(stream, i + 1) as u64;
+            i += 5;
+            match op {
+                1 => {
+                    let addr = addr_at(stream, i);
+                    i += 6;
+                    let Some(target) = self.permitted(addr) else {
+                        broker.borrow_mut().deliver_error(handle, 101); // ENETUNREACH
+                        continue;
+                    };
+                    match std::net::TcpStream::connect(std::net::SocketAddr::V4(target)) {
+                        Ok(stream) => {
+                            stream.set_nonblocking(true).expect("nonblocking");
+                            self.tcp.insert(handle, stream);
+                            broker.borrow_mut().deliver_connected(handle, None);
+                        }
+                        Err(_) => broker.borrow_mut().deliver_error(handle, 111), // ECONNREFUSED
+                    }
+                }
+                2 => {
+                    let len = u32_at(stream, i) as usize;
+                    i += 4;
+                    let bytes = &stream[i..i + len];
+                    i += len;
+                    if let Some(socket) = self.tcp.get_mut(&handle) {
+                        socket.set_nonblocking(false).expect("blocking");
+                        let _ = socket.write_all(bytes);
+                        socket.set_nonblocking(true).expect("nonblocking");
+                    }
+                }
+                3 => {
+                    if let Some(socket) = self.tcp.get(&handle) {
+                        let _ = socket.shutdown(std::net::Shutdown::Write);
+                    }
+                }
+                4 => {
+                    let socket =
+                        std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("udp bind");
+                    socket.set_nonblocking(true).expect("nonblocking");
+                    self.udp.insert(handle, socket);
+                }
+                5 => {
+                    let addr = addr_at(stream, i);
+                    i += 6;
+                    let len = u32_at(stream, i) as usize;
+                    i += 4;
+                    let bytes = &stream[i..i + len];
+                    i += len;
+                    let Some(target) = self.permitted(addr) else {
+                        broker.borrow_mut().deliver_error(handle, 101);
+                        continue;
+                    };
+                    if let Some(socket) = self.udp.get(&handle) {
+                        let _ = socket.send_to(bytes, std::net::SocketAddr::V4(target));
+                    }
+                }
+                6 => {
+                    self.tcp.remove(&handle);
+                    self.udp.remove(&handle);
+                }
+                other => panic!("unknown broker opcode {other}"),
+            }
+        }
+    }
+
+    /// Polls every open socket once and delivers whatever arrived. Returns
+    /// true when anything was delivered.
+    fn poll(&mut self, broker: &Rc<RefCell<HostBroker>>) -> bool {
+        let mut delivered = false;
+        let mut buf = [0_u8; 8192];
+        let mut dead = Vec::new();
+        for (&handle, socket) in self.tcp.iter_mut() {
+            match socket.read(&mut buf) {
+                Ok(0) => {
+                    broker.borrow_mut().deliver_closed(handle);
+                    dead.push(handle);
+                    delivered = true;
+                }
+                Ok(n) => {
+                    broker.borrow_mut().deliver_data(handle, &buf[..n]);
+                    delivered = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    broker.borrow_mut().deliver_error(handle, 104); // ECONNRESET
+                    dead.push(handle);
+                    delivered = true;
+                }
+            }
+        }
+        for handle in dead {
+            self.tcp.remove(&handle);
+        }
+        for (&handle, socket) in self.udp.iter() {
+            if let Ok((n, std::net::SocketAddr::V4(from))) = socket.recv_from(&mut buf) {
+                // A resolver checks the reply's source, so report the address
+                // the guest sent to rather than where the host redirected it.
+                let seen = self
+                    .redirects
+                    .iter()
+                    .find(|(_, to)| **to == from)
+                    .map_or(from, |(guest, _)| *guest);
+                broker
+                    .borrow_mut()
+                    .deliver_datagram(handle, seen, &buf[..n]);
+                delivered = true;
+            }
+        }
+        delivered
+    }
+}
+
+/// Runs a guest whose network is host-driven, pumping the transport between
+/// slices exactly as the browser worker does: run until the machine says it
+/// is waiting on the network, carry out its commands, deliver what arrived,
+/// and either continue or tell it the wait expired so its timers can fire.
+fn run_argv_pumped(machine: &mut Machine, host: &mut BrokerHost, path: &str, args: &[&str]) -> Run {
+    let broker = Rc::new(RefCell::new(HostBroker::new()));
+    machine.set_network(broker.clone());
+    let argv: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
+    machine.set_args(
+        argv,
+        vec![b"PATH=/bin:/usr/bin:/sbin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine.load(path.as_bytes()).expect("ELF load failed");
+
+    let mut output = Vec::new();
+    // Bounded so a bug cannot hang the suite; a fetch needs a few dozen.
+    for _ in 0..4000 {
+        machine.vm_mut().icount_limit = machine.icount() + 200_000_000;
+        let exit = machine.run();
+        output.extend(machine.take_output());
+        if !machine.awaiting_network() {
+            if exit == CpuExit::Interrupted {
+                // Out of fuel for this slice, or another host wait; keep going.
+                continue;
+            }
+            return Run {
+                exit,
+                output: String::from_utf8_lossy(&output).into_owned(),
+            };
+        }
+        let commands = broker.borrow_mut().take_commands();
+        host.perform(&commands, &broker);
+        // A real host waits on its event loop here; polling briefly is the
+        // portable stand-in. Nothing delivered means the wait expired.
+        let mut delivered = false;
+        for _ in 0..50 {
+            if host.poll(&broker) {
+                delivered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if !delivered {
+            machine.expire_network_wait();
+        }
+    }
+    panic!(
+        "guest never finished; output so far: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn host_driven_broker_fetches_http() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let server = spawn_http_server();
+    let mut host = BrokerHost::new(vec![server]);
+    let url = format!("http://{}/hello", server);
+
+    let run = run_argv_pumped(
+        &mut machine,
+        &mut host,
+        "/usr/bin/wget",
+        &["wget", "-q", "-O", "-", &url],
+    );
+    expect_clean(&run);
+    assert_eq!(
+        run.output, "hello-from-webtos-m5",
+        "wget output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn host_driven_broker_resolves_dns_over_udp() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let dns = spawn_dns_server();
+    // The guest asks its configured resolver on the standard port; the host
+    // sends that to the test server, and allows nothing else.
+    let mut host = BrokerHost::new(Vec::new());
+    host.redirect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53), dns);
+    machine
+        .add_file(
+            b"/etc/resolv.conf",
+            b"nameserver 127.0.0.1\n".to_vec(),
+            0o644,
+        )
+        .expect("resolv.conf");
+
+    let run = run_argv_pumped(
+        &mut machine,
+        &mut host,
+        "/usr/bin/nslookup",
+        &["nslookup", "webtos.test", "127.0.0.1"],
+    );
+    expect_clean(&run);
+    assert!(
+        run.output.contains("10.0.0.1"),
+        "nslookup output: {:?}",
+        run.output
+    );
+}
+
+/// The host, not the guest, decides what may be reached. A destination the
+/// host refuses must surface as a failure the guest can see, and no
+/// connection may be attempted.
+#[test]
+fn host_driven_broker_refuses_a_destination_outside_the_allowlist() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let server = spawn_http_server();
+    // The server exists, but the host allows nothing.
+    let mut host = BrokerHost::new(Vec::new());
+    let url = format!("http://{}/hello", server);
+
+    let run = run_argv_pumped(
+        &mut machine,
+        &mut host,
+        "/usr/bin/wget",
+        &["wget", "-q", "-O", "-", &url],
+    );
+    match run.exit {
+        CpuExit::Halt { code: Some(code) } => assert_ne!(
+            code, 0,
+            "wget must fail against a refused destination; output: {:?}",
+            run.output
+        ),
+        other => panic!("unexpected exit {other:?}; output: {:?}", run.output),
+    }
+    assert!(
+        !run.output.contains("hello-from-webtos-m5"),
+        "refused destination leaked a response: {:?}",
+        run.output
+    );
+    assert_eq!(host.refused, vec![server], "the host saw the attempt");
 }

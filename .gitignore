@@ -12,7 +12,8 @@ base_image.runtime.manifest
 /test_data/openfox
 /test_data/openfox.commit
 
-# Browser-matrix harness dependencies (web/package.json)
-/web/node_modules/
-/web/package-lock.json
+# Development tooling dependencies (package.json): the browser test matrix
+# and the network gateway
+/node_modules/
+/package-lock.json
 /web/vendor/

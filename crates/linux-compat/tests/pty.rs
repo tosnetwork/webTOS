@@ -428,3 +428,70 @@ fn host_resize_repaints_a_full_screen_program() {
     let tail = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
     assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "quit: {tail:?}");
 }
+
+/// The shape the browser terminal actually runs: an interactive shell that
+/// starts a full-screen program, and a window resize while that program owns
+/// the screen. The shell puts the job in its own process group and claims the
+/// terminal for it through `/dev/tty`, so the resize must reach the group the
+/// shell made the foreground one — not the shell's own.
+#[test]
+fn a_shell_launched_program_repaints_on_resize() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    for applet in ["sh", "vi"] {
+        machine
+            .add_symlink(format!("/bin/{applet}").as_bytes(), b"/bin/busybox")
+            .expect("applet link");
+    }
+    machine
+        .add_file(b"/root/notes.txt", b"alpha\nbeta\ngamma\n".to_vec(), 0o644)
+        .expect("add file");
+    machine.set_args(
+        vec![b"sh".to_vec(), b"-i".to_vec()],
+        vec![
+            b"PATH=/bin".to_vec(),
+            b"TERM=xterm".to_vec(),
+            b"HOME=/root".to_vec(),
+            b"PS1=$ ".to_vec(),
+        ],
+    );
+    machine.load(b"/bin/sh").expect("ELF load failed");
+    machine.install_pty_stdio(12, 40);
+
+    let mut run = |machine: &mut Machine| {
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        let exit = machine.run();
+        (
+            exit,
+            String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned(),
+        )
+    };
+
+    let (_, prompt) = run(&mut machine);
+    assert!(prompt.contains('$'), "no shell prompt: {prompt:?}");
+
+    machine.feed_terminal_input(b"vi /root/notes.txt\n");
+    let (_, painted) = run(&mut machine);
+    assert!(
+        painted.contains("\u{1b}[?1049h") && painted.contains("\u{1b}[12;1H"),
+        "editor did not paint a 12-row screen: {painted:?}"
+    );
+
+    // The window grows. Nothing is typed.
+    machine.resize_terminal(20, 40);
+    let (_, repainted) = run(&mut machine);
+    assert!(
+        repainted.contains("\u{1b}[20;1H") && repainted.contains("alpha"),
+        "editor did not repaint at 20 rows: {repainted:?}"
+    );
+}

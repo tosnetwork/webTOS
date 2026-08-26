@@ -147,6 +147,15 @@ pub struct LinuxEnv {
     /// pause, not a deadlock: the run stops so the host can collect input,
     /// and the next `run` puts the task back on the CPU.
     pub(crate) terminal_input_wait: bool,
+    /// Set when the machine went idle waiting on a host-driven network broker
+    /// (see `net::NetworkBroker::host_driven`). Like a terminal wait this is a
+    /// pause, not a deadlock: the host runs its event loop, delivers what
+    /// arrived, and calls `run` again.
+    pub(crate) network_wait: bool,
+    /// Set by the host to say its network wait expired with nothing to
+    /// deliver, which lets the next stall advance the guest's clock so timers
+    /// and socket timeouts fire.
+    pub(crate) network_expired: bool,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -174,6 +183,8 @@ impl LinuxEnv {
             stdio_pty: None,
             stdio_input: std::collections::VecDeque::new(),
             terminal_input_wait: false,
+            network_wait: false,
+            network_expired: false,
             exit_code: None,
         })
     }
@@ -293,6 +304,27 @@ impl LinuxEnv {
     /// for the host to supply terminal input.
     pub fn awaiting_terminal_input(&self) -> bool {
         self.terminal_input_wait
+    }
+
+    /// True when the last run stopped waiting on the host's network transport.
+    pub fn awaiting_network(&self) -> bool {
+        self.network_wait
+    }
+
+    /// Tells the machine the host waited for network activity and none came,
+    /// so the next stall may advance guest time instead of pausing again.
+    pub fn expire_network_wait(&mut self) {
+        self.network_expired = true;
+    }
+
+    /// How long the host may wait for network activity before the guest's own
+    /// earliest timer deadline expires, in milliseconds. `None` means the
+    /// guest armed no timer, so the host may wait as long as it likes.
+    pub fn network_wait_budget_ms(&self, cpu: &Cpu) -> Option<u64> {
+        let now = self.now_nanos(cpu);
+        self.sched
+            .earliest_deadline()
+            .map(|deadline| deadline.saturating_sub(now) / 1_000_000)
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
@@ -761,6 +793,30 @@ impl Machine {
         self.env().awaiting_terminal_input()
     }
 
+    /// True when [`run`](Self::run) stopped waiting on the host's network
+    /// transport. The host should carry out any pending broker commands, wait
+    /// up to [`network_wait_budget_ms`](Self::network_wait_budget_ms) for
+    /// activity, deliver what arrived (or call
+    /// [`expire_network_wait`](Self::expire_network_wait)), and run again.
+    pub fn awaiting_network(&mut self) -> bool {
+        self.env().awaiting_network()
+    }
+
+    /// See [`LinuxEnv::expire_network_wait`].
+    pub fn expire_network_wait(&mut self) {
+        self.env().expire_network_wait();
+    }
+
+    /// See [`LinuxEnv::network_wait_budget_ms`].
+    pub fn network_wait_budget_ms(&mut self) -> Option<u64> {
+        let InterpVm { cpu, env, .. } = &mut self.vm;
+        let env = env
+            .as_mut_any()
+            .downcast_mut::<LinuxEnv>()
+            .expect("machine environment is always LinuxEnv");
+        env.network_wait_budget_ms(cpu)
+    }
+
     /// Attaches a host network broker (network is denied without one).
     /// Sets the guest's CLOCK_REALTIME base (unix seconds at machine
     /// start). Call before `load` when the guest will validate real
@@ -814,18 +870,27 @@ impl Machine {
 
     /// Runs until the workload exits or faults.
     pub fn run(&mut self) -> CpuExit {
-        // A previous run paused with the guest blocked on terminal input.
-        // Put a task back on the CPU now that the host may have typed; with
-        // still nothing to read, stay paused rather than spinning.
-        if self.env().terminal_input_wait {
+        // A previous run paused waiting on the host — for a keystroke or for
+        // network activity. Put a task back on the CPU now that the host has
+        // had its turn; with still nothing to deliver, stay paused rather
+        // than spinning.
+        if self.env().terminal_input_wait || self.env().network_wait {
             self.env().terminal_input_wait = false;
+            self.env().network_wait = false;
             let InterpVm { cpu, env, .. } = &mut self.vm;
             let env = env
                 .as_mut_any()
                 .downcast_mut::<LinuxEnv>()
                 .expect("machine environment is always LinuxEnv");
             if !syscall::resume_parked(env, cpu) {
-                env.terminal_input_wait = true;
+                // Still nothing to run. Say which wait is outstanding so the
+                // host knows to try again rather than reading the pause as a
+                // stop; no outstanding wait is a real deadlock.
+                match syscall::pending_host_wait(env) {
+                    Some(syscall::HostWait::Terminal) => env.terminal_input_wait = true,
+                    Some(syscall::HostWait::Network) => env.network_wait = true,
+                    None => {}
+                }
                 return CpuExit::Interrupted;
             }
         }

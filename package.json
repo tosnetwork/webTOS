@@ -1,0 +1,15 @@
+{
+  "name": "webtos-dev-tools",
+  "private": true,
+  "description": "Development tooling for the webTOS browser host: the browser test matrix and the network gateway",
+  "type": "module",
+  "scripts": {
+    "test:node": "node web/test_node.mjs",
+    "test:browsers": "node web/test_browsers.mjs",
+    "gateway": "node tools/webtos_gateway.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "ws": "^8.19.0"
+  }
+}

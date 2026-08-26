@@ -37,6 +37,12 @@
   leave), <code>echo hi &gt; /root/f &amp;&amp; cat /root/f</code>.
   <a href="./index.html">One-shot command demo →</a>
 </p>
+<p class="meta" id="netnote">
+  The guest has no network. To grant one, run the relay
+  (<code>node tools/webtos_gateway.mjs --allow HOST:PORT</code>) and reload
+  with <code>?gateway=ws://127.0.0.1:8081</code>. Nothing is reachable unless
+  the relay's own allowlist names it.
+</p>
 <div id="missing">
   vendor/xterm is missing. Run <code>tools/fetch_xterm.sh</code> to fetch the
   pinned terminal emulator, then reload.
@@ -73,6 +79,16 @@
   const worker = new Worker(new URL("./worker.js", import.meta.url));
   let live = false;
 
+  // Network is opt-in and explicit: no gateway in the URL, no sockets.
+  const params = new URLSearchParams(location.search);
+  const gateway = params.get("gateway");
+  const resolver = params.get("dns") ?? "1.1.1.1";
+  if (gateway) {
+    document.getElementById("netnote").textContent =
+      `Network relayed through ${gateway}; resolver ${resolver}. The relay's` +
+      " allowlist, not this page, decides what is reachable.";
+  }
+
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "status") statusEl.textContent = msg.text;
@@ -80,6 +96,7 @@
       statusEl.textContent += msg.restored
         ? " — previous session restored"
         : " — filesystem ready";
+      if (gateway) worker.postMessage({ type: "network", gateway });
       // The guest's terminal is created at the size the tab actually has.
       worker.postMessage({
         type: "spawn",
@@ -128,12 +145,16 @@
 
   // A resize is a SIGWINCH to the guest's foreground group; a full-screen
   // program repaints itself without the user typing anything.
-  const applySize = () => {
-    fit.fit();
-    if (live) worker.postMessage({ type: "resize", rows: term.rows, cols: term.cols });
+  //
+  // The guest is told the size from xterm's own resize event, not from
+  // reading term.rows straight after fit(): the new dimensions are not
+  // necessarily in place by then, and reporting the old size means the guest
+  // is never told the window changed.
+  term.onResize(({ cols, rows }) => {
+    if (live) worker.postMessage({ type: "resize", rows, cols });
     statusEl.textContent = statusLine(live ? "running" : "idle");
-  };
-  window.addEventListener("resize", applySize);
+  });
+  window.addEventListener("resize", () => fit.fit());
 
   async function fetchBytes(url) {
     const response = await fetch(url);
@@ -148,11 +169,13 @@
       const notes = new TextEncoder().encode(
         "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
       ).buffer;
+      const resolvConf = new TextEncoder().encode(`nameserver ${resolver}\n`).buffer;
       // One image, many commands: BusyBox picks its applet from argv[0], so
       // each name on PATH is a link to the same binary.
       const applets = [
         "sh", "ls", "cat", "echo", "vi", "grep", "wc", "head", "tail",
         "mkdir", "rm", "cp", "mv", "touch", "date", "uname", "ps", "env",
+        "wget", "nslookup", "ping", "stty", "tty", "sleep", "sort", "sed",
       ];
       worker.postMessage(
         {
@@ -160,10 +183,11 @@
           files: [
             { path: "/bin/busybox", bytes: busybox },
             { path: "/root/notes.txt", bytes: notes },
+            { path: "/etc/resolv.conf", bytes: resolvConf },
           ],
           links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
         },
-        [busybox, notes],
+        [busybox, notes, resolvConf],
       );
     } catch (e) {
       statusEl.textContent = `${e} — run web/build.sh first (and tools/fetch_busybox.sh)`;

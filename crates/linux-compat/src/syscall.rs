@@ -643,6 +643,38 @@ fn sys_openat(
     let follow = flags & abi::O_NOFOLLOW == 0;
     let resolved = env.vfs.resolve(base, &path, follow)?;
 
+    // `/dev/tty` is the process's controlling terminal, not a device of its
+    // own. When stdio is a host-driven pty, an open must land on that pty:
+    // an interactive shell does its job control (tcsetpgrp, tcgetpgrp, window
+    // size) through this path, and answering with a generic tty makes those
+    // calls silently do nothing — so a program the shell starts never learns
+    // the window changed.
+    let opens_controlling_tty = resolved.node.is_some_and(|node| {
+        matches!(
+            env.vfs.node(node).kind,
+            crate::vfs::NodeKind::CharDev(crate::vfs::Dev::Tty)
+        )
+    });
+    if opens_controlling_tty {
+        if let Some(pty) = env.stdio_pty.clone() {
+            {
+                let mut inner = pty.borrow_mut();
+                inner.slaves += 1;
+                inner.slave_ever_opened = true;
+                inner.activity += 1;
+            }
+            let entry = FdEntry {
+                desc: std::rc::Rc::new(std::cell::RefCell::new(Description {
+                    backing: Backing::PtySlave(pty),
+                    offset: 0,
+                    flags: flags & (abi::O_ACCMODE | abi::O_APPEND | abi::O_NONBLOCK),
+                })),
+                cloexec: flags & abi::O_CLOEXEC != 0,
+            };
+            return env.proc.fds.borrow_mut().insert(entry);
+        }
+    }
+
     // `/dev/pts/<id>` slave devices are dynamic (no VFS node): a slave open
     // looks the pty up by id. The parent must be the `/dev/pts` directory and
     // the name a decimal id.
@@ -2001,6 +2033,9 @@ fn blocked_on_terminal_input(env: &LinuxEnv) -> bool {
 /// Classifies a total stall: an interactive pause the host can end by typing,
 /// or a genuine deadlock. `reason` describes the deadlock for diagnostics.
 fn stall_outcome(env: &mut LinuxEnv, reason: &str, dump: bool) -> Outcome {
+    if env.network_wait {
+        return Outcome::Exit(VmExit::Interrupted);
+    }
     if blocked_on_terminal_input(env) {
         env.terminal_input_wait = true;
         return Outcome::Exit(VmExit::Interrupted);
@@ -2013,10 +2048,32 @@ fn stall_outcome(env: &mut LinuxEnv, reason: &str, dump: bool) -> Outcome {
     Outcome::Exit(VmExit::Deadlock)
 }
 
-/// Puts a ready task back on the CPU after an interactive pause. Returns
-/// false when nothing is runnable yet (the host still owes input).
+/// Puts a ready task back on the CPU after a pause the host was asked to end.
+/// Returns false when nothing is runnable yet.
 pub(crate) fn resume_parked(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     schedule_next(env, cpu)
+}
+
+/// Which wait the host is still owed, when a resume found nothing runnable.
+/// `None` means the machine is idle for a reason the host cannot fix, which
+/// is a real deadlock.
+pub(crate) enum HostWait {
+    Terminal,
+    Network,
+}
+
+pub(crate) fn pending_host_wait(env: &LinuxEnv) -> Option<HostWait> {
+    if blocked_on_terminal_input(env) {
+        return Some(HostWait::Terminal);
+    }
+    let host_driven = env
+        .net
+        .as_ref()
+        .is_some_and(|broker| broker.borrow().host_driven());
+    if host_driven && !env.sched.net_watch_handles().is_empty() {
+        return Some(HostWait::Network);
+    }
+    None
 }
 
 /// Parks the current task and hands the CPU to the next ready one.
@@ -3418,24 +3475,38 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
     let handles = env.sched.net_watch_handles();
     if !handles.is_empty() {
         if let Some(broker) = env.net.clone() {
-            // Bound the host wait by the nearest guest deadline (nanoseconds
-            // of deterministic time map to host wall time here) or a hard
-            // cap that keeps a dead network from hanging the machine.
-            let cap = std::time::Duration::from_secs(30);
-            let timeout = match deadline {
-                Some(d) if d > now => std::time::Duration::from_nanos(d - now).min(cap),
-                _ => cap,
-            };
-            let woke = broker.borrow_mut().wait_ready(&handles, timeout);
-            if woke {
-                if let Some(index) = env.sched.find_ready(now) {
-                    return Some(index);
+            // A host-driven broker owns no transport of its own: the host must
+            // run its event loop before guest time may advance, or a socket
+            // timeout would fire before the reply had any chance to arrive.
+            // Pause once per stall; the host says "nothing came" by expiring
+            // the wait, and only then does the clock move.
+            if broker.borrow().host_driven() {
+                if env.network_expired {
+                    env.network_expired = false;
+                } else {
+                    env.network_wait = true;
+                    return None;
                 }
-            } else if deadline.is_none() {
-                tracing::error!(
-                    "network wait timed out after {timeout:?} with no guest timer armed"
-                );
-                return None;
+            } else {
+                // Bound the host wait by the nearest guest deadline (nanoseconds
+                // of deterministic time map to host wall time here) or a hard
+                // cap that keeps a dead network from hanging the machine.
+                let cap = std::time::Duration::from_secs(30);
+                let timeout = match deadline {
+                    Some(d) if d > now => std::time::Duration::from_nanos(d - now).min(cap),
+                    _ => cap,
+                };
+                let woke = broker.borrow_mut().wait_ready(&handles, timeout);
+                if woke {
+                    if let Some(index) = env.sched.find_ready(now) {
+                        return Some(index);
+                    }
+                } else if deadline.is_none() {
+                    tracing::error!(
+                        "network wait timed out after {timeout:?} with no guest timer armed"
+                    );
+                    return None;
+                }
             }
         }
     }

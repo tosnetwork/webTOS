@@ -195,12 +195,41 @@ resized (a host resize is a SIGWINCH to the guest's foreground group). A guest
 blocked on a terminal read pauses the run rather than deadlocking it; the next
 keystroke resumes the same process where it stopped.
 
+### Giving the guest a network
+
+A tab cannot open a socket, and the guest does its own TLS and its own DNS, so
+what it needs is a byte relay rather than an HTTP proxy. `tools/webtos_gateway.mjs`
+is that relay, and because it is the only component that can reach the network
+on the guest's behalf, it is where the policy lives:
+
+```bash
+npm install                                   # the relay needs 'ws'
+node tools/webtos_gateway.mjs --allow example.com:80 --allow 1.1.1.1:53
+python3 -m http.server -d web 8080
+# then open http://localhost:8080/terminal.html?gateway=ws://127.0.0.1:8081
+```
+
+Nothing is reachable unless an `--allow` rule names it; with no rules the relay
+starts and refuses everything. A rule is `host:port`, where the host is an IPv4
+literal or a name the relay resolves — the guest does its own DNS and connects
+to an address, so name rules are matched by address. The relay also requires a
+page `Origin` it was told to accept (localhost by default), so a page on any
+site the user happens to visit cannot drive their relay as an open proxy; that
+check constrains browsers, not local programs, which is why the allowlist is
+the boundary that matters. It binds to loopback, and logs every decision,
+allowed and refused alike.
+
+The guest has no network at all until the page asks for one, and the machine
+itself never opens anything: guest socket operations become a command stream
+the host carries out, which is why the browser and the native host can enforce
+different policies over the same runtime.
+
 Two harnesses gate it:
 
 ```bash
 node web/test_node.mjs              # the wasm module under Node/V8, no browser
 
-cd web && npm install               # Playwright, for the browser matrix
+npm install                         # Playwright, for the browser matrix
 npx playwright install              # Chromium, Firefox, and WebKit engines
 node web/test_browsers.mjs          # all three engines; --engines= to narrow
 ```
@@ -210,9 +239,11 @@ applets, a snapshot, a real page reload, a read-back of the restored
 filesystem — runs the static and dynamically linked fixtures through the
 worker protocol directly, drives the interactive terminal (a shell prompt, a
 pipeline, the full-screen editor, and a resize that repaints without a
-keystroke), and finally reruns the page in a profile without persistent
-storage to confirm the host reports the missing capability instead of failing
-at the first click. It ends by comparing per-command instruction counts across
+keystroke), starts its own gateway allowing exactly one destination and checks
+both that the guest can fetch over a real socket and that anything else is
+refused, and finally reruns the page in a profile without persistent storage
+to confirm the host reports the missing capability instead of failing at the
+first click. It ends by comparing per-command instruction counts across
 the three engines: identical input must retire an identical instruction stream
 everywhere.
 

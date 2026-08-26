@@ -8,6 +8,10 @@
 //                                        to this worker's message queue
 //               { type: "input", data: string }  -- keystrokes for the terminal
 //               { type: "resize", rows, cols }   -- terminal size (SIGWINCH)
+//               { type: "network", gateway: "ws://127.0.0.1:8081" }
+//                                     -- allow the guest to reach the network
+//                                        through that relay; without it the
+//                                        guest has no network at all
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
@@ -24,6 +28,12 @@ const FUEL = 5_000_000;
 const STATUS_RUNNING = 0;
 const STATUS_HALT = 1;
 const STATUS_AWAITING_INPUT = 7;
+const STATUS_AWAITING_NETWORK = 8;
+/// wtw_net_budget_ms when the guest armed no timer.
+const NET_BUDGET_UNBOUNDED = 0xffff_ffff;
+/// Longest the worker waits on the network in one go, so a silent peer
+/// cannot stall the machine indefinitely.
+const NET_WAIT_CAP_MS = 5_000;
 
 // Whether this browsing context may use the origin-private filesystem at all.
 // WebKit refuses it outright when the profile has no on-disk storage (a
@@ -74,9 +84,21 @@ let exports = null;
 const mem = () => new Uint8Array(exports.memory.buffer);
 const text = (ptr, len) => new TextDecoder().decode(mem().slice(ptr, ptr + len));
 const lastError = () => text(exports.wtw_error_ptr(), exports.wtw_error_len());
+/// Copies bytes into a module-owned buffer that lives until wtw_reset. For
+/// one-shot input: images, argv, a restored snapshot.
 const put = (value) => {
   const data = typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value);
   const ptr = exports.wtw_alloc(data.length);
+  mem().set(data, ptr);
+  return [ptr, data.length];
+};
+
+/// Copies bytes into the module's reusable staging buffer. For input that
+/// repeats without bound — keystrokes, received packets — where a fresh
+/// allocation per call would grow the module's memory all session.
+const stage = (value) => {
+  const data = typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value);
+  const ptr = exports.wtw_scratch(data.length);
   mem().set(data, ptr);
   return [ptr, data.length];
 };
@@ -158,24 +180,13 @@ function finish(status) {
   });
 }
 
+/// A non-interactive process, run through the same pump so a workload that
+/// uses the network still gets its host turns.
 function exec(path, argv, envp) {
   load(path, argv, envp);
-  // Run to completion in fuel slices, draining guest output after each.
-  let status;
-  do {
-    status = exports.wtw_run(FUEL);
-    drain();
-  } while (status === STATUS_RUNNING);
-  finish(status);
+  waiting = false;
+  return pump();
 }
-
-// ---------------------------------------------------------------- terminal
-
-// An interactive process is not a single call: it runs, blocks for a
-// keystroke, and continues. `running` says a pump is in flight, `waiting`
-// says the guest is parked on the terminal until input or a resize arrives.
-let running = false;
-let waiting = false;
 
 // A macrotask yield that the browser does not clamp to 4 ms the way nested
 // setTimeout is. Letting the worker reach its message queue between slices is
@@ -186,6 +197,243 @@ const yieldToQueue = () =>
     channel.port1.onmessage = () => resolve();
     channel.port2.postMessage(0);
   });
+
+// ----------------------------------------------------------------- network
+
+// The guest's sockets live in the gateway; this side is only a courier. Each
+// guest endpoint gets its own WebSocket, so the relay's own open/close and
+// back-pressure carry the stream's semantics instead of a framing layer.
+//
+// Linux errno values the guest expects to see for a transport failure.
+const ENETUNREACH = 101;
+const ECONNREFUSED = 111;
+const ECONNRESET = 104;
+/// WebSocket close codes the gateway uses to say why it hung up.
+const CLOSE_BAD_REQUEST = 4400;
+const CLOSE_REFUSED = 4403;
+const CLOSE_UNREACHABLE = 4502;
+
+let gateway = null;
+const sockets = new Map();
+/// Bumped whenever anything is delivered into the machine, so a paused pump
+/// can tell "something arrived" from "the wait expired".
+let netEvents = 0;
+/// Resolver for a pump parked on the network, so a delivery wakes it at once
+/// instead of after its timeout.
+let netWake = null;
+
+function noteNetEvent() {
+  netEvents += 1;
+  if (netWake) {
+    const wake = netWake;
+    netWake = null;
+    wake();
+  }
+}
+
+const netCommands = () => {
+  const len = exports.wtw_net_take();
+  if (len < 0) throw new Error(`network drain failed: ${lastError()}`);
+  return mem().slice(exports.wtw_net_cmd_ptr(), exports.wtw_net_cmd_ptr() + len);
+};
+
+const deliverData = (handle, bytes) => {
+  const [ptr, len] = stage(bytes);
+  exports.wtw_net_data(handle, ptr, len);
+  noteNetEvent();
+};
+
+const deliverDatagram = (handle, frame) => {
+  const ip = (frame[0] << 24) | (frame[1] << 16) | (frame[2] << 8) | frame[3];
+  const port = (frame[4] << 8) | frame[5];
+  const [ptr, len] = stage(frame.subarray(6));
+  exports.wtw_net_datagram(handle, ip >>> 0, port, ptr, len);
+  noteNetEvent();
+};
+
+const deliverError = (handle, errno) => {
+  exports.wtw_net_error(handle, errno);
+  noteNetEvent();
+};
+
+function openTcp(handle, ip, port) {
+  const socket = new WebSocket(`${gateway}/tcp?host=${ip}&port=${port}`);
+  socket.binaryType = "arraybuffer";
+  const entry = { socket, queue: [], open: false };
+  sockets.set(handle, entry);
+  socket.onopen = () => {
+    entry.open = true;
+    for (const pending of entry.queue) socket.send(pending);
+    entry.queue.length = 0;
+  };
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      // "open" once the relay's own TCP connect succeeded; "eof" on a peer
+      // half-close, which the guest reads as end of stream.
+      if (event.data === "open") {
+        entry.connected = true;
+        exports.wtw_net_connected(handle, 0, 0);
+        noteNetEvent();
+      } else if (event.data === "eof") {
+        entry.eof = true;
+        exports.wtw_net_closed(handle);
+        noteNetEvent();
+      }
+      return;
+    }
+    deliverData(handle, new Uint8Array(event.data));
+  };
+  // The close event always follows an error and carries why, so the guest's
+  // errno is decided there rather than twice.
+  socket.onerror = () => {};
+  socket.onclose = (event) => {
+    if (sockets.get(handle) !== entry) return; // the guest already closed it
+    sockets.delete(handle);
+    if (event.code === CLOSE_REFUSED || event.code === CLOSE_BAD_REQUEST) {
+      // The relay refused the destination by policy, so nothing was dialled:
+      // unreachable, not refused by a peer.
+      deliverError(handle, ENETUNREACH);
+    } else if (event.code === CLOSE_UNREACHABLE) {
+      deliverError(handle, ECONNREFUSED);
+    } else if (!entry.connected) {
+      // Never opened: no gateway listening, or the upgrade was rejected.
+      deliverError(handle, ENETUNREACH);
+    } else if (!entry.eof) {
+      exports.wtw_net_closed(handle);
+      noteNetEvent();
+    }
+  };
+}
+
+function openUdp(handle) {
+  const socket = new WebSocket(`${gateway}/udp`);
+  socket.binaryType = "arraybuffer";
+  const entry = { socket, queue: [], open: false };
+  sockets.set(handle, entry);
+  socket.onopen = () => {
+    entry.open = true;
+    for (const pending of entry.queue) socket.send(pending);
+    entry.queue.length = 0;
+  };
+  socket.onmessage = (event) => {
+    if (typeof event.data !== "string") deliverDatagram(handle, new Uint8Array(event.data));
+  };
+  socket.onerror = () => {};
+  socket.onclose = () => {
+    if (sockets.get(handle) !== entry) return; // the guest already closed it
+    sockets.delete(handle);
+    deliverError(handle, entry.open ? ECONNRESET : ENETUNREACH);
+  };
+}
+
+const sendOn = (handle, payload) => {
+  const entry = sockets.get(handle);
+  if (!entry) return;
+  if (entry.open) entry.socket.send(payload);
+  else entry.queue.push(payload);
+};
+
+/// Decodes and carries out one batch of broker commands. The encoding is
+/// defined by linux_compat::net::HostBroker::take_commands.
+function performNetwork(stream) {
+  const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
+  let i = 0;
+  const u32 = () => {
+    const value = view.getUint32(i, true);
+    i += 4;
+    return value;
+  };
+  const dest = () => {
+    const ip = `${stream[i]}.${stream[i + 1]}.${stream[i + 2]}.${stream[i + 3]}`;
+    const port = view.getUint16(i + 4, false);
+    i += 6;
+    return { ip, port };
+  };
+  const payload = () => {
+    const len = u32();
+    const bytes = stream.slice(i, i + len);
+    i += len;
+    return bytes;
+  };
+  while (i < stream.length) {
+    const op = stream[i];
+    i += 1;
+    const handle = u32();
+    switch (op) {
+      case 1: {
+        const { ip, port } = dest();
+        if (gateway) openTcp(handle, ip, port);
+        else deliverError(handle, ENETUNREACH);
+        break;
+      }
+      case 2:
+        sendOn(handle, payload());
+        break;
+      case 3:
+        sockets.get(handle)?.socket.send("shutdown");
+        break;
+      case 4:
+        if (gateway) openUdp(handle);
+        else deliverError(handle, ENETUNREACH);
+        break;
+      case 5: {
+        const { ip, port } = dest();
+        const bytes = payload();
+        const frame = new Uint8Array(6 + bytes.length);
+        for (const [slot, part] of ip.split(".").entries()) frame[slot] = Number(part);
+        frame[4] = (port >> 8) & 0xff;
+        frame[5] = port & 0xff;
+        frame.set(bytes, 6);
+        sendOn(handle, frame);
+        break;
+      }
+      case 6: {
+        sockets.get(handle)?.socket.close();
+        sockets.delete(handle);
+        break;
+      }
+      default:
+        throw new Error(`unknown broker opcode ${op}`);
+    }
+  }
+}
+
+/// Runs one turn of the host's side of the network: carry out what the guest
+/// asked for, then wait for a reply. Returns once something was delivered or
+/// the guest's own timer is due, and tells the machine which happened.
+async function pumpNetwork() {
+  performNetwork(netCommands());
+  // The export is a u32; JS reads a wasm i32, so 0xffffffff arrives as -1.
+  const budget = exports.wtw_net_budget_ms() >>> 0;
+  const waitMs = Math.min(
+    budget === NET_BUDGET_UNBOUNDED ? NET_WAIT_CAP_MS : budget,
+    NET_WAIT_CAP_MS,
+  );
+  const before = netEvents;
+  if (waitMs > 0) {
+    // Sleep until a socket delivers something or the guest's own timer is
+    // due. Spinning here would burn the worker for nothing.
+    await new Promise((resolve) => {
+      netWake = resolve;
+      setTimeout(() => {
+        if (netWake === resolve) {
+          netWake = null;
+          resolve();
+        }
+      }, waitMs);
+    });
+  }
+  // Nothing arrived: let the guest's clock advance so its timeouts can fire.
+  if (netEvents === before) exports.wtw_net_expire();
+}
+
+// ---------------------------------------------------------------- terminal
+
+// An interactive process is not a single call: it runs, blocks for a
+// keystroke, and continues. `running` says a pump is in flight, `waiting`
+// says the guest is parked on the terminal until input or a resize arrives.
+let running = false;
+let waiting = false;
 
 async function pump() {
   if (running) return;
@@ -199,6 +447,10 @@ async function pump() {
         postMessage({ type: "waiting" });
         return;
       }
+      if (status === STATUS_AWAITING_NETWORK) {
+        await pumpNetwork();
+        continue;
+      }
       if (status !== STATUS_RUNNING) {
         finish(status);
         return;
@@ -208,6 +460,16 @@ async function pump() {
   } finally {
     running = false;
   }
+}
+
+/// Grants the guest a network, routed through the host's relay. Called before
+/// the process starts; without it `socket(2)` fails and nothing can connect.
+function enableNetwork(url) {
+  if (exports.wtw_net_enable() !== 0) {
+    throw new Error(`network enable failed: ${lastError()}`);
+  }
+  gateway = url.replace(/\/$/, "");
+  postMessage({ type: "status", text: `network enabled via ${gateway}` });
 }
 
 function spawn(path, argv, envp, rows, cols) {
@@ -221,7 +483,7 @@ function spawn(path, argv, envp, rows, cols) {
 
 /// Delivers host keystrokes and restarts the pump if the guest was parked.
 function input(data) {
-  if (exports.wtw_pty_input(...put(data)) !== 0) {
+  if (exports.wtw_pty_input(...stage(data)) !== 0) {
     throw new Error(`terminal input failed: ${lastError()}`);
   }
   if (waiting) {
@@ -247,7 +509,8 @@ self.onmessage = async (event) => {
   const msg = event.data;
   try {
     if (msg.type === "boot") await boot(msg.files, msg.links);
-    if (msg.type === "exec") exec(msg.path, msg.argv, msg.envp);
+    if (msg.type === "network") enableNetwork(msg.gateway);
+    if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {
       spawn(msg.path, msg.argv, msg.envp, msg.rows, msg.cols);
     }
