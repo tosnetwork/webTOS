@@ -64,6 +64,11 @@ pub struct NetSocket {
     pub handle: Option<Handle>,
     /// Destination set by `connect` (TCP peer, or default UDP target).
     pub peer: Option<std::net::SocketAddrV4>,
+    /// Monotone counter bumped on every guest send/recv on this socket.
+    /// Edge-triggered epoll re-arms a delivered edge when it moves: once the
+    /// guest consumed some of the readable data, still-pending bytes are a
+    /// new edge (runtimes that stop reading after a partial fill rely on it).
+    pub activity: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

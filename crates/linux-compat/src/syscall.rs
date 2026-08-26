@@ -1258,6 +1258,7 @@ fn backing_activity(desc: &Description) -> u64 {
         Backing::Pipe { inner, .. } => inner.borrow().activity,
         Backing::SocketPair { rx, tx } => rx.borrow().activity + tx.borrow().activity,
         Backing::EventFd(event) => event.borrow().activity,
+        Backing::Net(socket) => socket.borrow().activity,
         _ => 0,
     }
 }
@@ -2502,10 +2503,13 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                 }
             };
             match result {
-                Ok(crate::net::RecvOutcome::Data(bytes)) => match write_mem(cpu, buf, &bytes) {
-                    Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
-                    Err(errno) => Outcome::Ret(Err(errno)),
-                },
+                Ok(crate::net::RecvOutcome::Data(bytes)) => {
+                    socket.borrow_mut().activity += 1;
+                    match write_mem(cpu, buf, &bytes) {
+                        Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
+                        Err(errno) => Outcome::Ret(Err(errno)),
+                    }
+                }
                 Ok(crate::net::RecvOutcome::Closed) => Outcome::Ret(Ok(0)),
                 Ok(crate::net::RecvOutcome::WouldBlock) => {
                     would_block(env, cpu, Watch::NetReadable(socket))
@@ -2620,6 +2624,10 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 }
                 (crate::fd::SocketKind::Udp, None) => Err(abi::EDESTADDRREQ),
             };
+            drop(inner);
+            if result.is_ok() {
+                socket.borrow_mut().activity += 1;
+            }
             Outcome::Ret(result.map(|n| n as u64))
         }
     }
@@ -2965,6 +2973,7 @@ fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -
         kind,
         handle: None,
         peer: None,
+        activity: 0,
     };
     let flags = abi::O_RDWR | ((sock_type & SOCK_NONBLOCK != 0) as u64 * abi::O_NONBLOCK);
     install_fd(
@@ -3025,6 +3034,9 @@ fn sys_sendto(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     }
     let handle = inner.handle.expect("handle set above");
     let result = broker.borrow_mut().udp_send_to(handle, target, &bytes);
+    if result.is_ok() {
+        inner.activity += 1;
+    }
     Outcome::Ret(result.map(|n| n as u64))
 }
 
@@ -3052,6 +3064,7 @@ fn sys_recvfrom(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     };
     match received {
         Ok(Some((bytes, from))) => {
+            socket.borrow_mut().activity += 1;
             if let Err(errno) = write_mem(cpu, buf, &bytes) {
                 return Outcome::Ret(Err(errno));
             }
