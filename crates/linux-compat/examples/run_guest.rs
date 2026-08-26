@@ -89,12 +89,20 @@ fn main() {
     let output = machine.take_output();
     print!("{}", String::from_utf8_lossy(&output));
     if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
+        let (exe, pid) = machine.current_task();
         let vm = machine.vm_mut();
         let rip = vm.cpu.read_pc();
+        let rsp: u64 = vm
+            .cpu
+            .arch
+            .sleigh
+            .get_varnode("RSP")
+            .map(|v| vm.cpu.read_reg(v))
+            .unwrap_or(0);
         let mut buf = [0u8; 16];
         let _ = vm.cpu.mem.read_bytes(rip, &mut buf, icicle_mem::perm::NONE);
         let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
-        eprintln!("[runner] fault rip={rip:#x} bytes: {hex}");
+        eprintln!("[runner] fault pid={pid} exe={exe} rip={rip:#x} rsp={rsp:#x} bytes: {hex}");
     }
     eprintln!("[runner] exit={exit:?} icount={}", machine.icount());
 }

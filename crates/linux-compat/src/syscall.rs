@@ -37,14 +37,20 @@ fn write_mem(cpu: &mut Cpu, addr: u64, bytes: &[u8]) -> Result<(), u64> {
 }
 
 fn read_cstr(cpu: &mut Cpu, addr: u64) -> Result<Vec<u8>, u64> {
+    read_cstr_limit(cpu, addr, PATH_MAX)
+}
+
+/// Like [`read_cstr`] with an explicit length cap: argv/envp strings may
+/// legally be far longer than a path (the kernel allows 128 KiB each).
+fn read_cstr_limit(cpu: &mut Cpu, addr: u64, max: usize) -> Result<Vec<u8>, u64> {
     let mut out = Vec::new();
     let mut chunk = [0_u8; 64];
     let mut cursor = addr;
-    while out.len() < PATH_MAX {
+    while out.len() < max {
         // Never read past the current page: the string may end just before
         // an unmapped page and a fixed-size chunk read would fault.
         let to_page_end = (PAGE_SIZE - (cursor & (PAGE_SIZE - 1))) as usize;
-        let take = 64.min(PATH_MAX - out.len()).min(to_page_end);
+        let take = 64.min(max - out.len()).min(to_page_end);
         cpu.mem
             .read_bytes(cursor, &mut chunk[..take], perm::NONE)
             .map_err(|_| abi::EFAULT)?;
@@ -74,7 +80,22 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
         Outcome::Ret(result) => {
             let value = match result {
                 Ok(v) => v,
-                Err(errno) => neg(errno),
+                Err(errno) => {
+                    if std::env::var_os("SYSCALL_ERR_TRACE").is_some() {
+                        let path = match nr {
+                            2 => read_cstr(cpu, a0).ok(),
+                            257 | 262 => read_cstr(cpu, a1).ok(),
+                            _ => None,
+                        }
+                        .map(|p| format!(" path={}", p.escape_ascii()))
+                        .unwrap_or_default();
+                        eprintln!(
+                            "[syscall-err] pid={} nr={nr}({a0:#x},{a1:#x},{a2:#x}) -> -{errno}{path}",
+                            env.proc.pid
+                        );
+                    }
+                    neg(errno)
+                }
             };
             tracing::trace!(
                 "[{}:{}] syscall {nr}({a0:#x}, {a1:#x}, {a2:#x}) = {value:#x}",
@@ -323,12 +344,20 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             Ok(sec as u64)
         }
 
-        abi::SYS_GETPID | abi::SYS_GETPGRP | abi::SYS_GETPGID => Ok(env.proc.tgid),
+        abi::SYS_GETPID => Ok(env.proc.tgid),
+        abi::SYS_GETPGRP => Ok(env.proc.pgid),
+        abi::SYS_GETPGID => sys_getpgid(env, a[0]),
+        abi::SYS_SETPGID => sys_setpgid(env, a[0], a[1]),
         abi::SYS_GETTID => Ok(env.proc.pid),
         abi::SYS_GETPPID => Ok(env.proc.ppid),
         abi::SYS_GETUID | abi::SYS_GETGID | abi::SYS_GETEUID | abi::SYS_GETEGID => Ok(0),
         abi::SYS_GETGROUPS => Ok(0),
-        abi::SYS_SETSID => Ok(env.proc.tgid),
+        abi::SYS_SETSID => {
+            // A new session's leader also leads a new process group.
+            let tgid = env.proc.tgid;
+            set_group_pgid(env, tgid, tgid);
+            Ok(tgid)
+        }
         abi::SYS_SET_TID_ADDRESS => {
             env.proc.clear_child_tid = a[0];
             Ok(env.proc.pid)
@@ -336,12 +365,24 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_PRLIMIT64 => sys_prlimit64(cpu, a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
         abi::SYS_PRCTL => {
+            const PR_SET_PDEATHSIG: u64 = 1;
+            const PR_GET_PDEATHSIG: u64 = 2;
             const PR_SET_NAME: u64 = 15;
-            if a[0] == PR_SET_NAME {
-                Ok(0) // thread names are accepted (not displayed anywhere)
-            } else {
-                tracing::debug!("prctl: unsupported option {}", a[0]);
-                Err(abi::EINVAL)
+            match a[0] {
+                // Thread names are accepted (not displayed anywhere).
+                PR_SET_NAME => Ok(0),
+                // Parent-death signals are accepted but not delivered: the
+                // registering child outliving its parent is not modeled, and
+                // spawn preambles (pre_exec) treat a failure here as fatal.
+                PR_SET_PDEATHSIG => Ok(0),
+                PR_GET_PDEATHSIG => {
+                    write_mem(cpu, a[1], &0u32.to_le_bytes())?;
+                    Ok(0)
+                }
+                other => {
+                    tracing::debug!("prctl: unsupported option {other}");
+                    Err(abi::EINVAL)
+                }
             }
         }
         // One virtual CPU: a one-bit affinity mask, and the mask size (in
@@ -1090,6 +1131,10 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
             desc.flags = keep | (arg & (abi::O_APPEND | abi::O_NONBLOCK));
             Ok(0)
         }
+        // Advisory record locks: a single guest has no competing lock
+        // holders, so setting always succeeds and querying reports unlocked
+        // (l_type = F_UNLCK in the caller's struct flock).
+        abi::F_SETLK | abi::F_SETLKW => Ok(0),
         _ => {
             tracing::debug!("fcntl: unsupported cmd {cmd}");
             Err(abi::EINVAL)
@@ -1692,7 +1737,7 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     // A task woken with a pending signal enters its handler before resuming
     // whatever it was doing. The interrupted syscall was parked to restart, so
     // when the handler returns via `rt_sigreturn` the wait is simply retried.
-    if env.proc.pending_signals != 0 {
+    if env.proc.pending_signals & !env.proc.sigmask != 0 {
         deliver_signal(env, cpu);
     }
     true
@@ -1992,7 +2037,10 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
 fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
     const SIG_DFL: u64 = 0;
     const SIG_IGN: u64 = 1;
-    let pending = env.proc.pending_signals;
+    // Only unblocked signals are deliverable; a signal raised while its
+    // handler runs (the handler's own mask blocks it) stays pending until
+    // `rt_sigreturn` restores the mask.
+    let pending = env.proc.pending_signals & !env.proc.sigmask;
     if pending == 0 {
         return;
     }
@@ -2074,6 +2122,12 @@ fn sys_rt_sigreturn(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
             cpu.restore(&snapshot);
             cpu.icount = icount;
             env.proc.sigmask = mask;
+            // Restoring the mask may make a signal that arrived during the
+            // handler deliverable; enter its handler now (bounded nesting:
+            // each level blocks its own signal).
+            if env.proc.pending_signals & !env.proc.sigmask != 0 {
+                deliver_signal(env, cpu);
+            }
             // The CPU now holds the fully restored pre-signal state (including
             // its resume exception); do not touch RAX.
             Outcome::Switched
@@ -2205,7 +2259,8 @@ fn read_string_vec(cpu: &mut Cpu, mut ptr: u64) -> Result<Vec<Vec<u8>>, u64> {
         if addr == 0 {
             return Ok(out);
         }
-        out.push(read_cstr(cpu, addr)?);
+        // The kernel's per-string argv/envp limit (MAX_ARG_STRLEN).
+        out.push(read_cstr_limit(cpu, addr, 128 * 1024)?);
         ptr += 8;
     }
     Err(abi::E2BIG)
@@ -2750,6 +2805,47 @@ fn signal_is_nonfatal(env: &LinuxEnv, signal: u64) -> bool {
 
 /// `kill`/`tgkill`. Fatal signals terminate (handler delivery is not
 /// modeled); ignorable or handled signals are dropped with a log line.
+/// Sets the pgid of every thread in `tgid` (the current task included).
+/// Returns false when no such process exists.
+fn set_group_pgid(env: &mut LinuxEnv, tgid: u64, pgid: u64) -> bool {
+    let mut found = false;
+    if env.proc.tgid == tgid {
+        env.proc.pgid = pgid;
+        found = true;
+    }
+    for task in &mut env.sched.parked {
+        if task.proc.tgid == tgid {
+            task.proc.pgid = pgid;
+            found = true;
+        }
+    }
+    found
+}
+
+fn sys_getpgid(env: &mut LinuxEnv, pid: u64) -> SysResult {
+    if pid == 0 || pid == env.proc.tgid {
+        return Ok(env.proc.pgid);
+    }
+    env.sched
+        .parked
+        .iter()
+        .find(|t| t.proc.tgid == pid)
+        .map(|t| t.proc.pgid)
+        .ok_or(abi::ESRCH)
+}
+
+/// `setpgid(pid, pgid)`: joins (or creates) a process group. Session
+/// boundaries are not modeled, so membership checks reduce to existence.
+fn sys_setpgid(env: &mut LinuxEnv, pid: u64, pgid: u64) -> SysResult {
+    let target = if pid == 0 { env.proc.tgid } else { pid };
+    let group = if pgid == 0 { target } else { pgid };
+    if set_group_pgid(env, target, group) {
+        Ok(0)
+    } else {
+        Err(abi::ESRCH)
+    }
+}
+
 fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outcome {
     let target = target as u32 as i32 as i64;
     if signal == 0 {
@@ -2770,31 +2866,66 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
         tracing::warn!("task killed itself with signal {signal} (no handler delivery)");
         return task_exit(env, cpu, 128 + signal as i32, true);
     }
-    if target <= 0 {
-        // Group signals are not modeled.
+    // Group target: `-pgid` (or 0 = the caller's own group) fans out to
+    // every member process. `-1` (all processes) is not modeled.
+    let victims: Vec<u64> = if target == -1 {
         return Outcome::Ret(Err(abi::ESRCH));
-    }
-
-    let target = target as u64;
-    let mut found = false;
-    let mut index = 0;
-    while index < env.sched.parked.len() {
-        if env.sched.parked[index].proc.tgid == target {
-            let task = env.sched.parked.remove(index);
-            found = true;
-            if task.proc.pid == task.proc.tgid {
-                env.sched.zombies.push(Zombie {
-                    pid: task.proc.tgid,
-                    ppid: task.proc.ppid,
-                    status: 128 + signal as i32,
-                });
-            }
+    } else if target <= 0 {
+        let pgid = if target == 0 {
+            env.proc.pgid
         } else {
-            index += 1;
+            (-target) as u64
+        };
+        let mut tgids: Vec<u64> = env
+            .sched
+            .parked
+            .iter()
+            .filter(|t| t.proc.pgid == pgid && t.proc.tgid != env.proc.tgid)
+            .map(|t| t.proc.tgid)
+            .collect();
+        tgids.sort_unstable();
+        tgids.dedup();
+        if tgids.is_empty() && env.proc.pgid != pgid {
+            return Outcome::Ret(Err(abi::ESRCH));
         }
-    }
-    if found && !env.sched.group_has_parked(target) {
-        env.sched.group_maps.remove(&target);
+        // The caller's own group membership is intentionally not fatal to
+        // the caller here; a self-directed group signal would need handler
+        // delivery, which `signal_is_nonfatal` above already routed.
+        tgids
+    } else {
+        vec![target as u64]
+    };
+
+    let mut found = false;
+    for target in victims {
+        let mut hit = false;
+        let mut index = 0;
+        while index < env.sched.parked.len() {
+            if env.sched.parked[index].proc.tgid == target {
+                let mut task = env.sched.parked.remove(index);
+                hit = true;
+                // A forcibly killed vfork child must still release its
+                // suspended parent, and the parent still gets SIGCHLD so a
+                // self-pipe reaper can collect the zombie.
+                if let Some(done) = task.proc.vfork_done.take() {
+                    done.set(true);
+                }
+                if task.proc.pid == task.proc.tgid {
+                    env.sched.zombies.push(Zombie {
+                        pid: task.proc.tgid,
+                        ppid: task.proc.ppid,
+                        status: 128 + signal as i32,
+                    });
+                    notify_parent_sigchld(env, task.proc.ppid);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if hit && !env.sched.group_has_parked(target) {
+            env.sched.group_maps.remove(&target);
+        }
+        found |= hit;
     }
     Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) })
 }
@@ -3140,8 +3271,21 @@ fn sys_socketpair(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     if domain != AF_UNIX {
         return Err(abi::EAFNOSUPPORT);
     }
-    if sock_type & SOCK_TYPE_MASK != SOCK_STREAM {
-        return Err(abi::EPROTONOSUPPORT);
+    // Stream pairs are exact; datagram/seqpacket pairs are approximated as
+    // byte streams (message boundaries are not preserved).
+    const SOCK_SEQPACKET: u64 = 5;
+    match sock_type & SOCK_TYPE_MASK {
+        SOCK_STREAM => {}
+        SOCK_DGRAM | SOCK_SEQPACKET => {
+            tracing::debug!(
+                "socketpair: type {} approximated as a byte stream",
+                sock_type & SOCK_TYPE_MASK
+            );
+        }
+        other => {
+            tracing::warn!("socketpair: unsupported type {other}");
+            return Err(abi::EPROTONOSUPPORT);
+        }
     }
     use crate::fd::PipeInner;
     let make_pipe = || {

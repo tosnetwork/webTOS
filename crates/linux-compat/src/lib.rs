@@ -38,7 +38,11 @@ use vfs::{NodeKind, Vfs};
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
-const STACK_SIZE: u64 = 0x80_0000; // 8 MiB
+// 16 MiB: the kernel's default RLIMIT_STACK is 8 MiB, but argv/envp/auxv
+// consume the top of the region here, and a real workload's helper process
+// faulted exactly 8 bytes below an 8 MiB stack. Pages are demand-allocated,
+// so the extra headroom costs address space only.
+const STACK_SIZE: u64 = 0x100_0000; // 16 MiB
 pub(crate) const MMAP_BASE: u64 = 0x6000_0000_0000;
 /// A pipe write blocks once this much data is buffered.
 pub(crate) const PIPE_CAPACITY: usize = 0x10_0000;
@@ -648,6 +652,16 @@ impl Machine {
         let exit = self.vm.run();
         let code = self.env().exit_code();
         classify_exit(&self.vm, exit, code)
+    }
+
+    /// The executable path and pid of the task currently on the CPU, for
+    /// crash diagnostics.
+    pub fn current_task(&mut self) -> (String, u64) {
+        let env = self.env();
+        (
+            String::from_utf8_lossy(&env.proc.exe_path).into_owned(),
+            env.proc.pid,
+        )
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {

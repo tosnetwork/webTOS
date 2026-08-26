@@ -90,6 +90,7 @@ pub const SYS_GETGID: u64 = 104;
 pub const SYS_GETEUID: u64 = 107;
 pub const SYS_GETEGID: u64 = 108;
 pub const SYS_GETPPID: u64 = 110;
+pub const SYS_SETPGID: u64 = 109;
 pub const SYS_GETPGRP: u64 = 111;
 pub const SYS_SETSID: u64 = 112;
 pub const SYS_GETGROUPS: u64 = 115;
@@ -217,6 +218,8 @@ pub const F_GETFD: u64 = 1;
 pub const F_SETFD: u64 = 2;
 pub const F_GETFL: u64 = 3;
 pub const F_SETFL: u64 = 4;
+pub const F_SETLK: u64 = 6;
+pub const F_SETLKW: u64 = 7;
 pub const F_DUPFD_CLOEXEC: u64 = 1030;
 pub const FD_CLOEXEC: u64 = 1;
 

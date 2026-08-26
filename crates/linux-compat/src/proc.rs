@@ -33,6 +33,9 @@ pub struct Process {
     /// Thread-group id: `getpid` reports this; threads share it.
     pub tgid: u64,
     pub ppid: u64,
+    /// Process-group id (job control): inherited across fork, changed by
+    /// `setpgid`/`setsid`. Signals sent to `-pgid` reach the whole group.
+    pub pgid: u64,
     /// Shared with sibling threads (`CLONE_FILES`); `fork` deep-clones the
     /// table (entries still share open file descriptions).
     pub fds: Rc<RefCell<FdTable>>,
@@ -73,6 +76,7 @@ impl Process {
             pid: ROOT_PID,
             tgid: ROOT_PID,
             ppid: 1,
+            pgid: ROOT_PID,
             fds: Rc::new(RefCell::new(FdTable::new())),
             cwd: crate::vfs::ROOT,
             umask: 0o022,
@@ -97,6 +101,7 @@ impl Process {
             pid,
             tgid: pid,
             ppid: self.tgid,
+            pgid: self.pgid,
             fds: Rc::new(RefCell::new(self.fds.borrow().clone())),
             cwd: self.cwd,
             umask: self.umask,
@@ -123,6 +128,7 @@ impl Process {
             pid: tid,
             tgid: self.tgid,
             ppid: self.ppid,
+            pgid: self.pgid,
             fds: Rc::clone(&self.fds),
             cwd: self.cwd,
             umask: self.umask,
