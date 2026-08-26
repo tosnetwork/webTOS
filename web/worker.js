@@ -12,15 +12,27 @@
 //                                     -- allow the guest to reach the network
 //                                        through that relay; without it the
 //                                        guest has no network at all
+//               { type: "image", path, url, mode }
+//                                     -- stream a large guest image in from
+//                                        `url`, cached in OPFS so a reload
+//                                        does not download it again
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
 //               { type: "output", text },
+//               { type: "progress", path, loaded, total, cached }
+//               { type: "image", path, bytes, cached }  -- one image is in
 //               { type: "waiting" }   -- the guest is blocked on the terminal
 //               { type: "done", status, error, exitCode, icount },
 //               { type: "persisted", bytes }, { type: "error", text }
 
 const SNAPSHOT_FILE = "webtos-fs.bin";
+/// Directory inside OPFS holding downloaded guest images.
+const IMAGE_CACHE = "webtos-images";
+/// Bytes moved per step while streaming an image. Small enough that the
+/// module's staging buffer stays modest, large enough that a 100 MB image
+/// does not cost a hundred thousand calls.
+const IMAGE_CHUNK = 4 << 20;
 /// Guest instructions per slice. Bounds how long the worker goes without
 /// draining output or reading its own message queue.
 const FUEL = 5_000_000;
@@ -76,6 +88,170 @@ async function opfsDelete(name) {
     await root.removeEntry(name);
   } catch {
     // Nothing to delete.
+  }
+}
+
+// ------------------------------------------------------------------ images
+
+// An agent image is two orders of magnitude larger than BusyBox, and the
+// obvious way to load one — fetch it whole, postMessage it, hand it to
+// wtw_alloc — holds three copies at once, which on wasm32 is fatal. So the
+// worker fetches it itself, writes it to an OPFS cache and into the guest as
+// the bytes arrive, and never holds more than one chunk.
+
+async function imageCacheDir(create) {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(IMAGE_CACHE, { create });
+}
+
+/// The cache name for an image: its guest path, flattened. Two images at the
+/// same guest path are the same image as far as a session is concerned.
+const cacheName = (path) => path.replace(/[^A-Za-z0-9._-]/g, "_");
+
+/// Feeds an image into the guest filesystem in chunks.
+function guestWriter(path, size, mode) {
+  // The path is copied into the module once and reused by every chunk.
+  const [pathPtr, pathLen] = put(path);
+  if (exports.wtw_file_create(pathPtr, pathLen, size, mode) !== 0) {
+    throw new Error(`create ${path}: ${lastError()}`);
+  }
+  return (chunk) => {
+    if (exports.wtw_file_append(pathPtr, pathLen, ...stage(chunk)) !== 0) {
+      throw new Error(`append ${path}: ${lastError()}`);
+    }
+  };
+}
+
+/// Reads a cached image out of OPFS and into the guest, without ever holding
+/// the whole file: the slices come straight off the File handle.
+async function loadFromCache(handle, path, mode) {
+  const file = await handle.getFile();
+  const write = guestWriter(path, file.size, mode);
+  let loaded = 0;
+  while (loaded < file.size) {
+    const end = Math.min(loaded + IMAGE_CHUNK, file.size);
+    write(new Uint8Array(await file.slice(loaded, end).arrayBuffer()));
+    loaded = end;
+    postMessage({ type: "progress", path, loaded, total: file.size, cached: true });
+  }
+  return file.size;
+}
+
+/// Downloads an image, writing it into the guest and the cache as it arrives.
+async function loadFromNetwork(url, path, mode) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  const total = Number(response.headers.get("content-length")) || 0;
+  const write = guestWriter(path, total, mode);
+
+  // The cache is written under a temporary name and renamed at the end, so an
+  // interrupted download cannot be mistaken for a complete image later.
+  let sink = null;
+  let temporary = null;
+  if (storageReady) {
+    try {
+      const dir = await imageCacheDir(true);
+      temporary = `${cacheName(path)}.partial`;
+      sink = await (await dir.getFileHandle(temporary, { create: true })).createWritable();
+    } catch {
+      sink = null; // Caching is an optimisation; the run continues without it.
+    }
+  }
+
+  const reader = response.body.getReader();
+  let loaded = 0;
+  // Accumulate small network reads into one guest write.
+  let pending = [];
+  let pendingBytes = 0;
+  const flush = async () => {
+    if (pendingBytes === 0) return;
+    const chunk = pending.length === 1 ? pending[0] : concat(pending, pendingBytes);
+    write(chunk);
+    if (sink) await sink.write(chunk);
+    pending = [];
+    pendingBytes = 0;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pending.push(value);
+    pendingBytes += value.length;
+    loaded += value.length;
+    if (pendingBytes >= IMAGE_CHUNK) {
+      await flush();
+      postMessage({ type: "progress", path, loaded, total, cached: false });
+    }
+  }
+  await flush();
+  postMessage({ type: "progress", path, loaded, total: total || loaded, cached: false });
+
+  if (sink) {
+    await sink.close();
+    try {
+      const dir = await imageCacheDir(true);
+      // Rename is not available on every engine, so the completed image is
+      // copied into place and the partial removed.
+      const source = await (await dir.getFileHandle(temporary)).getFile();
+      const target = await (await dir.getFileHandle(cacheName(path), { create: true })).createWritable();
+      await target.write(source);
+      await target.close();
+      await dir.removeEntry(temporary);
+    } catch {
+      // A cache that could not be completed is simply absent next time.
+    }
+  }
+  return loaded;
+}
+
+function concat(parts, total) {
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+}
+
+/// The cached copy of an image, or null when there is none to trust. A
+/// rebuilt image keeps its name, so the cache is only used when the server
+/// still reports the size that was stored.
+async function cachedImage(path, url) {
+  try {
+    const dir = await imageCacheDir(false);
+    const handle = await dir.getFileHandle(cacheName(path));
+    const file = await handle.getFile();
+    const head = await fetch(url, { method: "HEAD" }).catch(() => null);
+    const size = head?.ok ? Number(head.headers.get("content-length")) : 0;
+    if (size && size !== file.size) return null;
+    return handle;
+  } catch {
+    return null; // Not cached yet, or the cache is unusable.
+  }
+}
+
+async function loadImage({ path, url, mode = 0o755 }) {
+  postMessage({ type: "status", text: `loading ${path}…` });
+  if (storageReady) {
+    const handle = await cachedImage(path, url);
+    if (handle) {
+      const bytes = await loadFromCache(handle, path, mode);
+      postMessage({ type: "image", path, bytes, cached: true });
+      return;
+    }
+  }
+  const bytes = await loadFromNetwork(url, path, mode);
+  postMessage({ type: "image", path, bytes, cached: false });
+}
+
+/// Deletes every cached image.
+async function forgetImages() {
+  if (!storageReady) return;
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(IMAGE_CACHE, { recursive: true });
+  } catch {
+    // Nothing cached.
   }
 }
 
@@ -509,6 +685,7 @@ self.onmessage = async (event) => {
   const msg = event.data;
   try {
     if (msg.type === "boot") await boot(msg.files, msg.links);
+    if (msg.type === "image") await loadImage(msg);
     if (msg.type === "network") enableNetwork(msg.gateway);
     if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {
@@ -520,6 +697,7 @@ self.onmessage = async (event) => {
     if (msg.type === "forget") {
       if (!storageReady) throw new Error("browser storage is unavailable here");
       await opfsDelete(SNAPSHOT_FILE);
+      await forgetImages();
       postMessage({ type: "status", text: "saved filesystem deleted" });
     }
   } catch (e) {

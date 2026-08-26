@@ -7,7 +7,8 @@
 //! single-threaded, so the thread-local state is effectively global.
 //!
 //! Call sequence per process: `wtw_init` once; then `wtw_add_file` for the
-//! guest image and root filesystem, `wtw_arg`/`wtw_env` to stage argv and
+//! guest image and root filesystem (or `wtw_file_create` +
+//! `wtw_file_append` to stream a large one in), `wtw_arg`/`wtw_env` to stage argv and
 //! envp, `wtw_load` with the guest path, and `wtw_run` in fuel slices,
 //! draining output with `wtw_output_*` after each slice. The filesystem
 //! persists across `wtw_load` calls. Any `-1` return leaves a message
@@ -166,6 +167,48 @@ pub extern "C" fn wtw_add_file(path_ptr: u32, path_len: u32, data_ptr: u32, data
         let path = unsafe { slice_arg(path_ptr, path_len) };
         let data = unsafe { slice_arg(data_ptr, data_len) };
         match machine.add_file(&path, data, 0o755) {
+            Ok(()) => 0,
+            Err(e) => fail(state, e),
+        }
+    })
+}
+
+/// Starts a file the host will deliver in pieces, reserving `capacity` bytes.
+/// An agent image runs to hundreds of megabytes, so it arrives as a stream:
+/// `wtw_file_create` once, `wtw_file_append` per piece. Passing the whole
+/// image through `wtw_alloc` instead would hold a second copy of it for the
+/// module's lifetime, which on wasm32 is the difference between fitting and
+/// not.
+#[no_mangle]
+pub extern "C" fn wtw_file_create(path_ptr: u32, path_len: u32, capacity: u32, mode: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_file_create called before wtw_init");
+        };
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        match machine.create_file(&path, capacity as usize, mode) {
+            Ok(()) => 0,
+            Err(e) => fail(state, e),
+        }
+    })
+}
+
+/// Appends one piece to a file started with `wtw_file_create`. The bytes are
+/// copied, so the host may stage them in the scratch buffer.
+#[no_mangle]
+pub extern "C" fn wtw_file_append(
+    path_ptr: u32,
+    path_len: u32,
+    data_ptr: u32,
+    data_len: u32,
+) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_file_append called before wtw_init");
+        };
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let data = unsafe { slice_arg(data_ptr, data_len) };
+        match machine.append_file(&path, &data) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
         }

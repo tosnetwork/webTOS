@@ -2,11 +2,14 @@
 
 **Status: all milestone-6 workload gates pass natively — version, help,
 configuration persistence, the scripted network agent task, secret
-injection, crash bundles, and a compressed soak.**
+injection, crash bundles, and a compressed soak — and the image now runs in a
+browser: it streams into the guest filesystem and an OPFS cache, reaches a
+shell prompt in about three seconds, and executes in Chromium, Firefox, and
+WebKit.**
 
 OpenFox is the first real agent workload (roadmap milestone 6): a static Go
-binary (~97 MB with embedded assets) exercising the whole Go runtime on the
-webTOS Linux layer.
+binary — tens of megabytes, 52 MB for the build these gates were last run
+against — exercising the whole Go runtime on the webTOS Linux layer.
 
 ## Fixture
 
@@ -76,8 +79,23 @@ Each invocation retires ~60 M instructions (a few seconds native).
   physical pages, so a long-lived machine exhausted memory; `start_image`
   now fully clears physical memory when no other task is alive.
 
+## Browser delivery
+
+The image is never held whole. `web/worker.js` fetches it itself and writes it
+into the guest filesystem and an OPFS cache as the bytes arrive, through
+`wtw_file_create` + `wtw_file_append`; the module reserves the final size once
+and appends into it. Buffering the image in the page, transferring it to the
+worker, and copying it through `wtw_alloc` would hold three copies at once,
+which wasm32 does not have room for.
+
+Open `terminal.html?image=openfox` after `web/build.sh` has staged it. The
+first load downloads; later loads come from the cache, which is invalidated
+when the server reports a different size (a rebuilt image keeps its name).
+`web/test_browsers.mjs` gates delivery, integrity, and one real run per engine.
+
 ## Not yet covered
 
-- Browser delivery of the 97 MB image (interpreter throughput makes this a
-  post-M8 concern) and the full 60-minute interactive soak (the bounded
-  25-round soak is the CI-friendly proxy).
+- The full 60-minute interactive soak (the bounded 25-round soak is the
+  CI-friendly proxy).
+- Interpreter throughput: `openfox --help` takes about 20 seconds in Chromium
+  and longer in Firefox, so sustained interactive use waits on milestone 8.

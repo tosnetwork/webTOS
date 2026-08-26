@@ -74,7 +74,7 @@
   fit.fit();
   // The browser matrix drives this page; it reads the rendered screen and
   // the live state from here rather than scraping the DOM canvas.
-  window.webtos = { term, state: "starting" };
+  window.webtos = { term, state: "starting", images: [] };
 
   const worker = new Worker(new URL("./worker.js", import.meta.url));
   let live = false;
@@ -83,11 +83,42 @@
   const params = new URLSearchParams(location.search);
   const gateway = params.get("gateway");
   const resolver = params.get("dns") ?? "1.1.1.1";
+  // Extra guest images, streamed in beside BusyBox: ?image=NAME fetches
+  // ./NAME into /bin/NAME. An agent image is tens or hundreds of megabytes,
+  // so it is never held in this page — the worker streams it into the guest
+  // and into an OPFS cache as it arrives.
+  const extraImages = params.getAll("image");
   if (gateway) {
     document.getElementById("netnote").textContent =
       `Network relayed through ${gateway}; resolver ${resolver}. The relay's` +
       " allowlist, not this page, decides what is reachable.";
   }
+
+  // BusyBox and any extra images arrive the same way; the shell starts once
+  // every one is in the guest filesystem.
+  const wanted = new Map([["/bin/busybox", "./busybox-musl"]]);
+  for (const name of extraImages) wanted.set(`/bin/${name}`, `./${name}`);
+  const outstanding = new Set(wanted.keys());
+
+  const startShell = () => {
+    if (gateway) worker.postMessage({ type: "network", gateway });
+    // The guest's terminal is created at the size the tab actually has.
+    worker.postMessage({
+      type: "spawn",
+      path: "/bin/busybox",
+      argv: ["sh", "-i"],
+      envp: [
+        "PATH=/bin:/usr/bin",
+        "HOME=/root",
+        "TERM=xterm-256color",
+        "PS1=webtos:\\w$ ",
+      ],
+      rows: term.rows,
+      cols: term.cols,
+    });
+    live = true;
+    window.webtos.state = "running";
+  };
 
   worker.onmessage = (event) => {
     const msg = event.data;
@@ -96,23 +127,18 @@
       statusEl.textContent += msg.restored
         ? " — previous session restored"
         : " — filesystem ready";
-      if (gateway) worker.postMessage({ type: "network", gateway });
-      // The guest's terminal is created at the size the tab actually has.
-      worker.postMessage({
-        type: "spawn",
-        path: "/bin/busybox",
-        argv: ["sh", "-i"],
-        envp: [
-          "PATH=/bin:/usr/bin",
-          "HOME=/root",
-          "TERM=xterm-256color",
-          "PS1=webtos:\\w$ ",
-        ],
-        rows: term.rows,
-        cols: term.cols,
-      });
-      live = true;
-      window.webtos.state = "running";
+      for (const [path, url] of wanted) worker.postMessage({ type: "image", path, url });
+    }
+    if (msg.type === "progress") {
+      const mb = (n) => (n / (1 << 20)).toFixed(1);
+      statusEl.textContent = msg.total
+        ? `${msg.cached ? "restoring" : "downloading"} ${msg.path} — ${mb(msg.loaded)} / ${mb(msg.total)} MB`
+        : `${msg.cached ? "restoring" : "downloading"} ${msg.path} — ${mb(msg.loaded)} MB`;
+    }
+    if (msg.type === "image") {
+      window.webtos.images.push(msg);
+      outstanding.delete(msg.path);
+      if (outstanding.size === 0) startShell();
     }
     if (msg.type === "output") term.write(msg.text);
     if (msg.type === "waiting") {
@@ -156,43 +182,28 @@
   });
   window.addEventListener("resize", () => fit.fit());
 
-  async function fetchBytes(url) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-    return response.arrayBuffer();
-  }
-
-  (async () => {
-    try {
-      statusEl.textContent = "fetching BusyBox image…";
-      const busybox = await fetchBytes("./busybox-musl");
-      const notes = new TextEncoder().encode(
-        "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
-      ).buffer;
-      const resolvConf = new TextEncoder().encode(`nameserver ${resolver}\n`).buffer;
-      // One image, many commands: BusyBox picks its applet from argv[0], so
-      // each name on PATH is a link to the same binary.
-      const applets = [
-        "sh", "ls", "cat", "echo", "vi", "grep", "wc", "head", "tail",
-        "mkdir", "rm", "cp", "mv", "touch", "date", "uname", "ps", "env",
-        "wget", "nslookup", "ping", "stty", "tty", "sleep", "sort", "sed",
-      ];
-      worker.postMessage(
-        {
-          type: "boot",
-          files: [
-            { path: "/bin/busybox", bytes: busybox },
-            { path: "/root/notes.txt", bytes: notes },
-            { path: "/etc/resolv.conf", bytes: resolvConf },
-          ],
-          links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
-        },
-        [busybox, notes, resolvConf],
-      );
-    } catch (e) {
-      statusEl.textContent = `${e} — run web/build.sh first (and tools/fetch_busybox.sh)`;
-    }
-  })();
+  const notes = new TextEncoder().encode(
+    "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
+  ).buffer;
+  const resolvConf = new TextEncoder().encode(`nameserver ${resolver}\n`).buffer;
+  // One image, many commands: BusyBox picks its applet from argv[0], so each
+  // name on PATH is a link to the same binary.
+  const applets = [
+    "sh", "ls", "cat", "echo", "vi", "grep", "wc", "head", "tail",
+    "mkdir", "rm", "cp", "mv", "touch", "date", "uname", "ps", "env",
+    "wget", "nslookup", "ping", "stty", "tty", "sleep", "sort", "sed", "md5sum",
+  ];
+  worker.postMessage(
+    {
+      type: "boot",
+      files: [
+        { path: "/root/notes.txt", bytes: notes },
+        { path: "/etc/resolv.conf", bytes: resolvConf },
+      ],
+      links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
+    },
+    [notes, resolvConf],
+  );
 
   term.focus();
 </script>

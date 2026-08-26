@@ -334,6 +334,24 @@ impl LinuxEnv {
             .map_err(|e| format!("cannot add {}: errno {e}", path.escape_ascii()))
     }
 
+    /// Starts a file that will be delivered in pieces, reserving room for
+    /// `capacity` bytes. An agent image is hundreds of megabytes; buffering
+    /// one whole copy on the way in is the difference between fitting in a
+    /// tab and not.
+    pub fn create_file(&mut self, path: &[u8], capacity: usize, mode: u32) -> Result<(), String> {
+        self.vfs
+            .create_file_with_capacity(path, capacity, mode)
+            .map(|_| ())
+            .map_err(|e| format!("cannot create {}: errno {e}", path.escape_ascii()))
+    }
+
+    /// Appends one piece to a file started with [`create_file`].
+    pub fn append_file(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), String> {
+        self.vfs
+            .append_file(path, bytes)
+            .map_err(|e| format!("cannot append to {}: errno {e}", path.escape_ascii()))
+    }
+
     /// Adds a symlink at `path` pointing at `target`. Multi-call binaries
     /// select their behaviour from `argv[0]`, so a link is how one image
     /// becomes many commands on `PATH`.
@@ -702,6 +720,16 @@ impl Machine {
     /// Adds a symlink to the guest filesystem.
     pub fn add_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), String> {
         self.env().add_symlink(path, target)
+    }
+
+    /// Starts a file delivered in pieces; see [`LinuxEnv::create_file`].
+    pub fn create_file(&mut self, path: &[u8], capacity: usize, mode: u32) -> Result<(), String> {
+        self.env().create_file(path, capacity, mode)
+    }
+
+    /// Appends one piece to a file started with [`create_file`](Self::create_file).
+    pub fn append_file(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), String> {
+        self.env().append_file(path, bytes)
     }
 
     /// Recursively copies a host directory tree into the guest filesystem,

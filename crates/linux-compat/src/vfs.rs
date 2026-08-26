@@ -250,6 +250,36 @@ impl Vfs {
         Ok(node)
     }
 
+    /// Creates an empty file at `path` with room reserved for `capacity`
+    /// bytes, so a large image delivered in pieces does not repeatedly
+    /// reallocate and briefly hold two copies of itself.
+    pub fn create_file_with_capacity(
+        &mut self,
+        path: &[u8],
+        capacity: usize,
+        mode: u32,
+    ) -> Result<usize, u64> {
+        let mut data = Vec::new();
+        data.try_reserve_exact(capacity).map_err(|_| abi::ENOMEM)?;
+        self.add_node(path, NodeKind::File(data), mode)
+    }
+
+    /// Appends to the regular file at `path`. Paired with
+    /// [`create_file_with_capacity`] this is how a host streams an image in
+    /// without ever holding the whole thing twice.
+    pub fn append_file(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), u64> {
+        let resolved = self.resolve(ROOT, path, true)?;
+        let node = resolved.node.ok_or(abi::ENOENT)?;
+        match &mut self.nodes[node].kind {
+            NodeKind::File(data) => {
+                data.try_reserve(bytes.len()).map_err(|_| abi::ENOMEM)?;
+                data.extend_from_slice(bytes);
+                Ok(())
+            }
+            _ => Err(abi::EISDIR),
+        }
+    }
+
     /// Creates the directory chain for `path` and returns its node.
     pub fn mkdir_p(&mut self, path: &[u8]) -> Result<usize, u64> {
         let mut current = ROOT;

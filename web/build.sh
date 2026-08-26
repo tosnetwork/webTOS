@@ -11,6 +11,9 @@ if [ -f test_data/busybox-musl ]; then
 else
     echo "note: test_data/busybox-musl missing; run tools/fetch_busybox.sh for the BusyBox demo"
 fi
+if [ -f test_data/openfox ]; then
+    cp test_data/openfox web/
+fi
 if [ ! -f web/vendor/xterm/xterm.js ]; then
     echo "note: web/vendor/xterm missing; run tools/fetch_xterm.sh for the terminal demo"
 fi

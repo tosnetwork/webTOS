@@ -6,8 +6,9 @@
 // BusyBox applets, "Save FS", a browser reload, and a read-back of the
 // restored filesystem. Phase B drives web/worker.js directly on a blank page
 // to cover the static and dynamically linked hello binaries. Phase C drives
-// the interactive terminal — a real shell on a pty, a full-screen editor, a
-// window resize, and a real HTTP fetch through the network gateway. Phase D
+// the interactive terminal — streamed guest images, a real shell on a pty, a
+// full-screen editor, a window resize, and a real HTTP fetch through the
+// network gateway. Phase D
 // reruns the one-shot demo in a storage-less profile to prove the host
 // degrades cleanly.
 //
@@ -24,6 +25,8 @@
 // Usage:  node web/test_browsers.mjs [--engines=chromium,firefox,webkit] [--headed]
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, extname } from "node:path";
@@ -83,18 +86,34 @@ async function startServer() {
     // repository and nothing above it.
     const file = join(REPO, normalize(path).replace(/^(\.\.[/\\])+/, ""));
     try {
-      if (!(await stat(file)).isFile()) throw new Error("not a file");
+      const info = await stat(file);
+      if (!info.isFile()) throw new Error("not a file");
       res.writeHead(200, {
         "content-type": MIME[extname(file)] ?? "application/octet-stream",
+        "content-length": info.size,
         "cache-control": "no-store",
       });
-      res.end(await readFile(file));
+      // Streamed, not buffered: a guest image runs to tens of megabytes and
+      // the point of the test is that nothing holds one whole.
+      createReadStream(file).pipe(res);
     } catch {
       res.writeHead(404).end("not found");
     }
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
+}
+
+/// The md5 of a staged image, computed without holding it in memory, so the
+/// guest's own md5sum can be compared against it.
+function md5OfFile(path) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("md5");
+    createReadStream(path)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
 }
 
 /// Starts the relay with a single rule: the harness's own static server. It
@@ -239,8 +258,11 @@ const statusRow = (page) =>
     return { row, rows: window.webtos.term.rows };
   });
 
-async function runTerminalPhase(page, origin, name, record, gateway) {
-  await page.goto(`${origin}/web/terminal.html?gateway=${encodeURIComponent(gateway.url)}`);
+async function runTerminalPhase(page, origin, name, record, gateway, images) {
+  const query = [`gateway=${encodeURIComponent(gateway.url)}`]
+    .concat(images.agent ? ["image=openfox"] : [])
+    .join("&");
+  await page.goto(`${origin}/web/terminal.html?${query}`);
   const vendored = await page.evaluate(() => typeof window.Terminal === "function");
   if (!vendored) {
     record("terminal: emulator vendored", false, "run tools/fetch_xterm.sh");
@@ -251,6 +273,46 @@ async function runTerminalPhase(page, origin, name, record, gateway) {
   });
   const [cols, rows] = await terminalSize(page);
   record("terminal: interactive shell reaches a prompt", true, `${cols}x${rows}`);
+
+  // Images are streamed into the guest in chunks; a hash the guest computes
+  // itself is what says every chunk landed, in order, exactly once.
+  const hashed = await typeLine(page, "md5sum /bin/busybox", "^[0-9a-f]{32} ");
+  record(
+    "images: a streamed image arrives intact",
+    hashed.includes(images.busyboxMd5),
+    `the guest hashes /bin/busybox to ${images.busyboxMd5.slice(0, 12)}…`,
+  );
+
+  if (images.agent) {
+    // `ls -l` reads the size from the guest's own directory entry. `wc -c`
+    // would read all 52 MB back through the interpreter, which takes minutes.
+    const sized = await typeLine(page, "ls -l /bin/openfox; echo sized$?", "^sized[0-9]+$");
+    record(
+      "images: a whole agent image is delivered",
+      sized.includes(String(images.agentSize)),
+      `${(images.agentSize / (1 << 20)).toFixed(0)} MB streamed into the guest filesystem`,
+    );
+
+    // The point of delivering it: it runs.
+    const ran = await typeLine(page, "openfox --help; echo agent$?", "^agent[0-9]+$");
+    record(
+      "images: the agent image runs in the browser",
+      /openfox/i.test(ran) && /^agent0$/m.test(ran),
+      "a real Linux x86-64 agent binary, executed in a tab",
+    );
+  }
+
+  // Downloaded once: a reload must serve every image from the cache.
+  await page.reload();
+  await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
+    timeout: EXEC_TIMEOUT,
+  });
+  const restored = await page.evaluate(() => window.webtos.images);
+  record(
+    "images: a reload serves them from the cache",
+    restored.length > 0 && restored.every((image) => image.cached),
+    restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
+  );
 
   const echoed = await typeLine(page, `echo hello-from-${name}`, `hello-from-${name}`);
   record(
@@ -379,7 +441,7 @@ const icountOf = (status) => {
   return match ? Number(match[1].replace(/,/g, "")) : null;
 };
 
-async function runEngine(name, origin, gateway) {
+async function runEngine(name, origin, gateway, images) {
   const checks = [];
   const fingerprint = {};
   const record = (label, ok, detail = "") => {
@@ -513,7 +575,7 @@ async function runEngine(name, origin, gateway) {
     }
 
     // ---- Phase C: the interactive terminal, including its network.
-    await runTerminalPhase(page, origin, name, record, gateway);
+    await runTerminalPhase(page, origin, name, record, gateway, images);
 
   } catch (e) {
     record("engine run completed", false, String(e));
@@ -563,12 +625,25 @@ async function runEngine(name, origin, gateway) {
 
 const { server, origin } = await startServer();
 const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
+
+// The agent image is not part of the repository (tools/build_openfox_fixture.sh
+// builds it), so its checks run only where it has been staged.
+const agentPath = fileURLToPath(new URL("./openfox", import.meta.url));
+const agentInfo = await stat(agentPath).catch(() => null);
+const images = {
+  busyboxMd5: await md5OfFile(fileURLToPath(new URL("./busybox-musl", import.meta.url))),
+  agent: agentInfo !== null,
+  agentSize: agentInfo?.size ?? 0,
+};
+if (!images.agent) {
+  console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");
+}
 const summary = [];
 const fingerprints = {};
 try {
   for (const name of engines) {
     console.log(`\n=== ${name} ===`);
-    const { checks, fingerprint } = await runEngine(name, origin, gateway);
+    const { checks, fingerprint } = await runEngine(name, origin, gateway, images);
     const failed = checks.filter((c) => !c.ok);
     summary.push({ name, total: checks.length, failed: failed.length });
     fingerprints[name] = fingerprint;

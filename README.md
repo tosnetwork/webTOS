@@ -187,6 +187,21 @@ bash web/build.sh                   # build the wasm module and stage the images
 python3 -m http.server -d web 8080
 ```
 
+Guest images are streamed rather than loaded: the worker fetches an image
+itself, writing it into the guest filesystem and an OPFS cache as the bytes
+arrive, so nothing ever holds a whole one. A 52 MB agent binary reaches a
+shell prompt in about three seconds on the first load and one on the next,
+where buffering it in the page, transferring it, and copying it into the
+module would need three copies at once — which wasm32 does not have room for.
+`?image=NAME` on the terminal page streams `./NAME` into `/bin/NAME`:
+
+```bash
+tools/build_openfox_fixture.sh      # needs the OpenFox source (OPENFOX_SRC)
+bash web/build.sh
+# then open http://localhost:8080/terminal.html?image=openfox
+# and run:  openfox --help
+```
+
 Two pages: `/` runs one-shot BusyBox commands against a filesystem that
 survives reload, and `/terminal.html` is an interactive BusyBox shell on a
 pseudoterminal — it echoes what you type, forks and execs commands through
@@ -237,9 +252,10 @@ node web/test_browsers.mjs          # all three engines; --engines= to narrow
 `web/test_browsers.mjs` drives the demo page the way a user does — BusyBox
 applets, a snapshot, a real page reload, a read-back of the restored
 filesystem — runs the static and dynamically linked fixtures through the
-worker protocol directly, drives the interactive terminal (a shell prompt, a
-pipeline, the full-screen editor, and a resize that repaints without a
-keystroke), starts its own gateway allowing exactly one destination and checks
+worker protocol directly, drives the interactive terminal (a streamed image the guest
+hashes to prove it arrived intact, a shell prompt, a pipeline, the full-screen
+editor, and a resize that repaints without a keystroke), starts its own
+gateway allowing exactly one destination and checks
 both that the guest can fetch over a real socket and that anything else is
 refused, and finally reruns the page in a profile without persistent storage
 to confirm the host reports the missing capability instead of failing at the

@@ -242,3 +242,70 @@ fn filesystem_snapshot_survives_a_new_machine() {
     expect_clean(&run);
     assert_eq!(run.output, "persisted-across-reload\n");
 }
+
+/// Large guest images are delivered in pieces so no host ever holds a whole
+/// one: `create_file` reserves, `append_file` fills. The pieces here are odd
+/// sizes on purpose — a chunk boundary is where an off-by-one shows up — and
+/// the guest reads the result back byte for byte.
+#[test]
+fn a_file_delivered_in_pieces_reads_back_byte_for_byte() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    // Deterministic pseudo-random bytes: a repeating pattern would hide a
+    // chunk delivered twice or out of order.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let payload: Vec<u8> = (0..256 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect();
+
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    machine
+        .create_file(b"/root/streamed.bin", payload.len(), 0o644)
+        .expect("create streamed file");
+    for chunk in payload.chunks(7_919) {
+        machine
+            .append_file(b"/root/streamed.bin", chunk)
+            .expect("append chunk");
+    }
+
+    machine.set_args(
+        vec![
+            b"busybox".to_vec(),
+            b"cat".to_vec(),
+            b"/root/streamed.bin".to_vec(),
+        ],
+        vec![b"PATH=/bin".to_vec()],
+    );
+    machine.load(b"/bin/busybox").expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let read_back = machine.take_output();
+
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "cat did not exit cleanly");
+    assert_eq!(
+        read_back.len(),
+        payload.len(),
+        "guest read back {} bytes of {}",
+        read_back.len(),
+        payload.len()
+    );
+    assert!(
+        read_back == payload,
+        "the guest's copy differs from what was delivered"
+    );
+}

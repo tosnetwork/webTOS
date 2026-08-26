@@ -39,13 +39,13 @@ terminal behavior, and recovery after a browser reload.
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
-| M6 OpenFox | 🔶 | ~85% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak); browser delivery of the 97 MB image is the remaining gap |
+| M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~72% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Delivering the agent images to the browser and the Claude Code profile are the remaining agent work |
 | M8 Performance & release | ⬜ | ~5% | wasm opt pin and deterministic scheduling only |
 
 Weighted by engineering effort, overall completion is **roughly 73%**.
 The native test suites (54 native cases plus the 17-check wasm harness and the
-23-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
+27-check-per-engine browser matrix) gate every ✅ above; `crates/x64-engine` and
 `crates/linux-compat` are the delivered engine and OS layers, `crates/webtos-web`
 + `web/` the current browser host.
 
@@ -80,7 +80,7 @@ design, but not the browser CPU execution half.
 | Linux compatibility | Substantial process, VFS, memory, signal, futex, socket, poll, and epoll implementation exists | Eight modules still depend directly on native x86-64 facilities |
 | Wasm agents | Standalone engine integration and kernel host bridge exist | Add browser worker lifecycle and browser host adapters |
 | x86-64 execution | Native hardware executes guest instructions | Build the x86-64 interpreter and later a hot-block translator |
-| Browser host | Workers, terminal, OPFS persistence, and relayed networking exist and are gated in three engines | Large-image delivery and checkpoints remain |
+| Browser host | Workers, terminal, OPFS persistence, relayed networking, and streamed image delivery exist and are gated in three engines | Checkpoints and packaging remain |
 | Runtime validation | Native Java, Node.js, Python, and Linux maturity harnesses exist | Add browser-native workload and recovery gates |
 
 This means webTOS can reuse the upper execution stack, but it cannot be
@@ -164,7 +164,9 @@ Responsibilities:
 - network mediation through browser-available transports ✅
   (`tools/webtos_gateway.mjs`: a deny-by-default WebSocket relay; the wasm
   module owns no transport and the guest has no network until the page asks)
-- application images, dependency manifests, and version pinning
+- application images, dependency manifests, and version pinning 🔶 (images
+  stream in chunk by chunk and are cached in OPFS, so a reload does not
+  download again; manifests and pinning are not started)
 - capability prompts and credential injection
 - snapshot, reload, resume, diagnostics, and performance metrics
 
@@ -366,7 +368,9 @@ Work:
 
 Exit gate:
 
-- `openfox --version` and help complete in a clean browser profile. ✅ (native; browser run pending the 97 MB image delivery)
+- `openfox --version` and help complete in a clean browser profile. ✅ (the
+  agent image is streamed into a clean browser profile and `openfox --help`
+  runs there, in Chromium, Firefox, and WebKit)
 - OpenFox performs one scripted network-backed agent task against a mounted
   test repository. ✅
 - Configuration and repository changes survive reload and explicit resume. ✅ (filesystem snapshot restored into a fresh machine)

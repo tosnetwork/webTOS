@@ -8,6 +8,7 @@ base_image.runtime.manifest
 /web/hello_linux.elf
 /test_data/busybox-musl
 /web/busybox-musl
+/web/openfox
 /test_data/alpine-minirootfs/
 /test_data/openfox
 /test_data/openfox.commit
