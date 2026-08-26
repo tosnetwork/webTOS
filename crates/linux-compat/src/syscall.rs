@@ -1693,6 +1693,18 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
     }
     tracing::debug!("task {pid} exited (status {status:#x})");
 
+    // Release this task's descriptor-table handle before looking for a
+    // runnable task. Dropping the exiting process's pipe/socket ends now
+    // (rather than later, when its `Process` is finally overwritten in
+    // `schedule_next`) decrements the peer reader/writer counts, so a parent
+    // or sibling blocked on EOF is seen as runnable in this very scheduling
+    // decision. Threads share the table through the `Rc`, so replacing the
+    // handle only closes descriptors when this was the last reference — a
+    // lone thread exiting never closes the process's fds. Without this, a
+    // parent reading a child's stdout pipe to EOF deadlocks: the child's
+    // write end is still held open when readiness is evaluated.
+    env.proc.fds = std::rc::Rc::new(std::cell::RefCell::new(crate::fd::FdTable::new()));
+
     if schedule_next(env, cpu) {
         Outcome::Switched
     } else {

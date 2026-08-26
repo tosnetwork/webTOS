@@ -132,6 +132,53 @@ int main(void) {
     );
 }
 
+/// A parent reading a child's stdout pipe to EOF must wake when the child
+/// exits, even when the child is the last other runnable task. The exiting
+/// process's descriptor table has to be released before the scheduler looks
+/// for a runnable task, so the pipe's writer count drops to zero and the
+/// parent's blocked read becomes ready in the same scheduling decision.
+/// Otherwise the exiting child still holds its write end when readiness is
+/// evaluated and the whole machine deadlocks (observed bringing up a real
+/// Codex binary, which spawns short-lived probe subprocesses and reads their
+/// output). The child here fails its `execve` and exits, producing no output.
+#[test]
+fn parent_reading_child_pipe_wakes_on_child_exit() {
+    let source = r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {
+    int p[2];
+    if (pipe(p)) return 1;
+    pid_t pid = fork();
+    if (pid < 0) return 2;
+    if (pid == 0) {
+        dup2(p[1], 1);
+        close(p[0]); close(p[1]);
+        char *av[] = {"/bin/does-not-exist", 0};
+        execve(av[0], av, 0);   /* fails: no such file */
+        _exit(127);
+    }
+    close(p[1]);                /* parent keeps only the read end */
+    char buf[128]; ssize_t n; int total = 0;
+    while ((n = read(p[0], buf, sizeof buf)) > 0) total += n;
+    int st = 0; waitpid(pid, &st, 0);
+    printf("eof total=%d n=%zd child=%d\n", total, n, WEXITSTATUS(st));
+    return n == 0 ? 0 : 3;
+}
+"#;
+    let Some(image) = compile_c("pipe_eof_on_exit", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "pipe_eof_on_exit");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("eof total=0 n=0 child=127"),
+        "parent did not reach EOF after the child exited; output: {:?}",
+        run.output
+    );
+}
+
 #[test]
 fn threads_futex_mutex_and_join() {
     let source = r#"
