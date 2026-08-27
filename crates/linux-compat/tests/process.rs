@@ -1196,3 +1196,58 @@ fn a_runtime_can_read_its_own_address_space() {
         run.output
     );
 }
+
+/// Two images at one address must not make the engine throw its work away.
+///
+/// Lifted code is keyed by address space; the disassembly cache beside it is
+/// keyed by virtual address alone. When a second image is loaded where the
+/// first was — which is every `execve`, and which an agent spawning
+/// subprocesses does constantly — the two disagree, and that disagreement
+/// used to abort the lift and flush every block. An agent's session never
+/// finished because of it.
+///
+/// Measured by what survives: alternating between two images repeatedly must
+/// leave the block table holding both, not starting over.
+#[test]
+fn alternating_images_do_not_flush_the_block_table() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data");
+    let hello = std::fs::read(dir.join("hello_linux.elf")).expect("hello fixture");
+    let ps = std::fs::read(dir.join("guest_ps.elf")).expect("ps fixture");
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/hello", hello, 0o755)
+        .expect("add hello");
+    machine.add_file(b"/bin/ps", ps, 0o755).expect("add ps");
+
+    let mut low = usize::MAX;
+    for round in 0..8 {
+        let path: &[u8] = if round % 2 == 0 {
+            b"/bin/hello"
+        } else {
+            b"/bin/ps"
+        };
+        machine.set_args(vec![b"prog".to_vec()], vec![b"PATH=/bin".to_vec()]);
+        machine.load(path).expect("ELF load failed");
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        let exit = machine.run();
+        assert_eq!(
+            exit,
+            CpuExit::Halt { code: Some(0) },
+            "round {round} did not exit cleanly"
+        );
+        // After the first two rounds both images have been lifted; from then
+        // on the table should only ever grow.
+        if round >= 2 {
+            let blocks = machine.vm_mut().lift_stats().blocks;
+            assert!(
+                blocks >= low,
+                "the block table shrank from {low} to {blocks} on round {round}: \
+                 the engine threw away work it had already done"
+            );
+            low = blocks;
+        } else {
+            low = machine.vm_mut().lift_stats().blocks;
+        }
+    }
+}

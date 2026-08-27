@@ -347,7 +347,6 @@ impl From<DecodeError> for ExceptionCode {
             }
             DecodeError::NonExecutableMemory => ExceptionCode::ExecViolation,
             DecodeError::BadAlignment => ExceptionCode::ExecUnaligned,
-            DecodeError::DisassemblyChanged => ExceptionCode::SelfModifyingCode,
             DecodeError::UnimplementedOp => ExceptionCode::UnimplementedOp,
         }
     }

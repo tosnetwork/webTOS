@@ -58,7 +58,6 @@ pub enum DecodeError {
     InvalidInstruction,
     NonExecutableMemory,
     BadAlignment,
-    DisassemblyChanged,
     UnimplementedOp,
     LifterError(sleigh_runtime::LifterError),
 }
@@ -681,15 +680,28 @@ impl BlockLifter {
 
         if self.instruction_lifter.generate_disassembly {
             let new_disasm = &self.instruction_lifter.disasm;
+            // The disassembly cache is keyed by virtual address alone, while
+            // lifted code is keyed by address space as well. Two images
+            // mapped at the same address — which is every `execve`, and which
+            // an agent spawning subprocesses does constantly — therefore
+            // disagree here without either being wrong, and the stale entry
+            // is the one at fault.
+            //
+            // Refresh it rather than failing the lift. Real self-modifying
+            // code is not detected here: a write to a page lifted code was
+            // built from raises `SelfModifyingCode`, which flushes the cache.
+            // This map exists to show a human what an address decodes to, and
+            // a diagnostic must not decide whether execution continues.
             match ctx.code.disasm.entry(ctx.vaddr) {
-                std::collections::hash_map::Entry::Occupied(old) => {
-                    let old_disasm = old.get();
-                    if old_disasm != new_disasm {
-                        tracing::error!(
-                            "disassembly changed at {:#0x} (from {old_disasm} to {new_disasm})",
-                            ctx.vaddr
+                std::collections::hash_map::Entry::Occupied(mut old) => {
+                    if old.get() != new_disasm {
+                        tracing::debug!(
+                            "disassembly at {:#0x} is from another image ({} against {new_disasm}); \
+                             refreshing",
+                            ctx.vaddr,
+                            old.get(),
                         );
-                        return Err(DecodeError::DisassemblyChanged);
+                        old.insert(new_disasm.clone());
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
