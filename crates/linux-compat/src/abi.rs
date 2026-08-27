@@ -168,6 +168,7 @@ pub const EINVAL: u64 = 22;
 pub const EMFILE: u64 = 24;
 pub const ENOTTY: u64 = 25;
 pub const EFBIG: u64 = 27;
+pub const ENOSPC: u64 = 28;
 pub const ESPIPE: u64 = 29;
 pub const ERANGE: u64 = 34;
 pub const ENOSYS: u64 = 38;

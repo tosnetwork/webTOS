@@ -30,6 +30,19 @@ pub enum NodeKind {
     CharDev(Dev),
 }
 
+impl NodeKind {
+    /// Bytes this node's contents occupy, measured the way [`Vfs::bytes`]
+    /// sums them. Directory entries and the node record itself are not
+    /// counted: a filesystem's size is its data.
+    fn data_len(&self) -> usize {
+        match self {
+            NodeKind::File(data) => data.capacity(),
+            NodeKind::Symlink(target) => target.capacity(),
+            NodeKind::Dir(_) | NodeKind::CharDev(_) => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
@@ -79,11 +92,15 @@ pub struct Resolved {
 
 pub struct Vfs {
     pub(crate) nodes: Vec<Node>,
+    /// Ceiling on [`Vfs::bytes`], or None for unbounded. See
+    /// [`Vfs::set_storage_budget`].
+    storage_budget: Option<usize>,
 }
 
 impl Vfs {
     pub fn new() -> Self {
         let mut vfs = Self {
+            storage_budget: None,
             nodes: vec![Node {
                 kind: NodeKind::Dir(BTreeMap::new()),
                 mode: 0o755,
@@ -325,6 +342,9 @@ impl Vfs {
         if name.is_empty() || name == b"." || name == b".." {
             return Err(abi::EEXIST);
         }
+        // Charged before the node exists: a symlink whose target does not fit
+        // must leave the tree exactly as it was.
+        self.reserve(kind.data_len())?;
         let nlink = if matches!(kind, NodeKind::Dir(_)) {
             2
         } else {
@@ -489,14 +509,76 @@ impl Vfs {
     /// node records are not counted: a filesystem's size is its data, and
     /// that is the term an image moves.
     pub fn bytes(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|node| match &node.kind {
-                NodeKind::File(data) => data.capacity(),
-                NodeKind::Symlink(target) => target.capacity(),
-                NodeKind::Dir(_) | NodeKind::CharDev(_) => 0,
-            })
-            .sum()
+        self.nodes.iter().map(|node| node.kind.data_len()).sum()
+    }
+
+    /// Sets a ceiling on [`Vfs::bytes`], or clears it with None.
+    ///
+    /// This is the guest's disk, not the host's: the paths a guest can reach
+    /// — creating a node, writing past the end of a file, extending one with
+    /// `ftruncate` — are refused with `ENOSPC` once the tree is at the
+    /// ceiling, which is what a real kernel returns for a full filesystem.
+    /// The host's own preload paths ([`Vfs::add_node`],
+    /// [`Vfs::create_file_with_capacity`], [`Vfs::append_file`]) are not
+    /// refused, because what the host puts in is the host's decision and is
+    /// already governed by the machine's memory budget — but the bytes they
+    /// add do count against the ceiling, exactly as an image occupies space
+    /// on a real disk. Size the budget above the image accordingly.
+    ///
+    /// What this bounds is total allocation over the machine's life, not
+    /// live data. [`Vfs::unlink`] detaches a node from its directory but does
+    /// not release its contents — node indexes are stable for the life of the
+    /// VFS, and nothing yet decides when an unlinked file is past the last
+    /// descriptor that could still read it — so deleting a file does not
+    /// return its bytes to the budget. A guest that churns temporary files
+    /// therefore approaches the ceiling even though nothing it can see is
+    /// growing. The error is on the safe side (the budget refuses earlier
+    /// than a real disk would, never later), but it means this is not yet a
+    /// ceiling a long-running workload can live under.
+    pub fn set_storage_budget(&mut self, bytes: Option<usize>) {
+        self.storage_budget = bytes;
+    }
+
+    /// The ceiling on [`Vfs::bytes`], when one is set.
+    pub fn storage_budget(&self) -> Option<usize> {
+        self.storage_budget
+    }
+
+    /// Bytes the guest may still add, or None when no budget is set.
+    pub fn storage_headroom(&self) -> Option<usize> {
+        self.storage_budget
+            .map(|budget| budget.saturating_sub(self.bytes()))
+    }
+
+    /// Refuses `growth` bytes with `ENOSPC` when they would not fit.
+    ///
+    /// Costs nothing when no budget is set. When one is, it re-sums the tree
+    /// — one `usize` read per node, not per byte — which is the same
+    /// recompute-on-demand shape the memory budget uses.
+    ///
+    /// What is charged is allocation, not written length: `growth` is the
+    /// bytes being written, but the running total is capacity, the measure
+    /// [`Vfs::bytes`] reports and the one the memory footprint uses. A file
+    /// grown a chunk at a time doubles its buffer, so it can hold up to twice
+    /// what has been written to it, and the guest reaches the ceiling with a
+    /// smaller file than the number suggests. That is the truth about what
+    /// the tab is holding — the same way a real filesystem charges whole
+    /// blocks for a partly used one.
+    ///
+    /// Adding nothing always fits, whatever the total already is: an empty
+    /// file and a directory cost the filesystem no bytes, so a full one is
+    /// no reason to refuse them.
+    pub fn reserve(&self, growth: usize) -> Result<(), u64> {
+        if growth == 0 {
+            return Ok(());
+        }
+        let Some(budget) = self.storage_budget else {
+            return Ok(());
+        };
+        if self.bytes().saturating_add(growth) <= budget {
+            return Ok(());
+        }
+        Err(abi::ENOSPC)
     }
 
     /// A file's contents, or None when the path is not a file.
@@ -727,6 +809,9 @@ impl Vfs {
                 parent,
             });
         }
-        Ok(Self { nodes })
+        Ok(Self {
+            nodes,
+            storage_budget: None,
+        })
     }
 }

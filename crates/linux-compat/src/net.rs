@@ -612,3 +612,197 @@ impl NetworkBroker for HostBroker {
         handles.iter().any(|&h| self.readable(h))
     }
 }
+
+// ── The network quota ───────────────────────────────────────────────────────
+
+/// Bytes the guest has moved across the broker boundary, both ways.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetUsage {
+    /// Payload the guest handed the broker to send.
+    pub sent_bytes: usize,
+    /// Payload the broker handed back to the guest.
+    pub received_bytes: usize,
+    pub total_bytes: usize,
+}
+
+/// The meter behind the network quota: what has crossed the broker boundary,
+/// and the ceiling on it.
+///
+/// Only guest payload is counted — the bytes of `send`/`recv` in either
+/// direction. Connection setup, DNS the host does on the guest's behalf, TCP
+/// and TLS framing, and whatever the transport spends underneath are not
+/// counted, because the broker interface never sees them. So the number here
+/// is a floor on what a tab actually moves, not an exact wire total, and a
+/// host should size the budget with that slack in mind.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetMeter {
+    sent: usize,
+    received: usize,
+    budget: Option<usize>,
+}
+
+pub type MeterRef = Rc<RefCell<NetMeter>>;
+
+impl NetMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What has crossed so far.
+    pub fn usage(&self) -> NetUsage {
+        NetUsage {
+            sent_bytes: self.sent,
+            received_bytes: self.received,
+            total_bytes: self.sent.saturating_add(self.received),
+        }
+    }
+
+    /// Sets the ceiling on sent plus received bytes, or clears it with None.
+    /// Takes effect on the next operation, so a host may set it before or
+    /// after attaching its broker.
+    pub fn set_budget(&mut self, bytes: Option<usize>) {
+        self.budget = bytes;
+    }
+
+    /// Bytes still allowed through, or None when no budget is set.
+    pub fn headroom(&self) -> Option<usize> {
+        self.budget
+            .map(|budget| budget.saturating_sub(self.usage().total_bytes))
+    }
+
+    /// How much of a `want`-byte request may go ahead.
+    fn allowance(&self, want: usize) -> usize {
+        match self.headroom() {
+            Some(left) => want.min(left),
+            None => want,
+        }
+    }
+
+    fn charge(&mut self, sent: usize, received: usize) {
+        self.sent = self.sent.saturating_add(sent);
+        self.received = self.received.saturating_add(received);
+    }
+}
+
+/// Wraps a broker so every byte the guest sends or receives is charged
+/// against a [`NetMeter`], and refused once the budget is spent.
+///
+/// The wrapper sits at the broker boundary rather than in the socket
+/// syscalls: every path the guest has to host networking already goes
+/// through this trait, so there is no send or receive that can be added
+/// later and quietly escape the meter.
+///
+/// Over budget, the guest sees `EPERM` — the errno Linux returns when local
+/// policy rejects the packet, which is what this is. Where a partial
+/// operation is honest the request is clipped instead: a stream send or
+/// receive is short, which every correct TCP caller already handles. A
+/// datagram is never clipped, because half a datagram is a corrupt message —
+/// a `sendto` that does not fit the remaining budget is refused whole.
+pub struct MeteredBroker {
+    inner: BrokerRef,
+    meter: MeterRef,
+}
+
+impl MeteredBroker {
+    pub fn new(inner: BrokerRef, meter: MeterRef) -> Self {
+        Self { inner, meter }
+    }
+
+    /// The allowance for a `want`-byte transfer, or `EPERM` when the budget
+    /// leaves no room for any of it.
+    fn allow(&self, want: usize) -> Result<usize, u64> {
+        let allowance = self.meter.borrow().allowance(want);
+        if allowance == 0 && want > 0 {
+            tracing::warn!(want, "network: over the byte budget");
+            return Err(abi::EPERM);
+        }
+        Ok(allowance)
+    }
+}
+
+impl NetworkBroker for MeteredBroker {
+    fn host_driven(&self) -> bool {
+        self.inner.borrow().host_driven()
+    }
+
+    fn tcp_connect(&mut self, addr: SocketAddrV4) -> Result<Handle, u64> {
+        self.inner.borrow_mut().tcp_connect(addr)
+    }
+
+    fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {
+        let allowance = self.allow(bytes.len())?;
+        let sent = self
+            .inner
+            .borrow_mut()
+            .tcp_send(handle, &bytes[..allowance])?;
+        self.meter.borrow_mut().charge(sent, 0);
+        Ok(sent)
+    }
+
+    fn tcp_recv(&mut self, handle: Handle, max: usize) -> Result<RecvOutcome, u64> {
+        let allowance = self.allow(max)?;
+        let outcome = self.inner.borrow_mut().tcp_recv(handle, allowance)?;
+        if let RecvOutcome::Data(bytes) = &outcome {
+            self.meter.borrow_mut().charge(0, bytes.len());
+        }
+        Ok(outcome)
+    }
+
+    fn tcp_shutdown_write(&mut self, handle: Handle) -> Result<(), u64> {
+        self.inner.borrow_mut().tcp_shutdown_write(handle)
+    }
+
+    fn udp_open(&mut self) -> Result<Handle, u64> {
+        self.inner.borrow_mut().udp_open()
+    }
+
+    fn udp_send_to(
+        &mut self,
+        handle: Handle,
+        addr: SocketAddrV4,
+        bytes: &[u8],
+    ) -> Result<usize, u64> {
+        // Whole datagram or none of it.
+        if self.allow(bytes.len())? < bytes.len() {
+            tracing::warn!(
+                len = bytes.len(),
+                "network: datagram does not fit the byte budget"
+            );
+            return Err(abi::EPERM);
+        }
+        let sent = self.inner.borrow_mut().udp_send_to(handle, addr, bytes)?;
+        self.meter.borrow_mut().charge(sent, 0);
+        Ok(sent)
+    }
+
+    fn udp_recv_from(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64> {
+        // Clipping `max` here is the truncation a small receive buffer
+        // already produces, not a new failure mode.
+        let allowance = self.allow(max)?;
+        let received = self.inner.borrow_mut().udp_recv_from(handle, allowance)?;
+        if let Some((bytes, _)) = &received {
+            self.meter.borrow_mut().charge(0, bytes.len());
+        }
+        Ok(received)
+    }
+
+    fn readable(&mut self, handle: Handle) -> bool {
+        self.inner.borrow_mut().readable(handle)
+    }
+
+    fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {
+        self.inner.borrow_mut().local_addr(handle)
+    }
+
+    fn close(&mut self, handle: Handle) {
+        self.inner.borrow_mut().close(handle)
+    }
+
+    fn wait_ready(&mut self, handles: &[Handle], timeout: Duration) -> bool {
+        self.inner.borrow_mut().wait_ready(handles, timeout)
+    }
+}

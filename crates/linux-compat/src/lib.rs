@@ -128,8 +128,12 @@ pub struct LinuxEnv {
     pub(crate) last_group: u64,
     pub(crate) rng_state: u64,
     pub(crate) output: Vec<u8>,
-    /// Host network broker; None = network denied (the default).
+    /// Host network broker; None = network denied (the default). Whatever
+    /// the host attaches is wrapped in a [`net::MeteredBroker`], so every
+    /// byte the guest moves is counted whether a budget is set or not.
     pub(crate) net: Option<net::BrokerRef>,
+    /// The counter that wrapper charges, and the network quota's ceiling.
+    pub(crate) net_meter: net::MeterRef,
     /// Secrets injected by the host, by name. `${name}` in guest files is
     /// expanded to the value in memory, and redacted back to `${name}` when
     /// the filesystem is serialized, so secrets never enter a snapshot.
@@ -185,6 +189,7 @@ impl LinuxEnv {
             rng_state: 0x9e37_79b9_7f4a_7c15,
             output: Vec::new(),
             net: None,
+            net_meter: std::rc::Rc::new(std::cell::RefCell::new(net::NetMeter::new())),
             secrets: std::collections::BTreeMap::new(),
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
@@ -203,8 +208,20 @@ impl LinuxEnv {
 
     /// Attaches the host network broker. Without one, guest sockets fail
     /// with `EAFNOSUPPORT` (network is denied by default).
+    ///
+    /// The broker is wrapped in a [`net::MeteredBroker`] before the guest
+    /// can reach it, so the network quota applies to whatever the host
+    /// attaches, including a host's own implementation of the trait.
     pub fn set_network(&mut self, broker: net::BrokerRef) {
-        self.net = Some(broker);
+        self.net = Some(std::rc::Rc::new(std::cell::RefCell::new(
+            net::MeteredBroker::new(broker, std::rc::Rc::clone(&self.net_meter)),
+        )));
+    }
+
+    /// The metered broker the guest's sockets use, or None when no broker is
+    /// attached (network denied).
+    pub fn network_broker(&self) -> Option<net::BrokerRef> {
+        self.net.clone()
     }
 
     pub fn set_wall_clock_base(&mut self, unix_sec: i64) {
@@ -1083,6 +1100,62 @@ impl Machine {
         ))
     }
 
+    /// Bytes the guest filesystem currently holds — the same number
+    /// [`Footprint::files_bytes`] reports, and what the storage budget caps.
+    pub fn storage_bytes(&mut self) -> usize {
+        self.env().vfs.bytes()
+    }
+
+    /// Sets a ceiling on the guest filesystem, or clears it with None.
+    ///
+    /// Memory's budget refuses the host's requests; this one refuses the
+    /// guest's. A runaway `while true; do echo >> /tmp/x; done` otherwise
+    /// grows the tab's linear memory until the tab dies, with no error the
+    /// guest could have handled. With a budget the write that would cross it
+    /// returns `ENOSPC` — what a real kernel returns for a full filesystem,
+    /// and what every program that writes files already knows how to report.
+    ///
+    /// The ceiling is on the whole filesystem, not on the guest's share of
+    /// it: a preloaded image occupies the budget the way it occupies a real
+    /// disk, so size this above the image. See
+    /// [`vfs::Vfs::set_storage_budget`] for exactly which paths are refused,
+    /// and for why deleting a file does not yet give its bytes back.
+    pub fn set_storage_budget(&mut self, bytes: Option<usize>) {
+        self.env().vfs.set_storage_budget(bytes);
+    }
+
+    /// Bytes the guest may still write, or None when no budget is set.
+    pub fn storage_headroom(&mut self) -> Option<usize> {
+        self.env().vfs.storage_headroom()
+    }
+
+    /// Bytes the guest has moved through the host broker, both ways. Counted
+    /// whether or not a budget is set; see [`net::NetMeter`] for what is and
+    /// is not included.
+    pub fn network_usage(&mut self) -> net::NetUsage {
+        self.env().net_meter.borrow().usage()
+    }
+
+    /// Sets a ceiling on the bytes the guest may relay through the host
+    /// broker, or clears it with None.
+    ///
+    /// A tab is somebody else's bandwidth. Without this a guest can stream
+    /// without end through the host's transport, and nothing in the machine
+    /// says stop. Over the budget the guest's `send`/`recv` fails with
+    /// `EPERM`, the errno a locally rejected packet gets.
+    ///
+    /// Independent of the memory budget: relayed bytes pass through, they do
+    /// not accumulate in the footprint. May be set before or after
+    /// [`Machine::set_network`].
+    pub fn set_network_budget(&mut self, bytes: Option<usize>) {
+        self.env().net_meter.borrow_mut().set_budget(bytes);
+    }
+
+    /// Bytes the guest may still relay, or None when no budget is set.
+    pub fn network_headroom(&mut self) -> Option<usize> {
+        self.env().net_meter.borrow().headroom()
+    }
+
     /// Raises or lowers the guest's physical-memory cap, in mebibytes. The
     /// default is 1 GiB; a large runtime forking under load needs more, and a
     /// browser tab may have less to give. Returns false when the guest has
@@ -1171,8 +1244,13 @@ impl Machine {
     }
 
     /// Replaces the guest filesystem with a serialized snapshot.
+    ///
+    /// The storage budget survives: it is a property of the machine the host
+    /// configured, not of the tree that happens to be mounted in it.
     pub fn import_fs(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.env().vfs = vfs::Vfs::deserialize(bytes)?;
+        let mut restored = vfs::Vfs::deserialize(bytes)?;
+        restored.set_storage_budget(self.env().vfs.storage_budget());
+        self.env().vfs = restored;
         Ok(())
     }
 
