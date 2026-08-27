@@ -376,20 +376,48 @@ impl SegmentInfo {
         // two meaning no alignment. A corrupt file says otherwise — one flipped
         // bit turns 0x1000 into 0 or into 0x1001 — and the value is then
         // divided by (zero divides) and asserted on inside `align_up`.
+        // Segments are mapped at page granularity, so `p_align` only decides
+        // where the image as a whole may be placed. An alignment no allocator
+        // could honour is refused rather than quietly pushing the image to
+        // the top of the address space: 1 GiB is already far past anything a
+        // real toolchain emits.
+        const MAX_ALIGN: u64 = 1 << 30;
         let align = match align {
             0 | 1 => 1,
+            align if align > MAX_ALIGN => {
+                return Err(format!(
+                    "segment alignment {align:#x} is larger than an image can be placed at"
+                ));
+            }
             align if align.is_power_of_two() => align,
             align => return Err(format!("segment alignment {align:#x} is not a power of two")),
         };
-        let offset = addr % align;
+        // Segments are mapped at page granularity, not at `p_align`.
+        //
+        // `p_align` is the congruence a loader must preserve between a
+        // segment's file offset and its virtual address; it is not how much
+        // of the address space the segment claims. Rounding the base down by
+        // it makes a segment reach below itself and take the pages of
+        // whatever is already mapped there, permissions included. Claude Code
+        // has exactly that shape — an executable segment ending part-way
+        // through a page, followed by a 16 KiB-aligned read-write segment
+        // whose rounded-down base covers the code segment's last two pages,
+        // which then stop being executable and the first call through the PLT
+        // faults.
+        //
+        // A `u64` constant rather than `physical::PAGE_SIZE`: that one is a
+        // `usize`, and address arithmetic at `usize` width is 32 bits wide in
+        // a browser.
+        const MAP_GRANULARITY: u64 = 0x1000;
+        let offset = addr % MAP_GRANULARITY;
         // What `utils::align_up` computes, except that a claimed length running
         // off the end of the address space is refused rather than wrapped.
         let size = size
             .checked_add(offset)
-            .and_then(|size| size.checked_next_multiple_of(align))
+            .and_then(|size| size.checked_next_multiple_of(MAP_GRANULARITY))
             .ok_or_else(|| {
-            format!("segment at {addr:#x} claims {size:#x} bytes, past the address space")
-        })?;
+                format!("segment at {addr:#x} claims {size:#x} bytes, past the address space")
+            })?;
 
         Ok(Self { base: addr - offset, offset, size, alignment: align })
     }

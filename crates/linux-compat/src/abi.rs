@@ -129,6 +129,8 @@ pub const SYS_FCHMODAT: u64 = 268;
 pub const SYS_FACCESSAT: u64 = 269;
 pub const SYS_PSELECT6: u64 = 270;
 pub const SYS_PPOLL: u64 = 271;
+pub const SYS_GETRUSAGE: u64 = 98;
+pub const SYS_SYSINFO: u64 = 99;
 pub const SYS_SET_ROBUST_LIST: u64 = 273;
 pub const SYS_UTIMENSAT: u64 = 280;
 pub const SYS_EPOLL_PWAIT: u64 = 281;
@@ -144,6 +146,7 @@ pub const SYS_PRLIMIT64: u64 = 302;
 pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_STATX: u64 = 332;
 pub const SYS_RSEQ: u64 = 334;
+pub const SYS_CLOSE_RANGE: u64 = 436;
 pub const SYS_FACCESSAT2: u64 = 439;
 
 // ── Errno ───────────────────────────────────────────────────────────────────

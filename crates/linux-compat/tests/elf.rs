@@ -398,16 +398,16 @@ fn a_length_that_would_narrow_on_a_32_bit_host_is_refused() {
 /// Whoever loaded it goes on to place the heap after the end, so an end that
 /// wrapped is worse than a refusal.
 #[test]
-fn an_image_that_ends_past_the_address_space_is_refused() {
+fn an_alignment_no_image_could_be_placed_at_is_refused() {
     let mut elf = sample_elf();
     let segment = a_loadable_segment(&elf);
     set_field(&mut elf, segment, P_ALIGN, 1 << 63);
     let message = Probe::new()
         .load(&elf)
-        .refusal("an image spanning half the address space");
+        .refusal("an alignment of half the address space");
     assert!(
-        message.contains("does not fit"),
-        "the image was not refused for where it ends; it failed later: {message}"
+        message.contains("larger than an image can be placed at"),
+        "the image was not refused for its alignment; it failed later: {message}"
     );
 }
 

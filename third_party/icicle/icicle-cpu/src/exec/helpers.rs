@@ -524,17 +524,39 @@ pub mod x86 {
                 cpu.write_var(dst.slice(12, 4), 0_u32);
             }
 
-            // Get Highest Extended Function Implemented
+            // Highest extended function implemented. Reporting none is not a
+            // position a 64-bit processor can hold: every x86-64 part answers
+            // leaf 0x8000_0001, and programs read it without asking first.
             0x8000_0000 => {
-                cpu.write_var(dst.slice(0, 4), 0_u32);
+                cpu.write_var(dst.slice(0, 4), 0x8000_0001_u32);
                 cpu.write_var(dst.slice(4, 4), 0_u32);
                 cpu.write_var(dst.slice(8, 4), 0_u32);
                 cpu.write_var(dst.slice(12, 4), 0_u32);
             }
+
+            // Extended processor info. Only what this engine actually
+            // implements is advertised: long mode and `syscall`. Claiming a
+            // feature that is not there is how a guest takes a path that then
+            // executes something unimplemented.
+            0x8000_0001 => {
+                const SYSCALL: u32 = 1 << 11;
+                const LONG_MODE: u32 = 1 << 29;
+                cpu.write_var(dst.slice(0, 4), 0_u32);
+                cpu.write_var(dst.slice(4, 4), 0_u32);
+                cpu.write_var(dst.slice(8, 4), 0_u32);
+                cpu.write_var(dst.slice(12, 4), SYSCALL | LONG_MODE);
+            }
+
+            // Anything else reads as zero. `CPUID` does not fault on real
+            // hardware — an unimplemented leaf returns zeros — so raising an
+            // exception turns a feature probe the guest is entitled to make
+            // into a crash.
             unknown => {
-                tracing::warn!("Unknown CPUID index: {:0x}", unknown);
-                cpu.exception.code = ExceptionCode::UnknownCpuID as u32;
-                cpu.exception.value = unknown as u64;
+                tracing::debug!("CPUID leaf {unknown:#x} answered with zeros");
+                cpu.write_var(dst.slice(0, 4), 0_u32);
+                cpu.write_var(dst.slice(4, 4), 0_u32);
+                cpu.write_var(dst.slice(8, 4), 0_u32);
+                cpu.write_var(dst.slice(12, 4), 0_u32);
             }
         }
     }

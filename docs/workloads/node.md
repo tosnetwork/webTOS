@@ -74,6 +74,50 @@ This is the same class as the `u64 as usize` narrowing found in the ELF
 loader: 64-bit address arithmetic done at `usize` width, harmless on the host
 where the tests run and wrong on the target that ships.
 
+## The agent CLIs themselves
+
+Measured 2026-08-27 against the same `webtos_web.wasm` a browser loads.
+
+**Codex runs.** `codex-cli 0.150.1`, exit 0, in **0.8 s** — a 256 MB
+static-pie binary delivered in one file, 531 MB resident. Nothing about it
+needed changing.
+
+**Claude Code does not, yet — and it is not a Node application.** Version
+2.1.247 is a 239 MB **Bun** binary (Bun 1.4.1), dynamically linked. That
+matters for the milestone: "both are Node applications, so a stock Node is
+the reduction" holds for Codex and no longer holds here.
+
+Three defects were in the way, all fixed and all general rather than
+Bun-specific:
+
+1. **Segments were mapped at `p_align`, not at page granularity.** `p_align`
+   is the congruence a loader preserves between a segment's file offset and
+   its virtual address, not how much address space it claims. Rounding the
+   base down by it makes a segment reach below itself and take the pages of
+   whatever is mapped there. Claude Code has an executable segment ending
+   part-way through a page followed by a 16 KiB-aligned read-write segment
+   whose rounded-down base covered the code's last two pages — which then
+   stopped being executable, and the first call through the PLT faulted.
+   Diagnosed by reporting the faulting page's permissions rather than only
+   the exception: `mapped=true readable=true executable=false` inside an
+   `R E` segment says where to look.
+2. **`CPUID` faulted on extended leaves.** Leaf `0x8000_0000` reported no
+   extended functions, which no x86-64 part does, and anything else raised an
+   exception — but `CPUID` does not fault on real hardware. It now reports
+   `0x8000_0001` as the highest extended leaf, advertises long mode and
+   `syscall` there because those are implemented, and answers everything else
+   with zeros.
+3. **`sysinfo`, `getrusage`, and `close_range` were missing.** A runtime asks
+   `sysinfo` before deciding how much memory it may use; the answer now comes
+   from the guest's own budget, which is the only figure that means anything
+   in a tab.
+
+Together those took Claude Code from 195,792 instructions to 2,365,855 — it
+now gets through the dynamic loader, past its own feature probes, and into
+Bun's startup, where it calls `abort()`. No `clone` is ever issued, so it is
+not a thread that failed to start. That is where the next investigation
+begins.
+
 ## How far Node gets today
 
 A dynamically linked host `node` (glibc) mounted into the guest, running a

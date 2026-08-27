@@ -282,6 +282,20 @@ fn main() {
         let _ = vm.cpu.mem.read_bytes(rip, &mut buf, icicle_mem::perm::NONE);
         let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
         eprintln!("[runner] fault pid={pid} exe={exe} rip={rip:#x} rsp={rsp:#x} bytes: {hex}");
+        // What the faulting page is actually mapped as. A jump into a page
+        // the loader left non-executable and a jump into nothing at all look
+        // identical from the exception alone.
+        {
+            use icicle_mem::perm;
+            let page = rip & !0xfff;
+            let mut one = [0u8; 1];
+            let readable = vm.cpu.mem.read_bytes(rip, &mut one, perm::READ).is_ok();
+            let executable = vm.cpu.mem.read_bytes(rip, &mut one, perm::EXEC).is_ok();
+            let mapped = vm.cpu.mem.mapping.get_range((page, page)).is_some();
+            eprintln!(
+                "[runner]   page {page:#x}: mapped={mapped} readable={readable} executable={executable}"
+            );
+        }
         eprintln!(
             "[runner] syscall trail (pid:nr@icount): {}",
             machine.syscall_trail().join(" ")

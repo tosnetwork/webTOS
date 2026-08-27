@@ -491,6 +491,10 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
 
         abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ => Err(abi::ENOSYS),
 
+        abi::SYS_SYSINFO => sys_sysinfo(env, cpu, a[0]),
+        abi::SYS_GETRUSAGE => sys_getrusage(env, cpu, a[0] as i64, a[1]),
+        abi::SYS_CLOSE_RANGE => sys_close_range(env, a[0], a[1], a[2]),
+
         _ => {
             tracing::warn!("unimplemented syscall {nr} -> ENOSYS");
             Err(abi::ENOSYS)
@@ -661,6 +665,83 @@ fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
             .map_err(|_| abi::ENOSPC)?;
     }
     data.resize(length, 0);
+    Ok(0)
+}
+
+/// `sysinfo`: what a runtime asks before deciding how much memory it may use.
+/// The numbers come from the guest's own budget rather than the host's, which
+/// is the only figure that means anything to a program running in a tab.
+fn sys_sysinfo(env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64) -> SysResult {
+    if ptr == 0 {
+        return Err(abi::EFAULT);
+    }
+    let used_pages = cpu.mem.total_pages() as u64;
+    let cap_pages = cpu.mem.capacity() as u64;
+    let mem_unit = PAGE_SIZE;
+    // `struct sysinfo` on x86-64: uptime, three load averages, totalram,
+    // freeram, sharedram, bufferram, totalswap, freeswap, procs, pad,
+    // totalhigh, freehigh, mem_unit, and padding to 112 bytes.
+    let mut buf = [0_u8; 112];
+    let mut put = |offset: usize, value: u64| {
+        buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+    put(0, env.now_nanos(cpu) / 1_000_000_000); // uptime, seconds
+    put(40, cap_pages); // totalram, in mem_unit
+    put(48, cap_pages.saturating_sub(used_pages)); // freeram
+    put(72, 1); // procs
+    buf[104..108].copy_from_slice(&(mem_unit as u32).to_le_bytes());
+    write_mem(cpu, ptr, &buf)?;
+    Ok(0)
+}
+
+/// `getrusage`: a zeroed record with the times this machine can actually
+/// account for. Reporting nothing is honest — the fields it would fill are
+/// host figures that say nothing about a deterministic guest — and a runtime
+/// that reads it wants a successful call more than it wants the numbers.
+fn sys_getrusage(env: &mut LinuxEnv, cpu: &mut Cpu, who: i64, ptr: u64) -> SysResult {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return Err(abi::EINVAL);
+    }
+    if ptr == 0 {
+        return Err(abi::EFAULT);
+    }
+    let mut buf = [0_u8; 144];
+    // ru_utime: the deterministic clock is the only time this guest has.
+    let nanos = env.now_nanos(cpu);
+    buf[0..8].copy_from_slice(&(nanos / 1_000_000_000).to_le_bytes());
+    buf[8..16].copy_from_slice(&((nanos % 1_000_000_000) / 1_000).to_le_bytes());
+    write_mem(cpu, ptr, &buf)?;
+    Ok(0)
+}
+
+/// `close_range`: closes every descriptor in an inclusive range. A runtime
+/// uses it before `exec` instead of walking `/proc/self/fd`, so failing it
+/// sends the guest down a path that reads a `/proc` this machine does not
+/// have.
+fn sys_close_range(env: &mut LinuxEnv, first: u64, last: u64, flags: u64) -> SysResult {
+    const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    if first > last {
+        return Err(abi::EINVAL);
+    }
+    let mut fds = env.proc.fds.borrow_mut();
+    let open: Vec<u64> = fds
+        .iter()
+        .map(|(fd, _)| fd)
+        .filter(|fd| *fd >= first && *fd <= last)
+        .collect();
+    for fd in open {
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            // Mark rather than close: the descriptors survive until an exec.
+            if let Ok(entry) = fds.get_mut(fd) {
+                entry.cloexec = true;
+            }
+        } else {
+            let _ = fds.close(fd);
+        }
+    }
     Ok(0)
 }
 

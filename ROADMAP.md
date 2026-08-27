@@ -84,19 +84,21 @@ milestone numbering any more.
 The product goal is a coding agent in a tab. Everything below it now works;
 what is left is the agent itself.
 
-- **Carry an agent CLI into the browser.** Both are Node applications, so
-  stock Node is the reduction — and Node runs inside the wasm module a browser
-  loads: `node --version` prints `v24.13.0` and exits 0 in 0.9 s cold, 0.6 s
-  warm, with its seven shared objects delivered as files since a browser has
-  no `GUEST_MOUNT`. 122 MB reaches the guest in under half a second and the
-  machine sits at 247 MB. It took 159 s until a one-line fix: the TLB's
-  page-alignment mask was built at `usize` width, so on wasm32 it truncated a
-  64-bit address instead of aligning it and one page invalidation walked
-  16.7 million pages. See `docs/workloads/node.md`. What remains is packaging
-  and syscall coverage for the CLIs themselves, which is what this milestone
-  always claimed to be.
-- **The Claude Code profile.** Not started. The runtime beneath it now runs in
-  a browser at a usable speed.
+- **Carry an agent CLI into the browser.** **Codex runs**: `codex-cli
+  0.150.1` reports its version and exits 0 inside the wasm module a browser
+  loads, in 0.8 s, from a 256 MB static binary delivered as one file, 531 MB
+  resident. Node runs too, in 0.9 s. Delivery, memory, and speed are settled
+  problems. What remains for Codex is a session that does work rather than a
+  version string: credentials through the secret path, and the terminal.
+- **The Claude Code profile.** Claude Code 2.1.247 is a 239 MB **Bun**
+  binary, not a Node one, so "both agents are Node applications" is now only
+  true of Codex. Three defects that stood in its way are fixed — segments
+  were mapped at `p_align` instead of page granularity and clobbered the
+  permissions of the segment below, `CPUID` faulted on extended leaves, and
+  `sysinfo`/`getrusage`/`close_range` were missing — taking it from 195,792
+  instructions to 2,365,855. It now reaches Bun's own startup and calls
+  `abort()` there, with no `clone` ever issued, so it is not a thread that
+  failed to start. See `docs/workloads/node.md`.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
 - ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are
