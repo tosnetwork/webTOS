@@ -697,9 +697,21 @@ Each agent receives a separate workload manifest and compatibility report.
 Runtime dependencies must be discovered from the pinned release rather than
 assumed from historical packaging.
 
-**Runtime foundation (done).** Both agents are Node.js applications, so a
-stock Node running is the reduction. A stock `node` (v24, glibc) now runs
-scripts to a clean exit — `node -e "console.log(...)"` executes and array/
+**Runtime foundation (done).** This was justified by the belief that both
+agents are Node.js applications and that a stock Node was therefore the
+reduction. **Neither of them is.** Inspecting the binaries: Codex is Rust —
+3,941 `cargo` strings, 296 `tokio`, no `v8::internal` at all, its handful of
+"Node.js" mentions being text inside its own system prompt — and Claude Code
+is Bun 1.4.1, which embeds JavaScriptCore rather than V8, with the
+application's JavaScript in a 156 MB `.bun` section.
+
+The work below still stands, because none of it is V8-specific: lifting
+AVX-512, software SIMD helpers, and a CPUID baseline are general x86-64
+coverage that Bun needs as much as Node did, and getting a dynamically linked
+glibc program running is what both Node and Claude Code depend on. Only the
+stated reason was wrong.
+
+A stock `node` (v24, glibc) runs scripts to a clean exit — `node -e "console.log(...)"` executes and array/
 string/`JSON`/`Math` output is correct (~90 M instructions). This required,
 on top of milestones 1–6: upgrading the vendored Ghidra x86 SLEIGH spec to
 lift the AVX-512 family, adding software helpers for the SIMD pcodeops Node/

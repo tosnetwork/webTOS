@@ -7,10 +7,20 @@ produce correct output. This was reached on the AVX-512-capable spec plus a
 set of p-code-op helpers and a CPUID SSE2 baseline (below). This file records
 how it works and what remains.**
 
-Milestone 7 targets the Codex and Claude Code CLIs. Both are Node.js
-applications, so a stock `node` is the reduction: if `node script.js` runs,
-the CLIs become a packaging and syscall-coverage problem rather than a
-runtime-bring-up problem.
+Milestone 7 targets the Codex and Claude Code CLIs, and this file was written
+believing both were Node.js applications, so that a stock `node` would be the
+reduction. **Neither is**, measured against the binaries themselves:
+
+| | runtime | evidence |
+|---|---|---|
+| Codex | **Rust** | 3,941 `cargo` strings, 296 `tokio`, 93 `rustc`; no `v8::internal`, no `JavaScriptCore`. Its nine "Node.js" mentions are text inside its own system prompt. |
+| Claude Code | **Bun 1.4.1** | 541 `JavaScriptCore`/`WebKit` symbols, no `v8::internal`; a `.bun` section holding 156 MB of application JavaScript, against 57 MB of runtime code. |
+
+Bringing Node up was still worth it. Nothing it required was V8-specific —
+the AVX-512 lifting, the SIMD helpers, and the CPUID baseline are general
+x86-64 coverage, and Bun needs them too — and it proved the dynamically
+linked glibc path that Claude Code also takes. What was wrong was the reason
+given, not the work.
 
 Run it with the debug runner:
 
