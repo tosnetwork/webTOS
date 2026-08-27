@@ -95,12 +95,18 @@ pub struct Vfs {
     /// Ceiling on [`Vfs::bytes`], or None for unbounded. See
     /// [`Vfs::set_storage_budget`].
     storage_budget: Option<usize>,
+    /// Nodes whose last directory entry is gone. Their contents are still
+    /// readable through any descriptor open at the time, so the bytes are
+    /// released by [`Vfs::release_unreferenced`] once the host has
+    /// established that nothing points at them any more.
+    unlinked: Vec<usize>,
 }
 
 impl Vfs {
     pub fn new() -> Self {
         let mut vfs = Self {
             storage_budget: None,
+            unlinked: Vec::new(),
             nodes: vec![Node {
                 kind: NodeKind::Dir(BTreeMap::new()),
                 mode: 0o755,
@@ -405,7 +411,49 @@ impl Vfs {
             return Err(abi::ENOTDIR);
         };
         entries.remove(name);
+        // A name is a link. Losing the last one makes the file unreachable by
+        // path but not yet dead: POSIX keeps the contents readable through a
+        // descriptor opened before the unlink, which is how every "delete the
+        // file and keep writing to it" idiom works.
+        let node_ref = &mut self.nodes[node];
+        node_ref.nlink = node_ref.nlink.saturating_sub(1);
+        if node_ref.nlink == 0 && !self.unlinked.contains(&node) {
+            self.unlinked.push(node);
+        }
         Ok(())
+    }
+
+    /// Whether anything is waiting to be reclaimed, so the caller can skip
+    /// walking every descriptor table in the common case.
+    pub fn has_unlinked(&self) -> bool {
+        !self.unlinked.is_empty()
+    }
+
+    /// Frees the contents of unlinked nodes that `referenced` does not name,
+    /// returning the bytes released.
+    ///
+    /// The caller supplies the set because the filesystem cannot see
+    /// descriptors: they live in process tables, and a node stays alive while
+    /// any of them still points at it.
+    ///
+    /// The node itself is kept. Indices are how descriptors and directory
+    /// entries name nodes, so removing one would renumber the rest; what is
+    /// reclaimed is the data, which is all of it that has a size.
+    pub fn release_unreferenced(&mut self, referenced: &std::collections::HashSet<usize>) -> usize {
+        let mut freed = 0;
+        let mut still_open = Vec::new();
+        for node in std::mem::take(&mut self.unlinked) {
+            if referenced.contains(&node) {
+                still_open.push(node);
+                continue;
+            }
+            if let Some(entry) = self.nodes.get_mut(node) {
+                freed += entry.kind.data_len();
+                entry.kind = NodeKind::File(Vec::new());
+            }
+        }
+        self.unlinked = still_open;
+        freed
     }
 
     /// Moves `old_parent/old_name` to `new_parent/new_name`, replacing an
@@ -812,6 +860,7 @@ impl Vfs {
         Ok(Self {
             nodes,
             storage_budget: None,
+            unlinked: Vec::new(),
         })
     }
 }

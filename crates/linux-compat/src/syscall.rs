@@ -250,7 +250,15 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             a[1],
         ),
         abi::SYS_OPENAT => sys_openat(env, cpu, a[0], a[1], a[2], a[3]),
-        abi::SYS_CLOSE => env.proc.fds.borrow_mut().close(a[0]).map(|_| 0),
+        abi::SYS_CLOSE => {
+            let closed = env.proc.fds.borrow_mut().close(a[0]);
+            // Closing the last descriptor on an unlinked file is when its
+            // contents finally become unreachable.
+            if closed.is_ok() {
+                env.reclaim_unlinked();
+            }
+            closed.map(|_| 0)
+        }
         abi::SYS_LSEEK => sys_lseek(env, a[0], a[1], a[2]),
         abi::SYS_GETDENTS64 => sys_getdents64(env, cpu, a[0], a[1], a[2]),
         abi::SYS_GETDENTS => Err(abi::ENOSYS), // legacy; modern userlands use getdents64
@@ -1144,13 +1152,15 @@ fn sys_unlinkat(
     let path = path_arg(cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, false)?;
-    env.vfs
-        .unlink(
-            resolved.parent,
-            &resolved.name,
-            flags & abi::AT_REMOVEDIR != 0,
-        )
-        .map(|_| 0)
+    env.vfs.unlink(
+        resolved.parent,
+        &resolved.name,
+        flags & abi::AT_REMOVEDIR != 0,
+    )?;
+    // Usually nothing had it open and the bytes go now; when something does,
+    // the close reclaims them.
+    env.reclaim_unlinked();
+    Ok(0)
 }
 
 fn sys_renameat(

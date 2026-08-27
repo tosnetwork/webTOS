@@ -1000,3 +1000,138 @@ int main(void) {
         run.output
     );
 }
+
+/// Loads an image without running it, so a test can look at the filesystem
+/// before and after.
+fn image_machine(image: Vec<u8>, name: &str) -> Machine {
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![name.as_bytes().to_vec()], vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine
+}
+
+fn run_loaded(machine: &mut Machine) -> Run {
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    let icount = machine.icount();
+    Run {
+        exit,
+        output,
+        icount,
+    }
+}
+
+/// Deleting a file has to give its bytes back. They used to stay: `unlink`
+/// detached the name and left the contents in the node, so a guest churning
+/// temporary files walked into the storage ceiling while nothing it could see
+/// was growing — and the bytes went into every snapshot, which for a browser
+/// means deleted data reaching disk.
+#[test]
+fn deleting_a_file_releases_its_bytes_and_keeps_them_out_of_a_snapshot() {
+    let source = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    char buf[4096];
+    memset(buf, 'Z', sizeof buf);
+
+    int fd = open("/tmp/scratch", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) return 1;
+    for (int i = 0; i < 16; i++) {
+        if (write(fd, buf, sizeof buf) != (ssize_t)sizeof buf) return 2;
+    }
+    close(fd);
+
+    if (unlink("/tmp/scratch") != 0) return 3;
+    printf("deleted\n");
+    fflush(stdout);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("unlink_release", source, &[]) else {
+        return;
+    };
+    let mut machine = image_machine(image, "unlink_release");
+    let before = machine.env().vfs.bytes();
+    let run = run_loaded(&mut machine);
+    assert!(
+        run.output.contains("deleted"),
+        "probe did not run: {:?}",
+        run.output
+    );
+
+    let after = machine.env().vfs.bytes();
+    assert!(
+        after <= before + 8192,
+        "the 64 KiB the guest deleted is still held: {before} then {after}"
+    );
+
+    let snapshot = machine.export_fs();
+    let run_of_z = [b'Z'; 512];
+    assert!(
+        !snapshot
+            .windows(run_of_z.len())
+            .any(|w| w == run_of_z.as_slice()),
+        "deleted contents reached the snapshot"
+    );
+}
+
+/// The reclamation must not break the idiom it exists alongside: a file
+/// unlinked while still open stays readable through the descriptor that was
+/// already there. Freeing on `unlink` alone would be the easy fix and the
+/// wrong one.
+#[test]
+fn a_file_unlinked_while_open_is_still_readable() {
+    let source = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = open("/tmp/held", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 0) return 1;
+    const char *msg = "still-here-after-unlink";
+    if (write(fd, msg, strlen(msg)) != (ssize_t)strlen(msg)) return 2;
+
+    if (unlink("/tmp/held") != 0) return 3;
+    if (open("/tmp/held", O_RDONLY) >= 0) return 4;   /* gone by name */
+
+    char buf[64] = {0};
+    if (lseek(fd, 0, SEEK_SET) != 0) return 5;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    if (n <= 0) return 6;
+    printf("read back: %s\n", buf);
+    fflush(stdout);
+    close(fd);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("unlink_open", source, &[]) else {
+        return;
+    };
+    let mut machine = image_machine(image, "unlink_open");
+    let run = run_loaded(&mut machine);
+    assert!(
+        run.output.contains("read back: still-here-after-unlink"),
+        "an unlinked file was not readable through its open descriptor: {:?}",
+        run.output
+    );
+    // And once the descriptor is gone, so are the bytes. Measured rather than
+    // searched for: the string is a literal in the fixture, and the fixture
+    // is itself a file in this filesystem, so looking for it in a snapshot
+    // finds the program image and proves nothing.
+    assert!(
+        !machine.env().vfs.has_unlinked(),
+        "the file is still held after its last descriptor closed"
+    );
+}

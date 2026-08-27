@@ -37,7 +37,7 @@ terminal behavior, and recovery after a browser reload.
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
-| M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred. The suite is only sound single-threaded (see below) |
+| M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~92% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
@@ -147,11 +147,7 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   `ENOSPC` at the ceiling, and bytes across the host broker are metered in
   both directions, with a stream clipped to what is left and a datagram
   refused whole (`EPERM`). Both are exposed to the browser the way memory
-  was. Three limits bound what they are worth. `Vfs::unlink` detaches a node
-  without releasing its contents, so the storage ceiling bounds total
-  allocation over a machine's life rather than live data — a guest churning
-  temporary files approaches it while nothing it can see grows, and those
-  deleted contents also still reach a snapshot. Storage is charged by
+  was. Two limits bound what they are worth. Storage is charged by
   allocated capacity, not written length, so a file grown a chunk at a time
   can hold up to twice what has been written to it and the ceiling arrives
   sooner than the number suggests. The network meter counts guest payload
@@ -210,17 +206,15 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   runner, so the Linux host is still in the loop only when someone starts it.
 - **A compatibility dashboard** across engines and pinned workload versions.
   The measurement harnesses exist; nothing publishes them.
-- **A suite that is only sound single-threaded.** The engine keeps the current
-  address space in process-wide atomics — `CURRENT_ASID` and its neighbours in
-  `crates/x64-engine/src/vm.rs` — so two tests running as threads in one test
-  binary, each with its own machine, overwrite each other's notion of which
-  address space is executing. The failure is intermittent, reports as an
-  engine-level `InternalError`, and moves between tests, which is exactly what
-  makes it easy to mistake for a real regression: measured at about four
-  failures in fourteen parallel runs, and none in five single-threaded ones.
-  Run the suite with `-- --test-threads=1` until the state moves onto the
-  machine. Eleven consecutive parallel runs today were green, so it is rare
-  rather than gone.
+- ~~**A suite that is only sound single-threaded.**~~ Fixed. The engine kept
+  the current address space, block address, and instruction count in
+  process-wide atomics, and the OS layer the current pid, so two tests running
+  as threads in one binary overwrote each other's notion of which address
+  space was executing — an intermittent engine-level `InternalError` that
+  moved between tests, which is exactly what makes such a thing easy to
+  mistake for a real regression. They are thread-locals now: about four
+  failures in fourteen parallel runs before, none in fourteen after, at no
+  measurable cost to the interpreter.
 
 ### A bug that only appeared where the tests ran
 

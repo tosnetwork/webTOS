@@ -240,6 +240,38 @@ impl LinuxEnv {
         self.epoch_base_sec = unix_sec;
     }
 
+    /// Releases the contents of files that have been unlinked and are no
+    /// longer open anywhere.
+    ///
+    /// The filesystem cannot decide this alone: a node stays alive while any
+    /// descriptor still names it, and descriptors live in process tables —
+    /// this task's and every parked one's, which `fork` makes share the same
+    /// open file descriptions. Returns the bytes released.
+    pub(crate) fn reclaim_unlinked(&mut self) -> usize {
+        if !self.vfs.has_unlinked() {
+            return 0;
+        }
+        let mut referenced = std::collections::HashSet::new();
+        let mut collect = |fds: &crate::fd::FdTable| {
+            for (_, entry) in fds.iter() {
+                match entry.desc.borrow().backing {
+                    crate::fd::Backing::File { node } => {
+                        referenced.insert(node);
+                    }
+                    crate::fd::Backing::Dir { node, .. } => {
+                        referenced.insert(node);
+                    }
+                    _ => {}
+                }
+            }
+        };
+        collect(&self.proc.fds.borrow());
+        for task in &self.sched.parked {
+            collect(&task.proc.fds.borrow());
+        }
+        self.vfs.release_unreferenced(&referenced)
+    }
+
     /// Registers a secret readable by every guest file that names it.
     /// Prefer [`LinuxEnv::set_scoped_secret`]: an unscoped secret reaches any
     /// program that can read any file, which is not a boundary between two
