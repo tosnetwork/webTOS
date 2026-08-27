@@ -59,7 +59,7 @@ call, so here is the arithmetic rather than the assertion:
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 84% | 16.8 |
 | M8 Performance & release | 14% | 58% | 8.1 |
-| **Total** | **100%** | | **86.7** |
+| **Total** | **100%** | | **86.8** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 11 of the 15 points outstanding. Progress from
