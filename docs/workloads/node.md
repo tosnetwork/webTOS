@@ -21,78 +21,58 @@ cargo run --release -p linux-compat --example run_guest -- \
   /path/to/node --version
 ```
 
-## In a browser: it runs, and it is two hundred times too slow
+## In a browser: it runs
 
 Measured 2026-08-27 on x86-64 Linux, against the same `webtos_web.wasm` a
 browser loads. Every shared object was delivered as a *file* rather than
 mounted, because `GUEST_MOUNT` has no browser equivalent — so this answers the
 browser question, not just the native one.
 
-`node --version` **works**: `v24.13.0`, exit 0.
+`node --version` prints `v24.13.0` and exits 0 in **0.9 s** cold, 0.6 s warm.
+122 MB of Node and its seven shared objects reach the guest in under half a
+second, and the machine settles at 247 MB — guest 109, lifted code 16, files
+122 — inside any tab's budget.
 
-| | native | wasm module |
-|---|---|---|
-| `node --version` (6,512,041 instructions) | ~3 s (2.2 M inst/s) | **159 s (0.04 M inst/s)** |
-| BusyBox `md5sum` of 4 MiB (53.4 M instructions) | 17.3 M inst/s | 8.5 M inst/s |
+It took 159 s before the bug below.
 
-Delivery is not the problem: 122 MB of Node and its seven shared objects
-reached the guest in 284 ms, and the whole machine settled at 247 MB — guest
-109, lifted code 16, files 122 — inside any tab's budget.
+### The bug: a 32-bit mask on a 64-bit address
 
-Two things it is **not**:
+The first measurement had `node --version` at 159 s against 3 s natively, and
+finding out why took ruling out everything it wasn't. Four probes differing in
+one property each:
 
-- **Not lifting.** A second `--version` in the same machine took 158.9 s
-  against the first's 160.8 s, and the lifted-code figure did not move off
-  16 MB. The work is steady state, not translation.
-- **Not the module.** The same wasm build on the same host hashes 4 MiB at
-  8.5 M inst/s, about half native. Node gets 1/200th of that.
+| probe | native | wasm before | wasm after |
+|---|---|---|---|
+| 3 M-iteration compute loop | 2.29 s | 2.43 s | 2.4 s |
+| 200,000 `getpid` | 0.53 s | 0.50 s | 0.5 s |
+| 2,000 `mmap`, never touched | 0.32 s | 62 s | **0.12 s** |
+| 1 `mmap`, 2,000 first-touch faults | — | 0.13 s | 0.13 s |
 
-### Narrowed to one line
+So it was the `mmap` call — not page faults, not syscall overhead, not
+interpretation, not lifting, and not the module. Compiling out one line took it
+from 62 s to 0.12 s: `self.tlb.remove_range(start, len)` in
+`Mmu::map_memory_len`.
 
-Four probes, each differing in one property, separate the cause from
-everything it might have been. Times are the same guest binary, native
-against the wasm module:
+`TranslationCache::remove_range` page-aligned its start like this:
 
-| probe | native | wasm |
-|---|---|---|
-| 3 M-iteration compute loop | 2.29 s | 2.43 s |
-| 200,000 `getpid` | 0.53 s | 0.50 s |
-| 2,000 `mmap`, never touched | 0.32 s | **62 s** |
-| 1 `mmap`, 2,000 first-touch faults | — | 0.13 s |
+```rust
+for addr in (start & !(PAGE_SIZE - 1) as u64..=end).step_by(PAGE_SIZE)
+```
 
-So it is the `mmap` call itself, not page faults, not syscall overhead, and
-not interpretation. The cost is flat at about 30 ms per call and independent
-of the mapping's size — 4 KiB, 64 KiB and 1 MiB all take the same — and it is
-linear in the number of calls, not quadratic. It all happens inside a single
-`wtw_run`, with the wasm linear memory never growing, no code-cache flush, and
-the same number of lifted blocks as the fast probe.
+`PAGE_SIZE` is a `usize`. On a 64-bit host `!(PAGE_SIZE - 1)` is
+`0xFFFF_FFFF_FFFF_F000` and the mask is right. On wasm32 it is
+`0xFFFF_F000`, and widening it afterwards leaves the top half zero — so the
+mask does not align the address, it **truncates** it. Invalidating one page at
+`0x10_0000_0000` started the walk at 0 and stepped through 64 GiB of address
+space: 16,777,217 iterations for a single 4 KiB page, measured.
 
-Compiling out one line takes it from 62 s to **0.12 s**: the
-`self.tlb.remove_range(start, len)` in `Mmu::map_memory_len`
-(`third_party/icicle/icicle-mem/src/mmu.rs`). Removing `update_perm` instead
-changes nothing, so the TLB invalidation on every mapping change is the whole
-of it.
+That is why the cost was proportional to the *address* rather than the size,
+why every mapping cost the same 30 ms whatever its length, and why only the
+browser saw it. The mask is now built at the width of the address.
 
-**What is not yet pinned** is why that call is expensive. `TranslationCache`
-holds 1,024 entries and `remove_range` clears the whole thing when a range
-covers more pages than that, so the per-page loop should be bounded at 1,024
-iterations. Two instrumented runs disagreed about how many iterations actually
-occur — one counted billions across 4,014 calls, another found no call
-entering the loop with more than 210 pages — and those cannot both be right.
-The counters were reused between runs with different meanings, which is the
-likeliest explanation, so neither number should be relied on. The next step is
-to measure that call cleanly rather than to reason about it.
-
-Native runs the same code and does not show this, so whatever it is, it is a
-constant factor that wasm makes ~200× worse rather than an algorithmic
-difference.
-
-Node is already about eight times slower than a compute loop natively — its
-startup is syscall- and page-heavy rather than a tight loop — and this is what
-multiplies that by another twenty-five.
-
-What this settles: the browser milestone for both agent CLIs is not blocked on
-bring-up, packaging, delivery, or memory. It is blocked on this number.
+This is the same class as the `u64 as usize` narrowing found in the ELF
+loader: 64-bit address arithmetic done at `usize` width, harmless on the host
+where the tests run and wrong on the target that ships.
 
 ## How far Node gets today
 

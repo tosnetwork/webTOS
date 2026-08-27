@@ -85,31 +85,18 @@ The product goal is a coding agent in a tab. Everything below it now works;
 what is left is the agent itself.
 
 - **Carry an agent CLI into the browser.** Both are Node applications, so
-  stock Node is the reduction — and Node now runs inside the wasm module a
-  browser loads: `node --version` prints `v24.13.0` and exits 0, with its
-  seven shared objects delivered as files rather than mounted, since a
-  browser has no `GUEST_MOUNT`. Delivery and memory are settled: 122 MB in
-  284 ms, 247 MB resident. **What blocks it is speed.** That run takes 159 s
-  in wasm against about 3 s natively — 0.04 M inst/s where the same module
-  hashes at 8.5. It is not lifting (a second run is identical and translates
-  nothing new) and not the module (md5sum is half native). Node is already
-  eight times slower than a compute loop natively, being syscall- and
-  page-heavy, and the wasm host multiplies that by about twenty-five. That
-  multiplier is now narrowed to a single line: the TLB invalidation
-  `Mmu::map_memory_len` performs on every mapping change. Compiling it out
-  takes a 2,000-`mmap` probe from 62 s to 0.12 s, while removing `update_perm`
-  instead changes nothing. Why that call is expensive is not yet pinned — two
-  instrumented runs gave counts that contradict each other, so neither is
-  quoted as fact. See `docs/workloads/node.md`. Nothing else about the
-  milestone is worth attempting until that number moves.
-- **Per-agent secret handles.** Scoping and the browser path exist: a
-  credential is expanded only in the files the host names, everything else
-  keeps the placeholder, and a browser host injects one without it entering an
-  image or a snapshot. What is left is the handle proper — the guest still
-  ends up holding the value, so a program that can read its own configuration
-  can read its own key.
-- **The Claude Code profile.** Not started. The runtime beneath it runs in a
-  browser, at the speed above.
+  stock Node is the reduction — and Node runs inside the wasm module a browser
+  loads: `node --version` prints `v24.13.0` and exits 0 in 0.9 s cold, 0.6 s
+  warm, with its seven shared objects delivered as files since a browser has
+  no `GUEST_MOUNT`. 122 MB reaches the guest in under half a second and the
+  machine sits at 247 MB. It took 159 s until a one-line fix: the TLB's
+  page-alignment mask was built at `usize` width, so on wasm32 it truncated a
+  64-bit address instead of aligning it and one page invalidation walked
+  16.7 million pages. See `docs/workloads/node.md`. What remains is packaging
+  and syscall coverage for the CLIs themselves, which is what this milestone
+  always claimed to be.
+- **The Claude Code profile.** Not started. The runtime beneath it now runs in
+  a browser at a usable speed.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
 - ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are

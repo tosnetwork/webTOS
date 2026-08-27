@@ -118,7 +118,13 @@ impl TranslationCache {
             return;
         }
 
-        for addr in (start & !(PAGE_SIZE - 1) as u64..=end).step_by(PAGE_SIZE) {
+        // `PAGE_SIZE` is a `usize`, so `!(PAGE_SIZE - 1)` is 32 bits wide on a
+        // 32-bit host and widening it afterwards zeroes the top half of the
+        // mask. On wasm that turned page alignment into truncation: a 4 KiB
+        // invalidation at 0x10_0000_0000 started the walk at 0 and stepped
+        // through 64 GiB of address space, 16.7 million iterations for one
+        // page. The mask has to be built at the width of the address.
+        for addr in (start & !(PAGE_SIZE as u64 - 1)..=end).step_by(PAGE_SIZE) {
             self.remove(addr);
         }
     }
