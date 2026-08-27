@@ -164,8 +164,23 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   of aligning, and a file offset that folded 2^32 onto zero so a write landed
   on the start of the file. Clippy's `cast_possible_truncation` enumerates the
   remaining `u64`-to-`usize` casts — 45 in these crates — and most are
-  harmless; the ones on guest-supplied sizes have been narrowed deliberately,
-  but the vendored engine has not been swept the same way.
+  harmless; the ones on guest-supplied sizes have been narrowed deliberately.
+
+  The vendored engine has now been swept the same way and came back clean:
+  31 `u64`-to-`usize` casts across `icicle-mem`, `icicle-cpu`, `pcode`, and
+  `sleigh-runtime`, every one of them bounded by construction — page-relative
+  offsets, per-entry lengths inside an `overlapping_mut` closure, instruction
+  lengths, shift amounts, and an ELF partial-write fallback whose truncation
+  could only make a write shorter. A guest mapping 5 GiB and touching past the
+  4 GiB mark works in a browser, which is the behaviour a truncated length
+  would have broken. The one defect of this class in vendored code was the TLB
+  alignment mask, already fixed.
+
+  Reproducing that sweep needs one thing that is easy to get wrong: clippy
+  invoked from `crates/` compiles a path dependency but emits no lints for it,
+  silently. It has to be run from `third_party/icicle`, where those crates are
+  the workspace. A deliberately truncating function added to the crate is how
+  to tell the difference between "clean" and "not looking".
 - **Fuzzing.** Two surfaces are swept rather than fuzzed: every truncation and
   every single-bit flip of a real input, asserting the parser fails closed.
   Snapshot restore found two things — a header could make a dozen bytes out of
