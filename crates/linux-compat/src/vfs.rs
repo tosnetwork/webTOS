@@ -485,6 +485,30 @@ impl Vfs {
     /// Applies literal substitutions to every regular file's contents.
     /// Used for secret injection (`${name}` -> value) and its inverse
     /// (redaction before serialization).
+    /// Moves a file's contents out of the tree, returning them, or None when
+    /// the path is not a file. Used to keep host-supplied images out of a
+    /// snapshot: the bytes are moved, not copied, and moved back afterwards.
+    pub fn take_file_contents(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        let node = self.resolve(ROOT, path, true).ok()?.node?;
+        match &mut self.nodes.get_mut(node)?.kind {
+            NodeKind::File(data) => Some(std::mem::take(data)),
+            _ => None,
+        }
+    }
+
+    /// Puts contents taken by [`Vfs::take_file_contents`] back.
+    pub fn put_file_contents(&mut self, path: &[u8], data: Vec<u8>) {
+        let Ok(resolved) = self.resolve(ROOT, path, true) else {
+            return;
+        };
+        let Some(node) = resolved.node.and_then(|n| self.nodes.get_mut(n)) else {
+            return;
+        };
+        if let NodeKind::File(existing) = &mut node.kind {
+            *existing = data;
+        }
+    }
+
     pub fn rewrite_files(&mut self, subs: &[(String, String)]) {
         if subs.is_empty() {
             return;

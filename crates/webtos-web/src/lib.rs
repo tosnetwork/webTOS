@@ -55,6 +55,8 @@ struct HostState {
     envp: Vec<Vec<u8>>,
     /// Last exported filesystem snapshot; kept alive for the reader.
     fs_image: Vec<u8>,
+    /// Paths the next export writes as empty; see `wtw_fs_exclude`.
+    fs_excluded: Vec<Vec<u8>>,
     /// Last drained guest output; kept alive so the pointer handed to JS
     /// stays valid until the next drain.
     output: Vec<u8>,
@@ -81,6 +83,7 @@ thread_local! {
             argv: Vec::new(),
             envp: Vec::new(),
             fs_image: Vec::new(),
+            fs_excluded: Vec::new(),
             output: Vec::new(),
             pty: false,
             trace_text: String::new(),
@@ -653,13 +656,26 @@ fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
 
 /// Serializes the guest filesystem for persistence; read the image via
 /// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
+/// Names a file the next `wtw_fs_export` writes as empty. A host that streams
+/// large images into the guest and caches them itself would otherwise carry
+/// them in every snapshot too; it excludes them here and re-injects them after
+/// the matching import. The list is consumed by the export.
+#[no_mangle]
+pub extern "C" fn wtw_fs_exclude(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        state.fs_excluded.push(unsafe { slice_arg(ptr, len) });
+        0
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn wtw_fs_export() -> i32 {
     with_state(|state| {
+        let excluded = std::mem::take(&mut state.fs_excluded);
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_fs_export called before wtw_init");
         };
-        state.fs_image = machine.export_fs();
+        state.fs_image = machine.export_fs_excluding(&excluded);
         0
     })
 }

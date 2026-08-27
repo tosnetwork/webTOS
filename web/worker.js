@@ -20,6 +20,8 @@
 //                                     -- run one image start to finish while
 //                                        recording an architectural trace
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
+//                                        (images this worker cached are left
+//                                        out; boot re-injects them)
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
 //               { type: "output", text },
@@ -234,8 +236,14 @@ async function cachedImage(path, url) {
   }
 }
 
+/// Guest paths this worker put there from its own image cache. A snapshot
+/// leaves them out — the cache already holds the bytes and they are injected
+/// again on the next boot, so carrying them would pay for the image twice.
+const hostImages = new Set();
+
 async function loadImage({ path, url, mode = 0o755 }) {
   postMessage({ type: "status", text: `loading ${path}…` });
+  hostImages.add(path);
   if (storageReady) {
     const handle = await cachedImage(path, url);
     if (handle) {
@@ -328,6 +336,7 @@ async function persist() {
   if (!storageReady) {
     throw new Error("browser storage is unavailable here (private window or blocked storage)");
   }
+  for (const path of hostImages) exports.wtw_fs_exclude(...put(path));
   if (exports.wtw_fs_export() !== 0) throw new Error(`export failed: ${lastError()}`);
   const bytes = mem().slice(
     exports.wtw_fs_ptr(),

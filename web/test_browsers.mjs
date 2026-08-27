@@ -347,10 +347,12 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
       record("checkpoint: the session is written to browser storage", false, String(e));
     }
     if (checkpointed > 0) {
+      // The agent binary is not in here: the image cache already holds it and
+      // boot injects it again, so a session snapshot is the session.
       record(
         "checkpoint: the session is written to browser storage",
-        true,
-        `${(checkpointed / (1 << 20)).toFixed(1)} MB saved`,
+        checkpointed < images.agentSize,
+        `${checkpointed.toLocaleString()} bytes saved, against a ${(images.agentSize / (1 << 20)).toFixed(0)} MB agent image left to the cache`,
       );
     }
   }

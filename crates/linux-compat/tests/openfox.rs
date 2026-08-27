@@ -529,3 +529,56 @@ fn openfox_soak_is_bounded() {
         );
     }
 }
+
+/// A browser streams the agent image into the guest and caches it separately,
+/// so carrying it in every snapshot pays for it twice. The host names those
+/// paths and the export writes them empty — but the running machine must not
+/// notice, and a snapshot restored without re-injecting them must be visibly
+/// empty rather than quietly truncated.
+#[test]
+fn an_excluded_image_leaves_the_snapshot_without_leaving_the_machine() {
+    let Some(image) = openfox() else { return };
+    let size = image.len();
+    let mut machine = machine_with_openfox(image);
+    machine
+        .add_file(b"/root/.openfox/config.json", b"{}\n".to_vec(), 0o644)
+        .expect("seed config");
+
+    let full = machine.export_fs();
+    let slim = machine.export_fs_excluding(&[b"/bin/openfox".to_vec()]);
+    assert!(
+        full.len() > size,
+        "the full snapshot should carry the {size}-byte image, and is {} bytes",
+        full.len()
+    );
+    assert!(
+        slim.len() + size <= full.len(),
+        "excluding the image saved {} of {size} bytes",
+        full.len() - slim.len()
+    );
+
+    // The contents were moved out and moved back: the agent still runs.
+    let run = run_openfox(&mut machine, &["status"]);
+    expect_clean(&run);
+    assert!(
+        run.output.contains("config.json \u{2713}"),
+        "the machine did not survive its own export: {:?}",
+        &run.output[run.output.len().saturating_sub(200)..]
+    );
+
+    // Restoring without re-injecting leaves the file present and empty, which
+    // is the state the host is responsible for filling in.
+    let mut reborn =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    reborn.import_fs(&slim).expect("snapshot import failed");
+    let restored = reborn
+        .env()
+        .vfs
+        .take_file_contents(b"/bin/openfox")
+        .expect("the path should still be a file");
+    assert!(
+        restored.is_empty(),
+        "the excluded image came back with {} bytes",
+        restored.len()
+    );
+}

@@ -1001,11 +1001,34 @@ impl Machine {
     /// snapshots never carry injected credentials. Take snapshots between
     /// guest processes, not while one is running.
     pub fn export_fs(&mut self) -> Vec<u8> {
+        self.export_fs_excluding(&[])
+    }
+
+    /// Serializes the guest filesystem, writing the named files as empty.
+    ///
+    /// A host that supplies large images — a browser streaming an agent
+    /// binary into the guest and caching it separately — would otherwise
+    /// carry them in every snapshot as well, paying tens of megabytes twice.
+    /// The caller names those paths here, and is responsible for putting them
+    /// back after an import; a snapshot restored without that step has the
+    /// files present but empty.
+    ///
+    /// Contents are moved out and moved back, so this costs no extra memory.
+    pub fn export_fs_excluding(&mut self, paths: &[Vec<u8>]) -> Vec<u8> {
         let redactions = self.env().secret_redactions();
         if !redactions.is_empty() {
             self.env().vfs.rewrite_files(&redactions);
         }
+        let mut held: Vec<(&Vec<u8>, Vec<u8>)> = Vec::new();
+        for path in paths {
+            if let Some(data) = self.env().vfs.take_file_contents(path) {
+                held.push((path, data));
+            }
+        }
         let image = self.env().vfs.serialize();
+        for (path, data) in held {
+            self.env().vfs.put_file_contents(path, data);
+        }
         // Restore the in-memory values so the running machine keeps working.
         self.env().expand_secrets();
         image

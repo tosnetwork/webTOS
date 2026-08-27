@@ -97,8 +97,8 @@ what is left is the agent itself.
   regression-checked in all three browser engines. What is still untested is
   the rest of the set: an interrupted network call. **Checkpoint resume** now
   works — an agent reads back its own session across a real browser reload in
-  all three engines — but a snapshot still carries images the cache already
-  holds, so it costs 52.6 MB where it should cost kilobytes.
+  all three engines, and a snapshot carries the session rather than the images
+  the cache already holds.
 - **SIGTTIN/SIGTTOU from the tty layer.** A background process group that
   reads or writes the terminal should be signalled by the terminal; only the
   `kill` path can raise these today.
@@ -713,10 +713,10 @@ Exit gate for each agent:
   profile written before it — the agent's own account of the restore, not the
   harness reading a file back. Gated in Chromium, Firefox, and WebKit. A
   checkpoint is the filesystem, not the running processes: there is no CPU or
-  memory snapshot, so what resumes is what a program wrote to disk. It also
-  costs 52.6 MB here because the snapshot carries the agent binary that the
-  image cache already holds and re-injects on boot; excluding cached images
-  from a snapshot is not wired)
+  memory snapshot, so what resumes is what a program wrote to disk. Images the
+  host cached are left out of a snapshot and injected again on boot, so a
+  session costs 2,955 bytes rather than the 52.6 MB it did when it carried the
+  agent binary as well)
 - A multi-hour soak test has bounded memory, storage, and event-log growth. ⬜
 
 The milestone is complete only when both agent profiles pass independently.
