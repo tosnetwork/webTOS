@@ -94,9 +94,14 @@ what is left is the agent itself.
   hashes at 8.5. It is not lifting (a second run is identical and translates
   nothing new) and not the module (md5sum is half native). Node is already
   eight times slower than a compute loop natively, being syscall- and
-  page-heavy, and the wasm host multiplies that by about twenty-five. See
-  `docs/workloads/node.md`. Nothing else about the milestone is worth
-  attempting until that number moves.
+  page-heavy, and the wasm host multiplies that by about twenty-five. That
+  multiplier is now narrowed to a single line: the TLB invalidation
+  `Mmu::map_memory_len` performs on every mapping change. Compiling it out
+  takes a 2,000-`mmap` probe from 62 s to 0.12 s, while removing `update_perm`
+  instead changes nothing. Why that call is expensive is not yet pinned — two
+  instrumented runs gave counts that contradict each other, so neither is
+  quoted as fact. See `docs/workloads/node.md`. Nothing else about the
+  milestone is worth attempting until that number moves.
 - **Per-agent secret handles.** Scoping and the browser path exist: a
   credential is expanded only in the files the host names, everything else
   keeps the placeholder, and a browser host injects one without it entering an

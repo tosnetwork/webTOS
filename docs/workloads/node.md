@@ -47,12 +47,49 @@ Two things it is **not**:
 - **Not the module.** The same wasm build on the same host hashes 4 MiB at
   8.5 M inst/s, about half native. Node gets 1/200th of that.
 
-Node is already about eight times slower than a compute loop natively —
-its startup is syscall- and page-heavy rather than a tight loop — and the
-wasm host multiplies that penalty by roughly twenty-five, which is the part
-that has no explanation yet. The obvious suspect is how guest pages are
-allocated inside one linear memory when an address space is large and sparse
-(V8 reserves a 256 MiB sandbox), but that is a hypothesis, not a measurement.
+### Narrowed to one line
+
+Four probes, each differing in one property, separate the cause from
+everything it might have been. Times are the same guest binary, native
+against the wasm module:
+
+| probe | native | wasm |
+|---|---|---|
+| 3 M-iteration compute loop | 2.29 s | 2.43 s |
+| 200,000 `getpid` | 0.53 s | 0.50 s |
+| 2,000 `mmap`, never touched | 0.32 s | **62 s** |
+| 1 `mmap`, 2,000 first-touch faults | — | 0.13 s |
+
+So it is the `mmap` call itself, not page faults, not syscall overhead, and
+not interpretation. The cost is flat at about 30 ms per call and independent
+of the mapping's size — 4 KiB, 64 KiB and 1 MiB all take the same — and it is
+linear in the number of calls, not quadratic. It all happens inside a single
+`wtw_run`, with the wasm linear memory never growing, no code-cache flush, and
+the same number of lifted blocks as the fast probe.
+
+Compiling out one line takes it from 62 s to **0.12 s**: the
+`self.tlb.remove_range(start, len)` in `Mmu::map_memory_len`
+(`third_party/icicle/icicle-mem/src/mmu.rs`). Removing `update_perm` instead
+changes nothing, so the TLB invalidation on every mapping change is the whole
+of it.
+
+**What is not yet pinned** is why that call is expensive. `TranslationCache`
+holds 1,024 entries and `remove_range` clears the whole thing when a range
+covers more pages than that, so the per-page loop should be bounded at 1,024
+iterations. Two instrumented runs disagreed about how many iterations actually
+occur — one counted billions across 4,014 calls, another found no call
+entering the loop with more than 210 pages — and those cannot both be right.
+The counters were reused between runs with different meanings, which is the
+likeliest explanation, so neither number should be relied on. The next step is
+to measure that call cleanly rather than to reason about it.
+
+Native runs the same code and does not show this, so whatever it is, it is a
+constant factor that wasm makes ~200× worse rather than an algorithmic
+difference.
+
+Node is already about eight times slower than a compute loop natively — its
+startup is syscall- and page-heavy rather than a tight loop — and this is what
+multiplies that by another twenty-five.
 
 What this settles: the browser milestone for both agent CLIs is not blocked on
 bring-up, packaging, delivery, or memory. It is blocked on this number.
