@@ -918,8 +918,9 @@ Work:
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results.
 - Fuzz instruction decoding, memory translation, ELF loading, syscalls, image
-  parsing, snapshot restore, and browser messages. 🔶 (six of seven surfaces
-  are swept exhaustively. Snapshot restore and ELF loading take every
+  parsing, snapshot restore, and browser messages. 🔶 (six of the seven
+  surfaces are swept exhaustively; the seventh names a parser that does not
+  exist yet. Snapshot restore and ELF loading take every
   truncation and every single-bit flip, which found two defects and five. The
   syscall surface takes every argument position of every syscall number
   against a corpus of the ways a number breaks code that trusts it — singly
@@ -938,7 +939,17 @@ Work:
   `wtw_*` function, called with pointers, lengths, handles, and budgets it
   did not earn — is swept from Node against the real module, 6,013 calls
   across 56 functions, which found thirty-two ways for a page to trap the
-  module and kill its own tab. Image parsing has nothing)
+  module and kill its own tab. Image parsing is the one left, and there is
+  nothing to fuzz: an image arrives as a stream of bytes into a file, and
+  what parses it afterwards is the ELF loader or the snapshot importer, both
+  already swept. A package format with a manifest to parse arrives with the
+  signed-manifest item below. What does exist is the delivery protocol — a
+  reservation followed by pieces — and its sequences are now gated: a piece
+  for a file nobody started, more pieces than the reservation expected, two
+  streams to one path, interleaved streams, a reservation too large to serve,
+  and a stream aimed at a directory, which used to replace it and discard
+  everything underneath. A half-delivered image reads as the bytes that
+  arrived, never as the room made for the ones that did not)
 - Define memory, CPU, storage, network, and event-log quotas per agent,
   budgeting guest pages, image bytes, and the block cache against one address
   space (`wtw_set_guest_memory_mb` is the guest half of that). 🔶 (memory,

@@ -251,6 +251,9 @@ impl Vfs {
     /// Creates or replaces the node at `path`, creating parent directories.
     /// Host-side setup helper; guest-driven creation goes through `create`.
     pub fn add_node(&mut self, path: &[u8], kind: NodeKind, mode: u32) -> Result<usize, u64> {
+        if !matches!(kind, NodeKind::Dir(_)) && self.occupied_by_a_directory(path) {
+            return Err(abi::EISDIR);
+        }
         let parent_path_len = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
         self.mkdir_p(&path[..parent_path_len])?;
         let resolved = self.resolve(ROOT, path, false)?;
@@ -271,6 +274,21 @@ impl Vfs {
         };
         entries.insert(resolved.name, node);
         Ok(node)
+    }
+
+    /// Whether `path` already names a directory, which nothing may replace.
+    ///
+    /// Replacing a file is how a host restarts an interrupted delivery, so
+    /// that stays allowed. Replacing a directory is not the same act: it
+    /// discards everything underneath, and a host that aims an image at a
+    /// path that turns out to be a directory — a mistake, or a path out of a
+    /// manifest — would take the tree with it. The kernel answers `EISDIR`
+    /// here and so does this.
+    fn occupied_by_a_directory(&self, path: &[u8]) -> bool {
+        self.resolve(ROOT, path, false)
+            .ok()
+            .and_then(|resolved| resolved.node)
+            .is_some_and(|node| self.is_dir(node))
     }
 
     /// Creates an empty file at `path` with room reserved for `capacity`
