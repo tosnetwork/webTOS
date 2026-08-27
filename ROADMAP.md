@@ -33,7 +33,7 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~70% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines; fixtures exist but are not a formally pinned set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
+| M0 Lock the baseline | 🔶 | ~76% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the Linux host covers all 78 cases and macOS fails 23, which is how much of the suite was silently doing nothing. Fixtures are pinned by checksum where they are fetched, but not versioned as a set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
@@ -41,16 +41,16 @@ terminal behavior, and recovery after a browser reload.
 | M5 Event loop & networking | 🔶 | ~91% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, so a signal now ends one rather than restarting it; that path is gated through a terminal read, not a socket. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | 🔶 | ~36% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through |
+| M8 Performance & release | 🔶 | ~40% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Snapshot restore is swept for corruption and fails closed; the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 81%**. The weights are a judgement
+Weighted by engineering effort, **roughly 82%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
 |---|---|---|---|
-| M0 Lock the baseline | 5% | 70% | 3.5 |
+| M0 Lock the baseline | 5% | 76% | 3.8 |
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 90% | 9.0 |
@@ -58,11 +58,11 @@ call, so here is the arithmetic rather than the assertion:
 | M5 Event loop & networking | 13% | 91% | 11.8 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 79% | 15.8 |
-| M8 Performance & release | 14% | 36% | 5.0 |
-| **Total** | **100%** | | **81.4** |
+| M8 Performance & release | 14% | 40% | 5.6 |
+| **Total** | **100%** | | **82.3** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
-which together account for about 13 of the 19 points outstanding. Progress from
+which together account for about 12 of the 18 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
@@ -96,19 +96,18 @@ what is left is the agent itself.
 - **The Claude Code profile.** Not started; the Node runtime beneath it runs.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
-- **Cancellation** now exists at the terminal: `^C` and `^Z` are signals, a
-  stopped group is a scheduler state, and `fg` resumes it — gated natively and
-  regression-checked in all three browser engines. A background group that
-  reads the terminal is stopped with SIGTTIN instead of competing for the
-  user's keystrokes, and a blocking syscall interrupted by a handler returns
-  `EINTR` unless the handler asked for a restart, which nothing did before:
-  every wait restarted. **Checkpoint resume** now
-  works — an agent reads back its own session across a real browser reload in
-  all three engines, and a snapshot carries the session rather than the images
-  the cache already holds.
-- **SIGTTIN/SIGTTOU from the tty layer.** A background process group that
-  reads or writes the terminal should be signalled by the terminal; only the
-  `kill` path can raise these today.
+- ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are
+  signals, a stopped group is a scheduler state, `fg` resumes it, a background
+  reader is stopped with SIGTTIN rather than competing for keystrokes, and an
+  interrupted syscall returns `EINTR` unless the handler asked for a restart —
+  nothing did before, so every wait restarted. A checkpointed session resumes
+  after a real browser reload with the agent reading back its own profile.
+  Gated natively and in all three engines. What is untested is a network call
+  interrupted mid-flight: the mechanism is shared with every other blocking
+  wait, but no test exercises it through a socket.
+- **SIGTTOU on terminal writes** fires only when `TOSTOP` is set, which the
+  default termios leaves off, matching Linux — but `tcsetattr` and
+  `tcsetpgrp` from a background group should raise it regardless, and do not.
 - **The long soaks**: OpenFox's hour is done; a multi-hour agent soak is not,
   and neither is bounded event-log growth. The soak asserts four
   invariants rather than one; the block-table invariant is a structural
@@ -511,10 +510,13 @@ Work:
   base behavior. ✅
 - Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)
 - Port signals, alternate signal stacks, and signal return frames to virtual
-  CPU state. 🔶 (registration, fatal-signal semantics, and real handler
-  delivery with `rt_sigreturn` — SIGCHLD to a parent not in `wait4`, SIGWINCH
-  to a terminal's foreground group, both gated; `sigaltstack` is still
-  registration-only, so a handler asking for SA_ONSTACK runs on the
+  CPU state. 🔶 (registration and real handler delivery with `rt_sigreturn` —
+  SIGCHLD to a parent not in `wait4`, SIGWINCH to a terminal's foreground
+  group, both gated. Dispositions are consulted rather than assumed: default
+  actions run, including stopping a process group, a process can signal
+  itself, `rt_sigprocmask` delivers what it just unblocked, and an interrupted
+  wait returns `EINTR` unless the handler asked for a restart. `sigaltstack`
+  is still registration-only, so a handler asking for SA_ONSTACK runs on the
   interrupted stack)
 - Build versioned minimal root images with explicit licenses and manifests. 🔶 (Alpine minirootfs pinned by sha256; no per-package license manifest yet)
 
