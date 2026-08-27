@@ -2077,6 +2077,15 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         &task.state,
         ParkState::Futex { woken: false, deadline: Some(deadline), .. } if now >= *deadline
     );
+    // Every wait but vfork's is interruptible: a signal that runs a handler
+    // ends the syscall unless the handler asked for it to be restarted.
+    let interruptible = !matches!(&task.state, ParkState::VforkDone { .. });
+    // Whether the wait itself came good. A syscall whose condition is now
+    // satisfied completes when it re-runs, exactly as on Linux, where a
+    // signal arriving alongside a wakeup does not turn a successful wait into
+    // an error. Only a task woken by the signal alone is a candidate for
+    // `EINTR`.
+    let condition_ready = env.sched.wait_is_satisfied(&task, now);
 
     // Address spaces are per thread group: swap only on cross-group
     // switches. The MMU currently holds the previous task's group map
@@ -2136,12 +2145,61 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         cpu.write_var(env.regs.rax, neg(abi::ETIMEDOUT));
     }
     // A task woken with a pending signal enters its handler before resuming
-    // whatever it was doing. The interrupted syscall was parked to restart, so
-    // when the handler returns via `rt_sigreturn` the wait is simply retried.
+    // whatever it was doing. The syscall was parked to restart, which is what
+    // `SA_RESTART` asks for; without that flag the wait has to end instead,
+    // with `EINTR`. Rewriting the resume point first means the state the
+    // handler snapshots is "the syscall returned -EINTR", so `rt_sigreturn`
+    // continues after it rather than running it again.
     if env.proc.pending_signals & !env.proc.sigmask != 0 {
+        if interruptible
+            && !timed_out
+            && !condition_ready
+            && signal_restarts_the_syscall(env) == Some(false)
+        {
+            end_wait_with(env, cpu, neg(abi::EINTR));
+        }
         deliver_signal(env, cpu);
     }
     true
+}
+
+/// Turns a wait that was parked to restart into one that returns `value`.
+///
+/// A parked task's saved state points the CPU *at* the `syscall` instruction
+/// so that resuming re-runs it; `reg_next_pc` was set to the same address.
+/// Ending the wait therefore means stepping over the instruction rather than
+/// resuming at `reg_next_pc`, which would re-execute the syscall with the
+/// return value sitting in `rax` as its number.
+fn end_wait_with(env: &LinuxEnv, cpu: &mut Cpu, value: u64) {
+    let after = cpu.read_pc() + SYSCALL_INSN_LEN;
+    cpu.write_var(env.regs.rax, value);
+    let next_pc = cpu.arch.reg_next_pc;
+    cpu.write_var(next_pc, after);
+    cpu.write_pc(after);
+    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, after);
+    cpu.pending_exception = None;
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
+}
+
+/// Whether the signal about to be delivered was installed with `SA_RESTART`.
+/// None when nothing will be delivered to a handler — no pending signal, or
+/// one whose disposition is the default action or "ignore", neither of which
+/// interrupts a syscall on its own.
+fn signal_restarts_the_syscall(env: &LinuxEnv) -> Option<bool> {
+    const SA_RESTART: u64 = 0x1000_0000;
+    let pending = env.proc.pending_signals & !env.proc.sigmask;
+    if pending == 0 {
+        return None;
+    }
+    let sig = pending.trailing_zeros() as u64 + 1;
+    let action = env.proc.sigactions.borrow().get(&sig).copied()?;
+    let handler = u64::from_le_bytes(action.0[0..8].try_into().expect("size"));
+    if handler == SIG_DFL || handler == SIG_IGN {
+        return None;
+    }
+    let flags = u64::from_le_bytes(action.0[8..16].try_into().expect("size"));
+    Some(flags & SA_RESTART != 0)
 }
 
 /// True when the machine's only reason to be idle is a task blocked reading

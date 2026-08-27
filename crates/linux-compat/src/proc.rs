@@ -386,35 +386,44 @@ impl Scheduler {
             {
                 return true;
             }
-            match &task.state {
-                ParkState::Ready => true,
-                ParkState::Futex {
-                    woken, deadline, ..
-                } => *woken || deadline.is_some_and(|d| now >= d),
-                ParkState::WaitChild { pid, untraced } => {
-                    let matches = |child_pid: u64, child_ppid: u64| {
-                        child_ppid == task.proc.tgid && (*pid == -1 || child_pid == *pid as u64)
-                    };
-                    self.zombies.iter().any(|z| matches(z.pid, z.ppid))
-                        || (*untraced
-                            && self.parked.iter().any(|t| {
-                                t.proc.stop_report.is_some() && matches(t.proc.tgid, t.proc.ppid)
-                            }))
-                }
-                ParkState::PipeRead { pipe } => {
-                    let pipe = pipe.borrow();
-                    !pipe.data.is_empty() || pipe.writers == 0
-                }
-                ParkState::PipeWrite { pipe } => {
-                    let pipe = pipe.borrow();
-                    pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
-                }
-                ParkState::Waiting { watches, deadline } => {
-                    deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
-                }
-                ParkState::VforkDone { done } => done.get(),
-            }
+            self.wait_is_satisfied(task, now)
         })
+    }
+
+    /// Whether the condition a parked task waits on is satisfied — the test
+    /// `find_ready` applies, without the clause that makes a task runnable
+    /// merely because a signal is deliverable. A task scheduled while this is
+    /// false was woken by the signal alone, and that is what separates a
+    /// syscall the kernel restarts from one that returns `EINTR`.
+    pub fn wait_is_satisfied(&self, task: &ParkedTask, now: u64) -> bool {
+        match &task.state {
+            ParkState::Ready => true,
+            ParkState::Futex {
+                woken, deadline, ..
+            } => *woken || deadline.is_some_and(|d| now >= d),
+            ParkState::WaitChild { pid, untraced } => {
+                let matches = |child_pid: u64, child_ppid: u64| {
+                    child_ppid == task.proc.tgid && (*pid == -1 || child_pid == *pid as u64)
+                };
+                self.zombies.iter().any(|z| matches(z.pid, z.ppid))
+                    || (*untraced
+                        && self.parked.iter().any(|t| {
+                            t.proc.stop_report.is_some() && matches(t.proc.tgid, t.proc.ppid)
+                        }))
+            }
+            ParkState::PipeRead { pipe } => {
+                let pipe = pipe.borrow();
+                !pipe.data.is_empty() || pipe.writers == 0
+            }
+            ParkState::PipeWrite { pipe } => {
+                let pipe = pipe.borrow();
+                pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
+            }
+            ParkState::Waiting { watches, deadline } => {
+                deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
+            }
+            ParkState::VforkDone { done } => done.get(),
+        }
     }
 
     /// Earliest wake-up deadline among parked tasks (timerfd expiries and

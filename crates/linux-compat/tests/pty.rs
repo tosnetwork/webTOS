@@ -671,3 +671,102 @@ fn the_suspend_character_stops_and_fg_resumes() {
         "the shell did not run a command after the job-control cycle: {echoed:?}"
     );
 }
+
+/// A blocking syscall interrupted by a handler ends with `EINTR` unless the
+/// handler asked for a restart. Nothing in the runtime returned `EINTR`
+/// before this: every wait restarted, which is `SA_RESTART` semantics applied
+/// to handlers that never asked for them. A program that breaks out of a
+/// blocking read by catching a signal would wait forever.
+const EINTR_FIXTURE: &str = r#"
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t hits = 0;
+static void on_int(int s) { (void)s; hits++; }
+
+int main(int argc, char **argv) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_int;
+    if (argc > 1 && strcmp(argv[1], "restart") == 0) sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    printf("ready\n");
+    fflush(stdout);
+
+    char buf[64];
+    ssize_t n = read(0, buf, sizeof buf);
+    if (n < 0) {
+        printf("read failed errno=%d hits=%d\n", errno, hits);
+        fflush(stdout);
+        return errno == EINTR ? 0 : 1;
+    }
+    buf[n] = 0;
+    printf("read %zd bytes hits=%d: %s", n, hits, buf);
+    fflush(stdout);
+    return 0;
+}
+"#;
+
+fn eintr_machine(image: Vec<u8>, arg: Option<&str>) -> Machine {
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    let mut argv = vec![b"fixture".to_vec()];
+    if let Some(arg) = arg {
+        argv.push(arg.as_bytes().to_vec());
+    }
+    machine.set_args(argv, vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine.install_pty_stdio(24, 80);
+    machine
+}
+
+#[test]
+fn an_interrupted_read_returns_eintr_unless_the_handler_asked_for_a_restart() {
+    let Some(image) = compile_c("eintr", EINTR_FIXTURE, &[]) else {
+        return;
+    };
+    let step = |machine: &mut Machine| {
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        machine.run();
+        String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned()
+    };
+
+    // Without SA_RESTART the read ends, and the handler ran first.
+    let mut plain = eintr_machine(image.clone(), None);
+    let ready = step(&mut plain);
+    assert!(ready.contains("ready"), "fixture did not start: {ready:?}");
+    assert!(
+        plain.awaiting_terminal_input(),
+        "fixture should be blocked in read"
+    );
+    plain.feed_terminal_input(b"\x03");
+    let interrupted = step(&mut plain);
+    assert!(
+        interrupted.contains("read failed errno=4") && interrupted.contains("hits=1"),
+        "expected EINTR after one handler run: {interrupted:?}"
+    );
+
+    // With SA_RESTART the same signal runs the same handler and the read
+    // carries on, returning the line typed afterwards.
+    let mut restarting = eintr_machine(image, Some("restart"));
+    let ready = step(&mut restarting);
+    assert!(ready.contains("ready"), "fixture did not start: {ready:?}");
+    restarting.feed_terminal_input(b"\x03");
+    let after_signal = step(&mut restarting);
+    assert!(
+        !after_signal.contains("read failed"),
+        "SA_RESTART should not surface EINTR: {after_signal:?}"
+    );
+    restarting.feed_terminal_input(b"typed-after-the-signal\n");
+    let delivered = step(&mut restarting);
+    assert!(
+        delivered.contains("typed-after-the-signal") && delivered.contains("hits=1"),
+        "the restarted read should return the typed line: {delivered:?}"
+    );
+}
