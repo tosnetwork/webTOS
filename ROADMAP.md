@@ -898,9 +898,15 @@ Work:
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results.
 - Fuzz instruction decoding, memory translation, ELF loading, syscalls, image
-  parsing, snapshot restore, and browser messages. 🔶 (snapshot restore and
-  ELF loading are swept exhaustively — every truncation and every single-bit
-  flip — which found two defects and five respectively; the rest have nothing)
+  parsing, snapshot restore, and browser messages. 🔶 (three of seven surfaces
+  are swept exhaustively. Snapshot restore and ELF loading take every
+  truncation and every single-bit flip, which found two defects and five. The
+  syscall surface takes every argument position of every syscall number
+  against a corpus of the ways a number breaks code that trusts it — singly
+  and paired, each against four page contents, 7,128,576 cases — which found
+  five more, four of them wrapped arithmetic that only the `relcheck` profile
+  can see. Instruction decoding, memory translation, image parsing, and
+  browser messages have nothing)
 - Define memory, CPU, storage, network, and event-log quotas per agent,
   budgeting guest pages, image bytes, and the block cache against one address
   space (`wtw_set_guest_memory_mb` is the guest half of that). 🔶 (memory,

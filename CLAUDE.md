@@ -103,5 +103,17 @@ speaks:
 - "No FAILED in the output" is not a pass. A build that never ran prints no
   failures either. Check the `test result:` lines.
 
+- **`--release` cannot see wrapped arithmetic.** The syscall sweep found five
+  defects, four of them wraps, and its first run under `--release` reported
+  none of them. The workspace has a `relcheck` profile that turns overflow
+  checks on, and nothing had ever used it:
+
+  ```bash
+  cd crates && cargo test --profile relcheck -p linux-compat --test syscall_sweep -- --nocapture
+  ```
+
+  It prints whether overflow checks are on, so a pass in the wrong profile
+  says so out loud rather than reading as a clean sweep.
+
 And a test that cannot fail is not evidence. Before believing a new one,
 remove the thing it tests and watch it go red.
