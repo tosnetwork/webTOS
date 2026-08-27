@@ -28,7 +28,7 @@ terminal behavior, and recovery after a browser reload.
 
 ## Status
 
-**Updated 2026-08-27.** Legend: ✅ complete (gated by tests), 🔶 partial,
+**Updated 2026-08-28.** Legend: ✅ complete (gated by tests), 🔶 partial,
 ⬜ not started.
 
 | Milestone | State | Completion | Evidence |
@@ -37,15 +37,15 @@ terminal behavior, and recovery after a browser reload.
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
-| M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
-| M5 Event loop & networking | 🔶 | ~92% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Recording, reconnect, soak pending |
+| M4 Threads & processes | ✅ | ~96% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
+| M5 Event loop & networking | 🔶 | ~94% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
-| M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | 🔶 | ~46% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. CPU and the event log still have no quota; hot-block translation is not started |
+| M7 Codex & Claude Code | 🔶 | ~82% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work. **A session that does work now finishes**: asked to change a value in a file and check it, Codex read the file, applied its own patch, ran `cat` on a pty it allocated, reported what that subprocess printed, and exited 0. Two engine defects of one shape were in the way, each an unimplemented case reported as an unrecoverable error — a vaddr-keyed disassembly map disagreeing with the asid-keyed block cache on every `execve`, and `TCSETSF` missing from the ioctl table |
+| M8 Performance & release | 🔶 | ~50% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. A third surface is now swept — every argument position of every syscall number against a corpus of the ways a number breaks code that trusts it, singly and paired, against four page contents, 7,128,576 cases — which found five more defects, four of them wrapped arithmetic that only the `relcheck` profile can see, including an `align_up` that turned an address at the top of the space into page zero and an `mprotect` of length zero that took the host down. CPU and the event log still have no quota; hot-block translation is not started |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 83%**. The weights are a judgement
+Weighted by engineering effort, **roughly 85%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -54,15 +54,15 @@ call, so here is the arithmetic rather than the assertion:
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 90% | 9.0 |
-| M4 Threads & processes | 13% | 94% | 12.2 |
-| M5 Event loop & networking | 13% | 92% | 12.0 |
+| M4 Threads & processes | 13% | 96% | 12.5 |
+| M5 Event loop & networking | 13% | 94% | 12.2 |
 | M6 OpenFox | 12% | 96% | 11.5 |
-| M7 Codex & Claude Code | 20% | 79% | 15.8 |
-| M8 Performance & release | 14% | 46% | 6.4 |
-| **Total** | **100%** | | **83.3** |
+| M7 Codex & Claude Code | 20% | 82% | 16.4 |
+| M8 Performance & release | 14% | 50% | 7.0 |
+| **Total** | **100%** | | **84.9** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
-which together account for about 12 of the 17 points outstanding. Progress from
+which together account for about 11 of the 15 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
@@ -553,7 +553,11 @@ Work:
 - Support the minimal Linux path for `write`, `exit`, and `exit_group`. ✅
 - Connect stdout to the browser terminal. ✅ (web/ demo terminal, and a real
   pty-backed terminal at web/terminal.html)
-- Add instruction differential fixtures and malformed-ELF tests. 🔶 (trap tests exist; no differential suite)
+- Add instruction differential fixtures and malformed-ELF tests. 🔶
+  (malformed-ELF is done and then some: every truncation and every single-bit
+  flip of a real image, which found five defects, and a load must fail closed
+  rather than reserve memory on the strength of a header field. The
+  differential suite against another implementation does not exist)
 
 Exit gate:
 
@@ -628,7 +632,13 @@ Work:
 - Begin with deterministic cooperative scheduling inside one worker. ✅
 - Add multi-worker execution only after the single-worker model is correct;
   retain deterministic ordering and recorded external events. ⬜ (deferred by design)
-- Test races, cancellation, signals during waits, and process-image replacement. 🔶 (races/exec covered; cancellation and signal-in-wait pending)
+- Test races, cancellation, signals during waits, and process-image
+  replacement. ✅ (races and `execve` were already covered; a wait interrupted
+  by a signal now is too, on both kinds of wait — a pty `read` and a socket
+  `recv` — each returning `EINTR` or restarting according to what the handler
+  asked for, and cancellation is the interrupt character killing a foreground
+  program blocked in a syscall, with the shell surviving its own converted
+  interrupt)
 
 Exit gate:
 
@@ -650,7 +660,12 @@ Work:
   (two brokers over one boundary: host sockets natively, and a command stream
   the browser host carries out over a WebSocket relay)
 - Support authenticated HTTPS from guest userland without exposing browser
-  credentials to unrelated agents. 🔶 (guest TLS with full certificate-chain, SAN, and validity verification against a guest-installed trust anchor; credential injection pending)
+  credentials to unrelated agents. ✅ (guest TLS verifies the full certificate
+  chain, SAN, and validity against a guest-installed trust anchor; credentials
+  are injected at runtime and scoped per agent, so one reaches only the files
+  the host named and an out-of-scope program reads the placeholder rather than
+  an empty value — gated natively and in Chromium, Firefox, and WebKit, and a
+  real credential drives a live authenticated model call)
 - Record network inputs for replay and receipt classification. ⬜
 - Define offline, denied, timeout, reconnect, and proxy-failure behavior. 🔶
   (denied and timeout defined, including a browser guest with no relay and a
@@ -797,8 +812,10 @@ Work:
   child shell commands; the host `git` binary runs status/diff/add/commit/
   log in the guest (gated by `tests/git.rs`); pseudoterminals —
   openpty/forkpty, /dev/ptmx, /dev/pts, controlling terminal, termios, window
-  size, and SIGWINCH-on-resize — work, including a program a shell started in
-  its own process group, and the real Codex TUI renders and takes input on a
+  size, and SIGWINCH-on-resize — work, including changing terminal mode with
+  `tcsetattr(TCSAFLUSH)`, which a program running a command on a terminal of
+  its own does before anything else, and a program a shell started in its own
+  process group, and the real Codex TUI renders and takes input on a
   host-driven stdio pty; the input line discipline raises the interrupt,
   quit, and suspend characters as signals on the foreground group, and job
   control is real — `^C` kills the foreground program and the shell
@@ -838,8 +855,11 @@ Exit gate for each agent:
   checkpoint written to browser storage carries the placeholder — checked by
   reading the stored bytes, in all three engines)
 - The agent reads a repository, edits a file, runs a command, and reports the
-  result through the terminal. 🔶 (Codex `exec` does this natively via
-  `run_guest`; the browser-profile path remains)
+  result through the terminal. 🔶 (all four natively, in one session: asked to
+  change a value in a file and then check it, Codex read the file, called the
+  live model, applied its own patch, ran `cat` in a subprocess on a pty it
+  allocated, and reported what that subprocess printed — 24,573 tokens, exit
+  0. The browser-profile path remains)
 - Child processes, cancellation, and terminal resize behave correctly. 🔶
   (child processes and vfork spawns work; terminal resize delivers SIGWINCH,
   and a full-screen program repaints from a browser window resize with nothing
