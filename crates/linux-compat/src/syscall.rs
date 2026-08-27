@@ -2163,6 +2163,47 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     true
 }
 
+/// The terminal's own rule for a process that is not in its foreground
+/// group: it may not take the user's input, and with `TOSTOP` set it may not
+/// write either. POSIX has the terminal signal the offending process group
+/// rather than fail the call, which stops it until a shell moves it to the
+/// foreground and the syscall is retried.
+///
+/// A group that blocks or ignores the signal cannot be stopped by it, so the
+/// call fails with `EIO` instead — otherwise it would quietly steal
+/// keystrokes from the program the user is actually talking to.
+///
+/// Returns None when the caller is entitled to the terminal.
+fn background_tty_access(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    pty: &crate::fd::PtyRef,
+    signal: u64,
+) -> Option<Outcome> {
+    // No foreground group means no controlling terminal has claimed this pty,
+    // and the rule does not apply.
+    let foreground = pty.borrow().fg_pgrp;
+    if foreground == 0 || foreground == env.proc.pgid {
+        return None;
+    }
+    let bit = 1_u64 << (signal - 1);
+    let ignored = env
+        .proc
+        .sigactions
+        .borrow()
+        .get(&signal)
+        .map(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")))
+        == Some(SIG_IGN);
+    if env.proc.sigmask & bit != 0 || ignored {
+        return Some(Outcome::Ret(Err(abi::EIO)));
+    }
+    // Other members of the group stop when they next reach the kernel; this
+    // one stops now, with the syscall left to re-run after SIGCONT.
+    deliver_signal_to_pgrp(env, env.proc.pgid, signal);
+    env.proc.pending_signals &= !bit;
+    Some(stop_thread_group(env, cpu, signal, true))
+}
+
 /// Turns a wait that was parked to restart into one that returns `value`.
 ///
 /// A parked task's saved state points the CPU *at* the `syscall` instruction
@@ -2538,6 +2579,11 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// disposition table is process-wide, so any such thread can run the handler.
 /// Does nothing when the parent installed no SIGCHLD handler (the default
 /// disposition for SIGCHLD is to ignore it) or when every thread blocks it.
+/// Terminal-generated job-control signals: a background process group that
+/// reads the terminal, and one that writes it while `TOSTOP` is set.
+const SIGTTIN: u64 = 21;
+const SIGTTOU: u64 = 22;
+
 /// `sa_handler` values with a meaning of their own rather than an address.
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
@@ -3300,6 +3346,13 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             }
         }
         Kind::Pty(pty, master) => {
+            // Reading the terminal from a background process group is the
+            // terminal's business, not this descriptor's: SIGTTIN.
+            if !master {
+                if let Some(outcome) = background_tty_access(env, cpu, &pty, SIGTTIN) {
+                    return outcome;
+                }
+            }
             // A master drains slave output (`s2m`); a slave drains master
             // input (`m2s`). An empty queue is EOF once the other end is gone,
             // otherwise it blocks.
@@ -3457,6 +3510,14 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
+            // Writing to the terminal from a background group is allowed
+            // unless the line discipline asks otherwise with TOSTOP, which is
+            // off in the default termios.
+            if !master && pty.borrow().tostop() {
+                if let Some(outcome) = background_tty_access(env, cpu, &pty, SIGTTOU) {
+                    return outcome;
+                }
+            }
             let mut inner = pty.borrow_mut();
             // A master write is terminal input, which goes through the input
             // line discipline. A slave write is terminal output (into `s2m`),

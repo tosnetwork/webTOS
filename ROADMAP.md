@@ -94,8 +94,11 @@ what is left is the agent itself.
   running against a mounted tree.
 - **Cancellation** now exists at the terminal: `^C` and `^Z` are signals, a
   stopped group is a scheduler state, and `fg` resumes it — gated natively and
-  regression-checked in all three browser engines. What is still untested is
-  the rest of the set: an interrupted network call. **Checkpoint resume** now
+  regression-checked in all three browser engines. A background group that
+  reads the terminal is stopped with SIGTTIN instead of competing for the
+  user's keystrokes, and a blocking syscall interrupted by a handler returns
+  `EINTR` unless the handler asked for a restart, which nothing did before:
+  every wait restarted. **Checkpoint resume** now
   works — an agent reads back its own session across a real browser reload in
   all three engines, and a snapshot carries the session rather than the images
   the cache already holds.

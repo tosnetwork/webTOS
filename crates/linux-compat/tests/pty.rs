@@ -770,3 +770,65 @@ fn an_interrupted_read_returns_eintr_unless_the_handler_asked_for_a_restart() {
         "the restarted read should return the typed line: {delivered:?}"
     );
 }
+
+/// A background process group may not read the terminal. Without the rule it
+/// simply does, and the keystrokes meant for the shell disappear into it —
+/// the user types a command and nothing happens.
+#[test]
+fn a_background_reader_is_stopped_instead_of_stealing_keystrokes() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    for applet in ["sh", "cat", "echo"] {
+        machine
+            .add_symlink(format!("/bin/{applet}").as_bytes(), b"/bin/busybox")
+            .expect("applet link");
+    }
+    machine.set_args(
+        vec![b"sh".to_vec(), b"-i".to_vec()],
+        vec![
+            b"PATH=/bin".to_vec(),
+            b"TERM=xterm".to_vec(),
+            b"HOME=/root".to_vec(),
+            b"PS1=$ ".to_vec(),
+        ],
+    );
+    machine.load(b"/bin/sh").expect("ELF load failed");
+    machine.install_pty_stdio(24, 80);
+
+    let run = |machine: &mut Machine| {
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        machine.run();
+        String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned()
+    };
+
+    let prompt = run(&mut machine);
+    assert!(prompt.contains('$'), "no shell prompt: {prompt:?}");
+
+    // `cat` in the background wants the terminal it is not the foreground of.
+    machine.feed_terminal_input(b"cat &\n");
+    let _ = run(&mut machine);
+
+    // The shell's own account of what the terminal did. BusyBox names the
+    // reason: without the rule this reads "Running", and the background `cat`
+    // sits in the read competing for every keystroke.
+    machine.feed_terminal_input(b"jobs\n");
+    let jobs = run(&mut machine);
+    assert!(
+        jobs.contains("Stopped (tty input)"),
+        "the background reader was not stopped by the terminal: {jobs:?}"
+    );
+
+    // And the shell is still the one being talked to.
+    machine.feed_terminal_input(b"echo keystrokes-reached-the-shell\n");
+    let echoed = run(&mut machine);
+    assert!(
+        echoed.contains("keystrokes-reached-the-shell"),
+        "the shell stopped responding after the background reader: {echoed:?}"
+    );
+}

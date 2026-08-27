@@ -116,6 +116,13 @@ impl Pty {
         oflag & 0x1 != 0 && oflag & 0x4 != 0
     }
 
+    /// True when `TOSTOP` (c_lflag bit 8) is set, so a background process
+    /// group writing to the terminal is signalled rather than allowed. Off in
+    /// the default termios, which is why background output normally appears.
+    pub fn tostop(&self) -> bool {
+        u32::from_le_bytes(self.termios[12..16].try_into().expect("size")) & 0x100 != 0
+    }
+
     /// True when `ISIG` (c_lflag bit 0) is set, so the interrupt and quit
     /// characters generate signals instead of arriving as data.
     fn isig(&self) -> bool {
