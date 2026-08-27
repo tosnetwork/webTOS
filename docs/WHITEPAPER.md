@@ -2,10 +2,11 @@
 
 **An Operating System for AI Agents, Delivered by the Browser**
 
-**Version:** Draft v1.1 · 2026-08-26
+**Version:** Draft v1.2 · 2026-08-27
 **Status:** Product and vision white paper
 **Companions:** [Yellow Paper](specs/yellowpaper.md) (engineering specification) ·
-[ROADMAP](../ROADMAP.md) (milestones and exit gates)
+[ROADMAP](../ROADMAP.md) (milestones and exit gates) ·
+[Performance](performance.md) (measured throughput, memory, and method)
 
 This paper states what webTOS is, why it should exist now, who it competes
 with, why it can be defended, and what could kill it. It makes no adoption,
@@ -178,11 +179,12 @@ prompt does not pass a gate.
   state, checkpoints, execution receipts, and a deterministic Linux
   compatibility layer (100+ syscalls) that runs OpenJDK-, Node.js-, and
   CPython-class workloads under QEMU, with validation harnesses in-repo.
-- **The browser x86-64 engine is running.** A pure-Rust software CPU
-  (interpreter over a production-grade instruction decoder) compiles to
-  WebAssembly and executes static Linux binaries; the static-`hello` and
-  BusyBox milestones are verified native and in the wasm host, with the
-  cross-browser matrix in progress.
+- **The browser x86-64 engine is running, in three engines.** A pure-Rust
+  software CPU (interpreter over a production-grade instruction decoder)
+  compiles to WebAssembly and executes unmodified Linux binaries. A matrix of
+  27 checks runs in Chromium, Firefox and WebKit on every change, and it
+  compares instruction counts across them: identical input retires an
+  identical instruction stream in all three.
 - **The Linux userland is deep.** Dynamic linking through the real musl and
   glibc loaders; copy-on-write fork, vfork semantics, threads, futexes, and
   real signal delivery over a deterministic cooperative scheduler; brokered
@@ -190,13 +192,21 @@ prompt does not pass a gate.
   persist across reload.
 - **A real coding agent completes real work.** The stock, statically linked
   Codex CLI (0.149.1) runs an authenticated `exec` end to end: it discovers
-  the CA store, performs TLS handshakes, calls the OpenAI API, prints the
-  model's reply, and exits cleanly — 2.37 billion instructions, natively
-  under `run_guest`. OpenFox completes a scripted network agent task; a
-  stock Node.js v24 runs scripts.
-- What remains is roadmap with exit criteria written down: the interactive
-  TUI (PTY), model-driven repository edits, Git, browser-side delivery of
-  the large agent images, and Claude Code.
+  the CA store, performs TLS handshakes, calls the OpenAI API, edits a file,
+  runs a shell command, prints the model's summary, and exits cleanly — 2.37
+  billion instructions. Its interactive TUI renders full-screen on a
+  pseudoterminal, takes keystrokes, and quits cleanly. Both natively, under
+  `run_guest`.
+- **A real agent image runs in a tab.** A 52 MB Linux x86-64 agent binary
+  streams into the guest filesystem and a browser cache as it downloads,
+  reaches a shell prompt in about three seconds, and executes — in all three
+  engines. The browser also has an interactive shell on a pseudoterminal, a
+  full-screen editor that repaints when the window is resized, and networking
+  through a relay that refuses every destination its allowlist does not name.
+- What remains is roadmap with exit criteria written down: carrying Codex
+  itself into the browser (five times larger, and needing credentials that
+  must not be baked into an image), per-agent secret handles, checkpoint
+  resume across a reload, the long soaks, and Claude Code.
 
 Principles that govern all of it: correctness before speed (interpreter
 first, translation later); no silent compatibility lies (unsupported means a
@@ -315,6 +325,65 @@ Two things this architecture deliberately does **not** claim:
 
 Full specification: the [Yellow Paper](specs/yellowpaper.md).
 
+### 7.1 Execution model: an interpreter, on purpose
+
+The question a technical reader asks first is whether this is a JIT. It is
+not, and the reason is the product rather than the schedule.
+
+webTOS lifts each basic block of x86-64 once into an intermediate
+representation, caches it, and interprets it. Blocks link directly to their
+successors, so the loop stays inside the interpreter rather than returning to
+a dispatcher. No native code and no WebAssembly is generated at run time.
+Hot-block translation is the third tier of a written strategy — reference
+interpreter, cached interpreter, translator — and it is deliberately last.
+
+**Why last.** The claim webTOS sells is that the same input produces the same
+instruction stream, reproducibly, so a third party can replay it. That is
+measured today: `ls /` retires 73,280 instructions in Chromium, Firefox and
+WebKit alike; the musl-loaded fixture retires 31,937 in all three. A
+translation tier must reproduce those numbers bit for bit or the claim is
+gone, which is why the milestone gate for it reads "optimized and interpreter
+modes pass the same architectural trace suite". An engine whose goal is to run
+Linux in a tab does not carry that constraint. One whose goal is verifiable
+execution does, and it is cheaper to add a translator to a correct interpreter
+than to retrofit determinism onto a translator.
+
+**What it costs, measured.** Full figures and method are in
+[performance.md](performance.md); the shape:
+
+| | Sustained interpretation | Notes |
+|---|---|---|
+| Native | ~21 M inst/s | reference |
+| Chromium / WebKit | ~11 M inst/s | about half of native |
+| One engine's test build | ~1.4 M inst/s | see below |
+
+Two findings worth stating plainly. The browser is not the bottleneck: on the
+fast engines the interpreter runs within about a factor of two of native,
+which is a smaller gap than the architecture suggests. And the outlier is not
+a webTOS problem — a few-hundred-byte control module shows the same spread, so
+that column measures a browser build that compiles WebAssembly with its
+baseline compiler only. The control ships in the benchmark so the mistake is
+not made twice.
+
+**A translator is not free in a browser.** You cannot emit machine code; you
+emit WebAssembly, and the browser's own compiler joins your inner loop. That
+compilation is itself tiered — forcing Chromium to its baseline tier costs
+2.7x — so the payoff of a translator depends on a variable nobody outside the
+browser controls. Real implementations therefore batch large regions rather
+than translating per block, and keep an interpreter for cold code regardless.
+
+**Measurement changed what we did first.** The first optimization was not a
+translator at all. An `execve` of an image whose blocks were already lifted
+cost 48.8 ms to retire 22,272 instructions — about seventy times below the
+interpreter's own sustained rate, because the block cache keyed on *which
+process was looking* rather than *what the memory contained*. Keying it by
+content took that to roughly 2 ms, and a shell pipeline from 1.06 s to 0.28 s.
+It also exposed a live bug: two images sharing a load address shared their
+lifted code, so one program ran another's. Translation work that had been
+assumed necessary turned out to be a caching mistake worth twenty-fold — which
+is the argument for measuring before optimizing, and for publishing the
+harness rather than the conclusion.
+
 ---
 
 ## 8. Come for the Tool, Stay for the Network
@@ -352,7 +421,7 @@ Every row below is a respectable project; none occupies webTOS's position.
 |---|---|---|
 | **Cloud agent sandboxes** (microVM/container services) | Server-side isolated execution for agents | Remote, per-instance billing, cold starts, no local data, no user-side verifiability; trusts the operator. Complement more than competitor. |
 | **WebContainers-class runtimes** | Node.js/toolchain runtime in the browser | Language-runtime scope, not an OS: no unmodified x86-64 binaries, no agent primitives, no determinism or receipts. |
-| **In-browser x86 emulators** (v86-class, CheerpX-class) | Full machine or userspace x86 emulation in the browser, typically booting a Linux guest | Proves in-browser x86 is viable — and shares its distribution logic. But they reproduce a *human* OS in a tab: ambient authority inside the guest, no capability model, no metering, no deterministic replay, no receipts. webTOS replaces the guest OS itself with an agent kernel. |
+| **In-browser x86 emulators** (v86-class, CheerpX-class) | Full machine or userspace x86 emulation in the browser, typically booting a Linux guest; the mature ones are publicly described as translating x86 to WebAssembly at run time | Proves in-browser x86 is viable — and shares its distribution logic. But they reproduce a *human* OS in a tab: ambient authority inside the guest, no capability model, no metering, no deterministic replay, no receipts. webTOS replaces the guest OS itself with an agent kernel, and interprets rather than translates because a translation tier has to reproduce the interpreter's instruction stream exactly (see §7.1). |
 | **Syscall-interception sandboxes** (gVisor-class) | User-space Linux syscall reimplementation for containers | Server-side hardening layer; inherits Linux's non-determinism and ambient model; no browser story. |
 | **WASI / recompile-the-world** | Portable Wasm system interface | Requires recompilation and often source access. Agents ship as Linux x86-64 releases; the binary you must run is the binary the vendor pinned. webTOS meets software where it ships. |
 | **Agent framework governance** (permissions/limits in frameworks) | Userland conventions for agent control | Optional under pressure; not enforced beneath the agent. webTOS enforces the same intent at the kernel boundary. |
@@ -452,18 +521,20 @@ Full details with exit criteria live in [ROADMAP](../ROADMAP.md):
 | Milestone | Outcome | Status |
 |---|---|---|
 | M0 | Native baseline locked; fixtures and traces versioned | Partial (fixtures exist; trace format pending) |
-| M1 | Static `hello` in a browser worker | Done; cross-browser matrix in progress |
-| M2 | Static BusyBox: shell, files, persistence across reload | Done (native + wasm gates green) |
-| M3 | Dynamic Linux ELF via the real loader | Done (musl and glibc, native + wasm) |
+| M1 | Static `hello` in a browser worker | Done; the three-engine matrix passes and the engines agree instruction for instruction |
+| M2 | Static BusyBox: shell, files, persistence across reload | Done, verified in all three engines |
+| M3 | Dynamic Linux ELF via the real loader | Done (musl and glibc, native + browser) |
 | M4 | Threads, fork/exec, deterministic scheduling | Done incl. determinism and adversarial gates |
-| M5 | Event loops, brokered networking, HTTPS | Largely done (guest TLS verified; recording/soak pending) |
-| M6 | OpenFox completes a real agent task | Done natively; browser image delivery pending |
-| M7 | Codex and Claude Code: sustained interactive sessions | ~50%: authenticated Codex `exec` completes end to end natively; PTY, repo edits, Git, and Claude Code pending |
-| M8 | Performance tiers, fuzzing, quotas, signed releases | Roadmap |
+| M5 | Event loops, brokered networking, HTTPS | Largely done: guest TLS natively, and the browser reaches the network through a deny-by-default relay; recording and soak pending |
+| M6 | OpenFox completes a real agent task | Done natively, and the image now streams into a browser and runs there; the 60-minute soak remains |
+| M7 | Codex and Claude Code: sustained interactive sessions | ~74%: both Codex modes run end to end natively, including the interactive TUI on a pseudoterminal; the browser has the terminal half. Carrying Codex's own image, per-agent secrets, and Claude Code remain |
+| M8 | Performance tiers, fuzzing, quotas, signed releases | Started: a measured baseline (native, per-engine, and a control module), and the first optimization — a content-addressed lift cache worth roughly twenty-fold on process startup |
 
-Verification is the point: the repository builds, the native suites run, the
-wasm host runs, and every completed claim above corresponds to tests and
-fixtures in-tree. Claims and code travel together.
+Verification is the point: the repository builds, the native suites run (58
+cases), the wasm host runs, and a 27-check matrix runs in three browser
+engines. Every completed claim above corresponds to tests and fixtures
+in-tree, and the performance claims to harnesses that print their numbers
+rather than assert them. Claims and code travel together.
 
 ---
 
@@ -474,7 +545,17 @@ the OS. The product is not cycles — it is bounded authority, metered cost,
 deterministic replay, and receipts for agent execution, with zero-install
 distribution. Slow-and-verifiable already wins whole categories (consider
 what blockchains trade for auditability); here the workloads are interactive
-tools whose bottleneck is the model and the network, not the CPU.
+tools whose bottleneck is the model and the network, not the CPU. On the
+measured side the gap is smaller than the architecture suggests: the
+interpreter sustains roughly half of native throughput in the fast browser
+engines (§7.1).
+
+**"Is it a JIT?"** No — it lifts each block once, caches it, and interprets.
+Translation to WebAssembly is the last of three planned tiers, and it is last
+because a translator must reproduce the interpreter's instruction stream
+exactly or the replay claim is gone. §7.1 has the reasoning and the numbers,
+including why the first optimization worth doing turned out not to be a
+translator at all.
 
 **"Why would anyone run agents locally when clouds exist?"** Data gravity
 (the repository and credentials are here), cost (the user's silicon is free),
