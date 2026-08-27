@@ -331,6 +331,30 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     );
   }
 
+  // A checkpoint is the session: whatever the guest wrote to disk. Seed the
+  // agent's profile before the reload so what comes back is state this
+  // session produced, not something the boot sequence re-seeds.
+  let checkpointed = 0;
+  if (images.agent) {
+    await typeLine(
+      page,
+      "mkdir -p /root/.openfox/workspace && echo '{}' > /root/.openfox/config.json && echo seeded$?",
+      "^seeded[0-9]+$",
+    );
+    try {
+      checkpointed = await page.evaluate(() => window.webtos.checkpoint());
+    } catch (e) {
+      record("checkpoint: the session is written to browser storage", false, String(e));
+    }
+    if (checkpointed > 0) {
+      record(
+        "checkpoint: the session is written to browser storage",
+        true,
+        `${(checkpointed / (1 << 20)).toFixed(1)} MB saved`,
+      );
+    }
+  }
+
   // Downloaded once: a reload must serve every image from the cache.
   await page.reload();
   await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
@@ -342,6 +366,21 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     restored.length > 0 && restored.every((image) => image.cached),
     restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
   );
+
+  // The milestone gate: a checkpointed session resumes after a browser
+  // reload with its filesystem intact. The agent is what has to see it —
+  // `status` reads the profile it found on disk and marks each part present
+  // or missing, so this is the agent's own account of the restore, not the
+  // harness reading a file back.
+  if (checkpointed > 0) {
+    const status = await typeLine(page, "openfox status; echo agent$?", "^agent[0-9]+$", 600_000);
+    const sees = (part) => new RegExp(`${part}\\s*\u2713`).test(status);
+    record(
+      "checkpoint: the agent resumes from its session after a reload",
+      sees("config\\.json") && sees("workspace") && /^agent0$/m.test(status),
+      "openfox status found the profile written before the tab reloaded",
+    );
+  }
 
   const echoed = await typeLine(page, `echo hello-from-${name}`, `hello-from-${name}`);
   record(

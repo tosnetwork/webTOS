@@ -40,7 +40,7 @@ terminal behavior, and recovery after a browser reload.
 | M4 Threads & processes | ✅ | ~92% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. Multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the full 60-minute run is the outstanding gate |
-| M7 Codex & Claude Code | 🔶 | ~77% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, and `fg` resumes it. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
+| M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, and `fg` resumes it. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
 | M8 Performance & release | 🔶 | ~30% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute |
 
 ### Overall completion
@@ -57,9 +57,9 @@ call, so here is the arithmetic rather than the assertion:
 | M4 Threads & processes | 13% | 92% | 12.0 |
 | M5 Event loop & networking | 13% | 90% | 11.7 |
 | M6 OpenFox | 12% | 92% | 11.0 |
-| M7 Codex & Claude Code | 20% | 77% | 15.4 |
+| M7 Codex & Claude Code | 20% | 79% | 15.8 |
 | M8 Performance & release | 14% | 30% | 4.2 |
-| **Total** | **100%** | | **79.4** |
+| **Total** | **100%** | | **79.8** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 14 of the 21 points outstanding. Progress from
@@ -68,7 +68,7 @@ were the ones where a workload either ran or did not.
 
 The native test suites (68 cases, plus soak, measurement, and
 trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
-28-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+30-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -95,8 +95,10 @@ what is left is the agent itself.
 - **Cancellation** now exists at the terminal: `^C` and `^Z` are signals, a
   stopped group is a scheduler state, and `fg` resumes it — gated natively and
   regression-checked in all three browser engines. What is still untested is
-  the rest of the set: an interrupted network call, and **checkpoint resume**,
-  where a checkpointed session has never been resumed after a browser reload.
+  the rest of the set: an interrupted network call. **Checkpoint resume** now
+  works — an agent reads back its own session across a real browser reload in
+  all three engines — but a snapshot still carries images the cache already
+  holds, so it costs 52.6 MB where it should cost kilobytes.
 - **SIGTTIN/SIGTTOU from the tty layer.** A background process group that
   reads or writes the terminal should be signalled by the terminal; only the
   `kill` path can raise these today.
@@ -706,7 +708,15 @@ Exit gate for each agent:
   typed — gated in Chromium, Firefox, and WebKit; Codex's interactive TUI
   quits cleanly on Ctrl-C natively, not yet in a browser profile)
 - A checkpointed session resumes after browser reload with filesystem state
-  intact. ⬜
+  intact. ✅ (the terminal page checkpoints the guest filesystem to browser
+  storage on demand; after a real reload `openfox status` reports finding the
+  profile written before it — the agent's own account of the restore, not the
+  harness reading a file back. Gated in Chromium, Firefox, and WebKit. A
+  checkpoint is the filesystem, not the running processes: there is no CPU or
+  memory snapshot, so what resumes is what a program wrote to disk. It also
+  costs 52.6 MB here because the snapshot carries the agent binary that the
+  image cache already holds and re-injects on boot; excluding cached images
+  from a snapshot is not wired)
 - A multi-hour soak test has bounded memory, storage, and event-log growth. ⬜
 
 The milestone is complete only when both agent profiles pass independently.

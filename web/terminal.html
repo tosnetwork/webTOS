@@ -21,6 +21,14 @@
     flex: 1; min-height: 0; background: #05070b;
     border: 1px solid #1d2331; border-radius: 8px; padding: .6rem;
   }
+  #controls { display: flex; gap: .5rem; align-items: center; }
+  #controls button {
+    background: #131a26; color: #d6dbe4; border: 1px solid #1d2331;
+    border-radius: 6px; padding: .35rem .7rem; font: inherit; font-size: .85rem;
+    cursor: pointer;
+  }
+  #controls button:hover:not(:disabled) { border-color: #2f3a4f; }
+  #controls button:disabled { opacity: .45; cursor: default; }
   #missing {
     display: none; background: #1b1206; border: 1px solid #4a3410;
     border-radius: 8px; padding: 1rem; font: 13px ui-monospace, monospace;
@@ -46,6 +54,10 @@
 <div id="missing">
   vendor/xterm is missing. Run <code>tools/fetch_xterm.sh</code> to fetch the
   pinned terminal emulator, then reload.
+</div>
+<div id="controls">
+  <button id="checkpoint" disabled>Checkpoint session</button>
+  <button id="forget" disabled>Delete saved session</button>
 </div>
 <div id="status">starting worker…</div>
 <div id="screen"></div>
@@ -74,7 +86,27 @@
   fit.fit();
   // The browser matrix drives this page; it reads the rendered screen and
   // the live state from here rather than scraping the DOM canvas.
-  window.webtos = { term, state: "starting", images: [] };
+  const checkpointBtn = document.getElementById("checkpoint");
+  const forgetBtn = document.getElementById("forget");
+  // A checkpoint is the guest filesystem, not the running processes: there is
+  // no CPU or memory snapshot. What survives a reload is what a program wrote
+  // to disk, which is what an agent's session state is.
+  let checkpointDone = null;
+  window.webtos = {
+    term,
+    state: "starting",
+    images: [],
+    storage: false,
+    checkpoint: () =>
+      new Promise((resolve, reject) => {
+        if (!window.webtos.storage) {
+          reject(new Error("browser storage is unavailable here"));
+          return;
+        }
+        checkpointDone = { resolve, reject };
+        worker.postMessage({ type: "persist" });
+      }),
+  };
 
   const worker = new Worker(new URL("./worker.js", import.meta.url));
   let live = false;
@@ -124,9 +156,15 @@
     const msg = event.data;
     if (msg.type === "status") statusEl.textContent = msg.text;
     if (msg.type === "ready") {
+      window.webtos.storage = !!msg.storage;
+      checkpointBtn.disabled = !msg.storage;
+      forgetBtn.disabled = !msg.storage;
       statusEl.textContent += msg.restored
         ? " — previous session restored"
         : " — filesystem ready";
+      if (!msg.storage) {
+        statusEl.textContent += " — browser storage unavailable; checkpoints disabled";
+      }
       for (const [path, url] of wanted) worker.postMessage({ type: "image", path, url });
     }
     if (msg.type === "progress") {
@@ -154,9 +192,17 @@
           ? `shell exited ${msg.exitCode} · ${msg.icount.toLocaleString()} instructions — reload to start again`
           : `stopped (status ${msg.status}): ${msg.error}`;
     }
+    if (msg.type === "persisted") {
+      const mb = (msg.bytes / (1 << 20)).toFixed(1);
+      statusEl.textContent = `session checkpointed — ${mb} MB saved, survives a reload`;
+      checkpointDone?.resolve(msg.bytes);
+      checkpointDone = null;
+    }
     if (msg.type === "error") {
       window.webtos.state = "error";
       statusEl.textContent = `error: ${msg.text}`;
+      checkpointDone?.reject(new Error(msg.text));
+      checkpointDone = null;
     }
   };
 
@@ -181,6 +227,26 @@
     statusEl.textContent = statusLine(live ? "running" : "idle");
   });
   window.addEventListener("resize", () => fit.fit());
+
+  // Checkpointing is explicit. The guest filesystem is written to browser
+  // storage as it stands, so a reload starts from what the session had rather
+  // than from the seeded image.
+  checkpointBtn.addEventListener("click", () => {
+    checkpointBtn.disabled = true;
+    window.webtos
+      .checkpoint()
+      .catch((e) => {
+        statusEl.textContent = `checkpoint failed: ${e.message}`;
+      })
+      .finally(() => {
+        checkpointBtn.disabled = !window.webtos.storage;
+        term.focus();
+      });
+  });
+  forgetBtn.addEventListener("click", () => {
+    worker.postMessage({ type: "forget" });
+    term.focus();
+  });
 
   const notes = new TextEncoder().encode(
     "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
