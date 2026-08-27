@@ -611,7 +611,9 @@ fn iter_iov(cpu: &mut Cpu, iov: u64, iovcnt: u64) -> Result<Vec<(u64, u64)>, u64
     let iovcnt = iovcnt.min(1024);
     let raw = read_mem(cpu, iov, (iovcnt * 16) as usize)?;
     Ok(raw
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|entry| {
             (
                 u64::from_le_bytes(entry[..8].try_into().expect("chunk size")),
@@ -1444,7 +1446,7 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
     let nfds = nfds.min(1024) as usize;
     let mut records = read_mem(cpu, fds_ptr, nfds * 8)?;
     let mut ready = 0_u64;
-    for record in records.chunks_exact_mut(8) {
+    for record in records.as_chunks_mut::<8>().0 {
         let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
         let events = u16::from_le_bytes(record[4..6].try_into().expect("chunk size"));
         let revents = match env.proc.fds.borrow().get(fd as u32 as u64) {
@@ -4159,8 +4161,10 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
         }
         let bytes = read_mem(cpu, ptr, words * 8)?;
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("chunk size")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_le_bytes(*word))
             .collect())
     };
     let (rset, wset) = match (read_set(cpu, readfds), read_set(cpu, writefds)) {
@@ -4413,7 +4417,7 @@ fn outcome_poll(
     };
     {
         let fds = env.proc.fds.borrow();
-        for record in records.chunks_exact(8) {
+        for record in records.as_chunks::<8>().0 {
             let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
             let events = u16::from_le_bytes(record[4..6].try_into().expect("chunk size"));
             let Ok(entry) = fds.get(fd as u32 as u64) else {

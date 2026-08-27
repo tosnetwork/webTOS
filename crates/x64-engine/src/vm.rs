@@ -465,7 +465,13 @@ impl InterpVm {
                             if *count >= threshold {
                                 self.promoted.insert(addr);
                                 // Drop the cheap version so the next entry
-                                // lifts it again, with the optimizer on.
+                                // lifts it again, with the optimizer on. Its
+                                // group stays in the block arena, which is
+                                // append-only: the entries become unreachable
+                                // but are not reclaimed. `promoted` bounds
+                                // that at one stale copy per address, so the
+                                // table converges toward twice the image's hot
+                                // blocks rather than growing without limit.
                                 let key = self.get_block_key(addr);
                                 self.code.map.remove(&key);
                                 self.lifted.remove(&(addr, key.isa_mode));

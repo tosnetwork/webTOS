@@ -95,7 +95,10 @@ what is left is the agent itself.
 - **Cancellation, interrupted calls, and checkpoint resume** are untested as a
   set, and a checkpointed session has never been resumed after a reload.
 - **The long soaks**: 60 minutes for OpenFox, multi-hour for an agent, both
-  with bounded memory, storage, and event-log growth.
+  with bounded memory, storage, and event-log growth. The soak now asserts
+  three invariants rather than one, and the block-table invariant is
+  convergence rather than flatness, because tiered lifting leaves a retired
+  block group behind on promotion.
 
 ### Making it usable rather than possible (M8)
 
@@ -559,7 +562,12 @@ Exit gate:
   test repository. ✅
 - Configuration and repository changes survive reload and explicit resume. ✅ (filesystem snapshot restored into a fresh machine)
 - A 60-minute interactive soak test completes without kernel corruption or
-  unbounded memory growth. 🔶 (bounded 25-round soak green; caught and fixed a cross-process physical-memory leak; full 60-min pending)
+  unbounded memory growth. 🔶 (25-round soak green over filesystem, guest
+  physical memory, and the lifted-block table; caught a cross-process
+  physical-memory leak, and then caught tiered lifting retaining one stale
+  block group per promoted address — measured over 80 rounds as converging,
+  not linear, and documented in `docs/performance.md`; `OPENFOX_SOAK_ROUNDS`
+  scales the same test to the full hour, which has not been run in CI)
 
 ## Milestone 7: Codex and Claude Code 🔶
 

@@ -460,16 +460,27 @@ int main(void) {
 #[ignore = "slow soak; run explicitly with --ignored"]
 fn openfox_soak_is_bounded() {
     let Some(image) = openfox() else { return };
+    // 25 rounds is the CI-friendly proxy, about a minute and a half on a
+    // Linux host. The milestone gate is an hour; `OPENFOX_SOAK_ROUNDS=1000`
+    // is roughly that.
+    let rounds: usize = std::env::var("OPENFOX_SOAK_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(25)
+        .max(8);
     let mut machine = machine_with_openfox(image);
     machine
         .add_file(b"/root/.openfox/config.json", b"{}\n".to_vec(), 0o644)
         .expect("seed config");
 
     let mut prev_fs = machine.export_fs().len();
-    for round in 0..25 {
+    let mut first_guest_mb = None;
+    let mut blocks_at: Vec<usize> = Vec::with_capacity(rounds);
+    for round in 0..rounds {
         let cmd = if round % 2 == 0 { "status" } else { "version" };
         let run = run_openfox(&mut machine, &[cmd]);
         expect_clean(&run);
+
         let fs = machine.export_fs().len();
         // Allow a little jitter but no unbounded growth per round.
         assert!(
@@ -478,5 +489,31 @@ fn openfox_soak_is_bounded() {
             fs.saturating_sub(prev_fs)
         );
         prev_fs = fs;
+
+        // Guest physical pages once leaked across execve; they must be flat.
+        let (guest_mb, _) = machine.guest_memory_mb();
+        let baseline_mb = *first_guest_mb.get_or_insert(guest_mb);
+        assert!(
+            guest_mb <= baseline_mb + 8,
+            "guest memory grew from {baseline_mb} to {guest_mb} MiB by round {round}"
+        );
+
+        blocks_at.push(machine.vm_mut().code.blocks.len());
     }
+
+    // Lifted blocks do grow across rounds: an address that crosses the
+    // promotion threshold is lifted again with the optimizer, and the cheap
+    // version stays in the table. That is bounded by the number of blocks the
+    // image has, so what matters is that it converges rather than climbing
+    // linearly. Compare the first quarter's growth against the last.
+    let quarter = rounds / 4;
+    let early = blocks_at[quarter].saturating_sub(blocks_at[0]);
+    let late = blocks_at[rounds - 1].saturating_sub(blocks_at[rounds - 1 - quarter]);
+    assert!(
+        late * 2 <= early.max(1),
+        "lifted blocks are not converging: {early} added in the first quarter, \
+         {late} in the last ({} to {} over {rounds} rounds)",
+        blocks_at[0],
+        blocks_at[rounds - 1],
+    );
 }

@@ -247,6 +247,31 @@ The shell pipeline moving twenty-six-fold is the two changes compounding: the
 content-addressed cache stopped re-lifting the same image per process, and
 tiering stopped optimizing what a short-lived process never repeats.
 
+#### The cost tiering does have: one stale copy per promoted block
+
+Promotion re-lifts an address with the optimizer and drops the cheap version
+from the block map, but the block arena is append-only, so the retired group's
+entries stay allocated and unreachable. The soak test found this by asserting
+the block table was flat across repeated runs of the same image, which it is
+not.
+
+Eighty rounds of the agent, measured:
+
+| Round | 0 | 9 | 19 | 39 | 59 | 79 |
+|---|---|---|---|---|---|---|
+| Lifted blocks | 32,440 | 35,362 | 36,730 | 38,308 | 39,108 | 39,672 |
+
+Growth per ten rounds falls from 2,922 to about 250: addresses cross the
+threshold at different rates, and each can only ever be promoted once. The
+bound is twice the image's distinct blocks, and 22% over eighty rounds is well
+inside it. Guest memory and the filesystem stay flat over the same run.
+
+The soak therefore asserts convergence rather than flatness — the last
+quarter's growth must be a small fraction of the first quarter's — which still
+catches a genuinely linear leak. Reclaiming the retired groups would need
+index reuse in the arena, and stale `Target::Internal` references make that a
+larger change than the memory it returns is worth today.
+
 ## What this says about milestone 8
 
 In priority order, on the evidence above:
