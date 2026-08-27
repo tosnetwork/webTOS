@@ -108,11 +108,93 @@ fn fail(state: &mut HostState, message: impl Into<String>) -> i32 {
     -1
 }
 
-/// Copies `[ptr, ptr+len)` out of linear memory.
+/// The largest single message the host can send.
 ///
-/// Safety contract: `ptr` must come from `wtw_alloc` (module-owned memory).
-unsafe fn slice_arg(ptr: u32, len: u32) -> Vec<u8> {
-    unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) }.to_vec()
+/// Being inside linear memory is not enough to be a plausible message: a
+/// length can be inside it and still be most of it, and a copy of most of a
+/// 32-bit address space cannot be served — the allocator aborts, which is a
+/// dead tab rather than an error the page can handle. Serving a few of them
+/// in a row exhausts the space even when each one on its own would fit.
+///
+/// The largest message the host actually sends is a 4 MiB image chunk
+/// (`IMAGE_CHUNK` in `web/worker.js`), and the largest staged file is an
+/// agent image of about 52 MB. This is thirty-two times the chunk, above any
+/// image the browser gates carry, and a thirty-second of the address space,
+/// so no single call can take a meaningful bite out of it.
+const MAX_MESSAGE_BYTES: u64 = 128 << 20;
+
+/// How much staging memory the host may hold at once.
+///
+/// A `wtw_alloc` buffer lives until `wtw_reset`, so a host that keeps asking
+/// for them keeps the module growing. Each request can be a perfectly
+/// reasonable size and the total still reach the end of a 32-bit address
+/// space, where the next allocation aborts — a dead tab, from a sequence of
+/// calls none of which was individually wrong.
+///
+/// The host stages one image chunk at a time and a handful of small files, an
+/// agent image among them: about 53 MB in the browser gates. This leaves room
+/// for several times that before saying no.
+const MAX_STAGED_BYTES: u64 = 256 << 20;
+
+/// The longest path the host can name.
+///
+/// A path is not a message. It has a maximum length, the guest's `PATH_MAX`,
+/// and a "path" of a hundred megabytes is not a long path — it is a length
+/// that was never a path, which the filesystem then holds on to for as long
+/// as the session lasts. Sweeping the boundary drove the module past two
+/// gigabytes this way, one accepted call at a time.
+const MAX_PATH_BYTES: u64 = 4096;
+
+/// How many bytes of linear memory the module actually has.
+///
+/// A native build has no linear memory to speak of, so it answers with the
+/// whole address space and the bound below never fires; the boundary this
+/// guards only exists in wasm.
+fn linear_memory_bytes() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        const WASM_PAGE: u64 = 65_536;
+        core::arch::wasm32::memory_size(0) as u64 * WASM_PAGE
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        u64::MAX
+    }
+}
+
+/// Copies `[ptr, ptr+len)` out of linear memory, or `None` if that range is
+/// not inside it.
+///
+/// The old version of this documented a safety contract — that `ptr` came
+/// from `wtw_alloc` — which the caller breaks by passing a different number.
+/// On this boundary the caller's numbers are exactly the input whose
+/// correctness is not ours to assume: a page can call these functions with
+/// anything, and a length it made up turned into a read past the end of
+/// memory, which is a trap, which is a dead tab.
+fn slice_arg(ptr: u32, len: u32) -> Option<Vec<u8>> {
+    bounded_arg(ptr, len, MAX_MESSAGE_BYTES)
+}
+
+/// The same, for an argument that names a path rather than carrying content.
+fn path_arg(ptr: u32, len: u32) -> Option<Vec<u8>> {
+    bounded_arg(ptr, len, MAX_PATH_BYTES)
+}
+
+fn bounded_arg(ptr: u32, len: u32, max: u64) -> Option<Vec<u8>> {
+    if len as u64 > max {
+        return None;
+    }
+    let end = (ptr as u64).checked_add(len as u64)?;
+    if end > linear_memory_bytes() {
+        return None;
+    }
+    // Inside memory the module owns — but a length can be inside it and still
+    // be most of it, and a copy that cannot be allocated aborts rather than
+    // failing. Ask for the room first.
+    let mut out = Vec::new();
+    out.try_reserve_exact(len as usize).ok()?;
+    out.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) });
+    Some(out)
 }
 
 /// Allocates `len` bytes inside the module and returns the offset, so the
@@ -120,7 +202,25 @@ unsafe fn slice_arg(ptr: u32, len: u32) -> Vec<u8> {
 #[no_mangle]
 pub extern "C" fn wtw_alloc(len: u32) -> u32 {
     with_state(|state| {
-        let buf = vec![0_u8; len as usize].into_boxed_slice();
+        // The caller picks this number. One it cannot be served — four
+        // gigabytes in a 32-bit address space — must come back as a refusal,
+        // because a failed allocation inside wasm is an abort, and an abort
+        // is a dead tab rather than an error the page can handle. Offset zero
+        // is never a live allocation, so it is the refusal.
+        let staged: u64 = state.allocations.iter().map(|b| b.len() as u64).sum();
+        let mut buf = Vec::<u8>::new();
+        if len as u64 > MAX_MESSAGE_BYTES
+            || staged.saturating_add(len as u64) > MAX_STAGED_BYTES
+            || buf.try_reserve_exact(len as usize).is_err()
+        {
+            state.error = format!(
+                "wtw_alloc: cannot serve {len} bytes ({staged} already staged; \
+                 wtw_reset releases them)"
+            );
+            return 0;
+        }
+        buf.resize(len as usize, 0);
+        let buf = buf.into_boxed_slice();
         let ptr = buf.as_ptr() as u32;
         state.allocations.push(buf);
         ptr
@@ -141,6 +241,17 @@ pub extern "C" fn wtw_scratch(len: u32) -> u32 {
     with_state(|state| {
         let len = len as usize;
         if state.scratch.len() < len {
+            // Same refusal as `wtw_alloc`: a size that cannot be served is an
+            // answer, not an abort.
+            if len as u64 > MAX_MESSAGE_BYTES
+                || state
+                    .scratch
+                    .try_reserve(len - state.scratch.len())
+                    .is_err()
+            {
+                state.error = format!("wtw_scratch: cannot serve {len} bytes");
+                return 0;
+            }
             state.scratch.resize(len, 0);
         }
         state.scratch.as_ptr() as u32
@@ -173,8 +284,12 @@ pub extern "C" fn wtw_add_file(path_ptr: u32, path_len: u32, data_ptr: u32, data
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_add_file called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
-        let data = unsafe { slice_arg(data_ptr, data_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(data) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "data is not inside the module's memory");
+        };
         match machine.add_file(&path, data, 0o755) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
@@ -194,7 +309,9 @@ pub extern "C" fn wtw_file_create(path_ptr: u32, path_len: u32, capacity: u32, m
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_file_create called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
         match machine.create_file(&path, capacity as usize, mode) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
@@ -215,8 +332,12 @@ pub extern "C" fn wtw_file_append(
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_file_append called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
-        let data = unsafe { slice_arg(data_ptr, data_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(data) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "data is not inside the module's memory");
+        };
         match machine.append_file(&path, &data) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
@@ -237,8 +358,12 @@ pub extern "C" fn wtw_add_symlink(
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_add_symlink called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
-        let target = unsafe { slice_arg(target_ptr, target_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(target) = path_arg(target_ptr, target_len) else {
+            return fail(state, "target is not inside the module's memory");
+        };
         match machine.add_symlink(&path, &target) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
@@ -250,7 +375,10 @@ pub extern "C" fn wtw_add_symlink(
 #[no_mangle]
 pub extern "C" fn wtw_arg(ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        state.argv.push(unsafe { slice_arg(ptr, len) });
+        let Some(arg) = slice_arg(ptr, len) else {
+            return fail(state, "argument is not inside the module's memory");
+        };
+        state.argv.push(arg);
         0
     })
 }
@@ -259,7 +387,10 @@ pub extern "C" fn wtw_arg(ptr: u32, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_env(ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        state.envp.push(unsafe { slice_arg(ptr, len) });
+        let Some(var) = slice_arg(ptr, len) else {
+            return fail(state, "environment entry is not inside the module's memory");
+        };
+        state.envp.push(var);
         0
     })
 }
@@ -274,7 +405,9 @@ pub extern "C" fn wtw_load(path_ptr: u32, path_len: u32) -> i32 {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_load called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
         machine.set_args(argv, envp);
         match machine.load(&path) {
             Ok(()) => 0,
@@ -369,7 +502,9 @@ pub extern "C" fn wtw_pty_input(ptr: u32, len: u32) -> i32 {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_pty_input called before wtw_init");
         };
-        let bytes = unsafe { slice_arg(ptr, len) };
+        let Some(bytes) = slice_arg(ptr, len) else {
+            return fail(state, "bytes is not inside the module's memory");
+        };
         machine.feed_terminal_input(&bytes);
         0
     })
@@ -426,8 +561,12 @@ pub extern "C" fn wtw_trace_image(
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_trace_image called before wtw_init");
         };
-        let path = unsafe { slice_arg(path_ptr, path_len) };
-        let data = unsafe { slice_arg(data_ptr, data_len) };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(data) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "data is not inside the module's memory");
+        };
         machine.describe_trace_image(&path, &data);
         0
     })
@@ -581,7 +720,9 @@ pub extern "C" fn wtw_net_connected(handle: u32, ip: u32, port: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_net_data(handle: u32, ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        let bytes = unsafe { slice_arg(ptr, len) };
+        let Some(bytes) = slice_arg(ptr, len) else {
+            return fail(state, "bytes is not inside the module's memory");
+        };
         with_broker(state, |broker| {
             broker.deliver_data(handle as u64, &bytes);
         })
@@ -592,7 +733,9 @@ pub extern "C" fn wtw_net_data(handle: u32, ptr: u32, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_net_datagram(handle: u32, ip: u32, port: u32, ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        let bytes = unsafe { slice_arg(ptr, len) };
+        let Some(bytes) = slice_arg(ptr, len) else {
+            return fail(state, "bytes is not inside the module's memory");
+        };
         let from = socket_addr(ip, port)
             .unwrap_or_else(|| std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
         with_broker(state, |broker| {
@@ -809,9 +952,14 @@ pub extern "C" fn wtw_network_headroom_kib() -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_secret(name_ptr: u32, name_len: u32, value_ptr: u32, value_len: u32) -> i32 {
     with_state(|state| {
-        let name = String::from_utf8_lossy(&unsafe { slice_arg(name_ptr, name_len) }).into_owned();
-        let value =
-            String::from_utf8_lossy(&unsafe { slice_arg(value_ptr, value_len) }).into_owned();
+        let (Some(name), Some(value)) = (
+            slice_arg(name_ptr, name_len),
+            slice_arg(value_ptr, value_len),
+        ) else {
+            return fail(state, "secret is not inside the module's memory");
+        };
+        let name = String::from_utf8_lossy(&name).into_owned();
+        let value = String::from_utf8_lossy(&value).into_owned();
         state.secrets.push((name, value, Vec::new()));
         0
     })
@@ -823,7 +971,9 @@ pub extern "C" fn wtw_secret(name_ptr: u32, name_len: u32, value_ptr: u32, value
 #[no_mangle]
 pub extern "C" fn wtw_secret_scope(ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        let path = unsafe { slice_arg(ptr, len) };
+        let Some(path) = path_arg(ptr, len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
         match state.secrets.last_mut() {
             Some((_, _, paths)) => {
                 paths.push(path);
@@ -863,7 +1013,10 @@ pub extern "C" fn wtw_secrets_apply() -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_fs_exclude(ptr: u32, len: u32) -> i32 {
     with_state(|state| {
-        state.fs_excluded.push(unsafe { slice_arg(ptr, len) });
+        let Some(path) = path_arg(ptr, len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        state.fs_excluded.push(path);
         0
     })
 }
@@ -898,7 +1051,9 @@ pub extern "C" fn wtw_fs_import(ptr: u32, len: u32) -> i32 {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_fs_import called before wtw_init");
         };
-        let bytes = unsafe { slice_arg(ptr, len) };
+        let Some(bytes) = slice_arg(ptr, len) else {
+            return fail(state, "bytes is not inside the module's memory");
+        };
         match machine.import_fs(&bytes) {
             Ok(()) => 0,
             Err(e) => fail(state, format!("filesystem import failed: {e}")),
