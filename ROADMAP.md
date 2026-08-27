@@ -90,12 +90,13 @@ what is left is the agent itself.
   resident. Node runs too, in 0.9 s. Delivery, memory, and speed are settled
   problems, and so are credentials: Codex reports `Logged in using ChatGPT`
   in 2.2 s with the real profile arriving as a scoped secret, the snapshot
-  afterwards holding the placeholder. **A working session still does not
-  complete.** `codex exec` with a small task runs past 1.95 billion
-  instructions in the module without output or a single network command, and
-  behaves no better natively with 3 GiB and a real broker — so it is not a
-  browser problem, and the native runner's diagnostics are the way at it. See
-  `docs/workloads/node.md`.
+  afterwards holding the placeholder. **A real model call works**: with a
+  reachable nameserver in the guest, `codex exec "say hi"` reaches the live
+  API and prints `Hi! 👋`, 4,199 tokens, exit 0, in 2.7 billion instructions.
+  What hung before was DNS — no `/etc/resolv.conf`, so the resolver spun on
+  `recvmsg` 263,885 times. A session that *does work* is still blocked by the
+  lifter: once the agent spawns shells, repeated `disassembly changed` flushes
+  keep it from finishing. See `docs/workloads/node.md`.
 - **The Claude Code profile.** **It runs**: `2.1.247 (Claude Code)`, exit 0,
   inside the wasm module a browser loads — 184 M instructions in 16.6 s. It is
   a 239 MB **Bun** binary, not a Node one, so "both agents are Node

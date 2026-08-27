@@ -166,11 +166,58 @@ only in the browser:
   for network` as expected with no broker, and ends at 1.09 billion
   instructions with `OutOfMemory` under the 1 GiB default.
 
-So the agent starts, authenticates, spawns its subprocesses, and then
-something in a real session does not complete. It is not a browser-specific
-problem — the same thing happens natively — which makes it tractable to chase
-with the native runner's diagnostics rather than through a tab. That is where
-this stops.
+### What the syscall trail said
+
+`recvmsg` failed 263,885 times with `EAGAIN` on one descriptor. The sequence
+around it:
+
+```
+socket(AF_INET, SOCK_DGRAM|NONBLOCK) = 14
+bind(14, …)                          = 0
+sendto(14, …, 29)                    = 29      DNS query, sent
+sendto(14, …, 29)                    = 29
+recvmsg(14, …)                       = -EAGAIN  × 263,885
+```
+
+The query goes out and no answer comes back, so the agent spins. The cause is
+that the guest had **no `/etc/resolv.conf`** — nothing told the resolver whom
+to ask. The host's own copy does not help either: it names `127.0.0.53`, the
+systemd stub, which does not exist inside the guest. A reachable nameserver
+has to be supplied.
+
+### A real session, end to end
+
+With a resolver in place, Codex completed a session against the live API:
+
+```
+provider: openai   session id: 01a044ad-5bb2-7413-909c-1fd0e7547956
+user   say hi
+codex  Hi! 👋
+tokens used 4,199        exit 0        2,745,666,480 instructions
+```
+
+That is a real model call from inside webTOS.
+
+### What still stops a session that does work
+
+Three things, each concrete:
+
+1. **The command runner is found by absolute path.** Codex spawns
+   `/bin/codex-code-mode-host`, next to its own binary, not through `PATH` —
+   which is the 256 `execve` failures in the trail. Delivered there, it
+   spawns, and Codex issues `/bin/sh -lc 'cat config.txt'`.
+2. **The agent sandboxes itself with bubblewrap**, which needs Linux
+   namespaces this machine does not implement. Worth stating as an
+   architectural point rather than a gap to close: webTOS *is* the sandbox,
+   and a second one inside it is redundant. Codex's
+   `--dangerously-bypass-approvals-and-sandbox` is the right setting here, and
+   means something different inside a guest than on a host.
+3. **The lifter thrashes once the agent spawns shells.** With the inner
+   sandbox bypassed, short-lived `/bin/sh` subprocesses produce repeated
+   `disassembly changed at 0x…` errors — the engine finding cached blocks
+   whose bytes now decode differently — and the run does not finish in 500 s.
+   That is the next thing to chase, and it is an engine problem rather than an
+   agent one.
 
 ## How far Node gets today
 
