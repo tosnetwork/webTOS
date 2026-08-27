@@ -1431,4 +1431,47 @@ impl Machine {
     pub fn vm_mut(&mut self) -> &mut InterpVm {
         &mut self.vm
     }
+
+    /// Issue one syscall with raw arguments, the way the guest's `SYSCALL`
+    /// instruction does: the arguments go into the registers the ABI names
+    /// and the same entry point reads them back out.
+    ///
+    /// This exists for the argument sweep in `tests/syscall_sweep.rs`. The
+    /// guest is the untrusted party here, so every argument of every syscall
+    /// is attacker-controlled, and the property worth proving — that no
+    /// combination of them panics the host or reaches memory the guest does
+    /// not own — needs to drive one call at a time and name the one that
+    /// broke. Returns the value left in `rax`, which is a negated errno for
+    /// a refusal, and whether the call ended the task.
+    pub fn issue_syscall(&mut self, nr: u64, args: [u64; 6]) -> (i64, bool) {
+        let InterpVm { cpu, env, .. } = &mut self.vm;
+        let env = env
+            .as_mut_any()
+            .downcast_mut::<LinuxEnv>()
+            .expect("machine environment is always LinuxEnv");
+        let rax = env.regs.rax;
+        // A real `SYSCALL` leaves the next-instruction register pointing just
+        // past itself, and the restart path subtracts the instruction's length
+        // from it. Presenting anything else manufactures failures no guest can
+        // reach: at a next-pc of zero the subtraction underflows, which says
+        // nothing about a kernel a guest can only enter by executing the
+        // instruction.
+        const SYSCALL_INSN_LEN: u64 = 2;
+        let pc = cpu.read_pc();
+        cpu.write_var(cpu.arch.reg_next_pc, pc.wrapping_add(SYSCALL_INSN_LEN));
+        cpu.write_var(rax, nr);
+        for (reg, value) in [
+            (env.regs.rdi, args[0]),
+            (env.regs.rsi, args[1]),
+            (env.regs.rdx, args[2]),
+            (env.regs.r10, args[3]),
+            (env.regs.r8, args[4]),
+            (env.regs.r9, args[5]),
+        ] {
+            cpu.write_var(reg, value);
+        }
+        let exit = syscall::handle(env, cpu);
+        let ret: u64 = cpu.read_var(rax);
+        (ret as i64, exit.is_some())
+    }
 }

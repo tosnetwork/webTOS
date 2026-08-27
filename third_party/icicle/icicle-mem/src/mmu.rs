@@ -344,8 +344,12 @@ impl Mmu {
     #[cold]
     pub fn read_bytes_large(&mut self, mut addr: u64, buf: &mut [u8], perm: u8) -> MemResult<()> {
         // Read unaligned bytes at the start
-        let aligned_addr = crate::align_up(addr, 16); // @fixme: possible integer overflow
-        let (start, buf) = buf.split_at_mut(((aligned_addr - addr) as usize).min(buf.len()));
+        // An address with no aligned address above it saturates below itself,
+        // and the wrapped difference clamps to the whole buffer — which is
+        // the right answer: every byte of it is in the unaligned lead.
+        let aligned_addr = crate::align_up(addr, 16);
+        let lead = aligned_addr.wrapping_sub(addr);
+        let (start, buf) = buf.split_at_mut((lead as usize).min(buf.len()));
         for byte in start {
             *byte = self.read::<1>(addr, perm)?[0];
             addr = addr.wrapping_add(1);
@@ -386,8 +390,10 @@ impl Mmu {
     #[cold]
     pub fn write_bytes_large(&mut self, mut addr: u64, buf: &[u8], perm: u8) -> MemResult<()> {
         // Write unaligned bytes at the start
-        let aligned_addr = crate::align_up(addr, 16); // @fixme: possible integer overflow
-        let (start, buf) = buf.split_at(((aligned_addr - addr) as usize).min(buf.len()));
+        // See `read_bytes_large`: a saturated alignment is below the address.
+        let aligned_addr = crate::align_up(addr, 16);
+        let lead = aligned_addr.wrapping_sub(addr);
+        let (start, buf) = buf.split_at((lead as usize).min(buf.len()));
         for byte in start {
             self.write(addr, [*byte], perm)?;
             addr = addr.wrapping_add(1);
@@ -564,6 +570,12 @@ impl Mmu {
 
     /// Updates the mapping value associated with a region of memory
     pub fn update_perm(&mut self, addr: u64, count: u64, perm: u8) -> MemResult<()> {
+        // An empty range covers nothing, and is what `mprotect(addr, 0, ...)`
+        // asks for. Computing its last address underflows before any of the
+        // work below decides the range is empty.
+        if count == 0 {
+            return Ok(());
+        }
         let end = addr.checked_add(count - 1).ok_or(MemError::AddressOverflow)?;
         let perm =
             perm | perm::MAP | if self.track_uninitialized { perm::NONE } else { perm::INIT };

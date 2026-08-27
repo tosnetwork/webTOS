@@ -2874,6 +2874,9 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// The two signals a process cannot catch, block, or ignore.
 const SIGKILL: u64 = 9;
 const SIGSTOP: u64 = 19;
+/// The highest signal number there is. A pending set is a 64-bit word, so a
+/// number above this has no bit to occupy and shifting by it is undefined.
+const NSIG: u64 = 64;
 
 /// Terminal-generated job-control signals: a background process group that
 /// reads the terminal, and one that writes it while `TOSTOP` is set.
@@ -2957,6 +2960,9 @@ fn acts_on_signal(
 /// among those, because that is the one a debugger or a person watching
 /// `wait4` expects to see act.
 fn signal_process(env: &mut LinuxEnv, tgid: u64, signal: u64) -> bool {
+    if signal == 0 || signal > NSIG {
+        return false;
+    }
     let bit = 1_u64 << (signal - 1);
     if env.proc.tgid == tgid {
         if acts_on_signal(&env.proc.sigactions, signal) {
@@ -4044,6 +4050,12 @@ fn sys_setpgid(env: &mut LinuxEnv, pid: u64, pgid: u64) -> SysResult {
 /// the one signal carried out here on the sender's behalf.
 fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outcome {
     let target = target as u32 as i32 as i64;
+    // The signal number comes from the guest and indexes a bit in a 64-bit
+    // pending set. Anything above the last signal has no bit, and shifting by
+    // it is undefined rather than merely useless.
+    if signal > NSIG {
+        return Outcome::Ret(Err(abi::EINVAL));
+    }
     if signal == 0 {
         // Existence probe.
         let exists = target == env.proc.tgid as i64
@@ -4675,11 +4687,41 @@ fn sys_eventfd(env: &mut LinuxEnv, initval: u64, flags: u64) -> SysResult {
     )
 }
 
+/// A `timespec` read as a duration, for the five callers that wait on one:
+/// `futex`, `timerfd_settime`, `pselect6`, `ppoll`, and `nanosleep`.
+///
+/// The guest wrote these two numbers, so neither is trustworthy. A timespec
+/// that cannot be interpreted is refused rather than rounded into one that
+/// can — clamping a negative second count to zero turns "this is nonsense"
+/// into "wait no time at all", which is a different answer than the one the
+/// kernel gives and hides the guest's mistake from it. And the arithmetic
+/// saturates: seconds near `i64::MAX` scaled to nanoseconds overflow, and a
+/// wrapped result is a short wait where the guest asked for a long one.
 fn read_timespec_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
     let bytes = read_mem(cpu, addr, 16)?;
     let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
     let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
-    Ok((sec.max(0) as u64) * 1_000_000_000 + nsec.max(0) as u64)
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Err(abi::EINVAL);
+    }
+    Ok((sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64))
+}
+
+/// `select`'s `timeval` read as a duration, on the same terms as
+/// [`read_timespec_at`]: refused if it cannot be interpreted, saturating
+/// rather than wrapping when it can.
+fn read_timeval_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
+    let bytes = read_mem(cpu, addr, 16)?;
+    let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
+    let usec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
+    if sec < 0 || !(0..1_000_000).contains(&usec) {
+        return Err(abi::EINVAL);
+    }
+    Ok((sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usec as u64).saturating_mul(1_000)))
 }
 
 fn sys_timerfd_create(env: &mut LinuxEnv, _clockid: u64, flags: u64) -> SysResult {
@@ -4997,13 +5039,8 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
             Err(errno) => return Outcome::Ret(Err(errno)),
         }
     } else {
-        // struct timeval { sec, usec }.
-        match read_mem(cpu, timeout_ptr, 16) {
-            Ok(bytes) => {
-                let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
-                let usec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
-                Some((sec.max(0) as u64) * 1_000_000_000 + (usec.max(0) as u64) * 1_000)
-            }
+        match read_timeval_at(cpu, timeout_ptr) {
+            Ok(nanos) => Some(nanos),
             Err(errno) => return Outcome::Ret(Err(errno)),
         }
     };

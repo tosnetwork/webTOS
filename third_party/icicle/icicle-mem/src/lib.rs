@@ -217,10 +217,19 @@ impl AllocLayout {
     }
 }
 
+/// Rounds `value` up to the next multiple of `alignment` (a power of two),
+/// saturating at the highest aligned value instead of wrapping.
+///
+/// The value can be an address the guest chose. Wrapping turned an address at
+/// the very top of the space into a small one — `align_up(u64::MAX, 4096)`
+/// came back as 0 — so a bounds check downstream was asked about a page the
+/// caller never named. Callers that then measure `align_up(addr) - addr` must
+/// use `wrapping_sub`, because the saturated result is below `addr`: there is
+/// no aligned address above it, and the whole remainder is the unaligned lead.
 pub fn align_up(value: u64, alignment: u64) -> u64 {
     assert_eq!(alignment.count_ones(), 1, "Alignment must be a non-zero power of 2");
-    let mask = alignment.wrapping_sub(1);
-    value + ((alignment - (value & mask)) & mask)
+    let mask = !alignment.wrapping_sub(1);
+    value.checked_add(alignment - 1).map_or(mask, |v| v & mask)
 }
 
 pub fn align_down(value: u64, alignment: u64) -> u64 {
