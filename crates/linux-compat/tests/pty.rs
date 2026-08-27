@@ -3,7 +3,7 @@
 //! interactive TUI. Fixtures are compiled by the test with the host gcc, so
 //! these are native-only and skip when no static compiler is available.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use linux_compat::Machine;
@@ -468,7 +468,7 @@ fn a_shell_launched_program_repaints_on_resize() {
     machine.load(b"/bin/sh").expect("ELF load failed");
     machine.install_pty_stdio(12, 40);
 
-    let mut run = |machine: &mut Machine| {
+    let run = |machine: &mut Machine| {
         machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
         let exit = machine.run();
         (
@@ -499,20 +499,26 @@ fn a_shell_launched_program_repaints_on_resize() {
 /// `^C` has to be a signal, not a byte. Without the input line discipline the
 /// interrupt character arrives as data and a foreground program blocked in a
 /// read simply never ends, which is what a person notices first when a
-/// terminal is not really a terminal.
+/// terminal is not really a terminal. The `^C` at the prompt exercises the
+/// other half: BusyBox `sh` converts it to a self-directed SIGINT (blocked
+/// around the `raise` by musl), and the shell survives only if the handler
+/// runs on the way out of the `rt_sigprocmask` that unblocked it — otherwise
+/// the shell reads the interrupt as end-of-file and exits 130.
 #[test]
-#[ignore = "open: the shell exits 130 after its own SIGINT handler runs; real \
-            Linux returns to the prompt. See the handoff note."]
 fn the_interrupt_character_kills_the_foreground_program() {
     let Some(image) = busybox() else {
         return;
     };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
     let mut machine =
         Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
     machine
         .add_file(b"/bin/busybox", image, 0o755)
         .expect("add busybox");
-    for applet in ["sh", "sleep", "echo"] {
+    for applet in ["sh", "cat", "echo"] {
         machine
             .add_symlink(format!("/bin/{applet}").as_bytes(), b"/bin/busybox")
             .expect("applet link");
@@ -538,12 +544,14 @@ fn the_interrupt_character_kills_the_foreground_program() {
     let prompt = run(&mut machine);
     assert!(prompt.contains('$'), "no shell prompt: {prompt:?}");
 
-    // A foreground program that would otherwise outlive the test.
-    machine.feed_terminal_input(b"sleep 3600\n");
+    // A foreground program blocked reading the terminal. Unlike `sleep`, a
+    // blocked `cat` has no deadline, so the deterministic clock cannot warp
+    // past it: only the interrupt can end it.
+    machine.feed_terminal_input(b"cat\n");
     let _ = run(&mut machine);
     assert!(
         machine.awaiting_terminal_input(),
-        "the shell should be waiting on a sleeping child"
+        "the shell should be waiting on a child blocked in a terminal read"
     );
 
     machine.feed_terminal_input(b"\x03");
@@ -559,5 +567,20 @@ fn the_interrupt_character_kills_the_foreground_program() {
     assert!(
         echoed.contains("interrupted-and-alive"),
         "the shell did not run a command after the interrupt: {echoed:?}"
+    );
+
+    // `^C` at the prompt itself: the shell prints its own `^C`, redraws the
+    // prompt, and keeps working instead of treating it as end-of-file.
+    machine.feed_terminal_input(b"\x03");
+    let at_prompt = run(&mut machine);
+    assert!(
+        machine.awaiting_terminal_input(),
+        "the shell exited on ^C at the prompt: {at_prompt:?}"
+    );
+    machine.feed_terminal_input(b"echo still-here\n");
+    let echoed = run(&mut machine);
+    assert!(
+        echoed.contains("still-here"),
+        "the shell did not run a command after ^C at the prompt: {echoed:?}"
     );
 }

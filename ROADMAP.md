@@ -165,12 +165,19 @@ SIGCHLD and terminal-signal paths, and by making a parked task runnable only
 for a signal it does not block. `a_signal_raised_while_blocked_is_delivered_when_unblocked`
 opens the window deliberately instead of racing for it.
 
-**Remaining deviation:** delivery happens at the next scheduling point, not on
-the way out of the `sigprocmask` that unblocked it. A task that unblocks a
-pending signal and then never parks will not see it until it does. Delivering
-from the syscall return path was tried and broke the two tests above, so it
-needs the interrupted-context handling worked out properly rather than a
-quick fix.
+**Deviation since resolved:** delivery used to happen at the next scheduling
+point, not on the way out of the `sigprocmask` that unblocked it. That gap had
+a visible casualty: musl's `raise` blocks every signal around its `tkill`, so
+a shell's own SIGINT handler never ran before `raise` returned, and BusyBox
+`sh` read `^C` at its prompt as end-of-file and exited 130. `rt_sigprocmask`
+now delivers what it just unblocked before another guest instruction runs —
+writing the syscall's return value and resume point first, so the state the
+handler saves (and may `longjmp` away from) is a clean instruction boundary.
+The earlier broad attempt failed because it delivered from every syscall
+return without that context repair; the narrow exit-path fix keeps the two
+tests above green. A task that unblocks a pending signal by some means other
+than `sigprocmask`/`sigreturn` and never parks still waits for its next
+kernel entry.
 
 ### Not scoped by any milestone
 

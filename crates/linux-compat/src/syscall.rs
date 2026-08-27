@@ -84,7 +84,7 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     // `read` or `nanosleep` ends it. A task spinning in a compute loop that
     // issues no syscalls is not interrupted; killing that needs a check on
     // the execution path rather than the kernel entry.
-    if let Some(sig) = take_fatal_default_signal(env) {
+    if let SignalExitAction::Terminate(sig) = pending_signal_action(env) {
         tracing::debug!("[{}] killed by signal {sig}", env.proc.pid);
         return match task_exit(env, cpu, sig as i32, true) {
             Outcome::Exit(exit) => Some(exit),
@@ -198,6 +198,9 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_PIPE2 => sys_pipe(env, cpu, a[0], a[1]).into(),
         abi::SYS_FUTEX => sys_futex(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_RT_SIGRETURN => sys_rt_sigreturn(env, cpu),
+        // Delivers a signal the new mask just unblocked, so it returns an
+        // Outcome rather than a plain result.
+        abi::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(env, cpu, a[0], a[1], a[2]),
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
@@ -365,7 +368,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
-        abi::SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(env, cpu, a[0], a[1], a[2]),
         // Registration-only. Handlers themselves do run (see `deliver_signal`),
         // but always on the interrupted stack: a handler installed with
         // SA_ONSTACK gets the normal stack rather than the alternate one it
@@ -1788,27 +1790,44 @@ fn sys_rt_sigaction(
     Ok(0)
 }
 
-fn sys_rt_sigprocmask(
-    env: &mut LinuxEnv,
-    cpu: &mut Cpu,
-    how: u64,
-    new: u64,
-    old: u64,
-) -> SysResult {
+fn sys_rt_sigprocmask(env: &mut LinuxEnv, cpu: &mut Cpu, how: u64, new: u64, old: u64) -> Outcome {
     if old != 0 {
-        write_mem(cpu, old, &env.proc.sigmask.to_le_bytes())?;
+        if let Err(errno) = write_mem(cpu, old, &env.proc.sigmask.to_le_bytes()) {
+            return Outcome::Ret(Err(errno));
+        }
     }
-    if new != 0 {
-        let bytes = read_mem(cpu, new, 8)?;
-        let mask = u64::from_le_bytes(bytes.try_into().expect("read_mem length"));
-        env.proc.sigmask = match how {
-            0 => env.proc.sigmask | mask,  // SIG_BLOCK
-            1 => env.proc.sigmask & !mask, // SIG_UNBLOCK
-            2 => mask,                     // SIG_SETMASK
-            _ => return Err(abi::EINVAL),
-        };
+    if new == 0 {
+        return Outcome::Ret(Ok(0));
     }
-    Ok(0)
+    let bytes = match read_mem(cpu, new, 8) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let mask = u64::from_le_bytes(bytes.try_into().expect("read_mem length"));
+    env.proc.sigmask = match how {
+        0 => env.proc.sigmask | mask,  // SIG_BLOCK
+        1 => env.proc.sigmask & !mask, // SIG_UNBLOCK
+        2 => mask,                     // SIG_SETMASK
+        _ => return Outcome::Ret(Err(abi::EINVAL)),
+    };
+    // A pending signal this call just unblocked is delivered on the way back
+    // to userspace, before another guest instruction runs. musl's `raise`
+    // depends on this: it blocks every signal around the `tkill`, so the
+    // handler runs exactly here — a shell that expects its SIGINT handler to
+    // have longjmp'd before `raise` returns would otherwise read the
+    // never-delivered result and treat the interrupt as end-of-file.
+    match pending_signal_action(env) {
+        SignalExitAction::Terminate(sig) => {
+            tracing::debug!("[{}] killed by unblocked signal {sig}", env.proc.pid);
+            task_exit(env, cpu, sig as i32, true)
+        }
+        SignalExitAction::Handler => {
+            resume_after_syscall(env, cpu, 0);
+            deliver_signal(env, cpu);
+            Outcome::Switched
+        }
+        SignalExitAction::None => Outcome::Ret(Ok(0)),
+    }
 }
 
 // ── Time, identity, misc ────────────────────────────────────────────────────
@@ -1960,6 +1979,21 @@ fn prepare_resume(env: &LinuxEnv, cpu: &mut Cpu, restart: bool) {
     cpu.write_pc(resume);
     cpu.exception = Exception::new(ExceptionCode::ExternalAddr, resume);
     cpu.pending_exception = None;
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
+}
+
+/// Points the CPU at the instruction after the current syscall with `rax`
+/// already written, so a signal handler entered now snapshots a clean
+/// boundary: the state the handler saves (and may `longjmp` away from) is
+/// "the syscall returned `rax`", never the middle of the block that issued
+/// it — `rt_sigreturn` resuming mid-block would read a temporary the block
+/// never wrote.
+fn resume_after_syscall(env: &LinuxEnv, cpu: &mut Cpu, rax: u64) {
+    cpu.write_var(env.regs.rax, rax);
+    let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
+    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
+    cpu.write_pc(next_pc);
     cpu.block_id = u64::MAX;
     cpu.block_offset = 0;
 }
@@ -2445,28 +2479,49 @@ pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64)
     }
 }
 
-/// The lowest pending, unblocked signal whose disposition is the default
-/// action and whose default action is to terminate — consumed, so the caller
-/// must act on it. Called at the syscall boundary, which is where a task that
-/// was woken by a terminal interrupt next reaches the kernel.
-fn take_fatal_default_signal(env: &mut LinuxEnv) -> Option<u64> {
-    let mut pending = env.proc.pending_signals & !env.proc.sigmask;
-    while pending != 0 {
-        let sig = pending.trailing_zeros() as u64 + 1;
-        pending &= !(1_u64 << (sig - 1));
+/// What the lowest pending, unblocked signal calls for at a kernel-exit
+/// boundary, taken in signal-number order the way the kernel dequeues them.
+enum SignalExitAction {
+    /// Nothing deliverable (ignored signals were discarded along the way).
+    None,
+    /// The lowest deliverable signal has a user handler; enter it with
+    /// `deliver_signal`.
+    Handler,
+    /// The lowest deliverable signal defaults to termination — consumed, so
+    /// the caller must carry the death out.
+    Terminate(u64),
+}
+
+/// Scans pending, unblocked signals lowest-first: explicitly ignored signals
+/// and those whose default action is to ignore are discarded; the first one
+/// that would do something decides the action. Called at syscall boundaries
+/// — the kernel entry a woken task next reaches, and the exit of a call that
+/// just unblocked a pending signal.
+fn pending_signal_action(env: &mut LinuxEnv) -> SignalExitAction {
+    loop {
+        let deliverable = env.proc.pending_signals & !env.proc.sigmask;
+        if deliverable == 0 {
+            return SignalExitAction::None;
+        }
+        let sig = deliverable.trailing_zeros() as u64 + 1;
+        let bit = 1_u64 << (sig - 1);
         let disposition = env
             .proc
             .sigactions
             .borrow()
             .get(&sig)
             .map(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")));
-        let defaulted = matches!(disposition, None | Some(SIG_DFL));
-        if defaulted && default_action_terminates(sig) {
-            env.proc.pending_signals &= !(1_u64 << (sig - 1));
-            return Some(sig);
+        match disposition {
+            Some(SIG_IGN) => env.proc.pending_signals &= !bit,
+            None | Some(SIG_DFL) => {
+                env.proc.pending_signals &= !bit;
+                if default_action_terminates(sig) {
+                    return SignalExitAction::Terminate(sig);
+                }
+            }
+            Some(_) => return SignalExitAction::Handler,
         }
     }
-    None
 }
 
 fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
@@ -2528,31 +2583,40 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
 /// handler, saving the interrupted state so `rt_sigreturn` can resume it. The
 /// interrupted syscall was parked to resume (blocking waits pre-set their
 /// return value), so after the handler returns the wait is re-evaluated and,
-/// if still not satisfied, simply re-parks. Only signals with a real user
-/// handler reach a pending state, so a missing or default disposition here is
-/// treated as a no-op rather than a fault.
+/// if still not satisfied, simply re-parks. Returns false without consuming
+/// anything when the lowest deliverable signal calls for the default fatal
+/// action instead of a handler; the syscall boundary carries that out.
 fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     // Only unblocked signals are deliverable; a signal raised while its
     // handler runs (the handler's own mask blocks it) stays pending until
-    // `rt_sigreturn` restores the mask.
-    let pending = env.proc.pending_signals & !env.proc.sigmask;
-    if pending == 0 {
-        return false;
-    }
-    let sig = pending.trailing_zeros() as u64 + 1;
-    let bit = 1_u64 << (sig - 1);
-    env.proc.pending_signals &= !bit;
-
-    let Some(action) = env.proc.sigactions.borrow().get(&sig).copied() else {
-        return false;
+    // `rt_sigreturn` restores the mask. Scanned lowest-first: ignored
+    // signals are discarded, and one whose default action is to terminate is
+    // left pending — carrying out the death is the syscall boundary's job
+    // (`pending_signal_action`), and consuming it here would lose it.
+    let (sig, action) = loop {
+        let pending = env.proc.pending_signals & !env.proc.sigmask;
+        if pending == 0 {
+            return false;
+        }
+        let sig = pending.trailing_zeros() as u64 + 1;
+        let bit = 1_u64 << (sig - 1);
+        let action = env.proc.sigactions.borrow().get(&sig).copied();
+        let handler = action
+            .map(|a| u64::from_le_bytes(a.0[0..8].try_into().expect("size")))
+            .unwrap_or(SIG_DFL);
+        if handler == SIG_DFL && default_action_terminates(sig) {
+            return false;
+        }
+        env.proc.pending_signals &= !bit;
+        if handler != SIG_DFL && handler != SIG_IGN {
+            break (sig, action.expect("a real handler implies an action"));
+        }
     };
+    let bit = 1_u64 << (sig - 1);
     let handler = u64::from_le_bytes(action.0[0..8].try_into().expect("size"));
     let flags = u64::from_le_bytes(action.0[8..16].try_into().expect("size"));
     let restorer = u64::from_le_bytes(action.0[16..24].try_into().expect("size"));
     let sa_mask = u64::from_le_bytes(action.0[24..32].try_into().expect("size"));
-    if handler == SIG_DFL || handler == SIG_IGN {
-        return false;
-    }
 
     env.trace_event(crate::trace::Event::Signal {
         icount: cpu.icount(),
@@ -3455,6 +3519,15 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
     // handler snapshots then continues after the syscall instead of
     // repeating it.
     if target == env.proc.tgid as i64 || target == env.proc.pid as i64 {
+        let bit = 1_u64 << (signal - 1);
+        // A blocked signal is queued even when it is currently ignored: the
+        // process may change the disposition before unblocking it. musl's
+        // `raise` takes this path always — it blocks every signal around the
+        // `tkill` — and the unblocking `rt_sigprocmask` then delivers.
+        if env.proc.sigmask & bit != 0 {
+            env.proc.pending_signals |= bit;
+            return Outcome::Ret(Ok(0));
+        }
         let disposition = env
             .proc
             .sigactions
@@ -3464,17 +3537,8 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
         return match disposition {
             Some(SIG_IGN) => Outcome::Ret(Ok(0)),
             Some(handler) if handler != SIG_DFL => {
-                cpu.write_var(env.regs.rax, 0_u64);
-                let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
-                cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
-                // The state the handler saves has to be an instruction
-                // boundary. Without this it is the middle of the block that
-                // issued the syscall, and `rt_sigreturn` resumes there and
-                // reads a temporary the block never wrote.
-                cpu.write_pc(next_pc);
-                cpu.block_id = u64::MAX;
-                cpu.block_offset = 0;
-                env.proc.pending_signals |= 1_u64 << (signal - 1);
+                resume_after_syscall(env, cpu, 0);
+                env.proc.pending_signals |= bit;
                 deliver_signal(env, cpu);
                 Outcome::Switched
             }
