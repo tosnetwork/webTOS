@@ -1,0 +1,79 @@
+# The suite run somewhere it cannot skip.
+#
+# Most fixtures need an x86-64 Linux toolchain, so on a macOS development
+# machine 23 cases quietly do nothing and still report "ok". That is how two
+# failing gates went unnoticed. This job runs on the host that can build and
+# run every fixture, with WEBTOS_REQUIRE_FIXTURES=1, where a missing fixture
+# is a failure rather than a skip.
+name: native
+
+# Manual only, for now: the job is expensive — `build-std` compiles std from
+# source and the agent fixture is a 52 MB Go build — and it has not yet run on
+# a real runner. Start it from the Actions tab, or `gh workflow run native`.
+on:
+  workflow_dispatch:
+
+jobs:
+  strict:
+    name: strict suite (x86-64 Linux, no skips allowed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The agent workload fixture is built from its own repository, pinned to
+      # the commit the tests were written against. Tracking its main branch
+      # would make a failure here mean "OpenFox changed", which is not what
+      # this job is asking.
+      - uses: actions/checkout@v4
+        with:
+          repository: tosnetwork/openfox
+          ref: 6b997b638b7a99dd95f56bf6f35e91557f1cf7cf
+          path: .openfox-src
+
+      # The version OpenFox itself asks for, so the pin above decides it
+      # rather than a number written here going stale.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: .openfox-src/go.mod
+          cache: false
+
+      # rust-toolchain.toml pins the channel and components; rustup honours it.
+      - name: Show the toolchain
+        run: rustc --version && cargo --version && gcc --version | head -1
+
+      # `build-std` compiles std from source, so the build is expensive and
+      # worth caching. The lockfile and the toolchain file are what change it.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('crates/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Fetch the pinned guest images
+        run: |
+          tools/fetch_busybox.sh
+          tools/fetch_alpine_rootfs.sh
+
+      - name: Build the agent workload fixture
+        run: OPENFOX_SRC="$PWD/.openfox-src" tools/build_openfox_fixture.sh
+
+      # The point of the job: a fixture that is missing fails instead of
+      # skipping, so the run cannot cover less than it claims.
+      - name: Test, with skipping forbidden
+        working-directory: crates
+        env:
+          WEBTOS_REQUIRE_FIXTURES: '1'
+        run: cargo test -p linux-compat -p x64-engine --release
+
+      - name: Formatting of the crates this job builds
+        run: |
+          rustfmt --edition 2021 --check \
+            crates/linux-compat/src/*.rs \
+            crates/linux-compat/tests/*.rs
+
+      - name: Clippy
+        working-directory: crates
+        run: cargo clippy -p linux-compat --lib -- -D warnings

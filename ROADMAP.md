@@ -159,9 +159,11 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   failure. Run that way, the x86-64 Linux host covers everything — 73 cases,
   no skips, which is now demonstrated rather than assumed. On macOS the same
   switch fails 23 cases: every C fixture, which is most of the threads,
-  processes, epoll, pty, and signal surface. What remains is automation: no
-  CI runs the strict suite, so the Linux host is still in the loop only when
-  someone remembers.
+  processes, epoll, pty, and signal surface. `.github/workflows/native.yml`
+  runs the strict suite on x86-64 Linux, building the agent fixture from a
+  pinned OpenFox commit so a failure means this repository changed rather than
+  that one did. It is manual (`workflow_dispatch`) until it has run on a real
+  runner, so the Linux host is still in the loop only when someone starts it.
 - **A compatibility dashboard** across engines and pinned workload versions.
   The measurement harnesses exist; nothing publishes them.
 
