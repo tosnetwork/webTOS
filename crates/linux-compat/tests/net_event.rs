@@ -984,3 +984,254 @@ fn host_driven_broker_refuses_a_destination_outside_the_allowlist() {
     );
     assert_eq!(host.refused, vec![server], "the host saw the attempt");
 }
+
+// ------------------------------------------- a signal during a socket wait
+
+/// The guest side of the interrupted-network-call gate: connect to the test
+/// server, send a request, then block in `recv` on a peer that has not
+/// answered yet. The handler writes a line of its own, so the test can tell
+/// that the signal was taken *while* the call was outstanding rather than
+/// before it or after it finished.
+const SOCKET_EINTR_FIXTURE: &str = r#"
+#include <errno.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t hits = 0;
+static void on_int(int s) {
+    (void)s;
+    hits++;
+    if (write(1, "handler ran\n", 12) < 0) _exit(9);
+}
+
+int main(int argc, char **argv) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_int;
+    if (argc > 2 && strcmp(argv[2], "restart") == 0) sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("socket errno=%d\n", errno); fflush(stdout); return 1; }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)atoi(argv[1]));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        printf("connect errno=%d\n", errno); fflush(stdout); return 2;
+    }
+    const char *req = "GET /gated HTTP/1.0\r\n\r\n";
+    if (write(fd, req, strlen(req)) != (ssize_t)strlen(req)) {
+        printf("send errno=%d\n", errno); fflush(stdout); return 3;
+    }
+    printf("waiting for the peer\n"); fflush(stdout);
+
+    char buf[256];
+    ssize_t n = recv(fd, buf, sizeof buf - 1, 0);
+    if (n < 0) {
+        printf("recv failed errno=%d hits=%d\n", errno, (int)hits);
+        fflush(stdout);
+        return errno == EINTR ? 0 : 4;
+    }
+    buf[n] = 0;
+    printf("recv got %zd bytes hits=%d: %s\n", n, (int)hits, buf);
+    fflush(stdout);
+    return 0;
+}
+"#;
+
+/// A TCP server that accepts, reads the request, and then says nothing until
+/// the test releases it. That is what puts the guest in a wait whose end the
+/// test owns: no reply can race the signal.
+fn spawn_gated_server(body: &'static str) -> (SocketAddrV4, std::sync::mpsc::Sender<()>) {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = match listener.local_addr().expect("local addr") {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!("bound to IPv4"),
+    };
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            // Dropping the sender ends the wait with an error: the test
+            // finished without ever asking for the reply.
+            if gate.recv().is_err() {
+                return;
+            }
+            let _ = stream.write_all(body.as_bytes());
+        }
+    });
+    (addr, release)
+}
+
+fn socket_eintr_machine(
+    image: Vec<u8>,
+    port: u16,
+    restart: bool,
+) -> (Machine, Rc<RefCell<HostBroker>>) {
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/netintr", image, 0o755)
+        .expect("add fixture");
+    let broker = Rc::new(RefCell::new(HostBroker::new()));
+    machine.set_network(broker.clone());
+    let mut argv = vec![b"netintr".to_vec(), port.to_string().into_bytes()];
+    if restart {
+        argv.push(b"restart".to_vec());
+    }
+    machine.set_args(argv, vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/netintr").expect("ELF load failed");
+    // Stdio on a pty: `^C` is how the host raises a signal in a guest that is
+    // busy elsewhere — here, inside a socket read.
+    machine.install_pty_stdio(24, 80);
+    (machine, broker)
+}
+
+/// Runs the guest until it exits or parks on the socket with nothing for the
+/// host to deliver, carrying out broker commands and delivering whatever the
+/// real server produced. Returns the terminal output of *this* stretch only
+/// (drained, so nothing an earlier stretch printed can match) and the exit,
+/// if the guest exited.
+fn pump_socket_wait(
+    machine: &mut Machine,
+    host: &mut BrokerHost,
+    broker: &Rc<RefCell<HostBroker>>,
+) -> (String, Option<CpuExit>) {
+    let mut output = String::new();
+    for _ in 0..200 {
+        machine.vm_mut().icount_limit = machine.icount() + 200_000_000;
+        let exit = machine.run();
+        output.push_str(&String::from_utf8_lossy(&machine.drain_terminal_output()));
+        if machine.awaiting_network() {
+            let commands = broker.borrow_mut().take_commands();
+            host.perform(&commands, broker);
+            let mut delivered = false;
+            for _ in 0..200 {
+                if host.poll(broker) {
+                    delivered = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if delivered {
+                continue;
+            }
+            // The peer is silent and the guest is parked on the socket. The
+            // wait is deliberately left outstanding rather than expired: a
+            // host does not let guest time move on while a connection it
+            // still owns is open.
+            return (output, None);
+        }
+        if exit == CpuExit::Interrupted {
+            continue; // out of fuel for this slice
+        }
+        return (output, Some(exit));
+    }
+    panic!("guest never settled; output so far: {output:?}");
+}
+
+/// A network call interrupted mid-flight. A socket read parks on the same
+/// machinery as every other blocking wait, but nothing exercised that
+/// machinery through a socket: a guest waiting on a peer that has not
+/// answered must fail with `EINTR` when the handler was installed without
+/// `SA_RESTART`, and must resume the very same `recv` — completing when the
+/// bytes finally arrive — when it was installed with it. Getting this wrong
+/// either strands a program that breaks out of a network wait by catching a
+/// signal, or surfaces a spurious `EINTR` to one that asked never to see it.
+#[test]
+fn a_signal_interrupts_a_socket_read_unless_the_handler_asked_for_a_restart() {
+    let Some(image) = compile_c("net_eintr", SOCKET_EINTR_FIXTURE, &[]) else {
+        return;
+    };
+
+    // Without SA_RESTART: the read ends, and the handler ran first.
+    {
+        let (server, release) = spawn_gated_server("never-sent");
+        let mut host = BrokerHost::new(vec![server]);
+        let (mut machine, broker) = socket_eintr_machine(image.clone(), server.port(), false);
+
+        let (blocked, exit) = pump_socket_wait(&mut machine, &mut host, &broker);
+        assert!(exit.is_none(), "guest exited before blocking: {blocked:?}");
+        assert!(
+            blocked.contains("waiting for the peer"),
+            "fixture did not reach the read: {blocked:?}"
+        );
+        assert!(
+            !blocked.contains("handler ran"),
+            "the signal must arrive while the read is outstanding: {blocked:?}"
+        );
+
+        machine.feed_terminal_input(b"\x03");
+        let (interrupted, exit) = pump_socket_wait(&mut machine, &mut host, &broker);
+        assert!(
+            interrupted.contains("handler ran"),
+            "the handler did not run: {interrupted:?}"
+        );
+        assert!(
+            interrupted.contains("recv failed errno=4 hits=1"),
+            "an interrupted socket read must return EINTR: {interrupted:?}"
+        );
+        assert_eq!(
+            exit,
+            Some(CpuExit::Halt { code: Some(0) }),
+            "guest did not exit cleanly: {interrupted:?}"
+        );
+        // The peer never answered, so nothing but the signal can have ended
+        // the read.
+        drop(release);
+    }
+
+    // With SA_RESTART: the same signal runs the same handler, the read
+    // carries on, and it returns the bytes that only arrive afterwards.
+    {
+        let (server, release) = spawn_gated_server("answered-after-the-signal");
+        let mut host = BrokerHost::new(vec![server]);
+        let (mut machine, broker) = socket_eintr_machine(image, server.port(), true);
+
+        let (blocked, exit) = pump_socket_wait(&mut machine, &mut host, &broker);
+        assert!(exit.is_none(), "guest exited before blocking: {blocked:?}");
+        assert!(
+            blocked.contains("waiting for the peer"),
+            "fixture did not reach the read: {blocked:?}"
+        );
+
+        machine.feed_terminal_input(b"\x03");
+        let (signalled, exit) = pump_socket_wait(&mut machine, &mut host, &broker);
+        assert!(
+            signalled.contains("handler ran"),
+            "the handler did not run: {signalled:?}"
+        );
+        assert!(
+            !signalled.contains("recv failed"),
+            "SA_RESTART must not surface EINTR on a socket: {signalled:?}"
+        );
+        assert!(
+            exit.is_none(),
+            "the restarted read should still be waiting on the peer: {signalled:?}"
+        );
+
+        // Only now does the peer answer: whatever the guest reads was sent
+        // strictly after the signal was handled.
+        release.send(()).expect("release the server");
+        let (answered, exit) = pump_socket_wait(&mut machine, &mut host, &broker);
+        assert!(
+            answered.contains("hits=1: answered-after-the-signal"),
+            "the restarted read did not complete: {answered:?}"
+        );
+        assert_eq!(
+            exit,
+            Some(CpuExit::Halt { code: Some(0) }),
+            "guest did not exit cleanly: {answered:?}"
+        );
+    }
+}
