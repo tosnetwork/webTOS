@@ -157,6 +157,15 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   the broker interface, so the figure is a floor on what the tab moves rather
   than a wire total. CPU and the event log have no quota. The browser wiring
   for both new ceilings is gated natively but not yet in the engine matrix.
+- **32-bit narrowing.** Three found so far, all the same shape: 64-bit
+  address or size arithmetic done at `usize` width, which is correct on the
+  64-bit host the tests run on and wrong on the 32-bit target that ships. A
+  snapshot length that wrapped, a page-alignment mask that truncated instead
+  of aligning, and a file offset that folded 2^32 onto zero so a write landed
+  on the start of the file. Clippy's `cast_possible_truncation` enumerates the
+  remaining `u64`-to-`usize` casts — 45 in these crates — and most are
+  harmless; the ones on guest-supplied sizes have been narrowed deliberately,
+  but the vendored engine has not been swept the same way.
 - **Fuzzing.** Two surfaces are swept rather than fuzzed: every truncation and
   every single-bit flip of a real input, asserting the parser fails closed.
   Snapshot restore found two things — a header could make a dozen bytes out of

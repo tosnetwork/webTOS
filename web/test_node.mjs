@@ -261,4 +261,55 @@ try {
   }, "a header claiming four million nodes");
 }
 
+// Guest sizes that do not fit a 32-bit `usize`. This can only be checked
+// here: on a 64-bit host the same values are simply large and behave, while
+// in a browser `as usize` keeps the low half — a 4 GiB `ftruncate` became a
+// truncate to zero, and a write at offset 2^32 landed on the first bytes of
+// the file. Real Linux honours both and leaves the head intact; a tab cannot
+// hold 4 GiB, so refusing is right and quietly doing something smaller is not.
+{
+  const fixture = new URL("../test_data/test_size_narrowing.elf", import.meta.url);
+  const fresh = await WebAssembly.instantiate(await readFile(wasmPath), {});
+  const f = fresh.instance.exports;
+  const fmem = () => new Uint8Array(f.memory.buffer);
+  const fput = (bytes) => {
+    const data = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    const ptr = f.wtw_alloc(data.length);
+    fmem().set(data, ptr);
+    return [ptr, data.length];
+  };
+  if (f.wtw_init() !== 0) throw new Error("narrowing: init");
+  f.wtw_add_file(...fput("/bin/narrow"), ...fput(await readFile(fixture)));
+  f.wtw_arg(...fput("narrow"));
+  f.wtw_env(...fput("PATH=/bin"));
+  if (f.wtw_load(...fput("/bin/narrow")) !== 0) throw new Error("narrowing: load");
+  let st;
+  let out = "";
+  do {
+    st = f.wtw_run(20_000_000);
+    out += new TextDecoder().decode(
+      fmem().slice(f.wtw_output_ptr(), f.wtw_output_ptr() + f.wtw_output_len()),
+    );
+  } while (st === 0);
+
+  const head = /head=(\S*)/.exec(out)?.[1] ?? "";
+  const size = Number(/size=(-?\d+)/.exec(out)?.[1] ?? -1);
+  if (head !== "keep-me") {
+    console.error(`[node] FAILED a 2^32 offset wrote over the start of the file: ${out.trim()}`);
+    process.exit(1);
+  }
+  const far = Number(/far_read=(-?\d+)/.exec(out)?.[1] ?? -1);
+  if (far !== 0) {
+    console.error(
+      `[node] FAILED a read at offset 2^32 returned ${far} bytes instead of end-of-file: ${out.trim()}`,
+    );
+    process.exit(1);
+  }
+  if (size !== 7) {
+    console.error(`[node] FAILED a 4 GiB ftruncate changed the file to ${size} bytes: ${out.trim()}`);
+    process.exit(1);
+  }
+  console.log(`[node] ok: guest sizes past 32 bits are refused, not narrowed -> ${out.trim()}`);
+}
+
 console.log("[node] PASS");

@@ -533,7 +533,7 @@ fn read_backing(
             let NodeKind::File(data) = &env.vfs.node(*node).kind else {
                 return Err(abi::EIO);
             };
-            let start = (desc.offset as usize).min(data.len());
+            let start = offset_into(desc.offset, data.len());
             let end = (start + buf_len).min(data.len());
             let chunk = data[start..end].to_vec();
             desc.offset += chunk.len() as u64;
@@ -584,7 +584,7 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             if desc.flags & abi::O_APPEND != 0 {
                 desc.offset = len as u64;
             }
-            let start = desc.offset as usize;
+            let start = guest_size(desc.offset)?;
             let end = start.checked_add(bytes.len()).ok_or(abi::EFBIG)?;
             // Only what the file grows by is charged: overwriting bytes that
             // are already there costs the filesystem nothing. Charged before
@@ -649,7 +649,7 @@ fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
         return Err(abi::EIO);
     };
     let len = data.len();
-    let length = length as usize;
+    let length = guest_size(length)?;
     if length > len {
         env.vfs.reserve(length - len)?;
     }
@@ -662,6 +662,30 @@ fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
     }
     data.resize(length, 0);
     Ok(0)
+}
+
+/// Narrows a guest-supplied size to `usize`, refusing what will not fit.
+///
+/// `usize` is 32 bits in a browser, so `value as usize` silently keeps the low
+/// half of a guest value: an `ftruncate` to 4 GiB became a truncate to zero,
+/// and a write at offset 2^32 landed at offset zero, on top of the file. A
+/// value this host cannot represent cannot be honoured, and `EFBIG` is what a
+/// kernel says when a file operation exceeds what it can address.
+fn guest_size(value: u64) -> Result<usize, u64> {
+    usize::try_from(value).map_err(|_| abi::EFBIG)
+}
+
+/// Where a guest offset lands inside a buffer, clamped to its end.
+///
+/// Compared before narrowing: an offset past what `usize` holds is past the
+/// end of anything this host can store, so it reads as end-of-file rather
+/// than wrapping around to the beginning.
+fn offset_into(offset: u64, len: usize) -> usize {
+    if offset >= len as u64 {
+        len
+    } else {
+        offset as usize
+    }
 }
 
 fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
@@ -916,7 +940,7 @@ fn sys_getdents64(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, dirp: u64, count: 
     while position < entries.len() {
         let (name, entry_node) = &entries[position];
         let d_type = env.vfs.node(*entry_node).d_type();
-        let remaining = count as usize - out.len();
+        let remaining = count.min(usize::MAX as u64) as usize - out.len();
         match abi::encode_dirent64(
             *entry_node as u64 + 1,
             position as u64 + 1,
@@ -1689,8 +1713,8 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         let NodeKind::File(data) = &env.vfs.node(node).kind else {
             return Err(abi::EBADF);
         };
-        let start = (offset as usize).min(data.len());
-        let end = (start + len as usize).min(data.len());
+        let start = offset_into(offset, data.len());
+        let end = (start + guest_size(len)?).min(data.len());
         Some(data[start..end].to_vec())
     } else {
         None
@@ -1769,7 +1793,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     if !ok {
         return Err(abi::ENOMEM);
     }
-    let mut buf = vec![0u8; old_size as usize];
+    let mut buf = vec![0u8; guest_size(old_size).map_err(|_| abi::ENOMEM)?];
     cpu.mem
         .read_bytes(old_addr, &mut buf, perm::NONE)
         .map_err(|_| abi::EFAULT)?;
@@ -4826,8 +4850,8 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         let NodeKind::File(data) = &env.vfs.node(node).kind else {
             return Outcome::Ret(Err(abi::EIO));
         };
-        let start = (offset as usize).min(data.len());
-        let end = (start + (count as usize).min(0x4_0000)).min(data.len());
+        let start = offset_into(offset, data.len());
+        let end = (start + (count.min(0x4_0000) as usize)).min(data.len());
         data[start..end].to_vec()
     };
     if chunk.is_empty() {
