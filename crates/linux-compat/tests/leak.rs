@@ -222,3 +222,45 @@ fn the_guest_replacing_a_name_does_not_leave_the_old_bytes_behind() {
         "renaming over a file left the replaced file's bytes in the snapshot"
     );
 }
+
+#[test]
+fn a_crash_bundle_redacts_a_secret_that_reached_a_path() {
+    let mut machine = machine();
+    machine
+        .env()
+        .set_secret("AGENT_KEY", &String::from_utf8_lossy(MARKER));
+
+    // The executable path is the one field of a bundle the guest chooses, and
+    // a guest can put anything in a path. Nothing else in a bundle is guest
+    // data, which is why this is the field worth checking. Set the real way:
+    // by running something from a path that carries it.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data");
+    let image = std::fs::read(dir.join("hello_linux.elf")).expect("in-repo fixture");
+    let path = format!("/tmp/{}", String::from_utf8_lossy(MARKER)).into_bytes();
+    machine.add_file(&path, image, 0o755).expect("add");
+    machine.set_args(vec![b"probe".to_vec()], vec![]);
+    machine.load(&path).expect("load");
+
+    let bundle = machine
+        .crash_bundle(&x64_engine::CpuExit::IllegalInstruction { rip: 0x1000 })
+        .expect("a non-zero exit produces a bundle");
+    assert!(
+        find(bundle.as_bytes(), MARKER).is_none(),
+        "a crash bundle carried a secret out of the machine:\n{bundle}"
+    );
+    assert!(
+        bundle.contains("${AGENT_KEY}"),
+        "the secret was removed without saying what had been there:\n{bundle}"
+    );
+}
+
+#[test]
+fn a_clean_exit_produces_no_bundle() {
+    let mut machine = machine();
+    assert!(
+        machine
+            .crash_bundle(&x64_engine::CpuExit::Halt { code: Some(0) })
+            .is_none(),
+        "a workload that exited cleanly produced a crash bundle"
+    );
+}

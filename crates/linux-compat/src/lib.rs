@@ -1508,13 +1508,24 @@ impl Machine {
 ",
             trail.join(" ")
         ));
-        // Secrets are never in the trail or the fields above; nothing to
-        // redact, but assert the invariant if a value happens to appear.
-        for secret in self.env().secrets.values() {
-            debug_assert!(
-                !bundle.contains(secret.value.as_str()),
-                "secret leaked into crash bundle"
-            );
+        // A bundle is a diagnostic that leaves the machine — a host may hand
+        // it to someone, or upload it — so what it carries is a disclosure
+        // decision, not a debugging convenience.
+        //
+        // Most of it is the machine's own account of itself. One field is
+        // not: the executable path is whatever the guest asked to run, and a
+        // guest can put anything in a path. This used to be a
+        // `debug_assert!`, which is to say a check that does not run in the
+        // builds that ship. Redact for real instead, in every build.
+        let names: Vec<(String, String)> = self
+            .env()
+            .secrets
+            .iter()
+            .filter(|(_, secret)| !secret.value.is_empty())
+            .map(|(name, secret)| (secret.value.clone(), format!("${{{name}}}")))
+            .collect();
+        for (value, placeholder) in names {
+            bundle = bundle.replace(&value, &placeholder);
         }
         Some(bundle)
     }
