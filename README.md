@@ -296,6 +296,20 @@ fixtures need an x86-64 Linux toolchain skip themselves:
 cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
 ```
 
+A skip prints `SKIP:` naming the fixture and how to get it, but `cargo test`
+captures that for a passing test, so add `-- --nocapture` to see what a run
+actually covered. On macOS 23 cases skip: every C fixture, which is most of
+the threads, processes, epoll, pty, and signal surface.
+
+On a machine that can build and run everything, make a skip a failure so the
+run cannot quietly cover less than it claims:
+
+```bash
+cd crates && WEBTOS_REQUIRE_FIXTURES=1 cargo test -p linux-compat --release
+```
+
+The x86-64 Linux host passes that way with no skips.
+
 ## Native Development
 
 The native build remains the reference environment while the browser host is

@@ -38,27 +38,19 @@ fn compile_c(name: &str, source: &str, extra: &[&str]) -> Option<Vec<u8>> {
         .arg(&out)
         .arg(&src)
         .args(extra);
-    match cmd.status() {
-        Ok(status) if status.success() => Some(std::fs::read(&out).expect("compiler output")),
-        _ => {
-            eprintln!("skipping: fixture compiler unavailable ({cmd:?})");
-            None
-        }
-    }
+    let built = matches!(cmd.status(), Ok(status) if status.success());
+    linux_compat::testing::require(
+        &format!("a compiler that targets Linux x86-64 for {name} ({cmd:?})"),
+        built.then(|| std::fs::read(&out).expect("compiler output")),
+    )
 }
 
 fn openfox() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/openfox");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: {} missing (run tools/build_openfox_fixture.sh)",
-                path.display()
-            );
-            None
-        }
-    }
+    linux_compat::testing::require(
+        &format!("{} (run tools/build_openfox_fixture.sh)", path.display()),
+        std::fs::read(&path).ok(),
+    )
 }
 
 struct Run {

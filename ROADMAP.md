@@ -153,10 +153,15 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   rather than only against another run.
 - **Versioned fixtures.** They exist; they are not a formal, pinned set.
 - **Native QEMU validation** has not been re-run since the browser pivot.
-- **A Linux host in the loop.** Every test whose fixture is compiled by the
-  host `gcc` skips silently on macOS, which is where the browser work is
-  done. That is how two failing gates went unnoticed; the suite needs to run
-  somewhere it cannot skip.
+- ~~**A Linux host in the loop.**~~ Partly done: a skip is no longer silent.
+  Every fixture goes through one helper that prints `SKIP:` with the fixture
+  and how to get it, and `WEBTOS_REQUIRE_FIXTURES=1` turns a skip into a
+  failure. Run that way, the x86-64 Linux host covers everything — 73 cases,
+  no skips, which is now demonstrated rather than assumed. On macOS the same
+  switch fails 23 cases: every C fixture, which is most of the threads,
+  processes, epoll, pty, and signal surface. What remains is automation: no
+  CI runs the strict suite, so the Linux host is still in the loop only when
+  someone remembers.
 - **A compatibility dashboard** across engines and pinned workload versions.
   The measurement harnesses exist; nothing publishes them.
 

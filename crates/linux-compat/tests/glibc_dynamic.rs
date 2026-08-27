@@ -44,20 +44,16 @@ fn is_x86_64_elf(image: &[u8]) -> bool {
 }
 
 fn compile(cmd: &mut Command, out: &Path) -> Option<Vec<u8>> {
-    match cmd.status() {
+    let image = match cmd.status() {
         Ok(status) if status.success() => {
-            let image = std::fs::read(out).expect("compiler output");
-            if !is_x86_64_elf(&image) {
-                eprintln!("skipping: host compiler does not target x86-64 Linux ({cmd:?})");
-                return None;
-            }
-            Some(image)
+            std::fs::read(out).ok().filter(|image| is_x86_64_elf(image))
         }
-        _ => {
-            eprintln!("skipping: fixture compiler unavailable ({cmd:?})");
-            None
-        }
-    }
+        _ => None,
+    };
+    linux_compat::testing::require(
+        &format!("a compiler that targets Linux x86-64 ({cmd:?})"),
+        image,
+    )
 }
 
 fn run_guest(image: Vec<u8>, name: &str) -> Run {

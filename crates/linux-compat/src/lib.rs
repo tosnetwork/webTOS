@@ -18,6 +18,7 @@ pub mod fd;
 pub mod net;
 pub mod proc;
 pub mod syscall;
+pub mod testing;
 pub mod trace;
 pub mod vfs;
 

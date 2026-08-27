@@ -17,15 +17,11 @@ fn ldef_path() -> PathBuf {
 
 fn rootfs() -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/alpine-minirootfs");
-    if path.join("lib/ld-musl-x86_64.so.1").exists() {
-        Some(path)
-    } else {
-        eprintln!(
-            "skipping: {} missing (run tools/fetch_alpine_rootfs.sh)",
-            path.display()
-        );
-        None
-    }
+    let present = path.join("lib/ld-musl-x86_64.so.1").exists();
+    linux_compat::testing::require(
+        &format!("{} (run tools/fetch_alpine_rootfs.sh)", path.display()),
+        present.then_some(path),
+    )
 }
 
 fn alpine_machine() -> Option<Machine> {

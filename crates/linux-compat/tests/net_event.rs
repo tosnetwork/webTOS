@@ -47,13 +47,11 @@ fn compile_c(name: &str, source: &str, extra: &[&str]) -> Option<Vec<u8>> {
         .arg(&out)
         .arg(&src)
         .args(extra);
-    match cmd.status() {
-        Ok(status) if status.success() => Some(std::fs::read(&out).expect("compiler output")),
-        _ => {
-            eprintln!("skipping: fixture compiler unavailable ({cmd:?})");
-            None
-        }
-    }
+    let built = matches!(cmd.status(), Ok(status) if status.success());
+    linux_compat::testing::require(
+        &format!("a compiler that targets Linux x86-64 for {name} ({cmd:?})"),
+        built.then(|| std::fs::read(&out).expect("compiler output")),
+    )
 }
 
 fn run_image(image: Vec<u8>, name: &str) -> Run {
@@ -364,13 +362,13 @@ fn alpine_machine() -> Option<Machine> {
     init_logging();
     let rootfs =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/alpine-minirootfs");
-    if !rootfs.join("lib/ld-musl-x86_64.so.1").exists() {
-        eprintln!(
-            "skipping: {} missing (run tools/fetch_alpine_rootfs.sh)",
-            rootfs.display()
-        );
-        return None;
-    }
+    linux_compat::testing::require(
+        &format!("{} (run tools/fetch_alpine_rootfs.sh)", rootfs.display()),
+        rootfs
+            .join("lib/ld-musl-x86_64.so.1")
+            .exists()
+            .then_some(()),
+    )?;
     let mut machine =
         Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
     machine

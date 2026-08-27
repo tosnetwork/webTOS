@@ -27,13 +27,11 @@ fn compile_c(name: &str, source: &str, extra: &[&str]) -> Option<Vec<u8>> {
         .arg(&out)
         .arg(&src)
         .args(extra);
-    match cmd.status() {
-        Ok(status) if status.success() => Some(std::fs::read(&out).expect("compiler output")),
-        _ => {
-            eprintln!("skipping: fixture compiler unavailable ({cmd:?})");
-            None
-        }
-    }
+    let built = matches!(cmd.status(), Ok(status) if status.success());
+    linux_compat::testing::require(
+        &format!("a compiler that targets Linux x86-64 for {name} ({cmd:?})"),
+        built.then(|| std::fs::read(&out).expect("compiler output")),
+    )
 }
 
 fn run(image: Vec<u8>) -> (CpuExit, String) {
@@ -291,16 +289,10 @@ int main(void) {
 /// The pinned BusyBox image, or None when it has not been fetched.
 fn busybox() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/busybox-musl");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: {} missing (run tools/fetch_busybox.sh)",
-                path.display()
-            );
-            None
-        }
-    }
+    linux_compat::testing::require(
+        &format!("{} (run tools/fetch_busybox.sh)", path.display()),
+        std::fs::read(&path).ok(),
+    )
 }
 
 /// The browser terminal's core loop: a guest blocked on a terminal read is

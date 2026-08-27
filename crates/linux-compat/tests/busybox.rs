@@ -17,16 +17,10 @@ fn ldef_path() -> PathBuf {
 
 fn busybox() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/busybox-musl");
-    match std::fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(_) => {
-            eprintln!(
-                "skipping: {} missing (run tools/fetch_busybox.sh)",
-                path.display()
-            );
-            None
-        }
-    }
+    linux_compat::testing::require(
+        &format!("{} (run tools/fetch_busybox.sh)", path.display()),
+        std::fs::read(&path).ok(),
+    )
 }
 
 struct Run {
