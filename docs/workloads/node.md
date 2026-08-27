@@ -21,6 +21,42 @@ cargo run --release -p linux-compat --example run_guest -- \
   /path/to/node --version
 ```
 
+## In a browser: it runs, and it is two hundred times too slow
+
+Measured 2026-08-27 on x86-64 Linux, against the same `webtos_web.wasm` a
+browser loads. Every shared object was delivered as a *file* rather than
+mounted, because `GUEST_MOUNT` has no browser equivalent — so this answers the
+browser question, not just the native one.
+
+`node --version` **works**: `v24.13.0`, exit 0.
+
+| | native | wasm module |
+|---|---|---|
+| `node --version` (6,512,041 instructions) | ~3 s (2.2 M inst/s) | **159 s (0.04 M inst/s)** |
+| BusyBox `md5sum` of 4 MiB (53.4 M instructions) | 17.3 M inst/s | 8.5 M inst/s |
+
+Delivery is not the problem: 122 MB of Node and its seven shared objects
+reached the guest in 284 ms, and the whole machine settled at 247 MB — guest
+109, lifted code 16, files 122 — inside any tab's budget.
+
+Two things it is **not**:
+
+- **Not lifting.** A second `--version` in the same machine took 158.9 s
+  against the first's 160.8 s, and the lifted-code figure did not move off
+  16 MB. The work is steady state, not translation.
+- **Not the module.** The same wasm build on the same host hashes 4 MiB at
+  8.5 M inst/s, about half native. Node gets 1/200th of that.
+
+Node is already about eight times slower than a compute loop natively —
+its startup is syscall- and page-heavy rather than a tight loop — and the
+wasm host multiplies that penalty by roughly twenty-five, which is the part
+that has no explanation yet. The obvious suspect is how guest pages are
+allocated inside one linear memory when an address space is large and sparse
+(V8 reserves a 256 MiB sandbox), but that is a hypothesis, not a measurement.
+
+What this settles: the browser milestone for both agent CLIs is not blocked on
+bring-up, packaging, delivery, or memory. It is blocked on this number.
+
 ## How far Node gets today
 
 A dynamically linked host `node` (glibc) mounted into the guest, running a

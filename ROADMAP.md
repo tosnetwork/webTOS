@@ -84,17 +84,27 @@ milestone numbering any more.
 The product goal is a coding agent in a tab. Everything below it now works;
 what is left is the agent itself.
 
-- **Carry Codex into the browser.** The delivery mechanism exists and is
-  proven at 52 MB with OpenFox. Codex is ~258 MB, wants a large guest, and
-  needs credentials that must not be baked into an image — so this is a
-  memory-budget and secret-handle problem, not a transport one.
+- **Carry an agent CLI into the browser.** Both are Node applications, so
+  stock Node is the reduction — and Node now runs inside the wasm module a
+  browser loads: `node --version` prints `v24.13.0` and exits 0, with its
+  seven shared objects delivered as files rather than mounted, since a
+  browser has no `GUEST_MOUNT`. Delivery and memory are settled: 122 MB in
+  284 ms, 247 MB resident. **What blocks it is speed.** That run takes 159 s
+  in wasm against about 3 s natively — 0.04 M inst/s where the same module
+  hashes at 8.5. It is not lifting (a second run is identical and translates
+  nothing new) and not the module (md5sum is half native). Node is already
+  eight times slower than a compute loop natively, being syscall- and
+  page-heavy, and the wasm host multiplies that by about twenty-five. See
+  `docs/workloads/node.md`. Nothing else about the milestone is worth
+  attempting until that number moves.
 - **Per-agent secret handles.** Scoping and the browser path exist: a
   credential is expanded only in the files the host names, everything else
   keeps the placeholder, and a browser host injects one without it entering an
   image or a snapshot. What is left is the handle proper — the guest still
   ends up holding the value, so a program that can read its own configuration
   can read its own key.
-- **The Claude Code profile.** Not started; the Node runtime beneath it runs.
+- **The Claude Code profile.** Not started. The runtime beneath it runs in a
+  browser, at the speed above.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
 - ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are
