@@ -33,19 +33,19 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~76% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the Linux host covers all 78 cases and macOS fails 23, which is how much of the suite was silently doing nothing. Fixtures are pinned by checksum where they are fetched, but not versioned as a set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
+| M0 Lock the baseline | 🔶 | ~76% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. Fixtures are pinned by checksum where they are fetched, but not versioned as a set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
-| M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it. Multi-worker deferred |
-| M5 Event loop & networking | 🔶 | ~91% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, so a signal now ends one rather than restarting it; that path is gated through a terminal read, not a socket. Recording, reconnect, soak pending |
+| M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred. The suite is only sound single-threaded (see below) |
+| M5 Event loop & networking | 🔶 | ~92% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | 🔶 | ~40% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Snapshot restore is swept for corruption and fails closed; the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit |
+| M8 Performance & release | 🔶 | ~46% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. CPU and the event log still have no quota; hot-block translation is not started |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 82%**. The weights are a judgement
+Weighted by engineering effort, **roughly 83%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -55,19 +55,20 @@ call, so here is the arithmetic rather than the assertion:
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 90% | 9.0 |
 | M4 Threads & processes | 13% | 94% | 12.2 |
-| M5 Event loop & networking | 13% | 91% | 11.8 |
+| M5 Event loop & networking | 13% | 92% | 12.0 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 79% | 15.8 |
-| M8 Performance & release | 14% | 40% | 5.6 |
-| **Total** | **100%** | | **82.3** |
+| M8 Performance & release | 14% | 46% | 6.4 |
+| **Total** | **100%** | | **83.3** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
-which together account for about 12 of the 18 points outstanding. Progress from
+which together account for about 12 of the 17 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (78 cases, plus soak, measurement, and
-trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 20-check wasm harness and the
+The native test suites (98 cases, plus the soak, the nine measurement runs,
+and trace regeneration, all invoked explicitly) gate every ✅ above, alongside
+the 26-check wasm harness and the
 35-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
@@ -102,9 +103,12 @@ what is left is the agent itself.
   interrupted syscall returns `EINTR` unless the handler asked for a restart —
   nothing did before, so every wait restarted. A checkpointed session resumes
   after a real browser reload with the agent reading back its own profile.
-  Gated natively and in all three engines. What is untested is a network call
-  interrupted mid-flight: the mechanism is shared with every other blocking
-  wait, but no test exercises it through a socket.
+  Gated natively and in all three engines. A network call interrupted
+  mid-flight is now gated too, rather than inferred from the shared machinery:
+  a guest blocked in `recv` on a real connection, against a server holding its
+  reply, ends with `EINTR` after its handler runs, and with `SA_RESTART`
+  resumes and reads bytes the peer sent only afterwards. That gate needs a
+  compiled C fixture, so it runs on the Linux host and skips on macOS.
 - **SIGTTOU on terminal writes** fires only when `TOSTOP` is set, which the
   default termios leaves off, matching Linux — but `tcsetattr` and
   `tcsetpgrp` from a background group should raise it regardless, and do not.
@@ -137,15 +141,49 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   on — guest pages, lifted code (including the guest bytes the reuse index
   keeps), and guest files — and a budget refuses an image at the request
   rather than part-way through the delivery, naming what it would cost and
-  what is free. Gated in all three engines. CPU, storage, network, and the
-  event log have no quota.
-- **Fuzzing.** Snapshot restore is swept rather than fuzzed: every truncation
-  and every single-bit flip of a real snapshot, asserting the parser fails
-  closed. It found two things — a header could make a dozen bytes out of
+  what is free. Gated in all three engines. Storage and network now have
+  ceilings too, and both refuse the guest with an errno rather than
+  exhausting the tab: every path a guest can grow the filesystem by returns
+  `ENOSPC` at the ceiling, and bytes across the host broker are metered in
+  both directions, with a stream clipped to what is left and a datagram
+  refused whole (`EPERM`). Both are exposed to the browser the way memory
+  was. Three limits bound what they are worth. `Vfs::unlink` detaches a node
+  without releasing its contents, so the storage ceiling bounds total
+  allocation over a machine's life rather than live data — a guest churning
+  temporary files approaches it while nothing it can see grows, and those
+  deleted contents also still reach a snapshot. Storage is charged by
+  allocated capacity, not written length, so a file grown a chunk at a time
+  can hold up to twice what has been written to it and the ceiling arrives
+  sooner than the number suggests. The network meter counts guest payload
+  only; connection setup, host-side DNS, and TCP and TLS framing never cross
+  the broker interface, so the figure is a floor on what the tab moves rather
+  than a wire total. CPU and the event log have no quota. The browser wiring
+  for both new ceilings is gated natively but not yet in the engine matrix.
+- **Fuzzing.** Two surfaces are swept rather than fuzzed: every truncation and
+  every single-bit flip of a real input, asserting the parser fails closed.
+  Snapshot restore found two things — a header could make a dozen bytes out of
   browser storage reserve for four million nodes, and a 64-bit length or
   index narrowed silently on wasm's 32-bit `usize`, so a corrupt image parsed
-  into a plausible-looking filesystem. Decoding, memory translation, ELF
-  loading, syscalls, and host messages have no such sweep.
+  into a plausible-looking filesystem. ELF loading found five, all panics: a
+  header truncated after five bytes reached an `unwrap`; a `p_align` of zero
+  was divided by, and one that is not a power of two tripped an assert inside
+  `align_up`; a segment claiming the top of the address space, or 2^64 bytes,
+  overflowed the span; an image with nothing to load became a region of zero
+  length that underflowed the allocator; and an image naming itself as its own
+  `PT_INTERP` recursed until the stack was gone — which the sweep could not
+  even catch, because a stack overflow is not a panic. Each is now a refusal
+  naming the claim it refused, and Linux's one-interpreter rule is enforced.
+  The browser is where those panics cost the most: a Rust panic on wasm is an
+  abort, so before the fix a nonsense alignment did not fail to load — the
+  module trapped with `RuntimeError: unreachable` and every later call threw,
+  leaving the tab with no machine at all. Two honest negatives: neither defect
+  the snapshot sweep found is present here. Nothing is reserved on the
+  strength of a header, because the loader maps a range and hands out pages
+  when the guest touches them, so a segment claiming 64 TiB from an 8 KiB file
+  costs a map entry; and nothing narrows on wasm32, because this path works in
+  `u64` throughout, checked on the host and again in the wasm harness where a
+  narrowing could show. Decoding, memory translation, syscalls, and host
+  messages have no such sweep.
 - **Signed manifests, reproducible images, dependency licenses**, and a
   security audit of credential boundaries and snapshot contents.
 
@@ -160,16 +198,29 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
 - ~~**A Linux host in the loop.**~~ Partly done: a skip is no longer silent.
   Every fixture goes through one helper that prints `SKIP:` with the fixture
   and how to get it, and `WEBTOS_REQUIRE_FIXTURES=1` turns a skip into a
-  failure. Run that way, the x86-64 Linux host covers everything — 73 cases,
-  no skips, which is now demonstrated rather than assumed. On macOS the same
-  switch fails 23 cases: every C fixture, which is most of the threads,
-  processes, epoll, pty, and signal surface. `.github/workflows/native.yml`
+  failure. Run that way, the x86-64 Linux host covered everything — no skips,
+  which is demonstrated rather than assumed, though that run has not been
+  repeated since the suite grew to 98 cases. On macOS the same switch fails 26
+  of them: every C fixture, which is most of the threads, processes, epoll,
+  pty, and signal surface, and now the interrupted socket read as well.
+  `.github/workflows/native.yml`
   runs the strict suite on x86-64 Linux, building the agent fixture from a
   pinned OpenFox commit so a failure means this repository changed rather than
   that one did. It is manual (`workflow_dispatch`) until it has run on a real
   runner, so the Linux host is still in the loop only when someone starts it.
 - **A compatibility dashboard** across engines and pinned workload versions.
   The measurement harnesses exist; nothing publishes them.
+- **A suite that is only sound single-threaded.** The engine keeps the current
+  address space in process-wide atomics — `CURRENT_ASID` and its neighbours in
+  `crates/x64-engine/src/vm.rs` — so two tests running as threads in one test
+  binary, each with its own machine, overwrite each other's notion of which
+  address space is executing. The failure is intermittent, reports as an
+  engine-level `InternalError`, and moves between tests, which is exactly what
+  makes it easy to mistake for a real regression: measured at about four
+  failures in fourteen parallel runs, and none in five single-threaded ones.
+  Run the suite with `-- --test-threads=1` until the state moves onto the
+  machine. Eleven consecutive parallel runs today were green, so it is rare
+  rather than gone.
 
 ### A bug that only appeared where the tests ran
 
@@ -229,7 +280,7 @@ to M8 fully covers them:
 Joining the agent kernel's model to the Linux runtime is the largest unscoped
 piece of work in the project, and it is what separates webTOS from a Linux
 emulator that happens to run in a tab. It needs a milestone of its own before
-it can be estimated honestly, which is why it is absent from the 74% above
+it can be estimated honestly, which is why it is absent from the 83% above
 rather than dragging it down.
 
 ### Deferred on purpose
@@ -716,7 +767,12 @@ Work:
   a read of the stored snapshot itself. The value still lands in the guest
   filesystem, so this is scoping rather than a handle)
 - Test tool execution, cancellation, interrupted network calls, context
-  persistence, browser reload, and checkpoint resume. ⬜
+  persistence, browser reload, and checkpoint resume. 🔶 (cancellation,
+  browser reload, and checkpoint resume are gated, and an interrupted network
+  call now is too — a guest blocked in `recv` takes a signal mid-flight and
+  gets `EINTR`, or resumes under `SA_RESTART`. That gate needs a compiled C
+  fixture, so it runs on Linux and skips on macOS. Tool execution and context
+  persistence have no gate of their own beyond the Codex runs above)
 - Maintain per-version instruction, syscall, and performance regression data.
   ⬜
 
@@ -793,10 +849,14 @@ Work:
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results.
 - Fuzz instruction decoding, memory translation, ELF loading, syscalls, image
-  parsing, snapshot restore, and browser messages.
+  parsing, snapshot restore, and browser messages. 🔶 (snapshot restore and
+  ELF loading are swept exhaustively — every truncation and every single-bit
+  flip — which found two defects and five respectively; the rest have nothing)
 - Define memory, CPU, storage, network, and event-log quotas per agent,
   budgeting guest pages, image bytes, and the block cache against one address
-  space (`wtw_set_guest_memory_mb` is the guest half of that).
+  space (`wtw_set_guest_memory_mb` is the guest half of that). 🔶 (memory,
+  storage, and network have ceilings; CPU and the event log do not, and the
+  storage ceiling measures allocation over a machine's life, not live data)
 - Add signed workload manifests, reproducible images, dependency licenses,
   security policy, and vulnerability response procedures.
 - Add compatibility dashboards for supported browsers and pinned workload
