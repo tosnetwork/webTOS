@@ -2,7 +2,6 @@ use crate::{
     Cpu,
     debug_info::DebugInfo,
     mem::{AllocLayout, Mapping, perm},
-    utils,
 };
 
 use object::{Endianness, FileKind, elf, read::elf::ProgramHeader};
@@ -55,6 +54,18 @@ pub trait ElfLoader {
     }
 
     fn load_elf(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<LoadedElf, String> {
+        self.load_elf_at_depth(cpu, path, 0)
+    }
+
+    /// Loads the ELF at `path`, where `depth` counts interpreters: a binary is
+    /// loaded at depth 0 and the interpreter it names at depth 1, and nothing
+    /// deeper is loaded at all.
+    fn load_elf_at_depth(
+        &mut self,
+        cpu: &mut Cpu,
+        path: &[u8],
+        depth: u32,
+    ) -> Result<LoadedElf, String> {
         use object::read::elf::FileHeader;
 
         tracing::info!("Loading ELF file from: {}", path.escape_ascii());
@@ -62,14 +73,20 @@ pub trait ElfLoader {
         let file = self.read_file(path)?;
         let data: &[u8] = &file;
 
+        // `FileKind::parse` reads only the magic and the class byte, so a file
+        // truncated (or corrupted) anywhere after those still arrives here as
+        // an ELF and then fails in `FileHeader::parse`. That is an error, not
+        // an impossibility: an image streamed in from the network or read back
+        // out of browser storage may be any prefix of a real one.
+        let header_error = |e| format!("failed to parse elf header: {e}");
         let mut metadata = match FileKind::parse(data) {
             Ok(FileKind::Elf32) => {
-                let header = elf::FileHeader32::<Endianness>::parse(data).unwrap();
-                load_elf(self, cpu, data, header)?
+                let header = elf::FileHeader32::<Endianness>::parse(data).map_err(header_error)?;
+                load_elf(self, cpu, data, header, depth)?
             }
             Ok(FileKind::Elf64) => {
-                let header = elf::FileHeader64::<Endianness>::parse(data).unwrap();
-                load_elf(self, cpu, data, header)?
+                let header = elf::FileHeader64::<Endianness>::parse(data).map_err(header_error)?;
+                load_elf(self, cpu, data, header, depth)?
             }
             Ok(other) => return Err(format!("unsupported file type: {:?}", other)),
             Err(e) => return Err(format!("failed to parse file: {}", e)),
@@ -85,7 +102,13 @@ pub trait ElfLoader {
     }
 }
 
-fn load_elf<H, L>(loader: &mut L, cpu: &mut Cpu, data: &[u8], elf: &H) -> Result<LoadedElf, String>
+fn load_elf<H, L>(
+    loader: &mut L,
+    cpu: &mut Cpu,
+    data: &[u8],
+    elf: &H,
+    depth: u32,
+) -> Result<LoadedElf, String>
 where
     H: object::read::elf::FileHeader,
     L: ElfLoader + ?Sized,
@@ -98,13 +121,20 @@ where
     let program_headers = elf.program_headers(endian, data).map_err(parse_error)?;
 
     let (requested_base_addr, layout) =
-        get_layout(program_headers, endian, L::LOAD_AT_PHYSICAL_ADDRESS);
+        get_layout(program_headers, endian, L::LOAD_AT_PHYSICAL_ADDRESS)?;
 
     let (base_addr, relocation_offset) = if L::DYNAMIC_MEMORY {
         let base_addr = cpu
             .mem
             .alloc_memory(layout, Mapping { perm: perm::MAP, value: 0xaa })
             .map_err(|e| format!("Failed to allocate memory: {e:?}"))?;
+
+        // The image has to end somewhere inside the address space: the caller
+        // computes where it ends to place the heap after it, and a claimed
+        // length that runs past the top wraps that around to a low address.
+        base_addr.checked_add(layout.size).ok_or_else(|| {
+            format!("elf of {:#x} bytes does not fit at {base_addr:#x}", layout.size)
+        })?;
 
         (base_addr, base_addr - requested_base_addr)
     }
@@ -129,7 +159,7 @@ where
                     // We don't need to do anything for zero length load sections
                     continue;
                 }
-                let info = SegmentInfo::from_header(endian, header, L::LOAD_AT_PHYSICAL_ADDRESS);
+                let info = SegmentInfo::from_header(endian, header, L::LOAD_AT_PHYSICAL_ADDRESS)?;
                 let relocated_base = info.base + relocation_offset;
 
                 // For some targets we set memory permissions using an external configuration file
@@ -248,7 +278,15 @@ where
         phdr_num: elf.e_phnum(endian) as u64,
     };
 
-    let interpreter = interpreter_path.map(|path| loader.load_elf(cpu, path)).transpose()?;
+    // An image is free to name itself as its own interpreter, and following
+    // that recurses until the stack is gone — which aborts the process outright
+    // and cannot be caught. Linux allows exactly one interpreter; so does this.
+    let interpreter = interpreter_path
+        .map(|path| match depth {
+            0 => loader.load_elf_at_depth(cpu, path, depth + 1),
+            _ => Err(format!("an elf interpreter cannot name one itself: {}", path.escape_ascii())),
+        })
+        .transpose()?;
     let (interpreter, mut debug_info) = match interpreter {
         Some(entry) => (Some(entry.binary), entry.debug_info),
         None => (None, DebugInfo::default()),
@@ -262,26 +300,47 @@ where
 }
 
 // Retrives the base address and layout requirements of the ELF when it is loaded into memory.
-fn get_layout<H>(program_headers: &[H], endian: H::Endian, use_phy_addr: bool) -> (u64, AllocLayout)
+fn get_layout<H>(
+    program_headers: &[H],
+    endian: H::Endian,
+    use_phy_addr: bool,
+) -> Result<(u64, AllocLayout), String>
 where
     H: ProgramHeader,
 {
     let mut base = std::u64::MAX;
     let mut size = 0;
     let mut align = 0;
+    let mut loadable = 0;
 
     for header in program_headers {
         if header.p_type(endian) != elf::PT_LOAD || header.p_memsz(endian).into() == 0 {
             continue;
         }
 
-        let info = SegmentInfo::from_header(endian, header, use_phy_addr);
+        let info = SegmentInfo::from_header(endian, header, use_phy_addr)?;
+        // Where the segment says it ends. Every number here comes out of the
+        // file, so a segment may claim to start near the top of the address
+        // space and run for another terabyte past it.
+        let end = info.base.checked_add(info.size).ok_or_else(|| {
+            format!(
+                "segment at {:#x} runs {:#x} bytes past the address space",
+                info.base, info.size
+            )
+        })?;
+        loadable += 1;
         base = base.min(info.base);
-        size = size.max(info.base + info.size - base);
+        size = size.max(end - base);
         align = align.max(info.alignment);
     }
 
-    (base, AllocLayout { addr: Some(base), size, align })
+    // Nothing to load is not an empty image, it is a broken one: describing it
+    // as a zero-length region underflows the length inside the allocator.
+    if loadable == 0 {
+        return Err("elf has no loadable segments".to_string());
+    }
+
+    Ok((base, AllocLayout { addr: Some(base), size, align }))
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -301,7 +360,11 @@ struct SegmentInfo {
 }
 
 impl SegmentInfo {
-    fn from_header<H: ProgramHeader>(endian: H::Endian, header: &H, use_phy_addr: bool) -> Self {
+    fn from_header<H: ProgramHeader>(
+        endian: H::Endian,
+        header: &H,
+        use_phy_addr: bool,
+    ) -> Result<Self, String> {
         let addr: u64 = match use_phy_addr {
             true => header.p_paddr(endian).into(),
             false => header.p_vaddr(endian).into(),
@@ -309,13 +372,26 @@ impl SegmentInfo {
         let align: u64 = header.p_align(endian).into();
         let size: u64 = header.p_memsz(endian).into();
 
+        // ELF requires `p_align` to be zero, one, or a power of two, the first
+        // two meaning no alignment. A corrupt file says otherwise — one flipped
+        // bit turns 0x1000 into 0 or into 0x1001 — and the value is then
+        // divided by (zero divides) and asserted on inside `align_up`.
+        let align = match align {
+            0 | 1 => 1,
+            align if align.is_power_of_two() => align,
+            align => return Err(format!("segment alignment {align:#x} is not a power of two")),
+        };
         let offset = addr % align;
-        Self {
-            base: addr - offset,
-            offset,
-            size: utils::align_up(size + offset, align),
-            alignment: align,
-        }
+        // What `utils::align_up` computes, except that a claimed length running
+        // off the end of the address space is refused rather than wrapped.
+        let size = size
+            .checked_add(offset)
+            .and_then(|size| size.checked_next_multiple_of(align))
+            .ok_or_else(|| {
+            format!("segment at {addr:#x} claims {size:#x} bytes, past the address space")
+        })?;
+
+        Ok(Self { base: addr - offset, offset, size, alignment: align })
     }
 }
 
