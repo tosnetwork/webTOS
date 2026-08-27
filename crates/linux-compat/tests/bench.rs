@@ -297,3 +297,189 @@ fn bench_reload_same_image() {
         );
     }
 }
+
+/// Where a workload's time actually goes, per basic block.
+///
+/// Milestone 8's first work item is to "profile executed blocks and translate
+/// only proven hot paths". This is the profiling half. It reports how
+/// concentrated execution is, because that number decides whether a
+/// translator is worth building: if a handful of blocks account for most of
+/// the retired instructions, translating them is cheap and the payoff is
+/// large; if the distribution is flat, a translator has to cover most of the
+/// program before it earns anything.
+#[test]
+#[ignore = "measurement, not a gate; run with --ignored --nocapture"]
+fn bench_block_hotness() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    for (label, argv) in [
+        ("busybox ls /bin", vec!["busybox", "ls", "/bin"]),
+        (
+            "sh loop (100 iterations)",
+            vec![
+                "busybox",
+                "sh",
+                "-c",
+                "i=0; while [ $i -lt 100 ]; do i=$((i+1)); done",
+            ],
+        ),
+        ("md5sum 1 MiB", vec!["busybox", "md5sum", "/root/data.bin"]),
+    ] {
+        let mut machine = Machine::from_ldef(&ldef_path(), &EngineConfig::default())
+            .expect("machine build failed");
+        machine
+            .add_file(b"/bin/busybox", image.clone(), 0o755)
+            .expect("add busybox");
+        machine
+            .add_file(b"/root/data.bin", payload(1024 * 1024), 0o644)
+            .expect("add payload");
+        machine.set_args(
+            argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            vec![b"PATH=/bin".to_vec()],
+        );
+        machine.load(b"/bin/busybox").expect("ELF load failed");
+        machine.vm_mut().profile_blocks(true);
+        machine.vm_mut().icount_limit = machine.icount() + 40_000_000_000;
+        let exit = machine.run();
+        assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "{label} failed");
+
+        let profile = machine
+            .vm_mut()
+            .block_profile()
+            .expect("profiling was enabled");
+        // Weight by work done, not by how often a block was entered: a short
+        // block entered often is not the same target as a long one.
+        let mut blocks: Vec<(u64, u64)> = profile
+            .iter()
+            .map(|(&addr, p)| (addr, p.entries.saturating_mul(p.instructions)))
+            .collect();
+        blocks.sort_by_key(|(_, work)| std::cmp::Reverse(*work));
+        let total: u64 = blocks.iter().map(|(_, work)| work).sum();
+        if total == 0 {
+            continue;
+        }
+        let coverage = |fraction: f64| {
+            let target = (total as f64 * fraction) as u64;
+            let mut sum = 0_u64;
+            for (i, (_, work)) in blocks.iter().enumerate() {
+                sum += work;
+                if sum >= target {
+                    return i + 1;
+                }
+            }
+            blocks.len()
+        };
+        println!(
+            "[bench] {:<28} {:>6} blocks executed; {:>4} cover 50%, {:>4} cover 90%, {:>5} cover 99%",
+            label,
+            blocks.len(),
+            coverage(0.5),
+            coverage(0.9),
+            coverage(0.99),
+        );
+        let top: String = blocks
+            .iter()
+            .take(3)
+            .map(|(addr, work)| format!("{addr:#x}={:.0}%", *work as f64 * 100.0 / total as f64))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("[bench] {:<28} hottest: {top}", "");
+    }
+}
+
+/// The measurement that decides what milestone 8 should build.
+///
+/// A real agent binary starting up is the workload that matters, and it is
+/// nothing like a hot loop. This runs the same invocation three times in one
+/// machine: the first pays to lift every block it touches, the rest find them
+/// already lifted. The gap between them is the share of a cold start that is
+/// translation rather than execution — and the block distribution alongside
+/// says whether a selective translator could ever capture it.
+///
+/// Needs `tools/build_openfox_fixture.sh`; skips without it.
+#[test]
+#[ignore = "measurement, not a gate; run with --ignored --nocapture"]
+fn bench_agent_startup_is_lifting() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/openfox");
+    let Ok(image) = std::fs::read(&path) else {
+        eprintln!(
+            "skipping: {} missing (tools/build_openfox_fixture.sh)",
+            path.display()
+        );
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/openfox", image, 0o755)
+        .expect("add openfox");
+    machine.vm_mut().profile_blocks(true);
+
+    let mut cold = 0.0_f64;
+    let mut warm = 0.0_f64;
+    for run in 0..3 {
+        machine.set_args(
+            vec![b"openfox".to_vec(), b"--help".to_vec()],
+            vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()],
+        );
+        machine.load(b"/bin/openfox").expect("ELF load failed");
+        machine.vm_mut().icount_limit = machine.icount() + 40_000_000_000;
+        let before = machine.icount();
+        let start = Instant::now();
+        let exit = machine.run();
+        let seconds = start.elapsed().as_secs_f64();
+        let instructions = machine.icount() - before;
+        machine.take_output();
+        assert_eq!(
+            exit,
+            CpuExit::Halt { code: Some(0) },
+            "openfox --help failed"
+        );
+        println!(
+            "[bench] {:<28} run {run}: {instructions} instructions  {seconds:>6.2} s  {:>6.1} M inst/s",
+            "agent --help",
+            instructions as f64 / seconds / 1e6,
+        );
+        if run == 0 {
+            cold = seconds;
+        } else {
+            warm = seconds;
+        }
+    }
+    println!(
+        "[bench] {:<28} {:.0}% of a cold start is lifting, not executing",
+        "agent startup",
+        (cold - warm) * 100.0 / cold,
+    );
+
+    let profile = machine
+        .vm_mut()
+        .block_profile()
+        .expect("profiling was enabled");
+    let mut blocks: Vec<u64> = profile
+        .values()
+        .map(|p| p.entries.saturating_mul(p.instructions))
+        .collect();
+    blocks.sort_unstable_by_key(|work| std::cmp::Reverse(*work));
+    let total: u64 = blocks.iter().sum();
+    let coverage = |fraction: f64| {
+        let target = (total as f64 * fraction) as u64;
+        let mut sum = 0_u64;
+        for (i, work) in blocks.iter().enumerate() {
+            sum += work;
+            if sum >= target {
+                return i + 1;
+            }
+        }
+        blocks.len()
+    };
+    println!(
+        "[bench] {:<28} {} blocks executed; {} cover 50%, {} cover 90%, {} cover 99%",
+        "agent block spread",
+        blocks.len(),
+        coverage(0.5),
+        coverage(0.9),
+        coverage(0.99),
+    );
+}

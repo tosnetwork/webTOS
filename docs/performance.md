@@ -155,6 +155,52 @@ and the two static fixtures in this repository share a load address, so
 space. Without the content-addressed index that would have cost 18 ms of
 re-lifting per load; with it, a repeated load still runs in 0.1 ms.
 
+### The workload that matters has no hot path
+
+The plan for milestone 8 says "profile executed blocks and translate only
+proven hot paths". `bench_block_hotness` and `bench_agent_startup_is_lifting`
+did the profiling half, and it does not support the second half.
+
+How concentrated execution is, weighted by retired instructions:
+
+| Workload | Blocks executed | Cover 50% | Cover 90% | Hottest block |
+|---|---|---|---|---|
+| `md5sum` 1 MiB | 696 | 4 | 8 | 16% |
+| `busybox ls /bin` | 1,056 | 68 | 445 | 3% |
+| shell loop, 100 iterations | 1,701 | 55 | 478 | 7% |
+| **agent `--help`** | **29,347** | **212** | **1,879** | **1.5%** |
+
+Compute is the textbook case: thirteen blocks cover 99% of a megabyte of
+hashing, and a translator aimed at them would pay for itself immediately.
+A real agent starting up is the opposite. It executes twenty-nine thousand
+distinct blocks, the hottest accounts for one and a half percent, and covering
+ninety percent means translating nearly two thousand of them. There is no hot
+path to find.
+
+And the time is not going where a translator would look. The same invocation,
+three times in one machine, the first paying to lift what the others find
+already lifted:
+
+| Run | Instructions | Wall time | Rate |
+|---|---|---|---|
+| Cold | 18,528,799 | 5.27 s | 3.5 M inst/s |
+| Warm | 18,488,726 | 0.86 s | 21.4 M inst/s |
+| Warm | 18,506,097 | 0.85 s | 21.9 M inst/s |
+
+**84% of a cold agent start is lifting, not executing** — and the warm rate is
+the interpreter's own sustained rate, so once the blocks exist the interpreter
+is not the bottleneck at all. A hot-block translator would attack the
+remaining 16%, spread across a distribution with no peak, and would add
+translation work to a run already dominated by it.
+
+What the numbers point at instead is not translating the same blocks again on
+every cold start. The content-addressed index makes lifted blocks reusable
+within a session; making it survive across sessions — serialised, keyed by
+image content, validated against the specification it was lifted under —
+would turn a cold agent start from 5.3 s into something near 0.9 s, without
+generating a single instruction of code. That is a larger win than a
+translator, for less risk, and it is measured rather than assumed.
+
 ## What this says about milestone 8
 
 In priority order, on the evidence above:
@@ -162,13 +208,17 @@ In priority order, on the evidence above:
 1. ~~**Attack translation cost.**~~ Done: a content-addressed lift cache took
    `execve` from 48.8 ms to about 2 ms. What is left per exec is address-space
    teardown and ELF loading — a different problem, and a smaller one.
-2. **Then hot-block translation.** The interpreter is the floor for
-   long-running compute: an agent's 20-second command is 200-odd million
-   instructions, and no amount of host tuning turns that into 2 seconds.
-3. **Split the interpreter's cold half.** Not urgent — no engine has been shown
+2. **Persist the lift cache across sessions.** 84% of a cold agent start is
+   lifting blocks that were lifted the last time the same image ran. Nothing
+   else on this list is worth that much.
+3. **Hot-block translation, scoped to compute.** Still the floor for
+   long-running arithmetic, where thirteen blocks cover 99% of the work. Not
+   the answer for startup, which is where the complaint actually is — the
+   profile above is why that sentence changed.
+4. **Split the interpreter's cold half.** Not urgent — no engine has been shown
    to decline the 61.8 KiB function — but the cost if one did is known, and the
    fix is mechanical.
-4. **Budget memory as a whole.** Guest RAM, image bytes, and block cache share
+5. **Budget memory as a whole.** Guest RAM, image bytes, and block cache share
    one 4 GiB address space; quotas need to account for all three together.
 
 Not on the list: chasing the Firefox column. It measures a baseline-only

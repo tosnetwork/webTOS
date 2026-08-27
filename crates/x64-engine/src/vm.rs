@@ -63,6 +63,20 @@ pub struct InterpVm {
     lifted: std::collections::HashMap<(u64, u64), Vec<LiftedCode>>,
     /// The context `update_context` last installed in the lifter.
     lift_context: u64,
+    /// Per-block entry counts and retired instructions, when profiling is on.
+    /// Off by default: a translator should be pointed at blocks that were
+    /// measured to be hot, and the measurement should not be a cost the rest
+    /// of the time.
+    profile: Option<std::collections::HashMap<u64, BlockProfile>>,
+}
+
+/// How much of a run one basic block accounted for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockProfile {
+    /// Times the interpreter entered this block.
+    pub entries: u64,
+    /// Guest instructions in it, so entries can be weighted by real work.
+    pub instructions: u64,
 }
 
 impl InterpVm {
@@ -78,7 +92,20 @@ impl InterpVm {
             prev_isa_mode: u8::MAX,
             lifted: std::collections::HashMap::new(),
             lift_context: 0,
+            profile: None,
         }
+    }
+
+    /// Starts counting block entries. A translator is only worth pointing at
+    /// blocks that a real workload actually runs, and this is how that is
+    /// established rather than assumed.
+    pub fn profile_blocks(&mut self, enabled: bool) {
+        self.profile = enabled.then(std::collections::HashMap::new);
+    }
+
+    /// Block entry counts collected so far, keyed by guest address.
+    pub fn block_profile(&self) -> Option<&std::collections::HashMap<u64, BlockProfile>> {
+        self.profile.as_ref()
     }
 
     pub fn set_env(&mut self, env: impl Environment + 'static) {
@@ -346,6 +373,11 @@ impl InterpVm {
         adjust_cpu_fuel_for_block_reentry(&mut self.cpu, block, offset);
 
         loop {
+            if let Some(profile) = self.profile.as_mut() {
+                let entry = profile.entry(block.start).or_default();
+                entry.entries += 1;
+                entry.instructions = block.num_instructions as u64;
+            }
             if block.has_breakpoint() {
                 // Determine how many steps to execute before we hit the first
                 // breakpoint in this block.
