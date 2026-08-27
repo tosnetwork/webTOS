@@ -255,22 +255,40 @@ entries stay allocated and unreachable. The soak test found this by asserting
 the block table was flat across repeated runs of the same image, which it is
 not.
 
-Eighty rounds of the agent, measured:
+The first measurement of this was eighty rounds, where growth per ten rounds
+fell from 2,922 blocks to about 250, and that was read as convergence toward a
+bound. A thousand-round run said otherwise: the table went from 39,929 blocks
+to 76,057, and the last quarter added *more* than the first. Eighty rounds had
+only shown the initial burst of hot blocks; what follows is a long, nearly
+linear climb.
 
-| Round | 0 | 9 | 19 | 39 | 59 | 79 |
-|---|---|---|---|---|---|---|
-| Lifted blocks | 32,440 | 35,362 | 36,730 | 38,308 | 39,108 | 39,672 |
+Counting the structures separately says why:
 
-Growth per ten rounds falls from 2,922 to about 250: addresses cross the
-threshold at different rates, and each can only ever be promoted once. The
-bound is twice the image's distinct blocks, and 22% over eighty rounds is well
-inside it. Guest memory and the filesystem stay flat over the same run.
+| Round | 0 | 20 | 40 | 60 |
+|---|---|---|---|---|
+| Blocks in the arena | 39,929 | 45,542 | 47,432 | 48,374 |
+| Addresses in the lift index | 37,118 | 37,294 | 37,340 | 37,340 |
+| Addresses promoted | 1,234 | 6,315 | 8,036 | 8,942 |
+| Addresses counted | 37,098 | 37,274 | 37,320 | 37,320 |
 
-The soak therefore asserts convergence rather than flatness — the last
-quarter's growth must be a small fraction of the first quarter's — which still
-catches a genuinely linear leak. Reclaiming the retired groups would need
-index reuse in the arena, and stale `Target::Internal` references make that a
-larger change than the memory it returns is worth today.
+The index and the counter saturate by round 40. Only `promoted` keeps rising,
+and blocks track it almost one for one — 379 blocks per 367 promotions over ten
+rounds. So the growth is exactly one retired group per promoted address, and
+the ceiling is the number of addresses that can ever promote: 39,929 + (37,320
+− 1,234) = 76,015 against 76,057 measured at round 1,000. The table saturates
+at roughly twice its starting size, and a thousand rounds is about where it
+gets there.
+
+Two things follow. The soak's invariant is that ceiling — one retired group per
+counted address, checked every round — rather than a claim about the shape of
+the curve, which is what the eighty-round reading got wrong. And the entry
+counter never decays, so over a long enough session *every* address crosses the
+threshold: tiered lifting's steady state is "everything optimized, and twice
+the block table", not "only the hot blocks optimized". The startup win it was
+built for is unaffected, because promotion is spread across the run instead of
+being paid at load. Reclaiming the retired groups would need index reuse in the
+arena, and stale `Target::Internal` references make that a larger change than
+the memory it returns is worth today.
 
 ## What this says about milestone 8
 

@@ -93,6 +93,15 @@ pub struct InterpVm {
     profile: Option<std::collections::HashMap<u64, BlockProfile>>,
 }
 
+/// See [`InterpVm::lift_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiftStats {
+    pub blocks: usize,
+    pub indexed: usize,
+    pub promoted: usize,
+    pub counted: usize,
+}
+
 /// How much of a run one basic block accounted for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockProfile {
@@ -196,6 +205,19 @@ impl InterpVm {
         self.cpu.mem.clear();
         self.flush_code();
         self.prev_isa_mode = u8::MAX;
+    }
+
+    /// Counts for the structures tiered lifting grows: blocks in the arena,
+    /// addresses in the content-addressed index, addresses promoted, and
+    /// addresses being counted toward promotion. A soak asserts on these, and
+    /// when it fails these say which one moved.
+    pub fn lift_stats(&self) -> LiftStats {
+        LiftStats {
+            blocks: self.code.blocks.len(),
+            indexed: self.lifted.len(),
+            promoted: self.promoted.len(),
+            counted: self.entries.len(),
+        }
     }
 
     /// Drops every lifted block, including the content-addressed index.

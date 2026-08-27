@@ -475,7 +475,7 @@ fn openfox_soak_is_bounded() {
 
     let mut prev_fs = machine.export_fs().len();
     let mut first_guest_mb = None;
-    let mut blocks_at: Vec<usize> = Vec::with_capacity(rounds);
+    let first_blocks = machine.vm_mut().lift_stats().blocks;
     for round in 0..rounds {
         let cmd = if round % 2 == 0 { "status" } else { "version" };
         let run = run_openfox(&mut machine, &[cmd]);
@@ -498,22 +498,29 @@ fn openfox_soak_is_bounded() {
             "guest memory grew from {baseline_mb} to {guest_mb} MiB by round {round}"
         );
 
-        blocks_at.push(machine.vm_mut().code.blocks.len());
+        // Tiered lifting grows the block table in a way the soak has to
+        // bound. Promotion re-lifts an address with the optimizer and drops
+        // the cheap version from the block map, but the arena is append-only,
+        // so the retired group stays allocated. `promoted` admits an address
+        // once, so the ceiling is one retired group per address the engine
+        // ever counted — and a long run really does reach it, because the
+        // entry counter never decays and every address eventually crosses the
+        // threshold.
+        let st = machine.vm_mut().lift_stats();
+        assert!(
+            st.promoted <= st.counted,
+            "round {round}: {} addresses promoted but only {} counted",
+            st.promoted,
+            st.counted
+        );
+        let ceiling = first_blocks + st.counted + st.counted / 8;
+        assert!(
+            st.blocks <= ceiling,
+            "lifted blocks passed the one-retired-group-per-address ceiling on \
+             round {round}: {} blocks against {ceiling} ({} promoted of {} counted)",
+            st.blocks,
+            st.promoted,
+            st.counted
+        );
     }
-
-    // Lifted blocks do grow across rounds: an address that crosses the
-    // promotion threshold is lifted again with the optimizer, and the cheap
-    // version stays in the table. That is bounded by the number of blocks the
-    // image has, so what matters is that it converges rather than climbing
-    // linearly. Compare the first quarter's growth against the last.
-    let quarter = rounds / 4;
-    let early = blocks_at[quarter].saturating_sub(blocks_at[0]);
-    let late = blocks_at[rounds - 1].saturating_sub(blocks_at[rounds - 1 - quarter]);
-    assert!(
-        late * 2 <= early.max(1),
-        "lifted blocks are not converging: {early} added in the first quarter, \
-         {late} in the last ({} to {} over {rounds} rounds)",
-        blocks_at[0],
-        blocks_at[rounds - 1],
-    );
 }
