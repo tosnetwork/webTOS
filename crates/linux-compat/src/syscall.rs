@@ -391,18 +391,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
-        // Registration-only. Handlers themselves do run (see `deliver_signal`),
-        // but always on the interrupted stack: a handler installed with
-        // SA_ONSTACK gets the normal stack rather than the alternate one it
-        // asked for. Runtimes use the alternate stack to survive a fault on a
-        // small or exhausted goroutine/thread stack, so this is a real gap,
-        // not a no-op — it just has not been reached by a workload yet.
-        abi::SYS_SIGALTSTACK => {
-            if a[1] != 0 {
-                write_mem(cpu, a[1], &[0_u8; 24])?;
-            }
-            Ok(0)
-        }
+        abi::SYS_SIGALTSTACK => sys_sigaltstack(env, cpu, a[0], a[1]),
 
         abi::SYS_ARCH_PRCTL => match a[0] {
             abi::ARCH_SET_FS => {
@@ -3362,6 +3351,69 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
 }
 
 /// Redirects the current CPU into the lowest-numbered pending signal's
+/// `stack_t { void *ss_sp; int ss_flags; size_t ss_size; }` — with padding,
+/// twenty-four bytes: pointer, four-byte flags, four bytes of hole, size.
+const STACK_T_LEN: usize = 24;
+/// Reported when a handler is running on the alternate stack; never set by a
+/// caller.
+const SS_ONSTACK: u32 = 1;
+/// Set by a caller to take the alternate stack away.
+const SS_DISABLE: u32 = 2;
+/// The smallest alternate stack the kernel will accept. A handler frame plus
+/// what a handler does has to fit, and a stack too small to hold one is worse
+/// than none: the fault it was installed to survive happens on it instead.
+const MINSIGSTKSZ: u64 = 2048;
+
+/// Registers, queries, or disables the alternate signal stack.
+///
+/// A runtime installs one so a handler has somewhere to run when the stack it
+/// interrupted is the problem. This used to record the request and ignore it,
+/// which is the failure mode that matters least until it matters most: the
+/// handler runs on the stack that just overflowed.
+fn sys_sigaltstack(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> SysResult {
+    let on_stack = env.proc.altstack_depth > 0;
+    if old != 0 {
+        let mut out = [0_u8; STACK_T_LEN];
+        let (base, size, flags) = match env.proc.altstack {
+            Some((base, size)) => (base, size, if on_stack { SS_ONSTACK } else { 0 }),
+            None => (0, 0, SS_DISABLE),
+        };
+        out[0..8].copy_from_slice(&base.to_le_bytes());
+        out[8..12].copy_from_slice(&flags.to_le_bytes());
+        out[16..24].copy_from_slice(&size.to_le_bytes());
+        write_mem(cpu, old, &out)?;
+    }
+    if new == 0 {
+        return Ok(0);
+    }
+    // Changing the stack a handler is currently running on would pull the
+    // ground out from under it.
+    if on_stack {
+        return Err(abi::EPERM);
+    }
+    let bytes = read_mem(cpu, new, STACK_T_LEN)?;
+    let base = u64::from_le_bytes(bytes[0..8].try_into().expect("size"));
+    let flags = u32::from_le_bytes(bytes[8..12].try_into().expect("size"));
+    let size = u64::from_le_bytes(bytes[16..24].try_into().expect("size"));
+    if flags & SS_DISABLE != 0 {
+        env.proc.altstack = None;
+        return Ok(0);
+    }
+    // Anything other than SS_DISABLE is a flag this kernel does not know, and
+    // guessing at it would be worse than saying so.
+    if flags & !SS_ONSTACK != 0 {
+        return Err(abi::EINVAL);
+    }
+    if size < MINSIGSTKSZ {
+        return Err(abi::ENOMEM);
+    }
+    if base.checked_add(size).is_none() {
+        return Err(abi::EINVAL);
+    }
+    env.proc.altstack = Some((base, size));
+    Ok(0)
+}
+
 /// handler, saving the interrupted state so `rt_sigreturn` can resume it. The
 /// interrupted syscall was parked to resume (blocking waits pre-set their
 /// return value), so after the handler returns the wait is re-evaluated and,
@@ -3418,12 +3470,28 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     }
     env.proc.sigmask |= sa_mask;
 
-    // Build a minimal signal frame on the thread's own stack. A real handler
-    // gets (signo, &siginfo, &ucontext); tokio's SIGCHLD handler only writes a
-    // wakeup byte and ignores the latter two, so zeroed structures suffice.
-    // The handler returns into `restorer`, whose `rt_sigreturn` we service.
-    let mut sp: u64 = cpu.read_var(env.regs.rsp);
-    sp = sp.saturating_sub(128); // skip the x86-64 red zone
+    // Build a minimal signal frame. A real handler gets (signo, &siginfo,
+    // &ucontext); tokio's SIGCHLD handler only writes a wakeup byte and
+    // ignores the latter two, so zeroed structures suffice. The handler
+    // returns into `restorer`, whose `rt_sigreturn` we service.
+    //
+    // Which stack it goes on is the point of `SA_ONSTACK`: a handler asking
+    // for it gets the alternate stack, from its top, because the stack it
+    // interrupted may be the thing that faulted. Already running on the
+    // alternate stack, it continues down it instead of starting over at the
+    // top, which would overwrite the frame of the handler it interrupted.
+    const SA_ONSTACK: u64 = 0x0800_0000;
+    let interrupted_sp: u64 = cpu.read_var(env.regs.rsp);
+    let on_alt = flags & SA_ONSTACK != 0 && env.proc.altstack.is_some();
+    let mut sp = match (on_alt, env.proc.altstack_depth, env.proc.altstack) {
+        (true, 0, Some((base, size))) => base.saturating_add(size),
+        _ => interrupted_sp,
+    };
+    // The red zone belongs to the interrupted frame; the alternate stack has
+    // no frame below its top, so there is nothing to skip there.
+    if !on_alt || env.proc.altstack_depth > 0 {
+        sp = sp.saturating_sub(128);
+    }
     sp = sp.saturating_sub(128);
     let siginfo_ptr = sp;
     let mut siginfo = [0_u8; 128];
@@ -3443,6 +3511,12 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         env.proc.sigmask = env.proc.signal_saved_mask.pop().unwrap_or(env.proc.sigmask);
         return false;
     }
+    // Counted after the frame is written, so a delivery that failed to set up
+    // does not leave the process believing it is on the alternate stack.
+    if on_alt {
+        env.proc.altstack_depth += 1;
+    }
+    env.proc.altstack_frames.push(on_alt);
 
     cpu.write_var(env.regs.rsp, sp);
     cpu.write_var(env.regs.rdi, sig);
@@ -3465,6 +3539,10 @@ fn sys_rt_sigreturn(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
         env.proc.signal_saved_mask.pop(),
     ) {
         (Some(snapshot), Some(mask)) => {
+            // Leaving the handler leaves the stack it ran on.
+            if env.proc.altstack_frames.pop() == Some(true) {
+                env.proc.altstack_depth = env.proc.altstack_depth.saturating_sub(1);
+            }
             // The instruction counter is global and must not rewind.
             let icount = cpu.icount;
             cpu.restore(&snapshot);

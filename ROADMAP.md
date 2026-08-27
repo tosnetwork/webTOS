@@ -36,7 +36,7 @@ terminal behavior, and recovery after a browser reload.
 | M0 Lock the baseline | 🔶 | ~76% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. Fixtures are pinned by checksum where they are fetched, but not versioned as a set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
-| M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
+| M3 Dynamic userland | ✅ | ~93% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~96% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~94% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
@@ -53,13 +53,13 @@ call, so here is the arithmetic rather than the assertion:
 | M0 Lock the baseline | 5% | 76% | 3.8 |
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
-| M3 Dynamic userland | 10% | 90% | 9.0 |
+| M3 Dynamic userland | 10% | 93% | 9.3 |
 | M4 Threads & processes | 13% | 96% | 12.5 |
 | M5 Event loop & networking | 13% | 94% | 12.2 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 84% | 16.8 |
 | M8 Performance & release | 14% | 55% | 7.7 |
-| **Total** | **100%** | | **86.0** |
+| **Total** | **100%** | | **86.3** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 11 of the 15 points outstanding. Progress from
@@ -327,10 +327,6 @@ rather than dragging it down.
   correct.
 - **Worker cancellation leaving storage consistent** is browser-host work that
   has not started.
-- **Alternate signal stacks.** `sigaltstack` records and ignores; a handler
-  asking for `SA_ONSTACK` runs on the interrupted stack. No workload has
-  needed it yet, which is why it is here rather than above.
-
 ## Product Principles
 
 1. **Correctness before translation speed.** Start with an interpreter. Add
@@ -607,9 +603,19 @@ Work:
   group, both gated. Dispositions are consulted rather than assumed: default
   actions run, including stopping a process group, a process can signal
   itself, `rt_sigprocmask` delivers what it just unblocked, and an interrupted
-  wait returns `EINTR` unless the handler asked for a restart. `sigaltstack`
-  is still registration-only, so a handler asking for SA_ONSTACK runs on the
-  interrupted stack)
+  wait returns `EINTR` unless the handler asked for a restart. Alternate
+  signal stacks work: a handler installed with `SA_ONSTACK` runs on the stack
+  the process registered, which is the whole point of registering one — the
+  fault it exists to survive is the interrupted stack being the problem.
+  `sigaltstack` reports `SS_ONSTACK` while a handler is on it, refuses to be
+  changed under one, refuses a stack too small to hold a frame, and can be
+  taken away again; nested delivery continues down the alternate stack rather
+  than restarting at its top, which would overwrite the frame it interrupted.
+  A fork inherits the registration and a new thread does not, because the
+  memory it names is the registering thread's. Gated by `tests/altstack.rs`,
+  which asks the only question that distinguishes a handler that got the
+  stack it asked for from one that was told it did: where its own locals
+  live)
 - Build versioned minimal root images with explicit licenses and manifests. 🔶 (Alpine minirootfs pinned by sha256; no per-package license manifest yet)
 
 Exit gate:

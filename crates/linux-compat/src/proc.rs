@@ -62,6 +62,21 @@ pub struct Process {
     /// sigmask to reinstate when the handler returns.
     pub signal_saved: Vec<Box<CpuSnapshot>>,
     pub signal_saved_mask: Vec<u64>,
+    /// The alternate signal stack, when one is registered: base and size.
+    ///
+    /// A runtime installs one so a handler has somewhere to run when the
+    /// stack it interrupted is the problem — a fault on an exhausted thread
+    /// or goroutine stack. Running that handler on the stack that just
+    /// overflowed is how the process dies instead of reporting.
+    pub altstack: Option<(u64, u64)>,
+    /// How many handlers are currently running on it. Nested delivery
+    /// continues on the same stack rather than starting over at its top,
+    /// which would overwrite the frame of the handler that was interrupted.
+    pub altstack_depth: u32,
+    /// Whether each live handler frame is on the alternate stack, so leaving
+    /// one leaves the stack it actually ran on rather than the one the
+    /// innermost frame happened to use.
+    pub altstack_frames: Vec<bool>,
     pub exe_path: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
@@ -100,6 +115,9 @@ impl Process {
             pending_signals: 0,
             signal_saved: Vec::new(),
             signal_saved_mask: Vec::new(),
+            altstack: None,
+            altstack_depth: 0,
+            altstack_frames: Vec::new(),
             exe_path: Vec::new(),
             argv: Vec::new(),
             envp: Vec::new(),
@@ -129,6 +147,12 @@ impl Process {
             pending_signals: 0,
             signal_saved: Vec::new(),
             signal_saved_mask: Vec::new(),
+            // A fork inherits the registration; a new thread does not, since
+            // the memory it names is the registering thread's stack and two
+            // threads must not run handlers on one.
+            altstack: self.altstack,
+            altstack_depth: 0,
+            altstack_frames: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -159,6 +183,12 @@ impl Process {
             pending_signals: 0,
             signal_saved: Vec::new(),
             signal_saved_mask: Vec::new(),
+            // A fork inherits the registration; a new thread does not, since
+            // the memory it names is the registering thread's stack and two
+            // threads must not run handlers on one.
+            altstack: None,
+            altstack_depth: 0,
+            altstack_frames: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
