@@ -22,6 +22,8 @@
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //                                        (images this worker cached are left
 //                                        out; boot re-injects them)
+//               { type: "budget", mib }  -- cap the total footprint; 0 clears
+//               { type: "footprint" }   -- ask for a fresh reading
 //               { type: "secrets", secrets: [{ name, value, paths? }] }
 //                                     -- inject credentials by placeholder;
 //                                        values never reach storage or a log
@@ -30,6 +32,8 @@
 //               { type: "output", text },
 //               { type: "progress", path, loaded, total, cached }
 //               { type: "image", path, bytes, cached }  -- one image is in
+//               { type: "footprint", guest, code, files, total, headroom }
+//                                     -- bytes, and what the budget has left
 //               { type: "waiting" }   -- the guest is blocked on the terminal
 //               { type: "done", status, error, exitCode, icount },
 //               { type: "trace", status, trace }  -- the recorded trace text
@@ -252,11 +256,13 @@ async function loadImage({ path, url, mode = 0o755 }) {
     if (handle) {
       const bytes = await loadFromCache(handle, path, mode);
       postMessage({ type: "image", path, bytes, cached: true });
+      reportFootprint();
       return;
     }
   }
   const bytes = await loadFromNetwork(url, path, mode);
   postMessage({ type: "image", path, bytes, cached: false });
+  reportFootprint();
 }
 
 /// Deletes every cached image.
@@ -333,6 +339,23 @@ async function boot(files, links = []) {
       (restored ? " — filesystem restored from the previous session" : ""),
   });
   postMessage({ type: "ready", restored, storage: storageReady });
+}
+
+/// Reports where the machine's memory has gone. One wasm linear memory holds
+/// the guest's pages, the images streamed into it, and the code the engine has
+/// lifted; a tab's ceiling is about 3.9 GiB, so a host that wants to refuse a
+/// workload rather than die needs to see all three.
+function reportFootprint() {
+  const kib = (part) => exports.wtw_footprint_kib(part) * 1024;
+  const headroom = exports.wtw_memory_headroom_kib();
+  postMessage({
+    type: "footprint",
+    guest: kib(0),
+    code: kib(1),
+    files: kib(2),
+    total: kib(3),
+    headroom: headroom < 0 ? null : headroom * 1024,
+  });
 }
 
 /// Registers credentials with the guest and expands their placeholders.
@@ -756,6 +779,13 @@ self.onmessage = async (event) => {
     }
     if (msg.type === "input") input(msg.data);
     if (msg.type === "resize") resize(msg.rows, msg.cols);
+    if (msg.type === "footprint") reportFootprint();
+    if (msg.type === "budget") {
+      if (exports.wtw_set_memory_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
+        throw new Error(`budget: ${lastError()}`);
+      }
+      reportFootprint();
+    }
     if (msg.type === "secrets") applySecrets(msg.secrets);
     if (msg.type === "persist") await persist();
     if (msg.type === "forget") {

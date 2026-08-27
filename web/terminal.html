@@ -92,11 +92,22 @@
   // no CPU or memory snapshot. What survives a reload is what a program wrote
   // to disk, which is what an agent's session state is.
   let checkpointDone = null;
+  let measured = null;
   window.webtos = {
     term,
     state: "starting",
     images: [],
     storage: false,
+    // Where the tab's memory has gone: guest pages, lifted code, guest files.
+    // One linear memory holds all three.
+    footprint: null,
+    // A fresh reading rather than the last one pushed: lifted code only
+    // shows up once something has run.
+    measure: () =>
+      new Promise((resolve) => {
+        measured = resolve;
+        worker.postMessage({ type: "footprint" });
+      }),
     checkpoint: () =>
       new Promise((resolve, reject) => {
         if (!window.webtos.storage) {
@@ -166,6 +177,9 @@
     const msg = event.data;
     if (msg.type === "status") statusEl.textContent = msg.text;
     if (msg.type === "ready") {
+      // A host that knows its ceiling sets one, and an image that will not
+      // fit is refused at the request instead of part-way through.
+      if (budgetMib) worker.postMessage({ type: "budget", mib: Number(budgetMib) });
       window.webtos.storage = !!msg.storage;
       checkpointBtn.disabled = !msg.storage;
       forgetBtn.disabled = !msg.storage;
@@ -182,6 +196,11 @@
       statusEl.textContent = msg.total
         ? `${msg.cached ? "restoring" : "downloading"} ${msg.path} — ${mb(msg.loaded)} / ${mb(msg.total)} MB`
         : `${msg.cached ? "restoring" : "downloading"} ${msg.path} — ${mb(msg.loaded)} MB`;
+    }
+    if (msg.type === "footprint") {
+      window.webtos.footprint = msg;
+      measured?.(msg);
+      measured = null;
     }
     if (msg.type === "image") {
       window.webtos.images.push(msg);
@@ -265,6 +284,7 @@
   // config names it by placeholder, the value is expanded in that file only,
   // and a checkpoint redacts it back — so it never reaches browser storage.
   const secret = params.get("secret");
+  const budgetMib = params.get("budget");
   const agentConfig = new TextEncoder().encode(
     '{"api_key":"${AGENT_KEY}"}\n',
   ).buffer;

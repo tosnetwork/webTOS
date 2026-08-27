@@ -745,6 +745,22 @@ pub(crate) fn align_up(value: u64, align: u64) -> u64 {
 /// crate's environment.
 pub struct Machine {
     vm: InterpVm,
+    /// Ceiling on the total footprint, or None for unbounded. See
+    /// [`Machine::set_memory_budget`].
+    memory_budget: Option<usize>,
+}
+
+/// What a machine occupies, split by what it is spent on. All three live in
+/// one wasm linear memory and compete for its ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    /// Guest physical pages the MMU has handed out.
+    pub guest_bytes: usize,
+    /// Lifted p-code and the guest bytes kept to validate its reuse.
+    pub code_bytes: usize,
+    /// File contents and symlink targets in the guest filesystem.
+    pub files_bytes: usize,
+    pub total_bytes: usize,
 }
 
 impl Machine {
@@ -766,7 +782,10 @@ impl Machine {
     fn finish(mut vm: InterpVm) -> Result<Self, String> {
         let env = LinuxEnv::new(&vm.cpu)?;
         vm.set_env(env);
-        Ok(Self { vm })
+        Ok(Self {
+            vm,
+            memory_budget: None,
+        })
     }
 
     pub fn env(&mut self) -> &mut LinuxEnv {
@@ -776,7 +795,9 @@ impl Machine {
     }
 
     /// Adds a file to the guest filesystem (parent directories are created).
+    /// Refused when it would not fit the memory budget.
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        self.check_budget(bytes.len())?;
         self.env().add_file(path, bytes, mode)
     }
 
@@ -786,7 +807,12 @@ impl Machine {
     }
 
     /// Starts a file delivered in pieces; see [`LinuxEnv::create_file`].
+    ///
+    /// The whole reservation is charged here, before any of it arrives: an
+    /// image that cannot fit should be refused at the request, not part-way
+    /// through a download the host has already paid for.
     pub fn create_file(&mut self, path: &[u8], capacity: usize, mode: u32) -> Result<(), String> {
+        self.check_budget(capacity)?;
         self.env().create_file(path, capacity, mode)
     }
 
@@ -997,6 +1023,63 @@ impl Machine {
     /// to optimize every block as it is lifted.
     pub fn set_lift_tiering(&mut self, threshold: Option<u64>) {
         self.vm.set_lift_tiering(threshold);
+    }
+
+    /// What the machine occupies, split by what it is spent on. One wasm
+    /// linear memory holds all three, and a browser tab's ceiling is roughly
+    /// 3.9 GiB (`docs/performance.md`), so they compete: an agent image, the
+    /// guest's own pages, and the code the engine has lifted.
+    /// Takes `&mut self` because the guest filesystem is reached through the
+    /// environment's downcast, as everywhere else in this type.
+    pub fn footprint(&mut self) -> Footprint {
+        let guest_bytes = self.vm.cpu.mem.total_pages() * 4096;
+        let code_bytes = self.vm.lifted_bytes();
+        let files_bytes = self.env().vfs.bytes();
+        Footprint {
+            guest_bytes,
+            code_bytes,
+            files_bytes,
+            total_bytes: guest_bytes + code_bytes + files_bytes,
+        }
+    }
+
+    /// Sets a ceiling on the total footprint, or clears it with None.
+    ///
+    /// The point is to refuse work while refusing is still possible. Streaming
+    /// a 258 MB image into a tab that cannot hold it fails somewhere in the
+    /// middle, with the allocation that happens to be unlucky; checked here,
+    /// it fails before the first byte with a number the host can report.
+    pub fn set_memory_budget(&mut self, bytes: Option<usize>) {
+        self.memory_budget = bytes;
+    }
+
+    /// The budget, and what is left of it. None when no budget is set.
+    pub fn memory_headroom(&mut self) -> Option<usize> {
+        self.memory_budget
+            .map(|budget| budget.saturating_sub(self.footprint().total_bytes))
+    }
+
+    /// Rejects an addition that would not fit, naming what it would cost and
+    /// what is left.
+    fn check_budget(&mut self, adding: usize) -> Result<(), String> {
+        let Some(budget) = self.memory_budget else {
+            return Ok(());
+        };
+        let footprint = self.footprint();
+        if footprint.total_bytes + adding <= budget {
+            return Ok(());
+        }
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        Err(format!(
+            "over the memory budget: {:.1} MiB more against {:.1} MiB free \
+             (guest {:.1}, code {:.1}, files {:.1}, budget {:.1} MiB)",
+            mib(adding),
+            mib(budget.saturating_sub(footprint.total_bytes)),
+            mib(footprint.guest_bytes),
+            mib(footprint.code_bytes),
+            mib(footprint.files_bytes),
+            mib(budget),
+        ))
     }
 
     /// Raises or lowers the guest's physical-memory cap, in mebibytes. The

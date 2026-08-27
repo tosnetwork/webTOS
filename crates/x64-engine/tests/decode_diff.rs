@@ -89,14 +89,20 @@ int main(void) { long a[8] = {1,2,3,4,5,6,7,8}; return (int)work(a, 8); }
                 Ok(d) if d.len == instr.len() => {}
                 other => {
                     if !is_vector_prefix(window) {
-                        non_avx_gaps.push((window[..instr.len().min(window.len())].to_vec(), format!("{other:?}")));
+                        non_avx_gaps.push((
+                            window[..instr.len().min(window.len())].to_vec(),
+                            format!("{other:?}"),
+                        ));
                     }
                 }
             }
         }
     }
 
-    assert!(compared > 100, "fixture produced too few instructions ({compared})");
+    assert!(
+        compared > 100,
+        "fixture produced too few instructions ({compared})"
+    );
     assert!(
         non_avx_gaps.is_empty(),
         "non-AVX decode gaps found ({} of {compared} instrs): {:02x?}",

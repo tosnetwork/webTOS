@@ -101,7 +101,14 @@ fn scan_section(cpu: &icicle_cpu::Cpu, bytes: &[u8], base: u64, stats: &mut Stat
             }
             Ok(decoded) => {
                 stats.len_mismatch += 1;
-                record_gap(stats, &instr, window, iced_len, Some(decoded.len), decoded.disasm);
+                record_gap(
+                    stats,
+                    &instr,
+                    window,
+                    iced_len,
+                    Some(decoded.len),
+                    decoded.disasm,
+                );
             }
             Err(e) => {
                 stats.sleigh_rejected += 1;

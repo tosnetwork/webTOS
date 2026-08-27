@@ -39,13 +39,13 @@ terminal behavior, and recovery after a browser reload.
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~94% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it. Multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~91% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, so a signal now ends one rather than restarting it; that path is gated through a terminal read, not a socket. Recording, reconnect, soak pending |
-| M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the full 60-minute run is the outstanding gate |
+| M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~79% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | 🔶 | ~30% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute |
+| M8 Performance & release | 🔶 | ~36% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 80%**. The weights are a judgement
+Weighted by engineering effort, **roughly 81%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -56,19 +56,19 @@ call, so here is the arithmetic rather than the assertion:
 | M3 Dynamic userland | 10% | 90% | 9.0 |
 | M4 Threads & processes | 13% | 94% | 12.2 |
 | M5 Event loop & networking | 13% | 91% | 11.8 |
-| M6 OpenFox | 12% | 92% | 11.0 |
+| M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 79% | 15.8 |
-| M8 Performance & release | 14% | 30% | 4.2 |
-| **Total** | **100%** | | **80.1** |
+| M8 Performance & release | 14% | 36% | 5.0 |
+| **Total** | **100%** | | **81.4** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
-which together account for about 14 of the 20 points outstanding. Progress from
+which together account for about 13 of the 19 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (72 cases, plus soak, measurement, and
+The native test suites (73 cases, plus soak, measurement, and
 trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
-33-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+35-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -109,8 +109,8 @@ what is left is the agent itself.
 - **SIGTTIN/SIGTTOU from the tty layer.** A background process group that
   reads or writes the terminal should be signalled by the terminal; only the
   `kill` path can raise these today.
-- **The long soaks**: 60 minutes for OpenFox, multi-hour for an agent, both
-  with bounded memory, storage, and event-log growth. The soak asserts four
+- **The long soaks**: OpenFox's hour is done; a multi-hour agent soak is not,
+  and neither is bounded event-log growth. The soak asserts four
   invariants rather than one; the block-table invariant is a structural
   ceiling, because tiered lifting leaves a retired block group behind on
   promotion and a long run reaches the ceiling rather than converging short
@@ -134,8 +134,12 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
 - **Split the interpreter's cold half** (float and 80-bit paths). A risk
   rather than a defect: no engine has been shown to decline the 61.8 KiB
   function, and the fix is mechanical if one ever does.
-- **Quotas** over memory, CPU, storage, network, and the event log, budgeting
-  guest pages, image bytes, and the block cache against one 4 GiB space.
+- **Quotas.** Memory is done: the footprint is accounted by what it is spent
+  on — guest pages, lifted code (including the guest bytes the reuse index
+  keeps), and guest files — and a budget refuses an image at the request
+  rather than part-way through the delivery, naming what it would cost and
+  what is free. Gated in all three engines. CPU, storage, network, and the
+  event log have no quota.
 - **Fuzzing** of decoding, memory translation, ELF loading, syscalls, image
   parsing, snapshot restore, and host messages.
 - **Signed manifests, reproducible images, dependency licenses**, and a
@@ -585,15 +589,16 @@ Exit gate:
   test repository. ✅
 - Configuration and repository changes survive reload and explicit resume. ✅ (filesystem snapshot restored into a fresh machine)
 - A 60-minute interactive soak test completes without kernel corruption or
-  unbounded memory growth. 🔶 (soak green over filesystem, guest physical
-  memory, and the lifted-block table; caught a cross-process physical-memory
-  leak, and then caught tiered lifting retaining one stale block group per
-  promoted address. An 80-round reading called that growth converging; the
-  full 1,000-round hour showed it climbing to 76,057 blocks and disproved it.
-  Counting the engine's structures separately gave the real bound — one
-  retired group per counted address, saturating at roughly twice the starting
-  table — and that ceiling is now the invariant, checked every round. See
-  `docs/performance.md`. `OPENFOX_SOAK_ROUNDS=1000` is the hour)
+  unbounded memory growth. ✅ (1,000 rounds in 3,673 s on x86-64 Linux, green
+  over the filesystem, guest physical memory, and the lifted-block table. It
+  caught a cross-process physical-memory leak, and then caught tiered lifting
+  retaining one stale block group per promoted address. An 80-round reading
+  called that growth converging; the full hour showed it climbing to 76,057
+  blocks and disproved it. Counting the engine's structures separately gave
+  the real bound — one retired group per counted address, saturating at
+  roughly twice the starting table — and that ceiling is the invariant now,
+  checked every round rather than inferred from the shape of a curve. See
+  `docs/performance.md`; `OPENFOX_SOAK_ROUNDS=1000` reruns it)
 
 ## Milestone 7: Codex and Claude Code 🔶
 

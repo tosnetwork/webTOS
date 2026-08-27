@@ -50,7 +50,10 @@ pub struct Decoded {
 /// are consulted) using the SLEIGH tables of `cpu`'s architecture. Returns
 /// the decoded length and disassembly, or a decode error.
 pub fn decode_one(cpu: &Cpu, bytes: &[u8]) -> Result<Decoded, DecodeError> {
-    let mut window = ByteWindow { arch: &cpu.arch, bytes: [0; 16] };
+    let mut window = ByteWindow {
+        arch: &cpu.arch,
+        bytes: [0; 16],
+    };
     let n = bytes.len().min(16);
     window.bytes[..n].copy_from_slice(&bytes[..n]);
 
@@ -65,5 +68,8 @@ pub fn decode_one(cpu: &Cpu, bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let inst = lifter.decode(&mut window, 0)?;
     let len = inst.num_bytes() as usize;
     lifter.disasm_current(&window);
-    Ok(Decoded { len, disasm: lifter.disasm.clone() })
+    Ok(Decoded {
+        len,
+        disasm: lifter.disasm.clone(),
+    })
 }

@@ -290,6 +290,9 @@ being paid at load. Reclaiming the retired groups would need index reuse in the
 arena, and stale `Target::Internal` references make that a larger change than
 the memory it returns is worth today.
 
+The ceiling held for the full hour: 1,000 rounds in 3,673 s on x86-64 Linux,
+checked every round rather than inferred at the end.
+
 ## What this says about milestone 8
 
 In priority order, on the evidence above:

@@ -645,3 +645,63 @@ fn a_scoped_secret_stays_out_of_another_agents_configuration() {
         "a secret reached the snapshot"
     );
 }
+
+/// One wasm linear memory holds the guest's pages, the agent image, and the
+/// code the engine has lifted, and a browser tab's ceiling is about 3.9 GiB.
+/// A host that cannot fit a workload should learn that before it streams
+/// hundreds of megabytes into a tab that will die half way through.
+#[test]
+fn a_workload_that_will_not_fit_is_refused_before_it_arrives() {
+    let Some(image) = openfox() else { return };
+    let size = image.len();
+    let mut machine = machine_with_openfox(image.clone());
+
+    // Accounting is split by what the memory is spent on, and the image is
+    // in there.
+    let before = machine.footprint();
+    assert!(
+        before.files_bytes >= size,
+        "the {size}-byte image is not in the filesystem total ({})",
+        before.files_bytes
+    );
+    assert_eq!(
+        before.total_bytes,
+        before.guest_bytes + before.code_bytes + before.files_bytes
+    );
+
+    // Running lifts code, and the code shows up as its own line rather than
+    // being invisible until the tab dies.
+    let run = run_openfox(&mut machine, &["version"]);
+    expect_clean(&run);
+    let after = machine.footprint();
+    assert!(
+        after.code_bytes > before.code_bytes,
+        "lifted code is not being counted: {} then {}",
+        before.code_bytes,
+        after.code_bytes
+    );
+
+    // A budget with no room refuses the next image, and says what it would
+    // have cost. Nothing is added.
+    machine.set_memory_budget(Some(after.total_bytes + (1 << 20)));
+    let refused = machine
+        .create_file(b"/bin/second", size, 0o755)
+        .expect_err("a second image should not fit");
+    assert!(
+        refused.contains("over the memory budget"),
+        "unhelpful refusal: {refused}"
+    );
+    assert_eq!(
+        machine.footprint().files_bytes,
+        after.files_bytes,
+        "a refused image still changed the filesystem"
+    );
+
+    // Headroom is reported, and lifting it lets the same call through.
+    assert!(machine.memory_headroom().is_some_and(|left| left < size));
+    machine.set_memory_budget(None);
+    assert!(machine.memory_headroom().is_none());
+    machine
+        .create_file(b"/bin/second", size, 0o755)
+        .expect("no budget, no refusal");
+}

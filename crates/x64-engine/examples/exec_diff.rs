@@ -32,7 +32,13 @@ impl Runner {
         let vm = build_x64_vm(ldef, &EngineConfig::default()).expect("build engine");
         let reg_ids = GPRS
             .iter()
-            .filter_map(|name| vm.cpu.arch.sleigh.get_varnode(name).map(|v| (name.to_string(), v)))
+            .filter_map(|name| {
+                vm.cpu
+                    .arch
+                    .sleigh
+                    .get_varnode(name)
+                    .map(|v| (name.to_string(), v))
+            })
             .collect();
         Self { vm, reg_ids }
     }
@@ -54,14 +60,22 @@ impl Runner {
         self.vm.cpu.mem.map_memory_len(
             0,
             0x1000,
-            Mapping { perm: perm::NONE, value: 0 },
+            Mapping {
+                perm: perm::NONE,
+                value: 0,
+            },
         );
-        let meta = Bytes(elf).load_elf(&mut self.vm.cpu, b"guest").expect("load elf");
+        let meta = Bytes(elf)
+            .load_elf(&mut self.vm.cpu, b"guest")
+            .expect("load elf");
         // A stack so pushes during startup do not fault.
         self.vm.cpu.mem.map_memory_len(
             0x7fff_0000_0000,
             0x10_0000,
-            Mapping { perm: perm::READ | perm::WRITE | perm::INIT, value: 0 },
+            Mapping {
+                perm: perm::READ | perm::WRITE | perm::INIT,
+                value: 0,
+            },
         );
         let sp = self.vm.cpu.arch.reg_sp;
         self.vm.cpu.write_var(sp, 0x7fff_0010_0000_u64 & !0xf);
@@ -78,7 +92,10 @@ impl Runner {
     }
 
     fn state(&mut self) -> Vec<(String, u64)> {
-        self.reg_ids.iter().map(|(n, v)| (n.clone(), self.vm.cpu.read_reg(*v))).collect()
+        self.reg_ids
+            .iter()
+            .map(|(n, v)| (n.clone(), self.vm.cpu.read_reg(*v)))
+            .collect()
     }
 }
 
@@ -88,7 +105,10 @@ fn main() {
         eprintln!("usage: exec_diff REF_LDEF CAND_LDEF ELF [MAX_STEPS]");
         std::process::exit(2);
     }
-    let max_steps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
+    let max_steps: u64 = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000_000);
 
     let elf = std::fs::read(&args[2]).expect("read elf");
     let mut reference = Runner::new(&PathBuf::from(&args[0]));
@@ -101,7 +121,13 @@ fn main() {
         let pc_before = reference.pc();
         // Both engines must be at the same PC before stepping.
         if reference.pc() != candidate.pc() {
-            report_divergence(step, prev_pc, &mut reference, &mut candidate, "PC before step");
+            report_divergence(
+                step,
+                prev_pc,
+                &mut reference,
+                &mut candidate,
+                "PC before step",
+            );
             return;
         }
         let r_exit = reference.step();
@@ -122,20 +148,31 @@ fn main() {
             println!("instruction PC: {pc_before:#x}");
             println!("ref exit: {r_exit:?}   cand exit: {c_exit:?}");
             if pc_diff {
-                println!("PC after: ref {:#x}  cand {:#x}", reference.pc(), candidate.pc());
+                println!(
+                    "PC after: ref {:#x}  cand {:#x}",
+                    reference.pc(),
+                    candidate.pc()
+                );
             }
             for (name, a, b) in &diffs {
                 println!("  {name}: ref {a:#x}  cand {b:#x}");
             }
             // Show the instruction bytes at the divergence site.
             let mut bytes = [0_u8; 16];
-            let _ = reference.vm.cpu.mem.read_bytes(pc_before, &mut bytes, icicle_mem::perm::NONE);
+            let _ = reference
+                .vm
+                .cpu
+                .mem
+                .read_bytes(pc_before, &mut bytes, icicle_mem::perm::NONE);
             let hex: String = bytes.iter().map(|b| format!("{b:02x} ")).collect();
             println!("bytes: {hex}");
             return;
         }
 
-        if matches!(r_exit, x64_engine::VmExit::Halt | x64_engine::VmExit::UnhandledException(_)) {
+        if matches!(
+            r_exit,
+            x64_engine::VmExit::Halt | x64_engine::VmExit::UnhandledException(_)
+        ) {
             println!("both engines exited identically at step {step}: {r_exit:?}");
             return;
         }

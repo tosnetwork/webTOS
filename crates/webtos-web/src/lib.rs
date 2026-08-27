@@ -664,6 +664,57 @@ fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
 
 /// Serializes the guest filesystem for persistence; read the image via
 /// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
+/// One part of the machine's footprint, in kibibytes: 0 guest pages, 1
+/// lifted code, 2 guest files, 3 the total. Kibibytes rather than bytes
+/// because the total passes 4 GiB before a `u32` would.
+#[no_mangle]
+pub extern "C" fn wtw_footprint_kib(part: u32) -> u32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return 0;
+        };
+        let f = machine.footprint();
+        let bytes = match part {
+            0 => f.guest_bytes,
+            1 => f.code_bytes,
+            2 => f.files_bytes,
+            _ => f.total_bytes,
+        };
+        (bytes / 1024) as u32
+    })
+}
+
+/// Caps the total footprint, in kibibytes; 0 removes the cap. A host that
+/// knows its tab's ceiling sets this, and an image that would not fit is
+/// then refused at the request rather than part-way through the download.
+#[no_mangle]
+pub extern "C" fn wtw_set_memory_budget_kib(kib: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_memory_budget_kib called before wtw_init");
+        };
+        machine.set_memory_budget(match kib {
+            0 => None,
+            kib => Some(kib as usize * 1024),
+        });
+        0
+    })
+}
+
+/// Kibibytes left in the budget, or -1 when none is set.
+#[no_mangle]
+pub extern "C" fn wtw_memory_headroom_kib() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return -1;
+        };
+        match machine.memory_headroom() {
+            Some(left) => (left / 1024).min(i32::MAX as usize) as i32,
+            None => -1,
+        }
+    })
+}
+
 /// Registers a credential the guest receives by placeholder rather than by
 /// having it baked into an image. `${name}` is expanded in the files named by
 /// `wtw_secret_scope` — or in every file when none are named — at

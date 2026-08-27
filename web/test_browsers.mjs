@@ -334,6 +334,21 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     );
   }
 
+  // The footprint is reported by part, and the parts add up. A tab that
+  // cannot see where its memory went cannot refuse a workload before it dies.
+  const footprint = await page.evaluate(() => window.webtos.measure());
+  record(
+    "memory: the footprint is reported by what it is spent on",
+    footprint !== null &&
+      footprint.total === footprint.guest + footprint.code + footprint.files &&
+      footprint.files > 0 &&
+      footprint.code > 0 &&
+      footprint.guest > 0,
+    footprint
+      ? `guest ${(footprint.guest / (1 << 20)).toFixed(0)} MB, code ${(footprint.code / (1 << 20)).toFixed(0)} MB, files ${(footprint.files / (1 << 20)).toFixed(0)} MB`
+      : "no footprint reported",
+  );
+
   // Credentials: the guest gets the value where the host said it belongs,
   // and the placeholder everywhere else.
   //
@@ -540,6 +555,29 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     /^refused[1-9][0-9]*$/m.test(tail) && !tail.includes("net-probe-ok"),
     `gateway refused 127.0.0.1:${gateway.port}`,
   );
+
+  // A budget too small for the agent image. The tab should say so and stay
+  // up, rather than dying on whichever allocation happens to be unlucky part
+  // way through a 52 MB delivery.
+  if (images.agent) {
+    await page.goto(`${origin}/web/terminal.html?budget=32&image=openfox`);
+    const refusal = await page
+      .waitForFunction(
+        () => {
+          const status = document.getElementById("status")?.textContent ?? "";
+          return status.includes("memory budget") ? status : false;
+        },
+        undefined,
+        { timeout: EXEC_TIMEOUT },
+      )
+      .then((handle) => handle.jsonValue())
+      .catch(() => null);
+    record(
+      "memory: an image that will not fit the budget is refused, not fatal",
+      typeof refusal === "string" && refusal.includes("over the memory budget"),
+      refusal ? refusal.replace(/^error: /, "") : "no refusal reported",
+    );
+  }
 }
 
 // ------------------------------------------------------------- browser side

@@ -522,7 +522,11 @@ fn main() {
             reference: |a, b| unsafe {
                 let (a, b) = (load(a), load(b));
                 let _ = a;
-                store(_mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), _mm_castsi128_ps(a))))
+                store(_mm_castps_si128(_mm_blendv_ps(
+                    _mm_castsi128_ps(a),
+                    _mm_castsi128_ps(b),
+                    _mm_castsi128_ps(a),
+                )))
             },
         },
         Case {
@@ -532,7 +536,11 @@ fn main() {
             reference: |a, b| unsafe {
                 let (a, b) = (load(a), load(b));
                 let _ = a;
-                store(_mm_castpd_si128(_mm_blendv_pd(_mm_castsi128_pd(a), _mm_castsi128_pd(b), _mm_castsi128_pd(a))))
+                store(_mm_castpd_si128(_mm_blendv_pd(
+                    _mm_castsi128_pd(a),
+                    _mm_castsi128_pd(b),
+                    _mm_castsi128_pd(a),
+                )))
             },
         },
         Case {
@@ -792,7 +800,11 @@ fn main() {
             reference: |a, b| unsafe {
                 let (a, b) = (load(a), load(b));
                 let _ = a;
-                store(_mm_castps_si128(_mm_insert_ps(_mm_castsi128_ps(a), _mm_castsi128_ps(b), 0x9c)))
+                store(_mm_castps_si128(_mm_insert_ps(
+                    _mm_castsi128_ps(a),
+                    _mm_castsi128_ps(b),
+                    0x9c,
+                )))
             },
         },
         Case {

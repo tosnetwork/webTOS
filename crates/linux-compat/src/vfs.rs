@@ -485,6 +485,20 @@ impl Vfs {
     /// Applies literal substitutions to every regular file's contents.
     /// Used for secret injection (`${name}` -> value) and its inverse
     /// (redaction before serialization).
+    /// Bytes held in file contents and symlink targets. Directory entries and
+    /// node records are not counted: a filesystem's size is its data, and
+    /// that is the term an image moves.
+    pub fn bytes(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| match &node.kind {
+                NodeKind::File(data) => data.capacity(),
+                NodeKind::Symlink(target) => target.capacity(),
+                NodeKind::Dir(_) | NodeKind::CharDev(_) => 0,
+            })
+            .sum()
+    }
+
     /// A file's contents, or None when the path is not a file.
     pub fn read_file(&self, path: &[u8]) -> Option<&[u8]> {
         let node = self.resolve(ROOT, path, true).ok()?.node?;

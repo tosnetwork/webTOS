@@ -207,6 +207,31 @@ impl InterpVm {
         self.prev_isa_mode = u8::MAX;
     }
 
+    /// Bytes the engine holds in lifted code: the p-code instruction vectors
+    /// and the block records, plus the guest bytes the content-addressed
+    /// index keeps so it can prove a candidate still matches memory.
+    ///
+    /// Allocator overhead and the hash maps' own tables are not counted, so
+    /// this is a floor. It covers the terms that grow with the workload,
+    /// which is what a budget needs.
+    pub fn lifted_bytes(&self) -> usize {
+        let per_block = std::mem::size_of::<lifter::Block>();
+        let per_inst = std::mem::size_of::<pcode::Instruction>();
+        let code: usize = self
+            .code
+            .blocks
+            .iter()
+            .map(|block| per_block + block.pcode.instructions.capacity() * per_inst)
+            .sum();
+        let sources: usize = self
+            .lifted
+            .values()
+            .flat_map(|candidates| candidates.iter())
+            .map(|candidate| candidate.source.capacity())
+            .sum();
+        code + sources
+    }
+
     /// Counts for the structures tiered lifting grows: blocks in the arena,
     /// addresses in the content-addressed index, addresses promoted, and
     /// addresses being counted toward promotion. A soak asserts on these, and
