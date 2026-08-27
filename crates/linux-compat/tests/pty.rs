@@ -824,3 +824,86 @@ fn a_background_reader_is_stopped_instead_of_stealing_keystrokes() {
         "the shell stopped responding after the background reader: {echoed:?}"
     );
 }
+
+/// `tcsetattr(TCSAFLUSH)` is how a program changes terminal mode without
+/// letting keystrokes typed under the old mode be read back under the new
+/// one. Returning ENOTTY for it stops any program that switches modes —
+/// which is every program that runs a command on a terminal of its own.
+#[test]
+fn changing_terminal_mode_discards_what_was_typed_under_the_old_one() {
+    let Some(image) = compile_c(
+        "tcsaflush",
+        r#"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+
+int main(void) {
+    int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    int unlock = 0, n = 0;
+    ioctl(master, TIOCSPTLCK, &unlock);
+    ioctl(master, TIOCGPTN, &n);
+    char path[64];
+    snprintf(path, sizeof path, "/dev/pts/%d", n);
+    int slave = open(path, O_RDWR | O_NOCTTY);
+
+    struct termios t;
+    tcgetattr(slave, &t);
+    t.c_lflag &= ~(ICANON | ECHO);
+
+    /* Type ahead, then switch modes. The typed bytes must not survive. */
+    write(master, "stale", 5);
+    errno = 0;
+    if (tcsetattr(slave, TCSAFLUSH, &t) < 0) {
+        printf("TCSAFLUSH refused: %s\n", strerror(errno));
+        return 1;
+    }
+
+    /* Fresh input under the new settings is what the program should see. */
+    write(master, "fresh", 5);
+    char buf[32];
+    ssize_t got = read(slave, buf, sizeof buf);
+    if (got < 0) { printf("read failed: %s\n", strerror(errno)); return 1; }
+    buf[got] = 0;
+    printf("read [%s]\n", buf);
+
+    /* TCIOFLUSH must drop both directions. */
+    write(master, "dropme", 6);
+    errno = 0;
+    if (tcflush(slave, TCIOFLUSH) < 0) {
+        printf("tcflush refused: %s\n", strerror(errno));
+        return 1;
+    }
+    write(master, "kept", 4);
+    got = read(slave, buf, sizeof buf);
+    if (got < 0) { printf("second read failed: %s\n", strerror(errno)); return 1; }
+    buf[got] = 0;
+    printf("after flush [%s]\n", buf);
+    return 0;
+}
+"#,
+        &["-std=gnu17", "-D_GNU_SOURCE"],
+    ) else {
+        return;
+    };
+
+    let (exit, output) = run(image);
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "fixture did not exit cleanly: {output}"
+    );
+    assert!(
+        output.contains("read [fresh]"),
+        "type-ahead survived a mode change: {output}"
+    );
+    assert!(
+        output.contains("after flush [kept]"),
+        "tcflush did not discard queued input: {output}"
+    );
+}

@@ -1559,6 +1559,25 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
 }
 
+/// Drop queued bytes on one or both directions of a pty.
+///
+/// Which queue is "input" depends on the side asking: the slave reads what
+/// the master wrote, and the master reads what the slave wrote.
+fn flush_pty(pty: &mut crate::fd::Pty, is_master: bool, input: bool, output: bool) {
+    let (incoming, outgoing) = if is_master {
+        (&mut pty.s2m, &mut pty.m2s)
+    } else {
+        (&mut pty.m2s, &mut pty.s2m)
+    };
+    if input {
+        incoming.clear();
+    }
+    if output {
+        outgoing.clear();
+    }
+    pty.activity += 1;
+}
+
 fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64) -> SysResult {
     // General fd ioctls, valid on any descriptor. These must be handled
     // before the tty gate: FIONBIO in particular is how a runtime sets a
@@ -1604,10 +1623,11 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
 
     // Pseudoterminal ioctls carry per-pty termios and window size.
     let pty = match &env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
-        Backing::PtyMaster(pty) | Backing::PtySlave(pty) => Some(std::rc::Rc::clone(pty)),
+        Backing::PtyMaster(pty) => Some((std::rc::Rc::clone(pty), true)),
+        Backing::PtySlave(pty) => Some((std::rc::Rc::clone(pty), false)),
         _ => None,
     };
-    if let Some(pty) = pty {
+    if let Some((pty, is_master)) = pty {
         match request {
             abi::TIOCGPTN => {
                 let id = pty.borrow().id as u32;
@@ -1620,9 +1640,28 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
                 write_mem(cpu, arg, &termios)?;
                 return Ok(0);
             }
-            abi::TCSETS | abi::TCSETSW => {
+            abi::TCSETS | abi::TCSETSW | abi::TCSETSF => {
                 let bytes = read_mem(cpu, arg, 36)?;
-                pty.borrow_mut().termios.copy_from_slice(&bytes);
+                let mut pty = pty.borrow_mut();
+                pty.termios.copy_from_slice(&bytes);
+                // TCSETSF (tcsetattr's TCSAFLUSH) discards input the caller
+                // has not read before the new settings take effect, so that
+                // keystrokes typed under the old mode are not reinterpreted
+                // under the new one.
+                if request == abi::TCSETSF {
+                    flush_pty(&mut pty, is_master, true, false);
+                }
+                return Ok(0);
+            }
+            abi::TCFLSH => {
+                // TCIFLUSH = 0, TCOFLUSH = 1, TCIOFLUSH = 2.
+                let (input, output) = match arg {
+                    0 => (true, false),
+                    1 => (false, true),
+                    2 => (true, true),
+                    _ => return Err(abi::EINVAL),
+                };
+                flush_pty(&mut pty.borrow_mut(), is_master, input, output);
                 return Ok(0);
             }
             abi::TIOCGWINSZ => {
@@ -1698,6 +1737,8 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         }
         abi::TCSETS
         | abi::TCSETSW
+        | abi::TCSETSF
+        | abi::TCFLSH
         | abi::TIOCSWINSZ
         | abi::TIOCSPGRP
         | abi::TIOCSCTTY
