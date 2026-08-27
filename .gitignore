@@ -19,3 +19,6 @@ base_image.runtime.manifest
 /node_modules/
 /package-lock.json
 /web/vendor/
+
+# Agent worktrees (git worktrees, not content)
+/.claude/

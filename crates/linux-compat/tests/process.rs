@@ -869,3 +869,134 @@ int main(void) {
         "SIGCHLD raised while blocked was discarded rather than held pending; output: {output:?}"
     );
 }
+
+/// A signal one process sends another has to be resolved against the
+/// *target's* disposition. The rule used to read the sender's: a process that
+/// handled a signal itself could not `kill` anything with it, because its own
+/// handler made the signal look already dealt with — and where the sender had
+/// no handler, the target was zombied outright rather than running the one it
+/// did have. Dispositions are inherited across `fork`, so a parent that
+/// installs a handler and then signals its child exercises both halves.
+#[test]
+fn a_signal_sent_to_another_process_runs_that_process_handler() {
+    let source = r#"
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t got = 0;
+static void on_usr1(int s) { (void)s; got = 1; }
+
+int main(void) {
+    // Installed before the fork, so the sender has a handler too — which is
+    // exactly what used to make the signal disappear.
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_usr1;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    int ready[2], done[2];
+    if (pipe(ready) || pipe(done)) return 1;
+
+    pid_t pid = fork();
+    if (pid < 0) return 2;
+    if (pid == 0) {
+        close(ready[0]);
+        close(done[1]);
+        // Tell the parent the handler is in place, then block until it fires.
+        write(ready[1], "r", 1);
+        char c;
+        read(done[0], &c, 1);
+        _exit(got ? 42 : 43);
+    }
+
+    close(ready[1]);
+    close(done[0]);
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 3;
+
+    if (kill(pid, SIGUSR1) != 0) return 4;
+    // Release the child only after the signal has been sent, so a child that
+    // exits without ever seeing it reports 43 rather than racing to 42.
+    write(done[1], "d", 1);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return 5;
+    printf("child saw the signal: %d\n", WEXITSTATUS(status) == 42);
+    fflush(stdout);
+    return WEXITSTATUS(status) == 42 ? 0 : 6;
+}
+"#;
+    let Some(image) = compile_c("kill_handler", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "kill_handler");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("child saw the signal: 1"),
+        "the child's own handler did not run: {:?}",
+        run.output
+    );
+}
+
+/// A regression guard, not evidence of the fix above: a target with no
+/// handler used to be removed by the sender and now takes its own default
+/// action at its next kernel entry, and this pins that the observable
+/// outcome did not change — the child dies and the parent sees a signal
+/// death. It passes with the old path too, which is why it is labelled this
+/// way; the old status word was `128 + signal`, and its low seven bits are
+/// the signal either way, so `WIFSIGNALED` and `WTERMSIG` never told them
+/// apart.
+#[test]
+fn a_signal_with_no_handler_terminates_the_target_as_a_signal_death() {
+    let source = r#"
+#include <signal.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    int ready[2], hold[2];
+    if (pipe(ready) || pipe(hold)) return 1;
+    pid_t pid = fork();
+    if (pid < 0) return 2;
+    if (pid == 0) {
+        close(ready[0]);
+        close(hold[1]);
+        write(ready[1], "r", 1);
+        /* Blocks until signalled. No SIGTERM handler, so the default action
+           applies and this read never returns. */
+        char c;
+        read(hold[0], &c, 1);
+        _exit(7);
+    }
+    close(ready[1]);
+    close(hold[0]);
+    char c;
+    if (read(ready[0], &c, 1) != 1) return 3;
+
+    if (kill(pid, SIGTERM) != 0) return 4;
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return 5;
+    printf("signalled=%d sig=%d exited=%d\n",
+           WIFSIGNALED(status) ? 1 : 0,
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1,
+           WIFEXITED(status) ? 1 : 0);
+    fflush(stdout);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("kill_default", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "kill_default");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("signalled=1 sig=15 exited=0"),
+        "a signal death was not reported as one: {:?}",
+        run.output
+    );
+}

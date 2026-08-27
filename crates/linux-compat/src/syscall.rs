@@ -2579,6 +2579,10 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// disposition table is process-wide, so any such thread can run the handler.
 /// Does nothing when the parent installed no SIGCHLD handler (the default
 /// disposition for SIGCHLD is to ignore it) or when every thread blocks it.
+/// The two signals a process cannot catch, block, or ignore.
+const SIGKILL: u64 = 9;
+const SIGSTOP: u64 = 19;
+
 /// Terminal-generated job-control signals: a background process group that
 /// reads the terminal, and one that writes it while `TOSTOP` is set.
 const SIGTTIN: u64 = 21;
@@ -2613,31 +2617,88 @@ pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64)
         return;
     }
     let bit = 1_u64 << (signal - 1);
-    let acts_by_default = default_action_terminates(signal) || default_action_stops(signal);
-    // A disposition of SIG_IGN discards the signal outright; SIG_DFL (or no
-    // entry at all) means the default action, which is worth queueing only
-    // when that action is not "ignore".
-    let acts_on_it =
-        |acts: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, SigAction>>>| {
-            match acts.borrow().get(&signal) {
-                Some(a) => match u64::from_le_bytes(a.0[..8].try_into().expect("size")) {
-                    SIG_DFL => acts_by_default,
-                    SIG_IGN => false,
-                    _ => true,
-                },
-                None => acts_by_default,
-            }
-        };
     // The mask is not consulted: a signal raised while blocked stays pending
     // until it is unblocked. Only delivery looks at the mask.
-    if env.proc.pgid == pgrp && acts_on_it(&env.proc.sigactions) {
+    if env.proc.pgid == pgrp && acts_on_signal(&env.proc.sigactions, signal) {
         env.proc.pending_signals |= bit;
     }
     for t in &mut env.sched.parked {
-        if t.proc.pgid == pgrp && acts_on_it(&t.proc.sigactions) {
+        if t.proc.pgid == pgrp && acts_on_signal(&t.proc.sigactions, signal) {
             t.proc.pending_signals |= bit;
         }
     }
+}
+
+/// Whether a process with these dispositions would do anything with `signal`.
+///
+/// This has to be read from the *target's* table. Reading the sender's is the
+/// bug this replaced: a shell that handles SIGINT could not `kill` anything
+/// with it, because its own handler made the signal look "already dealt
+/// with". Nothing about the sender decides what a signal means to a process.
+fn acts_on_signal(
+    acts: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, SigAction>>>,
+    signal: u64,
+) -> bool {
+    // SIGKILL and SIGSTOP cannot be caught or ignored.
+    if matches!(signal, SIGKILL | SIGSTOP) {
+        return true;
+    }
+    let acts_by_default = default_action_terminates(signal) || default_action_stops(signal);
+    // SIG_IGN discards the signal outright; SIG_DFL (or no entry at all)
+    // means the default action, which is worth queueing only when that action
+    // is not "ignore".
+    match acts.borrow().get(&signal) {
+        Some(a) => match u64::from_le_bytes(a.0[..8].try_into().expect("size")) {
+            SIG_DFL => acts_by_default,
+            SIG_IGN => false,
+            _ => true,
+        },
+        None => acts_by_default,
+    }
+}
+
+/// Marks `signal` pending on a thread of `tgid`, so the target runs its own
+/// handler — or its own default action — when it is next scheduled. Returns
+/// whether such a process exists.
+///
+/// A thread that does not block the signal is preferred, and the group leader
+/// among those, because that is the one a debugger or a person watching
+/// `wait4` expects to see act.
+fn signal_process(env: &mut LinuxEnv, tgid: u64, signal: u64) -> bool {
+    let bit = 1_u64 << (signal - 1);
+    if env.proc.tgid == tgid {
+        if acts_on_signal(&env.proc.sigactions, signal) {
+            env.proc.pending_signals |= bit;
+        }
+        return true;
+    }
+    let mut unblocked: Option<usize> = None;
+    let mut fallback: Option<usize> = None;
+    let mut exists = false;
+    for (i, t) in env.sched.parked.iter().enumerate() {
+        if t.proc.tgid != tgid {
+            continue;
+        }
+        exists = true;
+        if !acts_on_signal(&t.proc.sigactions, signal) {
+            continue;
+        }
+        let blocked = t.proc.sigmask & bit != 0;
+        let leader = t.proc.pid == tgid;
+        if !blocked && (leader || unblocked.is_none()) {
+            unblocked = Some(i);
+            if leader {
+                break;
+            }
+        }
+        if blocked && (leader || fallback.is_none()) {
+            fallback = Some(i);
+        }
+    }
+    if let Some(i) = unblocked.or(fallback) {
+        env.sched.parked[i].proc.pending_signals |= bit;
+    }
+    exists
 }
 
 /// What the lowest pending, unblocked signal calls for at a kernel-exit
@@ -3642,28 +3703,6 @@ fn sys_yield(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
     block_and_switch(env, cpu, ParkState::Ready, false)
 }
 
-/// True when `signal` must not terminate: its default action is to ignore
-/// it, or the process registered a handler (delivery is not modeled, so a
-/// handled signal degrades to a drop — Go uses SIGURG this way for
-/// best-effort preemption).
-fn signal_is_nonfatal(env: &LinuxEnv, signal: u64) -> bool {
-    const SIGCHLD: u64 = 17;
-    const SIGCONT: u64 = 18;
-    const SIGURG: u64 = 23;
-    const SIGWINCH: u64 = 28;
-    if matches!(signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH) {
-        return true;
-    }
-    // A registered non-default handler exists (SIG_DFL = 0 in slot 0).
-    env.proc
-        .sigactions
-        .borrow()
-        .get(&signal)
-        .is_some_and(|action| u64::from_le_bytes(action.0[..8].try_into().expect("size")) > 1)
-}
-
-/// `kill`/`tgkill`. Fatal signals terminate (handler delivery is not
-/// modeled); ignorable or handled signals are dropped with a log line.
 /// Sets the pgid of every thread in `tgid` (the current task included).
 /// Returns false when no such process exists.
 fn set_group_pgid(env: &mut LinuxEnv, tgid: u64, pgid: u64) -> bool {
@@ -3705,6 +3744,12 @@ fn sys_setpgid(env: &mut LinuxEnv, pid: u64, pgid: u64) -> SysResult {
     }
 }
 
+/// `kill`, `tkill`, and `tgkill`.
+///
+/// Every signal but SIGKILL is resolved against the *target's* disposition:
+/// the target runs its own handler, or takes its own default action, when it
+/// is next scheduled. SIGKILL cannot be caught, blocked, or ignored, so it is
+/// the one signal carried out here on the sender's behalf.
 fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outcome {
     let target = target as u32 as i32 as i64;
     if signal == 0 {
@@ -3812,10 +3857,7 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
         }
         return Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) });
     }
-    if signal_is_nonfatal(env, signal) {
-        tracing::debug!("dropping non-fatal signal {signal} to {target} (no handler delivery)");
-        return Outcome::Ret(Ok(0));
-    }
+
     // Group target: `-pgid` (or 0 = the caller's own group) fans out to
     // every member process. `-1` (all processes) is not modeled.
     let victims: Vec<u64> = if target == -1 {
@@ -3838,9 +3880,8 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
         if tgids.is_empty() && env.proc.pgid != pgid {
             return Outcome::Ret(Err(abi::ESRCH));
         }
-        // The caller's own group membership is intentionally not fatal to
-        // the caller here; a self-directed group signal would need handler
-        // delivery, which `signal_is_nonfatal` above already routed.
+        // The caller's own group is included: its disposition decides what
+        // the signal means to it, the same as for any other member.
         tgids
     } else {
         vec![target as u64]
@@ -3848,6 +3889,18 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
 
     let mut found = false;
     for target in victims {
+        // Every signal but SIGKILL is resolved against the target's own
+        // disposition: it runs its handler, or takes its default action, when
+        // it is next scheduled. Removing the task here instead would mean a
+        // process could never handle a signal another process sent it, which
+        // is what used to happen.
+        if signal != SIGKILL {
+            found |= signal_process(env, target, signal);
+            continue;
+        }
+
+        // SIGKILL cannot be caught, blocked, or ignored, so it is the one
+        // signal the kernel carries out on the sender's behalf.
         let mut hit = false;
         let mut index = 0;
         while index < env.sched.parked.len() {
@@ -3864,7 +3917,7 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
                     env.sched.zombies.push(Zombie {
                         pid: task.proc.tgid,
                         ppid: task.proc.ppid,
-                        status: 128 + signal as i32,
+                        status: signal as i32,
                     });
                     notify_parent_sigchld(env, task.proc.ppid);
                 }
