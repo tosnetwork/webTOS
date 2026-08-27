@@ -52,6 +52,96 @@ const hello = await readFile(new URL("../test_data/hello_linux.elf", import.meta
 addFile("/bin/hello", hello);
 expect("hello", runProcess("/bin/hello", ["hello"]), "Hello");
 
+// A guest image arrives over the network, so it can be damaged in transit or
+// at rest. Refusing it has to leave the machine standing: on wasm a Rust panic
+// is an abort, so an image that panics the loader does not fail to load, it
+// takes the module with it and the tab has no machine left. Every case here
+// is one the host tests cover too (crates/linux-compat/tests/elf.rs); what
+// only this side can show is that the module is still alive afterwards.
+{
+  const view = (bytes) => new DataView(bytes.buffer, bytes.byteOffset);
+  const PHDR_SIZE = 56;
+  const phoff = (bytes) => Number(view(bytes).getBigUint64(0x20, true));
+  const phnum = (bytes) => view(bytes).getUint16(0x38, true);
+  const typeOf = (bytes, i) => view(bytes).getUint32(phoff(bytes) + i * PHDR_SIZE, true);
+  const setType = (bytes, i, value) =>
+    view(bytes).setUint32(phoff(bytes) + i * PHDR_SIZE, value, true);
+  const setField = (bytes, i, field, value) =>
+    view(bytes).setBigUint64(phoff(bytes) + i * PHDR_SIZE + field, value, true);
+  const P_FILESZ = 32;
+  const P_MEMSZ = 40;
+  const P_ALIGN = 48;
+  const PT_LOAD = 1;
+  const loadable = [...Array(phnum(hello)).keys()].find((i) => typeOf(hello, i) === PT_LOAD);
+  // A length of 2^32 plus the real one is the probe for a 32-bit `usize`:
+  // narrowed, it reads as the real length and the image loads as though
+  // nothing were wrong. The host refuses this same image, and so must this.
+  const realFilesz = Number(
+    view(hello).getBigUint64(phoff(hello) + loadable * PHDR_SIZE + 32, true),
+  );
+
+  const refuse = (transform, what) => {
+    const damaged = transform(Uint8Array.from(hello));
+    addFile("/bin/damaged", damaged);
+    let code;
+    try {
+      code = e.wtw_load(...put("/bin/damaged"));
+    } catch (error) {
+      console.error(`[node] FAILED ${what} took the module down: ${error}`);
+      process.exit(1);
+    }
+    if (code === 0) {
+      console.error(`[node] FAILED ${what} was loaded`);
+      process.exit(1);
+    }
+    console.log(`[node] ok: ${what} refused -> ${err()}`);
+  };
+
+  refuse((bytes) => bytes.slice(0, 16), "an image cut off after 16 bytes");
+  refuse((bytes) => {
+    setField(bytes, loadable, P_ALIGN, 0x1001n);
+    return bytes;
+  }, "a segment alignment that is not a power of two");
+  refuse((bytes) => {
+    setField(bytes, loadable, P_MEMSZ, (1n << 64n) - 1n);
+    return bytes;
+  }, "a segment of 2^64 bytes");
+  refuse((bytes) => {
+    setField(bytes, loadable, P_FILESZ, (1n << 32n) + BigInt(realFilesz));
+    return bytes;
+  }, "a segment length of 2^32 plus its real one");
+  refuse((bytes) => {
+    for (let i = 0; i < phnum(bytes); i += 1) {
+      if (typeOf(bytes, i) === PT_LOAD) setType(bytes, i, 0);
+    }
+    return bytes;
+  }, "an image with no loadable segment");
+
+  // An alignment of zero means "no alignment" in ELF, so this image is meant
+  // to load. It is here because dividing by it is a Rust panic in a release
+  // build as much as a debug one, and on wasm that abort would end the module
+  // rather than the load.
+  const unaligned = Uint8Array.from(hello);
+  setField(unaligned, loadable, P_ALIGN, 0n);
+  addFile("/bin/unaligned", unaligned);
+  try {
+    if (e.wtw_load(...put("/bin/unaligned")) !== 0) {
+      console.error(`[node] FAILED an unaligned segment was refused: ${err()}`);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error(`[node] FAILED an alignment of zero took the module down: ${error}`);
+    process.exit(1);
+  }
+  console.log("[node] ok: an alignment of zero loaded as unaligned");
+
+  if (e.wtw_load(...put("/bin/hello")) !== 0) {
+    console.error(`[node] FAILED the machine did not survive a damaged image: ${err()}`);
+    process.exit(1);
+  }
+  console.log("[node] ok: the machine still loads a good image afterwards");
+}
+
 // Milestone 2: BusyBox applets over the persistent filesystem.
 let busybox;
 try {
