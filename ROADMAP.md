@@ -88,8 +88,14 @@ what is left is the agent itself.
   0.150.1` reports its version and exits 0 inside the wasm module a browser
   loads, in 0.8 s, from a 256 MB static binary delivered as one file, 531 MB
   resident. Node runs too, in 0.9 s. Delivery, memory, and speed are settled
-  problems. What remains for Codex is a session that does work rather than a
-  version string: credentials through the secret path, and the terminal.
+  problems, and so are credentials: Codex reports `Logged in using ChatGPT`
+  in 2.2 s with the real profile arriving as a scoped secret, the snapshot
+  afterwards holding the placeholder. **A working session still does not
+  complete.** `codex exec` with a small task runs past 1.95 billion
+  instructions in the module without output or a single network command, and
+  behaves no better natively with 3 GiB and a real broker — so it is not a
+  browser problem, and the native runner's diagnostics are the way at it. See
+  `docs/workloads/node.md`.
 - **The Claude Code profile.** **It runs**: `2.1.247 (Claude Code)`, exit 0,
   inside the wasm module a browser loads — 184 M instructions in 16.6 s. It is
   a 239 MB **Bun** binary, not a Node one, so "both agents are Node

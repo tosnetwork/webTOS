@@ -143,6 +143,35 @@ answer than an invented one. Bun also probes `/proc/self/cgroup`,
 `/proc/stat`, `/proc/sys/vm/*`, and `/sys/devices/system/cpu/online`, and
 carries on without them.
 
+## What a session still cannot do
+
+`--version` is not the product. Taking Codex further, on 2026-08-27:
+
+**Credentials work.** Codex reports `Logged in using ChatGPT` inside the wasm
+module in 2.2 s, with the real `auth.json` arriving as a scoped secret — the
+guest file holds only `${CODEX_AUTH}`, and the snapshot afterwards holds the
+placeholder, checked rather than assumed.
+
+**A working session does not complete.** `codex exec` with a small task —
+read a file, change a value, run a command, report — does not finish, and not
+only in the browser:
+
+- In the wasm module it runs steadily at ~13 M inst/s past 1.95 billion
+  instructions, footprint flat at 567 MB, producing no output and issuing no
+  network commands at all.
+- Natively with the same arguments, memory raised to 3 GiB and a real broker
+  attached, it produces no output in 400 s either.
+- Natively with a bare prompt and no mounts it *does* progress: it spawns
+  threads and `execve`s subprocesses, prints `ERROR: Reconnecting... waiting
+  for network` as expected with no broker, and ends at 1.09 billion
+  instructions with `OutOfMemory` under the 1 GiB default.
+
+So the agent starts, authenticates, spawns its subprocesses, and then
+something in a real session does not complete. It is not a browser-specific
+problem — the same thing happens natively — which makes it tractable to chase
+with the native runner's diagnostics rather than through a tab. That is where
+this stops.
+
 ## How far Node gets today
 
 A dynamically linked host `node` (glibc) mounted into the guest, running a

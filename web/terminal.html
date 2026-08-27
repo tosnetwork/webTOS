@@ -149,9 +149,7 @@
       // what stops one agent reading another's credential.
       worker.postMessage({
         type: "secrets",
-        secrets: [
-          { name: "AGENT_KEY", value: secret, paths: ["/root/.agent/config.json"] },
-        ],
+        secrets: [{ name: secretName, value: secret, paths: [secretFile] }],
       });
     }
     if (gateway) worker.postMessage({ type: "network", gateway });
@@ -179,6 +177,9 @@
     if (msg.type === "ready") {
       // A host that knows its ceiling sets one, and an image that will not
       // fit is refused at the request instead of part-way through.
+      // Raise the guest's physical cap before anything is delivered: a large
+      // agent reserves hundreds of mebibytes before it runs a line.
+      if (guestMib) worker.postMessage({ type: "guestmem", mib: Number(guestMib) });
       if (budgetMib) worker.postMessage({ type: "budget", mib: Number(budgetMib) });
       // The two the guest spends rather than the host: a filesystem it may
       // not grow past, and a byte count it may not relay past. Both refuse
@@ -293,12 +294,18 @@
   // config names it by placeholder, the value is expanded in that file only,
   // and a checkpoint redacts it back — so it never reaches browser storage.
   const secret = params.get("secret");
+  // Where the credential belongs. A host injecting into an arbitrary path is
+  // the general case; the demo's own file is only the default.
+  const secretFile = params.get("secretfile") ?? "/root/.agent/config.json";
+  const secretName = params.get("secretname") ?? "AGENT_KEY";
   const budgetMib = params.get("budget");
+  const guestMib = params.get("guestmem");
   const storageMib = params.get("storage");
   const networkMib = params.get("network");
-  const agentConfig = new TextEncoder().encode(
-    '{"api_key":"${AGENT_KEY}"}\n',
-  ).buffer;
+  const agentConfig = new TextEncoder().encode(`{"api_key":"\${${secretName}}"}\n`).buffer;
+  // A file whose entire contents are the placeholder: for a credential that
+  // is itself a whole file, like an agent's auth profile.
+  const placeholderOnly = new TextEncoder().encode(`\${${secretName}}`).buffer;
   const otherConfig = new TextEncoder().encode(
     '{"api_key":"${AGENT_KEY}"}\n',
   ).buffer;
@@ -319,14 +326,14 @@
       ].concat(
         secret
           ? [
-              { path: "/root/.agent/config.json", bytes: agentConfig },
+              { path: secretFile, bytes: params.get("secretfile") ? placeholderOnly : agentConfig },
               { path: "/root/.other/config.json", bytes: otherConfig },
             ]
           : [],
       ),
       links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
     },
-    secret ? [notes, resolvConf, agentConfig, otherConfig] : [notes, resolvConf],
+    secret ? [notes, resolvConf, agentConfig, otherConfig, placeholderOnly] : [notes, resolvConf],
   );
 
   term.focus();

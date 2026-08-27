@@ -10,6 +10,7 @@ base_image.runtime.manifest
 /test_data/busybox-musl
 /web/busybox-musl
 /web/openfox
+/web/codex
 /test_data/alpine-minirootfs/
 /test_data/openfox
 /test_data/openfox.commit

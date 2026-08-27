@@ -22,6 +22,7 @@
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //                                        (images this worker cached are left
 //                                        out; boot re-injects them)
+//               { type: "guestmem", mib } -- raise the guest's physical cap
 //               { type: "budget", mib }  -- cap the total footprint; 0 clears
 //               { type: "storageBudget", mib }  -- cap the guest filesystem;
 //                                        past it a guest write gets ENOSPC
@@ -798,6 +799,14 @@ self.onmessage = async (event) => {
     }
     if (msg.type === "input") input(msg.data);
     if (msg.type === "resize") resize(msg.rows, msg.cols);
+    // A large agent wants more physical memory than the default: Codex
+    // reserves about 246 MiB of segments before it runs a line.
+    if (msg.type === "guestmem") {
+      if (exports.wtw_set_guest_memory_mb(msg.mib) !== 0) {
+        throw new Error(`guest memory cap: ${lastError()}`);
+      }
+      postMessage({ type: "status", text: `guest memory cap ${msg.mib} MiB` });
+    }
     if (msg.type === "footprint") reportFootprint();
     if (msg.type === "budget") {
       if (exports.wtw_set_memory_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
