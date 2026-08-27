@@ -14,6 +14,3 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# The syscall sweep fills a guest page with hostile struct contents, which is
-# a write into guest memory rather than anything the guest ABI offers.
-icicle-mem = { workspace = true }

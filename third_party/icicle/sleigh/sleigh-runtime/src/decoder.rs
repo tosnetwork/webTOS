@@ -136,13 +136,17 @@ impl Decoder {
                 inst.delay_slot = Some(self.decode_subtable(sleigh, inst, ROOT_TABLE_ID));
             } else {
                 // Assume the size of the delay slot is the same as the root instruction.
-                self.next_offset *= 2;
+                self.next_offset = self.next_offset.saturating_mul(2);
                 inst.delay_slot = Some(invalid_constructor(sleigh));
             }
         }
 
         inst.inst_start = self.base_addr;
-        inst.inst_next = self.base_addr + self.next_offset as u64;
+        // The guest chooses where it jumps, including the last bytes of the
+        // address space, where the address after an instruction does not fit.
+        // Wrapping keeps the arithmetic defined; the fetch that follows lands
+        // somewhere unmapped and faults, which is the answer the guest earned.
+        inst.inst_next = self.base_addr.wrapping_add(self.next_offset as u64);
 
         if !self.is_valid {
             return None;

@@ -847,6 +847,14 @@ impl Mmu {
     /// Check that the region of memory between addr..addr+len is initialized and executable, and
     /// ensure that if it is ever written to in the future it will be detected.
     pub fn ensure_executable(&mut self, start: u64, len: u64) -> bool {
+        // No bytes is not an executable region. Saying otherwise would let the
+        // lifter build an empty block, which executes no instructions and so
+        // advances neither the program counter nor the instruction count —
+        // a loop the instruction limit cannot end. Refusing gives the guest a
+        // fault, which is what an address with no instruction at it deserves.
+        if len == 0 {
+            return false;
+        }
         let Some(end) = start.checked_add(len - 1)
         else {
             return false;

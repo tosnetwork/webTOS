@@ -563,7 +563,10 @@ pub mod x86 {
 
     /// Extract Packed Double-Precision Floating-Point Sign Mask
     fn movmskpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let src = cpu.read::<u128>(args[1]);
+        let Some(src) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
+        let src = u128::from_le_bytes(src);
         let result = ((src >> 63) & 0b01) as u32 | ((src >> 126) & 0b10) as u32;
 
         // workaround SLEIGH bug? should zero extend to 64-bits
@@ -573,7 +576,10 @@ pub mod x86 {
     /// Extract the sign bit of each of the four packed single-precision floats
     /// into the low four bits of the destination register.
     fn movmskps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let src = cpu.read::<u128>(args[1]);
+        let Some(src) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
+        let src = u128::from_le_bytes(src);
         let result = ((src >> 31) & 0b0001) as u32
             | ((src >> 62) & 0b0010) as u32
             | ((src >> 93) & 0b0100) as u32
@@ -659,75 +665,115 @@ pub mod x86 {
         // two operands survive icicle's p-code), so round to nearest, ties to
         // even — the IEEE default and the MXCSR default that `imm8` bit 2
         // selects.
-        let upper = cpu.read::<u128>(args[0]);
+        let Some(upper) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        // The scalar operand is a lane of a vector register, so a
+        // narrower one has no lane to take.
+        if args[1].size() < 8 {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            return;
+        }
+        let upper = u128::from_le_bytes(upper);
         let value = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
         let rounded = value.round_ties_even().to_bits();
-        cpu.write_var(dst, (upper & !0xffff_ffff_ffff_ffffu128) | rounded as u128);
+        write_xmm(cpu, dst, ((upper & !0xffff_ffff_ffff_ffffu128) | rounded as u128).to_le_bytes());
     }
 
     fn roundss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let upper = cpu.read::<u128>(args[0]);
+        let Some(upper) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        // The scalar operand is a lane of a vector register, so a
+        // narrower one has no lane to take.
+        if args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            return;
+        }
+        let upper = u128::from_le_bytes(upper);
         let value = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
         let rounded = value.round_ties_even().to_bits();
-        cpu.write_var(dst, (upper & !0xffff_ffffu128) | rounded as u128);
+        write_xmm(cpu, dst, ((upper & !0xffff_ffffu128) | rounded as u128).to_le_bytes());
     }
 
     fn pshufb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Byte shuffle: for each byte, a control byte with the high bit set
         // yields zero, otherwise it selects a source byte by its low nibble
         // (within the same 128-bit lane; only 16-byte operands are used here).
-        let src: [u8; 16] = cpu.read::<u128>(args[0]).to_le_bytes();
-        let ctrl: [u8; 16] = cpu.read::<u128>(args[1]).to_le_bytes();
+        let (Some(src), Some(ctrl)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..16 {
             let c = ctrl[i];
             out[i] = if c & 0x80 != 0 { 0 } else { src[(c & 0x0f) as usize] };
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     // --- Packed-integer SIMD ops the spec leaves as opaque pcodeops -------
     // Verified against the native intrinsics in x64-engine/examples/sse_probe.
 
-    fn xmm_bytes(cpu: &mut Cpu, v: Value) -> [u8; 16] {
-        cpu.read::<u128>(v).to_le_bytes()
+    /// The 128-bit operand these helpers are written for.
+    ///
+    /// The same opcodes have 64-bit MMX forms, which a guest can execute —
+    /// nothing stops it mapping a page executable and jumping into one. A
+    /// helper written for one width cannot answer for the other, and reading
+    /// a register at a size it does not have is not an available answer: say
+    /// the operation is unimplemented, the way an unknown one is.
+    fn xmm_bytes(cpu: &mut Cpu, v: Value) -> Option<[u8; 16]> {
+        if v.size() != 16 {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            cpu.exception.value = v.size() as u64;
+            return None;
+        }
+        Some(cpu.read::<u128>(v).to_le_bytes())
     }
 
+
     fn pmulhuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..8 {
             let x = u16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as u32;
             let y = u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32;
             out[2 * i..2 * i + 2].copy_from_slice(&(((x * y) >> 16) as u16).to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pmulhw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..8 {
             let x = i16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as i32;
             let y = i16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as i32;
             out[2 * i..2 * i + 2].copy_from_slice(&(((x * y) >> 16) as i16).to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pmulld(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..4 {
             let x = u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap());
             let y = u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
             out[4 * i..4 * i + 4].copy_from_slice(&x.wrapping_mul(y).to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pack_words(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for (half, src) in [a, b].into_iter().enumerate() {
             for i in 0..8 {
@@ -739,7 +785,7 @@ pub mod x86 {
                 };
             }
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn packsswb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -750,7 +796,9 @@ pub mod x86 {
     }
 
     fn pack_dwords(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for (half, src) in [a, b].into_iter().enumerate() {
             for i in 0..4 {
@@ -763,7 +811,7 @@ pub mod x86 {
                 out[half * 8 + 2 * i..half * 8 + 2 * i + 2].copy_from_slice(&w.to_le_bytes());
             }
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn packssdw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -823,37 +871,45 @@ pub mod x86 {
     }
 
     fn punpcklqdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&a[0..8]);
         out[8..16].copy_from_slice(&b[0..8]);
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     /// pabs* take the source in the second operand; the first is the (unused)
     /// destination register the pcodeop is written with.
     fn pabsb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let s = xmm_bytes(cpu, args[1]);
+        let Some(s) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let out: [u8; 16] = std::array::from_fn(|i| (s[i] as i8).unsigned_abs());
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
     fn pabsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let s = xmm_bytes(cpu, args[1]);
+        let Some(s) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..8 {
             let w = i16::from_le_bytes([s[2 * i], s[2 * i + 1]]).unsigned_abs();
             out[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
     fn pabsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let s = xmm_bytes(cpu, args[1]);
+        let Some(s) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..4 {
             let d = i32::from_le_bytes(s[4 * i..4 * i + 4].try_into().unwrap()).unsigned_abs();
             out[4 * i..4 * i + 4].copy_from_slice(&d.to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     // --- Packed floating-point SIMD ops (whole-register pcodeops) ---------
@@ -861,27 +917,35 @@ pub mod x86 {
     // `(a OP b) ? a : b`.
 
     fn f64x2_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f64, f64) -> f64) {
-        let a = xmm_bytes(cpu, args[0]);
-        let b = xmm_bytes(cpu, args[1]);
+        let Some(a) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(b) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..2 {
             let x = f64::from_bits(u64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap()));
             let y = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
             out[8 * i..8 * i + 8].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn f32x4_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f32, f32) -> f32) {
-        let a = xmm_bytes(cpu, args[0]);
-        let b = xmm_bytes(cpu, args[1]);
+        let Some(a) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(b) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..4 {
             let x = f32::from_bits(u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap()));
             let y = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
             out[4 * i..4 * i + 4].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn divpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -915,29 +979,35 @@ pub mod x86 {
 
     fn pblendw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Third operand (imm8) arrives via the pcode arg slot.
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mask = cpu.args[0] as u8;
         let mut out = [0u8; 16];
         for i in 0..8 {
             let src = if mask >> i & 1 == 0 { &a } else { &b };
             out[2 * i..2 * i + 2].copy_from_slice(&src[2 * i..2 * i + 2]);
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pblendvb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Third operand (the implicit XMM0 mask) arrives via the arg slot.
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mask = cpu.args[0].to_le_bytes();
         let mut out = [0u8; 16];
         for i in 0..16 {
             out[i] = if mask[i] & 0x80 != 0 { b[i] } else { a[i] };
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn blendv_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane: usize) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mask = cpu.args[0].to_le_bytes();
         let mut out = [0u8; 16];
         for i in (0..16).step_by(lane) {
@@ -945,7 +1015,7 @@ pub mod x86 {
             let src = if take_b { &b } else { &a };
             out[i..i + lane].copy_from_slice(&src[i..i + lane]);
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn blendvps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -981,7 +1051,7 @@ pub mod x86 {
             lane.fill(fill);
             lane[..from].copy_from_slice(chunk);
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pmovzxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -1023,18 +1093,22 @@ pub mod x86 {
 
     fn pmuldq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Signed multiply of dwords 0 and 2 into two 64-bit products.
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..2 {
             let x = i32::from_le_bytes(a[8 * i..8 * i + 4].try_into().unwrap()) as i64;
             let y = i32::from_le_bytes(b[8 * i..8 * i + 4].try_into().unwrap()) as i64;
             out[8 * i..8 * i + 8].copy_from_slice(&x.wrapping_mul(y).to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pmulhrsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..8 {
             let x = i16::from_le_bytes([a[2 * i], a[2 * i + 1]]) as i32;
@@ -1042,13 +1116,15 @@ pub mod x86 {
             let r = ((x * y >> 14) + 1) >> 1;
             out[2 * i..2 * i + 2].copy_from_slice(&(r as i16).to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn pmaddubsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Unsigned bytes of a times signed bytes of b, adjacent pairs
         // summed with signed saturation.
-        let (a, b) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]));
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
         let mut out = [0u8; 16];
         for i in 0..8 {
             let lo = a[2 * i] as i32 * (b[2 * i] as i8) as i32;
@@ -1056,7 +1132,7 @@ pub mod x86 {
             let sum = (lo + hi).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             out[2 * i..2 * i + 2].copy_from_slice(&sum.to_le_bytes());
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     /// Reads a signed `lane`-byte element starting at `bytes[at]`.
@@ -1163,7 +1239,9 @@ pub mod x86 {
 
     fn phminposuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Single-operand op: the source is the only input.
-        let src = xmm_bytes(cpu, args[0]);
+        let Some(src) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
         let mut best = (u16::MAX, 0u16);
         for i in 0..8 {
             let w = u16::from_le_bytes([src[2 * i], src[2 * i + 1]]);
@@ -1175,12 +1253,16 @@ pub mod x86 {
     }
 
     fn insertps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let a = xmm_bytes(cpu, args[0]);
+        let Some(a) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
         let imm = cpu.args[0] as u8;
         // Register source: dword selected by bits 7:6; memory source: the
         // 32-bit value itself.
         let src = if args[1].size() >= 16 {
-            let b = xmm_bytes(cpu, args[1]);
+            let Some(b) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
             let idx = (imm >> 6 & 3) as usize;
             u32::from_le_bytes(b[4 * idx..4 * idx + 4].try_into().unwrap())
         } else {
@@ -1194,12 +1276,14 @@ pub mod x86 {
                 out[4 * i..4 * i + 4].fill(0);
             }
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn extractps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // dst is a 4- or 8-byte GPR/memory location; zero-extended dword.
-        let src = xmm_bytes(cpu, args[0]);
+        let Some(src) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
         let imm = cpu.read::<u64>(args[1]) as u8;
         let idx = (imm & 3) as usize;
         let value = u32::from_le_bytes(src[4 * idx..4 * idx + 4].try_into().unwrap());
@@ -1210,7 +1294,9 @@ pub mod x86 {
     }
 
     fn roundp_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
-        let b = xmm_bytes(cpu, args[1]);
+        let Some(b) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         // Bit 2 selects MXCSR rounding, which this machine keeps at the
         // default (nearest-even); bits 1:0 give the explicit mode.
         let imm = cpu.args[0] as u8;
@@ -1238,7 +1324,7 @@ pub mod x86 {
                 out[4 * i..4 * i + 4].copy_from_slice(&r.to_bits().to_le_bytes());
             }
         }
-        cpu.write_var(dst, u128::from_le_bytes(out));
+        write_xmm(cpu, dst, out);
     }
 
     fn roundps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -1421,17 +1507,24 @@ pub mod x86 {
         out
     }
 
-    fn read_xmm(cpu: &mut Cpu, v: Value) -> [u8; 16] {
-        cpu.read::<u128>(v).to_le_bytes()
-    }
-
+    /// The destination side of the same assumption `xmm_bytes` guards on the
+    /// way in: a 128-bit result has nowhere to go in a narrower register.
     fn write_xmm(cpu: &mut Cpu, dst: VarNode, s: [u8; 16]) {
+        if dst.size != 16 {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            cpu.exception.value = dst.size as u64;
+            return;
+        }
         cpu.write_var(dst, u128::from_le_bytes(s));
     }
 
     fn aesenc(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let state = read_xmm(cpu, args[0]);
-        let key = read_xmm(cpu, args[1]);
+        let Some(state) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(key) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut t = aes_shift_rows(&state, 1);
         aes_sub_bytes(&mut t, &AES_SBOX);
         let mut t = aes_mix_columns(&t, [2, 3, 1, 1]);
@@ -1442,8 +1535,12 @@ pub mod x86 {
     }
 
     fn aesenclast(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let state = read_xmm(cpu, args[0]);
-        let key = read_xmm(cpu, args[1]);
+        let Some(state) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(key) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let mut t = aes_shift_rows(&state, 1);
         aes_sub_bytes(&mut t, &AES_SBOX);
         for i in 0..16 {
@@ -1453,8 +1550,12 @@ pub mod x86 {
     }
 
     fn aesdec(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let state = read_xmm(cpu, args[0]);
-        let key = read_xmm(cpu, args[1]);
+        let Some(state) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(key) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let inv = aes_inv_sbox();
         let mut t = aes_shift_rows(&state, 3);
         aes_sub_bytes(&mut t, &inv);
@@ -1466,8 +1567,12 @@ pub mod x86 {
     }
 
     fn aesdeclast(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let state = read_xmm(cpu, args[0]);
-        let key = read_xmm(cpu, args[1]);
+        let Some(state) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
+        let Some(key) = xmm_bytes(cpu, args[1]) else {
+            return;
+        };
         let inv = aes_inv_sbox();
         let mut t = aes_shift_rows(&state, 3);
         aes_sub_bytes(&mut t, &inv);
@@ -1478,13 +1583,17 @@ pub mod x86 {
     }
 
     fn aesimc(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let x = read_xmm(cpu, args[0]);
+        let Some(x) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
         let t = aes_mix_columns(&x, [14, 11, 13, 9]);
         write_xmm(cpu, dst, t);
     }
 
     fn aeskeygenassist(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let x = read_xmm(cpu, args[0]);
+        let Some(x) = xmm_bytes(cpu, args[0]) else {
+            return;
+        };
         let rcon = cpu.read::<u8>(args[1]);
         let sub_word = |w: [u8; 4]| -> [u8; 4] {
             [
