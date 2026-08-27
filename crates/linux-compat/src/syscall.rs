@@ -2384,11 +2384,13 @@ pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64)
                 .get(&signal)
                 .is_some_and(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")) > 1)
         };
-    if env.proc.pgid == pgrp && env.proc.sigmask & bit == 0 && has_handler(&env.proc.sigactions) {
+    // The mask is not consulted: a signal raised while blocked stays pending
+    // until it is unblocked. Only delivery looks at the mask.
+    if env.proc.pgid == pgrp && has_handler(&env.proc.sigactions) {
         env.proc.pending_signals |= bit;
     }
     for t in &mut env.sched.parked {
-        if t.proc.pgid == pgrp && t.proc.sigmask & bit == 0 && has_handler(&t.proc.sigactions) {
+        if t.proc.pgid == pgrp && has_handler(&t.proc.sigactions) {
             t.proc.pending_signals |= bit;
         }
     }
@@ -2420,23 +2422,31 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
     if !has_handler {
         return;
     }
-    // Prefer the group's main thread (pid == tgid); fall back to any sibling
-    // that does not block SIGCHLD. A thread already handling the signal (bit
-    // set) keeps it — setting it again is idempotent.
-    let mut candidate: Option<usize> = None;
+    // Deliver to a thread that does not block SIGCHLD, preferring the group's
+    // main thread. If every thread blocks it the signal is still recorded:
+    // blocking defers delivery, it does not discard the signal. Dropping it
+    // here lost every SIGCHLD raised inside `posix_spawn`, which blocks all
+    // signals for the duration — the parent then waited forever for a child
+    // that had already exited.
+    let mut unblocked: Option<usize> = None;
+    let mut fallback: Option<usize> = None;
     for (i, t) in env.sched.parked.iter().enumerate() {
-        if t.proc.tgid != parent_tgid || t.proc.sigmask & SIGCHLD_BIT != 0 {
+        if t.proc.tgid != parent_tgid {
             continue;
         }
-        if t.proc.pid == parent_tgid {
-            candidate = Some(i);
-            break;
+        let blocked = t.proc.sigmask & SIGCHLD_BIT != 0;
+        let main = t.proc.pid == parent_tgid;
+        if !blocked && (main || unblocked.is_none()) {
+            unblocked = Some(i);
+            if main {
+                break;
+            }
         }
-        if candidate.is_none() {
-            candidate = Some(i);
+        if blocked && (main || fallback.is_none()) {
+            fallback = Some(i);
         }
     }
-    if let Some(i) = candidate {
+    if let Some(i) = unblocked.or(fallback) {
         env.sched.parked[i].proc.pending_signals |= SIGCHLD_BIT;
     }
 }
@@ -2448,7 +2458,7 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
 /// if still not satisfied, simply re-parks. Only signals with a real user
 /// handler reach a pending state, so a missing or default disposition here is
 /// treated as a no-op rather than a fault.
-fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
+fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     const SIG_DFL: u64 = 0;
     const SIG_IGN: u64 = 1;
     // Only unblocked signals are deliverable; a signal raised while its
@@ -2456,21 +2466,21 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
     // `rt_sigreturn` restores the mask.
     let pending = env.proc.pending_signals & !env.proc.sigmask;
     if pending == 0 {
-        return;
+        return false;
     }
     let sig = pending.trailing_zeros() as u64 + 1;
     let bit = 1_u64 << (sig - 1);
     env.proc.pending_signals &= !bit;
 
     let Some(action) = env.proc.sigactions.borrow().get(&sig).copied() else {
-        return;
+        return false;
     };
     let handler = u64::from_le_bytes(action.0[0..8].try_into().expect("size"));
     let flags = u64::from_le_bytes(action.0[8..16].try_into().expect("size"));
     let restorer = u64::from_le_bytes(action.0[16..24].try_into().expect("size"));
     let sa_mask = u64::from_le_bytes(action.0[24..32].try_into().expect("size"));
     if handler == SIG_DFL || handler == SIG_IGN {
-        return;
+        return false;
     }
 
     env.trace_event(crate::trace::Event::Signal {
@@ -2514,7 +2524,7 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
         // to be discarded on the next rt_sigreturn-less resume.
         env.proc.signal_saved.pop();
         env.proc.sigmask = env.proc.signal_saved_mask.pop().unwrap_or(env.proc.sigmask);
-        return;
+        return false;
     }
 
     cpu.write_var(env.regs.rsp, sp);
@@ -2526,6 +2536,7 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
     cpu.pending_exception = None;
     cpu.block_id = u64::MAX;
     cpu.block_offset = 0;
+    true
 }
 
 /// `rt_sigreturn`: restore the state saved when the current handler was

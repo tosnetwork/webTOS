@@ -483,4 +483,3 @@ fn bench_agent_startup_is_lifting() {
         coverage(0.99),
     );
 }
-

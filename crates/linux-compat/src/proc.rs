@@ -347,7 +347,11 @@ impl Scheduler {
             // except the uninterruptible vfork suspension: a vfork parent
             // must not observe anything (including a handler running on its
             // borrowed stack semantics) until the child execs or exits.
-            if task.proc.pending_signals != 0 && !matches!(task.state, ParkState::VforkDone { .. })
+            // Deliverable, not merely pending: a signal the task blocks must
+            // not wake it, or it would spin being scheduled with nothing to
+            // deliver.
+            if task.proc.pending_signals & !task.proc.sigmask != 0
+                && !matches!(task.state, ParkState::VforkDone { .. })
             {
                 return true;
             }

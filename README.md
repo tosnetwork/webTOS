@@ -284,9 +284,9 @@ our runtime". What they currently report, and what it implies, is in
 **Run the suite on x86-64 Linux before trusting it.** Every test whose fixture
 is compiled by the host `gcc` — the pseudoterminal, signal, and glibc cases —
 cannot build a static Linux binary on macOS or ARM, so it returns early and
-reports success. A green suite on a Mac is not a green suite. Two milestone-4
-SIGCHLD gates are currently failing on a modern Linux toolchain for exactly
-this reason; see *A gate that only fails where it runs* in the roadmap.
+reports success. A green suite on a Mac is not a green suite: a signal-loss
+bug lived behind that gap until the suite was run somewhere it could not skip.
+See *A bug that only appeared where the tests ran* in the roadmap.
 
 The native suite pins its target in `crates/.cargo/config.toml`, so on a macOS
 or ARM development machine run it against the host instead — tests whose

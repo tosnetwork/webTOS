@@ -783,3 +783,91 @@ fn two_images_at_one_address_do_not_share_lifted_code() {
         );
     }
 }
+
+/// A signal raised while it is blocked must be delivered once it is
+/// unblocked, not discarded.
+///
+/// This was broken, and the way it was broken is why it went unnoticed:
+/// SIGCHLD was only recorded against a thread that did not currently block
+/// it, so a child exiting inside `posix_spawn` — which blocks every signal
+/// for the duration — lost its notification entirely and the parent waited
+/// forever for a child that had already gone. Whether the child got there
+/// first depended on how much work the host libc's `posix_spawn` did, so the
+/// same code passed on one machine and hung on another.
+///
+/// Here the window is opened deliberately rather than raced for: the parent
+/// blocks SIGCHLD, waits for the child to have exited, and only then unblocks.
+#[test]
+fn a_signal_raised_while_blocked_is_delivered_when_unblocked() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let source = r#"
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+extern char **environ;
+static volatile sig_atomic_t caught = 0;
+static void on_sigchld(int sig) { (void)sig; caught = 1; }
+
+int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigchld;
+    if (sigaction(SIGCHLD, &sa, 0) != 0) { printf("sigaction failed\n"); return 1; }
+
+    sigset_t chld, saved;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &chld, &saved) != 0) { printf("block failed\n"); return 2; }
+
+    pid_t pid;
+    char *argv[] = { "/bin/echo", "child-done", 0 };
+    if (posix_spawn(&pid, "/bin/echo", 0, 0, argv, environ) != 0) { printf("spawn failed\n"); return 3; }
+
+    /* Reap it while SIGCHLD is blocked: the child is gone before the signal
+       can be delivered, so only a signal held pending can still arrive. */
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) { printf("reap failed\n"); return 4; }
+    if (caught) { printf("handler ran while blocked\n"); return 5; }
+
+    if (sigprocmask(SIG_SETMASK, &saved, 0) != 0) { printf("unblock failed\n"); return 6; }
+    /* Delivery happens at the next scheduling point rather than on the way
+       out of the mask change, so the guest reaches one deliberately. What
+       matters is that the signal survived the blocked window at all. */
+    struct timespec pause = { 0, 1000000 };
+    nanosleep(&pause, 0);
+    printf("caught=%d\n", caught ? 1 : 0);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("sigchld_blocked", source, &[]) else {
+        return;
+    };
+    machine
+        .add_file(b"/bin/sigchld_blocked", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"sigchld_blocked".to_vec()],
+        vec![b"PATH=/bin:/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/sigchld_blocked")
+        .expect("ELF load failed");
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "guest did not finish; output: {output:?}"
+    );
+    assert!(
+        output.contains("caught=1"),
+        "SIGCHLD raised while blocked was discarded rather than held pending; output: {output:?}"
+    );
+}
