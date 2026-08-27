@@ -475,7 +475,7 @@ fn openfox_soak_is_bounded() {
 
     let mut prev_fs = machine.export_fs().len();
     let mut first_guest_mb = None;
-    let first_blocks = machine.vm_mut().lift_stats().blocks;
+    let mut first_blocks = None;
     for round in 0..rounds {
         let cmd = if round % 2 == 0 { "status" } else { "version" };
         let run = run_openfox(&mut machine, &[cmd]);
@@ -513,7 +513,12 @@ fn openfox_soak_is_bounded() {
             st.promoted,
             st.counted
         );
-        let ceiling = first_blocks + st.counted + st.counted / 8;
+        // The baseline is taken after the first round, when the image has
+        // been lifted once. `counted` only sees addresses entered through an
+        // external jump — a block reached by chaining inside a group is never
+        // counted — so it undercounts the table and cannot serve as one.
+        let baseline_blocks = *first_blocks.get_or_insert(st.blocks);
+        let ceiling = baseline_blocks + st.counted + st.counted / 8;
         assert!(
             st.blocks <= ceiling,
             "lifted blocks passed the one-retired-group-per-address ceiling on \
