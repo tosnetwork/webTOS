@@ -1601,6 +1601,9 @@ fn sys_renameat(
     let was_dir = moved.is_some_and(|node| env.vfs.is_dir(node));
     env.vfs
         .rename(old.parent, &old.name, new.parent, &new.name)?;
+    // A rename onto an existing name unlinks what was there; reclaim it the
+    // same way `unlinkat` does, so nothing keeps the replaced version alive.
+    env.reclaim_unlinked();
     // The two halves share a cookie, which is the only thing that lets a
     // watcher tell a rename from a delete followed by an unrelated create.
     let cookie = next_inotify_cookie(env);

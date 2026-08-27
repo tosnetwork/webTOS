@@ -448,10 +448,17 @@ impl LinuxEnv {
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
-        self.vfs
+        let added = self
+            .vfs
             .add_node(path, NodeKind::File(bytes), mode)
             .map(|_| ())
-            .map_err(|e| format!("cannot add {}: errno {e}", path.escape_ascii()))
+            .map_err(|e| format!("cannot add {}: errno {e}", path.escape_ascii()));
+        // Writing over a name displaces whatever held it. Reclaim now rather
+        // than at some later unlink: until this runs the old contents are
+        // still in the arena, still counted, and still written into every
+        // snapshot taken in between.
+        self.reclaim_unlinked();
+        added
     }
 
     /// Starts a file that will be delivered in pieces, reserving room for
@@ -459,10 +466,14 @@ impl LinuxEnv {
     /// one whole copy on the way in is the difference between fitting in a
     /// tab and not.
     pub fn create_file(&mut self, path: &[u8], capacity: usize, mode: u32) -> Result<(), String> {
-        self.vfs
+        let created = self
+            .vfs
             .create_file_with_capacity(path, capacity, mode)
             .map(|_| ())
-            .map_err(|e| format!("cannot create {}: errno {e}", path.escape_ascii()))
+            .map_err(|e| format!("cannot create {}: errno {e}", path.escape_ascii()));
+        // See `add_file`: a restarted delivery displaces the abandoned one.
+        self.reclaim_unlinked();
+        created
     }
 
     /// Appends one piece to a file started with [`create_file`].

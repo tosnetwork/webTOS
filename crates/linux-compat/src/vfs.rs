@@ -272,7 +272,23 @@ impl Vfs {
         let NodeKind::Dir(entries) = &mut self.nodes[resolved.parent].kind else {
             return Err(abi::ENOTDIR);
         };
-        entries.insert(resolved.name, node);
+        // Replacing a name drops the link the old node had under it. Without
+        // this the old node stays in the arena, unreachable by path but not
+        // gone: its bytes survive in memory, in the storage accounting, and
+        // in every snapshot taken afterwards — so a file rewritten shorter
+        // kept the tail of what it used to say, and a config rewritten
+        // without a secret kept the secret.
+        //
+        // The link count is what decides, not the overwrite: a name is a
+        // link, and the contents outlive the last one only for as long as a
+        // descriptor opened before it still refers to them.
+        if let Some(displaced) = entries.insert(resolved.name, node) {
+            let old = &mut self.nodes[displaced];
+            old.nlink = old.nlink.saturating_sub(1);
+            if old.nlink == 0 && !self.unlinked.contains(&displaced) {
+                self.unlinked.push(displaced);
+            }
+        }
         Ok(node)
     }
 
@@ -509,7 +525,21 @@ impl Vfs {
         let NodeKind::Dir(entries) = &mut self.nodes[new_parent].kind else {
             return Err(abi::ENOTDIR);
         };
-        entries.insert(new_name.to_vec(), node);
+        // Renaming onto an existing name replaces it, and the file that was
+        // there loses its last link. This is the "write a temp file and move
+        // it into place" idiom — the one an agent uses to edit a file — so
+        // the replaced contents are exactly the previous version of something
+        // someone cared about. Leaving the node behind keeps that version in
+        // the arena and in every snapshot after it.
+        if let Some(displaced) = entries.insert(new_name.to_vec(), node) {
+            if displaced != node {
+                let old = &mut self.nodes[displaced];
+                old.nlink = old.nlink.saturating_sub(1);
+                if old.nlink == 0 && !self.unlinked.contains(&displaced) {
+                    self.unlinked.push(displaced);
+                }
+            }
+        }
         self.nodes[node].parent = new_parent;
         Ok(())
     }
