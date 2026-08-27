@@ -38,9 +38,21 @@ use x64_engine::{
 use proc::{Process, Scheduler};
 use vfs::{NodeKind, Vfs};
 
-/// Diagnostic mirror of the currently scheduled task's pid, for memory-write
-/// hooks that cannot reach the environment.
-pub static CURRENT_PID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+// Per-thread, like the engine's mirrors: a test binary runs several machines
+// at once and a process-wide static lets them overwrite each other.
+thread_local! {
+    static PID: std::cell::Cell<u64> = const { std::cell::Cell::new(1000) };
+}
+
+/// Pid of the task currently on the CPU, for diagnostics that cannot reach
+/// the environment.
+pub fn current_pid() -> u64 {
+    PID.with(std::cell::Cell::get)
+}
+
+pub fn set_current_pid(pid: u64) {
+    PID.with(|c| c.set(pid));
+}
 
 /// Allocates fresh address-space ids. Id 0 is the initial process; `fork` and
 /// `execve` take a new id (a new/replaced address space), while threads share
@@ -736,7 +748,7 @@ impl Environment for LinuxEnv {
         // static binaries commonly share a load address, which meant the second
         // one ran the first one's code.
         self.proc.asid = crate::alloc_asid();
-        x64_engine::vm::CURRENT_ASID.store(self.proc.asid, std::sync::atomic::Ordering::Relaxed);
+        x64_engine::vm::set_current_asid(self.proc.asid);
         self.start_image(cpu, path)
     }
 

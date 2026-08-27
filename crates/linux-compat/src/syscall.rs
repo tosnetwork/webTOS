@@ -2144,8 +2144,8 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     cpu.restore(&task.cpu);
     cpu.icount = icount;
     env.proc = task.proc;
-    crate::CURRENT_PID.store(env.proc.pid, std::sync::atomic::Ordering::Relaxed);
-    x64_engine::vm::CURRENT_ASID.store(env.proc.asid, std::sync::atomic::Ordering::Relaxed);
+    crate::set_current_pid(env.proc.pid);
+    x64_engine::vm::set_current_asid(env.proc.asid);
     // SWAP_WATCH=hexaddr: read the 8 bytes at that guest VA in whichever
     // address space is now installed. A value that changes across a swap,
     // with no write hook firing, exposes wrong address-space bookkeeping.
@@ -3148,7 +3148,7 @@ fn sys_execve(
     // A new image occupies the same virtual addresses as the old one; give
     // it a fresh address-space id so its blocks key distinctly in the cache.
     env.proc.asid = crate::alloc_asid();
-    x64_engine::vm::CURRENT_ASID.store(env.proc.asid, std::sync::atomic::Ordering::Relaxed);
+    x64_engine::vm::set_current_asid(env.proc.asid);
 
     match result {
         Ok(()) => {

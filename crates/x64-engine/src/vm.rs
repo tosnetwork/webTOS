@@ -11,16 +11,54 @@ use icicle_cpu::{
     InternalError, ValueSource, VmExit,
 };
 
+// Mirrors of the running machine's state, for code that cannot reach the CPU
+// — memory-write hooks, and the block cache's key.
+//
+// These are per-thread, not per-process. A machine belongs to the thread
+// running it: in a browser there is one, but a test binary runs several at
+// once, and process-wide statics let those machines overwrite each other's
+// address-space id. The symptom was an engine-level `InternalError` that
+// moved between tests, roughly four runs in fourteen, and never appeared
+// single-threaded.
+//
+// `const`-initialised `Cell`s, so access is a TLS offset rather than a lazy
+// initialisation check — `set_current_block_start` runs once per basic block.
+thread_local! {
+    static BLOCK_START: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ASID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static ICOUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Guest address of the basic block currently executing in the interpreter.
 /// A diagnostic mirror for memory-write hooks, which cannot see the CPU.
-pub static CURRENT_BLOCK_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn current_block_start() -> u64 {
+    BLOCK_START.with(std::cell::Cell::get)
+}
+
+pub fn set_current_block_start(addr: u64) {
+    BLOCK_START.with(|c| c.set(addr));
+}
+
 /// Current guest address-space id. The OS layer bumps it whenever the memory
 /// behind the guest's virtual addresses changes wholesale (execve, or a
 /// switch to a different address space), so the VA-keyed block cache never
 /// reuses a block lifted from a different image at the same VA.
-pub static CURRENT_ASID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Instruction count mirror, updated alongside [`CURRENT_BLOCK_START`].
-pub static CURRENT_ICOUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn current_asid() -> u64 {
+    ASID.with(std::cell::Cell::get)
+}
+
+pub fn set_current_asid(asid: u64) {
+    ASID.with(|c| c.set(asid));
+}
+
+/// Instruction count mirror, updated alongside [`current_block_start`].
+pub fn current_icount() -> u64 {
+    ICOUNT.with(std::cell::Cell::get)
+}
+
+pub fn set_current_icount(icount: u64) {
+    ICOUNT.with(|c| c.set(icount));
+}
 
 /// A block group already lifted at some virtual address, kept so a different
 /// address space can reuse it rather than lift the same bytes again.
@@ -267,7 +305,7 @@ impl InterpVm {
 
     fn get_block_key(&self, vaddr: u64) -> BlockKey {
         let isa_mode = self.cpu.isa_mode() as u64;
-        let asid = CURRENT_ASID.load(std::sync::atomic::Ordering::Relaxed);
+        let asid = current_asid();
         BlockKey {
             vaddr,
             isa_mode,
@@ -432,7 +470,7 @@ impl InterpVm {
         self.cpu.exception.clear();
         if let Some((id, _)) = self.get_current_block() {
             if let Some(b) = self.code.blocks.get(id as usize) {
-                CURRENT_BLOCK_START.store(b.start, std::sync::atomic::Ordering::Relaxed);
+                set_current_block_start(b.start);
             }
         }
 
@@ -570,8 +608,8 @@ impl InterpVm {
                 Some(block) => block,
                 None => return self.corrupted_block_map(block_id),
             };
-            CURRENT_BLOCK_START.store(block.start, std::sync::atomic::Ordering::Relaxed);
-            CURRENT_ICOUNT.store(self.cpu.icount(), std::sync::atomic::Ordering::Relaxed);
+            set_current_block_start(block.start);
+            set_current_icount(self.cpu.icount());
         }
     }
 

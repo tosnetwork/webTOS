@@ -145,10 +145,10 @@ fn main() {
             target + 8,
             Box::new(move |_mem: &mut icicle_mem::Mmu, addr: u64, value: &[u8]| {
                 let block =
-                    x64_engine::vm::CURRENT_BLOCK_START.load(std::sync::atomic::Ordering::Relaxed);
+                    x64_engine::vm::current_block_start();
                 let icount =
-                    x64_engine::vm::CURRENT_ICOUNT.load(std::sync::atomic::Ordering::Relaxed);
-                let pid = linux_compat::CURRENT_PID.load(std::sync::atomic::Ordering::Relaxed);
+                    x64_engine::vm::current_icount();
+                let pid = linux_compat::current_pid();
                 eprintln!(
                     "[guest-watch] pid={pid} ic={icount} write {addr:#x} len={} val={:02x?} in-block={block:#x}",
                     value.len(),
@@ -166,9 +166,8 @@ fn main() {
         struct ReadWatch;
         impl icicle_mem::ReadAfterHook for ReadWatch {
             fn read(&mut self, _mem: &mut icicle_mem::Mmu, addr: u64, value: &[u8]) {
-                let block =
-                    x64_engine::vm::CURRENT_BLOCK_START.load(std::sync::atomic::Ordering::Relaxed);
-                let ic = x64_engine::vm::CURRENT_ICOUNT.load(std::sync::atomic::Ordering::Relaxed);
+                let block = x64_engine::vm::current_block_start();
+                let ic = x64_engine::vm::current_icount();
                 eprintln!(
                     "[guest-read] ic={ic} read {addr:#x} len={} val={:02x?} in-block={block:#x}",
                     value.len(),
