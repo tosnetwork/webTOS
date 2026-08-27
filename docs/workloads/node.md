@@ -112,11 +112,26 @@ Bun-specific:
    from the guest's own budget, which is the only figure that means anything
    in a tab.
 
-Together those took Claude Code from 195,792 instructions to 2,365,855 — it
-now gets through the dynamic loader, past its own feature probes, and into
-Bun's startup, where it calls `abort()`. No `clone` is ever issued, so it is
-not a thread that failed to start. That is where the next investigation
-begins.
+Together those took Claude Code from 195,792 instructions to 2,365,855, into
+Bun's own startup — where it aborted. Bun's crash banner, once it could be
+seen, named the machine correctly (`Bun v1.4.1 Linux x64`, `Features: jsc
+no_avx2 no_avx standalone_executable claude_code`) and offered a hint about
+AVX that is not the cause: the successful run below also has no AVX.
+
+The cause was **`/proc/self/maps`**. Seeding it alone gets Bun through
+startup; seeding every other file it probes and omitting only that one still
+aborts. Both directions were checked.
+
+**Claude Code runs**: `2.1.247 (Claude Code)`, exit 0, 184 M instructions in
+16.6 s at 11.1 M inst/s, with the contents generated from the machine's own
+mapping table rather than seeded by hand.
+
+`/proc/self/statm`, `/proc/self/cmdline`, and `/proc/meminfo` are answered the
+same way, from the same state. Nothing else in `/proc` exists, and that is
+deliberate: a runtime acts on what it reads, so an absent file is a better
+answer than an invented one. Bun also probes `/proc/self/cgroup`,
+`/proc/stat`, `/proc/sys/vm/*`, and `/sys/devices/system/cpu/online`, and
+carries on without them.
 
 ## How far Node gets today
 

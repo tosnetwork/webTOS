@@ -1135,3 +1135,64 @@ int main(void) {
         "the file is still held after its last descriptor closed"
     );
 }
+
+/// A language runtime reads `/proc/self/maps` to learn its own address space,
+/// and Bun — which Claude Code is built on — aborts at startup without it.
+/// The contents come from the machine's own mapping table rather than from
+/// anything invented: a plausible lie about the system is worse than an
+/// absent file, because a runtime acts on it.
+#[test]
+fn a_runtime_can_read_its_own_address_space() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/test_procfs.elf");
+    let Some(image) = linux_compat::testing::require(
+        &format!("{} (built from test_procfs.c)", path.display()),
+        std::fs::read(&path).ok(),
+    ) else {
+        return;
+    };
+    let run = run_image(image, "procfs");
+    expect_clean(&run);
+
+    // Every line is `start-end perms offset dev inode path`, and the entry
+    // covering the program itself has to be executable or nothing could be
+    // running to read the file.
+    let maps = run
+        .output
+        .lines()
+        .find(|l| l.starts_with("/proc/self/maps: "))
+        .unwrap_or("")
+        .trim_start_matches("/proc/self/maps: ");
+    assert!(
+        maps.contains('-') && maps.split_whitespace().count() >= 5,
+        "the first line of maps is not in procfs's shape: {maps:?}"
+    );
+    let perms = maps.split_whitespace().nth(1).unwrap_or("");
+    assert_eq!(
+        perms.len(),
+        4,
+        "permissions should be four characters like `r-xp`: {perms:?}"
+    );
+
+    for (file, wanted) in [
+        ("/proc/self/statm", char::is_numeric as fn(char) -> bool),
+        ("/proc/meminfo", |c: char| c == 'M'),
+    ] {
+        let line = run
+            .output
+            .lines()
+            .find(|l| l.starts_with(&format!("{file}: ")))
+            .unwrap_or("");
+        let body = line.trim_start_matches(&format!("{file}: "));
+        assert!(
+            body.chars().next().is_some_and(wanted),
+            "{file} did not read back in its own shape: {body:?}"
+        );
+    }
+
+    // argv, NUL-separated, so the first entry is the program name.
+    assert!(
+        run.output.contains("/proc/self/cmdline: procfs"),
+        "cmdline did not report argv: {:?}",
+        run.output
+    );
+}

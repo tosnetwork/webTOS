@@ -90,15 +90,16 @@ what is left is the agent itself.
   resident. Node runs too, in 0.9 s. Delivery, memory, and speed are settled
   problems. What remains for Codex is a session that does work rather than a
   version string: credentials through the secret path, and the terminal.
-- **The Claude Code profile.** Claude Code 2.1.247 is a 239 MB **Bun**
-  binary, not a Node one, so "both agents are Node applications" is now only
-  true of Codex. Three defects that stood in its way are fixed — segments
-  were mapped at `p_align` instead of page granularity and clobbered the
-  permissions of the segment below, `CPUID` faulted on extended leaves, and
-  `sysinfo`/`getrusage`/`close_range` were missing — taking it from 195,792
-  instructions to 2,365,855. It now reaches Bun's own startup and calls
-  `abort()` there, with no `clone` ever issued, so it is not a thread that
-  failed to start. See `docs/workloads/node.md`.
+- **The Claude Code profile.** **It runs**: `2.1.247 (Claude Code)`, exit 0,
+  inside the wasm module a browser loads — 184 M instructions in 16.6 s. It is
+  a 239 MB **Bun** binary, not a Node one, so "both agents are Node
+  applications" is only true of Codex. Four things were in the way, none of
+  them Bun-specific: segments were mapped at `p_align` instead of page
+  granularity and took the permissions of the segment below, `CPUID` faulted
+  on extended leaves, `sysinfo`/`getrusage`/`close_range` were missing, and
+  `/proc/self/maps` did not exist — that last one alone is what Bun aborts
+  without. What remains is a session that does work rather than a version
+  string. See `docs/workloads/node.md`.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
 - ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are

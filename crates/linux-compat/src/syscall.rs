@@ -745,6 +745,110 @@ fn sys_close_range(env: &mut LinuxEnv, first: u64, last: u64, flags: u64) -> Sys
     Ok(0)
 }
 
+/// Regenerates a synthesised `/proc` file if `path` names one.
+///
+/// Only files whose contents this machine actually knows are here. The rest
+/// of `/proc` is absent, and absent is a better answer than invented: a
+/// runtime that reads a plausible lie about the system will act on it.
+///
+/// `/proc/self/maps` is the one a language runtime cannot do without — Bun
+/// aborts at startup without it, and every debugger reads it.
+fn refresh_procfs(env: &mut LinuxEnv, cpu: &mut Cpu, path: &[u8]) {
+    let pid = env.proc.pid;
+    let self_prefix = format!("/proc/{pid}/");
+    let name = if let Some(rest) = path.strip_prefix(b"/proc/self/".as_slice()) {
+        rest
+    } else if let Some(rest) = path.strip_prefix(self_prefix.as_bytes()) {
+        rest
+    } else if path == b"/proc/meminfo" {
+        b"meminfo".as_slice()
+    } else {
+        return;
+    };
+
+    let content = match name {
+        b"maps" => procfs_maps(env, cpu),
+        b"statm" => procfs_statm(cpu),
+        b"cmdline" => env
+            .proc
+            .argv
+            .iter()
+            .flat_map(|a| a.iter().copied().chain(std::iter::once(0)))
+            .collect(),
+        b"meminfo" => procfs_meminfo(cpu),
+        _ => return,
+    };
+
+    let full = if path.starts_with(b"/proc/meminfo") {
+        b"/proc/meminfo".to_vec()
+    } else {
+        path.to_vec()
+    };
+    if env.vfs.take_file_contents(&full).is_some() {
+        env.vfs.put_file_contents(&full, content);
+    } else {
+        let _ = env.add_file(&full, content, 0o444);
+    }
+}
+
+/// `/proc/self/maps`, from the address space the guest actually has.
+fn procfs_maps(env: &mut LinuxEnv, cpu: &mut Cpu) -> Vec<u8> {
+    use std::fmt::Write as _;
+    let exe = String::from_utf8_lossy(&env.proc.exe_path).into_owned();
+    let mut out = String::new();
+    // Adjacent ranges with the same permissions are separate entries in the
+    // mapping table; procfs coalesces them, and so does this.
+    let mut runs: Vec<(u64, u64, u8)> = Vec::new();
+    for (start, end, _) in cpu.mem.mapping.iter() {
+        let p = cpu.mem.get_perm(start);
+        match runs.last_mut() {
+            Some((_, last_end, last_perm)) if *last_end + 1 == start && *last_perm == p => {
+                *last_end = end;
+            }
+            _ => runs.push((start, end, p)),
+        }
+    }
+    for (start, end, p) in runs {
+        let bit = |b: u8, c: char| if p & b != 0 { c } else { '-' };
+        // Private mappings throughout: this machine has no shared ones.
+        let _ = writeln!(
+            out,
+            "{start:012x}-{:012x} {}{}{}p 00000000 00:00 0 {}",
+            end.saturating_add(1),
+            bit(perm::READ, 'r'),
+            bit(perm::WRITE, 'w'),
+            bit(perm::EXEC, 'x'),
+            if start < 0x1_0000_0000 {
+                exe.as_str()
+            } else {
+                ""
+            }
+        );
+    }
+    out.into_bytes()
+}
+
+/// `/proc/self/statm`, in pages: total, resident, shared, text, lib, data, dirty.
+/// The machine tracks what it has handed out, not the split between those, so
+/// the figures it cannot separate are reported as the total rather than
+/// invented.
+fn procfs_statm(cpu: &Cpu) -> Vec<u8> {
+    let pages = cpu.mem.total_pages() as u64;
+    format!("{pages} {pages} 0 0 0 {pages} 0\n").into_bytes()
+}
+
+/// `/proc/meminfo`, from the guest's budget rather than the host's memory.
+fn procfs_meminfo(cpu: &Cpu) -> Vec<u8> {
+    let kb = |pages: usize| pages as u64 * 4;
+    let total = kb(cpu.mem.capacity());
+    let used = kb(cpu.mem.total_pages());
+    let free = total.saturating_sub(used);
+    format!(
+        "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n"
+    )
+    .into_bytes()
+}
+
 /// Narrows a guest-supplied size to `usize`, refusing what will not fit.
 ///
 /// `usize` is 32 bits in a browser, so `value as usize` silently keeps the low
@@ -845,6 +949,11 @@ fn sys_openat(
     mode: u64,
 ) -> SysResult {
     let path = path_arg(cpu, path_ptr)?;
+    // A few `/proc` files are answered from the machine's own state. They are
+    // written into the filesystem at each open rather than being a live
+    // backing: a reader gets the snapshot it opened, which is what procfs
+    // gives for these anyway.
+    refresh_procfs(env, cpu, &path);
     let base = dir_of(env, dirfd)?;
     let follow = flags & abi::O_NOFOLLOW == 0;
     let resolved = env.vfs.resolve(base, &path, follow)?;
