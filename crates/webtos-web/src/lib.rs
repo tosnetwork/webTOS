@@ -57,6 +57,8 @@ struct HostState {
     fs_image: Vec<u8>,
     /// Paths the next export writes as empty; see `wtw_fs_exclude`.
     fs_excluded: Vec<Vec<u8>>,
+    /// Credentials awaiting `wtw_secrets_apply`, as (name, value, scope).
+    secrets: Vec<(String, String, Vec<Vec<u8>>)>,
     /// Last drained guest output; kept alive so the pointer handed to JS
     /// stays valid until the next drain.
     output: Vec<u8>,
@@ -84,6 +86,7 @@ thread_local! {
             envp: Vec::new(),
             fs_image: Vec::new(),
             fs_excluded: Vec::new(),
+            secrets: Vec::new(),
             output: Vec::new(),
             pty: false,
             trace_text: String::new(),
@@ -413,7 +416,12 @@ pub extern "C" fn wtw_trace_start(sample_every: u32) -> i32 {
 /// Names the image the trace is of, so the recording identifies its subject
 /// exactly as the native recorder does.
 #[no_mangle]
-pub extern "C" fn wtw_trace_image(path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) -> i32 {
+pub extern "C" fn wtw_trace_image(
+    path_ptr: u32,
+    path_len: u32,
+    data_ptr: u32,
+    data_len: u32,
+) -> i32 {
     with_state(|state| {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_trace_image called before wtw_init");
@@ -656,6 +664,64 @@ fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
 
 /// Serializes the guest filesystem for persistence; read the image via
 /// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
+/// Registers a credential the guest receives by placeholder rather than by
+/// having it baked into an image. `${name}` is expanded in the files named by
+/// `wtw_secret_scope` — or in every file when none are named — at
+/// `wtw_secrets_apply`, and redacted back to the placeholder whenever the
+/// filesystem is serialized, so a value never reaches browser storage.
+///
+/// The value is not echoed anywhere: no status message, no log line, no
+/// error text carries it.
+#[no_mangle]
+pub extern "C" fn wtw_secret(name_ptr: u32, name_len: u32, value_ptr: u32, value_len: u32) -> i32 {
+    with_state(|state| {
+        let name = String::from_utf8_lossy(&unsafe { slice_arg(name_ptr, name_len) }).into_owned();
+        let value =
+            String::from_utf8_lossy(&unsafe { slice_arg(value_ptr, value_len) }).into_owned();
+        state.secrets.push((name, value, Vec::new()));
+        0
+    })
+}
+
+/// Restricts the most recently registered secret to one more guest path.
+/// Called once per file the credential belongs in; with no call, the secret
+/// reaches every file.
+#[no_mangle]
+pub extern "C" fn wtw_secret_scope(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let path = unsafe { slice_arg(ptr, len) };
+        match state.secrets.last_mut() {
+            Some((_, _, paths)) => {
+                paths.push(path);
+                0
+            }
+            None => fail(state, "wtw_secret_scope called before wtw_secret"),
+        }
+    })
+}
+
+/// Applies every registered secret to the guest filesystem. Call after the
+/// files that reference the placeholders exist and before `wtw_load`.
+#[no_mangle]
+pub extern "C" fn wtw_secrets_apply() -> i32 {
+    with_state(|state| {
+        let secrets = std::mem::take(&mut state.secrets);
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_secrets_apply called before wtw_init");
+        };
+        for (name, value, paths) in &secrets {
+            let refs: Vec<&[u8]> = paths.iter().map(|p| p.as_slice()).collect();
+            if refs.is_empty() {
+                machine.set_secret(name, value);
+            } else {
+                machine.set_scoped_secret(name, value, &refs);
+            }
+        }
+        machine.expand_secrets();
+        0
+    })
+}
+
 /// Names a file the next `wtw_fs_export` writes as empty. A host that streams
 /// large images into the guest and caches them itself would otherwise carry
 /// them in every snapshot too; it excludes them here and re-injects them after

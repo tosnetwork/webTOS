@@ -582,3 +582,66 @@ fn an_excluded_image_leaves_the_snapshot_without_leaving_the_machine() {
         restored.len()
     );
 }
+
+/// Two agents on one filesystem must not be able to read each other's
+/// credentials. An unscoped secret is expanded into every file, so any
+/// program that can read any file has every key; a scoped one reaches only
+/// the files the host named.
+#[test]
+fn a_scoped_secret_stays_out_of_another_agents_configuration() {
+    let Some(image) = openfox() else { return };
+    let mut machine = machine_with_openfox(image);
+    const MINE: &str = "sk-belongs-to-the-first-agent";
+    const YOURS: &str = "sk-belongs-to-the-second-agent";
+
+    for path in [
+        b"/root/.openfox/config.json".as_slice(),
+        b"/root/.other/config.json",
+    ] {
+        machine
+            .add_file(
+                path,
+                b"{\"key\":\"${AGENT_A_KEY}\",\"other\":\"${AGENT_B_KEY}\"}\n".to_vec(),
+                0o600,
+            )
+            .expect("seed config");
+    }
+    machine.set_scoped_secret("AGENT_A_KEY", MINE, &[b"/root/.openfox/config.json"]);
+    machine.set_scoped_secret("AGENT_B_KEY", YOURS, &[b"/root/.other/config.json"]);
+    machine.expand_secrets();
+
+    let read = |machine: &mut Machine, path: &[u8]| -> String {
+        String::from_utf8_lossy(&machine.env().vfs.read_file(path).expect("read config"))
+            .into_owned()
+    };
+    let mine = read(&mut machine, b"/root/.openfox/config.json");
+    let yours = read(&mut machine, b"/root/.other/config.json");
+
+    assert!(
+        mine.contains(MINE),
+        "the agent did not get its own key: {mine}"
+    );
+    assert!(
+        !mine.contains(YOURS),
+        "the other agent's key leaked into this one's config: {mine}"
+    );
+    assert!(
+        yours.contains(YOURS) && !yours.contains(MINE),
+        "scope did not hold in the other direction: {yours}"
+    );
+    // The unexpanded placeholder is what a program sees for a key it was not
+    // given — not an empty string that might read as "no key configured".
+    assert!(
+        mine.contains("${AGENT_B_KEY}"),
+        "an out-of-scope secret should stay a placeholder: {mine}"
+    );
+
+    // Scope narrows who receives a value, never who redacts it: a snapshot
+    // carries neither key, wherever they ended up.
+    let snapshot = machine.export_fs();
+    let text = String::from_utf8_lossy(&snapshot);
+    assert!(
+        !text.contains(MINE) && !text.contains(YOURS),
+        "a secret reached the snapshot"
+    );
+}

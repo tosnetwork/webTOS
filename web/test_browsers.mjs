@@ -285,7 +285,10 @@ const statusRow = (page) =>
   });
 
 async function runTerminalPhase(page, origin, name, record, gateway, images) {
-  const query = [`gateway=${encodeURIComponent(gateway.url)}`]
+  // A credential the host injects, never baked into an image. The value is
+  // distinctive so the snapshot check below cannot pass by accident.
+  const secret = `sk-webtos-${name}-must-not-persist`;
+  const query = [`gateway=${encodeURIComponent(gateway.url)}`, `secret=${encodeURIComponent(secret)}`]
     .concat(images.agent ? ["image=openfox"] : [])
     .join("&");
   await page.goto(`${origin}/web/terminal.html?${query}`);
@@ -331,6 +334,31 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     );
   }
 
+  // Credentials: the guest gets the value where the host said it belongs,
+  // and the placeholder everywhere else.
+  //
+  // Each command carries its own marker and only the text after the command
+  // echo is read. Waiting for `api_key` alone matched the previous command's
+  // output still on screen, so the second check was reading the first
+  // check's answer.
+  const output = async (command, marker) => {
+    const line = `${command}; echo ${marker}$?`;
+    const screen = await typeLine(page, line, `^${marker}[0-9]+$`);
+    return screen.slice(screen.lastIndexOf(line) + line.length);
+  };
+  const mine = await output("cat /root/.agent/config.json", "scoped-a");
+  record(
+    "secrets: the credential reaches the file the host scoped it to",
+    mine.includes(secret),
+    "expanded from a placeholder at boot, never part of an image",
+  );
+  const other = await output("cat /root/.other/config.json", "scoped-b");
+  record(
+    "secrets: another agent's config keeps the placeholder",
+    !other.includes(secret) && other.includes("${AGENT_KEY}"),
+    "scope is what separates two agents sharing a filesystem",
+  );
+
   // A checkpoint is the session: whatever the guest wrote to disk. Seed the
   // agent's profile before the reload so what comes back is state this
   // session produced, not something the boot sequence re-seeds.
@@ -345,6 +373,19 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
       checkpointed = await page.evaluate(() => window.webtos.checkpoint());
     } catch (e) {
       record("checkpoint: the session is written to browser storage", false, String(e));
+    }
+    if (checkpointed > 0) {
+      // The strongest thing to check about a credential is where it is not.
+      const stored = await page.evaluate(async () => {
+        const root = await navigator.storage.getDirectory();
+        const handle = await root.getFileHandle("webtos-fs.bin");
+        return new TextDecoder().decode(await (await handle.getFile()).arrayBuffer());
+      });
+      record(
+        "secrets: the checkpoint carries the placeholder, not the value",
+        !stored.includes(secret) && stored.includes("${AGENT_KEY}"),
+        "redacted on the way into browser storage",
+      );
     }
     if (checkpointed > 0) {
       // The agent binary is not in here: the image cache already holds it and

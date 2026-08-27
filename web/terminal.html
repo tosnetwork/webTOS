@@ -133,6 +133,16 @@
   const outstanding = new Set(wanted.keys());
 
   const startShell = () => {
+    if (secret) {
+      // Scoped to one file: the second config keeps the placeholder, which is
+      // what stops one agent reading another's credential.
+      worker.postMessage({
+        type: "secrets",
+        secrets: [
+          { name: "AGENT_KEY", value: secret, paths: ["/root/.agent/config.json"] },
+        ],
+      });
+    }
     if (gateway) worker.postMessage({ type: "network", gateway });
     // The guest's terminal is created at the size the tab actually has.
     worker.postMessage({
@@ -251,6 +261,16 @@
   const notes = new TextEncoder().encode(
     "webTOS terminal\n\nThis file lives in the guest filesystem.\n",
   ).buffer;
+  // `?secret=VALUE` injects a credential the way a host would: the guest
+  // config names it by placeholder, the value is expanded in that file only,
+  // and a checkpoint redacts it back — so it never reaches browser storage.
+  const secret = params.get("secret");
+  const agentConfig = new TextEncoder().encode(
+    '{"api_key":"${AGENT_KEY}"}\n',
+  ).buffer;
+  const otherConfig = new TextEncoder().encode(
+    '{"api_key":"${AGENT_KEY}"}\n',
+  ).buffer;
   const resolvConf = new TextEncoder().encode(`nameserver ${resolver}\n`).buffer;
   // One image, many commands: BusyBox picks its applet from argv[0], so each
   // name on PATH is a link to the same binary.
@@ -265,10 +285,17 @@
       files: [
         { path: "/root/notes.txt", bytes: notes },
         { path: "/etc/resolv.conf", bytes: resolvConf },
-      ],
+      ].concat(
+        secret
+          ? [
+              { path: "/root/.agent/config.json", bytes: agentConfig },
+              { path: "/root/.other/config.json", bytes: otherConfig },
+            ]
+          : [],
+      ),
       links: applets.map((name) => ({ path: `/bin/${name}`, target: "/bin/busybox" })),
     },
-    [notes, resolvConf],
+    secret ? [notes, resolvConf, agentConfig, otherConfig] : [notes, resolvConf],
   );
 
   term.focus();

@@ -66,9 +66,9 @@ which together account for about 14 of the 20 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (71 cases, plus soak, measurement, and
+The native test suites (72 cases, plus soak, measurement, and
 trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
-30-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+33-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -87,8 +87,12 @@ what is left is the agent itself.
   proven at 52 MB with OpenFox. Codex is ~258 MB, wants a large guest, and
   needs credentials that must not be baked into an image — so this is a
   memory-budget and secret-handle problem, not a transport one.
-- **Per-agent secret handles.** Credentials mount from a host directory
-  today; the browser path and per-agent scoping are not wired.
+- **Per-agent secret handles.** Scoping and the browser path exist: a
+  credential is expanded only in the files the host names, everything else
+  keeps the placeholder, and a browser host injects one without it entering an
+  image or a snapshot. What is left is the handle proper — the guest still
+  ends up holding the value, so a program that can read its own configuration
+  can read its own key.
 - **The Claude Code profile.** Not started; the Node runtime beneath it runs.
 - **Repository access with real history**, beyond the host `git` binary
   running against a mounted tree.
@@ -685,8 +689,13 @@ Work:
 - Mount a repository with explicit read/write capabilities. 🔶 (host
   directories mount read/write via `run_guest`; a repository with real Git
   history is the next target)
-- Provide controlled environment variables and secret handles. 🔶 (env + M6
-  secret injection exist; per-agent handles not wired)
+- Provide controlled environment variables and secret handles. 🔶 (env and
+  secret injection exist, now scoped per agent — a credential reaches only the
+  files the host names, and an out-of-scope program sees the placeholder
+  rather than an empty value that would read as "no key configured". A browser
+  host injects credentials the same way, gated in all three engines including
+  a read of the stored snapshot itself. The value still lands in the guest
+  filesystem, so this is scoping rather than a handle)
 - Test tool execution, cancellation, interrupted network calls, context
   persistence, browser reload, and checkpoint resume. ⬜
 - Maintain per-version instruction, syscall, and performance regression data.
@@ -698,10 +707,12 @@ Exit gate for each agent:
   delivery mechanism exists and is proven — the OpenFox image streams into a
   clean profile and runs in all three engines. Codex is five times larger and
   has not been carried through it yet)
-- Authentication can be supplied without baking secrets into an image. 🔶
+- Authentication can be supplied without baking secrets into an image. ✅
   (real credentials mount at runtime from a host directory and drive an
-  authenticated model call; per-agent secret handles and the browser path
-  are pending)
+  authenticated model call; a browser host injects them through the same
+  placeholder mechanism, scoped to the files that should have them, and the
+  checkpoint written to browser storage carries the placeholder — checked by
+  reading the stored bytes, in all three engines)
 - The agent reads a repository, edits a file, runs a command, and reports the
   result through the terminal. 🔶 (Codex `exec` does this natively via
   `run_guest`; the browser-profile path remains)

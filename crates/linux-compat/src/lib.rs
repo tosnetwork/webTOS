@@ -109,6 +109,14 @@ impl Regs {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SigAction(pub [u8; 32]);
 
+/// A credential the host injects, and where it is allowed to appear. An
+/// empty `paths` means every file, which is the older unscoped behaviour.
+#[derive(Debug, Clone)]
+pub(crate) struct Secret {
+    pub(crate) value: String,
+    pub(crate) paths: Vec<Vec<u8>>,
+}
+
 pub struct LinuxEnv {
     pub(crate) regs: Regs,
     pub vfs: Vfs,
@@ -121,11 +129,10 @@ pub struct LinuxEnv {
     pub(crate) output: Vec<u8>,
     /// Host network broker; None = network denied (the default).
     pub(crate) net: Option<net::BrokerRef>,
-    /// Secrets injected by the host: `name -> value`. `${name}` in guest
-    /// files is expanded to the value in memory, and redacted back to
-    /// `${name}` when the filesystem is serialized, so secrets never enter
-    /// a snapshot.
-    pub(crate) secrets: std::collections::BTreeMap<String, String>,
+    /// Secrets injected by the host, by name. `${name}` in guest files is
+    /// expanded to the value in memory, and redacted back to `${name}` when
+    /// the filesystem is serialized, so secrets never enter a snapshot.
+    pub(crate) secrets: std::collections::BTreeMap<String, Secret>,
     /// Recent syscalls, as `(pid, nr, icount)` (bounded ring), for crash
     /// and deadlock diagnostics.
     pub(crate) syscall_trail: std::collections::VecDeque<(u64, u64, u64)>,
@@ -203,32 +210,70 @@ impl LinuxEnv {
         self.epoch_base_sec = unix_sec;
     }
 
-    /// Registers a secret. `${name}` in any guest file is expanded to
-    /// `value` in memory (see `expand_secrets`), and redacted back to the
-    /// placeholder in serialized snapshots, so the value never persists.
+    /// Registers a secret readable by every guest file that names it.
+    /// Prefer [`LinuxEnv::set_scoped_secret`]: an unscoped secret reaches any
+    /// program that can read any file, which is not a boundary between two
+    /// agents sharing a machine.
     pub fn set_secret(&mut self, name: &str, value: &str) {
-        self.secrets.insert(name.to_string(), value.to_string());
+        self.secrets.insert(
+            name.to_string(),
+            Secret {
+                value: value.to_string(),
+                paths: Vec::new(),
+            },
+        );
     }
 
-    /// Expands `${name}` placeholders in every regular file using the
-    /// registered secrets. Call after seeding files and before `load`.
+    /// Registers a secret that is expanded only in the files named here.
+    ///
+    /// This is what keeps one agent's credential out of another's
+    /// configuration on the same filesystem: the placeholder is substituted
+    /// where the host says it belongs and nowhere else, so a program that
+    /// reads a file it was not given still sees `${name}`.
+    pub fn set_scoped_secret(&mut self, name: &str, value: &str, paths: &[&[u8]]) {
+        self.secrets.insert(
+            name.to_string(),
+            Secret {
+                value: value.to_string(),
+                paths: paths.iter().map(|p| p.to_vec()).collect(),
+            },
+        );
+    }
+
+    /// Expands `${name}` placeholders using the registered secrets: in every
+    /// regular file for an unscoped secret, and only in its own files for a
+    /// scoped one. Call after seeding files and before `load`.
     pub fn expand_secrets(&mut self) {
         if self.secrets.is_empty() {
             return;
         }
-        let subs: Vec<(String, String)> = self
-            .secrets
-            .iter()
-            .map(|(name, value)| (format!("${{{name}}}"), value.clone()))
-            .collect();
-        self.vfs.rewrite_files(&subs);
+        let mut everywhere: Vec<(String, String)> = Vec::new();
+        let mut scoped: Vec<(Vec<u8>, (String, String))> = Vec::new();
+        for (name, secret) in &self.secrets {
+            let sub = (format!("${{{name}}}"), secret.value.clone());
+            if secret.paths.is_empty() {
+                everywhere.push(sub);
+            } else {
+                for path in &secret.paths {
+                    scoped.push((path.clone(), sub.clone()));
+                }
+            }
+        }
+        if !everywhere.is_empty() {
+            self.vfs.rewrite_files(&everywhere);
+        }
+        for (path, sub) in scoped {
+            self.vfs.rewrite_file(&path, std::slice::from_ref(&sub));
+        }
     }
 
-    /// The reverse map (`value -> ${name}`) used to redact snapshots.
+    /// The reverse map (`value -> ${name}`) used to redact snapshots. Scope
+    /// does not narrow this: wherever a value ended up, a snapshot must not
+    /// carry it.
     pub(crate) fn secret_redactions(&self) -> Vec<(String, String)> {
         self.secrets
             .iter()
-            .map(|(name, value)| (value.clone(), format!("${{{name}}}")))
+            .map(|(name, secret)| (secret.value.clone(), format!("${{{name}}}")))
             .collect()
     }
 
@@ -990,6 +1035,13 @@ impl Machine {
         self.env().set_secret(name, value);
     }
 
+    /// Registers a secret that only the named files receive, so one agent's
+    /// credential stays out of another's configuration.
+    /// See [`LinuxEnv::set_scoped_secret`].
+    pub fn set_scoped_secret(&mut self, name: &str, value: &str, paths: &[&[u8]]) {
+        self.env().set_scoped_secret(name, value, paths);
+    }
+
     /// Expands `${name}` secret placeholders in guest files. Call after
     /// seeding files and before `load`.
     pub fn expand_secrets(&mut self) {
@@ -1161,9 +1213,9 @@ impl Machine {
         ));
         // Secrets are never in the trail or the fields above; nothing to
         // redact, but assert the invariant if a value happens to appear.
-        for value in self.env().secrets.values() {
+        for secret in self.env().secrets.values() {
             debug_assert!(
-                !bundle.contains(value.as_str()),
+                !bundle.contains(secret.value.as_str()),
                 "secret leaked into crash bundle"
             );
         }

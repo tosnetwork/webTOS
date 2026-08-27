@@ -485,6 +485,15 @@ impl Vfs {
     /// Applies literal substitutions to every regular file's contents.
     /// Used for secret injection (`${name}` -> value) and its inverse
     /// (redaction before serialization).
+    /// A file's contents, or None when the path is not a file.
+    pub fn read_file(&self, path: &[u8]) -> Option<&[u8]> {
+        let node = self.resolve(ROOT, path, true).ok()?.node?;
+        match &self.nodes.get(node)?.kind {
+            NodeKind::File(data) => Some(data),
+            _ => None,
+        }
+    }
+
     /// Moves a file's contents out of the tree, returning them, or None when
     /// the path is not a file. Used to keep host-supplied images out of a
     /// snapshot: the bytes are moved, not copied, and moved back afterwards.
@@ -507,6 +516,25 @@ impl Vfs {
         if let NodeKind::File(existing) = &mut node.kind {
             *existing = data;
         }
+    }
+
+    /// Applies substitutions to one file. Used to give a secret a scope:
+    /// the value is written where the host says it belongs and nowhere else.
+    pub fn rewrite_file(&mut self, path: &[u8], subs: &[(String, String)]) {
+        let Some(data) = self.take_file_contents(path) else {
+            return;
+        };
+        let replaced = match std::str::from_utf8(&data) {
+            Ok(text) => {
+                let mut out = text.to_string();
+                for (from, to) in subs {
+                    out = out.replace(from.as_str(), to);
+                }
+                out.into_bytes()
+            }
+            Err(_) => data, // never touch binary files
+        };
+        self.put_file_contents(path, replaced);
     }
 
     pub fn rewrite_files(&mut self, subs: &[(String, String)]) {

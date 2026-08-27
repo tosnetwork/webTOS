@@ -22,6 +22,9 @@
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //                                        (images this worker cached are left
 //                                        out; boot re-injects them)
+//               { type: "secrets", secrets: [{ name, value, paths? }] }
+//                                     -- inject credentials by placeholder;
+//                                        values never reach storage or a log
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
 //               { type: "output", text },
@@ -330,6 +333,26 @@ async function boot(files, links = []) {
       (restored ? " — filesystem restored from the previous session" : ""),
   });
   postMessage({ type: "ready", restored, storage: storageReady });
+}
+
+/// Registers credentials with the guest and expands their placeholders.
+///
+/// The values are handed to the module and dropped here: nothing keeps a copy
+/// in the worker, and no message, status line, or error carries one. A
+/// snapshot redacts them back to `${name}`, so they never reach OPFS either.
+function applySecrets(secrets) {
+  for (const { name, value, paths = [] } of secrets ?? []) {
+    if (exports.wtw_secret(...put(name), ...put(value)) !== 0) {
+      throw new Error(`secret ${name}: ${lastError()}`);
+    }
+    for (const path of paths) {
+      if (exports.wtw_secret_scope(...put(path)) !== 0) {
+        throw new Error(`secret ${name} scope: ${lastError()}`);
+      }
+    }
+  }
+  if (exports.wtw_secrets_apply() !== 0) throw new Error(`secrets: ${lastError()}`);
+  postMessage({ type: "status", text: `${(secrets ?? []).length} credential(s) injected` });
 }
 
 async function persist() {
@@ -733,6 +756,7 @@ self.onmessage = async (event) => {
     }
     if (msg.type === "input") input(msg.data);
     if (msg.type === "resize") resize(msg.rows, msg.cols);
+    if (msg.type === "secrets") applySecrets(msg.secrets);
     if (msg.type === "persist") await persist();
     if (msg.type === "forget") {
       if (!storageReady) throw new Error("browser storage is unavailable here");
