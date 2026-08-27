@@ -37,7 +37,7 @@ terminal behavior, and recovery after a browser reload.
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
-| M4 Threads & processes | ✅ | ~88% | green incl. determinism and adversarial COW/fd-sharing/backpressure gates; multi-worker deferred |
+| M4 Threads & processes | 🔶 | ~84% | determinism and adversarial COW/fd-sharing/backpressure gates green, but two SIGCHLD gates fail on a current x86-64 Linux toolchain — see *A gate that only fails where it runs* below; multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~74% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
@@ -54,12 +54,12 @@ call, so here is the arithmetic rather than the assertion:
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 90% | 9.0 |
-| M4 Threads & processes | 13% | 88% | 11.4 |
+| M4 Threads & processes | 13% | 84% | 10.9 |
 | M5 Event loop & networking | 13% | 90% | 11.7 |
 | M6 OpenFox | 12% | 92% | 11.0 |
 | M7 Codex & Claude Code | 20% | 74% | 14.8 |
 | M8 Performance & release | 14% | 30% | 4.2 |
-| **Total** | **100%** | | **78.2** |
+| **Total** | **100%** | | **77.7** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 17 of the 25 points outstanding. Progress from
@@ -130,8 +130,40 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   rather than only against another run.
 - **Versioned fixtures.** They exist; they are not a formal, pinned set.
 - **Native QEMU validation** has not been re-run since the browser pivot.
+- **A Linux host in the loop.** Every test whose fixture is compiled by the
+  host `gcc` skips silently on macOS, which is where the browser work is
+  done. That is how two failing gates went unnoticed; the suite needs to run
+  somewhere it cannot skip.
 - **A compatibility dashboard** across engines and pinned workload versions.
   The measurement harnesses exist; nothing publishes them.
+
+### A gate that only fails where it runs
+
+Two milestone-4 tests — `sigchld_self_pipe_wakes_a_parent_not_in_wait` and
+`failed_exec_releases_vfork_parent_and_raises_sigchld` — **fail on x86-64
+Linux** with a current toolchain (Ubuntu, gcc 15.2, static glibc). The guest
+stops with an unresolved `ExternalAddr` while a SIGCHLD handler is being
+delivered.
+
+Three things make this worth writing down rather than filing away:
+
+- **It is not new.** It reproduces at `429d576`, well before the browser work
+  began. The status table said these gates were green because nobody had run
+  them on such a host recently.
+- **It is invisible on macOS.** Both compile their fixture with the host
+  `gcc`, which cannot produce a static Linux binary there, so the tests
+  return early and report success. A developer on a Mac — which is where the
+  browser work happens — sees a fully green suite.
+- **It is not the obvious cause.** Rebuilding the fixture with `-O0
+  -march=x86-64` does not fix it, so it is not the engine failing on modern
+  instruction selection. The likeliest explanation is the deliberately
+  minimal signal frame: the code builds zeroed `siginfo`/`ucontext`
+  structures because the handlers tested against only needed a wakeup byte,
+  and a newer static glibc's restorer path evidently needs more.
+
+Until it is understood, M4 is marked partial. Reproduce with
+`cargo test -p linux-compat --release --test process` on an x86-64 Linux host
+with `test_data/alpine-minirootfs` present.
 
 ### Not scoped by any milestone
 
