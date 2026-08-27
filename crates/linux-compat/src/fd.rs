@@ -199,6 +199,59 @@ pub struct EventFdInner {
 
 pub type EventFdRef = Rc<RefCell<EventFdInner>>;
 
+/// One watch: the path a program asked about and the events it asked for.
+#[derive(Debug, Clone)]
+pub struct Watch {
+    pub descriptor: i32,
+    /// The node being watched. A watch follows the file, not the name: the
+    /// kernel watches an inode, so renaming what is watched does not move the
+    /// watch, and two names for one file are one watch.
+    pub node: usize,
+    /// The path it was asked for, kept so a program can be told what it
+    /// asked about rather than a number it never chose.
+    pub path: Vec<u8>,
+    pub mask: u32,
+}
+
+/// An inotify instance: what a program is watching, and what has happened
+/// that it has not read yet.
+///
+/// Events are queued rather than delivered, because a watcher reads on its
+/// own schedule and the change that interests it happens on someone else's.
+/// The queue has a ceiling: a program that stops reading must not be able to
+/// grow this without end, and the kernel answers that case with `IN_Q_OVERFLOW`
+/// — one event that says "you missed some" rather than a silent gap.
+#[derive(Debug, Default)]
+pub struct InotifyInner {
+    pub watches: Vec<Watch>,
+    /// Next watch descriptor. Kernel descriptors start at 1 and do not
+    /// repeat while an instance lives, so a stale one is recognisably stale.
+    pub next_descriptor: i32,
+    pub queue: std::collections::VecDeque<InotifyEvent>,
+    /// Set when the queue filled and events were dropped; the next read
+    /// reports the overflow before anything else.
+    pub overflowed: bool,
+    /// Monotone change counter; edge-triggered epoll re-arms on it.
+    pub activity: u64,
+}
+
+/// A queued event, in the shape `read` will serialise it.
+#[derive(Debug, Clone)]
+pub struct InotifyEvent {
+    pub descriptor: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    /// The entry within a watched directory, empty when the watch is on the
+    /// file itself.
+    pub name: Vec<u8>,
+}
+
+/// The most events one instance will hold. Past this the queue drops and says
+/// so, which is what the kernel does and what a watcher already handles.
+pub const INOTIFY_QUEUE_LIMIT: usize = 16384;
+
+pub type InotifyRef = Rc<RefCell<InotifyInner>>;
+
 /// timerfd state; times are deterministic nanoseconds (see `LinuxEnv::now`).
 #[derive(Debug, Default)]
 pub struct TimerFdInner {
@@ -292,6 +345,8 @@ pub enum Backing {
     PtyMaster(PtyRef),
     /// Pseudoterminal slave (`/dev/pts/N`): the process side of the terminal.
     PtySlave(PtyRef),
+    /// inotify instance: watches, and the events they have collected.
+    Inotify(InotifyRef),
 }
 
 #[derive(Debug)]

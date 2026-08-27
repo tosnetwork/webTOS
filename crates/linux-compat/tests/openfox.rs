@@ -446,8 +446,14 @@ int main(void) {
 }
 
 /// A compressed soak: OpenFox runs many short commands back to back on one
-/// machine. The filesystem must not grow without bound between runs
-/// (proxy for the 60-minute interactive soak the milestone calls for).
+/// machine. Nothing that accumulates may grow without bound between runs —
+/// the filesystem, the guest's physical pages, the block table, and the event
+/// log, which is the one a workload can grow arbitrarily while doing nothing
+/// wrong.
+///
+/// `OPENFOX_SOAK_ROUNDS=1000` is about an hour; the milestone asks for
+/// several. A long run is where a bound that only looks flat separates from
+/// one that is.
 #[test]
 #[ignore = "slow soak; run explicitly with --ignored"]
 fn openfox_soak_is_bounded() {
@@ -464,6 +470,14 @@ fn openfox_soak_is_bounded() {
     machine
         .add_file(b"/root/.openfox/config.json", b"{}\n".to_vec(), 0o644)
         .expect("seed config");
+
+    // The event log is recorded for the whole soak with a ceiling on it, so
+    // the run gates the ceiling rather than merely avoiding the question by
+    // not recording. A round issues tens of syscalls; a thousand rounds would
+    // hold hundreds of thousands of events without one.
+    const EVENT_CEILING: usize = 256;
+    machine.set_event_log_budget(Some(EVENT_CEILING));
+    machine.record_trace(0);
 
     let mut prev_fs = machine.export_fs().len();
     let mut first_guest_mb = None;
@@ -498,6 +512,16 @@ fn openfox_soak_is_bounded() {
         // ever counted — and a long run really does reach it, because the
         // entry counter never decays and every address eventually crosses the
         // threshold.
+        // The log holds what it was allowed and no more, and says how much
+        // it turned away — an unbounded log is how a long session dies with
+        // everything else in order.
+        let held = machine.event_log_len();
+        assert!(
+            held <= EVENT_CEILING,
+            "the event log holds {held} events against a ceiling of \
+             {EVENT_CEILING} on round {round}"
+        );
+
         let st = machine.vm_mut().lift_stats();
         assert!(
             st.promoted <= st.counted,
@@ -520,6 +544,20 @@ fn openfox_soak_is_bounded() {
             st.counted
         );
     }
+
+    // The ceiling has to have been reached, or the soak proved only that a
+    // log below its ceiling stays below it.
+    let dropped = machine.event_log_dropped();
+    assert!(
+        dropped > 0,
+        "the event log turned nothing away over {rounds} rounds, so this soak \
+         does not gate its ceiling"
+    );
+    println!(
+        "soak: {rounds} rounds, event log held {} of {} events, {dropped} turned away",
+        machine.event_log_len(),
+        machine.event_log_len() as u64 + dropped,
+    );
 }
 
 /// A browser streams the agent image into the guest and caches it separately,

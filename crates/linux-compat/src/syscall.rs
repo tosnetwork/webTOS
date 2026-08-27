@@ -351,6 +351,10 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
 
         abi::SYS_EVENTFD => sys_eventfd(env, a[0], 0),
         abi::SYS_EVENTFD2 => sys_eventfd(env, a[0], a[1]),
+        abi::SYS_INOTIFY_INIT => sys_inotify_init(env, 0),
+        abi::SYS_INOTIFY_INIT1 => sys_inotify_init(env, a[0]),
+        abi::SYS_INOTIFY_ADD_WATCH => sys_inotify_add_watch(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_INOTIFY_RM_WATCH => sys_inotify_rm_watch(env, a[0], a[1]),
         abi::SYS_TIMERFD_CREATE => sys_timerfd_create(env, a[0], a[1]),
         abi::SYS_TIMERFD_SETTIME => sys_timerfd_settime(env, cpu, a),
         abi::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(env, cpu, a[0], a[1]),
@@ -525,6 +529,190 @@ fn path_arg(cpu: &mut Cpu, ptr: u64) -> Result<Vec<u8>, u64> {
 
 // ── File I/O ────────────────────────────────────────────────────────────────
 
+/// Creates an inotify instance. `flags` carries `O_NONBLOCK` and `O_CLOEXEC`
+/// in the same bits `open` uses.
+fn sys_inotify_init(env: &mut LinuxEnv, flags: u64) -> SysResult {
+    let inner = std::rc::Rc::new(std::cell::RefCell::new(crate::fd::InotifyInner {
+        next_descriptor: 1,
+        ..Default::default()
+    }));
+    env.inotify.push(std::rc::Rc::clone(&inner));
+    install_fd(
+        env,
+        Backing::Inotify(inner),
+        abi::O_RDONLY | (flags & abi::O_NONBLOCK),
+        flags & abi::O_CLOEXEC != 0,
+    )
+}
+
+/// Adds or updates a watch. Returns the watch descriptor, which is what a
+/// later event carries and what `inotify_rm_watch` takes.
+///
+/// Watching a path that is already watched updates the existing watch and
+/// returns the same descriptor, because the kernel watches an inode and a
+/// second request names the same one.
+fn sys_inotify_add_watch(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    fd: u64,
+    path_ptr: u64,
+    mask: u64,
+) -> SysResult {
+    let path = read_cstr(cpu, path_ptr)?;
+    let node = env
+        .vfs
+        .resolve(crate::vfs::ROOT, &path, true)?
+        .node
+        .ok_or(abi::ENOENT)?;
+    // A mask with no event bits watches nothing, which is a request the
+    // kernel refuses rather than silently honouring.
+    let mask = (mask as u32) & abi::IN_ALL_EVENTS;
+    if mask == 0 {
+        return Err(abi::EINVAL);
+    }
+    let inner = inotify_of(env, fd)?;
+    let mut inner = inner.borrow_mut();
+    if let Some(existing) = inner.watches.iter_mut().find(|watch| watch.node == node) {
+        existing.mask = mask;
+        existing.path = path;
+        return Ok(existing.descriptor as u64);
+    }
+    let descriptor = inner.next_descriptor;
+    inner.next_descriptor += 1;
+    inner.watches.push(crate::fd::Watch {
+        descriptor,
+        node,
+        path,
+        mask,
+    });
+    Ok(descriptor as u64)
+}
+
+fn sys_inotify_rm_watch(env: &mut LinuxEnv, fd: u64, descriptor: u64) -> SysResult {
+    let descriptor = descriptor as u32 as i32;
+    let inner = inotify_of(env, fd)?;
+    let mut inner = inner.borrow_mut();
+    let before = inner.watches.len();
+    inner.watches.retain(|watch| watch.descriptor != descriptor);
+    if inner.watches.len() == before {
+        return Err(abi::EINVAL);
+    }
+    // Events already queued for a removed watch are dropped: a program that
+    // stopped watching asked not to hear about it.
+    inner.queue.retain(|event| event.descriptor != descriptor);
+    Ok(0)
+}
+
+fn inotify_of(env: &LinuxEnv, fd: u64) -> Result<crate::fd::InotifyRef, u64> {
+    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let backing = &desc.borrow().backing;
+    match backing {
+        Backing::Inotify(inner) => Ok(std::rc::Rc::clone(inner)),
+        _ => Err(abi::EINVAL),
+    }
+}
+
+/// Tells every watcher that something happened to `node`, or to `name` inside
+/// it when `name` is given.
+///
+/// Both halves are needed and they are different questions: a program
+/// watching a file wants to know the file changed, and a program watching a
+/// directory wants to know which entry did. The kernel answers both from one
+/// event, distinguished by whether the name field is empty.
+pub(crate) fn notify_inotify(env: &mut LinuxEnv, node: usize, name: &[u8], mask: u32, cookie: u32) {
+    if env.inotify.is_empty() {
+        return;
+    }
+    // Instances no descriptor holds any more are the registry's own to drop.
+    env.inotify
+        .retain(|inner| std::rc::Rc::strong_count(inner) > 1);
+    for inner in &env.inotify {
+        let mut inner = inner.borrow_mut();
+        let matched: Vec<(i32, u32)> = inner
+            .watches
+            .iter()
+            .filter(|watch| watch.node == node && watch.mask & mask != 0)
+            .map(|watch| (watch.descriptor, mask))
+            .collect();
+        for (descriptor, mask) in matched {
+            if inner.queue.len() >= crate::fd::INOTIFY_QUEUE_LIMIT {
+                // Losing events is bad; losing them quietly is worse. The
+                // next read says so before it says anything else.
+                inner.overflowed = true;
+                break;
+            }
+            inner.queue.push_back(crate::fd::InotifyEvent {
+                descriptor,
+                mask,
+                cookie,
+                name: name.to_vec(),
+            });
+        }
+        inner.activity += 1;
+    }
+}
+
+/// A cookie pairing the two halves of a rename.
+fn next_inotify_cookie(env: &mut LinuxEnv) -> u32 {
+    env.inotify_cookie = env.inotify_cookie.wrapping_add(1).max(1);
+    env.inotify_cookie
+}
+
+/// Serialises queued events into the shape a watcher reads:
+/// `struct inotify_event { int wd; uint32_t mask, cookie, len; char name[len]; }`
+/// with the name NUL-terminated and padded so the next record is aligned.
+///
+/// The kernel refuses a buffer too small for the first event rather than
+/// returning a partial one — a half record is not something a reader can
+/// resynchronise from — and returns as many whole events as fit otherwise.
+fn read_inotify(inner: &mut crate::fd::InotifyInner, buf_len: usize) -> Result<Vec<u8>, u64> {
+    const HEADER: usize = 16;
+    // An overflow is announced before the events that survived it, so a
+    // reader learns it has a gap before it acts on what came after.
+    if inner.overflowed {
+        inner.overflowed = false;
+        inner.queue.push_front(crate::fd::InotifyEvent {
+            descriptor: -1,
+            mask: abi::IN_Q_OVERFLOW,
+            cookie: 0,
+            name: Vec::new(),
+        });
+    }
+    if inner.queue.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    while let Some(event) = inner.queue.front() {
+        // The name is NUL-terminated and padded to a multiple of the header's
+        // alignment, so the record after it starts where a reader expects.
+        let name_len = if event.name.is_empty() {
+            0
+        } else {
+            (event.name.len() + 1).next_multiple_of(16)
+        };
+        let record = HEADER + name_len;
+        if out.is_empty() && record > buf_len {
+            // Nothing fits, not even the first. Say so rather than hand back
+            // a fragment of a record.
+            return Err(abi::EINVAL);
+        }
+        if out.len() + record > buf_len {
+            break;
+        }
+        let event = inner.queue.pop_front().expect("front was Some");
+        out.extend_from_slice(&event.descriptor.to_le_bytes());
+        out.extend_from_slice(&event.mask.to_le_bytes());
+        out.extend_from_slice(&event.cookie.to_le_bytes());
+        out.extend_from_slice(&(name_len as u32).to_le_bytes());
+        if name_len > 0 {
+            out.extend_from_slice(&event.name);
+            out.resize(out.len() + (name_len - event.name.len()), 0);
+        }
+    }
+    inner.activity += 1;
+    Ok(out)
+}
+
 fn read_backing(
     env: &mut LinuxEnv,
     desc: &mut Description,
@@ -533,6 +721,7 @@ fn read_backing(
     match &mut desc.backing {
         Backing::Std(StdStream::In) => Ok(Vec::new()),
         Backing::Std(_) => Err(abi::EBADF),
+        Backing::Inotify(inner) => read_inotify(&mut inner.borrow_mut(), buf_len),
         Backing::File { node } => {
             let NodeKind::File(data) = &env.vfs.node(*node).kind else {
                 return Err(abi::EIO);
@@ -574,6 +763,10 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
     }
     match &mut desc.backing {
         Backing::Std(StdStream::In) => Err(abi::EBADF),
+        // An inotify instance is something to read from. The kernel refuses
+        // a write to one, and a program that tries has misunderstood the fd
+        // it is holding rather than asked for something reasonable.
+        Backing::Inotify(_) => Err(abi::EBADF),
         Backing::Std(_) | Backing::Dev(Dev::Tty) => {
             env.output.extend_from_slice(bytes);
             Ok(bytes.len() as u64)
@@ -608,6 +801,9 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             }
             data[start..end].copy_from_slice(bytes);
             desc.offset = end as u64;
+            // The change reaches a watcher only if something tells it. This
+            // is the write path, so it is the one place that knows.
+            notify_inotify(env, node, b"", abi::IN_MODIFY, 0);
             Ok(bytes.len() as u64)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
@@ -1038,12 +1234,16 @@ fn sys_openat(
                 return Err(abi::ENOENT);
             }
             let mode = (mode as u32) & 0o777 & !env.proc.umask;
-            env.vfs.create(
+            let created = env.vfs.create(
                 resolved.parent,
                 &resolved.name,
                 NodeKind::File(Vec::new()),
                 mode,
-            )?
+            )?;
+            // A watcher on the directory wants the entry's name; one on the
+            // new file cannot exist yet, since it had nothing to watch.
+            notify_inotify(env, resolved.parent, &resolved.name, abi::IN_CREATE, 0);
+            created
         }
     };
 
@@ -1204,15 +1404,17 @@ fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
             blksize: 4096,
             ..Default::default()
         },
-        // Anonymous inodes (eventfd/timerfd/epoll).
-        Backing::EventFd(_) | Backing::TimerFd(_) | Backing::Epoll(_) => abi::Stat {
-            dev: 1,
-            ino: u64::MAX - 3,
-            nlink: 1,
-            mode: 0o600,
-            blksize: 4096,
-            ..Default::default()
-        },
+        // Anonymous inodes (eventfd/timerfd/epoll/inotify).
+        Backing::EventFd(_) | Backing::TimerFd(_) | Backing::Epoll(_) | Backing::Inotify(_) => {
+            abi::Stat {
+                dev: 1,
+                ino: u64::MAX - 3,
+                nlink: 1,
+                mode: 0o600,
+                blksize: 4096,
+                ..Default::default()
+            }
+        }
     })
 }
 
@@ -1366,11 +1568,26 @@ fn sys_unlinkat(
     let path = path_arg(cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, false)?;
+    let gone = resolved.node;
+    let was_dir = gone.is_some_and(|node| env.vfs.is_dir(node));
     env.vfs.unlink(
         resolved.parent,
         &resolved.name,
         flags & abi::AT_REMOVEDIR != 0,
     )?;
+    let dir_bit = if was_dir { abi::IN_ISDIR } else { 0 };
+    notify_inotify(
+        env,
+        resolved.parent,
+        &resolved.name,
+        abi::IN_DELETE | dir_bit,
+        0,
+    );
+    if let Some(node) = gone {
+        // The watch on the thing itself outlives the name, so it is told
+        // separately that the thing it was watching is gone.
+        notify_inotify(env, node, b"", abi::IN_DELETE_SELF, 0);
+    }
     // Usually nothing had it open and the bytes go now; when something does,
     // the close reclaims them.
     env.reclaim_unlinked();
@@ -1391,9 +1608,32 @@ fn sys_renameat(
     let new_base = dir_of(env, new_dirfd)?;
     let old = env.vfs.resolve(old_base, &old_path, false)?;
     let new = env.vfs.resolve(new_base, &new_path, false)?;
+    let moved = old.node;
+    let was_dir = moved.is_some_and(|node| env.vfs.is_dir(node));
     env.vfs
-        .rename(old.parent, &old.name, new.parent, &new.name)
-        .map(|_| 0)
+        .rename(old.parent, &old.name, new.parent, &new.name)?;
+    // The two halves share a cookie, which is the only thing that lets a
+    // watcher tell a rename from a delete followed by an unrelated create.
+    let cookie = next_inotify_cookie(env);
+    let dir_bit = if was_dir { abi::IN_ISDIR } else { 0 };
+    notify_inotify(
+        env,
+        old.parent,
+        &old.name,
+        abi::IN_MOVED_FROM | dir_bit,
+        cookie,
+    );
+    notify_inotify(
+        env,
+        new.parent,
+        &new.name,
+        abi::IN_MOVED_TO | dir_bit,
+        cookie,
+    );
+    if let Some(node) = moved {
+        notify_inotify(env, node, b"", abi::IN_MOVE_SELF, 0);
+    }
+    Ok(0)
 }
 
 fn sys_linkat(
@@ -1835,6 +2075,7 @@ fn backing_activity(desc: &Description) -> u64 {
         Backing::Pipe { inner, .. } => inner.borrow().activity,
         Backing::SocketPair { rx, tx } => rx.borrow().activity + tx.borrow().activity,
         Backing::EventFd(event) => event.borrow().activity,
+        Backing::Inotify(inner) => inner.borrow().activity,
         Backing::Net(socket) => socket.borrow().activity,
         Backing::PtyMaster(pty) | Backing::PtySlave(pty) => pty.borrow().activity,
         _ => 0,
@@ -1880,6 +2121,7 @@ fn read_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
         Backing::Net(socket) => Some(Watch::NetReadable(socket.clone())),
         Backing::PtyMaster(pty) => Some(Watch::PtyReadable(pty.clone(), true)),
         Backing::PtySlave(pty) => Some(Watch::PtyReadable(pty.clone(), false)),
+        Backing::Inotify(inner) => Some(Watch::InotifyReadable(inner.clone())),
         _ => None,
     }
 }
@@ -2658,6 +2900,12 @@ fn dump_parked(env: &LinuxEnv) {
                         crate::proc::Watch::Event(e) => {
                             format!("event(count={})", e.borrow().count)
                         }
+                        crate::proc::Watch::InotifyReadable(i) => {
+                            format!("inotifyR(queued={})", i.borrow().queue.len())
+                        }
+                        crate::proc::Watch::InotifyActivity(i, seen) => {
+                            format!("inotifyA(now={},seen={seen})", i.borrow().activity)
+                        }
                         crate::proc::Watch::Timer(t) => {
                             format!("timer(next={:?})", t.borrow().next_expiry)
                         }
@@ -2712,6 +2960,14 @@ fn dump_parked(env: &LinuxEnv) {
                 Backing::File { node } => format!("file(node={node})"),
                 Backing::Dir { node, .. } => format!("dir(node={node})"),
                 Backing::Dev(d) => format!("dev({d:?})"),
+                Backing::Inotify(inner) => {
+                    let i = inner.borrow();
+                    format!(
+                        "inotify(watches={}, queued={})",
+                        i.watches.len(),
+                        i.queue.len()
+                    )
+                }
                 Backing::Pipe { inner, write_end } => {
                     let p = inner.borrow();
                     format!(

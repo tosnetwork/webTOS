@@ -222,6 +222,11 @@ pub enum Watch {
     PtyReadable(PtyRef, bool),
     /// Fires when a pty's activity counter moves past the recorded value.
     PtyActivity(PtyRef, u64),
+    /// An inotify instance with something to read.
+    InotifyReadable(crate::fd::InotifyRef),
+    /// Fires when an inotify instance's activity counter moves past the
+    /// recorded value.
+    InotifyActivity(crate::fd::InotifyRef, u64),
     /// Immediately ready (regular files and similar).
     Always,
 }
@@ -257,6 +262,11 @@ impl Watch {
                 }
             }
             Watch::PtyActivity(pty, seen) => pty.borrow().activity != *seen,
+            Watch::InotifyReadable(inner) => {
+                let inner = inner.borrow();
+                !inner.queue.is_empty() || inner.overflowed
+            }
+            Watch::InotifyActivity(inner, seen) => inner.borrow().activity != *seen,
             Watch::Always => true,
         }
     }

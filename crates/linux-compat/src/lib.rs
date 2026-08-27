@@ -160,6 +160,13 @@ pub struct LinuxEnv {
     /// fixed instant for reproducibility; hosts override it with the real
     /// wall clock when the guest talks to real services.
     pub(crate) epoch_base_sec: i64,
+    /// Live inotify instances. A change to the filesystem has to reach every
+    /// watcher, and a watcher is reachable only through the descriptor that
+    /// holds it — so they are registered here as well, and entries no
+    /// descriptor holds any more are dropped when the list is next walked.
+    pub(crate) inotify: Vec<crate::fd::InotifyRef>,
+    /// A rename's two halves share a cookie so a watcher can pair them.
+    pub(crate) inotify_cookie: u32,
     /// Live pseudoterminals, keyed by id (`/dev/pts/<id>`), for slave lookup.
     pub(crate) ptys: std::collections::BTreeMap<u64, fd::PtyRef>,
     pub(crate) next_pty_id: u64,
@@ -206,6 +213,8 @@ impl LinuxEnv {
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
             epoch_base_sec: EPOCH_BASE_SEC,
+            inotify: Vec::new(),
+            inotify_cookie: 0,
             ptys: std::collections::BTreeMap::new(),
             next_pty_id: 0,
             stdio_pty: None,
@@ -1170,6 +1179,14 @@ impl Machine {
     /// recorded. Zero when the log kept up.
     pub fn event_log_dropped(&mut self) -> u64 {
         self.env().trace.as_ref().map_or(0, trace::Trace::dropped)
+    }
+
+    /// Events the log is holding. Zero when nothing is being recorded.
+    pub fn event_log_len(&mut self) -> usize {
+        self.env()
+            .trace
+            .as_ref()
+            .map_or(0, |trace| trace.events().len())
     }
 
     /// Rejects an addition that would not fit, naming what it would cost and

@@ -139,6 +139,10 @@ pub const SYS_EVENTFD: u64 = 284;
 pub const SYS_TIMERFD_SETTIME: u64 = 286;
 pub const SYS_TIMERFD_GETTIME: u64 = 287;
 pub const SYS_ACCEPT4: u64 = 288;
+pub const SYS_INOTIFY_INIT: u64 = 253;
+pub const SYS_INOTIFY_ADD_WATCH: u64 = 254;
+pub const SYS_INOTIFY_RM_WATCH: u64 = 255;
+pub const SYS_INOTIFY_INIT1: u64 = 294;
 pub const SYS_EVENTFD2: u64 = 290;
 pub const SYS_EPOLL_CREATE1: u64 = 291;
 pub const SYS_PIPE2: u64 = 293;
@@ -230,6 +234,27 @@ pub const F_DUPFD_CLOEXEC: u64 = 1030;
 pub const FD_CLOEXEC: u64 = 1;
 
 // ── ioctl(2) ────────────────────────────────────────────────────────────────
+// inotify event bits, as `<sys/inotify.h>` defines them.
+pub const IN_ACCESS: u32 = 0x0000_0001;
+pub const IN_MODIFY: u32 = 0x0000_0002;
+pub const IN_ATTRIB: u32 = 0x0000_0004;
+pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+pub const IN_OPEN: u32 = 0x0000_0020;
+pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+pub const IN_MOVED_TO: u32 = 0x0000_0080;
+pub const IN_CREATE: u32 = 0x0000_0100;
+pub const IN_DELETE: u32 = 0x0000_0200;
+pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+/// Set by the kernel on an event about an entry that is itself a directory.
+pub const IN_ISDIR: u32 = 0x4000_0000;
+/// The queue filled and events were lost.
+pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+/// Everything a watcher can ask for, so a mask of zero or of `IN_ALL_EVENTS`
+/// means the same thing to the code that matches on it.
+pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+
 pub const TCGETS: u64 = 0x5401;
 pub const TCSETS: u64 = 0x5402;
 pub const TCSETSW: u64 = 0x5403;
