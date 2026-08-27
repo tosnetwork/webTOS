@@ -198,13 +198,30 @@ tokens used 4,199        exit 0        2,745,666,480 instructions
 
 That is a real model call from inside webTOS.
 
-### What still stops a session that does work
+### A session that does work, end to end
 
-Three things, each concrete:
+On 2026-08-28, given the task *"read config.txt, change greeting from hello
+to goodbye, then run cat config.txt and report exactly what it prints"*,
+Codex did all four inside webTOS and exited 0:
+
+```
+diff --git a/config.txt b/config.txt
+-greeting = hello
++greeting = goodbye
+
+codex
+greeting = goodbye
+
+tokens used 24,573      exit 0      3,846,485,466 instructions
+```
+
+It read the file, called the live model, applied its own patch, ran `cat`
+in a subprocess on a pty it allocated itself, and reported what that
+subprocess printed. Three things had been in the way.
 
 1. **The command runner is found by absolute path.** Codex spawns
    `/bin/codex-code-mode-host`, next to its own binary, not through `PATH` —
-   which is the 256 `execve` failures in the trail. Delivered there, it
+   which was the 256 `execve` failures in the trail. Delivered there, it
    spawns, and Codex issues `/bin/sh -lc 'cat config.txt'`.
 2. **The agent sandboxes itself with bubblewrap**, which needs Linux
    namespaces this machine does not implement. Worth stating as an
@@ -212,12 +229,20 @@ Three things, each concrete:
    and a second one inside it is redundant. Codex's
    `--dangerously-bypass-approvals-and-sandbox` is the right setting here, and
    means something different inside a guest than on a host.
-3. **The lifter thrashes once the agent spawns shells.** With the inner
-   sandbox bypassed, short-lived `/bin/sh` subprocesses produce repeated
-   `disassembly changed at 0x…` errors — the engine finding cached blocks
-   whose bytes now decode differently — and the run does not finish in 500 s.
-   That is the next thing to chase, and it is an engine problem rather than an
-   agent one.
+3. **Two engine defects, both of the same shape** — a case nobody had
+   implemented, reported as an error the caller could not recover from:
+
+   - The lifter kept a virtual-address-keyed map of disassembly text for a
+     human to read, while lifted code beside it was keyed by address space
+     too. Every `execve` puts a second image where the first was, so the two
+     disagreed without either being wrong — and the mismatch aborted the lift
+     and flushed every block. Sessions never finished. A diagnostic must not
+     decide whether execution continues.
+   - `tcsetattr(TCSAFLUSH)` arrives as `TCSETSF`, which was not in the ioctl
+     table and so fell through to `ENOTTY`. Every program that changes
+     terminal mode was told it had no terminal — including the one that runs
+     a command on a pty of its own. `openpty` itself succeeded; the failure
+     was one call later, which is why the symptom read as "failed to openpty".
 
 ## How far Node gets today
 

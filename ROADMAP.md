@@ -94,9 +94,16 @@ what is left is the agent itself.
   reachable nameserver in the guest, `codex exec "say hi"` reaches the live
   API and prints `Hi! 👋`, 4,199 tokens, exit 0, in 2.7 billion instructions.
   What hung before was DNS — no `/etc/resolv.conf`, so the resolver spun on
-  `recvmsg` 263,885 times. A session that *does work* is still blocked by the
-  lifter: once the agent spawns shells, repeated `disassembly changed` flushes
-  keep it from finishing. See `docs/workloads/node.md`.
+  `recvmsg` 263,885 times. **And a session that does work now finishes**:
+  asked to edit a file and then run a command to check it, Codex read the
+  file, applied its own patch, ran `cat` in a subprocess on a pty it
+  allocated, reported what that subprocess printed, and exited 0 — 24,573
+  tokens, 3.8 billion instructions. Two engine defects of one shape were in
+  the way, each an unimplemented case reported as an unrecoverable error: a
+  vaddr-keyed disassembly map disagreeing with the asid-keyed block cache on
+  every `execve`, which flushed every block; and `TCSETSF` missing from the
+  ioctl table, which told any program changing terminal mode that it had no
+  terminal. See `docs/workloads/node.md`.
 - **The Claude Code profile.** **It runs**: `2.1.247 (Claude Code)`, exit 0,
   inside the wasm module a browser loads — 184 M instructions in 16.6 s. It is
   a 239 MB **Bun** binary, not a Node one, so "both agents are Node
