@@ -106,6 +106,20 @@ event sequence that produced it.
 
 ## Architecture
 
+<p align="center">
+  <img src="webTOS-architecture.png"
+       alt="webTOS architecture: Linux x86-64 applications (OpenFox, Codex, BusyBox) enter through the browser host (Web Worker, terminal, OPFS, network relay), are loaded as ELF against the Linux ABI, and run inside the WebAssembly module webtos-web, whose linux-compat layer provides processes, VFS, signals, futexes, sockets, epoll, and PTYs on top of the x64-engine that decodes, lifts, interprets, and owns guest memory; the agent kernel and the TOS network sit alongside as future integration."
+       width="760">
+</p>
+
+<p align="center">
+  <em>The solid path is what executes in a browser today. The agent kernel —
+  capabilities, energy, events, receipts, secrets — is drawn dashed because it
+  is not integrated yet; see <a href="#project-status">Project Status</a>.</em>
+</p>
+
+The same structure in text:
+
 ```text
 Browser
   |
