@@ -23,6 +23,11 @@
 //                                        (images this worker cached are left
 //                                        out; boot re-injects them)
 //               { type: "budget", mib }  -- cap the total footprint; 0 clears
+//               { type: "storageBudget", mib }  -- cap the guest filesystem;
+//                                        past it a guest write gets ENOSPC
+//               { type: "networkBudget", mib } -- cap the bytes the guest may
+//                                        relay through the broker; past it a
+//                                        guest send or receive gets EPERM
 //               { type: "footprint" }   -- ask for a fresh reading
 //               { type: "secrets", secrets: [{ name, value, paths? }] }
 //                                     -- inject credentials by placeholder;
@@ -32,8 +37,9 @@
 //               { type: "output", text },
 //               { type: "progress", path, loaded, total, cached }
 //               { type: "image", path, bytes, cached }  -- one image is in
-//               { type: "footprint", guest, code, files, total, headroom }
-//                                     -- bytes, and what the budget has left
+//               { type: "footprint", guest, code, files, total, headroom,
+//                                       storageHeadroom, network }
+//                                     -- bytes, and what each budget has left
 //               { type: "waiting" }   -- the guest is blocked on the terminal
 //               { type: "done", status, error, exitCode, icount },
 //               { type: "trace", status, trace }  -- the recorded trace text
@@ -348,6 +354,8 @@ async function boot(files, links = []) {
 function reportFootprint() {
   const kib = (part) => exports.wtw_footprint_kib(part) * 1024;
   const headroom = exports.wtw_memory_headroom_kib();
+  const storageHeadroom = exports.wtw_storage_headroom_kib();
+  const networkHeadroom = exports.wtw_network_headroom_kib();
   postMessage({
     type: "footprint",
     guest: kib(0),
@@ -355,6 +363,17 @@ function reportFootprint() {
     files: kib(2),
     total: kib(3),
     headroom: headroom < 0 ? null : headroom * 1024,
+    // The filesystem's own ceiling. `files` is what it holds; this is what
+    // the guest may still add before a write gets ENOSPC.
+    storageHeadroom: storageHeadroom < 0 ? null : storageHeadroom * 1024,
+    // Relayed bytes pass through rather than accumulating, so the network
+    // quota is counted, not measured off the footprint.
+    network: {
+      sent: exports.wtw_network_usage_kib(0) * 1024,
+      received: exports.wtw_network_usage_kib(1) * 1024,
+      total: exports.wtw_network_usage_kib(2) * 1024,
+      headroom: networkHeadroom < 0 ? null : networkHeadroom * 1024,
+    },
   });
 }
 
@@ -783,6 +802,18 @@ self.onmessage = async (event) => {
     if (msg.type === "budget") {
       if (exports.wtw_set_memory_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
         throw new Error(`budget: ${lastError()}`);
+      }
+      reportFootprint();
+    }
+    if (msg.type === "storageBudget") {
+      if (exports.wtw_set_storage_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
+        throw new Error(`storage budget: ${lastError()}`);
+      }
+      reportFootprint();
+    }
+    if (msg.type === "networkBudget") {
+      if (exports.wtw_set_network_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
+        throw new Error(`network budget: ${lastError()}`);
       }
       reportFootprint();
     }

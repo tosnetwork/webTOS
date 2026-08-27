@@ -715,6 +715,89 @@ pub extern "C" fn wtw_memory_headroom_kib() -> i32 {
     })
 }
 
+/// Caps the guest filesystem, in kibibytes; 0 removes the cap. Memory's
+/// budget refuses what the host asks for; this one refuses what the guest
+/// writes — past the cap a guest write fails with `ENOSPC` instead of
+/// growing the tab's memory until it dies. The cap covers the whole
+/// filesystem, images included, so set it above what was loaded.
+#[no_mangle]
+pub extern "C" fn wtw_set_storage_budget_kib(kib: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_storage_budget_kib called before wtw_init");
+        };
+        machine.set_storage_budget(match kib {
+            0 => None,
+            kib => Some(kib as usize * 1024),
+        });
+        0
+    })
+}
+
+/// Kibibytes the guest may still write, or -1 when no storage cap is set.
+#[no_mangle]
+pub extern "C" fn wtw_storage_headroom_kib() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return -1;
+        };
+        match machine.storage_headroom() {
+            Some(left) => (left / 1024).min(i32::MAX as usize) as i32,
+            None => -1,
+        }
+    })
+}
+
+/// Caps the bytes the guest may relay through the host broker, in kibibytes;
+/// 0 removes the cap. Past the cap the guest's sends and receives fail with
+/// `EPERM`, so a workload cannot stream without end through somebody else's
+/// tab.
+#[no_mangle]
+pub extern "C" fn wtw_set_network_budget_kib(kib: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_network_budget_kib called before wtw_init");
+        };
+        machine.set_network_budget(match kib {
+            0 => None,
+            kib => Some(kib as usize * 1024),
+        });
+        0
+    })
+}
+
+/// One part of what the guest has relayed, in kibibytes: 0 sent, 1 received,
+/// 2 the total. Counted whether or not a cap is set.
+#[no_mangle]
+pub extern "C" fn wtw_network_usage_kib(part: u32) -> u32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return 0;
+        };
+        let usage = machine.network_usage();
+        let bytes = match part {
+            0 => usage.sent_bytes,
+            1 => usage.received_bytes,
+            _ => usage.total_bytes,
+        };
+        (bytes / 1024) as u32
+    })
+}
+
+/// Kibibytes the guest may still relay, or -1 when no network cap is set.
+#[no_mangle]
+pub extern "C" fn wtw_network_headroom_kib() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return -1;
+        };
+        match machine.network_headroom() {
+            Some(left) => (left / 1024).min(i32::MAX as usize) as i32,
+            None => -1,
+        }
+    })
+}
+
 /// Registers a credential the guest receives by placeholder rather than by
 /// having it baked into an image. `${name}` is expanded in the files named by
 /// `wtw_secret_scope` — or in every file when none are named — at

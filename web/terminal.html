@@ -180,6 +180,15 @@
       // A host that knows its ceiling sets one, and an image that will not
       // fit is refused at the request instead of part-way through.
       if (budgetMib) worker.postMessage({ type: "budget", mib: Number(budgetMib) });
+      // The two the guest spends rather than the host: a filesystem it may
+      // not grow past, and a byte count it may not relay past. Both refuse
+      // with an errno the guest can report, not by killing the tab.
+      if (storageMib) {
+        worker.postMessage({ type: "storageBudget", mib: Number(storageMib) });
+      }
+      if (networkMib) {
+        worker.postMessage({ type: "networkBudget", mib: Number(networkMib) });
+      }
       window.webtos.storage = !!msg.storage;
       checkpointBtn.disabled = !msg.storage;
       forgetBtn.disabled = !msg.storage;
@@ -285,6 +294,8 @@
   // and a checkpoint redacts it back — so it never reaches browser storage.
   const secret = params.get("secret");
   const budgetMib = params.get("budget");
+  const storageMib = params.get("storage");
+  const networkMib = params.get("network");
   const agentConfig = new TextEncoder().encode(
     '{"api_key":"${AGENT_KEY}"}\n',
   ).buffer;

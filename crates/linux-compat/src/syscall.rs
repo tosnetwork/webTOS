@@ -569,18 +569,33 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
         Backing::Dev(_) => Ok(bytes.len() as u64),
         Backing::File { node } => {
             let node = *node;
+            let NodeKind::File(data) = &env.vfs.node(node).kind else {
+                return Err(abi::EIO);
+            };
+            let len = data.len();
+            if desc.flags & abi::O_APPEND != 0 {
+                desc.offset = len as u64;
+            }
+            let start = desc.offset as usize;
+            let end = start.checked_add(bytes.len()).ok_or(abi::EFBIG)?;
+            // Only what the file grows by is charged: overwriting bytes that
+            // are already there costs the filesystem nothing. Charged before
+            // the write, so a refusal leaves the file untouched.
+            if end > len {
+                env.vfs.reserve(end - len)?;
+            }
             let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind else {
                 return Err(abi::EIO);
             };
-            if desc.flags & abi::O_APPEND != 0 {
-                desc.offset = data.len() as u64;
+            if data.len() < end {
+                // A host that cannot find the memory is a full disk to the
+                // guest, not an abort of the whole tab.
+                data.try_reserve(end - data.len())
+                    .map_err(|_| abi::ENOSPC)?;
+                data.resize(end, 0);
             }
-            let start = desc.offset as usize;
-            if data.len() < start + bytes.len() {
-                data.resize(start + bytes.len(), 0);
-            }
-            data[start..start + bytes.len()].copy_from_slice(bytes);
-            desc.offset += bytes.len() as u64;
+            data[start..end].copy_from_slice(bytes);
+            desc.offset = end as u64;
             Ok(bytes.len() as u64)
         }
         Backing::Dir { .. } => Err(abi::EISDIR),
@@ -622,10 +637,22 @@ fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
     let Backing::File { node } = desc.backing else {
         return Err(abi::EINVAL);
     };
+    let NodeKind::File(data) = &env.vfs.node(node).kind else {
+        return Err(abi::EIO);
+    };
+    let len = data.len();
+    let length = length as usize;
+    if length > len {
+        env.vfs.reserve(length - len)?;
+    }
     let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind else {
         return Err(abi::EIO);
     };
-    data.resize(length as usize, 0);
+    if length > data.len() {
+        data.try_reserve(length - data.len())
+            .map_err(|_| abi::ENOSPC)?;
+    }
+    data.resize(length, 0);
     Ok(0)
 }
 
