@@ -133,6 +133,42 @@ try {
     process.exit(1);
   }
   console.log(`[node] ok: reload persistence -> ${JSON.stringify(output)}`);
+
+  // A snapshot comes out of browser storage, so it can be anything. The
+  // interesting corruption is one that only misbehaves here: wasm is 32-bit,
+  // and a 64-bit length cast to `usize` narrows — 2^32 + 1 would read as 1
+  // and the parse would carry on with a plausible-looking filesystem. A
+  // 64-bit host cannot show that, because there the same value is simply too
+  // large and fails anyway.
+  const corrupt = (transform, what) => {
+    const damaged = transform(snapshot.slice());
+    const again = f.wtw_fs_import(...fput(damaged));
+    if (again === 0) {
+      console.error(`[node] FAILED ${what} was accepted`);
+      process.exit(1);
+    }
+    console.log(`[node] ok: ${what} refused -> ${ferr()}`);
+  };
+
+  // The first file length in the snapshot, set to 2^32 + 1: narrowed to 32
+  // bits it is 1, which the parse would accept.
+  const marker = new TextEncoder().encode("survived-the-reload");
+  const at = snapshot.findIndex((_, i) =>
+    marker.every((byte, j) => snapshot[i + j] === byte),
+  );
+  if (at < 8) throw new Error("could not find the seeded file in the snapshot");
+  corrupt((bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset);
+    view.setBigUint64(at - 8, (1n << 32n) + 1n, true);
+    return bytes;
+  }, "a file length that narrows to 1 on a 32-bit host");
+
+  corrupt((bytes) => bytes.slice(0, bytes.length >> 1), "a half-written snapshot");
+  corrupt((bytes) => {
+    const view = new DataView(bytes.buffer, bytes.byteOffset);
+    view.setUint32(8, 3_999_999, true);
+    return bytes.slice(0, 12);
+  }, "a header claiming four million nodes");
 }
 
 console.log("[node] PASS");

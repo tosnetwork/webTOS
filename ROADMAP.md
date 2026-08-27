@@ -66,8 +66,8 @@ which together account for about 13 of the 19 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (73 cases, plus soak, measurement, and
-trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
+The native test suites (78 cases, plus soak, measurement, and
+trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 20-check wasm harness and the
 35-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
@@ -140,8 +140,13 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   rather than part-way through the delivery, naming what it would cost and
   what is free. Gated in all three engines. CPU, storage, network, and the
   event log have no quota.
-- **Fuzzing** of decoding, memory translation, ELF loading, syscalls, image
-  parsing, snapshot restore, and host messages.
+- **Fuzzing.** Snapshot restore is swept rather than fuzzed: every truncation
+  and every single-bit flip of a real snapshot, asserting the parser fails
+  closed. It found two things — a header could make a dozen bytes out of
+  browser storage reserve for four million nodes, and a 64-bit length or
+  index narrowed silently on wasm's 32-bit `usize`, so a corrupt image parsed
+  into a plausible-looking filesystem. Decoding, memory translation, ELF
+  loading, syscalls, and host messages have no such sweep.
 - **Signed manifests, reproducible images, dependency licenses**, and a
   security audit of credential boundaries and snapshot contents.
 

@@ -660,9 +660,26 @@ impl Vfs {
         if count == 0 || count > 4_000_000 {
             return Err("implausible filesystem image".into());
         }
+        // The smallest a node can be on the wire: parent, mode, nlink, mtime,
+        // and a kind tag. Reserving for a count the remaining bytes could not
+        // possibly hold turns a dozen bytes out of browser storage into a
+        // large allocation, so the claim is checked before it is believed.
+        const MIN_NODE_BYTES: usize = 8 + 4 + 8 + 8 + 1;
+        if count.saturating_mul(MIN_NODE_BYTES) > r.0.len() {
+            return Err(format!(
+                "implausible filesystem image: {count} nodes claimed, {} bytes to hold them",
+                r.0.len()
+            ));
+        }
         let mut nodes = Vec::with_capacity(count);
+        // `as usize` would truncate these on a 32-bit host, and the browser is
+        // one: a length of 2^32 + 1 would read as 1, and an out-of-range
+        // parent index would wrap into a valid-looking one. Refuse instead.
+        fn index(value: u64) -> Result<usize, String> {
+            usize::try_from(value).map_err(|_| "filesystem image too large for this host".into())
+        }
         for _ in 0..count {
-            let parent = r.u64()? as usize;
+            let parent = index(r.u64()?)?;
             let mode = r.u32()?;
             let nlink = r.u64()?;
             let mtime_sec = i64::from_le_bytes(r.take(8)?.try_into().expect("size"));
@@ -673,7 +690,7 @@ impl Vfs {
                     for _ in 0..entries {
                         let len = r.u16()? as usize;
                         let name = r.take(len)?.to_vec();
-                        let child = r.u64()? as usize;
+                        let child = index(r.u64()?)?;
                         if child >= count {
                             return Err("corrupt filesystem image: bad child index".into());
                         }
@@ -682,7 +699,7 @@ impl Vfs {
                     NodeKind::Dir(map)
                 }
                 2 => {
-                    let len = r.u64()? as usize;
+                    let len = index(r.u64()?)?;
                     NodeKind::File(r.take(len)?.to_vec())
                 }
                 3 => {
