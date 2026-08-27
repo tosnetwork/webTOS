@@ -110,6 +110,11 @@ pub struct Trace {
     sample_every: u64,
     next_sample: u64,
     events: Vec<Event>,
+    /// Ceiling on recorded events, or None for unbounded.
+    budget: Option<usize>,
+    /// Events that happened after the ceiling was reached. A log that stops
+    /// without saying so reads as a workload that stopped doing anything.
+    dropped: u64,
 }
 
 impl Trace {
@@ -133,6 +138,8 @@ impl Trace {
             sample_every,
             next_sample: 0,
             events: Vec::new(),
+            budget: None,
+            dropped: 0,
         }
     }
 
@@ -156,7 +163,33 @@ impl Trace {
         self.envp = text(envp);
     }
 
+    /// Sets a ceiling on recorded events, or clears it with None.
+    ///
+    /// The log grows with the workload, and a workload that syscalls in a
+    /// loop grows it without end — the one structure here that a guest can
+    /// make arbitrarily large while doing nothing wrong. Past the ceiling the
+    /// workload keeps running and the log stops recording, because losing the
+    /// tail of a diagnostic is the smaller harm; what is not acceptable is
+    /// losing it quietly, so the count of what was dropped is kept and
+    /// written into the trace.
+    pub fn set_budget(&mut self, events: Option<usize>) {
+        self.budget = events;
+    }
+
+    /// Events that happened after the ceiling was reached.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    fn room(&self) -> bool {
+        self.budget.is_none_or(|budget| self.events.len() < budget)
+    }
+
     pub fn push(&mut self, event: Event) {
+        if !self.room() {
+            self.dropped += 1;
+            return;
+        }
         self.events.push(event);
     }
 
@@ -185,7 +218,11 @@ impl Trace {
                 _ => cpu.read_var::<u64>(*node),
             })
             .collect();
-        self.events.push(Event::State { icount, values });
+        if self.room() {
+            self.events.push(Event::State { icount, values });
+        } else {
+            self.dropped += 1;
+        }
         if self.sample_every > 0 {
             // Skip past any samples the run overshot, so the schedule stays a
             // function of the instruction count rather than of how far a
@@ -212,6 +249,15 @@ impl Trace {
         let names: Vec<&str> = self.registers.iter().map(|(n, _)| n.as_str()).collect();
         let _ = writeln!(out, "# registers {}", names.join(" "));
         let _ = writeln!(out, "# sample-every {}", self.sample_every);
+        if self.dropped > 0 {
+            // Before the events, so a reader meets it rather than finding it.
+            let _ = writeln!(
+                out,
+                "# truncated {} events not recorded past a budget of {}",
+                self.dropped,
+                self.budget.unwrap_or(0)
+            );
+        }
 
         for event in &self.events {
             match event {

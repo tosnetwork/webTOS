@@ -45,6 +45,12 @@ pub const STATUS_AWAITING_INPUT: i32 = 7;
 /// The guest is blocked on the network and the host owes it socket activity.
 /// Not an error: carry out the pending commands, deliver results, run again.
 pub const STATUS_AWAITING_NETWORK: i32 = 8;
+/// The workload has spent the instructions `wtw_set_cpu_budget_kinsn` allowed
+/// it. Not a failure: raise the budget and call `wtw_run` again to continue
+/// where it stopped, or stop. Distinct from `STATUS_RUNNING`, which means the
+/// turn is over and the host should call again — a host that confuses the two
+/// spins forever on a workload with no allowance left.
+pub const STATUS_OUT_OF_CPU: i32 = 9;
 /// `wtw_net_budget_ms` when the guest armed no timer: the host may wait as
 /// long as it wants.
 pub const NET_BUDGET_UNBOUNDED: u32 = u32::MAX;
@@ -458,6 +464,7 @@ fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
             }
         }
         CpuExit::OutOfMemory => STATUS_OUT_OF_MEMORY,
+        CpuExit::OutOfCpu => STATUS_OUT_OF_CPU,
         CpuExit::PageFault { address, access } => {
             state.error = format!("page fault: {access:?} at {address:#x}");
             STATUS_PAGE_FAULT
@@ -863,6 +870,59 @@ pub extern "C" fn wtw_memory_headroom_kib() -> i32 {
 /// writes — past the cap a guest write fails with `ENOSPC` instead of
 /// growing the tab's memory until it dies. The cap covers the whole
 /// filesystem, images included, so set it above what was loaded.
+/// Caps the instructions the workload may retire, in thousands; 0 clears it.
+///
+/// Thousands because a `u32` of instructions is about two seconds of guest
+/// time, which is too short a leash to be useful, and the boundary carries
+/// 32-bit numbers.
+#[no_mangle]
+pub extern "C" fn wtw_set_cpu_budget_kinsn(kinsn: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_cpu_budget_kinsn called before wtw_init");
+        };
+        machine.set_cpu_budget((kinsn != 0).then(|| kinsn as u64 * 1_000));
+        0
+    })
+}
+
+/// Instructions the workload may still retire, in thousands, or -1 when no
+/// budget is set.
+#[no_mangle]
+pub extern "C" fn wtw_cpu_headroom_kinsn() -> i32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .and_then(Machine::cpu_headroom)
+            .map_or(-1, |left| (left / 1_000).min(i32::MAX as u64) as i32)
+    })
+}
+
+/// Caps the events the trace may record; 0 clears it. Past the cap the
+/// workload keeps running and the log stops growing, which is why this is not
+/// reported through `wtw_run`.
+#[no_mangle]
+pub extern "C" fn wtw_set_event_log_budget(events: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_event_log_budget called before wtw_init");
+        };
+        machine.set_event_log_budget((events != 0).then_some(events as usize));
+        0
+    })
+}
+
+/// Events that happened past the cap and were not recorded.
+#[no_mangle]
+pub extern "C" fn wtw_event_log_dropped() -> u32 {
+    with_state(|state| {
+        state.machine.as_mut().map_or(0, |machine| {
+            machine.event_log_dropped().min(u32::MAX as u64) as u32
+        })
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn wtw_set_storage_budget_kib(kib: u32) -> i32 {
     with_state(|state| {

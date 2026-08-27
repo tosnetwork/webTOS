@@ -61,6 +61,10 @@ const STATUS_RUNNING = 0;
 const STATUS_HALT = 1;
 const STATUS_AWAITING_INPUT = 7;
 const STATUS_AWAITING_NETWORK = 8;
+// The workload has spent its instruction allowance. The run loops below stop
+// on it like any non-running status; it is named here so a reader of a
+// stopped session can tell "out of allowance" from "crashed".
+const STATUS_OUT_OF_CPU = 9;
 /// wtw_net_budget_ms when the guest armed no timer.
 const NET_BUDGET_UNBOUNDED = 0xffff_ffff;
 /// Longest the worker waits on the network in one go, so a silent peer
@@ -706,6 +710,12 @@ async function pump() {
         await pumpNetwork();
         continue;
       }
+      if (status === STATUS_OUT_OF_CPU) {
+        postMessage({
+          type: "status",
+          text: "the workload has spent its instruction allowance",
+        });
+      }
       if (status !== STATUS_RUNNING) {
         finish(status);
         return;
@@ -825,6 +835,25 @@ self.onmessage = async (event) => {
         throw new Error(`network budget: ${lastError()}`);
       }
       reportFootprint();
+    }
+    // A workload that computes in a loop and issues no syscalls is outside
+    // every other mechanism here: nothing to interrupt, nothing to refuse.
+    // Its allowance is the only thing that stops it.
+    if (msg.type === "cpuBudget") {
+      if (exports.wtw_set_cpu_budget_kinsn(Math.round(msg.kinsn ?? 0)) !== 0) {
+        throw new Error(`cpu budget: ${lastError()}`);
+      }
+      postMessage({
+        type: "status",
+        text: msg.kinsn
+          ? `cpu budget ${(msg.kinsn / 1000).toFixed(0)}M instructions`
+          : "cpu budget cleared",
+      });
+    }
+    if (msg.type === "eventLogBudget") {
+      if (exports.wtw_set_event_log_budget(Math.round(msg.events ?? 0)) !== 0) {
+        throw new Error(`event log budget: ${lastError()}`);
+      }
     }
     if (msg.type === "secrets") applySecrets(msg.secrets);
     if (msg.type === "persist") await persist();

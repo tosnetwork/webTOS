@@ -44,6 +44,14 @@ pub enum CpuExit {
     IllegalInstruction { rip: u64 },
     /// The engine could not allocate guest memory.
     OutOfMemory,
+    /// The workload has spent the instructions it was allotted.
+    ///
+    /// Unlike the others this is a policy, not a failure: nothing went wrong,
+    /// the guest simply has no allowance left. It is kept apart from
+    /// [`CpuExit::InstructionLimit`], which means "your turn is over, call
+    /// again" — a host that confuses the two either spins forever on a
+    /// workload that is finished with, or stops one that had only paused.
+    OutOfCpu,
     /// Any other exception, reported without translation.
     Unhandled { code: ExceptionCode, value: u64 },
 }

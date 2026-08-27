@@ -1,15 +1,23 @@
-//! Storage and network quotas.
+//! Storage, network, and CPU quotas.
 //!
-//! Memory's budget refuses what the host asks for. These two refuse what the
-//! guest does: a filesystem that may not grow past a ceiling, and a byte
-//! count the guest may not relay past. Both have to fail the way a real
-//! system fails — an errno the guest can read and report — rather than by
-//! exhausting the tab.
+//! Memory's budget refuses what the host asks for. The rest refuse what the
+//! guest does: a filesystem that may not grow past a ceiling, a byte count
+//! the guest may not relay past, and instructions it may not retire past.
+//! The first two fail the way a real system fails — an errno the guest can
+//! read and report — rather than by exhausting the tab.
+//!
+//! The CPU ceiling is not symmetric with those, because the guest it exists
+//! for cannot be told anything: a workload that computes in a loop and issues
+//! no syscalls is outside every mechanism the machine has for stopping a
+//! task. The terminal's interrupt character reaches a task at a kernel entry,
+//! and this one never makes one; the instruction limit ends a turn, and the
+//! host's loop begins another.
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, UdpSocket};
 use std::path::PathBuf;
+use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -686,5 +694,205 @@ fn a_host_driven_broker_is_metered_without_losing_its_command_queue() {
         broker.borrow_mut().tcp_send(handle, b"x").err(),
         Some(abi::EPERM),
         "a send past the budget should be refused on a host-driven broker too"
+    );
+}
+
+// ── CPU ──────────────────────────────────────────────────────────────────────
+
+fn compile_c(name: &str, source: &str) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join("webtos-quota-fixture");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let src = dir.join(format!("{name}.c"));
+    let out = dir.join(name);
+    std::fs::write(&src, source).expect("write source");
+    let mut cmd = Command::new("gcc");
+    cmd.arg("-O0").arg("-static").arg("-o").arg(&out).arg(&src);
+    let built = matches!(cmd.status(), Ok(status) if status.success());
+    linux_compat::testing::require(
+        &format!("a compiler that targets Linux x86-64 for {name} ({cmd:?})"),
+        built.then(|| std::fs::read(&out).expect("compiler output")),
+    )
+}
+
+/// A guest that never returns and never enters the kernel after it starts.
+fn spinner() -> Option<Machine> {
+    let image = compile_c(
+        "spin",
+        r#"
+#include <unistd.h>
+int main(void) {
+    write(1, "spinning\n", 9);
+    /* No syscalls past this point, and no way out. */
+    volatile unsigned long x = 0;
+    for (;;) x += 1;
+}
+"#,
+    )?;
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine.add_file(b"/bin/spin", image, 0o755).expect("add");
+    machine.set_args(vec![b"spin".to_vec()], vec![]);
+    machine.load(b"/bin/spin").expect("load");
+    Some(machine)
+}
+
+/// The host's loop: hand the guest a turn, take the answer, repeat. This is
+/// what `web/worker.js` does, and what a spinning guest exploits.
+fn host_loop(machine: &mut Machine, turns: u32, fuel: u64) -> (CpuExit, u32) {
+    for turn in 1..=turns {
+        machine.vm_mut().icount_limit = machine.icount() + fuel;
+        let exit = machine.run();
+        if exit != CpuExit::InstructionLimit {
+            return (exit, turn);
+        }
+    }
+    (CpuExit::InstructionLimit, turns)
+}
+
+#[test]
+fn a_guest_that_only_computes_still_runs_out_of_cpu() {
+    let Some(mut machine) = spinner() else {
+        return;
+    };
+    machine.set_cpu_budget(Some(20_000_000));
+
+    let (exit, turns) = host_loop(&mut machine, 10_000, 1_000_000);
+    assert_eq!(
+        exit,
+        CpuExit::OutOfCpu,
+        "a guest that issues no syscalls ran for {turns} turns without the \
+         budget stopping it"
+    );
+    assert_eq!(machine.cpu_headroom(), Some(0), "stopped with budget left");
+    assert!(
+        machine.icount() <= 20_000_000,
+        "ran {} instructions against a budget of 20,000,000",
+        machine.icount()
+    );
+    assert!(
+        String::from_utf8_lossy(&machine.take_output()).contains("spinning"),
+        "the guest never got started, so the budget proved nothing"
+    );
+}
+
+#[test]
+fn a_spent_budget_stays_spent_until_it_is_raised() {
+    let Some(mut machine) = spinner() else {
+        return;
+    };
+    machine.set_cpu_budget(Some(5_000_000));
+    assert_eq!(host_loop(&mut machine, 100, 1_000_000).0, CpuExit::OutOfCpu);
+
+    // Asking again changes nothing: a ceiling a host can walk through by
+    // calling twice is not a ceiling.
+    machine.vm_mut().icount_limit = machine.icount() + 1_000_000;
+    assert_eq!(machine.run(), CpuExit::OutOfCpu, "a second ask got through");
+    let stopped_at = machine.icount();
+
+    // Raising it lets the workload continue from where it stopped, so a host
+    // can put the question to a person instead of killing the tab.
+    machine.set_cpu_budget(Some(10_000_000));
+    let (exit, _) = host_loop(&mut machine, 100, 1_000_000);
+    assert_eq!(exit, CpuExit::OutOfCpu, "the raised budget was not spent");
+    assert!(
+        machine.icount() > stopped_at,
+        "the workload did not continue: {} then {}",
+        stopped_at,
+        machine.icount()
+    );
+}
+
+#[test]
+fn no_budget_leaves_the_workload_alone() {
+    let Some(mut machine) = spinner() else {
+        return;
+    };
+    let (exit, turns) = host_loop(&mut machine, 20, 1_000_000);
+    assert_eq!(
+        exit,
+        CpuExit::InstructionLimit,
+        "an unbudgeted workload stopped on its own after {turns} turns"
+    );
+}
+
+// ── The event log ────────────────────────────────────────────────────────────
+
+/// A machine running an in-repo image, so this gate is real on every host
+/// rather than skipping where no cross compiler lives.
+fn traced(events: Option<usize>) -> Machine {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data");
+    let image = std::fs::read(dir.join("hello_linux.elf")).expect("in-repo fixture");
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine.add_file(b"/bin/hello", image, 0o755).expect("add");
+    machine.set_args(vec![b"hello".to_vec()], vec![]);
+    machine.load(b"/bin/hello").expect("load");
+    machine.set_event_log_budget(events);
+    // Sample often enough that a short program produces many events.
+    machine.record_trace(1);
+    machine
+}
+
+#[test]
+fn the_event_log_stops_at_its_ceiling_and_says_how_much_it_missed() {
+    let mut machine = traced(Some(4));
+    machine.vm_mut().icount_limit = machine.icount() + 1_000_000;
+    let exit = machine.run_traced(1_000_000);
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "the guest did not run"
+    );
+
+    let dropped = machine.event_log_dropped();
+    assert!(
+        dropped > 0,
+        "a ceiling of four events dropped none; either the workload produced \
+         fewer than four events or the ceiling is not enforced"
+    );
+
+    let text = machine
+        .take_trace()
+        .expect("a trace was recorded")
+        .to_text();
+    let recorded = text.lines().filter(|l| !l.starts_with('#')).count();
+    assert_eq!(
+        recorded, 4,
+        "recorded {recorded} events against a ceiling of 4"
+    );
+    assert!(
+        text.contains(&format!("# truncated {dropped} events not recorded")),
+        "the trace does not say it was truncated, so its end reads as the \
+         workload's end:\n{}",
+        text.lines().take(8).collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn an_unbounded_event_log_records_everything() {
+    let mut machine = traced(None);
+    machine.vm_mut().icount_limit = machine.icount() + 1_000_000;
+    assert_eq!(
+        machine.run_traced(1_000_000),
+        CpuExit::Halt { code: Some(0) }
+    );
+    assert_eq!(
+        machine.event_log_dropped(),
+        0,
+        "dropped events with no ceiling"
+    );
+
+    let text = machine
+        .take_trace()
+        .expect("a trace was recorded")
+        .to_text();
+    assert!(
+        !text.contains("# truncated"),
+        "an untruncated trace claimed truncation"
+    );
+    assert!(
+        text.lines().filter(|l| !l.starts_with('#')).count() > 4,
+        "the workload produced too few events for the ceiling test above to \
+         mean anything"
     );
 }

@@ -810,6 +810,12 @@ pub struct Machine {
     /// Ceiling on the total footprint, or None for unbounded. See
     /// [`Machine::set_memory_budget`].
     memory_budget: Option<usize>,
+    /// Ceiling on retired instructions, or None for unbounded. See
+    /// [`Machine::set_cpu_budget`].
+    cpu_budget: Option<u64>,
+    /// Ceiling on recorded trace events, or None for unbounded. See
+    /// [`Machine::set_event_log_budget`].
+    event_log_budget: Option<usize>,
 }
 
 /// What a machine occupies, split by what it is spent on. All three live in
@@ -847,6 +853,8 @@ impl Machine {
         Ok(Self {
             vm,
             memory_budget: None,
+            cpu_budget: None,
+            event_log_budget: None,
         })
     }
 
@@ -991,6 +999,7 @@ impl Machine {
     /// Call after `load`, so the trace's header describes what is running.
     pub fn record_trace(&mut self, sample_every: u64) {
         let mut collected = trace::Trace::new(&self.vm.cpu, sample_every);
+        collected.set_budget(self.event_log_budget);
         let env = self.env();
         collected.set_args(&env.proc.argv, &env.proc.envp);
         env.trace = Some(collected);
@@ -1119,6 +1128,48 @@ impl Machine {
     pub fn memory_headroom(&mut self) -> Option<usize> {
         self.memory_budget
             .map(|budget| budget.saturating_sub(self.footprint().total_bytes))
+    }
+
+    /// Sets a ceiling on the instructions the workload may retire over its
+    /// life, or clears it with None.
+    ///
+    /// The instruction limit on a run is not this. That one ends a turn so
+    /// the host can do its own work and call again, and a host's loop calls
+    /// again for as long as the guest keeps asking — which a guest computing
+    /// in a loop, issuing no syscalls, does forever. Nothing else in the
+    /// machine says stop to it: the terminal's interrupt character reaches a
+    /// task at a kernel entry, and that task never makes one.
+    ///
+    /// Spent, `run` returns [`CpuExit::OutOfCpu`] without executing anything
+    /// further. Raising the budget lets it continue where it stopped, so a
+    /// host can ask a person before granting more.
+    pub fn set_cpu_budget(&mut self, instructions: Option<u64>) {
+        self.cpu_budget = instructions;
+    }
+
+    /// Instructions the workload may still retire, or None when unbounded.
+    pub fn cpu_headroom(&self) -> Option<u64> {
+        self.cpu_budget
+            .map(|budget| budget.saturating_sub(self.icount()))
+    }
+
+    /// Sets a ceiling on the events the trace may record, or clears it with
+    /// None. Takes effect on the trace now being recorded and on any started
+    /// afterwards.
+    ///
+    /// See [`trace::Trace::set_budget`] for why this one stops recording
+    /// rather than stopping the workload.
+    pub fn set_event_log_budget(&mut self, events: Option<usize>) {
+        self.event_log_budget = events;
+        if let Some(trace) = self.env().trace.as_mut() {
+            trace.set_budget(events);
+        }
+    }
+
+    /// Events that happened after the ceiling was reached, and so were not
+    /// recorded. Zero when the log kept up.
+    pub fn event_log_dropped(&mut self) -> u64 {
+        self.env().trace.as_ref().map_or(0, trace::Trace::dropped)
     }
 
     /// Rejects an addition that would not fit, naming what it would cost and
@@ -1306,6 +1357,18 @@ impl Machine {
 
     /// Runs until the workload exits or faults.
     pub fn run(&mut self) -> CpuExit {
+        // Before anything executes. A ceiling noticed after the fact is not a
+        // ceiling, and the host's own loop is what would otherwise keep
+        // handing a spinning guest another turn.
+        if self.cpu_headroom() == Some(0) {
+            return CpuExit::OutOfCpu;
+        }
+        // The run may not exceed what is left, so a budget spent mid-run ends
+        // the turn at the boundary rather than a whole fuel quantum past it.
+        if let Some(headroom) = self.cpu_headroom() {
+            let ceiling = self.icount().saturating_add(headroom);
+            self.vm.icount_limit = self.vm.icount_limit.min(ceiling);
+        }
         // A previous run paused waiting on the host — for a keystroke or for
         // network activity. Put a task back on the CPU now that the host has
         // had its turn; with still nothing to deliver, stay paused rather

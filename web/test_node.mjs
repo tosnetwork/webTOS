@@ -312,4 +312,53 @@ try {
   console.log(`[node] ok: guest sizes past 32 bits are refused, not narrowed -> ${out.trim()}`);
 }
 
+// A workload that computes in a loop and issues no syscalls is outside every
+// other mechanism the runtime has for stopping a task: there is no kernel
+// entry to interrupt it at, and the instruction limit only ends a turn, which
+// this loop begins another of. Its allowance is the only thing that stops it,
+// and until now there was none.
+{
+  // BusyBox `ls /` is 73,280 instructions, which is more than the allowance
+  // below. The workload that this ceiling exists for — a loop with no
+  // syscalls in it — needs a fixture compiled for Linux, so that half is
+  // gated natively in `crates/linux-compat/tests/quota.rs`; what is gated
+  // here is the boundary: setting the allowance, being told it is spent, and
+  // continuing after it is raised.
+  for (const a of ["busybox", "ls", "/"]) e.wtw_arg(...put(a));
+  if (e.wtw_load(...put("/bin/busybox")) !== 0) throw new Error(`load: ${err()}`);
+
+  // Ten thousand instructions, in turns of a thousand.
+  if (e.wtw_set_cpu_budget_kinsn(10) !== 0) throw new Error(`cpu budget: ${err()}`);
+  let status;
+  let turns = 0;
+  do {
+    status = e.wtw_run(1_000);
+    turns += 1;
+  } while (status === 0 && turns < 1000);
+
+  const STATUS_OUT_OF_CPU = 9;
+  if (status !== STATUS_OUT_OF_CPU) {
+    console.error(`[node] FAILED cpu budget: status=${status} after ${turns} turns`);
+    process.exit(1);
+  }
+  if (e.wtw_cpu_headroom_kinsn() !== 0) {
+    console.error(`[node] FAILED cpu budget: ${e.wtw_cpu_headroom_kinsn()}k left after stopping`);
+    process.exit(1);
+  }
+  console.log(
+    `[node] ok: a workload runs out of its instruction allowance -> stopped after ${turns} turns`,
+  );
+
+  // Raising it lets the workload continue, so a host can ask a person for
+  // more rather than killing the tab.
+  e.wtw_set_cpu_budget_kinsn(20);
+  if (e.wtw_run(1_000) !== 0) {
+    console.error(`[node] FAILED cpu budget: a raised allowance did not resume`);
+    process.exit(1);
+  }
+  console.log("[node] ok: a raised allowance resumes where it stopped");
+  e.wtw_reset();
+  if (e.wtw_init() !== 0) throw new Error(`init: ${err()}`);
+}
+
 console.log("[node] PASS");
