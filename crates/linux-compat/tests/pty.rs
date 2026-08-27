@@ -584,3 +584,90 @@ fn the_interrupt_character_kills_the_foreground_program() {
         "the shell did not run a command after ^C at the prompt: {echoed:?}"
     );
 }
+
+/// `^Z` is the other half of job control: the foreground program stops (it
+/// does not die), the shell reports it and takes the terminal back, and `fg`
+/// puts it back in the foreground exactly where it left off — a blocked read
+/// resumes blocking, and the next line typed reaches the same process.
+#[test]
+fn the_suspend_character_stops_and_fg_resumes() {
+    let Some(image) = busybox() else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/busybox", image, 0o755)
+        .expect("add busybox");
+    for applet in ["sh", "cat", "echo"] {
+        machine
+            .add_symlink(format!("/bin/{applet}").as_bytes(), b"/bin/busybox")
+            .expect("applet link");
+    }
+    machine.set_args(
+        vec![b"sh".to_vec(), b"-i".to_vec()],
+        vec![
+            b"PATH=/bin".to_vec(),
+            b"TERM=xterm".to_vec(),
+            b"HOME=/root".to_vec(),
+            b"PS1=$ ".to_vec(),
+        ],
+    );
+    machine.load(b"/bin/sh").expect("ELF load failed");
+    machine.install_pty_stdio(24, 80);
+
+    let run = |machine: &mut Machine| {
+        machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+        machine.run();
+        String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned()
+    };
+
+    let prompt = run(&mut machine);
+    assert!(prompt.contains('$'), "no shell prompt: {prompt:?}");
+
+    machine.feed_terminal_input(b"cat\n");
+    let _ = run(&mut machine);
+    machine.feed_terminal_input(b"first-line\n");
+    let echoed = run(&mut machine);
+    assert!(
+        echoed.contains("first-line"),
+        "cat did not echo before the suspend: {echoed:?}"
+    );
+
+    // ^Z: cat stops, the shell reports the stopped job and prompts again.
+    machine.feed_terminal_input(b"\x1a");
+    let stopped = run(&mut machine);
+    assert!(
+        machine.awaiting_terminal_input(),
+        "the shell did not come back after ^Z: {stopped:?}"
+    );
+    assert!(
+        stopped.contains("Stopped"),
+        "the shell did not report a stopped job: {stopped:?}"
+    );
+
+    // The stopped cat is not dead: fg resumes it and it reads the next line.
+    machine.feed_terminal_input(b"fg\n");
+    let _ = run(&mut machine);
+    machine.feed_terminal_input(b"second-line\n");
+    let echoed = run(&mut machine);
+    assert!(
+        echoed.contains("second-line") && !echoed.contains("not found"),
+        "cat did not resume reading after fg (a dead cat leaves the line \
+         to the shell, which rejects it as a command): {echoed:?}"
+    );
+
+    // And the interrupt still ends it: back to a working shell.
+    machine.feed_terminal_input(b"\x03");
+    let _ = run(&mut machine);
+    machine.feed_terminal_input(b"echo after-jobctl\n");
+    let echoed = run(&mut machine);
+    assert!(
+        echoed.contains("after-jobctl"),
+        "the shell did not run a command after the job-control cycle: {echoed:?}"
+    );
+}

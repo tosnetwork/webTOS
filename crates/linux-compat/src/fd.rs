@@ -132,18 +132,23 @@ impl Pty {
     /// `ISIG` and then reads `\x03` as an ordinary byte, which is how a
     /// full-screen editor keeps its own key bindings.
     ///
-    /// The suspend character is deliberately left as data: stopping a process
-    /// group needs a stopped task state that the scheduler does not have, and
-    /// silently discarding `^Z` would be worse than passing it through.
+    /// The suspend character raises SIGTSTP the same way: the scheduler has
+    /// a stopped task state, and `wait4(WUNTRACED)` reports the stop to the
+    /// job-control shell.
     pub fn feed_input(&mut self, bytes: &[u8]) -> Option<u64> {
         const SIGINT: u64 = 2;
         const SIGQUIT: u64 = 3;
+        const SIGTSTP: u64 = 20;
         if !self.isig() {
             self.m2s.extend(bytes.iter().copied());
             self.activity += 1;
             return None;
         }
-        let (intr, quit) = (self.termios[C_CC], self.termios[C_CC + 1]);
+        let (intr, quit, susp) = (
+            self.termios[C_CC],
+            self.termios[C_CC + 1],
+            self.termios[C_CC + 10],
+        );
         let mut signal = None;
         for &byte in bytes {
             // A disabled character is encoded as NUL and must not match a
@@ -152,6 +157,8 @@ impl Pty {
                 Some(SIGINT)
             } else if quit != 0 && byte == quit {
                 Some(SIGQUIT)
+            } else if susp != 0 && byte == susp {
+                Some(SIGTSTP)
             } else {
                 None
             };

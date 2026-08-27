@@ -75,6 +75,12 @@ pub struct Process {
     /// via `execve` or exits, releasing the parent parked in
     /// [`ParkState::VforkDone`]. Never inherited across fork/clone.
     pub vfork_done: Option<Rc<Cell<bool>>>,
+    /// Job control: a stopped task is parked and stays unrunnable — whatever
+    /// its park state says — until SIGCONT clears this.
+    pub stopped: bool,
+    /// A stop the parent has not yet collected through `wait4(WUNTRACED)`:
+    /// the signal that caused it. Held by the thread-group leader.
+    pub stop_report: Option<u64>,
 }
 
 impl Process {
@@ -100,6 +106,8 @@ impl Process {
             clear_child_tid: 0,
             asid: 0,
             vfork_done: None,
+            stopped: false,
+            stop_report: None,
         }
     }
 
@@ -127,6 +135,8 @@ impl Process {
             clear_child_tid: 0,
             asid: crate::alloc_asid(),
             vfork_done: None,
+            stopped: false,
+            stop_report: None,
         }
     }
 
@@ -155,6 +165,8 @@ impl Process {
             clear_child_tid: 0,
             asid: self.asid,
             vfork_done: None,
+            stopped: false,
+            stop_report: None,
         }
     }
 }
@@ -163,9 +175,10 @@ impl Process {
 pub enum ParkState {
     /// Runnable; waiting only for the CPU.
     Ready,
-    /// `wait4`: waiting for a child to become a zombie. `pid` follows the
-    /// wait4 convention (-1 = any child, >0 = that specific child).
-    WaitChild { pid: i64 },
+    /// `wait4`: waiting for a child to become a zombie — or, with
+    /// `WUNTRACED` (`untraced`), to stop. `pid` follows the wait4
+    /// convention (-1 = any child, >0 = that specific child).
+    WaitChild { pid: i64, untraced: bool },
     /// `FUTEX_WAIT` on `addr`; `woken` is set by `FUTEX_WAKE`. With a
     /// deadline, expiry wakes the task and the scheduler patches the
     /// return value to `-ETIMEDOUT`.
@@ -308,6 +321,18 @@ impl Scheduler {
                 .any(|t| matches(t.proc.tgid, t.proc.ppid))
     }
 
+    /// Takes an uncollected stop report from a child of `ppid` matching the
+    /// wait4 `pid` filter: the child's pid and the signal that stopped it.
+    /// Each stop is reported once, which is the `WUNTRACED` contract.
+    pub fn take_stop_report(&mut self, ppid: u64, pid_filter: i64) -> Option<(u64, u64)> {
+        self.parked
+            .iter_mut()
+            .filter(|t| {
+                t.proc.ppid == ppid && (pid_filter == -1 || t.proc.tgid == pid_filter as u64)
+            })
+            .find_map(|t| t.proc.stop_report.take().map(|sig| (t.proc.tgid, sig)))
+    }
+
     /// Takes a zombie child of `ppid` matching the wait4 `pid` filter.
     pub fn take_zombie(&mut self, ppid: u64, pid_filter: i64) -> Option<Zombie> {
         let index = self
@@ -343,6 +368,12 @@ impl Scheduler {
     /// `now` is the deterministic clock in nanoseconds.
     pub fn find_ready(&self, now: u64) -> Option<usize> {
         self.parked.iter().position(|task| {
+            // A stopped task is not runnable no matter what it waits on or
+            // what is pending; only SIGCONT (which clears the flag) or a
+            // kill that removes it outright ends the stop.
+            if task.proc.stopped {
+                return false;
+            }
             // A deliverable pending signal interrupts any blocking wait
             // except the uninterruptible vfork suspension: a vfork parent
             // must not observe anything (including a handler running on its
@@ -360,10 +391,16 @@ impl Scheduler {
                 ParkState::Futex {
                     woken, deadline, ..
                 } => *woken || deadline.is_some_and(|d| now >= d),
-                ParkState::WaitChild { pid } => self
-                    .zombies
-                    .iter()
-                    .any(|z| z.ppid == task.proc.tgid && (*pid == -1 || z.pid == *pid as u64)),
+                ParkState::WaitChild { pid, untraced } => {
+                    let matches = |child_pid: u64, child_ppid: u64| {
+                        child_ppid == task.proc.tgid && (*pid == -1 || child_pid == *pid as u64)
+                    };
+                    self.zombies.iter().any(|z| matches(z.pid, z.ppid))
+                        || (*untraced
+                            && self.parked.iter().any(|t| {
+                                t.proc.stop_report.is_some() && matches(t.proc.tgid, t.proc.ppid)
+                            }))
+                }
                 ParkState::PipeRead { pipe } => {
                     let pipe = pipe.borrow();
                     !pipe.data.is_empty() || pipe.writers == 0
@@ -386,6 +423,9 @@ impl Scheduler {
     pub fn earliest_deadline(&self) -> Option<u64> {
         self.parked
             .iter()
+            // A stopped task's deadline cannot wake it; warping to it would
+            // advance the clock toward a task that stays unrunnable.
+            .filter(|task| !task.proc.stopped)
             .flat_map(|task| match &task.state {
                 ParkState::Futex {
                     deadline: Some(deadline),

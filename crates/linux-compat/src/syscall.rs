@@ -84,12 +84,23 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     // `read` or `nanosleep` ends it. A task spinning in a compute loop that
     // issues no syscalls is not interrupted; killing that needs a check on
     // the execution path rather than the kernel entry.
-    if let SignalExitAction::Terminate(sig) = pending_signal_action(env) {
-        tracing::debug!("[{}] killed by signal {sig}", env.proc.pid);
-        return match task_exit(env, cpu, sig as i32, true) {
-            Outcome::Exit(exit) => Some(exit),
-            _ => None,
-        };
+    match pending_signal_action(env) {
+        SignalExitAction::Terminate(sig) => {
+            tracing::debug!("[{}] killed by signal {sig}", env.proc.pid);
+            return match task_exit(env, cpu, sig as i32, true) {
+                Outcome::Exit(exit) => Some(exit),
+                _ => None,
+            };
+        }
+        // A job-control stop taken here re-executes the interrupted syscall
+        // when SIGCONT lifts it, which is the restart a blocking read wants.
+        SignalExitAction::Stop(sig) => {
+            return match stop_thread_group(env, cpu, sig, true) {
+                Outcome::Exit(exit) => Some(exit),
+                _ => None,
+            };
+        }
+        _ => {}
     }
 
     match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
@@ -1771,6 +1782,12 @@ fn sys_rt_sigaction(
     new: u64,
     old: u64,
 ) -> SysResult {
+    // SIGKILL and SIGSTOP cannot be caught, blocked, or ignored; changing
+    // their disposition is refused, which is what keeps a forced stop or
+    // kill forced.
+    if new != 0 && matches!(signal, 9 | 19) {
+        return Err(abi::EINVAL);
+    }
     if old != 0 {
         let previous = env
             .proc
@@ -1820,6 +1837,10 @@ fn sys_rt_sigprocmask(env: &mut LinuxEnv, cpu: &mut Cpu, how: u64, new: u64, old
         SignalExitAction::Terminate(sig) => {
             tracing::debug!("[{}] killed by unblocked signal {sig}", env.proc.pid);
             task_exit(env, cpu, sig as i32, true)
+        }
+        SignalExitAction::Stop(sig) => {
+            resume_after_syscall(env, cpu, 0);
+            stop_thread_group(env, cpu, sig, false)
         }
         SignalExitAction::Handler => {
             resume_after_syscall(env, cpu, 0);
@@ -1914,6 +1935,7 @@ const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
 const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -1996,6 +2018,32 @@ fn resume_after_syscall(env: &LinuxEnv, cpu: &mut Cpu, rax: u64) {
     cpu.write_pc(next_pc);
     cpu.block_id = u64::MAX;
     cpu.block_offset = 0;
+}
+
+/// Job-control stop: parks the current task and marks its whole thread
+/// group stopped, records the stop for the parent's `wait4(WUNTRACED)`, and
+/// raises SIGCHLD there. `restart` chooses what runs when SIGCONT lifts the
+/// stop: re-execute the interrupted syscall (a stop taken at kernel entry)
+/// or continue after it (a stop the syscall itself concluded, its return
+/// value already written).
+fn stop_thread_group(env: &mut LinuxEnv, cpu: &mut Cpu, signal: u64, restart: bool) -> Outcome {
+    let tgid = env.proc.tgid;
+    tracing::debug!("[{}] stopped by signal {signal}", env.proc.pid);
+    env.proc.stopped = true;
+    if env.proc.pid == tgid {
+        env.proc.stop_report = Some(signal);
+    }
+    for task in &mut env.sched.parked {
+        if task.proc.tgid == tgid {
+            task.proc.stopped = true;
+            if task.proc.pid == tgid {
+                task.proc.stop_report = Some(signal);
+            }
+        }
+    }
+    let parent = env.proc.ppid;
+    notify_parent_sigchld(env, parent);
+    block_and_switch(env, cpu, ParkState::Ready, restart)
 }
 
 /// Parks the current task (CPU registers) with `state`. The address space
@@ -2180,7 +2228,9 @@ fn dump_parked(env: &LinuxEnv) {
     for task in &env.sched.parked {
         let state = match &task.state {
             ParkState::Ready => "Ready".to_string(),
-            ParkState::WaitChild { pid } => format!("WaitChild(pid={pid})"),
+            ParkState::WaitChild { pid, untraced } => {
+                format!("WaitChild(pid={pid}, untraced={untraced})")
+            }
             ParkState::Futex { addr, deadline, .. } => {
                 format!("Futex(addr={addr:#x}, deadline={deadline:?})")
             }
@@ -2437,9 +2487,16 @@ const SIG_IGN: u64 = 1;
 /// True when the kernel's default action for `signal` is to terminate the
 /// process. The signals a process is expected to ignore by default —
 /// SIGCHLD, SIGURG, SIGWINCH, SIGCONT — are not in this set, so raising one
-/// on a process that installed no handler stays a no-op.
+/// on a process that installed no handler stays a no-op; nor are the four
+/// job-control signals, whose default action is to stop, not to kill.
 fn default_action_terminates(signal: u64) -> bool {
-    !matches!(signal, 17 | 18 | 23 | 28)
+    !matches!(signal, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28)
+}
+
+/// True when the kernel's default action for `signal` is to stop the
+/// process: SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU.
+fn default_action_stops(signal: u64) -> bool {
+    matches!(signal, 19..=22)
 }
 
 /// Marks `signal` pending on every task in process group `pgrp` that would do
@@ -2452,7 +2509,7 @@ pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64)
         return;
     }
     let bit = 1_u64 << (signal - 1);
-    let fatal_by_default = default_action_terminates(signal);
+    let acts_by_default = default_action_terminates(signal) || default_action_stops(signal);
     // A disposition of SIG_IGN discards the signal outright; SIG_DFL (or no
     // entry at all) means the default action, which is worth queueing only
     // when that action is not "ignore".
@@ -2460,11 +2517,11 @@ pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64)
         |acts: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, SigAction>>>| {
             match acts.borrow().get(&signal) {
                 Some(a) => match u64::from_le_bytes(a.0[..8].try_into().expect("size")) {
-                    SIG_DFL => fatal_by_default,
+                    SIG_DFL => acts_by_default,
                     SIG_IGN => false,
                     _ => true,
                 },
-                None => fatal_by_default,
+                None => acts_by_default,
             }
         };
     // The mask is not consulted: a signal raised while blocked stays pending
@@ -2490,6 +2547,9 @@ enum SignalExitAction {
     /// The lowest deliverable signal defaults to termination — consumed, so
     /// the caller must carry the death out.
     Terminate(u64),
+    /// The lowest deliverable signal defaults to stopping the process —
+    /// consumed, so the caller must park the thread group stopped.
+    Stop(u64),
 }
 
 /// Scans pending, unblocked signals lowest-first: explicitly ignored signals
@@ -2517,6 +2577,9 @@ fn pending_signal_action(env: &mut LinuxEnv) -> SignalExitAction {
                 env.proc.pending_signals &= !bit;
                 if default_action_terminates(sig) {
                     return SignalExitAction::Terminate(sig);
+                }
+                if default_action_stops(sig) {
+                    return SignalExitAction::Stop(sig);
                 }
             }
             Some(_) => return SignalExitAction::Handler,
@@ -2604,7 +2667,7 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         let handler = action
             .map(|a| u64::from_le_bytes(a.0[0..8].try_into().expect("size")))
             .unwrap_or(SIG_DFL);
-        if handler == SIG_DFL && default_action_terminates(sig) {
+        if handler == SIG_DFL && (default_action_terminates(sig) || default_action_stops(sig)) {
             return false;
         }
         env.proc.pending_signals &= !bit;
@@ -2935,13 +2998,36 @@ fn sys_wait4(
         }
         return Outcome::Ret(Ok(zombie.pid));
     }
+    let untraced = options & WUNTRACED != 0;
+    // WUNTRACED: a stopped child is reportable the same way an exited one
+    // is, with the wait status the job-control encoding (0x7f in the low
+    // byte, the stopping signal above it).
+    if untraced {
+        if let Some((pid, sig)) = env.sched.take_stop_report(env.proc.tgid, filter) {
+            let status = ((sig as i32) << 8) | 0x7f;
+            if status_ptr != 0 {
+                if let Err(errno) = write_mem(cpu, status_ptr, &status.to_le_bytes()) {
+                    return Outcome::Ret(Err(errno));
+                }
+            }
+            return Outcome::Ret(Ok(pid));
+        }
+    }
     if !env.sched.has_child(env.proc.tgid, filter) {
         return Outcome::Ret(Err(abi::ECHILD));
     }
     if options & WNOHANG != 0 {
         return Outcome::Ret(Ok(0));
     }
-    block_and_switch(env, cpu, ParkState::WaitChild { pid: filter }, true)
+    block_and_switch(
+        env,
+        cpu,
+        ParkState::WaitChild {
+            pid: filter,
+            untraced,
+        },
+        true,
+    )
 }
 
 fn sys_pipe(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, flags: u64) -> SysResult {
@@ -3542,11 +3628,70 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
                 deliver_signal(env, cpu);
                 Outcome::Switched
             }
-            // The default action: terminate, or ignore for the four signals
-            // a process is expected to ignore.
+            // The default action: terminate, stop for the job-control
+            // signals, or ignore for the four signals a process is expected
+            // to ignore.
             _ if default_action_terminates(signal) => task_exit(env, cpu, signal as i32, true),
+            _ if default_action_stops(signal) => {
+                resume_after_syscall(env, cpu, 0);
+                stop_thread_group(env, cpu, signal, false)
+            }
             _ => Outcome::Ret(Ok(0)),
         };
+    }
+    // Job-control signals to another process (or group) act on the target's
+    // state directly. SIGCONT lifts a stop no matter what the target's
+    // disposition says; a stop signal is queued and the target stops at its
+    // next kernel entry. Both are resolved before `signal_is_nonfatal`,
+    // which would otherwise drop them against the caller's own dispositions.
+    const SIGCONT: u64 = 18;
+    if signal == SIGCONT || default_action_stops(signal) {
+        let stop_bits: u64 = [19_u64, 20, 21, 22]
+            .iter()
+            .map(|s| 1_u64 << (s - 1))
+            .fold(0, |acc, bit| acc | bit);
+        let group = |pgid: u64| {
+            if target == 0 {
+                pgid == env.proc.pgid
+            } else {
+                pgid == (-target) as u64
+            }
+        };
+        let matches = |proc: &Process| {
+            if target <= 0 {
+                group(proc.pgid)
+            } else {
+                proc.tgid == target as u64
+            }
+        };
+        let mut found = false;
+        if matches(&env.proc) {
+            // The caller is in the target group. It is running, so a stop
+            // queues for its next kernel entry; a continue has only pending
+            // stop signals to clear.
+            found = true;
+            if signal == SIGCONT {
+                env.proc.pending_signals &= !stop_bits;
+            } else {
+                env.proc.pending_signals |= 1_u64 << (signal - 1);
+            }
+        }
+        for task in &mut env.sched.parked {
+            if !matches(&task.proc) {
+                continue;
+            }
+            found = true;
+            if signal == SIGCONT {
+                // Continuing clears the stop and any not-yet-taken stop
+                // signals; an uncollected stop notice is superseded.
+                task.proc.stopped = false;
+                task.proc.pending_signals &= !stop_bits;
+                task.proc.stop_report = None;
+            } else {
+                task.proc.pending_signals |= 1_u64 << (signal - 1);
+            }
+        }
+        return Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) });
     }
     if signal_is_nonfatal(env, signal) {
         tracing::debug!("dropping non-fatal signal {signal} to {target} (no handler delivery)");

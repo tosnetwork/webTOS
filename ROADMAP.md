@@ -661,7 +661,12 @@ Work:
   openpty/forkpty, /dev/ptmx, /dev/pts, controlling terminal, termios, window
   size, and SIGWINCH-on-resize — work, including a program a shell started in
   its own process group, and the real Codex TUI renders and takes input on a
-  host-driven stdio pty; file watching is not started)
+  host-driven stdio pty; the input line discipline raises the interrupt,
+  quit, and suspend characters as signals on the foreground group, and job
+  control is real — `^C` kills the foreground program and the shell
+  survives its own converted interrupt, `^Z` stops it with the stop
+  reported through `wait4(WUNTRACED)`, and `fg` + SIGCONT resume it where
+  it blocked (gated by `tests/pty.rs`); file watching is not started)
 - Mount a repository with explicit read/write capabilities. 🔶 (host
   directories mount read/write via `run_guest`; a repository with real Git
   history is the next target)
