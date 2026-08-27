@@ -338,12 +338,15 @@ Hot-block translation is the third tier of a written strategy — reference
 interpreter, cached interpreter, translator — and it is deliberately last.
 
 **Why last.** The claim webTOS sells is that the same input produces the same
-instruction stream, reproducibly, so a third party can replay it. That is
-measured today: `ls /` retires 73,280 instructions in Chromium, Firefox and
-WebKit alike; the musl-loaded fixture retires 31,937 in all three. A
-translation tier must reproduce those numbers bit for bit or the claim is
-gone, which is why the milestone gate for it reads "optimized and interpreter
-modes pass the same architectural trace suite". An engine whose goal is to run
+execution, reproducibly, so a third party can replay it. That is recorded, not
+asserted. `test_data/traces/` holds architectural traces — the syscall stream
+with its arguments and results, delivered signals, and register and flag
+samples taken at exact instruction counts — committed to the repository, and
+every browser engine reproduces one of them register for register on each run.
+A translation tier has to produce those same files or the claim is gone, which
+is why the milestone gate for it reads "optimized and interpreter modes pass
+the same architectural trace suite". The harness for that gate is the one
+already running. An engine whose goal is to run
 Linux in a tab does not carry that constraint. One whose goal is verifiable
 execution does, and it is cheaper to add a translator to a correct interpreter
 than to retrofit determinism onto a translator.

@@ -33,7 +33,7 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~45% | fixtures exist; native QEMU harnesses not re-run since the pivot; no trace format; measurement harnesses exist but no dashboard |
+| M0 Lock the baseline | 🔶 | ~70% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines; fixtures exist but are not a formally pinned set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~90% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
@@ -45,12 +45,12 @@ terminal behavior, and recovery after a browser reload.
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 75%**. The weights are a judgement
+Weighted by engineering effort, **roughly 76%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
 |---|---|---|---|
-| M0 Lock the baseline | 5% | 45% | 2.3 |
+| M0 Lock the baseline | 5% | 70% | 3.5 |
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 90% | 9.0 |
@@ -59,16 +59,16 @@ call, so here is the arithmetic rather than the assertion:
 | M6 OpenFox | 12% | 92% | 11.0 |
 | M7 Codex & Claude Code | 20% | 74% | 14.8 |
 | M8 Performance & release | 14% | 18% | 2.5 |
-| **Total** | **100%** | | **75.3** |
+| **Total** | **100%** | | **76.5** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 17 of the 25 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
-The native test suites (58 cases, plus 7 soak and measurement runs invoked
-explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
-27-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+The native test suites (60 cases, plus 8 soak, measurement, and
+trace-regeneration runs invoked explicitly) gate every ✅ above, alongside the 17-check wasm harness and the
+28-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -122,8 +122,10 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
 
 ### Evidence the project does not yet keep (M0, and cross-cutting)
 
-- **An instruction trace format** and stored reference traces. Determinism is
-  gated today by comparing runs to each other, not to a recorded baseline.
+- ~~**An instruction trace format** and stored reference traces.~~ Done: four
+  traces in `test_data/traces/`, and the browser matrix reproduces one of them
+  register for register. Determinism is now gated against a recorded baseline
+  rather than only against another run.
 - **Versioned fixtures.** They exist; they are not a formal, pinned set.
 - **Native QEMU validation** has not been re-run since the browser pivot.
 - **A compatibility dashboard** across engines and pinned workload versions.
@@ -341,11 +343,20 @@ Work:
   results from a clean checkout. 🔶 (harnesses exist; not re-run since the
   browser pivot — the native kernel build itself is verified)
 - Extract small ELF fixtures for static, PIE, dynamic, TLS, signal, futex,
-  filesystem, and socket behavior. 🔶 (test_data + test-compiled fixtures; not versioned as a formal set)
+  filesystem, and socket behavior. 🔶 (test_data + test-compiled fixtures;
+  those covered by a reference trace are now pinned by it, the rest are not
+  yet a formal versioned set)
 - Create an instruction trace format containing registers, flags, memory
-  effects, traps, and syscall exits. ⬜
+  effects, traps, and syscall exits. ✅ (`linux_compat::trace`: a documented,
+  versioned, line-oriented text format carrying a self-describing header, the
+  syscall stream with arguments and results, delivered signals, exits and
+  stops, and register/flag samples taken at exact instruction counts.
+  Memory effects appear as the syscall arguments that make them observable
+  rather than as a per-write log)
 - Record syscall traces for the target workloads without treating trace count
-  as proof of semantic completeness. 🔶 (live tracing exists; no stored traces)
+  as proof of semantic completeness. ✅ (four traces in `test_data/traces/`,
+  regenerated deliberately and diffed on every run; the count is not the
+  claim, the contents are)
 - Define browser support and performance dashboards. 🔶 (`web/bench.mjs` and
   `crates/linux-compat/tests/bench.rs` measure the same workloads in a browser
   and natively, against a control module that separates a slow engine from a
@@ -354,8 +365,11 @@ Work:
 
 Exit gate:
 
-- Native reference tests are reproducible. 🔶 (kernel builds; QEMU validation harnesses not re-run since the pivot)
-- Fixtures and expected traces are versioned. 🔶
+- Native reference tests are reproducible. 🔶 (kernel builds; the browser line
+  reproduces recorded traces exactly, natively and in all three engines; QEMU
+  validation harnesses not re-run since the pivot)
+- Fixtures and expected traces are versioned. 🔶 (expected traces are, in
+  `test_data/traces/`; the fixture set itself is not yet formally pinned)
 - Every later milestone can run without depending on a full root filesystem. ✅
 
 ## Milestone 1: Static `hello` ✅

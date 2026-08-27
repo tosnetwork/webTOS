@@ -263,6 +263,17 @@ first click. It ends by comparing per-command instruction counts across
 the three engines: identical input must retire an identical instruction stream
 everywhere.
 
+Determinism is gated against recorded baselines rather than only against
+another run: `test_data/traces/` holds architectural traces — the syscall
+stream with its arguments, delivered signals, and register and flag samples
+taken at exact instruction counts — and the browser matrix reproduces one of
+them register for register in each engine. The format is documented in
+`crates/linux-compat/src/trace.rs`; regenerate after an intended change with:
+
+```bash
+cd crates && cargo test -p linux-compat --release --test trace -- --ignored rewrite
+```
+
 Measurements, as opposed to gates, live in `web/bench.mjs` and
 `crates/linux-compat/tests/bench.rs`: the same guest workloads in a browser and
 natively, so the two can be read against each other, plus a few-hundred-byte

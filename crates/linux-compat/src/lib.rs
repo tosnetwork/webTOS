@@ -18,6 +18,7 @@ pub mod fd;
 pub mod net;
 pub mod proc;
 pub mod syscall;
+pub mod trace;
 pub mod vfs;
 
 use std::collections::HashMap;
@@ -156,6 +157,8 @@ pub struct LinuxEnv {
     /// deliver, which lets the next stall advance the guest's clock so timers
     /// and socket timeouts fire.
     pub(crate) network_expired: bool,
+    /// Architectural trace being recorded, when the host asked for one.
+    pub(crate) trace: Option<trace::Trace>,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
 }
@@ -185,6 +188,7 @@ impl LinuxEnv {
             terminal_input_wait: false,
             network_wait: false,
             network_expired: false,
+            trace: None,
             exit_code: None,
         })
     }
@@ -372,6 +376,13 @@ impl LinuxEnv {
 
     pub(crate) fn record_exit(&mut self, code: i32) {
         self.exit_code = Some(code);
+    }
+
+    /// Records an event when a trace is being collected.
+    pub(crate) fn trace_event(&mut self, event: trace::Event) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.push(event);
+        }
     }
 
     /// Records a syscall in the bounded diagnostic trail.
@@ -840,6 +851,90 @@ impl Machine {
     /// See [`LinuxEnv::expire_network_wait`].
     pub fn expire_network_wait(&mut self) {
         self.env().expire_network_wait();
+    }
+
+    /// Starts recording an architectural trace, sampling registers and flags
+    /// every `sample_every` retired instructions (0 records events only).
+    /// Call after `load`, so the trace's header describes what is running.
+    pub fn record_trace(&mut self, sample_every: u64) {
+        let mut collected = trace::Trace::new(&self.vm.cpu, sample_every);
+        let env = self.env();
+        collected.set_args(&env.proc.argv, &env.proc.envp);
+        env.trace = Some(collected);
+    }
+
+    /// Names the image a trace is of, so the file identifies its own subject.
+    pub fn describe_trace_image(&mut self, path: &[u8], bytes: &[u8]) {
+        if let Some(trace) = self.env().trace.as_mut() {
+            trace.set_image(path, bytes);
+        }
+    }
+
+    /// Takes the recorded trace, if any.
+    pub fn take_trace(&mut self) -> Option<trace::Trace> {
+        self.env().trace.take()
+    }
+
+    /// Runs until the guest stops or `limit` instructions have retired,
+    /// breaking at exact instruction counts to sample architectural state.
+    /// Sample points are a function of the guest's own execution rather than
+    /// of how the host sliced it, so two runs sample in the same places.
+    pub fn run_traced(&mut self, limit: u64) -> CpuExit {
+        let budget_end = self.icount().saturating_add(limit);
+        loop {
+            let sample_at = {
+                let InterpVm { cpu, env, .. } = &mut self.vm;
+                let env = env
+                    .as_mut_any()
+                    .downcast_mut::<LinuxEnv>()
+                    .expect("machine environment is always LinuxEnv");
+                match env.trace.as_mut() {
+                    Some(trace) => {
+                        // The first sample is the state before anything runs.
+                        if trace.next_sample() == Some(0) && cpu.icount() == 0 {
+                            trace.sample(cpu);
+                        }
+                        trace.next_sample()
+                    }
+                    None => None,
+                }
+            };
+            let stop_at = sample_at.map_or(budget_end, |at| at.min(budget_end));
+            self.vm.icount_limit = stop_at;
+            let exit = self.run();
+            if exit == CpuExit::InstructionLimit && self.icount() < budget_end {
+                let InterpVm { cpu, env, .. } = &mut self.vm;
+                let env = env
+                    .as_mut_any()
+                    .downcast_mut::<LinuxEnv>()
+                    .expect("machine environment is always LinuxEnv");
+                if let Some(trace) = env.trace.as_mut() {
+                    trace.sample(cpu);
+                    continue;
+                }
+            }
+            // A final sample makes the end state part of the record.
+            let icount = self.icount();
+            let InterpVm { cpu, env, .. } = &mut self.vm;
+            let env = env
+                .as_mut_any()
+                .downcast_mut::<LinuxEnv>()
+                .expect("machine environment is always LinuxEnv");
+            if let Some(trace) = env.trace.as_mut() {
+                match &exit {
+                    CpuExit::Halt { code } => trace.push(trace::Event::Exit {
+                        icount,
+                        code: code.unwrap_or(-1),
+                    }),
+                    other => trace.push(trace::Event::Stop {
+                        icount,
+                        reason: format!("{other:?}"),
+                    }),
+                }
+                trace.sample(cpu);
+            }
+            return exit;
+        }
     }
 
     /// See [`LinuxEnv::network_wait_budget_ms`].

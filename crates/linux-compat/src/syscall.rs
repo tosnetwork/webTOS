@@ -75,6 +75,7 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     let a4: u64 = cpu.read_var(env.regs.r8);
     let a5: u64 = cpu.read_var(env.regs.r9);
     env.record_syscall(nr, cpu.icount());
+    let trace_entry = env.trace.is_some().then(|| (cpu.icount(), env.proc.pid));
 
     match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
         Outcome::Ret(result) => {
@@ -103,6 +104,15 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
                 cpu.icount()
             );
             cpu.write_var(env.regs.rax, value);
+            if let Some((icount, pid)) = trace_entry {
+                env.trace_event(crate::trace::Event::Syscall {
+                    icount,
+                    pid,
+                    nr,
+                    args: [a0, a1, a2, a3, a4, a5],
+                    ret: crate::trace::SyscallResult::Value(value),
+                });
+            }
             // Resume at the instruction after `syscall`.
             let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
             cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
@@ -112,9 +122,29 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
         // (including its pending exception); do not touch RAX.
         Outcome::Switched => {
             tracing::trace!("[{}] resumed after syscall {nr} switch", env.proc.pid);
+            if let Some((icount, pid)) = trace_entry {
+                env.trace_event(crate::trace::Event::Syscall {
+                    icount,
+                    pid,
+                    nr,
+                    args: [a0, a1, a2, a3, a4, a5],
+                    ret: crate::trace::SyscallResult::Blocked,
+                });
+            }
             None
         }
-        Outcome::Exit(exit) => Some(exit),
+        Outcome::Exit(exit) => {
+            if let Some((icount, pid)) = trace_entry {
+                env.trace_event(crate::trace::Event::Syscall {
+                    icount,
+                    pid,
+                    nr,
+                    args: [a0, a1, a2, a3, a4, a5],
+                    ret: crate::trace::SyscallResult::NoReturn,
+                });
+            }
+            Some(exit)
+        }
     }
 }
 
@@ -2442,6 +2472,12 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) {
     if handler == SIG_DFL || handler == SIG_IGN {
         return;
     }
+
+    env.trace_event(crate::trace::Event::Signal {
+        icount: cpu.icount(),
+        pid: env.proc.pid,
+        signal: sig,
+    });
 
     // Save the interrupted state and current mask for rt_sigreturn, which
     // restores from this snapshot rather than parsing the stack frame.

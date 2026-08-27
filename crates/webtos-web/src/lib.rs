@@ -61,6 +61,8 @@ struct HostState {
     /// Whether stdio is a host-driven pty, which changes where `wtw_run`
     /// collects guest output from.
     pty: bool,
+    /// Last rendered architectural trace; kept alive for the reader.
+    trace_text: String,
     /// The host-driven network broker, once `wtw_net_enable` attached one.
     net: Option<std::rc::Rc<std::cell::RefCell<HostBroker>>>,
     /// Last drained broker command stream; kept alive for the reader.
@@ -81,6 +83,7 @@ thread_local! {
             fs_image: Vec::new(),
             output: Vec::new(),
             pty: false,
+            trace_text: String::new(),
             net: None,
             net_commands: Vec::new(),
             error: String::new(),
@@ -291,34 +294,44 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
         if state.pty {
             state.output.extend(machine.drain_terminal_output());
         }
-        match exit {
-            CpuExit::InstructionLimit => STATUS_RUNNING,
-            CpuExit::Halt { .. } => STATUS_HALT,
-            CpuExit::Breakpoint { .. } => STATUS_RUNNING,
-            CpuExit::Interrupted => {
-                if machine.awaiting_network() {
-                    STATUS_AWAITING_NETWORK
-                } else if machine.awaiting_terminal_input() {
-                    STATUS_AWAITING_INPUT
-                } else {
-                    STATUS_INTERRUPTED
-                }
-            }
-            CpuExit::OutOfMemory => STATUS_OUT_OF_MEMORY,
-            CpuExit::PageFault { address, access } => {
-                state.error = format!("page fault: {access:?} at {address:#x}");
-                STATUS_PAGE_FAULT
-            }
-            CpuExit::IllegalInstruction { rip } => {
-                state.error = format!("illegal instruction at {rip:#x}");
-                STATUS_ILLEGAL_INSTRUCTION
-            }
-            CpuExit::Unhandled { code, value } => {
-                state.error = format!("unhandled exception {code:?} ({value:#x})");
-                STATUS_UNHANDLED
+        classify(state, exit)
+    })
+}
+
+/// Maps an engine exit to the status class the host sees, recording a
+/// diagnostic for the ones that carry one.
+fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
+    let machine = match state.machine.as_mut() {
+        Some(machine) => machine,
+        None => return STATUS_UNHANDLED,
+    };
+    match exit {
+        CpuExit::InstructionLimit => STATUS_RUNNING,
+        CpuExit::Halt { .. } => STATUS_HALT,
+        CpuExit::Breakpoint { .. } => STATUS_RUNNING,
+        CpuExit::Interrupted => {
+            if machine.awaiting_network() {
+                STATUS_AWAITING_NETWORK
+            } else if machine.awaiting_terminal_input() {
+                STATUS_AWAITING_INPUT
+            } else {
+                STATUS_INTERRUPTED
             }
         }
-    })
+        CpuExit::OutOfMemory => STATUS_OUT_OF_MEMORY,
+        CpuExit::PageFault { address, access } => {
+            state.error = format!("page fault: {access:?} at {address:#x}");
+            STATUS_PAGE_FAULT
+        }
+        CpuExit::IllegalInstruction { rip } => {
+            state.error = format!("illegal instruction at {rip:#x}");
+            STATUS_ILLEGAL_INSTRUCTION
+        }
+        CpuExit::Unhandled { code, value } => {
+            state.error = format!("unhandled exception {code:?} ({value:#x})");
+            STATUS_UNHANDLED
+        }
+    }
 }
 
 /// Puts the loaded process's stdin/stdout/stderr on a host-driven pty of
@@ -372,6 +385,81 @@ pub extern "C" fn wtw_pty_resize(rows: u32, cols: u32) -> i32 {
         );
         0
     })
+}
+
+// ------------------------------------------------------------------- trace
+
+/// Starts recording an architectural trace, sampling registers and flags
+/// every `sample_every` retired instructions (0 records events only). Call
+/// after `wtw_load`, then drive the run with `wtw_run_traced`.
+///
+/// The point of exporting this is that the trace a browser records can be
+/// compared against a reference recorded natively. Instruction counts already
+/// match across engines; a trace says the architectural state does too.
+#[no_mangle]
+pub extern "C" fn wtw_trace_start(sample_every: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_trace_start called before wtw_init");
+        };
+        machine.record_trace(sample_every as u64);
+        0
+    })
+}
+
+/// Names the image the trace is of, so the recording identifies its subject
+/// exactly as the native recorder does.
+#[no_mangle]
+pub extern "C" fn wtw_trace_image(path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_trace_image called before wtw_init");
+        };
+        let path = unsafe { slice_arg(path_ptr, path_len) };
+        let data = unsafe { slice_arg(data_ptr, data_len) };
+        machine.describe_trace_image(&path, &data);
+        0
+    })
+}
+
+/// Runs up to `fuel` instructions, breaking at exact counts to sample state.
+/// Returns the same `STATUS_*` classes as `wtw_run`.
+#[no_mangle]
+pub extern "C" fn wtw_run_traced(fuel: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_run_traced called before wtw_init");
+        };
+        let exit = machine.run_traced(fuel as u64);
+        state.output = machine.take_output();
+        if state.pty {
+            state.output.extend(machine.drain_terminal_output());
+        }
+        classify(state, exit)
+    })
+}
+
+/// Renders the recorded trace and returns its length; read it at
+/// `wtw_trace_ptr`. Taking it ends the recording.
+#[no_mangle]
+pub extern "C" fn wtw_trace_take() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_trace_take called before wtw_init");
+        };
+        match machine.take_trace() {
+            Some(trace) => {
+                state.trace_text = trace.to_text();
+                state.trace_text.len() as i32
+            }
+            None => fail(state, "no trace was being recorded"),
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_trace_ptr() -> u32 {
+    with_state(|state| state.trace_text.as_ptr() as u32)
 }
 
 /// Sets the guest's physical-memory cap, in mebibytes (default 1 GiB). A tab
@@ -666,6 +754,7 @@ pub extern "C" fn wtw_reset() {
         state.fs_image.clear();
         state.output.clear();
         state.pty = false;
+        state.trace_text = String::new();
         state.net = None;
         state.net_commands.clear();
         state.error.clear();

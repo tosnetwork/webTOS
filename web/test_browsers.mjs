@@ -5,7 +5,9 @@
 // Phase A drives the real demo page (web/index.html) exactly as a user would:
 // BusyBox applets, "Save FS", a browser reload, and a read-back of the
 // restored filesystem. Phase B drives web/worker.js directly on a blank page
-// to cover the static and dynamically linked hello binaries. Phase C drives
+// to cover the static and dynamically linked hello binaries, and records an
+// architectural trace there to compare against the reference in the
+// repository. Phase C drives
 // the interactive terminal — streamed guest images, a real shell on a pty, a
 // full-screen editor, a window resize, and a real HTTP fetch through the
 // network gateway. Phase D
@@ -104,6 +106,19 @@ async function startServer() {
   return { server, origin: `http://127.0.0.1:${server.address().port}` };
 }
 
+/// Where a browser recording first departs from the reference, which is what
+/// a reader needs rather than two large blobs.
+function firstTraceDifference(expected, actual) {
+  const want = expected.split("\n");
+  const got = actual.split("\n");
+  for (let i = 0; i < Math.min(want.length, got.length); i += 1) {
+    if (want[i] !== got[i]) {
+      return `line ${i + 1}: expected ${JSON.stringify(want[i])}, got ${JSON.stringify(got[i])}`;
+    }
+  }
+  return `agree for ${Math.min(want.length, got.length)} lines, then lengths differ (${want.length} vs ${got.length})`;
+}
+
 /// The md5 of a staged image, computed without holding it in memory, so the
 /// guest's own md5sum can be compared against it.
 function md5OfFile(path) {
@@ -159,6 +174,7 @@ const workerDriver = async (input) => {
     if (msg.type === "ready") resolveReady(msg);
     if (msg.type === "output") pending.output += msg.text;
     if (msg.type === "done") { pending.status = msg; resolveDone?.(msg); }
+    if (msg.type === "trace") resolveDone?.(msg);
     if (msg.type === "error") {
       const failure = { type: "done", status: -1, error: msg.text, exitCode: -1, icount: 0 };
       pending.status = failure;
@@ -179,6 +195,16 @@ const workerDriver = async (input) => {
   if (readyMsg.status === -1) throw new Error(`boot failed: ${readyMsg.error}`);
   const bootMs = performance.now() - t0;
 
+  // An architectural trace of one fixture, recorded the same way the native
+  // recorder does it, so the two can be compared line for line.
+  let trace = null;
+  if (input.trace) {
+    const done = new Promise((r) => { resolveDone = r; });
+    worker.postMessage({ type: "trace", ...input.trace });
+    const result = await done;
+    trace = result.trace ?? null;
+  }
+
   const runs = [];
   for (const step of input.steps) {
     pending.output = "";
@@ -196,7 +222,7 @@ const workerDriver = async (input) => {
     });
   }
   worker.terminate();
-  return { bootMs, restored: readyMsg.restored === true, runs };
+  return { bootMs, restored: readyMsg.restored === true, runs, trace };
 };
 
 // --------------------------------------------------------------- terminal
@@ -565,6 +591,15 @@ async function runEngine(name, origin, gateway, images) {
         { path: "/bin/hello_dynamic", url: `${origin}/test_data/hello_dynamic.elf` },
         { path: "/lib/ld-musl-x86_64.so.1", url: `${origin}/test_data/alpine-minirootfs/lib/ld-musl-x86_64.so.1` },
       ],
+      // Matches the `hello-static` case in the native trace recorder exactly:
+      // same guest path, same argv, same environment, same sample rate.
+      trace: {
+        path: "/bin/hello",
+        url: `${origin}/web/hello_linux.elf`,
+        argv: ["hello"],
+        envp: ["PATH=/bin"],
+        sampleEvery: 8,
+      },
       steps: [
         { label: "static hello", path: "/bin/hello", argv: ["hello"] },
         { label: "dynamic hello (musl loader)", path: "/bin/hello_dynamic", argv: ["hello_dynamic"] },
@@ -576,6 +611,19 @@ async function runEngine(name, origin, gateway, images) {
       fingerprint[run.label] = run.icount;
       record(run.label, ok, ok ? `${run.icount.toLocaleString()} instructions` : `status=${run.status} exit=${run.exitCode} ${run.error} ${JSON.stringify(run.output.slice(0, 80))}`);
     }
+
+    // The strongest determinism statement this harness can make. Not "the
+    // engines retired the same number of instructions", but "this browser
+    // reproduced, register for register, a trace recorded natively and kept
+    // in the repository".
+    const traceMatches = direct.trace === referenceTrace;
+    record(
+      "architectural trace matches the native reference",
+      traceMatches,
+      traceMatches
+        ? `${referenceTrace.trimEnd().split("\n").length} lines identical to test_data/traces/hello-static.trace`
+        : firstTraceDifference(referenceTrace, direct.trace ?? ""),
+    );
 
     // ---- Phase C: the interactive terminal, including its network.
     await runTerminalPhase(page, origin, name, record, gateway, images);
@@ -641,6 +689,13 @@ const images = {
 if (!images.agent) {
   console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");
 }
+
+// The reference trace was recorded natively and committed; the browsers have
+// to reproduce it exactly.
+const referenceTrace = await readFile(
+  fileURLToPath(new URL("../test_data/traces/hello-static.trace", import.meta.url)),
+  "utf8",
+);
 const summary = [];
 const fingerprints = {};
 try {

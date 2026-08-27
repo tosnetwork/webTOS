@@ -16,6 +16,9 @@
 //                                     -- stream a large guest image in from
 //                                        `url`, cached in OPFS so a reload
 //                                        does not download it again
+//               { type: "trace", path, url, argv, envp, sampleEvery }
+//                                     -- run one image start to finish while
+//                                        recording an architectural trace
 //               { type: "persist" }   -- snapshot the guest FS into OPFS
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
@@ -24,6 +27,7 @@
 //               { type: "image", path, bytes, cached }  -- one image is in
 //               { type: "waiting" }   -- the guest is blocked on the terminal
 //               { type: "done", status, error, exitCode, icount },
+//               { type: "trace", status, trace }  -- the recorded trace text
 //               { type: "persisted", bytes }, { type: "error", text }
 
 const SNAPSHOT_FILE = "webtos-fs.bin";
@@ -648,6 +652,32 @@ function enableNetwork(url) {
   postMessage({ type: "status", text: `network enabled via ${gateway}` });
 }
 
+/// Records an architectural trace of one image, run to completion. The text
+/// is the same format the native recorder writes, so a browser recording can
+/// be diffed against the reference in the repository.
+async function recordTrace({ path, url, argv, envp, sampleEvery }) {
+  const image = new Uint8Array(await (await fetch(url)).arrayBuffer());
+  if (exports.wtw_add_file(...put(path), ...put(image)) !== 0) {
+    throw new Error(`add_file ${path}: ${lastError()}`);
+  }
+  load(path, argv, envp);
+  if (exports.wtw_trace_start(sampleEvery) !== 0) {
+    throw new Error(`trace start: ${lastError()}`);
+  }
+  if (exports.wtw_trace_image(...put(path), ...put(image)) !== 0) {
+    throw new Error(`trace image: ${lastError()}`);
+  }
+  let status;
+  do {
+    status = exports.wtw_run_traced(FUEL);
+    drain();
+  } while (status === STATUS_RUNNING);
+  const len = exports.wtw_trace_take();
+  if (len < 0) throw new Error(`trace take: ${lastError()}`);
+  const trace = text(exports.wtw_trace_ptr(), len);
+  postMessage({ type: "trace", status, trace });
+}
+
 function spawn(path, argv, envp, rows, cols) {
   load(path, argv, envp);
   if (exports.wtw_pty_install(rows, cols) !== 0) {
@@ -686,6 +716,7 @@ self.onmessage = async (event) => {
   try {
     if (msg.type === "boot") await boot(msg.files, msg.links);
     if (msg.type === "image") await loadImage(msg);
+    if (msg.type === "trace") await recordTrace(msg);
     if (msg.type === "network") enableNetwork(msg.gateway);
     if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {
