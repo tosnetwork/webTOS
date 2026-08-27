@@ -193,13 +193,59 @@ is not the bottleneck at all. A hot-block translator would attack the
 remaining 16%, spread across a distribution with no peak, and would add
 translation work to a run already dominated by it.
 
-What the numbers point at instead is not translating the same blocks again on
-every cold start. The content-addressed index makes lifted blocks reusable
-within a session; making it survive across sessions — serialised, keyed by
-image content, validated against the specification it was lifted under —
-would turn a cold agent start from 5.3 s into something near 0.9 s, without
-generating a single instruction of code. That is a larger win than a
-translator, for less risk, and it is measured rather than assumed.
+### Almost all of that lifting was the optimizer
+
+Splitting the lifting cost said where it went. The same agent start, with the
+p-code optimizer configured three ways:
+
+| Optimizer | Cold | Lifting | Warm rate |
+|---|---|---|---|
+| Instruction and block (the default) | 5.09 s | 4.35 s (86%) | 25.1 M inst/s |
+| Instruction only | 3.35 s | 2.61 s (78%) | 25.0 M inst/s |
+| Off | 1.10 s | 0.24 s (22%) | 21.5 M inst/s |
+
+**94% of lifting was optimization, not decoding.** And what it buys is small:
+hashing 4 MiB runs at 17.1 M inst/s optimized against 15.3 unoptimized, about
+12%. Optimizing every block to gain 12% on the few that are hot, while paying
+four seconds for the 29,000 that are not, is the wrong trade for anything but
+a compute loop.
+
+So blocks are now lifted without the optimizer and re-lifted with it once they
+have been entered enough times to have earned it. Counting happens where the
+interpreter already does a lookup, so straight-line chaining inside a block
+group costs nothing extra.
+
+| Threshold | Agent cold start | md5sum 4 MiB |
+|---|---|---|
+| Optimize everything | 5.07 s | 3.11 s (17.2 M inst/s) |
+| 200 | 1.42 s | 3.07 s (17.4 M inst/s) |
+| 1000 (the default) | 1.20 s | 3.06 s (17.5 M inst/s) |
+| 5000 | 1.13 s | 3.08 s (17.4 M inst/s) |
+
+There is no trade-off to make. Compute is unaffected — its inner blocks are
+entered millions of times and promote immediately at any of these thresholds —
+and startup improves by more than three times. The default is 1000, where the
+startup curve has flattened and merely warm code can still earn optimization.
+
+The reference traces did not have to be regenerated, which is the point of
+having them: a change that rewrites how every block is lifted turned out to be
+architecturally invisible, and the baselines said so rather than a person
+asserting it.
+
+Measured after, against the same workloads:
+
+| | Before | After |
+|---|---|---|
+| Agent `--help`, cold | 5.27 s | 1.44 s |
+| — of which lifting | 84% | 31% |
+| Five-stage shell pipeline | 1.06 s | 0.04 s |
+| Reloading the same image | 21.9 ms | 1.2 ms |
+| `execve`, marginal | ~2 ms | 1.3 ms |
+| md5sum sustained | 17.3 M inst/s | 17.3 M inst/s |
+
+The shell pipeline moving twenty-six-fold is the two changes compounding: the
+content-addressed cache stopped re-lifting the same image per process, and
+tiering stopped optimizing what a short-lived process never repeats.
 
 ## What this says about milestone 8
 
@@ -208,17 +254,21 @@ In priority order, on the evidence above:
 1. ~~**Attack translation cost.**~~ Done: a content-addressed lift cache took
    `execve` from 48.8 ms to about 2 ms. What is left per exec is address-space
    teardown and ELF loading — a different problem, and a smaller one.
-2. **Persist the lift cache across sessions.** 84% of a cold agent start is
-   lifting blocks that were lifted the last time the same image ran. Nothing
-   else on this list is worth that much.
-3. **Hot-block translation, scoped to compute.** Still the floor for
+2. ~~**Stop optimizing blocks that are never repeated.**~~ Done: tiered
+   lifting took a cold agent start from 5.3 s to 1.4 s and cost compute
+   nothing.
+3. **Persist the lift cache across sessions.** Still worth doing — 31% of a
+   cold start remains lifting — but the prize shrank from four seconds to
+   about half of one, so it now ranks below its own risk. Revisit after the
+   items below.
+4. **Hot-block translation, scoped to compute.** Still the floor for
    long-running arithmetic, where thirteen blocks cover 99% of the work. Not
    the answer for startup, which is where the complaint actually is — the
    profile above is why that sentence changed.
-4. **Split the interpreter's cold half.** Not urgent — no engine has been shown
+5. **Split the interpreter's cold half.** Not urgent — no engine has been shown
    to decline the 61.8 KiB function — but the cost if one did is known, and the
    fix is mechanical.
-5. **Budget memory as a whole.** Guest RAM, image bytes, and block cache share
+6. **Budget memory as a whole.** Guest RAM, image bytes, and block cache share
    one 4 GiB address space; quotas need to account for all three together.
 
 Not on the list: chasing the Firefox column. It measures a baseline-only

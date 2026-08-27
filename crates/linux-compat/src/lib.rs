@@ -947,6 +947,13 @@ impl Machine {
         env.network_wait_budget_ms(cpu)
     }
 
+    /// Lifts blocks without the p-code optimizer until one has been entered
+    /// `threshold` times. See [`InterpVm::set_lift_tiering`]; the default is
+    /// to optimize every block as it is lifted.
+    pub fn set_lift_tiering(&mut self, threshold: Option<u64>) {
+        self.vm.set_lift_tiering(threshold);
+    }
+
     /// Raises or lowers the guest's physical-memory cap, in mebibytes. The
     /// default is 1 GiB; a large runtime forking under load needs more, and a
     /// browser tab may have less to give. Returns false when the guest has

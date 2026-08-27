@@ -41,11 +41,11 @@ terminal behavior, and recovery after a browser reload.
 | M5 Event loop & networking | 🔶 | ~90% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines; recording, reconnect, soak pending |
 | M6 OpenFox | 🔶 | ~92% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The full 60-minute soak remains |
 | M7 Codex & Claude Code | 🔶 | ~74% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work |
-| M8 Performance & release | 🔶 | ~22% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, and block profiling established that a real agent's startup has no hot path to translate |
+| M8 Performance & release | 🔶 | ~30% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute |
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 77%**. The weights are a judgement
+Weighted by engineering effort, **roughly 78%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -58,8 +58,8 @@ call, so here is the arithmetic rather than the assertion:
 | M5 Event loop & networking | 13% | 90% | 11.7 |
 | M6 OpenFox | 12% | 92% | 11.0 |
 | M7 Codex & Claude Code | 20% | 74% | 14.8 |
-| M8 Performance & release | 14% | 22% | 3.1 |
-| **Total** | **100%** | | **77.1** |
+| M8 Performance & release | 14% | 30% | 4.2 |
+| **Total** | **100%** | | **78.2** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 17 of the 25 points outstanding. Progress from
@@ -107,12 +107,11 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   An `execve` went from 48.8 ms to about 2 ms, and a five-stage shell pipeline from 1.06 s to 0.28 s. It also fixed a live bug — two
   images loaded into one machine shared a load address and so shared blocks,
   and the second one ran the first one's code.
-- **Persist the lift cache across sessions.** Measured: 84% of a cold agent
-  start is lifting blocks that the previous run of the same image already
-  lifted, and the warm rate is the interpreter's own sustained rate. This is
-  now the first unclaimed item, and it is larger than the translator.
 - **Hot-block translation**, once the semantics are stable enough to risk it —
   and scoped to compute, where the profile has a peak. Agent startup does not.
+- **Persist the lift cache across sessions.** Worth about half a second on a
+  cold agent start now that tiered lifting has taken the other four, so it
+  ranks below the risk of serialising lifted code.
 - **Split the interpreter's cold half** (float and 80-bit paths). A risk
   rather than a defect: no engine has been shown to decline the 61.8 KiB
   function, and the fix is mechanical if one ever does.
@@ -671,9 +670,15 @@ Work:
   1.5%, and 84% of that cold start is lifting rather than executing. There is
   no hot path to translate; compute-bound work still has one (13 blocks cover
   99% of a megabyte of hashing).
+- Lift blocks cheaply and optimize only the ones that prove hot. ✅ (94% of
+  lifting was the p-code optimizer, and it buys about 12% on the few blocks
+  that repeat; blocks now earn it by being re-entered. A cold agent start went
+  from 5.3 s to 1.4 s, a five-stage shell pipeline from 1.06 s to 0.04 s, and
+  compute was unaffected. The reference traces did not need regenerating.)
 - Persist the lift cache across sessions, keyed by image content and validated
-  against the specification it was lifted under, so a cold start does not
-  re-translate what the last run already translated.
+  against the specification it was lifted under. Still worth doing — 31% of a
+  cold start is lifting — but the prize shrank from four seconds to half of
+  one, so it now ranks below its own risk.
 - Translate proven hot paths to WebAssembly, scoped to compute-bound work
   where the profile shows a peak — not to startup, where it does not.
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
@@ -721,7 +726,9 @@ Performance work follows three tiers:
 1. **Interpreter:** reference semantics, tracing, debugging, and complete
    workload bring-up.
 2. **Cached interpreter:** decoded blocks, direct branch linking, inline guest
-   memory checks, and syscall dispatch caching.
+   memory checks, and syscall dispatch caching. Lifting is itself tiered —
+   blocks are lifted cheaply and re-lifted with the p-code optimizer once
+   they have been entered enough times to be worth it.
 3. **Hot-block translator:** selected x86-64 blocks translated to WebAssembly,
    guarded by page versions and deoptimized on invalidation or uncommon exits.
 

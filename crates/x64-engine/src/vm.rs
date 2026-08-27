@@ -43,6 +43,16 @@ const MAX_LIFTED_SOURCE: usize = 64 * 1024;
 /// address reuse is churning, and verifying each candidate stops being cheap.
 const MAX_LIFTED_CANDIDATES: usize = 4;
 
+/// Entries before a block is re-lifted with the p-code optimizer.
+///
+/// Chosen by measurement rather than taste. A real agent's cold start takes
+/// 5.1 s optimizing every block, 1.4 s at a threshold of 200, 1.2 s at 1000
+/// and 1.1 s at 5000, while a compute loop is unaffected across all of them —
+/// its inner blocks are entered millions of times and promote immediately
+/// either way. 1000 sits where the startup curve has flattened while leaving
+/// room for merely warm code to earn optimization.
+const DEFAULT_PROMOTE_AFTER: u64 = 1000;
+
 pub struct InterpVm {
     pub cpu: Box<Cpu>,
     pub env: Box<dyn EnvironmentAny>,
@@ -63,6 +73,19 @@ pub struct InterpVm {
     lifted: std::collections::HashMap<(u64, u64), Vec<LiftedCode>>,
     /// The context `update_context` last installed in the lifter.
     lift_context: u64,
+    /// Re-lift a block with the p-code optimizer once it has been entered
+    /// this many times. `None` optimizes everything, as before.
+    ///
+    /// Measured: optimizing every block costs 94% of the lifting on a cold
+    /// agent start, and such a start has no hot blocks to justify it — 29,347
+    /// distinct blocks, the hottest worth 1.5%. A compute loop is the
+    /// opposite, and there the optimizer is worth about 12%. So blocks are
+    /// lifted cheaply and earn optimization by being run.
+    promote_after: Option<u64>,
+    /// Entries per block address, counted where a lookup already happens.
+    entries: std::collections::HashMap<u64, u64>,
+    /// Addresses already promoted, so a block is optimized once.
+    promoted: std::collections::HashSet<u64>,
     /// Per-block entry counts and retired instructions, when profiling is on.
     /// Off by default: a translator should be pointed at blocks that were
     /// measured to be hot, and the measurement should not be a cost the rest
@@ -92,8 +115,20 @@ impl InterpVm {
             prev_isa_mode: u8::MAX,
             lifted: std::collections::HashMap::new(),
             lift_context: 0,
+            promote_after: Some(DEFAULT_PROMOTE_AFTER),
+            entries: std::collections::HashMap::new(),
+            promoted: std::collections::HashSet::new(),
             profile: None,
         }
+    }
+
+    /// Lifts blocks without the p-code optimizer until one has been entered
+    /// `threshold` times, then re-lifts that block with it. `None` restores
+    /// the previous behaviour of optimizing every block as it is lifted.
+    pub fn set_lift_tiering(&mut self, threshold: Option<u64>) {
+        self.promote_after = threshold;
+        self.entries.clear();
+        self.promoted.clear();
     }
 
     /// Starts counting block entries. A translator is only worth pointing at
@@ -420,6 +455,28 @@ impl InterpVm {
                     let addr: u64 = self.cpu.read_dynamic(addr).zxt();
                     self.cpu.write_pc(addr);
 
+                    // A block earns the optimizer by being re-entered. This is
+                    // counted here because a map lookup happens here anyway;
+                    // straight-line chaining inside a group stays untouched.
+                    if let Some(threshold) = self.promote_after {
+                        if !self.promoted.contains(&addr) {
+                            let count = self.entries.entry(addr).or_default();
+                            *count += 1;
+                            if *count >= threshold {
+                                self.promoted.insert(addr);
+                                // Drop the cheap version so the next entry
+                                // lifts it again, with the optimizer on.
+                                let key = self.get_block_key(addr);
+                                self.code.map.remove(&key);
+                                self.lifted.remove(&(addr, key.isa_mode));
+                                self.cpu.block_id = block_id;
+                                self.cpu.exception.code = ExceptionCode::CodeNotTranslated as u32;
+                                self.cpu.exception.value = addr;
+                                break;
+                            }
+                        }
+                    }
+
                     match self.code.map.get(&self.get_block_key(addr)) {
                         Some(group) => {
                             block_id = group.blocks.0 as u64;
@@ -480,8 +537,23 @@ impl InterpVm {
             return Ok(group);
         }
 
+        // Tiered lifting: the optimizer runs only for an address that has
+        // proved hot. The setting is restored afterwards so nothing else sees
+        // a changed lifter.
+        let optimize = self.promote_after.is_none() || self.promoted.contains(&addr);
+        let saved = (
+            self.lifter.settings.optimize,
+            self.lifter.settings.optimize_block,
+        );
+        if !optimize {
+            self.lifter.settings.optimize = false;
+            self.lifter.settings.optimize_block = false;
+        }
         let mut ctx = lifter::Context::new(&mut *self.cpu, &mut self.code, addr);
-        let group = self.lifter.lift_block(&mut ctx)?;
+        let lifted = self.lifter.lift_block(&mut ctx);
+        self.lifter.settings.optimize = saved.0;
+        self.lifter.settings.optimize_block = saved.1;
+        let group = lifted?;
 
         // Add breakpoints to the lifted code.
         if !self.code.breakpoints.is_empty() {
