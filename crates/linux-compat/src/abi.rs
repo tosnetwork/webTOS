@@ -114,6 +114,7 @@ pub const SYS_CLOCK_NANOSLEEP: u64 = 230;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_EPOLL_WAIT: u64 = 232;
 pub const SYS_EPOLL_CTL: u64 = 233;
+pub const SYS_TKILL: u64 = 200;
 pub const SYS_TGKILL: u64 = 234;
 pub const SYS_OPENAT: u64 = 257;
 pub const SYS_MKDIRAT: u64 = 258;

@@ -77,6 +77,21 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     env.record_syscall(nr, cpu.icount());
     let trace_entry = env.trace.is_some().then(|| (cpu.icount(), env.proc.pid));
 
+    // A signal whose disposition is the default action and whose default is
+    // to terminate kills the task here, before the syscall runs. This is the
+    // boundary the interpreter reaches after the scheduler wakes a task that
+    // a terminal interrupt made runnable, so `^C` on a program blocked in
+    // `read` or `nanosleep` ends it. A task spinning in a compute loop that
+    // issues no syscalls is not interrupted; killing that needs a check on
+    // the execution path rather than the kernel entry.
+    if let Some(sig) = take_fatal_default_signal(env) {
+        tracing::debug!("[{}] killed by signal {sig}", env.proc.pid);
+        return match task_exit(env, cpu, sig as i32, true) {
+            Outcome::Exit(exit) => Some(exit),
+            _ => None,
+        };
+    }
+
     match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
         Outcome::Ret(result) => {
             let value = match result {
@@ -186,6 +201,8 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_SCHED_YIELD => sys_yield(env, cpu),
         abi::SYS_KILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_TGKILL => sys_kill(env, cpu, a[1], a[2]),
+        // `tkill` addresses a thread directly; `raise` in musl is built on it.
+        abi::SYS_TKILL => sys_kill(env, cpu, a[0], a[1]),
         abi::SYS_NANOSLEEP => outcome_nanosleep(env, cpu, a[0], false),
         abi::SYS_CLOCK_NANOSLEEP => {
             const TIMER_ABSTIME: u64 = 1;
@@ -2321,7 +2338,15 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 
     let group_leader = pid == tgid;
     if tgid == ROOT_PID && (exit_group || group_leader) {
-        env.record_exit(status >> 8);
+        // A wait status with no exit byte is a signal death. Report it the
+        // way a shell does, as 128 plus the signal, so a caller sees 130 for
+        // an interrupt rather than a silent 0.
+        let code = if status & 0x7f != 0 {
+            128 + (status & 0x7f)
+        } else {
+            status >> 8
+        };
+        env.record_exit(code);
         tracing::debug!("root process exited with status {status:#x}");
         return Outcome::Exit(VmExit::Halt);
     }
@@ -2371,31 +2396,77 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
 /// disposition table is process-wide, so any such thread can run the handler.
 /// Does nothing when the parent installed no SIGCHLD handler (the default
 /// disposition for SIGCHLD is to ignore it) or when every thread blocks it.
-/// Marks `signal` pending on every task in process group `pgrp` that has a
-/// user handler for it and does not block it. Used for terminal-generated
-/// signals (e.g. SIGWINCH to the foreground group on a resize). Does nothing
-/// when `pgrp` is 0 or no member handles the signal.
+/// `sa_handler` values with a meaning of their own rather than an address.
+const SIG_DFL: u64 = 0;
+const SIG_IGN: u64 = 1;
+
+/// True when the kernel's default action for `signal` is to terminate the
+/// process. The signals a process is expected to ignore by default —
+/// SIGCHLD, SIGURG, SIGWINCH, SIGCONT — are not in this set, so raising one
+/// on a process that installed no handler stays a no-op.
+fn default_action_terminates(signal: u64) -> bool {
+    !matches!(signal, 17 | 18 | 23 | 28)
+}
+
+/// Marks `signal` pending on every task in process group `pgrp` that would do
+/// something with it: one that installed a handler, or one where the default
+/// action is fatal. Used for terminal-generated signals — SIGWINCH on a
+/// resize, SIGINT and SIGQUIT from the line discipline. Does nothing when
+/// `pgrp` is 0.
 pub(crate) fn deliver_signal_to_pgrp(env: &mut LinuxEnv, pgrp: u64, signal: u64) {
     if pgrp == 0 {
         return;
     }
     let bit = 1_u64 << (signal - 1);
-    let has_handler =
+    let fatal_by_default = default_action_terminates(signal);
+    // A disposition of SIG_IGN discards the signal outright; SIG_DFL (or no
+    // entry at all) means the default action, which is worth queueing only
+    // when that action is not "ignore".
+    let acts_on_it =
         |acts: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<u64, SigAction>>>| {
-            acts.borrow()
-                .get(&signal)
-                .is_some_and(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")) > 1)
+            match acts.borrow().get(&signal) {
+                Some(a) => match u64::from_le_bytes(a.0[..8].try_into().expect("size")) {
+                    SIG_DFL => fatal_by_default,
+                    SIG_IGN => false,
+                    _ => true,
+                },
+                None => fatal_by_default,
+            }
         };
     // The mask is not consulted: a signal raised while blocked stays pending
     // until it is unblocked. Only delivery looks at the mask.
-    if env.proc.pgid == pgrp && has_handler(&env.proc.sigactions) {
+    if env.proc.pgid == pgrp && acts_on_it(&env.proc.sigactions) {
         env.proc.pending_signals |= bit;
     }
     for t in &mut env.sched.parked {
-        if t.proc.pgid == pgrp && has_handler(&t.proc.sigactions) {
+        if t.proc.pgid == pgrp && acts_on_it(&t.proc.sigactions) {
             t.proc.pending_signals |= bit;
         }
     }
+}
+
+/// The lowest pending, unblocked signal whose disposition is the default
+/// action and whose default action is to terminate — consumed, so the caller
+/// must act on it. Called at the syscall boundary, which is where a task that
+/// was woken by a terminal interrupt next reaches the kernel.
+fn take_fatal_default_signal(env: &mut LinuxEnv) -> Option<u64> {
+    let mut pending = env.proc.pending_signals & !env.proc.sigmask;
+    while pending != 0 {
+        let sig = pending.trailing_zeros() as u64 + 1;
+        pending &= !(1_u64 << (sig - 1));
+        let disposition = env
+            .proc
+            .sigactions
+            .borrow()
+            .get(&sig)
+            .map(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")));
+        let defaulted = matches!(disposition, None | Some(SIG_DFL));
+        if defaulted && default_action_terminates(sig) {
+            env.proc.pending_signals &= !(1_u64 << (sig - 1));
+            return Some(sig);
+        }
+    }
+    None
 }
 
 fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
@@ -2461,8 +2532,6 @@ fn notify_parent_sigchld(env: &mut LinuxEnv, parent_tgid: u64) {
 /// handler reach a pending state, so a missing or default disposition here is
 /// treated as a no-op rather than a fault.
 fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
-    const SIG_DFL: u64 = 0;
-    const SIG_IGN: u64 = 1;
     // Only unblocked signals are deliverable; a signal raised while its
     // handler runs (the handler's own mask blocks it) stays pending until
     // `rt_sigreturn` restores the mask.
@@ -3181,12 +3250,20 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
             let mut inner = pty.borrow_mut();
-            // A master write is terminal input (raw, into `m2s`). A slave
-            // write is terminal output (into `s2m`), expanding `\n` to `\r\n`
-            // when the line discipline has OPOST|ONLCR.
+            // A master write is terminal input, which goes through the input
+            // line discipline. A slave write is terminal output (into `s2m`),
+            // expanding `\n` to `\r\n` when the discipline has OPOST|ONLCR.
             if master {
-                inner.m2s.extend(bytes.iter().copied());
-            } else if inner.onlcr() {
+                let signal = inner.feed_input(&bytes);
+                let pgrp = inner.fg_pgrp;
+                drop(inner);
+                if let Some(sig) = signal {
+                    deliver_signal_to_pgrp(env, pgrp, sig);
+                }
+                let _ = nonblock;
+                return Outcome::Ret(Ok(bytes.len() as u64));
+            }
+            if inner.onlcr() {
                 for &b in &bytes {
                     if b == b'\n' {
                         inner.s2m.push_back(b'\r');
@@ -3371,13 +3448,45 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
                 .any(|t| t.proc.tgid as i64 == target);
         return Outcome::Ret(if exists { Ok(0) } else { Err(abi::ESRCH) });
     }
+    // A signal a task sends to itself — `raise`, `abort`, a shell aborting
+    // its own line — is resolved against the disposition rather than assumed
+    // fatal. POSIX requires the handler to have run before `raise` returns,
+    // so the return value and resume point are written first: the state the
+    // handler snapshots then continues after the syscall instead of
+    // repeating it.
+    if target == env.proc.tgid as i64 || target == env.proc.pid as i64 {
+        let disposition = env
+            .proc
+            .sigactions
+            .borrow()
+            .get(&signal)
+            .map(|a| u64::from_le_bytes(a.0[..8].try_into().expect("size")));
+        return match disposition {
+            Some(SIG_IGN) => Outcome::Ret(Ok(0)),
+            Some(handler) if handler != SIG_DFL => {
+                cpu.write_var(env.regs.rax, 0_u64);
+                let next_pc: u64 = cpu.read_var(cpu.arch.reg_next_pc);
+                cpu.exception = Exception::new(ExceptionCode::ExternalAddr, next_pc);
+                // The state the handler saves has to be an instruction
+                // boundary. Without this it is the middle of the block that
+                // issued the syscall, and `rt_sigreturn` resumes there and
+                // reads a temporary the block never wrote.
+                cpu.write_pc(next_pc);
+                cpu.block_id = u64::MAX;
+                cpu.block_offset = 0;
+                env.proc.pending_signals |= 1_u64 << (signal - 1);
+                deliver_signal(env, cpu);
+                Outcome::Switched
+            }
+            // The default action: terminate, or ignore for the four signals
+            // a process is expected to ignore.
+            _ if default_action_terminates(signal) => task_exit(env, cpu, signal as i32, true),
+            _ => Outcome::Ret(Ok(0)),
+        };
+    }
     if signal_is_nonfatal(env, signal) {
         tracing::debug!("dropping non-fatal signal {signal} to {target} (no handler delivery)");
         return Outcome::Ret(Ok(0));
-    }
-    if target == env.proc.tgid as i64 || target == env.proc.pid as i64 {
-        tracing::warn!("task killed itself with signal {signal} (no handler delivery)");
-        return task_exit(env, cpu, 128 + signal as i32, true);
     }
     // Group target: `-pgid` (or 0 = the caller's own group) fans out to
     // every member process. `-1` (all processes) is not modeled.
@@ -3513,9 +3622,12 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
             if waiting {
                 let bytes: Vec<u8> = env.stdio_input.drain(..).collect();
                 let mut p = pty.borrow_mut();
-                p.m2s.extend(bytes);
-                p.activity += 1;
+                let signal = p.feed_input(&bytes);
+                let pgrp = p.fg_pgrp;
                 drop(p);
+                if let Some(sig) = signal {
+                    deliver_signal_to_pgrp(env, pgrp, sig);
+                }
                 if let Some(index) = env.sched.find_ready(now) {
                     return Some(index);
                 }

@@ -72,6 +72,29 @@ impl Pty {
         termios[4..8].copy_from_slice(&0x0005_u32.to_le_bytes());
         termios[8..12].copy_from_slice(&0x00bf_u32.to_le_bytes());
         termios[12..16].copy_from_slice(&0x8a3b_u32.to_le_bytes());
+        // c_cc, which a program reads to learn which keys mean what. Leaving
+        // it zeroed advertises NUL as the interrupt character and VMIN 0,
+        // which is not what any terminal library expects.
+        termios[C_CC..].copy_from_slice(&[
+            3,   // VINTR   ^C
+            28,  // VQUIT   ^\
+            127, // VERASE  DEL
+            21,  // VKILL   ^U
+            4,   // VEOF    ^D
+            0,   // VTIME
+            1,   // VMIN
+            0,   // VSWTC
+            17,  // VSTART  ^Q
+            19,  // VSTOP   ^S
+            26,  // VSUSP   ^Z
+            0,   // VEOL
+            18,  // VREPRINT ^R
+            15,  // VDISCARD ^O
+            23,  // VWERASE  ^W
+            22,  // VLNEXT   ^V
+            0,   // VEOL2
+            0, 0,
+        ]);
         Self {
             id,
             m2s: std::collections::VecDeque::new(),
@@ -92,7 +115,62 @@ impl Pty {
         let oflag = u32::from_le_bytes(self.termios[4..8].try_into().expect("size"));
         oflag & 0x1 != 0 && oflag & 0x4 != 0
     }
+
+    /// True when `ISIG` (c_lflag bit 0) is set, so the interrupt and quit
+    /// characters generate signals instead of arriving as data.
+    fn isig(&self) -> bool {
+        u32::from_le_bytes(self.termios[12..16].try_into().expect("size")) & 0x1 != 0
+    }
+
+    /// Queues terminal input, applying the input side of the line discipline.
+    ///
+    /// With `ISIG` set, the interrupt and quit characters are not data: the
+    /// kernel consumes the character, discards whatever input was already
+    /// queued, and raises a signal on the foreground process group. Returns
+    /// the signal to raise, which the caller delivers — a `Pty` has no view of
+    /// the process table. A program that puts the terminal in raw mode clears
+    /// `ISIG` and then reads `\x03` as an ordinary byte, which is how a
+    /// full-screen editor keeps its own key bindings.
+    ///
+    /// The suspend character is deliberately left as data: stopping a process
+    /// group needs a stopped task state that the scheduler does not have, and
+    /// silently discarding `^Z` would be worse than passing it through.
+    pub fn feed_input(&mut self, bytes: &[u8]) -> Option<u64> {
+        const SIGINT: u64 = 2;
+        const SIGQUIT: u64 = 3;
+        if !self.isig() {
+            self.m2s.extend(bytes.iter().copied());
+            self.activity += 1;
+            return None;
+        }
+        let (intr, quit) = (self.termios[C_CC], self.termios[C_CC + 1]);
+        let mut signal = None;
+        for &byte in bytes {
+            // A disabled character is encoded as NUL and must not match a
+            // typed NUL.
+            let raised = if intr != 0 && byte == intr {
+                Some(SIGINT)
+            } else if quit != 0 && byte == quit {
+                Some(SIGQUIT)
+            } else {
+                None
+            };
+            match raised {
+                Some(sig) => {
+                    self.m2s.clear();
+                    signal = Some(sig);
+                }
+                None => self.m2s.push_back(byte),
+            }
+        }
+        self.activity += 1;
+        signal
+    }
 }
+
+/// Offset of `c_cc` in the 36-byte `struct termios`: four 32-bit flag words
+/// and the one-byte `c_line`.
+const C_CC: usize = 17;
 
 pub type PtyRef = Rc<RefCell<Pty>>;
 
