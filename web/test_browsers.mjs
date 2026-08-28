@@ -695,6 +695,40 @@ async function runEngine(name, origin, gateway, images) {
       readBack.status,
     );
 
+    // A persist interrupted partway must not corrupt the committed snapshot.
+    // The probe persists a good snapshot, then persists again with the next
+    // write made to reject — a worker killed mid-write — and reads the
+    // committed file back. `intact` is true only if the good snapshot
+    // survived the failed second persist. Run in its own worker so the demo
+    // page's is untouched.
+    const probe = await page.evaluate(async (workerUrl) => {
+      const worker = new Worker(workerUrl);
+      const boot = new Promise((r) => {
+        worker.onmessage = (e) => {
+          if (e.data.type === "ready") r(true);
+        };
+      });
+      worker.postMessage({ type: "boot", files: [] });
+      await boot;
+      const result = new Promise((r) => {
+        worker.onmessage = (e) => {
+          if (e.data.type === "persistProbe") r(e.data);
+          if (e.data.type === "error") r({ intact: false, error: e.data.text });
+        };
+      });
+      worker.postMessage({ type: "persistFaultProbe" });
+      const out = await result;
+      worker.terminate();
+      return out;
+    }, `${origin}/web/worker.js`);
+    record(
+      "checkpoint: an interrupted persist leaves the committed snapshot intact",
+      probe.intact === true && probe.threw === true,
+      probe.intact
+        ? `a failed persist threw and the committed ${probe.len}-byte snapshot was unchanged`
+        : `committed snapshot corrupted by a failed persist: ${JSON.stringify(probe)}`,
+    );
+
     await page.click("#forget");
     await page.waitForFunction(
       () => document.getElementById("status").textContent.includes("deleted"),

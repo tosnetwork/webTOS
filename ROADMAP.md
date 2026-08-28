@@ -37,7 +37,7 @@ terminal behavior, and recovery after a browser reload.
 | M1 Static `hello` | ✅ | ~95% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~93% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
-| M4 Threads & processes | ✅ | ~96% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
+| M4 Threads & processes | ✅ | ~97% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
 | M5 Event loop & networking | 🔶 | ~99% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, soak pending |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~88% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work. **A session that does work now finishes**: asked to change a value in a file and check it, Codex read the file, applied its own patch, ran `cat` on a pty it allocated, reported what that subprocess printed, and exited 0. Two engine defects of one shape were in the way, each an unimplemented case reported as an unrecoverable error — a vaddr-keyed disassembly map disagreeing with the asid-keyed block cache on every `execve`, and `TCSETSF` missing from the ioctl table |
@@ -54,12 +54,12 @@ call, so here is the arithmetic rather than the assertion:
 | M1 Static `hello` | 5% | 95% | 4.8 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 93% | 9.3 |
-| M4 Threads & processes | 13% | 96% | 12.5 |
+| M4 Threads & processes | 13% | 97% | 12.6 |
 | M5 Event loop & networking | 13% | 99% | 12.9 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 88% | 17.6 |
 | M8 Performance & release | 14% | 73% | 10.2 |
-| **Total** | **100%** | | **90.3** |
+| **Total** | **100%** | | **90.4** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 11 of the 15 points outstanding. Progress from
@@ -651,7 +651,19 @@ Exit gate:
 - Thread, futex, child-process, and exec fixture suites pass. ✅
 - Repeated runs from the same checkpoint produce the same scheduled event
   sequence in deterministic mode. ✅ (identical output and instruction counts across runs)
-- Worker cancellation cannot leave committed storage in a partial state. ⬜ (browser-host work)
+- Worker cancellation cannot leave committed storage in a partial state. ✅
+  (a persist interrupted partway must leave the committed snapshot equal to
+  the last good one. Gated by a probe in `web/test_browsers.mjs`: it persists
+  a snapshot, then persists again with the next OPFS write made to reject — a
+  worker killed mid-write — and reads the committed file back. The probe
+  discriminates rather than passing for free: an in-place write
+  (`createSyncAccessHandle` + truncate) corrupts the committed file and the
+  probe catches it on all three engines. What passes is `createWritable`,
+  whose swap-on-close semantics write to a scratch file and only replace the
+  committed one atomically — so an interrupted write leaves the original
+  intact, which the direct-write canary confirmed empirically. `persist` now
+  makes that explicit with a temp-file-then-`move` commit, robust even where
+  an engine might write in place. Green in Chromium, Firefox, and WebKit)
 
 ## Milestone 5: Event Loop and Networking 🔶
 

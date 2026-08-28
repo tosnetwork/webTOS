@@ -98,12 +98,50 @@ async function opfsRead(name) {
   }
 }
 
-async function opfsWrite(name, bytes) {
+/// Writes `bytes` to `name` so that a cancellation cannot leave the committed
+/// file partial.
+///
+/// `createWritable()` truncates the file it opens at once, so writing straight
+/// to `name` and being killed before `close()` destroys whatever was there —
+/// for a snapshot, that is the session. So the bytes go to a `.partial` first,
+/// which is fully written and closed before the committed name is touched at
+/// all, and the commit is a single `move()`, which replaces atomically. If the
+/// worker dies before the move, the old committed file is exactly as it was;
+/// if it dies during the partial write, only the partial is damaged, and a
+/// stale partial is overwritten by the next write or ignored on read.
+async function opfsWriteAtomic(name, bytes) {
   const root = await navigator.storage.getDirectory();
+  const partial = `${name}.partial`;
+  const scratch = await root.getFileHandle(partial, { create: true });
+  const writable = await scratch.createWritable();
+  try {
+    await writable.write(bytes);
+    await writable.close();
+  } catch (e) {
+    // A failed write must not leave a partial masquerading as committable.
+    try { await root.removeEntry(partial); } catch {}
+    throw e;
+  }
+  if (typeof scratch.move === "function") {
+    try {
+      // The atomic path: one rename over the target.
+      await scratch.move(name);
+      return;
+    } catch {
+      // Some engines expose move() with a different signature or refuse a
+      // rename over an existing file. Fall through to the copy commit.
+    }
+  }
+  // Fallback where move() is absent or refused: the target is written from the
+  // completed partial's bytes, which are already known to be whole. This
+  // reopens the window the partial was meant to close, so it is the lesser
+  // path, taken only when the atomic one is unavailable.
+  const whole = await (await scratch.getFile()).arrayBuffer();
   const handle = await root.getFileHandle(name, { create: true });
-  const writable = await handle.createWritable();
-  await writable.write(bytes);
-  await writable.close();
+  const commit = await handle.createWritable();
+  await commit.write(whole);
+  await commit.close();
+  try { await root.removeEntry(partial); } catch {}
 }
 
 async function opfsDelete(name) {
@@ -366,7 +404,11 @@ function reportFootprint() {
     guest: kib(0),
     code: kib(1),
     files: kib(2),
-    total: kib(3),
+    // The sum of the parts, not a separately rounded whole: each part is
+    // reported in KiB, and round(a)+round(b)+round(c) is not round(a+b+c), so
+    // a separately rounded total would disagree with its own parts by a few
+    // KiB. The total is what the footprint is spent on, which is the parts.
+    total: kib(0) + kib(1) + kib(2),
     headroom: headroom < 0 ? null : headroom * 1024,
     // The filesystem's own ceiling. `files` is what it holds; this is what
     // the guest may still add before a write gets ENOSPC.
@@ -412,7 +454,7 @@ async function persist() {
     exports.wtw_fs_ptr(),
     exports.wtw_fs_ptr() + exports.wtw_fs_len(),
   );
-  await opfsWrite(SNAPSHOT_FILE, bytes);
+  await opfsWriteAtomic(SNAPSHOT_FILE, bytes);
   postMessage({ type: "persisted", bytes: bytes.length });
 }
 
@@ -818,6 +860,51 @@ self.onmessage = async (event) => {
       postMessage({ type: "status", text: `guest memory cap ${msg.mib} MiB` });
     }
     if (msg.type === "footprint") reportFootprint();
+    if (msg.type === "persistFaultProbe") {
+      // Does an interrupted persist leave the committed snapshot partial?
+      // Persist a good snapshot, then persist again with the very next
+      // createWritable write made to reject — the shape of a worker killed
+      // mid-write — and read the committed file back. `intact` says whether
+      // the committed snapshot is still the good one.
+      await persist();
+      const root = await navigator.storage.getDirectory();
+      const read = async () =>
+        new Uint8Array(
+          await (await (await root.getFileHandle(SNAPSHOT_FILE)).getFile()).arrayBuffer(),
+        );
+      const before = await read();
+      const proto = self.FileSystemWritableFileStream.prototype;
+      const realWrite = proto.write;
+      let armed = true;
+      proto.write = function (...args) {
+        if (armed) {
+          armed = false;
+          return Promise.reject(new Error("injected write fault"));
+        }
+        return realWrite.apply(this, args);
+      };
+      let threw = false;
+      try {
+        exports.wtw_file_create(...put("/home/probe.txt"), 4, 0o644);
+        exports.wtw_file_append(...put("/home/probe.txt"), ...put("data"));
+        await persist();
+      } catch {
+        threw = true;
+      } finally {
+        proto.write = realWrite;
+      }
+      let after;
+      try {
+        after = await read();
+      } catch {
+        after = new Uint8Array(0); // the committed file is gone entirely
+      }
+      const intact =
+        before.length > 0 &&
+        before.length === after.length &&
+        before.every((b, i) => b === after[i]);
+      postMessage({ type: "persistProbe", intact, threw, len: before.length });
+    }
     if (msg.type === "budget") {
       if (exports.wtw_set_memory_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
         throw new Error(`budget: ${lastError()}`);
