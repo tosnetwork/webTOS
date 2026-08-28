@@ -936,6 +936,81 @@ fn cases() -> Vec<Case> {
         });
     }
 
+    // 128-bit (16-byte) move/widen/logic ops, done as two 8-byte lanes. Inputs
+    // are seeded through their 8-byte slices (the seed value is a u64). The two
+    // lanes carry different patterns so a lane mix-up or a dropped high lane
+    // shows.
+    let (o16, a16, b16) = (reg(1, 16), reg(2, 16), reg(3, 16));
+    let (alo, ahi) = (a16.slice(0, 8), a16.slice(8, 8));
+    let (blo, bhi) = (b16.slice(0, 8), b16.slice(8, 8));
+    let seed16 = || {
+        vec![
+            (alo, 0x0f0f_f0f0_dead_beef_u64),
+            (ahi, 0x1122_3344_5566_7788),
+            (blo, 0xffff_0000_ffff_0000),
+            (bhi, 0x00ff_00ff_00ff_00ff),
+        ]
+    };
+    for (name, op) in [
+        ("IntXor u128", Op::IntXor),
+        ("IntOr u128", Op::IntOr),
+        ("IntAnd u128", Op::IntAnd),
+    ] {
+        let mut block = pcode::Block::new();
+        block.push((o16, op, a16, b16));
+        out.push(Case {
+            name,
+            seeds: seed16(),
+            block,
+        });
+    }
+    {
+        let mut block = pcode::Block::new();
+        block.push((o16, Op::Copy, a16));
+        out.push(Case {
+            name: "Copy u128",
+            seeds: seed16(),
+            block,
+        });
+    }
+    {
+        let mut block = pcode::Block::new();
+        block.push((o16, Op::IntNot, a16));
+        out.push(Case {
+            name: "IntNot u128",
+            seeds: seed16(),
+            block,
+        });
+    }
+    // ZeroExtend/SignExtend a sub-16 input to 16 bytes; the input's top bit is
+    // set so the sign fill of SignExtend is exercised (0xff high lane).
+    for (name, op, in_size, av) in [
+        ("ZeroExtend u32->u128", Op::ZeroExtend, 4u8, 0x8000_00ff_u64),
+        (
+            "ZeroExtend u64->u128",
+            Op::ZeroExtend,
+            8,
+            0xdead_beef_8000_0001,
+        ),
+        ("SignExtend u32->u128", Op::SignExtend, 4, 0x8000_00ff),
+        ("SignExtend u8->u128", Op::SignExtend, 1, 0xf3),
+        (
+            "SignExtend u64->u128",
+            Op::SignExtend,
+            8,
+            0x8000_0000_0000_0001,
+        ),
+    ] {
+        let a = reg(2, in_size);
+        let mut block = pcode::Block::new();
+        block.push((o16, op, a));
+        out.push(Case {
+            name,
+            seeds: vec![(a, av)],
+            block,
+        });
+    }
+
     out
 }
 
@@ -1665,6 +1740,35 @@ fn mem_cases() -> Vec<MemCase> {
             seeds: vec![],
             block,
             region: None,
+        });
+    }
+
+    // 128-bit load/store (movdqa-shaped): each is two 8-byte guest accesses,
+    // low half at addr and high at addr + 8, matching the interpreter.
+    {
+        let (out, addr) = (v(1, 16), v(5, 8));
+        let mut block = pcode::Block::new();
+        block.push((out, Op::Load(RAM_SPACE), addr));
+        cases.push(MemCase {
+            name: "Load u128",
+            seeds: vec![(addr, BASE)],
+            block,
+            region: Some((BASE, seed16.clone())),
+        });
+    }
+    {
+        let (addr, val) = (v(5, 8), v(6, 16));
+        let mut block = pcode::Block::new();
+        block.push((Op::Store(RAM_SPACE), Inputs::new(addr, val)));
+        cases.push(MemCase {
+            name: "Store u128",
+            seeds: vec![
+                (addr, BASE),
+                (val.slice(0, 8), 0xdead_beef_cafe_babe),
+                (val.slice(8, 8), 0x0011_2233_4455_6677),
+            ],
+            block,
+            region: Some((BASE, vec![0u8; 32])),
         });
     }
 

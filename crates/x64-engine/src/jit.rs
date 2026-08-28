@@ -260,6 +260,67 @@ fn emit_signed(f: &mut Function, v: Value, size: u8) -> Option<()> {
     Some(())
 }
 
+/// Pushes an operand sign-extended to a full `i64`, whatever its byte width.
+/// Used for the low lane of a 128-bit sign-extend and its sign fill.
+fn emit_sext_i64(f: &mut Function, v: Value, size: u8) -> Option<()> {
+    emit_signed(f, v, size)?;
+    if size < 8 {
+        f.instruction(&Instruction::I64ExtendI32S);
+    }
+    Some(())
+}
+
+/// The two 8-byte lane offsets of a 128-bit varnode. The move/widen/logic ops
+/// that dominate vectorised code are per-lane, so they are emitted as two
+/// independent `i64` operations on the low and high halves — no wasm SIMD. The
+/// register file lays a 16-byte varnode out contiguously, so lane `off` is the
+/// varnode sliced at `off` for 8 bytes, matching the interpreter, which reads
+/// and writes a 128-bit value as its two little-endian `u64` halves.
+const WIDE_LANES: [u8; 2] = [0, 8];
+
+/// out = a `<op>` b, a 128-bit same-width binary op done as two `i64` lanes.
+/// `op` emits the `i64` instruction once the two lane operands are on the stack.
+fn emit_wide_binop(
+    f: &mut Function,
+    out: VarNode,
+    a: Value,
+    b: Value,
+    op: impl Fn(&mut Function),
+) -> Option<()> {
+    if out.size != 16 || a.size() != 16 || b.size() != 16 {
+        return None;
+    }
+    for off in WIDE_LANES {
+        emit_store_addr(f);
+        emit_load(f, a.slice(off, 8), 8)?;
+        emit_load(f, b.slice(off, 8), 8)?;
+        op(f);
+        emit_store(f, out.slice(off, 8))?;
+    }
+    Some(())
+}
+
+/// out = `<op>` a, a 128-bit unary op (a move, or a not) done as two `i64`
+/// lanes. `op` transforms each loaded lane before it is stored; for a plain
+/// copy it does nothing.
+fn emit_wide_unary(
+    f: &mut Function,
+    out: VarNode,
+    a: Value,
+    op: impl Fn(&mut Function),
+) -> Option<()> {
+    if out.size != 16 || a.size() != 16 {
+        return None;
+    }
+    for off in WIDE_LANES {
+        emit_store_addr(f);
+        emit_load(f, a.slice(off, 8), 8)?;
+        op(f);
+        emit_store(f, out.slice(off, 8))?;
+    }
+    Some(())
+}
+
 /// The `iN.eqz` for an operand of this width (i64 at width 8, i32 otherwise).
 fn int_eqz(size: u8) -> Instruction<'static> {
     match size {
@@ -422,6 +483,11 @@ pub fn translate_instruction(
 
         // out = a ^ b, all one width.
         Op::IntXor => {
+            if out.size == 16 {
+                return emit_wide_binop(f, out, a, b, |f| {
+                    f.instruction(&Instruction::I64Xor);
+                });
+            }
             let size = same_width(out, a, b)?;
             emit_store_addr(f);
             emit_load(f, a, size)?;
@@ -435,6 +501,11 @@ pub fn translate_instruction(
 
         // out = a | b, all one width.
         Op::IntOr => {
+            if out.size == 16 {
+                return emit_wide_binop(f, out, a, b, |f| {
+                    f.instruction(&Instruction::I64Or);
+                });
+            }
             let size = same_width(out, a, b)?;
             emit_store_addr(f);
             emit_load(f, a, size)?;
@@ -448,6 +519,11 @@ pub fn translate_instruction(
 
         // out = a & b, all one width.
         Op::IntAnd => {
+            if out.size == 16 {
+                return emit_wide_binop(f, out, a, b, |f| {
+                    f.instruction(&Instruction::I64And);
+                });
+            }
             let size = same_width(out, a, b)?;
             emit_store_addr(f);
             emit_load(f, a, size)?;
@@ -477,6 +553,12 @@ pub fn translate_instruction(
         // truncates, so setting the high wasm bits for a sub-word `a` is
         // harmless.
         Op::IntNot => {
+            if out.size == 16 {
+                return emit_wide_unary(f, out, a, |f| {
+                    f.instruction(&Instruction::I64Const(-1));
+                    f.instruction(&Instruction::I64Xor);
+                });
+            }
             let size = out.size;
             let ty = wasm_ty(size)?;
             if a.size() != size {
@@ -830,6 +912,9 @@ pub fn translate_instruction(
 
         // out = a, same width. A load then a store of the same size.
         Op::Copy => {
+            if out.size == 16 {
+                return emit_wide_unary(f, out, a, |_| {});
+            }
             let size = out.size;
             if a.size() != size {
                 return None;
@@ -846,6 +931,17 @@ pub fn translate_instruction(
         // Only widening the `i32`-typed load to an `i64` output needs an
         // explicit `i64.extend_i32_u`.
         Op::ZeroExtend => {
+            // 128-bit output: the low lane is the zero-extended input, the high
+            // lane is zero (the SSE "move-and-zero-upper" idiom).
+            if out.size == 16 && matches!(a.size(), 1 | 2 | 4 | 8) {
+                emit_store_addr(f);
+                emit_zext_i64(f, a)?;
+                emit_store(f, out.slice(0, 8))?;
+                emit_store_addr(f);
+                f.instruction(&Instruction::I64Const(0));
+                emit_store(f, out.slice(8, 8))?;
+                return Some(());
+            }
             let in_size = a.size();
             let out_size = out.size;
             let in_ty = wasm_ty(in_size)?;
@@ -871,6 +967,20 @@ pub fn translate_instruction(
         // `i32.extend16_s` fill the sign within an `i32`, and `i64.extend_i32_s`
         // widens a sign-filled `i32` to an `i64` output.
         Op::SignExtend => {
+            // 128-bit output: the low lane is the sign-extended input as an
+            // i64, the high lane is that i64's sign (an arithmetic shift by 63,
+            // giving all-zero or all-one bytes).
+            if out.size == 16 && matches!(a.size(), 1 | 2 | 4 | 8) {
+                emit_store_addr(f);
+                emit_sext_i64(f, a, a.size())?;
+                emit_store(f, out.slice(0, 8))?;
+                emit_store_addr(f);
+                emit_sext_i64(f, a, a.size())?;
+                f.instruction(&Instruction::I64Const(63));
+                f.instruction(&Instruction::I64ShrS);
+                emit_store(f, out.slice(8, 8))?;
+                return Some(());
+            }
             let in_size = a.size();
             let out_size = out.size;
             wasm_ty(in_size)?;
@@ -1285,8 +1395,24 @@ pub fn translate_instruction(
         // 1/2/4/8 are handled; anything else bails. On a fault the import has
         // set the exception and returns 0, and the block stops here.
         Op::Load(id) => {
-            if !has_host || id != pcode::RAM_SPACE || !matches!(out.size, 1 | 2 | 4 | 8) {
+            if !has_host || id != pcode::RAM_SPACE || !matches!(out.size, 1 | 2 | 4 | 8 | 16) {
                 return None;
+            }
+            // A 128-bit load is two 8-byte loads, low half at addr and high at
+            // addr + 8 — exactly how the interpreter reads a 16-byte value.
+            if out.size == 16 {
+                for off in WIDE_LANES {
+                    emit_zext_i64(f, a)?;
+                    if off != 0 {
+                        f.instruction(&Instruction::I64Const(off as i64));
+                        f.instruction(&Instruction::I64Add);
+                    }
+                    f.instruction(&Instruction::I32Const(var_offset(out.slice(off, 8)) as i32));
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::Call(IMPORT_LOAD));
+                    emit_fault_check(f, index);
+                }
+                return Some(());
             }
             emit_zext_i64(f, a)?;
             f.instruction(&Instruction::I32Const(var_offset(out) as i32));
@@ -1302,8 +1428,25 @@ pub fn translate_instruction(
         // operand works. Same RAM-only, size-1/2/4/8, fault-stops-here contract
         // as Load.
         Op::Store(id) => {
-            if !has_host || id != pcode::RAM_SPACE || !matches!(b.size(), 1 | 2 | 4 | 8) {
+            if !has_host || id != pcode::RAM_SPACE || !matches!(b.size(), 1 | 2 | 4 | 8 | 16) {
                 return None;
+            }
+            // A 128-bit store is two 8-byte stores, low half at addr and high at
+            // addr + 8 — matching the interpreter, so a fault on the high half
+            // after the low half is written leaves the same partial effect.
+            if b.size() == 16 {
+                for off in WIDE_LANES {
+                    emit_zext_i64(f, a)?;
+                    if off != 0 {
+                        f.instruction(&Instruction::I64Const(off as i64));
+                        f.instruction(&Instruction::I64Add);
+                    }
+                    emit_zext_i64(f, b.slice(off, 8))?;
+                    f.instruction(&Instruction::I32Const(8));
+                    f.instruction(&Instruction::Call(IMPORT_STORE));
+                    emit_fault_check(f, index);
+                }
+                return Some(());
             }
             emit_zext_i64(f, a)?;
             emit_zext_i64(f, b)?;
