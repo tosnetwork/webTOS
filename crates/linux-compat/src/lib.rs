@@ -19,6 +19,7 @@ pub mod fd;
 pub mod liftcache;
 pub mod manifest;
 pub mod net;
+pub mod netrecord;
 pub mod proc;
 pub mod syscall;
 pub mod testing;
