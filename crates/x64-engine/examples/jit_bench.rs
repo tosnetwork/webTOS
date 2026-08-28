@@ -181,10 +181,6 @@ fn run_jit(bench: &Bench, calls: u64) -> (Vec<u8>, std::time::Duration) {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define regs");
-    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
-    linker
-        .define("env", "regs_base", regs_base)
-        .expect("define regs_base");
 
     // The block only loads, but a host block declares all four imports; the
     // unused ones are inert stubs.
@@ -240,12 +236,12 @@ fn run_jit(bench: &Bench, calls: u64) -> (Vec<u8>, std::time::Duration) {
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<(), ()>(&store, "run")
+        .get_typed_func::<i32, ()>(&store, "run")
         .expect("run export");
 
     let start = Instant::now();
     for _ in 0..calls {
-        run.call(&mut store, ()).expect("run");
+        run.call(&mut store, 0).expect("run");
     }
     let elapsed = start.elapsed();
 

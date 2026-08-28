@@ -37,17 +37,14 @@ const blockBytes = mem().slice(blockPtr, blockPtr + blockLen);
 let blockInstance;
 try {
   const module = new WebAssembly.Module(blockBytes);
-  const regsBaseGlobal = new WebAssembly.Global({ value: "i32", mutable: false }, regsBase);
-  blockInstance = new WebAssembly.Instance(module, {
-    env: { regs: e.memory, regs_base: regsBaseGlobal },
-  });
+  blockInstance = new WebAssembly.Instance(module, { env: { regs: e.memory } });
 } catch (ex) {
   fail(`browser could not compile/instantiate the emitted block: ${ex}`);
 }
 
-// 4. Run it. It reads a and b and writes their sum, all through the shared
-//    memory the engine also sees.
-blockInstance.exports.run();
+// 4. Run it, passing the register base. It reads a and b and writes their sum,
+//    all through the shared memory the engine also sees.
+blockInstance.exports.run(regsBase);
 
 // 5. The engine reads its register buffer and confirms the sum landed.
 if (e.wtw_jit_check() !== 1) fail("compiled block did not write the expected sum into shared memory");

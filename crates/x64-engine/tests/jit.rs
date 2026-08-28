@@ -980,19 +980,15 @@ fn jit(case: &Case) -> Option<Vec<u8>> {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
-    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
-    linker
-        .define("env", "regs_base", regs_base)
-        .expect("define regs_base");
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiate")
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<(), ()>(&store, "run")
+        .get_typed_func::<i32, ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, ()).expect("run");
+    run.call(&mut store, 0).expect("run");
 
     let mut out = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, 0, &mut out).expect("read memory");
@@ -1026,23 +1022,15 @@ fn jit_at_base(case: &Case, base: u32) -> Vec<u8> {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
-    let regs_base = wasmi::Global::new(
-        &mut store,
-        wasmi::Val::I32(base as i32),
-        wasmi::Mutability::Const,
-    );
-    linker
-        .define("env", "regs_base", regs_base)
-        .expect("define regs_base");
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiate")
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<(), ()>(&store, "run")
+        .get_typed_func::<i32, ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, ()).expect("run");
+    run.call(&mut store, base as i32).expect("run");
 
     let mut out = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, base as usize, &mut out).expect("read");
@@ -1301,10 +1289,6 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
-    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
-    linker
-        .define("env", "regs_base", regs_base)
-        .expect("define regs_base");
 
     // load(addr, dst_off, size) -> ok: read `size` bytes through the MMU and,
     // on success, write them into the register space at dst_off (little-endian
@@ -1413,9 +1397,9 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<(), ()>(&store, "run")
+        .get_typed_func::<i32, ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, ()).expect("run");
+    run.call(&mut store, 0).expect("run");
 
     let mut regs = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, 0, &mut regs).expect("read memory");

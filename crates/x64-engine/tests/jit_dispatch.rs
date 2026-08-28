@@ -62,11 +62,6 @@ impl WasmiJit {
 
         let mut linker = wasmi::Linker::new(&engine);
         linker.define("env", "regs", memory).expect("regs");
-        let regs_base =
-            wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
-        linker
-            .define("env", "regs_base", regs_base)
-            .expect("regs_base");
 
         // Safety in the callbacks: `cpu` is set to the live CPU for the duration
         // of one `run.call`, during which these run synchronously; it is never
@@ -191,11 +186,11 @@ impl JitBackend for WasmiJit {
         self.store.data_mut().fault = None;
 
         let instance = self.instances[handle as usize];
-        let run = match instance.get_typed_func::<(), ()>(&self.store, "run") {
+        let run = match instance.get_typed_func::<i32, ()>(&self.store, "run") {
             Ok(run) => run,
             Err(_) => return JitOutcome::Unavailable,
         };
-        let ran = run.call(&mut self.store, ());
+        let ran = run.call(&mut self.store, 0i32);
         self.store.data_mut().cpu = std::ptr::null_mut();
         if ran.is_err() {
             return JitOutcome::Unavailable;

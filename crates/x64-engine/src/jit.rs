@@ -63,12 +63,13 @@ const IMPORT_STORE: u32 = 1;
 const IMPORT_FAULT: u32 = 2;
 const IMPORT_RAISE: u32 = 3;
 
-/// Index of the imported `env.regs_base` global — the byte offset of the
-/// register file within the host's memory, added to every varnode address (see
-/// [`reg_arg`]). Every block imports it, since every block touches registers;
-/// globals have their own index space, so this is 0 regardless of the function
-/// imports.
-const REGS_BASE_GLOBAL: u32 = 0;
+/// Local index of `run`'s single parameter, `regs_base` — the byte offset of
+/// the register file within the host's memory, added to every varnode address
+/// (see [`reg_arg`]). Passing it as a parameter (rather than an imported global)
+/// lets the host supply the base per call, so the same compiled block works
+/// wherever the register file sits — offset 0 for a dedicated register memory,
+/// or the live pointer into the engine's memory in the browser.
+const REGS_BASE_PARAM: u32 = 0;
 
 /// The exception codes the division guards raise. These mirror
 /// `icicle_cpu::ExceptionCode` discriminants; the `raise` import re-canonicalises
@@ -153,12 +154,11 @@ fn reg_arg(var: VarNode) -> MemArg {
     }
 }
 
-/// Pushes `regs_base`, the dynamic part of every register address. It is an
-/// imported immutable global so the same translated block works at any base —
-/// the host supplies the base at instantiate time (0 for a dedicated register
-/// memory).
+/// Pushes `regs_base`, the dynamic part of every register address. It is `run`'s
+/// parameter, so the host supplies the base on each call (0 for a dedicated
+/// register memory).
 fn emit_regs_base(f: &mut Function) {
-    f.instruction(&Instruction::GlobalGet(REGS_BASE_GLOBAL));
+    f.instruction(&Instruction::LocalGet(REGS_BASE_PARAM));
 }
 
 /// Pushes the base address for a following `store` to a varnode. Wasm `store`
@@ -1523,10 +1523,10 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
 
     let mut module = Module::new();
 
-    // Type 0 is always `run`: [] -> []. The host-import signatures follow it
-    // and exist only when the block uses them.
+    // Type 0 is always `run(regs_base: i32)`. The host-import signatures follow
+    // it and exist only when the block uses them.
     let mut types = TypeSection::new();
-    types.ty().function([], []); // 0: run
+    types.ty().function([ValType::I32], []); // 0: run(regs_base)
     if has_host {
         types
             .ty()
@@ -1556,18 +1556,6 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
             memory64: false,
             shared: false,
             page_size_log2: None,
-        }),
-    );
-    // The base of the register file within `env.regs`, added to every varnode
-    // address. Immutable, supplied at instantiate time (0 for a dedicated
-    // register memory).
-    imports.import(
-        "env",
-        "regs_base",
-        EntityType::Global(wasm_encoder::GlobalType {
-            val_type: ValType::I32,
-            mutable: false,
-            shared: false,
         }),
     );
     if has_host {
