@@ -161,6 +161,11 @@ pub struct InterpVm {
     /// [`InterpVm::set_phase_timing`]). Off by default: the `Instant::now` at
     /// each block and exception is only paid when a run is being profiled.
     phase_times: Option<PhaseTimes>,
+    /// Lift-churn counters: groups decoded, groups served from reuse, and code
+    /// flushes — to size how much lifting a persistent cache could avoid.
+    lift_decoded: u64,
+    lift_reused: u64,
+    flush_count: u64,
 }
 
 /// Where a profiled run spends wall-clock time, in nanoseconds. `exec` is
@@ -321,6 +326,17 @@ pub struct LiftStats {
     pub indexed: usize,
     pub promoted: usize,
     pub counted: usize,
+    /// Groups actually decoded (a lift that the cross-address-space reuse cache
+    /// missed). This is the work a cross-session persistent cache could avoid —
+    /// but only for bytes that recur; code a JIT-in-a-JIT generates fresh each
+    /// run is re-decoded here every time and is not cacheable.
+    pub decoded: u64,
+    /// Groups served from the reuse cache without decoding.
+    pub reused: u64,
+    /// Times the code cache was flushed wholesale (self-modifying code / execve)
+    /// — each flush forces everything live to be decoded again, churn a
+    /// persistent cache cannot remove because the bytes changed.
+    pub flushes: u64,
 }
 
 /// How much of a run one basic block accounted for.
@@ -392,6 +408,9 @@ impl InterpVm {
             jit_dispatches: 0,
             jit_budget: JitBudget::default(),
             phase_times: None,
+            lift_decoded: 0,
+            lift_reused: 0,
+            flush_count: 0,
         }
     }
 
@@ -684,6 +703,9 @@ impl InterpVm {
             indexed: self.lifted.len(),
             promoted: self.promoted.len(),
             counted: self.entries.len(),
+            decoded: self.lift_decoded,
+            reused: self.lift_reused,
+            flushes: self.flush_count,
         }
     }
 
@@ -692,6 +714,7 @@ impl InterpVm {
     /// own leaves the index holding block numbers that no longer mean
     /// anything.
     pub fn flush_code(&mut self) {
+        self.flush_count += 1;
         self.code.flush_code();
         self.lifted.clear();
         // Compiled handles were built from bytes that are now gone. A key can
@@ -1246,10 +1269,12 @@ impl InterpVm {
         // when the bytes still match, so this cannot resurrect the bug the
         // address-space id was added to fix.
         if let Some(group) = self.reuse_lifted(addr, isa_mode) {
+            self.lift_reused += 1;
             let key = self.get_block_key(addr);
             self.code.map.insert(key, group);
             return Ok(group);
         }
+        self.lift_decoded += 1;
 
         // Tiered lifting: the optimizer runs only for an address that has
         // proved hot. The setting is restored afterwards so nothing else sees

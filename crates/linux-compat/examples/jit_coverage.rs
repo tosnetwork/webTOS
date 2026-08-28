@@ -134,6 +134,16 @@ fn main() {
             ms(other),
             pc(other)
         );
+        let ls = machine.vm_mut().lift_stats();
+        let total = (ls.decoded + ls.reused).max(1);
+        println!(
+            "  lift churn: {} decoded, {} reused ({:.1}% reuse), {} self-modifying flushes; {} blocks live",
+            ls.decoded,
+            ls.reused,
+            100.0 * ls.reused as f64 / total as f64,
+            ls.flushes,
+            ls.blocks,
+        );
     }
 
     let cov = machine.jit_coverage().expect("profiling was on");
