@@ -38,7 +38,7 @@ terminal behavior, and recovery after a browser reload.
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~93% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~97% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
-| M5 Event loop & networking | 🔶 | ~99% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, soak pending |
+| M5 Event loop & networking | ✅ | ~99% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, and suspension now gated; a session records and replays offline, a dropped connection leaves an error not a wait, and a suspended tab is told how much real time passed |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~88% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser now exists and is proven with OpenFox; carrying Codex itself (five times larger, and needing credentials) and the Claude Code profile are the remaining agent work. **A session that does work now finishes**: asked to change a value in a file and check it, Codex read the file, applied its own patch, ran `cat` on a pty it allocated, reported what that subprocess printed, and exited 0. Two engine defects of one shape were in the way, each an unimplemented case reported as an unrecoverable error — a vaddr-keyed disassembly map disagreeing with the asid-keyed block cache on every `execve`, and `TCSETSF` missing from the ioctl table |
 | M8 Performance & release | 🔶 | ~78% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. Two more surfaces are now swept. Every argument position of every syscall number against a corpus of the ways a number breaks code that trusts it, singly and paired, against four page contents, 7,128,576 cases — which found five more defects, four of them wrapped arithmetic that only the `relcheck` profile can see, including an `align_up` that turned an address at the top of the space into page zero and an `mprotect` of length zero that took the host down. And the decoder, which the guest reaches without a syscall at all by mapping a page executable and jumping into it: every opcode in all four maps under seventeen prefix combinations, then again truncated against a mapping boundary, 365,568 sequences, clean. The host side of the boundary is swept too, from Node against the real module: thirty-two distinct traps, all from a `slice_arg` whose documented safety contract — that the pointer came from `wtw_alloc` — a caller breaks by passing a different number. Executing guest bytes found three defects the decoder pass could not: a family of SIMD helpers written for the 128-bit form of their instruction and handed the 64-bit MMX form, which reads a register at a size it does not have; the address after an instruction at the top of the address space, computed with an addition that overflowed; and a zero-length executable range whose last address underflowed. CPU and the event log now have ceilings of their own: a workload that computes without ever entering the kernel used to be outside every mechanism for stopping a task, and the trace could grow until the tab died. Hot-block translation is not started |
@@ -665,7 +665,7 @@ Exit gate:
   makes that explicit with a temp-file-then-`move` commit, robust even where
   an engine might write in place. Green in Chromium, Firefox, and WebKit)
 
-## Milestone 5: Event Loop and Networking 🔶
+## Milestone 5: Event Loop and Networking ✅
 
 **Outcome:** interactive network clients and event-driven runtimes work in the
 browser.
@@ -698,14 +698,17 @@ Work:
   which is the case most worth seeing. Gated by `tests/netrecord.rs`)
 - Define offline, denied, timeout, reconnect, and proxy-failure behavior. 🔶
   (denied and timeout defined, including a browser guest with no relay and a
-  destination the relay refuses; reconnect and proxy pending)
+  destination the relay refuses; reconnect gated by `tests/net_event.rs` — a
+  dropped connection leaves an error not a wait, and a retry afterwards
+  succeeds — leaving only an explicit proxy-failure case, which the deny path
+  already covers in effect but does not name)
 
 Exit gate:
 
 - HTTP, HTTPS, DNS, pipe, and epoll fixture suites pass. ✅ (natively, and
   HTTP over a relayed socket in Chromium, Firefox, and WebKit)
 - A long-running event loop survives transient network failure and browser
-  tab suspension. 🔶 (suspension is gated. A browser stops scheduling a
+  tab suspension. ✅ (both halves gated. Suspension: A browser stops scheduling a
   background tab, and this machine's clock is retired instructions plus an
   idle warp — neither moves while the host is not calling `run`, so a resumed
   guest believed no time had passed. `Machine::skip_time` and
@@ -1102,7 +1105,12 @@ Work:
 
 Exit gate:
 
-- Optimized and interpreter modes pass the same architectural trace suite.
+- Optimized and interpreter modes pass the same architectural trace suite. ⬜
+  (there is no optimized mode: the profiling in `docs/performance.md` found no
+  hot path to translate — a cold agent start is lifting-bound with no
+  execution peak — so a JIT was deprioritized, and this gate is blocked on a
+  mode that has not been built rather than failing. The interpreter alone
+  already passes the trace suite register for register)
 - Supported workload profiles meet published startup and interactive latency
   budgets. ✅ (gated on instruction counts, which is the deterministic half of
   latency: the same workload retires the same count on every host and engine
@@ -1126,6 +1134,9 @@ Exit gate:
   Between them they found twelve defects, of which thirty-two distinct traps
   on the message boundary were one cause)
 - Release artifacts are reproducible and carry complete dependency metadata.
+  🔶 (the dependency metadata is done — `LICENSES.tsv` and the gate in
+  `tests/licenses.rs` — but a reproducible build and a release artifact are
+  not started; there is no release yet, as `SECURITY.md` notes)
 
 ## Cross-Cutting Test Matrix
 
