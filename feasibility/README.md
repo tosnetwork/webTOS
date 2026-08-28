@@ -134,3 +134,33 @@ matches the field. The engineering to add, learned from theirs:
 1. Compile a hot *region*, not a single block, to amortize instantiation.
 2. Compile asynchronously; keep interpreting; swap in when ready.
 3. Translate from p-code, not x86 — our advantage over CheerpX and v86.
+
+## What is on GitHub — reuse survey
+
+Searched for anyone doing what we need, and for pieces we can reuse.
+
+| Project | Approach | To us |
+|---|---|---|
+| **icicle-emu** (our upstream) | p-code → native via **Cranelift** JIT | Confirms the native path is unusable in a browser; the Cranelift backend was not vendored, by design |
+| **ktock/qemu-wasm** | **TCG IR → wasm at runtime**, one TB per module, browser `WebAssembly.Module/Instance`, tiered (interpret cold, compile TBs seen ~1000×) | A *working* precedent for exactly our problem — but **GPL**. Learn the architecture, do not copy the code (the architecture is public and matches CheerpX anyway) |
+| **CheerpX / WebVM** | tiered interpreter + JIT-to-wasm | Proprietary; same architecture, no code |
+| **v86** | x86 → wasm JIT for hot loops | Open reference for the mechanism |
+| **ghidra-wasm-plugin** | **wasm → p-code** (loads wasm into Ghidra) | Opposite direction; not useful |
+| **bytecodealliance `wasm-encoder`** | Rust library that emits wasm bytes programmatically | **The reusable codegen base.** Apache-2.0 WITH LLVM-exception — on our license allowlist. Our engine (itself wasm) uses it to emit a hot region's wasm bytes; the JS host instantiates and exposes it back through a table |
+
+### Findings
+
+- **No one has done p-code → wasm.** That direction is novel — the existing
+  Ghidra/wasm work goes the other way. So the translator is ours to write.
+- **The approach is validated by every browser-x86 system that exists.**
+  qemu-wasm (TCG→wasm), CheerpX (proprietary), and v86 (x86→wasm) are all the
+  same shape my prototype measured: tiered, runtime wasm generation, browser
+  instantiate, memory shared. qemu-wasm is the closest and it works — but it
+  is GPL, so it is a reference, not a dependency.
+- **We reuse one permissively-licensed piece:** `wasm-encoder` for emitting
+  the bytes. Everything above it — deciding which region is hot, walking its
+  p-code, mapping p-code ops to wasm — is ours, and it is where our p-code
+  input makes us simpler than the x86/TCG translators.
+- **License discipline:** qemu-wasm and QEMU are GPL; nothing from them may be
+  copied into this MIT tree. The architecture we would follow is the one
+  CheerpX and my own measurements already establish independently.
