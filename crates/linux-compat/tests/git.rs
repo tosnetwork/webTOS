@@ -109,6 +109,44 @@ fn seed_repo(root: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((repo, home))
 }
 
+/// A repository with several commits and nothing dirty, so `git log` has a
+/// real history to walk. Separate from `seed_repo`, whose single commit and
+/// dirty tree the status/diff tests depend on.
+fn seed_repo_with_history(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let repo = root.join("repo");
+    let home = root.join("home");
+    std::fs::create_dir_all(&repo).ok()?;
+    std::fs::create_dir_all(&home).ok()?;
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[user]\n\temail = t@example.com\n\tname = Tester\n[commit]\n\tgpgsign = false\n[core]\n\tpager = cat\n",
+    )
+    .ok()?;
+    let git = |args: &[&str]| -> bool {
+        Command::new(GIT)
+            .args(args)
+            .current_dir(&repo)
+            .env("HOME", &home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !git(&["init", "-q"]) {
+        eprintln!("skipping: host git init failed");
+        return None;
+    }
+    std::fs::write(repo.join("a.txt"), "one\n").ok()?;
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "first commit"]);
+    std::fs::write(repo.join("a.txt"), "one\ntwo\n").ok()?;
+    git(&["commit", "-aq", "-m", "second commit"]);
+    std::fs::write(repo.join("b.txt"), "new\n").ok()?;
+    git(&["add", "b.txt"]);
+    git(&["commit", "-q", "-m", "third commit"]);
+    Some((repo, home))
+}
+
 #[test]
 fn git_status_reports_a_dirty_file() {
     let dir = std::env::temp_dir().join("webtos-git-status");
@@ -162,5 +200,39 @@ fn git_commit_writes_an_object_and_updates_the_ref() {
     assert!(
         out.contains("second commit from webTOS") && out.contains("1 file changed"),
         "git commit output: {out:?}"
+    );
+}
+
+/// An agent reads a repository to understand it, and reading means the
+/// history, not just the working tree. `git log` walking three commits in the
+/// guest is the smallest proof that a mounted repository's history — its
+/// object database and refs, delivered as host files — is intact and
+/// traversable, not merely that the checked-out files are readable.
+#[test]
+fn git_log_reads_the_repository_history() {
+    let dir = std::env::temp_dir().join("webtos-git-log");
+    let _ = std::fs::remove_dir_all(&dir);
+    let Some((repo, home)) = seed_repo_with_history(&dir) else {
+        return;
+    };
+    let Some(mut machine) = git_machine(&repo, &home) else {
+        return;
+    };
+    let (exit, out) = run_git(&mut machine, &["log", "--oneline"]);
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "git log: {out:?}");
+    // All three commits, newest first — the whole history, walked from HEAD
+    // back through the parent chain.
+    for subject in ["third commit", "second commit", "first commit"] {
+        assert!(
+            out.contains(subject),
+            "git log did not show {subject:?}; the history was not fully \
+             traversable:\n{out}"
+        );
+    }
+    let order = |s: &str| out.find(s).unwrap_or(usize::MAX);
+    assert!(
+        order("third commit") < order("second commit")
+            && order("second commit") < order("first commit"),
+        "git log did not walk the history newest-first:\n{out}"
     );
 }
