@@ -14,3 +14,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+jit-wasmi = { path = "../jit-wasmi" }

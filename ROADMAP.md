@@ -1167,12 +1167,18 @@ Work:
 
 Exit gate:
 
-- Optimized and interpreter modes pass the same architectural trace suite. 🔶
-  (there is one mode today, and it passes the trace suite register for
-  register. The second, optimized mode is the JIT above: when hot blocks are
-  translated to WebAssembly, they must reproduce the interpreter's result bit
-  for bit, and this gate is what proves it. Pending on the JIT, not on a
-  decision against it)
+- Optimized and interpreter modes pass the same architectural trace suite. ✅
+  (both modes now reproduce the same reference traces register for register.
+  The optimized mode is the JIT: `reference_traces_reproduce_under_the_jit` in
+  `tests/trace.rs` records each workload with hot blocks translated to
+  WebAssembly and executed by wasmi, asserts the JIT actually dispatched, and
+  holds the result byte-for-byte to the interpreter's reference — and the
+  browser matrix carries the same proof against V8/SpiderMonkey/
+  JavaScriptCore. Building this gate found and fixed a real defect: a
+  zero-instruction block was being JIT-dispatched, advancing register state
+  under an icount that never moved and colliding in the start-keyed block
+  cache, which the per-block-at-natural-termination tests never exposed because
+  only a mid-sample budget cut reveals it)
 - Supported workload profiles meet published startup and interactive latency
   budgets. ✅ (gated on instruction counts, which is the deterministic half of
   latency: the same workload retires the same count on every host and engine

@@ -102,6 +102,48 @@ fn record(case: &Case) -> Option<String> {
     Some(machine.take_trace().expect("trace was recorded").to_text())
 }
 
+/// Records a case with the wasmi JIT installed, so hot blocks execute as
+/// compiled wasm instead of being interpreted. Returns the trace text and the
+/// number of JIT dispatches, or None when the fixture is absent. Every input —
+/// image, args, sampling — is identical to [`record`], so the trace it produces
+/// must be byte-identical to the interpreter's: same bytes seen by the CPU, same
+/// retired-instruction count at every sample point.
+fn record_jit(case: &Case) -> Option<(String, u64)> {
+    let image = std::fs::read(test_data().join(case.image)).ok()?;
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(case.guest_path.as_bytes(), image.clone(), 0o755)
+        .expect("add image");
+    machine.set_args(
+        case.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        vec![b"PATH=/bin".to_vec()],
+    );
+    machine
+        .load(case.guest_path.as_bytes())
+        .expect("ELF load failed");
+    machine.record_trace(case.sample_every);
+    machine.describe_trace_image(case.guest_path.as_bytes(), &image);
+
+    // Compile a block the first time it is re-entered, so the trace exercises as
+    // much of the emitter as the workload allows; blocks the translator bails on
+    // fall back to the interpreter and are traced the same either way.
+    machine.set_jit(Box::new(jit_wasmi::WasmiJit::new()));
+    machine.set_jit_tiering(Some(1));
+
+    let exit = machine.run_traced(4_000_000_000);
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "{} did not exit cleanly under the JIT",
+        case.name
+    );
+    Some((
+        machine.take_trace().expect("trace was recorded").to_text(),
+        machine.jit_dispatch_count(),
+    ))
+}
+
 fn reference_path(case: &Case) -> PathBuf {
     test_data()
         .join("traces")
@@ -147,6 +189,46 @@ fn reference_traces_still_reproduce() {
     assert!(
         checked >= 2,
         "no reference trace was checked; the in-repository fixtures should always be present"
+    );
+}
+
+/// The exit gate for the optimized mode: with hot blocks translated to
+/// WebAssembly and executed by wasmi, every case must reproduce the
+/// interpreter's reference trace register for register — the same file the
+/// interpreter is held to above. The JIT must actually have fired, or a match
+/// proves nothing. wasmi is a correctness backend, not a speedup one (see
+/// `feasibility/jit_native_wasmi.md`); the browser matrix carries the same proof
+/// against V8/SpiderMonkey/JavaScriptCore.
+#[test]
+fn reference_traces_reproduce_under_the_jit() {
+    let mut checked = 0;
+    for case in CASES {
+        let Some((actual, dispatches)) = record_jit(case) else {
+            eprintln!("skipping {}: {} missing", case.name, case.image);
+            continue;
+        };
+        assert!(
+            dispatches > 0,
+            "{}: the JIT never dispatched under this workload — the trace match proves nothing",
+            case.name
+        );
+        let path = reference_path(case);
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("no reference trace at {}: {e}", path.display()));
+        assert!(
+            expected == actual,
+            "{} diverged from its interpreter reference trace under the JIT \
+             ({dispatches} dispatches).\n{}\n\
+             The optimized mode must reproduce the interpreter bit for bit; this \
+             is a JIT correctness bug, not a trace to regenerate.",
+            case.name,
+            first_difference(&expected, &actual)
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "no reference trace was checked under the JIT; the in-repository fixtures should always be present"
     );
 }
 

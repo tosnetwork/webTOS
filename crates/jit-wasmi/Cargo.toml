@@ -1,0 +1,13 @@
+[package]
+name = "jit-wasmi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A wasmi-backed JitBackend for x64-engine, used natively to prove the JIT reproduces the interpreter bit-for-bit. Test/measurement only; never part of the browser build."
+
+[dependencies]
+# Same paths the workspace uses, so these resolve to the exact same crate
+# instances as x64-engine (the `Cpu` type must unify across the boundary).
+x64-engine = { path = "../x64-engine" }
+icicle-cpu = { path = "../../third_party/icicle/icicle-cpu" }
+wasmi = "0.51"

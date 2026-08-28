@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["x64-engine", "linux-compat", "webtos-web", "bench-control"]
+# jit-wasmi is a wasmi-backed JitBackend used only by tests (x64-engine and
+# linux-compat dev-depend on it by path). It is deliberately NOT a member so
+# wasmi stays a dev/test dependency and out of the shipped license manifest
+# (`cargo tree -e normal`), and never enters the browser build.
+exclude = ["jit-wasmi"]
 
 [workspace.dependencies]
 icicle-cpu = { path = "../third_party/icicle/icicle-cpu" }

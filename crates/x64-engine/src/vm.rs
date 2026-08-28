@@ -635,7 +635,12 @@ impl InterpVm {
             // cross the fuel limit — falls through to the interpreter, which
             // stays the floor.
             let mut jit_ran = false;
-            if offset == 0 && !block.has_breakpoint() {
+            // A zero-instruction block retires nothing: dispatching it would advance
+            // register state under an icount that never moves, and — because both JIT
+            // caches are keyed by block start — its compiled handle would be reused by
+            // a real block that shares the address. Keep it out of the JIT entirely
+            // (the region path already required `num > 0`); the interpreter runs it.
+            if offset == 0 && !block.has_breakpoint() && block.num_instructions > 0 {
                 if let Some(after) = self.jit_after {
                     let start = block.start;
                     let count = self.jit_entries.entry(start).or_insert(0);
