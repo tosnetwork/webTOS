@@ -137,6 +137,11 @@ pub(crate) struct Secret {
 pub struct LinuxEnv {
     pub(crate) regs: Regs,
     pub vfs: Vfs,
+    /// VFS node ids the guest has opened, when access tracking is on (`Some`).
+    /// A delivered file never in this set was materialized for nothing — the
+    /// measure of how much a lazy image could avoid. Off by default so the set
+    /// insert per open is only paid when profiling.
+    pub(crate) opened_files: Option<std::collections::HashSet<usize>>,
     /// The task currently executing on the CPU.
     pub(crate) proc: Process,
     pub(crate) sched: Scheduler,
@@ -213,6 +218,7 @@ impl LinuxEnv {
         Ok(Self {
             regs: Regs::resolve(cpu)?,
             vfs: Vfs::new(),
+            opened_files: None,
             proc: Process::initial(),
             sched: Scheduler::new(),
             last_group: proc::ROOT_PID,
@@ -980,6 +986,15 @@ pub struct Footprint {
     pub total_bytes: usize,
 }
 
+/// Delivered versus opened files, for sizing a lazy-delivery win.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileAccessStats {
+    pub delivered_files: usize,
+    pub delivered_bytes: usize,
+    pub opened_files: usize,
+    pub opened_bytes: usize,
+}
+
 impl Machine {
     /// Builds a machine from a SLEIGH `.ldefs` path (native hosts).
     pub fn from_ldef(ldef_path: &Path, config: &EngineConfig) -> Result<Self, String> {
@@ -1298,6 +1313,31 @@ impl Machine {
     /// The accumulated phase wall-clock, or `None` if timing is off.
     pub fn phase_times(&self) -> Option<x64_engine::vm::PhaseTimes> {
         self.vm.phase_times()
+    }
+
+    /// Turns file-access tracking on or off (which delivered files the guest
+    /// opens). Off by default.
+    pub fn set_access_tracking(&mut self, on: bool) {
+        self.env().opened_files = on.then(std::collections::HashSet::new);
+    }
+
+    /// Delivered files/bytes versus the ones the guest actually opened — the
+    /// untouched-image fraction a lazy delivery could avoid materializing.
+    pub fn file_access_stats(&mut self) -> FileAccessStats {
+        let env = self.env();
+        let opened = env.opened_files.as_ref();
+        let mut s = FileAccessStats::default();
+        for (idx, node) in env.vfs.nodes.iter().enumerate() {
+            if let crate::vfs::NodeKind::File(data) = &node.kind {
+                s.delivered_files += 1;
+                s.delivered_bytes += data.len();
+                if opened.is_some_and(|o| o.contains(&idx)) {
+                    s.opened_files += 1;
+                    s.opened_bytes += data.len();
+                }
+            }
+        }
+        s
     }
 
     /// Records per-block entry counts, so [`jit_coverage`](Self::jit_coverage)

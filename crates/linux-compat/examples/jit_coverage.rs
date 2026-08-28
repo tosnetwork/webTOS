@@ -96,6 +96,7 @@ fn main() {
 
     machine.profile_blocks(true);
     machine.set_phase_timing(true);
+    machine.set_access_tracking(true);
     machine.vm_mut().icount_limit = 50_000_000_000;
     let wall_start = std::time::Instant::now();
     loop {
@@ -145,6 +146,29 @@ fn main() {
             ls.blocks,
         );
     }
+
+    let fa = machine.file_access_stats();
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    let untouched_bytes = fa.delivered_bytes.saturating_sub(fa.opened_bytes);
+    let untouched_pct = if fa.delivered_bytes == 0 {
+        0.0
+    } else {
+        100.0 * untouched_bytes as f64 / fa.delivered_bytes as f64
+    };
+    println!("file delivery vs use:");
+    println!(
+        "  delivered {} files, {:.1} MiB;  opened {} files, {:.1} MiB",
+        fa.delivered_files,
+        mib(fa.delivered_bytes),
+        fa.opened_files,
+        mib(fa.opened_bytes),
+    );
+    println!(
+        "  never opened: {} files, {:.1} MiB ({:.1}% of delivered bytes) — a lazy image would not materialize these",
+        fa.delivered_files - fa.opened_files,
+        mib(untouched_bytes),
+        untouched_pct,
+    );
 
     let cov = machine.jit_coverage().expect("profiling was on");
     let pct = |n: u64| {

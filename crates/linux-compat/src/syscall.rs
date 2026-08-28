@@ -1143,6 +1143,14 @@ fn sys_openat(
     let follow = flags & abi::O_NOFOLLOW == 0;
     let resolved = env.vfs.resolve(base, &path, follow)?;
 
+    // Access tracking (profiling only): note that a delivered file was actually
+    // reached, so the untouched-image fraction can be measured.
+    if let (Some(opened), Some(node)) = (env.opened_files.as_mut(), resolved.node) {
+        if matches!(env.vfs.node(node).kind, crate::vfs::NodeKind::File(_)) {
+            opened.insert(node);
+        }
+    }
+
     // `/dev/tty` is the process's controlling terminal, not a device of its
     // own. When stdio is a host-driven pty, an open must land on that pty:
     // an interactive shell does its job control (tcsetpgrp, tcgetpgrp, window
