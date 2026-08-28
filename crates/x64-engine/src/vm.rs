@@ -129,6 +129,19 @@ pub struct InterpVm {
     /// measured to be hot, and the measurement should not be a cost the rest
     /// of the time.
     profile: Option<std::collections::HashMap<u64, BlockProfile>>,
+    /// The JIT backend, if one is installed: compiles translated blocks and
+    /// runs them (see [`InterpVm::set_jit`]).
+    jit: Option<Box<dyn crate::jit::JitBackend>>,
+    /// Entries after which a block is JIT-compiled; `None` = JIT off.
+    jit_after: Option<u64>,
+    /// Per-block-address compiled handles: `Some(handle)` once compiled,
+    /// `None` once the block is known not to JIT (so it is never retried).
+    jit_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Per-block-address entry counts, to decide when a block is hot enough to
+    /// compile. Separate from `entries`, which counts only external re-entries.
+    jit_entries: std::collections::HashMap<u64, u64>,
+    /// How many times a compiled block ran in place of the interpreter.
+    jit_dispatches: u64,
 }
 
 /// See [`InterpVm::lift_stats`].
@@ -166,7 +179,35 @@ impl InterpVm {
             entries: std::collections::HashMap::new(),
             promoted: std::collections::HashSet::new(),
             profile: None,
+            jit: None,
+            jit_after: None,
+            jit_cache: std::collections::HashMap::new(),
+            jit_entries: std::collections::HashMap::new(),
+            jit_dispatches: 0,
         }
+    }
+
+    /// Installs a JIT backend. Blocks that grow hot (see [`set_jit_tiering`])
+    /// are then translated to wasm, compiled by the backend, and dispatched to
+    /// instead of interpreted. Without a backend, or with tiering off, execution
+    /// is exactly as before.
+    pub fn set_jit(&mut self, backend: Box<dyn crate::jit::JitBackend>) {
+        self.jit = Some(backend);
+    }
+
+    /// Compiles a block to wasm and dispatches to it once it has been entered
+    /// `after` times; `None` turns the JIT off. The interpreter remains the
+    /// floor: a block that does not translate, or that a backend declines, stays
+    /// interpreted forever.
+    pub fn set_jit_tiering(&mut self, after: Option<u64>) {
+        self.jit_after = after;
+        self.jit_entries.clear();
+        self.jit_cache.clear();
+    }
+
+    /// How many times a compiled block ran in place of the interpreter.
+    pub fn jit_dispatch_count(&self) -> u64 {
+        self.jit_dispatches
     }
 
     /// Lifts blocks without the p-code optimizer until one has been entered
@@ -517,17 +558,76 @@ impl InterpVm {
                 }
             }
 
+            // JIT dispatch: at a fresh block entry (not a mid-block re-entry)
+            // with no breakpoint, a hot fully-translatable block runs as
+            // compiled wasm instead of being interpreted. Anything else — not
+            // hot, not translatable, a block the backend declined, or one that
+            // would cross the fuel limit — falls through to the interpreter,
+            // which stays the floor.
+            let mut jit_ran = false;
+            if offset == 0 && !block.has_breakpoint() {
+                if let Some(after) = self.jit_after {
+                    let start = block.start;
+                    let count = self.jit_entries.entry(start).or_insert(0);
+                    *count += 1;
+                    let hot = *count >= after;
+                    let handle = match self.jit_cache.get(&start).copied() {
+                        Some(decided) => decided,
+                        None if hot => {
+                            // Compile once. Host blocks (memory, division,
+                            // exceptions) are not dispatched yet, so they cache
+                            // as a bail here.
+                            let compiled = if crate::jit::block_needs_host(&block.pcode) {
+                                None
+                            } else {
+                                crate::jit::translate_block(&block.pcode)
+                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes))
+                            };
+                            self.jit_cache.insert(start, compiled);
+                            compiled
+                        }
+                        None => None,
+                    };
+                    if let Some(handle) = handle {
+                        if self.cpu.fuel.remaining >= block.num_instructions as u64 {
+                            let outcome = match self.jit.as_mut() {
+                                Some(j) => j.call(handle, self.cpu.regs.as_bytes_mut()),
+                                None => crate::jit::JitOutcome::Unavailable,
+                            };
+                            match outcome {
+                                crate::jit::JitOutcome::Completed => {
+                                    // The compiled block ticks no per-instruction
+                                    // fuel the way InstructionMarker does; charge
+                                    // the whole block here so icount stays exact.
+                                    self.cpu.fuel.remaining -= block.num_instructions as u64;
+                                    self.jit_dispatches += 1;
+                                    jit_ran = true;
+                                }
+                                crate::jit::JitOutcome::Faulted(i) => {
+                                    self.cpu.block_id = block_id;
+                                    self.cpu.block_offset = i as u64;
+                                    break;
+                                }
+                                crate::jit::JitOutcome::Unavailable => {}
+                            }
+                        }
+                    }
+                }
+            }
+
             // Safety: every block is validated as part of `lift`.
-            unsafe {
-                if let Some(offset) = self
-                    .cpu
-                    .interpret_block_unchecked(&block.pcode, offset as usize)
-                {
-                    // We exited early due to an exception, so keep track of
-                    // the offset where the CPU exited from.
-                    self.cpu.block_id = block_id;
-                    self.cpu.block_offset = offset as u64;
-                    break;
+            if !jit_ran {
+                unsafe {
+                    if let Some(offset) = self
+                        .cpu
+                        .interpret_block_unchecked(&block.pcode, offset as usize)
+                    {
+                        // We exited early due to an exception, so keep track of
+                        // the offset where the CPU exited from.
+                        self.cpu.block_id = block_id;
+                        self.cpu.block_offset = offset as u64;
+                        break;
+                    }
                 }
             }
 

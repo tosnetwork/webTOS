@@ -82,7 +82,7 @@ const EXC_INVALID_INSTRUCTION: u32 = 0x1001;
 /// `INT_MIN/-1` divisor), and the `Exception`/`Invalid` ops all cross into the
 /// host. A block with none of them stays a self-contained register-to-register
 /// function with no imported calls.
-fn block_needs_host(block: &pcode::Block) -> bool {
+pub fn block_needs_host(block: &pcode::Block) -> bool {
     block.instructions.iter().any(|inst| {
         matches!(
             inst.op,
@@ -1595,4 +1595,37 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     module.section(&code);
 
     Some(module.finish())
+}
+
+/// The outcome of running a compiled block through a [`JitBackend`].
+pub enum JitOutcome {
+    /// Ran to completion; the register file is updated and control falls
+    /// through to the block's exit, exactly as after the interpreter runs the
+    /// whole block.
+    Completed,
+    /// Faulted at this instruction index — a memory fault or a raised
+    /// exception. The backend has already set the exception, so this is the
+    /// interpreter's `Some(index)` early return reached a second way.
+    Faulted(u32),
+    /// The backend declined or could not run the block; fall back to the
+    /// interpreter for this entry.
+    Unavailable,
+}
+
+/// A host that compiles translated blocks and runs them.
+///
+/// [`translate_block`] produces the wasm; a backend turns those bytes into
+/// something callable — the browser's WebAssembly engine, or wasmi in a native
+/// test — and runs it against the register file. The backend owns how the
+/// register file is made visible to the compiled code: shared with the host's
+/// own memory in the browser (no copy), copied in and out for a native runtime.
+pub trait JitBackend {
+    /// Compiles block bytes to an opaque handle, or `None` if it declines (a
+    /// module too large to compile synchronously, say). A `None` is cached as a
+    /// permanent bail for that block.
+    fn compile(&mut self, bytes: &[u8]) -> Option<u32>;
+
+    /// Runs the compiled block `handle` against `regs`, the whole register
+    /// space, reflecting the block's writes back into it.
+    fn call(&mut self, handle: u32, regs: &mut [u8]) -> JitOutcome;
 }
