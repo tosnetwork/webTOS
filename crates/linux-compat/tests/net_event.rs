@@ -12,6 +12,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use linux_compat::net::{HostBroker, NativeBroker};
 use linux_compat::Machine;
@@ -1234,4 +1235,163 @@ fn a_signal_interrupts_a_socket_read_unless_the_handler_asked_for_a_restart() {
             "guest did not exit cleanly: {answered:?}"
         );
     }
+}
+
+// ── Transient failure and reconnect ──────────────────────────────────────────
+
+/// Accepts and drops the first `fail_first` connections without answering,
+/// then serves normally. A peer that goes away mid-exchange is the ordinary
+/// case on a network, and the question is what the guest is left holding.
+fn spawn_flaky_server(fail_first: usize) -> (SocketAddrV4, std::sync::Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = match listener.local_addr().expect("local addr") {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!("bound to IPv4"),
+    };
+    // How many connections actually arrived. Without it the test passes
+    // whether or not the guest ever reached the server, which would make
+    // "the guest got an error" say nothing about the path it came from.
+    let arrived = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&arrived);
+    std::thread::spawn(move || {
+        let mut seen = 0_usize;
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            seen += 1;
+            counter.fetch_add(1, Ordering::SeqCst);
+            if seen <= fail_first {
+                // Read the request so the guest gets as far as waiting for an
+                // answer, then vanish. Waiting forever is the failure that
+                // ends a long-running loop; an error is one it can act on.
+                let mut buf = [0_u8; 2048];
+                let _ = stream.read(&mut buf);
+                drop(stream);
+                continue;
+            }
+            let mut buf = [0_u8; 2048];
+            let mut request = Vec::new();
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "back-after-the-drop";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (addr, arrived)
+}
+
+#[test]
+fn a_peer_that_vanishes_leaves_an_error_rather_than_a_wait() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    let (server, arrived) = spawn_flaky_server(1);
+    let mut broker = NativeBroker::new();
+    broker.redirect(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80), server);
+    broker.restrict_to_redirects();
+    machine.set_network(Rc::new(RefCell::new(broker)));
+
+    let url = "http://10.0.0.1/".to_string();
+
+    // The first attempt meets a peer that reads the request and disappears.
+    let first = run_argv(&mut machine, "/usr/bin/wget", &["wget", "-q", "-O-", &url]);
+    assert!(
+        matches!(first.exit, CpuExit::Halt { .. }),
+        "a peer that vanished left the guest waiting: {:?} {}",
+        first.exit,
+        first.output
+    );
+    assert!(
+        !first.output.contains("back-after-the-drop"),
+        "the dropped attempt somehow got a body: {}",
+        first.output
+    );
+    assert_eq!(
+        arrived.load(Ordering::SeqCst),
+        1,
+        "the guest never reached the server, so its failure says nothing \
+         about a peer that vanished: {}",
+        first.output
+    );
+
+    // The second reaches a server that is answering again. Nothing about the
+    // first attempt may have poisoned the machine's ability to try.
+    let second = run_argv(&mut machine, "/usr/bin/wget", &["wget", "-q", "-O-", &url]);
+    assert_eq!(
+        second.exit,
+        CpuExit::Halt { code: Some(0) },
+        "a retry after a dropped connection failed: {}",
+        second.output
+    );
+    assert!(
+        second.output.contains("back-after-the-drop"),
+        "the retry did not get the body: {}",
+        second.output
+    );
+    assert_eq!(
+        arrived.load(Ordering::SeqCst),
+        2,
+        "the retry did not open a second connection"
+    );
+}
+
+#[test]
+fn a_connection_refused_is_reported_and_does_not_stop_the_next_one() {
+    let Some(mut machine) = alpine_machine() else {
+        return;
+    };
+    // A port nothing is listening on. Bound and dropped, so it is a port that
+    // was real a moment ago — which is what a peer that went away looks like.
+    let dead = {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        match listener.local_addr().expect("local addr") {
+            std::net::SocketAddr::V4(addr) => addr,
+            _ => unreachable!("bound to IPv4"),
+        }
+    };
+    let alive = spawn_http_server();
+    let mut broker = NativeBroker::new();
+    broker.redirect(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 80), dead);
+    broker.redirect(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 80), alive);
+    broker.restrict_to_redirects();
+    machine.set_network(Rc::new(RefCell::new(broker)));
+
+    let refused = run_argv(
+        &mut machine,
+        "/usr/bin/wget",
+        &["wget", "-q", "-O-", "http://10.0.0.1/"],
+    );
+    assert!(
+        matches!(refused.exit, CpuExit::Halt { code: Some(code) } if code != 0),
+        "connecting to nothing did not fail cleanly: {:?} {}",
+        refused.exit,
+        refused.output
+    );
+
+    let ok = run_argv(
+        &mut machine,
+        "/usr/bin/wget",
+        &["wget", "-q", "-O-", "http://10.0.0.2/"],
+    );
+    assert_eq!(
+        ok.exit,
+        CpuExit::Halt { code: Some(0) },
+        "a refused connection stopped the next one from working: {}",
+        ok.output
+    );
+    assert!(
+        ok.output.contains("hello-from-webtos-m5"),
+        "the working connection returned nothing: {}",
+        ok.output
+    );
 }
