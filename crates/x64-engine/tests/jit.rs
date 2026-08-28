@@ -982,6 +982,48 @@ fn cases() -> Vec<Case> {
             block,
         });
     }
+    // 128-bit multiply: the low lane is a plain product, the high lane needs the
+    // schoolbook mulhi plus the a_lo*b_hi + a_hi*b_lo cross terms, so values with
+    // both lanes set and a carry into the high lane catch a wrong mulhi or a
+    // dropped term.
+    for (name, alo_v, ahi_v, blo_v, bhi_v) in [
+        // (2^64-1)^2: lo = 1, hi = 0xffff_ffff_ffff_fffe — a full mulhi carry.
+        ("IntMul u128 all-ones squared", u64::MAX, 0, u64::MAX, 0),
+        (
+            "IntMul u128 both lanes",
+            0x0f0f_f0f0_dead_beef,
+            0x1122_3344_5566_7788,
+            0xffff_0000_ffff_0000,
+            0x00ff_00ff_00ff_00ff,
+        ),
+        // A product that overflows 128 bits, so truncation shows.
+        (
+            "IntMul u128 overflow",
+            0xdead_beef_cafe_babe,
+            0x8000_0000_0000_0000,
+            0x2,
+            0x1,
+        ),
+    ] {
+        let mut block = pcode::Block::new();
+        block.push((o16, Op::IntMul, a16, b16));
+        out.push(Case {
+            name,
+            seeds: vec![(alo, alo_v), (ahi, ahi_v), (blo, blo_v), (bhi, bhi_v)],
+            block,
+        });
+    }
+    // 128-bit multiply in place: the output aliases an input, so a naive lane
+    // store would corrupt an operand the high lane still needs.
+    {
+        let mut block = pcode::Block::new();
+        block.push((a16, Op::IntMul, a16, b16));
+        out.push(Case {
+            name: "IntMul u128 in place",
+            seeds: seed16(),
+            block,
+        });
+    }
     // ZeroExtend/SignExtend a sub-16 input to 16 bytes; the input's top bit is
     // set so the sign fill of SignExtend is exercised (0xff high lane).
     for (name, op, in_size, av) in [
@@ -3150,4 +3192,110 @@ fn fastmem_permission_fault_after_mprotect() {
         x64_engine::ExceptionCode::from_load_error(icicle_cpu::mem::MemError::ReadViolation) as u32,
         "perm: expected a ReadViolation"
     );
+}
+
+/// A deterministic splitmix64 stream, so a failure names the exact inputs and
+/// reproduces.
+struct SplitMix(u64);
+impl SplitMix {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
+
+/// 128-bit multiply against the interpreter over many random inputs, including
+/// the in-place form, so a wrong mulhi, a dropped cross term, or an aliasing bug
+/// shows on some seed.
+#[test]
+fn wide_multiply_matches_the_interpreter_on_random_inputs() {
+    let (o16, a16, b16) = (reg(1, 16), reg(2, 16), reg(3, 16));
+    let (alo, ahi) = (a16.slice(0, 8), a16.slice(8, 8));
+    let (blo, bhi) = (b16.slice(0, 8), b16.slice(8, 8));
+    let mut rng = SplitMix(0x1234_5678_9abc_def0);
+    for i in 0..256 {
+        let (av0, av1, bv0, bv1) = (rng.next(), rng.next(), rng.next(), rng.next());
+        // Alternate the plain and in-place (output aliases `a`) forms.
+        let dst = if i % 2 == 0 { o16 } else { a16 };
+        let mut block = pcode::Block::new();
+        block.push((dst, Op::IntMul, a16, b16));
+        let case = Case {
+            name: "IntMul u128 random",
+            seeds: vec![(alo, av0), (ahi, av1), (blo, bv0), (bhi, bv1)],
+            block,
+        };
+        let interp = interpret(&case);
+        let jitted = jit(&case).expect("IntMul u128 must translate");
+        assert_eq!(
+            interp,
+            jitted,
+            "IntMul u128 diverged: a={av1:016x}{av0:016x} b={bv1:016x}{bv0:016x} (in_place={})",
+            i % 2 == 1
+        );
+    }
+}
+
+/// 128-bit shifts (left, logical right, arithmetic right) against the
+/// interpreter across the boundary counts (0, 63, 64, 65, 127, 128, ...) and
+/// random values/counts, including the in-place form.
+#[test]
+fn wide_shift_matches_the_interpreter() {
+    let (o16, a16, cnt) = (reg(1, 16), reg(2, 16), reg(4, 4));
+    let (alo, ahi) = (a16.slice(0, 8), a16.slice(8, 8));
+
+    let run = |op: Op, dst: VarNode, av0: u64, av1: u64, c: u64| -> (Vec<u8>, Vec<u8>) {
+        let mut block = pcode::Block::new();
+        block.push((dst, op, a16, cnt));
+        let case = Case {
+            name: "wide shift",
+            seeds: vec![(alo, av0), (ahi, av1), (cnt, c)],
+            block,
+        };
+        (interpret(&case), jit(&case).expect("wide shift translates"))
+    };
+
+    let boundaries = [
+        0u64, 1, 31, 32, 33, 63, 64, 65, 95, 96, 127, 128, 129, 191, 192, 255, 256, 1000,
+    ];
+    let mut rng = SplitMix(0xdead_beef_1234_5678);
+    for (name, op) in [
+        ("IntLeft u128", Op::IntLeft),
+        ("IntRight u128", Op::IntRight),
+        ("IntSignedRight u128", Op::IntSignedRight),
+    ] {
+        // A value with the sign bit set, so the arithmetic shift's sign fill shows.
+        for &c in &boundaries {
+            for &(av0, av1) in &[
+                (0x8000_0000_0000_0001u64, 0xfedc_ba98_7654_3210u64),
+                (0x0, 0x8000_0000_0000_0000),
+                (u64::MAX, u64::MAX),
+                (0x1, 0x0),
+            ] {
+                for dst in [o16, a16] {
+                    let (interp, jitted) = run(op, dst, av0, av1, c);
+                    assert_eq!(
+                        interp,
+                        jitted,
+                        "{name} diverged: a={av1:016x}{av0:016x} count={c} in_place={}",
+                        dst == a16
+                    );
+                }
+            }
+        }
+        for i in 0..128 {
+            let (av0, av1) = (rng.next(), rng.next());
+            let c = rng.next() % 300;
+            let dst = if i % 2 == 0 { o16 } else { a16 };
+            let (interp, jitted) = run(op, dst, av0, av1, c);
+            assert_eq!(
+                interp,
+                jitted,
+                "{name} diverged (random): a={av1:016x}{av0:016x} count={c} in_place={}",
+                i % 2 == 1
+            );
+        }
+    }
 }

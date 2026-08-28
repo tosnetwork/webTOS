@@ -89,19 +89,29 @@ const TLB_BASE_PARAM: u32 = 1;
 /// - `addr`: the guest address, zero-extended to `i64`.
 /// - `entry`: the byte offset of the addressed TLB entry (`i32`).
 /// - `data`: the host linear-memory offset of the addressed guest byte (`i32`).
+/// - `wide`: the first of [`WIDE_SCRATCH`] consecutive `i64` locals the 128-bit
+///   cross-lane ops (multiply, shifts) use to snapshot their operands before
+///   they overwrite an output that aliases an input.
 #[derive(Clone, Copy)]
 pub struct FastLocals {
     addr: u32,
     entry: u32,
     data: u32,
+    wide: u32,
 }
 
+/// The count of `i64` scratch locals reserved for the 128-bit cross-lane ops:
+/// four to snapshot the two operands' lanes, plus one temporary.
+const WIDE_SCRATCH: u32 = 6;
+
 /// Fast-path scratch locals for a per-block `run` — params are `regs_base` (0)
-/// and `tlb_base` (1), so the scratch locals begin at 2.
+/// and `tlb_base` (1), so the scratch locals begin at 2, and the wide scratch
+/// after the three memory-fast-path locals.
 const BLOCK_FAST: FastLocals = FastLocals {
     addr: 2,
     entry: 3,
     data: 4,
+    wide: 5,
 };
 
 /// Fast-path scratch locals for a region `run` — params are `regs_base` (0),
@@ -111,6 +121,7 @@ const REGION_FAST: FastLocals = FastLocals {
     addr: 4,
     entry: 5,
     data: 6,
+    wide: 7,
 };
 
 /// The mask of permission bits the fast path requires per byte: `READ | INIT`
@@ -397,6 +408,295 @@ fn emit_wide_unary(
         emit_store(f, out.slice(off, 8))?;
     }
     Some(())
+}
+
+/// Low 32 bits, as an `i64` mask.
+const LO32_MASK: i64 = 0xffff_ffff;
+
+/// Pushes the high 64 bits of the 128-bit product `x * y` (both `u64`, read from
+/// the given locals) onto the stack. Wasm has no widening multiply, so this is
+/// the schoolbook sum over 32-bit halves: with `xl/xh`, `yl/yh` the low/high
+/// halves, the cross term `(xl*yl >> 32) + (xl*yh & lo) + (xh*yl & lo)` carries
+/// into `xh*yh + (xl*yh >> 32) + (xh*yl >> 32)`. `t` is a scratch `i64` local.
+fn emit_mulhi_u64(f: &mut Function, x: u32, y: u32, t: u32) {
+    let get = |f: &mut Function, l: u32| {
+        f.instruction(&Instruction::LocalGet(l));
+    };
+    let lo = |f: &mut Function| {
+        f.instruction(&Instruction::I64Const(LO32_MASK));
+        f.instruction(&Instruction::I64And);
+    };
+    let hi = |f: &mut Function| {
+        f.instruction(&Instruction::I64Const(32));
+        f.instruction(&Instruction::I64ShrU);
+    };
+    // cross = (xl*yl >> 32) + (xl*yh & lo) + (xh*yl & lo)
+    get(f, x);
+    lo(f);
+    get(f, y);
+    lo(f);
+    f.instruction(&Instruction::I64Mul);
+    hi(f);
+    get(f, x);
+    lo(f);
+    get(f, y);
+    hi(f);
+    f.instruction(&Instruction::I64Mul);
+    lo(f);
+    f.instruction(&Instruction::I64Add);
+    get(f, x);
+    hi(f);
+    get(f, y);
+    lo(f);
+    f.instruction(&Instruction::I64Mul);
+    lo(f);
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::LocalSet(t));
+    // mulhi = xh*yh + (xl*yh >> 32) + (xh*yl >> 32) + (cross >> 32)
+    get(f, x);
+    hi(f);
+    get(f, y);
+    hi(f);
+    f.instruction(&Instruction::I64Mul);
+    get(f, x);
+    lo(f);
+    get(f, y);
+    hi(f);
+    f.instruction(&Instruction::I64Mul);
+    hi(f);
+    f.instruction(&Instruction::I64Add);
+    get(f, x);
+    hi(f);
+    get(f, y);
+    lo(f);
+    f.instruction(&Instruction::I64Mul);
+    hi(f);
+    f.instruction(&Instruction::I64Add);
+    get(f, t);
+    hi(f);
+    f.instruction(&Instruction::I64Add);
+}
+
+/// out = (a * b) mod 2^128, a 128-bit multiply as two `i64` lanes:
+///   lo = a_lo * b_lo,
+///   hi = mulhi_u64(a_lo, b_lo) + a_lo*b_hi + a_hi*b_lo   (all mod 2^64).
+/// Operands are snapshotted into locals first so an output that aliases an input
+/// is safe.
+fn emit_wide_mul(
+    f: &mut Function,
+    out: VarNode,
+    a: Value,
+    b: Value,
+    fast: FastLocals,
+) -> Option<()> {
+    if out.size != 16 || a.size() != 16 || b.size() != 16 {
+        return None;
+    }
+    let (al, ah, bl, bh, t) = (
+        fast.wide,
+        fast.wide + 1,
+        fast.wide + 2,
+        fast.wide + 3,
+        fast.wide + 4,
+    );
+    emit_load(f, a.slice(0, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(al));
+    emit_load(f, a.slice(8, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(ah));
+    emit_load(f, b.slice(0, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(bl));
+    emit_load(f, b.slice(8, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(bh));
+
+    // Low lane: a_lo * b_lo (wraps).
+    emit_store_addr(f);
+    f.instruction(&Instruction::LocalGet(al));
+    f.instruction(&Instruction::LocalGet(bl));
+    f.instruction(&Instruction::I64Mul);
+    emit_store(f, out.slice(0, 8))?;
+
+    // High lane: mulhi(a_lo, b_lo) + a_lo*b_hi + a_hi*b_lo.
+    emit_store_addr(f);
+    emit_mulhi_u64(f, al, bl, t);
+    f.instruction(&Instruction::LocalGet(al));
+    f.instruction(&Instruction::LocalGet(bh));
+    f.instruction(&Instruction::I64Mul);
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::LocalGet(ah));
+    f.instruction(&Instruction::LocalGet(bl));
+    f.instruction(&Instruction::I64Mul);
+    f.instruction(&Instruction::I64Add);
+    emit_store(f, out.slice(8, 8))
+}
+
+/// Which 128-bit shift to emit.
+#[derive(Clone, Copy)]
+enum WideShift {
+    /// `IntLeft`: `y >= 128 ? 0 : x << y`.
+    Left,
+    /// `IntRight`: `y >= 128 ? 0 : x >>u y` (logical).
+    RightU,
+    /// `IntSignedRight`: `x >>u min(y, 127)`. At width 16 the interpreter reads
+    /// `x` as `sxt()` (a no-op — the value is already 128 bits) into a `u128` and
+    /// shifts it *logically*, so this is a logical right shift with the count
+    /// clamped to 127; the clamp is the only difference from `RightU`.
+    RightS,
+}
+
+/// out = a `<shift>` b, a 128-bit shift by the count in `b`, as two `i64` lanes.
+///
+/// A lane shift by `s = shift & 63` moves bits within a lane; the bits crossing
+/// the lane boundary are `lo >> (64 - s)` (left) or `hi << (64 - s)` (right),
+/// which we form as `(v >> 1) >> (63 - s)` / `(v << 1) << (63 - s)` so `s == 0`
+/// gives 0 rather than tripping wasm's shift-count masking. A shift of 64..127
+/// moves one lane whole into the other; 128+ (logical only) is zero; the
+/// arithmetic shift clamps the count to 127 and fills with the sign bit. All
+/// cases are selected on the count at run time.
+fn emit_wide_shift(
+    f: &mut Function,
+    out: VarNode,
+    a: Value,
+    b: Value,
+    mode: WideShift,
+    fast: FastLocals,
+) -> Option<()> {
+    if out.size != 16 || a.size() != 16 {
+        return None;
+    }
+    wasm_ty(b.size())?;
+    let (al, ah, s, y, tmp) = (
+        fast.wide,
+        fast.wide + 1,
+        fast.wide + 2,
+        fast.wide + 3,
+        fast.wide + 4,
+    );
+    let get = |f: &mut Function, l: u32| {
+        f.instruction(&Instruction::LocalGet(l));
+    };
+    let konst = |f: &mut Function, c: i64| {
+        f.instruction(&Instruction::I64Const(c));
+    };
+
+    // Snapshot the operand lanes (the output may alias the input).
+    emit_load(f, a.slice(0, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(al));
+    emit_load(f, a.slice(8, 8), 8)?;
+    f.instruction(&Instruction::LocalSet(ah));
+
+    // y = the count as i64; the arithmetic shift clamps it to 127.
+    emit_shift_count_u32(f, b)?;
+    f.instruction(&Instruction::I64ExtendI32U);
+    if let WideShift::RightS = mode {
+        f.instruction(&Instruction::LocalSet(tmp));
+        get(f, tmp);
+        konst(f, 127);
+        get(f, tmp);
+        konst(f, 127);
+        f.instruction(&Instruction::I64LtU);
+        f.instruction(&Instruction::Select);
+    }
+    f.instruction(&Instruction::LocalSet(y));
+    // s = y & 63.
+    get(f, y);
+    konst(f, 63);
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::LocalSet(s));
+
+    // `lo_lt64 = (a_lo >>u s) | (a_hi << (64 - s))`, the low lane for a right
+    // shift by s < 64; `hi_lt64 = (a_hi << s) | (a_lo >> (64 - s))`, the high
+    // lane for a left shift by s < 64. Emitted where needed below.
+    let carry_up = |f: &mut Function| {
+        // a_lo >> (64 - s) as (a_lo >> 1) >> (63 - s).
+        get(f, al);
+        konst(f, 1);
+        f.instruction(&Instruction::I64ShrU);
+        konst(f, 63);
+        get(f, s);
+        f.instruction(&Instruction::I64Sub);
+        f.instruction(&Instruction::I64ShrU);
+    };
+    let carry_down = |f: &mut Function| {
+        // a_hi << (64 - s) as (a_hi << 1) << (63 - s).
+        get(f, ah);
+        konst(f, 1);
+        f.instruction(&Instruction::I64Shl);
+        konst(f, 63);
+        get(f, s);
+        f.instruction(&Instruction::I64Sub);
+        f.instruction(&Instruction::I64Shl);
+    };
+
+    match mode {
+        WideShift::Left => {
+            // Low lane: (y < 64) ? a_lo << s : 0.
+            emit_store_addr(f);
+            get(f, al);
+            get(f, s);
+            f.instruction(&Instruction::I64Shl);
+            konst(f, 0);
+            get(f, y);
+            konst(f, 64);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            emit_store(f, out.slice(0, 8))?;
+            // High lane: (y<64) ? (a_hi<<s)|carry_up : (y<128) ? a_lo<<s : 0.
+            emit_store_addr(f);
+            get(f, ah);
+            get(f, s);
+            f.instruction(&Instruction::I64Shl);
+            carry_up(f);
+            f.instruction(&Instruction::I64Or);
+            get(f, al);
+            get(f, s);
+            f.instruction(&Instruction::I64Shl);
+            konst(f, 0);
+            get(f, y);
+            konst(f, 128);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            get(f, y);
+            konst(f, 64);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            emit_store(f, out.slice(8, 8))
+        }
+        // Logical right shift. `RightS` reaches here too: its count was clamped
+        // to 127 above, so the `y >= 128 ? 0` case simply never fires.
+        WideShift::RightU | WideShift::RightS => {
+            // High lane: (y < 64) ? a_hi >>u s : 0.
+            emit_store_addr(f);
+            get(f, ah);
+            get(f, s);
+            f.instruction(&Instruction::I64ShrU);
+            konst(f, 0);
+            get(f, y);
+            konst(f, 64);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            emit_store(f, out.slice(8, 8))?;
+            // Low lane: (y<64) ? (a_lo>>u s)|carry_down : (y<128) ? a_hi>>u s : 0.
+            emit_store_addr(f);
+            get(f, al);
+            get(f, s);
+            f.instruction(&Instruction::I64ShrU);
+            carry_down(f);
+            f.instruction(&Instruction::I64Or);
+            get(f, ah);
+            get(f, s);
+            f.instruction(&Instruction::I64ShrU);
+            konst(f, 0);
+            get(f, y);
+            konst(f, 128);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            get(f, y);
+            konst(f, 64);
+            f.instruction(&Instruction::I64LtU);
+            f.instruction(&Instruction::Select);
+            emit_store(f, out.slice(0, 8))
+        }
+    }
 }
 
 /// The `iN.eqz` for an operand of this width (i64 at width 8, i32 otherwise).
@@ -699,6 +999,23 @@ fn emit_mem_fastpath(
 /// `Some(iter_local)` in a region `run(..) -> i64` (they push the
 /// completed-iteration counter before returning it). It threads straight through
 /// to [`emit_fault_check`]/[`emit_raise_const`] and the inline `Exception` stop.
+/// Pushes the p-code shift count as an `i32` holding the interpreter's
+/// `read_dynamic(b).zxt::<u32>()`: the count zero-extended, and — for an 8-byte
+/// count — truncated to its low 32 bits (`i32.wrap_i64`), which is what a
+/// `u128 -> u32` zxt does. Used for the width comparison, and (after widening)
+/// as the shift amount itself. A count wider than 8 bytes bails.
+fn emit_shift_count_u32(f: &mut Function, b: Value) -> Option<()> {
+    match b.size() {
+        1 | 2 | 4 => emit_load(f, b, b.size())?,
+        8 => {
+            emit_load(f, b, 8)?;
+            f.instruction(&Instruction::I32WrapI64);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 pub fn translate_instruction(
     f: &mut Function,
     inst: &pcode::Instruction,
@@ -709,23 +1026,6 @@ pub fn translate_instruction(
 ) -> Option<()> {
     let out = inst.output;
     let [a, b] = inst.inputs.get();
-
-    // Pushes the p-code shift count as an `i32` holding the interpreter's
-    // `read_dynamic(b).zxt::<u32>()`: the count zero-extended, and — for an
-    // 8-byte count — truncated to its low 32 bits (`i32.wrap_i64`), which is
-    // what a `u128 -> u32` zxt does. Used for the width comparison, and (after
-    // widening) as the shift amount itself.
-    fn emit_shift_count_u32(f: &mut Function, b: Value) -> Option<()> {
-        match b.size() {
-            1 | 2 | 4 => emit_load(f, b, b.size())?,
-            8 => {
-                emit_load(f, b, 8)?;
-                f.instruction(&Instruction::I32WrapI64);
-            }
-            _ => return None,
-        }
-        Some(())
-    }
 
     match inst.op {
         // Metadata: marks an instruction boundary. No machine effect; the
@@ -817,6 +1117,9 @@ pub fn translate_instruction(
         // out = a * b, all one width. Wasm mul wraps, matching wrapping_mul; the
         // store keeps only the low `size` bytes.
         Op::IntMul => {
+            if out.size == 16 {
+                return emit_wide_mul(f, out, a, b, fast);
+            }
             let size = same_width(out, a, b)?;
             emit_store_addr(f);
             emit_load(f, a, size)?;
@@ -887,6 +1190,13 @@ pub fn translate_instruction(
         // selecting zero when `y >= width`. `a` must match the output width; the
         // count may be any handled size.
         Op::IntLeft | Op::IntRight => {
+            if out.size == 16 {
+                let mode = match inst.op {
+                    Op::IntLeft => WideShift::Left,
+                    _ => WideShift::RightU,
+                };
+                return emit_wide_shift(f, out, a, b, mode, fast);
+            }
             let size = out.size;
             let ty = wasm_ty(size)?;
             if a.size() != size {
@@ -938,6 +1248,9 @@ pub fn translate_instruction(
         // sign-propagates but masks the count, so we clamp explicitly and
         // sign-extend a sub-word `a` up to its wasm type first.
         Op::IntSignedRight => {
+            if out.size == 16 {
+                return emit_wide_shift(f, out, a, b, WideShift::RightS, fast);
+            }
             let size = out.size;
             let ty = wasm_ty(size)?;
             if a.size() != size {
@@ -1948,10 +2261,14 @@ pub fn translate_instruction(
 pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     let has_host = block_needs_host(block);
 
-    // Three scratch locals for the inline memory fast path (an i64 address, and
-    // two i32 host offsets); see [`FastLocals`] / [`BLOCK_FAST`]. Unused by a
-    // block with no Load/Store, which is harmless.
-    let mut body = Function::new([(1, ValType::I64), (2, ValType::I32)]);
+    // Scratch locals: the inline memory fast path's i64 address and two i32 host
+    // offsets, then WIDE_SCRATCH i64 locals for the 128-bit cross-lane ops; see
+    // [`FastLocals`] / [`BLOCK_FAST`]. Unused locals are harmless.
+    let mut body = Function::new([
+        (1, ValType::I64),
+        (2, ValType::I32),
+        (WIDE_SCRATCH, ValType::I64),
+    ]);
     for (i, inst) in block.instructions.iter().enumerate() {
         // Per-block `run` returns nothing, so a fault emits a bare `return`.
         translate_instruction(&mut body, inst, i as u32, has_host, None, BLOCK_FAST)?;
@@ -2082,10 +2399,16 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
         None => None,
     };
 
-    // Locals after the three params: the i64 iteration counter (index 3), then
-    // the three inline-fast-path scratch locals (an i64 address and two i32 host
-    // offsets, indices 4/5/6); see [`FastLocals`] / [`REGION_FAST`].
-    let mut body = Function::new([(1, ValType::I64), (1, ValType::I64), (2, ValType::I32)]);
+    // Locals after the three params: the i64 iteration counter (index 3), the
+    // three inline-fast-path scratch locals (an i64 address and two i32 host
+    // offsets, indices 4/5/6), then WIDE_SCRATCH i64 locals for the 128-bit
+    // cross-lane ops; see [`FastLocals`] / [`REGION_FAST`].
+    let mut body = Function::new([
+        (1, ValType::I64),
+        (1, ValType::I64),
+        (2, ValType::I32),
+        (WIDE_SCRATCH, ValType::I64),
+    ]);
     body.instruction(&Instruction::Loop(BlockType::Empty));
     for (i, inst) in block.instructions.iter().enumerate() {
         // A host op that faults stops the region by returning the current
@@ -2285,7 +2608,11 @@ pub struct Bail {
 pub fn first_bail(block: &pcode::Block) -> Option<Bail> {
     let has_host = block_needs_host(block);
     for (i, inst) in block.instructions.iter().enumerate() {
-        let mut scratch = Function::new([(1, ValType::I64), (2, ValType::I32)]);
+        let mut scratch = Function::new([
+            (1, ValType::I64),
+            (2, ValType::I32),
+            (WIDE_SCRATCH, ValType::I64),
+        ]);
         if translate_instruction(&mut scratch, inst, i as u32, has_host, None, BLOCK_FAST).is_none()
         {
             let out = inst.output.size;
