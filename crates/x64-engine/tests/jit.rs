@@ -1093,3 +1093,436 @@ fn subpiece_matches_lowered_copy() {
         failures.join("\n  ")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Guest-memory ops (Load/Store).
+//
+// These cross the wasm/host boundary, so they need a richer harness than the
+// register-only gate above. The emitted `run` calls three host imports
+// (`env.load`, `env.store`, `env.fault`); the load/store imports go through a
+// real MMU on a second VM built exactly like the interpreter's, so a fault
+// faults identically by construction. The gate compares the full register
+// space, the guest region, the resume index (`None` vs the faulting
+// instruction), and `cpu.exception` — everything the interpreter's mid-block
+// stop produces.
+
+use icicle_cpu::mem::{perm, Mapping};
+use pcode::{Inputs, RAM_SPACE};
+
+/// The state the memory imports act on: a VM providing the real MMU (guest
+/// memory and the exception it sets on a fault), the register memory the load
+/// import writes into, and the index a fault reported.
+struct JitHost {
+    vm: x64_engine::InterpVm,
+    regs: Option<wasmi::Memory>,
+    fault: Option<u32>,
+}
+
+/// A guest-memory gate case.
+struct MemCase {
+    name: &'static str,
+    seeds: Vec<(VarNode, u64)>,
+    block: pcode::Block,
+    /// A region mapped read+write in both VMs and seeded with these bytes
+    /// before the run; `None` maps nothing, so any access faults. The same
+    /// bytes are compared back after the run.
+    region: Option<(u64, Vec<u8>)>,
+}
+
+/// What a run produced, for the interpreter and the JIT to be compared on.
+struct MemOut {
+    regs: Vec<u8>,
+    guest: Vec<u8>,
+    fault: Option<usize>,
+    exc: (u32, u64),
+}
+
+/// Maps a region read+write and seeds it, the same way in either VM's MMU.
+fn map_region(mem: &mut icicle_cpu::mem::Mmu, base: u64, bytes: &[u8]) {
+    let len = ((bytes.len() as u64 + 0xfff) / 0x1000).max(1) * 0x1000;
+    mem.map_memory_len(
+        base,
+        len,
+        Mapping {
+            perm: perm::READ | perm::WRITE,
+            value: 0,
+        },
+    );
+    // Bypass the permission check for seeding; the mapping already carries RW.
+    mem.write_bytes(base, bytes, perm::NONE)
+        .expect("seed guest");
+}
+
+fn seed_regs_bytes(seeds: &[(VarNode, u64)]) -> Vec<u8> {
+    let mut regs = vec![0u8; REG_SPACE_BYTES as usize];
+    for &(var, value) in seeds {
+        let off = x64_engine::jit::var_offset(var) as usize;
+        let n = var.size as usize;
+        regs[off..off + n].copy_from_slice(&value.to_le_bytes()[..n]);
+    }
+    regs
+}
+
+fn mem_interpret(case: &MemCase) -> MemOut {
+    let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+    vm.cpu.regs.fill(0);
+    if let Some((base, bytes)) = &case.region {
+        map_region(&mut vm.cpu.mem, *base, bytes);
+    }
+    for &(var, value) in &case.seeds {
+        let off = x64_engine::jit::var_offset(var) as usize;
+        let n = var.size as usize;
+        vm.cpu.regs.as_bytes_mut()[off..off + n].copy_from_slice(&value.to_le_bytes()[..n]);
+    }
+    // Safety: the block is well-formed p-code built below.
+    let fault = unsafe { vm.cpu.interpret_block_unchecked(&case.block, 0) };
+    let regs = vm.cpu.regs.as_bytes().to_vec();
+    let guest = match &case.region {
+        Some((base, bytes)) => {
+            let mut buf = vec![0u8; bytes.len()];
+            vm.cpu
+                .mem
+                .read_bytes(*base, &mut buf, perm::NONE)
+                .expect("read guest");
+            buf
+        }
+        None => vec![],
+    };
+    MemOut {
+        regs,
+        guest,
+        fault,
+        exc: (vm.cpu.exception.code, vm.cpu.exception.value),
+    }
+}
+
+fn mem_jit(case: &MemCase) -> Option<MemOut> {
+    let bytes = translate_block(&case.block)?;
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, &bytes[..]).expect("emitted wasm is valid");
+
+    let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+    vm.cpu.regs.fill(0);
+    if let Some((base, region)) = &case.region {
+        map_region(&mut vm.cpu.mem, *base, region);
+    }
+
+    let mut store = wasmi::Store::new(
+        &engine,
+        JitHost {
+            vm,
+            regs: None,
+            fault: None,
+        },
+    );
+    let mem_ty = wasmi::MemoryType::new(REG_SPACE_BYTES / 65536, None);
+    let memory = wasmi::Memory::new(&mut store, mem_ty).expect("memory");
+    store.data_mut().regs = Some(memory);
+    memory
+        .write(&mut store, 0, &seed_regs_bytes(&case.seeds))
+        .expect("seed memory");
+
+    let mut linker = wasmi::Linker::new(&engine);
+    linker.define("env", "regs", memory).expect("define memory");
+
+    // load(addr, dst_off, size) -> ok: read `size` bytes through the MMU and,
+    // on success, write them into the register space at dst_off (little-endian
+    // makes this a memcpy). On a fault, set the same exception the interpreter
+    // would and return 0.
+    linker
+        .func_wrap(
+            "env",
+            "load",
+            |mut caller: wasmi::Caller<JitHost>, addr: i64, dst_off: i32, size: i32| -> i32 {
+                let addr = addr as u64;
+                let res = {
+                    let mem = &mut caller.data_mut().vm.cpu.mem;
+                    match size {
+                        1 => mem.read::<1>(addr, perm::READ).map(|b| b.to_vec()),
+                        2 => mem.read::<2>(addr, perm::READ).map(|b| b.to_vec()),
+                        4 => mem.read::<4>(addr, perm::READ).map(|b| b.to_vec()),
+                        8 => mem.read::<8>(addr, perm::READ).map(|b| b.to_vec()),
+                        _ => return 0,
+                    }
+                };
+                match res {
+                    Ok(loaded) => {
+                        let regs = caller.data().regs.expect("regs");
+                        regs.write(&mut caller, dst_off as usize, &loaded)
+                            .expect("write regs");
+                        1
+                    }
+                    Err(e) => {
+                        let code = x64_engine::ExceptionCode::from_load_error(e) as u32;
+                        let cpu = &mut caller.data_mut().vm.cpu;
+                        cpu.exception.code = code;
+                        cpu.exception.value = addr;
+                        0
+                    }
+                }
+            },
+        )
+        .expect("define load");
+
+    // store(addr, value, size) -> ok: write the low `size` bytes of value
+    // (little-endian) through the MMU.
+    linker
+        .func_wrap(
+            "env",
+            "store",
+            |mut caller: wasmi::Caller<JitHost>, addr: i64, value: i64, size: i32| -> i32 {
+                let addr = addr as u64;
+                let v = value as u64;
+                let cpu = &mut caller.data_mut().vm.cpu;
+                let res = match size {
+                    1 => cpu
+                        .mem
+                        .write::<1>(addr, (v as u8).to_le_bytes(), perm::WRITE),
+                    2 => cpu
+                        .mem
+                        .write::<2>(addr, (v as u16).to_le_bytes(), perm::WRITE),
+                    4 => cpu
+                        .mem
+                        .write::<4>(addr, (v as u32).to_le_bytes(), perm::WRITE),
+                    8 => cpu.mem.write::<8>(addr, v.to_le_bytes(), perm::WRITE),
+                    _ => return 0,
+                };
+                match res {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        let code = x64_engine::ExceptionCode::from_store_error(e) as u32;
+                        cpu.exception.code = code;
+                        cpu.exception.value = addr;
+                        0
+                    }
+                }
+            },
+        )
+        .expect("define store");
+
+    linker
+        .func_wrap(
+            "env",
+            "fault",
+            |mut caller: wasmi::Caller<JitHost>, index: i32| {
+                caller.data_mut().fault = Some(index as u32);
+            },
+        )
+        .expect("define fault");
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate")
+        .start(&mut store)
+        .expect("start");
+    let run = instance
+        .get_typed_func::<(), ()>(&store, "run")
+        .expect("run export");
+    run.call(&mut store, ()).expect("run");
+
+    let mut regs = vec![0u8; REG_SPACE_BYTES as usize];
+    memory.read(&store, 0, &mut regs).expect("read memory");
+    let fault = store.data().fault.map(|i| i as usize);
+    let exc = {
+        let e = &store.data().vm.cpu.exception;
+        (e.code, e.value)
+    };
+    let guest = match &case.region {
+        Some((base, region)) => {
+            let mut buf = vec![0u8; region.len()];
+            store
+                .data_mut()
+                .vm
+                .cpu
+                .mem
+                .read_bytes(*base, &mut buf, perm::NONE)
+                .expect("read guest");
+            buf
+        }
+        None => vec![],
+    };
+    Some(MemOut {
+        regs,
+        guest,
+        fault,
+        exc,
+    })
+}
+
+/// A register-space varnode holding a memory address or a value operand.
+fn v(id: i16, size: u8) -> VarNode {
+    VarNode::new(id, size)
+}
+
+fn mem_cases() -> Vec<MemCase> {
+    const BASE: u64 = 0x1_0000;
+    let seed16: Vec<u8> = (0..16u8).map(|i| 0x11u8.wrapping_mul(i + 1)).collect();
+    let mut cases = Vec::new();
+
+    // Loads of each width, at nonzero offsets so the address arithmetic shows.
+    for &(name, off, size) in &[
+        ("Load u64", 0u64, 8u8),
+        ("Load u32 at +4", 4, 4),
+        ("Load u16 at +1", 1, 2),
+        ("Load u8 at +7", 7, 1),
+    ] {
+        let (out, addr) = (v(1, size), v(5, 8));
+        let mut block = pcode::Block::new();
+        block.push((out, Op::Load(RAM_SPACE), addr));
+        cases.push(MemCase {
+            name,
+            seeds: vec![(addr, BASE + off)],
+            block,
+            region: Some((BASE, seed16.clone())),
+        });
+    }
+
+    // Load from an unmapped address: both sides fault ReadUnmapped at index 0,
+    // leave the destination untouched, and set exception value = addr.
+    {
+        let (out, addr) = (v(1, 4), v(5, 8));
+        let mut block = pcode::Block::new();
+        block.push((out, Op::Load(RAM_SPACE), addr));
+        cases.push(MemCase {
+            name: "Load fault (unmapped)",
+            seeds: vec![(out, 0xdead_beef), (addr, 0x9_0000)],
+            block,
+            region: None,
+        });
+    }
+
+    // Stores of each width, including a constant operand (only reachable
+    // because the value is passed on the stack, not by register offset).
+    {
+        let (addr, val) = (v(5, 8), v(6, 8));
+        let mut block = pcode::Block::new();
+        block.push((Op::Store(RAM_SPACE), Inputs::new(addr, val)));
+        cases.push(MemCase {
+            name: "Store u64",
+            seeds: vec![(addr, BASE), (val, 0xcafe_f00d_1234_5678)],
+            block,
+            region: Some((BASE, vec![0u8; 32])),
+        });
+    }
+    {
+        let (addr, val) = (v(5, 8), v(6, 4));
+        let mut block = pcode::Block::new();
+        block.push((Op::Store(RAM_SPACE), Inputs::new(addr, val)));
+        cases.push(MemCase {
+            name: "Store u32 at +8",
+            seeds: vec![(addr, BASE + 8), (val, 0xaabb_ccdd)],
+            block,
+            region: Some((BASE, vec![0xffu8; 32])),
+        });
+    }
+    {
+        let addr = v(5, 8);
+        let mut block = pcode::Block::new();
+        block.push((
+            Op::Store(RAM_SPACE),
+            Inputs::new(addr, pcode::Value::Const(0x00ff, 2)),
+        ));
+        cases.push(MemCase {
+            name: "Store const u16",
+            seeds: vec![(addr, BASE + 3)],
+            block,
+            region: Some((BASE, vec![0u8; 32])),
+        });
+    }
+    {
+        let (addr, val) = (v(5, 8), v(6, 4));
+        let mut block = pcode::Block::new();
+        block.push((Op::Store(RAM_SPACE), Inputs::new(addr, val)));
+        cases.push(MemCase {
+            name: "Store fault (unmapped)",
+            seeds: vec![(addr, 0x9_0000), (val, 0x1234_5678)],
+            block,
+            region: None,
+        });
+    }
+
+    // Load, transform, store back: a realistic straight-line sequence that
+    // both reads and writes guest memory in one translated block.
+    {
+        let (tmp, addr) = (v(1, 8), v(5, 8));
+        let mut block = pcode::Block::new();
+        block.push((tmp, Op::Load(RAM_SPACE), addr));
+        block.push((tmp, Op::IntAdd, tmp, pcode::Value::Const(0x1111_1111, 8)));
+        block.push((Op::Store(RAM_SPACE), Inputs::new(addr, tmp)));
+        cases.push(MemCase {
+            name: "Load, add, store back",
+            seeds: vec![(addr, BASE)],
+            block,
+            region: Some((BASE, seed16.clone())),
+        });
+    }
+
+    // A fault partway through a block: the first op applies, the second (a
+    // load from unmapped memory) faults. Both sides must apply instruction 0,
+    // not instruction 1, and report the fault at index 1.
+    {
+        let (r1, r2, r3) = (v(1, 4), v(2, 4), v(3, 4));
+        let (out, addr) = (v(4, 4), v(5, 8));
+        let mut block = pcode::Block::new();
+        block.push((r1, Op::IntAdd, r2, r3));
+        block.push((out, Op::Load(RAM_SPACE), addr));
+        cases.push(MemCase {
+            name: "Fault at index 1 after an applied add",
+            seeds: vec![
+                (r2, 0x1000),
+                (r3, 0x0337),
+                (out, 0x4242_4242),
+                (addr, 0x9_0000),
+            ],
+            block,
+            region: None,
+        });
+    }
+
+    cases
+}
+
+#[test]
+fn memory_ops_match_the_interpreter() {
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for case in mem_cases() {
+        let Some(j) = mem_jit(&case) else {
+            failures.push(format!("{}: did not translate", case.name));
+            continue;
+        };
+        let i = mem_interpret(&case);
+        ran += 1;
+        if let Some(off) = first_difference(&i.regs, &j.regs) {
+            failures.push(format!(
+                "{}: registers diverged at byte {off:#x} (interp {:#04x}, jit {:#04x})",
+                case.name, i.regs[off], j.regs[off]
+            ));
+        }
+        if i.guest != j.guest {
+            failures.push(format!(
+                "{}: guest memory diverged (interp {:02x?}, jit {:02x?})",
+                case.name, i.guest, j.guest
+            ));
+        }
+        if i.fault != j.fault {
+            failures.push(format!(
+                "{}: resume index diverged (interp {:?}, jit {:?})",
+                case.name, i.fault, j.fault
+            ));
+        }
+        if i.exc != j.exc {
+            failures.push(format!(
+                "{}: exception diverged (interp {:#06x}/{:#x}, jit {:#06x}/{:#x})",
+                case.name, i.exc.0, i.exc.1, j.exc.0, j.exc.1
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} memory blocks diverged from the interpreter:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    assert!(ran > 0, "no cases ran");
+}

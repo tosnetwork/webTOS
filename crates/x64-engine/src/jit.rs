@@ -43,9 +43,30 @@
 
 use pcode::{Op, Value, VarNode};
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, Instruction,
-    MemArg, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+    Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
+
+/// Function indices of the three memory imports, in the order
+/// [`translate_block`] declares them. Imported functions occupy the low end of
+/// the function index space, so these are fixed; the emitted `run` function
+/// follows them. They are declared only for a block that actually loads or
+/// stores (see [`block_needs_mem`]); a block without memory ops imports none of
+/// them and its `run` is function 0.
+const IMPORT_LOAD: u32 = 0;
+const IMPORT_STORE: u32 = 1;
+const IMPORT_FAULT: u32 = 2;
+
+/// Whether the block reaches guest memory, and so needs the memory imports.
+///
+/// Only `Load`/`Store` do. A block with none of them stays a self-contained
+/// register-to-register function with no imported host calls.
+fn block_needs_mem(block: &pcode::Block) -> bool {
+    block
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst.op, Op::Load(_) | Op::Store(_)))
+}
 
 /// The register space is 0x20000 bytes — two 64 KiB wasm pages.
 pub const REG_SPACE_BYTES: u32 = 0x20000;
@@ -148,6 +169,33 @@ pub fn emit_store(f: &mut Function, out: VarNode) -> Option<()> {
     Some(())
 }
 
+/// Pushes an operand as an `i64`, zero-extended from its own width. A memory
+/// address or a store value is passed to the host import this way: loaded at
+/// its size, then widened, so the import receives a full 64-bit value. Returns
+/// `None` for a size this JIT does not handle.
+fn emit_zext_i64(f: &mut Function, v: Value) -> Option<()> {
+    let size = v.size();
+    emit_load(f, v, size)?;
+    if !matches!(wasm_ty(size)?, ValType::I64) {
+        f.instruction(&Instruction::I64ExtendI32U);
+    }
+    Some(())
+}
+
+/// Emits the fault check that follows a memory import: the import left an `ok`
+/// flag on the stack, and if it is zero the access faulted. On a fault the
+/// block stops exactly where the interpreter would — it reports the faulting
+/// instruction's index (the import has already set the exception) and returns,
+/// leaving every earlier instruction's effects in place and this one's undone.
+fn emit_fault_check(f: &mut Function, index: u32) {
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::I32Const(index as i32));
+    f.instruction(&Instruction::Call(IMPORT_FAULT));
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+}
+
 /// Translates one p-code instruction into wasm appended to `f`, or returns
 /// `None` if the op (or a size it uses) is not handled — which bails the whole
 /// block to the interpreter.
@@ -155,7 +203,12 @@ pub fn emit_store(f: &mut Function, out: VarNode) -> Option<()> {
 /// This is the dispatch the op handlers plug into. `IntAdd` is the worked
 /// reference; each remaining integer op is one arm here, mostly a single wasm
 /// binary instruction between the shared load/store helpers.
-pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Option<()> {
+pub fn translate_instruction(
+    f: &mut Function,
+    inst: &pcode::Instruction,
+    index: u32,
+    has_mem: bool,
+) -> Option<()> {
     let out = inst.output;
     let [a, b] = inst.inputs.get();
 
@@ -972,6 +1025,41 @@ pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Opt
             emit_store(f, out)
         }
 
+        // out = *addr, a guest-memory load. The address is input 0; the host
+        // import reads `out.size` bytes through the real MMU and writes them
+        // into the register space at `out`'s offset (little-endian makes that a
+        // memcpy, identical to the interpreter's write). Only RAM and sizes
+        // 1/2/4/8 are handled; anything else bails. On a fault the import has
+        // set the exception and returns 0, and the block stops here.
+        Op::Load(id) => {
+            if !has_mem || id != pcode::RAM_SPACE || !matches!(out.size, 1 | 2 | 4 | 8) {
+                return None;
+            }
+            emit_zext_i64(f, a)?;
+            f.instruction(&Instruction::I32Const(var_offset(out) as i32));
+            f.instruction(&Instruction::I32Const(out.size as i32));
+            f.instruction(&Instruction::Call(IMPORT_LOAD));
+            emit_fault_check(f, index);
+            Some(())
+        }
+
+        // *addr = value, a guest-memory store. Address is input 0, value is
+        // input 1, and the store width is the value's size. The value is passed
+        // to the import on the stack (not by register offset) so a constant
+        // operand works. Same RAM-only, size-1/2/4/8, fault-stops-here contract
+        // as Load.
+        Op::Store(id) => {
+            if !has_mem || id != pcode::RAM_SPACE || !matches!(b.size(), 1 | 2 | 4 | 8) {
+                return None;
+            }
+            emit_zext_i64(f, a)?;
+            emit_zext_i64(f, b)?;
+            f.instruction(&Instruction::I32Const(b.size() as i32));
+            f.instruction(&Instruction::Call(IMPORT_STORE));
+            emit_fault_check(f, index);
+            Some(())
+        }
+
         // Everything above translates fully; anything else bails the block to
         // the interpreter. That deliberately includes the four division ops
         // (IntDiv/IntSignedDiv/IntRem/IntSignedRem): the interpreter raises an
@@ -987,23 +1075,43 @@ pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Opt
 /// executes it against the register space (imported as memory `env.regs`), or
 /// returns `None` if any instruction is unhandled.
 ///
-/// The module is self-contained bytes ready for `WebAssembly.instantiate`; the
-/// host supplies the register memory and calls `run`.
+/// A block that reaches guest memory also imports three host functions —
+/// `env.load`, `env.store`, `env.fault` — described in `feasibility/`; a block
+/// that does not imports only the register memory. Either way the module is
+/// self-contained bytes ready for `WebAssembly.instantiate`; the host supplies
+/// the register memory (and, for a memory-using block, the imports) and calls
+/// `run`.
 pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
+    let has_mem = block_needs_mem(block);
+
     let mut body = Function::new([]);
-    for inst in &block.instructions {
-        translate_instruction(&mut body, inst)?;
+    for (i, inst) in block.instructions.iter().enumerate() {
+        translate_instruction(&mut body, inst, i as u32, has_mem)?;
     }
     body.instruction(&Instruction::End);
 
     let mut module = Module::new();
 
+    // Type 0 is always `run`: [] -> []. The memory-import signatures follow it
+    // and exist only when the block uses them.
     let mut types = TypeSection::new();
-    types.ty().function([], []);
+    types.ty().function([], []); // 0: run
+    if has_mem {
+        types
+            .ty()
+            .function([ValType::I64, ValType::I32, ValType::I32], [ValType::I32]); // 1: load
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64, ValType::I32], [ValType::I32]); // 2: store
+        types.ty().function([ValType::I32], []); // 3: fault
+    }
     module.section(&types);
 
     // Import the register space as memory, so JIT'd code and the interpreter
-    // share it. The host binds `env.regs` to the real register bytes.
+    // share it. The host binds `env.regs` to the real register bytes. The
+    // function imports, when present, are declared in the order the
+    // `IMPORT_*` indices expect (memory imports do not occupy the function
+    // index space, so `load`/`store`/`fault` are 0/1/2).
     let mut imports = wasm_encoder::ImportSection::new();
     imports.import(
         "env",
@@ -1016,14 +1124,23 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
             page_size_log2: None,
         }),
     );
+    if has_mem {
+        imports.import("env", "load", EntityType::Function(1));
+        imports.import("env", "store", EntityType::Function(2));
+        imports.import("env", "fault", EntityType::Function(3));
+    }
     module.section(&imports);
+
+    // `run` is type 0. Its function index is 0 when there are no function
+    // imports, or 3 when the three memory imports precede it.
+    let run_index = if has_mem { 3 } else { 0 };
 
     let mut funcs = FunctionSection::new();
     funcs.function(0);
     module.section(&funcs);
 
     let mut exports = ExportSection::new();
-    exports.export("run", ExportKind::Func, 0);
+    exports.export("run", ExportKind::Func, run_index);
     module.section(&exports);
 
     let mut code = CodeSection::new();
