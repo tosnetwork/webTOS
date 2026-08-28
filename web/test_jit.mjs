@@ -52,9 +52,10 @@ try {
   fail(`browser could not compile/instantiate the emitted block: ${ex}`);
 }
 
-// 4. Run it, passing the register base. It reads a and b and writes their sum,
-//    all through the shared memory the engine also sees.
-blockInstance.exports.run(regsBase);
+// 4. Run it, passing the register base and a tlb_base (unused by this
+//    register-only block). It reads a and b and writes their sum, all through
+//    the shared memory the engine also sees.
+blockInstance.exports.run(regsBase, 0);
 
 // 5. The engine reads its register buffer and confirms the sum landed.
 if (e.wtw_jit_check() !== 1) fail("compiled block did not write the expected sum into shared memory");

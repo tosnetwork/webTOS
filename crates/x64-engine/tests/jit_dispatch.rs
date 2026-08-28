@@ -35,12 +35,23 @@ struct HostData {
     fault: Option<u32>,
 }
 
+/// Bytes of an `icicle_mem::tlb::TranslationCache` image (read + write arrays,
+/// 1024 × 16 bytes each).
+const TLB_BYTES: u32 = 2 * 1024 * 16;
+
 /// A wasmi backend that runs each compiled block against a copy of the register
 /// space, routing guest-memory callbacks through the live CPU.
 struct WasmiJit {
     engine: wasmi::Engine,
     store: wasmi::Store<HostData>,
     memory: wasmi::Memory,
+    /// Byte offset of the all-invalid TLB image within `memory`. This backend
+    /// copies the register file into a dedicated memory rather than sharing the
+    /// engine's, so the inline fast path never has a live TLB to hit; an
+    /// all-`0xFF` (invalid) TLB makes every access defer to the host callbacks,
+    /// exactly as before the fast path existed. The warm fast path is exercised
+    /// by the `fastmem` gate in `jit.rs` and by the browser Node gates.
+    tlb_base: u32,
     linker: wasmi::Linker<HostData>,
     instances: Vec<wasmi::Instance>,
 }
@@ -56,8 +67,18 @@ impl WasmiJit {
                 fault: None,
             },
         );
-        let mem_ty = wasmi::MemoryType::new(REG_SPACE_BYTES / 65536, None);
+        // Register file, then an all-invalid TLB image (see `tlb_base`).
+        let tlb_base = REG_SPACE_BYTES;
+        let total = REG_SPACE_BYTES + TLB_BYTES;
+        let mem_ty = wasmi::MemoryType::new(total.div_ceil(65536), None);
         let memory = wasmi::Memory::new(&mut store, mem_ty).expect("memory");
+        memory
+            .write(
+                &mut store,
+                tlb_base as usize,
+                &vec![0xffu8; TLB_BYTES as usize],
+            )
+            .expect("invalidate tlb");
         store.data_mut().memory = Some(memory);
 
         let mut linker = wasmi::Linker::new(&engine);
@@ -155,6 +176,7 @@ impl WasmiJit {
             engine,
             store,
             memory,
+            tlb_base,
             linker,
             instances: Vec::new(),
         }
@@ -186,11 +208,11 @@ impl JitBackend for WasmiJit {
         self.store.data_mut().fault = None;
 
         let instance = self.instances[handle as usize];
-        let run = match instance.get_typed_func::<i32, ()>(&self.store, "run") {
+        let run = match instance.get_typed_func::<(i32, i32), ()>(&self.store, "run") {
             Ok(run) => run,
             Err(_) => return JitOutcome::Unavailable,
         };
-        let ran = run.call(&mut self.store, 0i32);
+        let ran = run.call(&mut self.store, (0i32, self.tlb_base as i32));
         self.store.data_mut().cpu = std::ptr::null_mut();
         if ran.is_err() {
             return JitOutcome::Unavailable;
@@ -220,13 +242,16 @@ impl JitBackend for WasmiJit {
         self.store.data_mut().fault = None;
 
         let instance = self.instances[handle as usize];
-        // A region is `run(regs_base: i32, max_iters: i64) -> i64`, returning the
-        // iterations it executed.
-        let run = match instance.get_typed_func::<(i32, i64), i64>(&self.store, "run") {
+        // A region is `run(regs_base: i32, tlb_base: i32, max_iters: i64) -> i64`,
+        // returning the iterations it executed.
+        let run = match instance.get_typed_func::<(i32, i32, i64), i64>(&self.store, "run") {
             Ok(run) => run,
             Err(_) => return RegionOutcome::Unavailable,
         };
-        let ran = run.call(&mut self.store, (0i32, max_iters as i64));
+        let ran = run.call(
+            &mut self.store,
+            (0i32, self.tlb_base as i32, max_iters as i64),
+        );
         self.store.data_mut().cpu = std::ptr::null_mut();
         let iters = match ran {
             Ok(iters) => iters as u64,

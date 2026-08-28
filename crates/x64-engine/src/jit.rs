@@ -71,6 +71,84 @@ const IMPORT_RAISE: u32 = 3;
 /// or the live pointer into the engine's memory in the browser.
 const REGS_BASE_PARAM: u32 = 0;
 
+/// Local index of `run`'s second parameter, `tlb_base` — the byte offset of
+/// icicle's live translation cache ([`icicle_mem::tlb::TranslationCache`])
+/// within the host's memory. The inline softmmu fast path reads the TLB and the
+/// resolved guest page directly from that memory, calling the host only on a
+/// miss or a fault. Passing it as a parameter (like `regs_base`) lets the host
+/// supply the live pointer per call — `cpu.mem.tlb_ptr()` in the browser, where
+/// the TLB and the guest pages both live in the same linear memory the compiled
+/// block imports as `env.regs`.
+const TLB_BASE_PARAM: u32 = 1;
+
+/// The scratch locals the inline memory fast path uses, by index. They differ
+/// between a per-block `run` (params `regs_base`, `tlb_base`) and a region `run`
+/// (params `regs_base`, `tlb_base`, `max_iters`, then the iteration counter), so
+/// the layout is passed in rather than hard-coded.
+///
+/// - `addr`: the guest address, zero-extended to `i64`.
+/// - `entry`: the byte offset of the addressed TLB entry (`i32`).
+/// - `data`: the host linear-memory offset of the addressed guest byte (`i32`).
+#[derive(Clone, Copy)]
+pub struct FastLocals {
+    addr: u32,
+    entry: u32,
+    data: u32,
+}
+
+/// Fast-path scratch locals for a per-block `run` — params are `regs_base` (0)
+/// and `tlb_base` (1), so the scratch locals begin at 2.
+const BLOCK_FAST: FastLocals = FastLocals {
+    addr: 2,
+    entry: 3,
+    data: 4,
+};
+
+/// Fast-path scratch locals for a region `run` — params are `regs_base` (0),
+/// `tlb_base` (1), `max_iters` (2), then the iteration counter local (3), so the
+/// scratch locals begin at 4.
+const REGION_FAST: FastLocals = FastLocals {
+    addr: 4,
+    entry: 5,
+    data: 6,
+};
+
+/// The mask of permission bits the fast path requires per byte: `READ | INIT`
+/// for a load, `WRITE | INIT` for a store (`READ=0b10`, `WRITE=0b100`,
+/// `INIT=0b1`). Requiring `INIT` too is what keeps the fast path correct whether
+/// or not `track_uninitialized` is on — an uninitialized or unmapped-perm byte
+/// fails the mask and falls to the host, which raises the exact exception. INIT
+/// is only ever set on a byte that also went through a MAP-setting path, so the
+/// mask needs no separate MAP check.
+const PERM_READ_INIT: u64 = 0b0000_0011;
+const PERM_WRITE_INIT: u64 = 0b0000_0101;
+
+/// The TLB tag mask, `addr & 0xFFFF_FFFF_FFC0_0000` — the address with its low
+/// 22 bits (page offset + TLB index) cleared. Mirrors
+/// `icicle_mem::tlb::TLBEntry::tag_mask()`.
+const TLB_TAG_MASK: i64 = 0xFFFF_FFFF_FFC0_0000u64 as i64;
+
+/// Byte offset of the WRITE half of the translation cache within it: the READ
+/// array is `[TLBEntry; 1024]` at offset 0, so the WRITE array begins at
+/// `1024 * 16`. Mirrors the `#[repr(C)]` layout of
+/// `icicle_mem::tlb::TranslationCache`.
+const TLB_WRITE_ARRAY_OFFSET: u64 = 1024 * 16;
+
+/// Byte offset of the permission bytes within a `PageData` (`#[repr(C)]`:
+/// `data: [u8; 4096]` then `perm: [u8; 4096]`).
+const PAGE_PERM_OFFSET: u64 = 4096;
+
+/// The per-byte permission mask replicated across the `n` low bytes of a word,
+/// for the single masked compare the fast path uses (e.g. `n = 8` → the mask in
+/// every byte of an `i64`).
+fn perm_mask_word(byte: u64, n: u8) -> u64 {
+    let mut m = 0u64;
+    for i in 0..n {
+        m |= byte << (8 * i as u64);
+    }
+    m
+}
+
 /// The exception codes the division guards raise. These mirror
 /// `icicle_cpu::ExceptionCode` discriminants; the `raise` import re-canonicalises
 /// through `from_u32`, so a value here need only match the interpreter's.
@@ -431,6 +509,183 @@ fn emit_float_store(f: &mut Function, out: VarNode) -> Option<()> {
     Some(())
 }
 
+/// A `MemArg` for a raw byte-offset access into the host memory (not the
+/// register file): `offset` rides the load/store immediate, natural alignment
+/// unconstrained (`align = 0`) since guest pages and the TLB are read at
+/// whatever alignment the address lands on.
+fn raw_arg(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// Emits the inline softmmu fast path for a scalar guest Load or Store of `n` ∈
+/// {1,2,4,8} bytes, with the existing host call as the fall-back `slow` path.
+///
+/// The common case — a resident, permissioned, single-page access — is done
+/// entirely in wasm by reading icicle's live TLB (at `tlb_base`) and the
+/// resolved guest page directly from the host memory, so no host callback and no
+/// wasm→JS→wasm crossing happens. Anything the fast path is not certain it can
+/// handle falls to `slow` (the unchanged `env.load`/`env.store` call), which is
+/// always correct and also fills the TLB for next time. The guards, in order:
+///
+/// 1. Cross-page: `(addr & 0xfff) + n > 4096` ⇒ slow. A single TLB entry and a
+///    single page only cover one page; a straddling access needs two.
+/// 2. Tag: the TLB entry at `index(addr)` (the READ array for a load, the WRITE
+///    array for a store) must have `tag == addr & TLB_TAG_MASK`. An invalid
+///    entry holds `u64::MAX`, whose low 22 bits are set, so it never matches a
+///    real address's tag — a flushed (invalidated) entry always falls to slow,
+///    which is what makes reading the *live* TLB coherent after a remap.
+/// 3. Permissions: every one of the `n` permission bytes must have `READ|INIT`
+///    (load) / `WRITE|INIT` (store) set, tested as one masked compare.
+///
+/// When all guards pass, the `n` bytes are moved directly between the guest page
+/// and the register file (load) or the register/const operand and the guest page
+/// (store), little-endian, matching the host callback's effect exactly. No fault
+/// is possible on the taken fast path.
+///
+/// The address is resolved once into `fast.addr`; `slow` re-derives it the same
+/// way the pre-fast-path code did, so the fall-back is byte-identical to the
+/// proven host path. The whole thing is wrapped in two nested empty blocks so a
+/// guard `br_if`s to the slow path (depth 0) and the taken fast path `br`s past
+/// it (depth 1).
+#[allow(clippy::too_many_arguments)]
+fn emit_mem_fastpath(
+    f: &mut Function,
+    is_store: bool,
+    addr: Value,
+    n: u8,
+    load_out: Option<VarNode>,
+    store_val: Option<Value>,
+    fast: FastLocals,
+    slow: impl FnOnce(&mut Function) -> Option<()>,
+) -> Option<()> {
+    if !matches!(n, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let tlb_off = if is_store { TLB_WRITE_ARRAY_OFFSET } else { 0 };
+    let perm_byte = if is_store {
+        PERM_WRITE_INIT
+    } else {
+        PERM_READ_INIT
+    };
+    let mask = perm_mask_word(perm_byte, n);
+
+    // block $done { block $slow { <fast attempt>; br $done } ; <slow> }
+    f.instruction(&Instruction::Block(BlockType::Empty)); // $done
+    f.instruction(&Instruction::Block(BlockType::Empty)); // $slow
+
+    // fast.addr = zext_i64(addr)
+    emit_zext_i64(f, addr)?;
+    f.instruction(&Instruction::LocalSet(fast.addr));
+
+    // Cross-page guard: (addr & 0xfff) + n > 4096 -> $slow
+    f.instruction(&Instruction::LocalGet(fast.addr));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(0xfff));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(n as i32));
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Const(4096));
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::BrIf(0));
+
+    // fast.entry = tlb_base + index(addr) * 16 ; index = (addr >> 12) & 0x3ff
+    f.instruction(&Instruction::LocalGet(TLB_BASE_PARAM));
+    f.instruction(&Instruction::LocalGet(fast.addr));
+    f.instruction(&Instruction::I64Const(12));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Const(0x3ff));
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Const(16));
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalSet(fast.entry));
+
+    // Tag guard: entry.tag (at tlb_off) != (addr & TLB_TAG_MASK) -> $slow
+    f.instruction(&Instruction::LocalGet(fast.entry));
+    f.instruction(&Instruction::I64Load(raw_arg(tlb_off)));
+    f.instruction(&Instruction::LocalGet(fast.addr));
+    f.instruction(&Instruction::I64Const(TLB_TAG_MASK));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I64Ne);
+    f.instruction(&Instruction::BrIf(0));
+
+    // fast.data = wrap_i64(addr + entry.guest_to_host_offset)  (the data byte).
+    // guest_to_host_offset is the second u64 of the entry, at tlb_off + 8.
+    f.instruction(&Instruction::LocalGet(fast.addr));
+    f.instruction(&Instruction::LocalGet(fast.entry));
+    f.instruction(&Instruction::I64Load(raw_arg(tlb_off + 8)));
+    f.instruction(&Instruction::I64Add);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::LocalSet(fast.data));
+
+    // Permission guard: the n perm bytes at fast.data + PAGE_PERM_OFFSET must
+    // all carry the required bits. One masked compare: (perm & mask) != mask.
+    f.instruction(&Instruction::LocalGet(fast.data));
+    match n {
+        1 => f.instruction(&Instruction::I32Load8U(raw_arg(PAGE_PERM_OFFSET))),
+        2 => f.instruction(&Instruction::I32Load16U(raw_arg(PAGE_PERM_OFFSET))),
+        4 => f.instruction(&Instruction::I32Load(raw_arg(PAGE_PERM_OFFSET))),
+        _ => f.instruction(&Instruction::I64Load(raw_arg(PAGE_PERM_OFFSET))),
+    };
+    if n == 8 {
+        f.instruction(&Instruction::I64Const(mask as i64));
+        f.instruction(&Instruction::I64And);
+        f.instruction(&Instruction::I64Const(mask as i64));
+        f.instruction(&Instruction::I64Ne);
+    } else {
+        f.instruction(&Instruction::I32Const(mask as i32));
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::I32Const(mask as i32));
+        f.instruction(&Instruction::I32Ne);
+    }
+    f.instruction(&Instruction::BrIf(0));
+
+    // Fast path taken: move the n bytes directly, no fault possible.
+    if is_store {
+        let val = store_val?;
+        f.instruction(&Instruction::LocalGet(fast.data));
+        emit_load(f, val, n)?;
+        match n {
+            1 => f.instruction(&Instruction::I32Store8(raw_arg(0))),
+            2 => f.instruction(&Instruction::I32Store16(raw_arg(0))),
+            4 => f.instruction(&Instruction::I32Store(raw_arg(0))),
+            _ => f.instruction(&Instruction::I64Store(raw_arg(0))),
+        };
+    } else {
+        let out = load_out?;
+        // Store into the register file: [regs_base, value] then iN.store.
+        f.instruction(&Instruction::LocalGet(REGS_BASE_PARAM));
+        f.instruction(&Instruction::LocalGet(fast.data));
+        match n {
+            1 => f.instruction(&Instruction::I32Load8U(raw_arg(0))),
+            2 => f.instruction(&Instruction::I32Load16U(raw_arg(0))),
+            4 => f.instruction(&Instruction::I32Load(raw_arg(0))),
+            _ => f.instruction(&Instruction::I64Load(raw_arg(0))),
+        };
+        match n {
+            1 => f.instruction(&Instruction::I32Store8(reg_arg(out))),
+            2 => f.instruction(&Instruction::I32Store16(reg_arg(out))),
+            4 => f.instruction(&Instruction::I32Store(reg_arg(out))),
+            _ => f.instruction(&Instruction::I64Store(reg_arg(out))),
+        };
+    }
+    f.instruction(&Instruction::Br(1)); // skip the slow path
+
+    f.instruction(&Instruction::End); // end $slow
+
+    // Slow path: the unchanged host call (which also fills the TLB) plus its
+    // fault check.
+    slow(f)?;
+
+    f.instruction(&Instruction::End); // end $done
+    Some(())
+}
+
 /// Translates one p-code instruction into wasm appended to `f`, or returns
 /// `None` if the op (or a size it uses) is not handled — which bails the whole
 /// block to the interpreter.
@@ -450,6 +705,7 @@ pub fn translate_instruction(
     index: u32,
     has_host: bool,
     region_iter: Option<u32>,
+    fast: FastLocals,
 ) -> Option<()> {
     let out = inst.output;
     let [a, b] = inst.inputs.get();
@@ -1437,12 +1693,16 @@ pub fn translate_instruction(
                 }
                 return Some(());
             }
-            emit_zext_i64(f, a)?;
-            f.instruction(&Instruction::I32Const(var_offset(out) as i32));
-            f.instruction(&Instruction::I32Const(out.size as i32));
-            f.instruction(&Instruction::Call(IMPORT_LOAD));
-            emit_fault_check(f, index, region_iter);
-            Some(())
+            // Inline softmmu fast path with the host `env.load` as the
+            // fall-back; see [`emit_mem_fastpath`].
+            emit_mem_fastpath(f, false, a, out.size, Some(out), None, fast, |f| {
+                emit_zext_i64(f, a)?;
+                f.instruction(&Instruction::I32Const(var_offset(out) as i32));
+                f.instruction(&Instruction::I32Const(out.size as i32));
+                f.instruction(&Instruction::Call(IMPORT_LOAD));
+                emit_fault_check(f, index, region_iter);
+                Some(())
+            })
         }
 
         // *addr = value, a guest-memory store. Address is input 0, value is
@@ -1471,12 +1731,16 @@ pub fn translate_instruction(
                 }
                 return Some(());
             }
-            emit_zext_i64(f, a)?;
-            emit_zext_i64(f, b)?;
-            f.instruction(&Instruction::I32Const(b.size() as i32));
-            f.instruction(&Instruction::Call(IMPORT_STORE));
-            emit_fault_check(f, index, region_iter);
-            Some(())
+            // Inline softmmu fast path with the host `env.store` as the
+            // fall-back; see [`emit_mem_fastpath`].
+            emit_mem_fastpath(f, true, a, b.size(), None, Some(b), fast, |f| {
+                emit_zext_i64(f, a)?;
+                emit_zext_i64(f, b)?;
+                f.instruction(&Instruction::I32Const(b.size() as i32));
+                f.instruction(&Instruction::Call(IMPORT_STORE));
+                emit_fault_check(f, index, region_iter);
+                Some(())
+            })
         }
 
         // Unsigned division/remainder. The interpreter raises
@@ -1684,19 +1948,22 @@ pub fn translate_instruction(
 pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     let has_host = block_needs_host(block);
 
-    let mut body = Function::new([]);
+    // Three scratch locals for the inline memory fast path (an i64 address, and
+    // two i32 host offsets); see [`FastLocals`] / [`BLOCK_FAST`]. Unused by a
+    // block with no Load/Store, which is harmless.
+    let mut body = Function::new([(1, ValType::I64), (2, ValType::I32)]);
     for (i, inst) in block.instructions.iter().enumerate() {
         // Per-block `run` returns nothing, so a fault emits a bare `return`.
-        translate_instruction(&mut body, inst, i as u32, has_host, None)?;
+        translate_instruction(&mut body, inst, i as u32, has_host, None, BLOCK_FAST)?;
     }
     body.instruction(&Instruction::End);
 
     let mut module = Module::new();
 
-    // Type 0 is always `run(regs_base: i32)`. The host-import signatures follow
-    // it and exist only when the block uses them.
+    // Type 0 is always `run(regs_base: i32, tlb_base: i32)`. The host-import
+    // signatures follow it and exist only when the block uses them.
     let mut types = TypeSection::new();
-    types.ty().function([ValType::I32], []); // 0: run(regs_base)
+    types.ty().function([ValType::I32, ValType::I32], []); // 0: run(regs_base, tlb_base)
     if has_host {
         types
             .ty()
@@ -1755,14 +2022,14 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     Some(module.finish())
 }
 
-/// Local index of a region `run`'s second parameter, `max_iters` — the cap on
+/// Local index of a region `run`'s third parameter, `max_iters` — the cap on
 /// how many loop iterations one call may execute (the fuel budget divided by the
-/// block's instruction count).
-const REGION_MAX_ITERS_PARAM: u32 = 1;
+/// block's instruction count). It follows `regs_base` (0) and `tlb_base` (1).
+const REGION_MAX_ITERS_PARAM: u32 = 2;
 
-/// Local index of a region's iteration counter, an `i64` declared after the two
-/// parameters.
-const REGION_ITER_LOCAL: u32 = 2;
+/// Local index of a region's iteration counter, an `i64` declared after the
+/// three parameters.
+const REGION_ITER_LOCAL: u32 = 3;
 
 /// Translates a register-only self-loop block into a wasm *region* function.
 ///
@@ -1815,15 +2082,24 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
         None => None,
     };
 
-    // One extra local: the i64 iteration counter (index 2, after the params).
-    let mut body = Function::new([(1, ValType::I64)]);
+    // Locals after the three params: the i64 iteration counter (index 3), then
+    // the three inline-fast-path scratch locals (an i64 address and two i32 host
+    // offsets, indices 4/5/6); see [`FastLocals`] / [`REGION_FAST`].
+    let mut body = Function::new([(1, ValType::I64), (1, ValType::I64), (2, ValType::I32)]);
     body.instruction(&Instruction::Loop(BlockType::Empty));
     for (i, inst) in block.instructions.iter().enumerate() {
         // A host op that faults stops the region by returning the current
         // iteration count (`REGION_ITER_LOCAL`), so the host can reproduce the
         // interpreter's mid-loop stop; a register-only body emits no such
         // `return` and its loop is the only control flow.
-        translate_instruction(&mut body, inst, i as u32, has_host, Some(REGION_ITER_LOCAL))?;
+        translate_instruction(
+            &mut body,
+            inst,
+            i as u32,
+            has_host,
+            Some(REGION_ITER_LOCAL),
+            REGION_FAST,
+        )?;
     }
     // iter += 1
     body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
@@ -1851,14 +2127,14 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
 
     let mut module = Module::new();
 
-    // Type 0 is always the region `run(regs_base, max_iters) -> iters`. The
-    // host-import signatures follow it and exist only when the block uses them,
-    // declared exactly as `translate_block` does so `IMPORT_LOAD/STORE/FAULT/
-    // RAISE` (0/1/2/3) stay valid.
+    // Type 0 is always the region `run(regs_base, tlb_base, max_iters) ->
+    // iters`. The host-import signatures follow it and exist only when the block
+    // uses them, declared exactly as `translate_block` does so `IMPORT_LOAD/
+    // STORE/FAULT/RAISE` (0/1/2/3) stay valid.
     let mut types = TypeSection::new();
     types
         .ty()
-        .function([ValType::I32, ValType::I64], [ValType::I64]); // 0: run(regs_base, max_iters) -> iters
+        .function([ValType::I32, ValType::I32, ValType::I64], [ValType::I64]); // 0: run(regs_base, tlb_base, max_iters) -> iters
     if has_host {
         types
             .ty()
@@ -2009,8 +2285,9 @@ pub struct Bail {
 pub fn first_bail(block: &pcode::Block) -> Option<Bail> {
     let has_host = block_needs_host(block);
     for (i, inst) in block.instructions.iter().enumerate() {
-        let mut scratch = Function::new([]);
-        if translate_instruction(&mut scratch, inst, i as u32, has_host, None).is_none() {
+        let mut scratch = Function::new([(1, ValType::I64), (2, ValType::I32)]);
+        if translate_instruction(&mut scratch, inst, i as u32, has_host, None, BLOCK_FAST).is_none()
+        {
             let out = inst.output.size;
             let in_max = inst
                 .inputs
