@@ -126,6 +126,11 @@ const benchmark = async (input) => {
       const iters = jitBlockInstances[handle - 1].exports.run(regsBase, tlbBase, maxIters);
       return Number(BigInt(iters) & 0xffffffffn);
     },
+    jit_evict(handle) {
+      if (handle >= 1 && handle <= jitBlockInstances.length) {
+        jitBlockInstances[handle - 1] = null;
+      }
+    },
   };
 
   const instantiateStart = performance.now();

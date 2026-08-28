@@ -384,6 +384,13 @@ const jitImports = {
     const iters = jitBlockInstances[handle - 1].exports.run(regsBase, tlbBase, maxIters);
     return Number(BigInt(iters) & 0xffffffffn);
   },
+  // Drop the evicted module and instance so the engine's native code memory is
+  // reclaimed; the slot is nulled, not spliced, so later handles keep indices.
+  jit_evict(handle) {
+    if (handle >= 1 && handle <= jitBlockInstances.length) {
+      jitBlockInstances[handle - 1] = null;
+    }
+  },
 };
 
 async function boot(files, links = []) {

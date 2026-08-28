@@ -153,6 +153,150 @@ pub struct InterpVm {
     jit_entries: std::collections::HashMap<BlockKey, u64>,
     /// How many times a compiled block ran in place of the interpreter.
     jit_dispatches: u64,
+    /// Bookkeeping for the compiled-code budget: how much wasm code the backend
+    /// is holding, and which block each live handle belongs to, so the least
+    /// recently used can be evicted when the budget is exceeded.
+    jit_budget: JitBudget,
+}
+
+/// One live compiled handle's place in the budget: which block cache holds it,
+/// how big its wasm is, and when it last ran (for least-recently-used eviction).
+struct JitEntry {
+    key: BlockKey,
+    is_region: bool,
+    bytes: u32,
+    last_epoch: u64,
+}
+
+/// The compiled-code budget and its metrics. `budget == 0` means unlimited (the
+/// default, so nothing changes until a host sets a cap). Native runs leave it
+/// unlimited; the browser sets a cap so a long session cannot grow the engine's
+/// wasm code memory without bound.
+#[derive(Default)]
+struct JitBudget {
+    /// Live handles → their entry. A handle absent here was evicted or never
+    /// compiled; the block re-earns compilation.
+    meta: std::collections::HashMap<u32, JitEntry>,
+    /// Sum of `bytes` over `meta` — the code the backend currently holds.
+    total_bytes: usize,
+    /// The cap in wasm bytes, or 0 for unlimited.
+    budget: usize,
+    /// Monotonic clock for recency; the smallest `last_epoch` is the LRU victim.
+    epoch: u64,
+    compiles: u64,
+    evictions: u64,
+    hits: u64,
+    peak_bytes: usize,
+}
+
+/// A snapshot of the compiled-code budget, for tuning and for surfacing to the
+/// resource ledger. See [`InterpVm::jit_code_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JitCodeStats {
+    /// Wasm bytes the backend currently holds across all live handles.
+    pub total_bytes: usize,
+    /// The high-water mark of `total_bytes`.
+    pub peak_bytes: usize,
+    /// The cap, or 0 for unlimited.
+    pub budget: usize,
+    /// Live compiled handles.
+    pub live: usize,
+    /// Compilations performed.
+    pub compiles: u64,
+    /// Handles evicted under budget pressure or a code flush.
+    pub evictions: u64,
+    /// Dispatches to a compiled handle (a cache hit that ran).
+    pub hits: u64,
+}
+
+impl JitBudget {
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
+    }
+
+    /// Evicts least-recently-used handles until `incoming` more bytes fit under
+    /// the budget, dropping each from the backend and from whichever block cache
+    /// still points at it. A single block larger than the whole budget is left
+    /// to run once the rest is cleared.
+    fn make_room(
+        &mut self,
+        incoming: usize,
+        jit: &mut dyn crate::jit::JitBackend,
+        block_cache: &mut std::collections::HashMap<BlockKey, Option<u32>>,
+        region_cache: &mut std::collections::HashMap<BlockKey, Option<u32>>,
+    ) {
+        if self.budget == 0 {
+            return;
+        }
+        while self.total_bytes + incoming > self.budget {
+            let Some((&handle, _)) = self.meta.iter().min_by_key(|(_, e)| e.last_epoch) else {
+                break;
+            };
+            let entry = self.meta.remove(&handle).expect("just found");
+            jit.evict(handle);
+            let cache = if entry.is_region {
+                &mut *region_cache
+            } else {
+                &mut *block_cache
+            };
+            // Only clear the mapping if it still names this handle; a re-lift may
+            // have replaced it already.
+            if cache.get(&entry.key).copied().flatten() == Some(handle) {
+                cache.remove(&entry.key);
+            }
+            self.total_bytes = self.total_bytes.saturating_sub(entry.bytes as usize);
+            self.evictions += 1;
+        }
+    }
+
+    /// Records a freshly compiled handle.
+    fn record(&mut self, handle: u32, key: BlockKey, is_region: bool, bytes: usize) {
+        let last_epoch = self.next_epoch();
+        self.meta.insert(
+            handle,
+            JitEntry {
+                key,
+                is_region,
+                bytes: bytes as u32,
+                last_epoch,
+            },
+        );
+        self.total_bytes += bytes;
+        self.peak_bytes = self.peak_bytes.max(self.total_bytes);
+        self.compiles += 1;
+    }
+
+    /// Marks a handle used, so recency tracks execution.
+    fn touch(&mut self, handle: u32) {
+        let epoch = self.next_epoch();
+        if let Some(entry) = self.meta.get_mut(&handle) {
+            entry.last_epoch = epoch;
+        }
+        self.hits += 1;
+    }
+
+    /// Drops every live handle from the backend (used when the code cache is
+    /// flushed wholesale). Metrics are preserved.
+    fn clear(&mut self, jit: &mut dyn crate::jit::JitBackend) {
+        for &handle in self.meta.keys() {
+            jit.evict(handle);
+        }
+        self.meta.clear();
+        self.total_bytes = 0;
+    }
+
+    fn stats(&self) -> JitCodeStats {
+        JitCodeStats {
+            total_bytes: self.total_bytes,
+            peak_bytes: self.peak_bytes,
+            budget: self.budget,
+            live: self.meta.len(),
+            compiles: self.compiles,
+            evictions: self.evictions,
+            hits: self.hits,
+        }
+    }
 }
 
 /// See [`InterpVm::lift_stats`].
@@ -211,6 +355,7 @@ impl InterpVm {
             jit_region_cache: std::collections::HashMap::new(),
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
+            jit_budget: JitBudget::default(),
         }
     }
 
@@ -231,6 +376,22 @@ impl InterpVm {
         self.jit_entries.clear();
         self.jit_cache.clear();
         self.jit_region_cache.clear();
+        if let Some(jit) = self.jit.as_deref_mut() {
+            self.jit_budget.clear(jit);
+        }
+    }
+
+    /// Caps the wasm code the JIT backend may hold, in bytes; `0` is unlimited.
+    /// Over the cap, the least recently used compiled blocks are evicted and fall
+    /// back to the interpreter until they grow hot again. Bounds the engine's
+    /// native code memory across a long session.
+    pub fn set_jit_code_budget(&mut self, bytes: usize) {
+        self.jit_budget.budget = bytes;
+    }
+
+    /// A snapshot of the compiled-code budget and its metrics.
+    pub fn jit_code_stats(&self) -> JitCodeStats {
+        self.jit_budget.stats()
     }
 
     /// How many times a compiled block ran in place of the interpreter.
@@ -410,6 +571,9 @@ impl InterpVm {
         self.jit_cache.clear();
         self.jit_region_cache.clear();
         self.jit_entries.clear();
+        if let Some(jit) = self.jit.as_deref_mut() {
+            self.jit_budget.clear(jit);
+        }
     }
 
     pub fn get_current_block(&self) -> Option<(u64, u64)> {
@@ -670,12 +834,32 @@ impl InterpVm {
                     if let Some(cond) = self_loop_kind(block, block_id) {
                         let handle = match self.jit_region_cache.get(&key).copied() {
                             Some(decided) => decided,
-                            None if hot => {
-                                let compiled = crate::jit::translate_region(&block.pcode, cond)
-                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
-                                self.jit_region_cache.insert(key, compiled);
-                                compiled
-                            }
+                            None if hot => match crate::jit::translate_region(&block.pcode, cond) {
+                                // Not a region we can build: a permanent bail.
+                                None => {
+                                    self.jit_region_cache.insert(key, None);
+                                    None
+                                }
+                                Some(bytes) => {
+                                    self.jit_budget.make_room(
+                                        bytes.len(),
+                                        self.jit.as_deref_mut().expect("jit installed when hot"),
+                                        &mut self.jit_cache,
+                                        &mut self.jit_region_cache,
+                                    );
+                                    match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
+                                        Some(h) => {
+                                            self.jit_region_cache.insert(key, Some(h));
+                                            self.jit_budget.record(h, key, true, bytes.len());
+                                            Some(h)
+                                        }
+                                        // A transient decline (over budget, runtime
+                                        // refused): leave the cache absent so it retries
+                                        // once room frees, not a permanent bail.
+                                        None => None,
+                                    }
+                                }
+                            },
                             None => None,
                         };
                         if let Some(handle) = handle {
@@ -701,6 +885,7 @@ impl InterpVm {
                                         // the interpreter would.
                                         self.cpu.fuel.remaining -= iters.saturating_mul(num);
                                         self.jit_dispatches += 1;
+                                        self.jit_budget.touch(handle);
                                         jit_ran = true;
                                     }
                                     crate::jit::RegionOutcome::Faulted(iters, index) => {
@@ -725,6 +910,7 @@ impl InterpVm {
                                         self.cpu.fuel.remaining =
                                             self.cpu.fuel.remaining.saturating_sub(guest_insns);
                                         self.jit_dispatches += 1;
+                                        self.jit_budget.touch(handle);
                                         self.cpu.block_id = block_id;
                                         self.cpu.block_offset = index as u64;
                                         break;
@@ -739,15 +925,33 @@ impl InterpVm {
                     if !jit_ran {
                         let handle = match self.jit_cache.get(&key).copied() {
                             Some(decided) => decided,
-                            None if hot => {
-                                // Compile once, or cache a bail. A block that touches
-                                // guest memory, divides, or raises compiles the same
-                                // way; its host callbacks are wired at run time.
-                                let compiled = crate::jit::translate_block(&block.pcode)
-                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
-                                self.jit_cache.insert(key, compiled);
-                                compiled
-                            }
+                            None if hot => match crate::jit::translate_block(&block.pcode) {
+                                // Not translatable: a permanent bail. A block that
+                                // touches guest memory, divides, or raises translates
+                                // the same way; its host callbacks are wired at run time.
+                                None => {
+                                    self.jit_cache.insert(key, None);
+                                    None
+                                }
+                                Some(bytes) => {
+                                    self.jit_budget.make_room(
+                                        bytes.len(),
+                                        self.jit.as_deref_mut().expect("jit installed when hot"),
+                                        &mut self.jit_cache,
+                                        &mut self.jit_region_cache,
+                                    );
+                                    match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
+                                        Some(h) => {
+                                            self.jit_cache.insert(key, Some(h));
+                                            self.jit_budget.record(h, key, false, bytes.len());
+                                            Some(h)
+                                        }
+                                        // Transient decline: leave the cache absent to
+                                        // retry once room frees, not a permanent bail.
+                                        None => None,
+                                    }
+                                }
+                            },
                             None => None,
                         };
                         if let Some(handle) = handle {
@@ -763,6 +967,7 @@ impl InterpVm {
                                         // the whole block here so icount stays exact.
                                         self.cpu.fuel.remaining -= block.num_instructions as u64;
                                         self.jit_dispatches += 1;
+                                        self.jit_budget.touch(handle);
                                         jit_ran = true;
                                     }
                                     crate::jit::JitOutcome::Faulted(i) => {
@@ -779,6 +984,7 @@ impl InterpVm {
                                         self.cpu.fuel.remaining =
                                             self.cpu.fuel.remaining.saturating_sub(guest_insns);
                                         self.jit_dispatches += 1;
+                                        self.jit_budget.touch(handle);
                                         self.cpu.block_id = block_id;
                                         self.cpu.block_offset = i as u64;
                                         break;

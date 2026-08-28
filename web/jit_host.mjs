@@ -58,6 +58,14 @@ export function makeJitHost() {
       const iters = instances[handle - 1].exports.run(regsBase, tlbBase, maxIters);
       return Number(BigInt(iters) & 0xffffffffn);
     },
+
+    // Drop the evicted module and instance so its wasm code memory is reclaimed;
+    // the slot is nulled, not spliced, so later handles keep their indices.
+    jit_evict(handle) {
+      if (handle >= 1 && handle <= instances.length) {
+        instances[handle - 1] = null;
+      }
+    },
   };
 
   return {

@@ -2592,6 +2592,13 @@ pub trait JitBackend {
         cpu: &mut icicle_cpu::Cpu,
         max_iters: u64,
     ) -> RegionOutcome;
+
+    /// Drops the compiled code for `handle`, freeing whatever the runtime spent
+    /// on it (a wasm module and instance). The host calls this when it evicts a
+    /// block under the code budget, or wholesale when it flushes the code cache;
+    /// after it, the host never calls `handle` again (it re-earns compilation
+    /// from scratch). A handle already dropped or never issued is ignored.
+    fn evict(&mut self, handle: u32);
 }
 
 /// Where a block first fails to translate, for the coverage diagnostic. `width`

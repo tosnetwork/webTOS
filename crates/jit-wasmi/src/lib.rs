@@ -47,7 +47,10 @@ pub struct WasmiJit {
     /// all-`0xFF` (invalid) TLB makes every access defer to the host callbacks.
     tlb_base: u32,
     linker: wasmi::Linker<HostData>,
-    instances: Vec<wasmi::Instance>,
+    /// Compiled instances by handle (the index). `None` once evicted, so the
+    /// slot's module and instance are dropped while later handles keep their
+    /// indices.
+    instances: Vec<Option<wasmi::Instance>>,
 }
 
 impl WasmiJit {
@@ -192,8 +195,14 @@ impl JitBackend for WasmiJit {
             .linker
             .instantiate_and_start(&mut self.store, &module)
             .ok()?;
-        self.instances.push(instance);
+        self.instances.push(Some(instance));
         Some((self.instances.len() - 1) as u32)
+    }
+
+    fn evict(&mut self, handle: u32) {
+        if let Some(slot) = self.instances.get_mut(handle as usize) {
+            *slot = None;
+        }
     }
 
     fn call(&mut self, handle: u32, cpu: &mut Cpu) -> JitOutcome {
@@ -207,7 +216,9 @@ impl JitBackend for WasmiJit {
         self.store.data_mut().cpu = cpu as *mut Cpu;
         self.store.data_mut().fault = None;
 
-        let instance = self.instances[handle as usize];
+        let Some(instance) = self.instances.get(handle as usize).copied().flatten() else {
+            return JitOutcome::Unavailable;
+        };
         let run = match instance.get_typed_func::<(i32, i32), ()>(&self.store, "run") {
             Ok(run) => run,
             Err(_) => return JitOutcome::Unavailable,
@@ -241,7 +252,9 @@ impl JitBackend for WasmiJit {
         self.store.data_mut().cpu = cpu as *mut Cpu;
         self.store.data_mut().fault = None;
 
-        let instance = self.instances[handle as usize];
+        let Some(instance) = self.instances.get(handle as usize).copied().flatten() else {
+            return RegionOutcome::Unavailable;
+        };
         // A region is `run(regs_base: i32, tlb_base: i32, max_iters: i64) -> i64`,
         // returning the iterations it executed.
         let run = match instance.get_typed_func::<(i32, i32, i64), i64>(&self.store, "run") {

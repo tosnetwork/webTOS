@@ -404,6 +404,10 @@ extern "C" {
         max_iters_lo: u32,
         max_iters_hi: u32,
     ) -> u32;
+    /// Drops the host's compiled module and instance for `handle`, freeing its
+    /// wasm code memory. Called when the engine evicts a block under the code
+    /// budget or flushes the code cache; the handle is never run again.
+    fn jit_evict(handle: u32);
 }
 
 struct BrowserJit;
@@ -462,6 +466,10 @@ impl JitBackend for BrowserJit {
             i if i < 0 => RegionOutcome::Ran(iters),
             i => RegionOutcome::Faulted(iters, i as u32),
         }
+    }
+
+    fn evict(&mut self, handle: u32) {
+        unsafe { jit_evict(handle) };
     }
 }
 
@@ -584,6 +592,42 @@ pub extern "C" fn wtw_jit_enable(after: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_jit_dispatch_count() -> u64 {
     with_state(|state| state.machine.as_ref().map_or(0, |m| m.jit_dispatch_count()))
+}
+
+/// Caps the wasm code the JIT may hold, in bytes (`0` = unlimited). Over the cap
+/// the least recently used compiled blocks are evicted and fall back to the
+/// interpreter, bounding this module's native code memory over a long session.
+#[no_mangle]
+pub extern "C" fn wtw_jit_set_code_budget(bytes: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_jit_set_code_budget called before wtw_init");
+        };
+        machine.set_jit_code_budget(bytes as usize);
+        0
+    })
+}
+
+/// Wasm bytes the JIT backend currently holds across all live compiled blocks.
+#[no_mangle]
+pub extern "C" fn wtw_jit_code_bytes() -> u64 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |m| m.jit_code_stats().total_bytes as u64)
+    })
+}
+
+/// How many compiled blocks have been evicted under the code budget.
+#[no_mangle]
+pub extern "C" fn wtw_jit_evictions() -> u64 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |m| m.jit_code_stats().evictions)
+    })
 }
 
 /// Builds the machine from the embedded SLEIGH specification. Returns 0 on

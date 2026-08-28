@@ -1272,6 +1272,17 @@ impl Machine {
         self.vm.jit_dispatch_count()
     }
 
+    /// Caps the wasm code the JIT may hold, in bytes (`0` = unlimited). See
+    /// [`InterpVm::set_jit_code_budget`].
+    pub fn set_jit_code_budget(&mut self, bytes: usize) {
+        self.vm.set_jit_code_budget(bytes);
+    }
+
+    /// A snapshot of the compiled-code budget and its metrics.
+    pub fn jit_code_stats(&self) -> x64_engine::vm::JitCodeStats {
+        self.vm.jit_code_stats()
+    }
+
     /// Records per-block entry counts, so [`jit_coverage`](Self::jit_coverage)
     /// can weigh JIT coverage by what actually executed.
     pub fn profile_blocks(&mut self, enabled: bool) {

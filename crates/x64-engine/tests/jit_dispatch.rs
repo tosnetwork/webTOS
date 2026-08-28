@@ -684,3 +684,83 @@ fn a_new_address_space_does_not_reuse_the_jit_handle() {
         "the asid-2 block must recompile and dispatch"
     );
 }
+
+// ── Compiled-code budget: over the cap, the least-recently-used compiled block
+//    is evicted and recompiled on demand, and results stay correct ────────────
+
+#[test]
+fn the_code_budget_evicts_and_recompiles() {
+    let base = 0x40_0000u64;
+    let n = 100u64;
+    // A register self-loop: RAX ends at n. Compiles as a region.
+    let want = run_program(
+        false,
+        &LOOP_ADD,
+        &[("RAX", 0), ("RBX", 1), ("RCX", n)],
+        None,
+        100_000,
+    )
+    .0;
+
+    let mut vm = jit_vm_with_writable_code(base);
+    vm.cpu
+        .mem
+        .write_bytes(base, &LOOP_ADD, perm::NONE)
+        .expect("code");
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+    let rax = vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX");
+
+    let mut run_under = |vm: &mut x64_engine::InterpVm, asid: u64| {
+        x64_engine::vm::set_current_asid(asid);
+        seed_loop(vm, n);
+        vm.cpu.write_pc(base);
+        vm.cpu.block_id = u64::MAX;
+        vm.cpu.block_offset = 0;
+        vm.icount_limit = vm.cpu.icount() + 100_000;
+        let _ = vm.run();
+    };
+
+    // Learn one address space's total compiled size with no budget in force.
+    run_under(&mut vm, 1);
+    let one = vm.jit_code_stats();
+    assert!(
+        one.live >= 1 && one.total_bytes > 0,
+        "something compiled: {one:?}"
+    );
+
+    // Cap the budget at one address space's worth, then run the same program
+    // under many address spaces — each a distinct block identity and set of
+    // handles — so the cap is exceeded and older handles are evicted.
+    let baseline = one.total_bytes;
+    vm.set_jit_code_budget(baseline);
+    for asid in 2..12u64 {
+        run_under(&mut vm, asid);
+        assert_eq!(
+            vm.cpu.read_reg(rax),
+            want,
+            "asid {asid} produced the wrong result under the budget"
+        );
+        let s = vm.jit_code_stats();
+        assert!(
+            s.total_bytes <= s.budget,
+            "asid {asid} held more than the budget: {s:?}"
+        );
+    }
+    let s = vm.jit_code_stats();
+    assert!(s.evictions > 0, "the budget should have evicted: {s:?}");
+    assert!(s.compiles >= 11, "each new address space recompiles: {s:?}");
+
+    // Asid 1 was evicted long ago; running it again must recompile and be correct.
+    let before = vm.jit_code_stats().compiles;
+    run_under(&mut vm, 1);
+    x64_engine::vm::set_current_asid(0);
+    assert_eq!(
+        vm.cpu.read_reg(rax),
+        want,
+        "evicted asid 1 recompiled wrong"
+    );
+    assert!(
+        vm.jit_code_stats().compiles > before,
+        "asid 1 should have recompiled after eviction, not stayed bailed"
+    );
+}

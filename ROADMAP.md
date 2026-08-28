@@ -1074,12 +1074,19 @@ Work:
   a re-lifted block could run a stale compiled handle after self-modifying code
   or reuse another image's handle at the same address after `execve`. They are
   now keyed by the block's full identity (vaddr, isa_mode, asid) and cleared on
-  flush, gated by two tests that fail without the fix. The syscall fast path is not pursued — agent workloads
-  are bound by lifting and syscalls, not execution. SIMD is different: the
-  bail-cause histogram found 128-bit SSE ops are ~9% of executed work in
-  glibc/Node and the top of their bail histogram, so a 128-bit move/widen fast
-  path is the wide-op coverage worth adding for that class; see the JIT item
-  above)
+  flush, gated by two tests that fail without the fix. A compiled-code budget
+  then bounded the last unbounded JIT resource: the backend held every compiled
+  module for the life of the session, and its native code memory was outside
+  every ledger. The budget caps the wasm bytes held, evicts the least recently
+  used blocks over the cap (dropping the module and instance, native and in the
+  browser), and lets them recompile on demand; a transient decline no longer
+  caches a permanent bail, only a genuine failure to translate does. Gated by an
+  eviction/recompile test and a browser wiring test. The syscall fast path is not
+  pursued — agent workloads are bound by lifting and syscalls, not execution.
+  SIMD is different: the bail-cause histogram found 128-bit SSE ops are ~9% of
+  executed work in glibc/Node and the top of their bail histogram, so a 128-bit
+  move/widen fast path is the wide-op coverage worth adding for that class; see
+  the JIT item above)
 - Fuzz instruction decoding, memory translation, ELF loading, syscalls, image
   parsing, snapshot restore, and browser messages. 🔶 (six of the seven
   surfaces are swept exhaustively; the seventh names a parser that does not
