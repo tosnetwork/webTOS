@@ -123,6 +123,11 @@ fn main() {
         cov.covered_insns,
         cov.hot_insns
     );
+    println!(
+        "  of that, self-loop (region): {:.1}%   non-self-loop (trace target): {:.1}%",
+        pct(cov.covered_self_loop_insns),
+        pct(cov.covered_chain_insns),
+    );
     println!("bail causes (op@width, share of executed insns):");
     for (cause, weight) in cov.bails.iter().take(20) {
         println!("  {cause:<26} {:5.1}%", pct(*weight));

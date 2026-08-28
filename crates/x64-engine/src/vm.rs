@@ -326,6 +326,12 @@ pub struct JitCoverage {
     pub hot_insns: u64,
     /// Of those, the weight in blocks that translate whole.
     pub covered_insns: u64,
+    /// Of the covered weight, the part in self-loop blocks — the ones region
+    /// compilation already runs as one `jit_call` for the whole loop.
+    pub covered_self_loop_insns: u64,
+    /// Of the covered weight, the part in non-self-loop blocks — dispatched one
+    /// block at a time, so the share a multi-block trace could stitch.
+    pub covered_chain_insns: u64,
     /// Distinct hot blocks profiled.
     pub blocks: usize,
     /// Bail causes as `"Op@width" -> weight`, heaviest first.
@@ -407,17 +413,20 @@ impl InterpVm {
     /// run. `None` if it was not.
     pub fn jit_coverage(&self) -> Option<JitCoverage> {
         let profile = self.profile.as_ref()?;
-        // Latest lifted block at each address (a re-lift replaces an earlier one).
-        let mut by_addr: std::collections::HashMap<u64, &lifter::Block> =
+        // Latest lifted block at each address (a re-lift replaces an earlier one),
+        // with its arena id so self-loop targets can be resolved.
+        let mut by_addr: std::collections::HashMap<u64, (u64, &lifter::Block)> =
             std::collections::HashMap::new();
-        for block in &self.code.blocks {
-            by_addr.insert(block.start, block);
+        for (id, block) in self.code.blocks.iter().enumerate() {
+            by_addr.insert(block.start, (id as u64, block));
         }
         let mut hot = 0u64;
         let mut covered = 0u64;
+        let mut covered_self_loop = 0u64;
+        let mut covered_chain = 0u64;
         let mut hist: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for (addr, prof) in profile {
-            let Some(block) = by_addr.get(addr) else {
+            let Some(&(id, block)) = by_addr.get(addr) else {
                 continue;
             };
             let weight = prof.entries.saturating_mul(prof.instructions);
@@ -426,7 +435,14 @@ impl InterpVm {
             }
             hot = hot.saturating_add(weight);
             match crate::jit::first_bail(&block.pcode) {
-                None => covered = covered.saturating_add(weight),
+                None => {
+                    covered = covered.saturating_add(weight);
+                    if self_loop_kind(block, id).is_some() {
+                        covered_self_loop = covered_self_loop.saturating_add(weight);
+                    } else {
+                        covered_chain = covered_chain.saturating_add(weight);
+                    }
+                }
                 Some(b) => {
                     *hist.entry(format!("{}@{}", b.op, b.width)).or_default() += weight;
                 }
@@ -437,6 +453,8 @@ impl InterpVm {
         Some(JitCoverage {
             hot_insns: hot,
             covered_insns: covered,
+            covered_self_loop_insns: covered_self_loop,
+            covered_chain_insns: covered_chain,
             blocks: profile.len(),
             bails,
         })
