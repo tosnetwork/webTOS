@@ -339,6 +339,13 @@ pub struct JitCoverage {
     /// How the non-self-loop covered blocks exit, `"kind" -> weight`, heaviest
     /// first — the control-flow shape of the multi-block opportunity.
     pub chain_exits: Vec<(String, u64)>,
+    /// Total per-block JIT dispatches on the non-self-loop path (one per block
+    /// entry). `covered_chain_insns / chain_dispatches` is the average guest
+    /// instructions each such jit_call amortizes over.
+    pub chain_dispatches: u64,
+    /// Those dispatches bucketed by block size (guest instructions),
+    /// `"bucket" -> dispatch count` — the dispatch-granularity distribution.
+    pub chain_dispatch_sizes: Vec<(String, u64)>,
     /// Distinct hot blocks profiled.
     pub blocks: usize,
     /// Bail causes as `"Op@width" -> weight`, heaviest first.
@@ -446,6 +453,22 @@ impl InterpVm {
         // to characterize the shape of the multi-block opportunity.
         let mut exits: std::collections::HashMap<&'static str, u64> =
             std::collections::HashMap::new();
+        // Dispatch granularity for the non-self-loop path: how many jit_calls
+        // (block entries) land on blocks of each size. A per-block dispatch to a
+        // tiny block cannot amortize the call overhead the way a region does, so
+        // this predicts whether the JIT can speed the block up at all.
+        let mut chain_dispatches = 0u64;
+        let mut size_buckets: std::collections::HashMap<&'static str, u64> =
+            std::collections::HashMap::new();
+        let bucket = |n: u64| -> &'static str {
+            match n {
+                0..=1 => "1",
+                2..=4 => "2-4",
+                5..=16 => "5-16",
+                17..=64 => "17-64",
+                _ => "65+",
+            }
+        };
         let internal = |t: Target| matches!(t, Target::Internal(_));
         let ext_const = |t: Target| matches!(t, Target::External(pcode::Value::Const(..)));
         let exit_kind = |exit: lifter::BlockExit| -> &'static str {
@@ -486,6 +509,8 @@ impl InterpVm {
                             covered_trace = covered_trace.saturating_add(weight);
                         }
                         *exits.entry(exit_kind(block.exit)).or_default() += weight;
+                        chain_dispatches = chain_dispatches.saturating_add(prof.entries);
+                        *size_buckets.entry(bucket(prof.instructions)).or_default() += prof.entries;
                     }
                 }
                 Some(b) => {
@@ -498,6 +523,11 @@ impl InterpVm {
         let mut chain_exits: Vec<(String, u64)> =
             exits.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
         chain_exits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let order = ["1", "2-4", "5-16", "17-64", "65+"];
+        let chain_dispatch_sizes: Vec<(String, u64)> = order
+            .iter()
+            .filter_map(|&k| size_buckets.get(k).map(|&v| (k.to_owned(), v)))
+            .collect();
         Some(JitCoverage {
             hot_insns: hot,
             covered_insns: covered,
@@ -505,6 +535,8 @@ impl InterpVm {
             covered_chain_insns: covered_chain,
             covered_trace_insns: covered_trace,
             chain_exits,
+            chain_dispatches,
+            chain_dispatch_sizes,
             blocks: profile.len(),
             bails,
         })

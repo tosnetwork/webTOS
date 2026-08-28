@@ -136,6 +136,22 @@ fn main() {
     for (kind, weight) in cov.chain_exits.iter().take(10) {
         println!("    {kind:<22} {:5.1}%", pct(*weight));
     }
+    if cov.chain_dispatches > 0 {
+        println!(
+            "  non-self-loop dispatch granularity: {:.1} guest insns per jit_call (avg over {} dispatches)",
+            cov.covered_chain_insns as f64 / cov.chain_dispatches as f64,
+            cov.chain_dispatches,
+        );
+        let dtot: u64 = cov.chain_dispatch_sizes.iter().map(|(_, v)| v).sum();
+        for (bucket, count) in &cov.chain_dispatch_sizes {
+            let share = if dtot == 0 {
+                0.0
+            } else {
+                100.0 * *count as f64 / dtot as f64
+            };
+            println!("    block size {bucket:<6} {share:5.1}% of dispatches");
+        }
+    }
     println!("bail causes (op@width, share of executed insns):");
     for (cause, weight) in cov.bails.iter().take(20) {
         println!("  {cause:<26} {:5.1}%", pct(*weight));
