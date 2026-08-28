@@ -95,7 +95,9 @@ fn main() {
     machine.load(guest_exe.as_bytes()).expect("load");
 
     machine.profile_blocks(true);
+    machine.set_phase_timing(true);
     machine.vm_mut().icount_limit = 50_000_000_000;
+    let wall_start = std::time::Instant::now();
     loop {
         let exit = machine.run();
         // A normal guest returns a terminal exit; only a breakpoint asks to
@@ -104,6 +106,34 @@ fn main() {
             eprintln!("[coverage] guest stopped: {exit:?}");
             break;
         }
+    }
+    let wall_ns = wall_start.elapsed().as_nanos() as u64;
+    if let Some(p) = machine.phase_times() {
+        let total = wall_ns.max(1);
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let pc = |ns: u64| 100.0 * ns as f64 / total as f64;
+        let other = wall_ns.saturating_sub(p.exec_ns + p.lift_ns + p.syscall_ns);
+        println!("wall-clock phase breakdown ({:.0} ms total):", ms(wall_ns));
+        println!(
+            "  execute (interp+JIT):  {:6.1} ms  {:5.1}%",
+            ms(p.exec_ns),
+            pc(p.exec_ns)
+        );
+        println!(
+            "  lift (translate):      {:6.1} ms  {:5.1}%",
+            ms(p.lift_ns),
+            pc(p.lift_ns)
+        );
+        println!(
+            "  syscall + host I/O:    {:6.1} ms  {:5.1}%",
+            ms(p.syscall_ns),
+            pc(p.syscall_ns)
+        );
+        println!(
+            "  other (dispatch/loop): {:6.1} ms  {:5.1}%",
+            ms(other),
+            pc(other)
+        );
     }
 
     let cov = machine.jit_coverage().expect("profiling was on");

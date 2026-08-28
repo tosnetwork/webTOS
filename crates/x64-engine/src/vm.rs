@@ -157,6 +157,21 @@ pub struct InterpVm {
     /// is holding, and which block each live handle belongs to, so the least
     /// recently used can be evicted when the budget is exceeded.
     jit_budget: JitBudget,
+    /// Wall-clock split across run phases, accumulated only while `Some` (see
+    /// [`InterpVm::set_phase_timing`]). Off by default: the `Instant::now` at
+    /// each block and exception is only paid when a run is being profiled.
+    phase_times: Option<PhaseTimes>,
+}
+
+/// Where a profiled run spends wall-clock time, in nanoseconds. `exec` is
+/// interpreting p-code and running compiled blocks; `lift` is translating guest
+/// bytes to blocks; `syscall` is the OS layer handling an exception (a syscall
+/// and its host I/O); the rest of the run loop is unattributed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTimes {
+    pub exec_ns: u64,
+    pub lift_ns: u64,
+    pub syscall_ns: u64,
 }
 
 /// One live compiled handle's place in the budget: which block cache holds it,
@@ -376,7 +391,19 @@ impl InterpVm {
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
             jit_budget: JitBudget::default(),
+            phase_times: None,
         }
+    }
+
+    /// Turns on (or off) wall-clock accounting across run phases (exec, lift,
+    /// syscall); resets the accumulators when turned on. See [`phase_times`].
+    pub fn set_phase_timing(&mut self, on: bool) {
+        self.phase_times = on.then(PhaseTimes::default);
+    }
+
+    /// The accumulated phase wall-clock, or `None` if timing is off.
+    pub fn phase_times(&self) -> Option<PhaseTimes> {
+        self.phase_times
     }
 
     /// Installs a JIT backend. Blocks that grow hot (see [`set_jit_tiering`])
@@ -597,7 +624,11 @@ impl InterpVm {
             let instructions_to_exec = self.next_timer.saturating_sub(self.cpu.icount);
             if instructions_to_exec > 0 {
                 self.cpu.update_fuel(instructions_to_exec);
+                let started = self.phase_times.map(|_| std::time::Instant::now());
                 self.run_block_interpreter();
+                if let (Some(t), Some(pt)) = (started, self.phase_times.as_mut()) {
+                    pt.exec_ns += t.elapsed().as_nanos() as u64;
+                }
                 // Clear fuel so `icount` is correct.
                 self.cpu.update_fuel(0);
             } else {
@@ -705,7 +736,12 @@ impl InterpVm {
             return VmExit::Interrupted;
         }
 
-        if let Some(exit) = self.env.handle_exception(&mut self.cpu) {
+        let started = self.phase_times.map(|_| std::time::Instant::now());
+        let env_exit = self.env.handle_exception(&mut self.cpu);
+        if let (Some(t), Some(pt)) = (started, self.phase_times.as_mut()) {
+            pt.syscall_ns += t.elapsed().as_nanos() as u64;
+        }
+        if let Some(exit) = env_exit {
             return exit;
         }
 
@@ -788,7 +824,12 @@ impl InterpVm {
             ));
         }
 
-        match self.lift(pc) {
+        let started = self.phase_times.map(|_| std::time::Instant::now());
+        let lifted = self.lift(pc);
+        if let (Some(t), Some(pt)) = (started, self.phase_times.as_mut()) {
+            pt.lift_ns += t.elapsed().as_nanos() as u64;
+        }
+        match lifted {
             Ok(group) => {
                 self.cpu.block_id = group.blocks.0 as u64;
                 self.cpu.block_offset = 0;

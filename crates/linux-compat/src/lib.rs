@@ -1283,6 +1283,16 @@ impl Machine {
         self.vm.jit_code_stats()
     }
 
+    /// Turns wall-clock phase accounting (exec/lift/syscall) on or off.
+    pub fn set_phase_timing(&mut self, on: bool) {
+        self.vm.set_phase_timing(on);
+    }
+
+    /// The accumulated phase wall-clock, or `None` if timing is off.
+    pub fn phase_times(&self) -> Option<x64_engine::vm::PhaseTimes> {
+        self.vm.phase_times()
+    }
+
     /// Records per-block entry counts, so [`jit_coverage`](Self::jit_coverage)
     /// can weigh JIT coverage by what actually executed.
     pub fn profile_blocks(&mut self, enabled: bool) {
