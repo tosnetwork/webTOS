@@ -42,6 +42,43 @@ rather than trusting those numbers.
 
 ---
 
+## What has actually run
+
+The table above says what the runtime provides. This says what it has been
+pointed at. These five are the examples WebVM shows on its own front page,
+which makes them a fair outside choice rather than a flattering one; they were
+run here unmodified.
+
+| Workload | Result |
+|---|---|
+| `python3 fibonacci.py` | Python 3.10.12 computes fib(90) correctly. 161 M instructions |
+| `gcc -O2 -o hello hello.c && ./hello` | A shell forks the driver, which execs the compiler, the assembler, and the linker; the 15,960-byte ELF it produced then runs and prints. 126 M instructions, 11.9 s, 682 MB resident |
+| `objdump -d ./hello` | Real binutils disassembles what the guest had just compiled, with `-O2` visible in the output — `printf` folded to `puts` |
+| `vim hello.c` | Real vim — eleven shared libraries and an embedded Python — renders full-screen on a pseudoterminal, takes keystrokes, and exits cleanly. 48 M instructions |
+| `curl --max-time 15 parrot.live` | DNS resolves in 23 ms and the connection opens. In one run 936 KB of a streaming ASCII animation arrived with its colour escapes intact; in two others the connection opened and nothing arrived before the deadline. That has not been investigated |
+
+Getting the first four running needed no engine fix. Everything that went
+wrong along the way was a missing file: a header directory, an assembler the
+driver looks for on PATH, a linker plugin, and two libraries the link step
+opens by name. The fifth is the open one — a connection that opens and then
+delivers nothing is either a host-side detail of that particular run or a
+wakeup the broker can miss, and which has not been established.
+
+**Where these ran matters.** All five ran on the native runner on an x86-64
+Linux host — the same `x64-engine` and `linux-compat` a browser loads, but
+without the browser host, and none has been carried into a tab. One has a gate
+behind it: `crates/linux-compat/tests/gcc.rs` compiles, links, and runs a
+program on every suite run, and skips when the host has no compiler. The other
+four were run by hand and are not regression-tested.
+
+What is gated in Chromium, Firefox, and WebKit is the set the milestones
+cover: BusyBox applets and a shell, dynamic loading under both musl and glibc,
+an interactive terminal with job control, a full-screen editor, the network
+path, snapshots across a reload, and a 52 MB agent binary streamed in and
+executed.
+
+---
+
 ## 1. Zero-install development environments
 
 **Problem**: browser IDEs either ship a JavaScript reimplementation of the
