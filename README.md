@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="webTOS.png" alt="webTOS — Operating System for AI Agents" width="360">
+  <img src="webTOS.png" alt="webTOS" width="360">
 </p>
 
 <p align="center">
@@ -351,7 +351,6 @@ cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
   acceptance gates, and release definition
 - [Use cases](docs/USE-CASES.md) - what the runtime supports today, and what
   it deliberately does not
-- [Linux Compatibility Notes](docs/LinuxCompat.md) - Linux ABI translation and runtime bring-up
 - [Performance and memory](docs/performance.md) - what the interpreter costs
   per browser engine, and what a tab grants it
 

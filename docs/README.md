@@ -1,86 +1,57 @@
 # webTOS Documentation
 
-This directory is the entry point for webTOS documentation. webTOS is an
-AI-agent-first bare-metal operating system kernel designed to run in the
-browser. The repository also retains its native x86-64 reference environment
-for kernel development and compatibility validation.
+This directory is the entry point for webTOS documentation. webTOS runs
+unmodified Linux x86-64 binaries inside a browser tab: a WebAssembly x86-64
+engine, the operating-system half of the Linux ABI on top of it, and a browser
+host supplying storage, a terminal, and a relayed network path.
 
-## Start Here
+Six documents, and they are all current. There is no historical section,
+because the documents that described the removed bare-metal kernel were
+deleted with it rather than left to be mistaken for present behaviour; `git
+log` has them.
 
-- [Project overview](../README.md) - product direction, architecture, status,
-  and native development commands
+## Start here
+
+- [Project overview](../README.md) - what it is, how to run it in a browser
+  and natively, and what exists today
 - [White paper](WHITEPAPER.md) - product and vision paper: thesis, why now,
-  competitive landscape, moat, risks, and anticipated investor questions
-- [Product roadmap](../ROADMAP.md) - the primary webTOS plan from static
-  `hello` and BusyBox through OpenFox, Codex, and Claude Code
-- [Architecture](TOS_ARCHITECTURE.md) - kernel subsystems and execution
-  model inherited from the native TOS core
-- [Use cases](USE-CASES.md) - what the browser runtime supports today, and
-  what it deliberately does not
+  competitive position, moat, risks, and anticipated questions
+- [Product roadmap](../ROADMAP.md) - the plan from static `hello` and BusyBox
+  through OpenFox, Codex, and Claude Code, with milestone exit gates
+- [Use cases](USE-CASES.md) - what the runtime supports today, what it has
+  actually been pointed at, and what it deliberately does not do
 
-## Guides and Examples
-
-- [Smart contract example](contract-example.md) - conceptual Wasm contract
-  packaging, deployment, invocation, and receipt flow
-- [Real hardware testing](REAL_HARDWARE_TEST.md) - native x86-64 reference
-  validation; this is not the browser launch path
-- [Package manager](specs/PackageManager.md) - `.tos` package and installation
-  model
-
-## Runtime and Compatibility
+## Measurement and workloads
 
 - [Performance and memory](performance.md) - what the interpreter costs
-  natively and per browser engine, what a tab grants it, and what that implies
-  for milestone 8
+  natively and per browser engine, what a tab grants it, and what that
+  implies for milestone 8
+- [OpenFox workload profile](workloads/openfox.md) - the milestone-6 agent:
+  its gates and what each one covers
+- [Node.js workload profile](workloads/node.md) - a demanding dynamic
+  runtime, used as milestone-7 groundwork
 
-- [Linux compatibility](LinuxCompat.md) - Linux x86-64 syscall, process,
-  VFS, memory, and networking translation
-- [WebAssembly runtime specification](specs/WASM-runtime-spec.md) - Wasm
-  execution classes and host ABI
-- [Wasm engine integration](wasm-engine-integration.md) - boundary between
-  the standalone `wasbi` engine and the webTOS kernel
-- [Kernel policy runtime](specs/eBPF-lite-spec.md) - policy instructions,
-  helpers, maps, and attachment points
+## Status conventions
 
-## Specifications
+- **Gated** means a test in this repository fails when the behaviour breaks.
+  Milestone claims in the roadmap name the gate.
+- **Run** means it has been made to work and recorded, but nothing would catch
+  a regression. The use-case document distinguishes the two explicitly.
+- **Roadmap** means intended work with an exit criterion written down. It is
+  not a release guarantee.
+- **TOS** survives in crate names and identifiers. The bare-metal kernel that
+  once carried the name has been removed from this repository.
 
-- [Yellow Paper](specs/yellowpaper.md) - current detailed engineering
-  specification
-- [Contract and proof platform plan](plans/TODO-proof-contract-platform.md) -
-  forward-looking contract execution and proof work
+## Maintenance
 
-## Engineering Roadmaps
+When changing behaviour:
 
-[`ROADMAP.md`](../ROADMAP.md) is the primary product roadmap. The following
-files are supporting implementation plans for the native Linux substrate and
-contract system; they are not descriptions of guaranteed current behavior:
-
-- [Linux maturity](plans/TODO-linux-maturity.md)
-- [Linux runtime](plans/TODO-linux-runtime.md)
-- [Linux substrate depth](plans/TODO-linux-substrate-depth.md)
-- [Memory subsystem](plans/TODO-memory-subsystem.md)
-- [Professional uptake](plans/TODO-professional-uptake.md)
-- [Runtime semantics](plans/TODO-runtime-semantics.md)
-
-## Naming and Status Conventions
-
-- **webTOS** is the browser-capable operating-system project and product name.
-- **TOS** remains in existing kernel ABI names, Rust crate names, SDK paths,
-  package formats such as `.tos`, and historical specifications until those
-  interfaces are deliberately migrated.
-- **Available** means the implementation exists in this repository and has a
-  native reference path.
-- **Browser integration** means the kernel feature exists but its Web host
-  adapter or x86-64 Web execution path is still being connected.
-- **Roadmap** means the document describes intended work and must not be read
-  as a release guarantee.
-
-## Documentation Maintenance
-
-When changing behavior:
-
-1. Update the closest implementation guide or specification.
-2. Mark browser-only, native-only, and shared behavior explicitly.
-3. Keep commands executable against the current repository layout.
+1. Update the closest document, and say which of the three states above the
+   change lands in.
+2. Mark browser-only, native-only, and shared behaviour explicitly — most of
+   the suite cannot run on a developer's macOS machine, and a document that
+   forgets this reports coverage that did not happen.
+3. Keep commands executable against the current repository layout. A command
+   that cannot run is worse than no command.
 4. Link new documents from this index.
-5. Avoid presenting roadmap items as completed functionality.
+5. Never present roadmap items as completed functionality.

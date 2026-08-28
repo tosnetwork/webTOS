@@ -1259,19 +1259,6 @@ This is a target boundary, not permission for a one-shot rewrite. Code moves
 should follow tested interface extraction and keep the native reference path
 working throughout the migration.
 
-## Supporting Plans
-
-The existing plans remain useful for deep native Linux semantics, memory, and
-contract work, but they are subordinate to this roadmap:
-
-- [`TODO-linux-maturity.md`](docs/plans/TODO-linux-maturity.md)
-- [`TODO-linux-runtime.md`](docs/plans/TODO-linux-runtime.md)
-- [`TODO-linux-substrate-depth.md`](docs/plans/TODO-linux-substrate-depth.md)
-- [`TODO-memory-subsystem.md`](docs/plans/TODO-memory-subsystem.md)
-- [`TODO-professional-uptake.md`](docs/plans/TODO-professional-uptake.md)
-- [`TODO-runtime-semantics.md`](docs/plans/TODO-runtime-semantics.md)
-- [`TODO-proof-contract-platform.md`](docs/plans/TODO-proof-contract-platform.md)
-
 ## Definition of Done
 
 webTOS reaches its initial product goal when a supported browser can start a
