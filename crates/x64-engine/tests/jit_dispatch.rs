@@ -533,3 +533,154 @@ fn a_faulting_memory_block_matches_the_interpreter() {
         jit.3
     );
 }
+
+// ── JIT cache identity: a compiled handle must never outlive the bytes it was
+//    built from at the same virtual address ───────────────────────────────────
+//
+// Both JIT caches are keyed by block start. When a block is re-lifted at the
+// same VA — self-modifying code (the run loop calls `flush_code`), or a new
+// image at that VA in a fresh address space (`execve` bumps the asid) — the
+// stale handle must not be reused. Each test compiles one loop, then runs a
+// different loop at the same address and checks the result matches the
+// interpreter and that the new bytes actually recompiled.
+
+/// add rax, rbx ; dec rcx ; jnz -8 ; hlt  — RAX ends at +N.
+const LOOP_ADD: [u8; 9] = [0x48, 0x01, 0xD8, 0x48, 0xFF, 0xC9, 0x75, 0xF8, 0xF4];
+/// sub rax, rbx ; dec rcx ; jnz -8 ; hlt  — same layout, RAX ends at -N.
+const LOOP_SUB: [u8; 9] = [0x48, 0x29, 0xD8, 0x48, 0xFF, 0xC9, 0x75, 0xF8, 0xF4];
+
+fn seed_loop(vm: &mut x64_engine::InterpVm, n: u64) {
+    for (name, val) in [("RAX", 0u64), ("RBX", 1), ("RCX", n)] {
+        let v = vm.cpu.arch.sleigh.get_varnode(name).expect("varnode");
+        vm.cpu.write_var(v, val);
+    }
+}
+
+fn jit_vm_with_writable_code(base: u64) -> x64_engine::InterpVm {
+    let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+    vm.cpu.mem.reset_virtual();
+    vm.cpu.reset();
+    vm.cpu.mem.map_memory_len(
+        base,
+        0x1000,
+        Mapping {
+            perm: perm::READ | perm::WRITE | perm::EXEC | perm::INIT,
+            value: 0,
+        },
+    );
+    vm.cpu.mem.map_memory_len(
+        0x7fff_0000_0000,
+        0x10_0000,
+        Mapping {
+            perm: perm::READ | perm::WRITE | perm::INIT,
+            value: 0,
+        },
+    );
+    let sp = vm.cpu.arch.reg_sp;
+    vm.cpu.write_var(sp, 0x7fff_0010_0000u64 & !0xf);
+    vm.set_jit(Box::new(WasmiJit::new()));
+    vm.set_jit_tiering(Some(1));
+    vm
+}
+
+#[test]
+fn self_modifying_code_drops_the_stale_jit_handle() {
+    let base = 0x40_0000u64;
+    let n = 100u64;
+    let want = run_program(
+        false,
+        &LOOP_SUB,
+        &[("RAX", 0), ("RBX", 1), ("RCX", n)],
+        None,
+        100_000,
+    )
+    .0;
+
+    let mut vm = jit_vm_with_writable_code(base);
+    let rax = vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX");
+
+    vm.cpu
+        .mem
+        .write_bytes(base, &LOOP_ADD, perm::NONE)
+        .expect("write add");
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+    seed_loop(&mut vm, n);
+    vm.icount_limit = vm.cpu.icount() + 100_000;
+    let _ = vm.run();
+    assert_eq!(vm.cpu.read_reg(rax), n, "phase 1 (add) result");
+    assert!(vm.jit_dispatch_count() > 0, "phase 1 must actually JIT");
+
+    vm.cpu
+        .mem
+        .write_bytes(base, &LOOP_SUB, perm::NONE)
+        .expect("write sub");
+    vm.flush_code();
+    vm.cpu.block_id = u64::MAX;
+    vm.cpu.block_offset = 0;
+    vm.cpu.write_pc(base);
+    seed_loop(&mut vm, n);
+    vm.icount_limit = vm.cpu.icount() + 100_000;
+    let before = vm.jit_dispatch_count();
+    let _ = vm.run();
+    assert_eq!(
+        vm.cpu.read_reg(rax),
+        want,
+        "after flush the JIT ran the stale add handle instead of the re-lifted sub block"
+    );
+    assert!(
+        vm.jit_dispatch_count() > before,
+        "the re-lifted block must recompile and dispatch, not sit on a stale entry"
+    );
+}
+
+#[test]
+fn a_new_address_space_does_not_reuse_the_jit_handle() {
+    let base = 0x40_0000u64;
+    let n = 100u64;
+    let want = run_program(
+        false,
+        &LOOP_SUB,
+        &[("RAX", 0), ("RBX", 1), ("RCX", n)],
+        None,
+        100_000,
+    )
+    .0;
+
+    x64_engine::vm::set_current_asid(1);
+    let mut vm = jit_vm_with_writable_code(base);
+    let rax = vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX");
+
+    vm.cpu
+        .mem
+        .write_bytes(base, &LOOP_ADD, perm::NONE)
+        .expect("write add");
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+    seed_loop(&mut vm, n);
+    vm.icount_limit = vm.cpu.icount() + 100_000;
+    let _ = vm.run();
+    assert_eq!(vm.cpu.read_reg(rax), n, "asid 1 (add) result");
+    assert!(vm.jit_dispatch_count() > 0, "asid 1 must actually JIT");
+
+    x64_engine::vm::set_current_asid(2);
+    vm.cpu
+        .mem
+        .write_bytes(base, &LOOP_SUB, perm::NONE)
+        .expect("write sub");
+    vm.cpu.block_id = u64::MAX;
+    vm.cpu.block_offset = 0;
+    vm.cpu.write_pc(base);
+    seed_loop(&mut vm, n);
+    vm.icount_limit = vm.cpu.icount() + 100_000;
+    let before = vm.jit_dispatch_count();
+    let _ = vm.run();
+    x64_engine::vm::set_current_asid(0);
+    assert_eq!(
+        vm.cpu.read_reg(rax),
+        want,
+        "the JIT served the asid-1 add handle for the asid-2 sub block at the same VA"
+    );
+    assert!(
+        vm.jit_dispatch_count() > before,
+        "the asid-2 block must recompile and dispatch"
+    );
+}

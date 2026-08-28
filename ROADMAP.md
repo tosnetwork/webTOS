@@ -1066,7 +1066,12 @@ Work:
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results. 🔶 (block caching, tiering,
   and self-modifying-code invalidation all landed — the content-addressed lift
-  cache and tiered lifting. The syscall fast path is not pursued — agent workloads
+  cache and tiered lifting. The JIT caches then had to join that invalidation:
+  they were keyed by bare address and were not cleared on a code-cache flush, so
+  a re-lifted block could run a stale compiled handle after self-modifying code
+  or reuse another image's handle at the same address after `execve`. They are
+  now keyed by the block's full identity (vaddr, isa_mode, asid) and cleared on
+  flush, gated by two tests that fail without the fix. The syscall fast path is not pursued — agent workloads
   are bound by lifting and syscalls, not execution. SIMD is different: the
   bail-cause histogram found 128-bit SSE ops are ~9% of executed work in
   glibc/Node and the top of their bail histogram, so a 128-bit move/widen fast

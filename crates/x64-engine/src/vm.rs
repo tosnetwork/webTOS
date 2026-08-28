@@ -134,18 +134,23 @@ pub struct InterpVm {
     jit: Option<Box<dyn crate::jit::JitBackend>>,
     /// Entries after which a block is JIT-compiled; `None` = JIT off.
     jit_after: Option<u64>,
-    /// Per-block-address compiled handles: `Some(handle)` once compiled,
+    /// Compiled handles keyed by [`BlockKey`] — the same (vaddr, isa_mode,
+    /// asid) identity the block cache uses, not the bare address: a handle
+    /// compiled for one image must never be served for a different image that
+    /// reuses the address in a new address space. `Some(handle)` once compiled,
     /// `None` once the block is known not to JIT (so it is never retried).
-    jit_cache: std::collections::HashMap<u64, Option<u32>>,
-    /// Per-block-address compiled *region* (self-loop) handles, keyed the same
+    /// Cleared by [`InterpVm::flush_code`] when bytes change under a live key
+    /// (self-modifying code).
+    jit_cache: std::collections::HashMap<BlockKey, Option<u32>>,
+    /// Compiled *region* (self-loop) handles, keyed by [`BlockKey`] the same
     /// way: `Some(handle)` once the block compiled as a region, `None` once it
     /// is known not to (not a self-loop, or not region-translatable), so it is
     /// never retried. Separate from `jit_cache` because a region is a different
     /// wasm module (an internal loop) than the per-block function.
-    jit_region_cache: std::collections::HashMap<u64, Option<u32>>,
-    /// Per-block-address entry counts, to decide when a block is hot enough to
+    jit_region_cache: std::collections::HashMap<BlockKey, Option<u32>>,
+    /// Per-[`BlockKey`] entry counts, to decide when a block is hot enough to
     /// compile. Separate from `entries`, which counts only external re-entries.
-    jit_entries: std::collections::HashMap<u64, u64>,
+    jit_entries: std::collections::HashMap<BlockKey, u64>,
     /// How many times a compiled block ran in place of the interpreter.
     jit_dispatches: u64,
 }
@@ -397,6 +402,14 @@ impl InterpVm {
     pub fn flush_code(&mut self) {
         self.code.flush_code();
         self.lifted.clear();
+        // Compiled handles were built from bytes that are now gone. A key can
+        // survive a flush (self-modifying code rewrites a page without changing
+        // the asid), so keying alone is not enough — drop the handles, the bail
+        // decisions, and the hotness counts, and let re-lifted blocks earn the
+        // JIT again from their new bytes.
+        self.jit_cache.clear();
+        self.jit_region_cache.clear();
+        self.jit_entries.clear();
     }
 
     pub fn get_current_block(&self) -> Option<(u64, u64)> {
@@ -636,14 +649,18 @@ impl InterpVm {
             // stays the floor.
             let mut jit_ran = false;
             // A zero-instruction block retires nothing: dispatching it would advance
-            // register state under an icount that never moves, and — because both JIT
-            // caches are keyed by block start — its compiled handle would be reused by
-            // a real block that shares the address. Keep it out of the JIT entirely
-            // (the region path already required `num > 0`); the interpreter runs it.
+            // register state under an icount that never moves, and its handle would
+            // be reused by a real block that shares the address. Keep it out of the
+            // JIT entirely (the region path already required `num > 0`); the
+            // interpreter runs it.
             if offset == 0 && !block.has_breakpoint() && block.num_instructions > 0 {
                 if let Some(after) = self.jit_after {
-                    let start = block.start;
-                    let count = self.jit_entries.entry(start).or_insert(0);
+                    // Key the JIT caches by the block's full identity (vaddr,
+                    // isa_mode, asid), the same key the block cache uses, so a
+                    // handle compiled for one image is never served for a different
+                    // image at the same address after `execve`.
+                    let key = self.get_block_key(block.start);
+                    let count = self.jit_entries.entry(key).or_insert(0);
                     *count += 1;
                     let hot = *count >= after;
 
@@ -651,12 +668,12 @@ impl InterpVm {
                     // whole loop in one call; a self-loop that needs the host
                     // caches a bail here and takes the per-block path below.
                     if let Some(cond) = self_loop_kind(block, block_id) {
-                        let handle = match self.jit_region_cache.get(&start).copied() {
+                        let handle = match self.jit_region_cache.get(&key).copied() {
                             Some(decided) => decided,
                             None if hot => {
                                 let compiled = crate::jit::translate_region(&block.pcode, cond)
                                     .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
-                                self.jit_region_cache.insert(start, compiled);
+                                self.jit_region_cache.insert(key, compiled);
                                 compiled
                             }
                             None => None,
@@ -720,7 +737,7 @@ impl InterpVm {
 
                     // Per-block (single-shot) path, when the region did not run.
                     if !jit_ran {
-                        let handle = match self.jit_cache.get(&start).copied() {
+                        let handle = match self.jit_cache.get(&key).copied() {
                             Some(decided) => decided,
                             None if hot => {
                                 // Compile once, or cache a bail. A block that touches
@@ -728,7 +745,7 @@ impl InterpVm {
                                 // way; its host callbacks are wired at run time.
                                 let compiled = crate::jit::translate_block(&block.pcode)
                                     .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
-                                self.jit_cache.insert(start, compiled);
+                                self.jit_cache.insert(key, compiled);
                                 compiled
                             }
                             None => None,
