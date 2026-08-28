@@ -332,6 +332,10 @@ pub struct JitCoverage {
     /// Of the covered weight, the part in non-self-loop blocks — dispatched one
     /// block at a time, so the share a multi-block trace could stitch.
     pub covered_chain_insns: u64,
+    /// Of the non-self-loop weight, the part in blocks that a looping trace
+    /// actually forms over — the reach of the trace selector, and so the share
+    /// a multi-block trace could really capture.
+    pub covered_trace_insns: u64,
     /// Distinct hot blocks profiled.
     pub blocks: usize,
     /// Bail causes as `"Op@width" -> weight`, heaviest first.
@@ -420,10 +424,20 @@ impl InterpVm {
         for (id, block) in self.code.blocks.iter().enumerate() {
             by_addr.insert(block.start, (id as u64, block));
         }
+        // Block ids that appear in some looping trace formed from a hot block —
+        // the reach of the trace selector.
+        let mut in_a_trace: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &(id, _) in by_addr.values() {
+            if let Some(order) = select_trace(&self.code.blocks, id as usize) {
+                in_a_trace.extend(order);
+            }
+        }
+
         let mut hot = 0u64;
         let mut covered = 0u64;
         let mut covered_self_loop = 0u64;
         let mut covered_chain = 0u64;
+        let mut covered_trace = 0u64;
         let mut hist: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         for (addr, prof) in profile {
             let Some(&(id, block)) = by_addr.get(addr) else {
@@ -441,6 +455,9 @@ impl InterpVm {
                         covered_self_loop = covered_self_loop.saturating_add(weight);
                     } else {
                         covered_chain = covered_chain.saturating_add(weight);
+                        if in_a_trace.contains(&(id as usize)) {
+                            covered_trace = covered_trace.saturating_add(weight);
+                        }
                     }
                 }
                 Some(b) => {
@@ -455,6 +472,7 @@ impl InterpVm {
             covered_insns: covered,
             covered_self_loop_insns: covered_self_loop,
             covered_chain_insns: covered_chain,
+            covered_trace_insns: covered_trace,
             blocks: profile.len(),
             bails,
         })
@@ -1311,6 +1329,88 @@ fn self_loop_kind(block: &lifter::Block, block_id: u64) -> Option<Option<pcode::
         }
         lifter::BlockExit::Jump { target } if resolves_to_self(target) => Some(None),
         _ => None,
+    }
+}
+
+/// The block ids, in execution order, of a linear looping trace anchored at
+/// `header`, or `None` if no clean trace forms. A trace is a chain of blocks
+/// joined by in-group edges that closes with an edge back to the header; a
+/// conditional branch's non-followed direction becomes a side exit to a static
+/// address. Bounded in length, and never a single self-loop block (that is the
+/// region's job). Correctness never depends on which direction is followed — a
+/// wrong guess just fails to close, so no trace forms.
+fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
+    const MAX_BLOCKS: usize = 8;
+    // In-group block id of a target, and whether a target has a static resume
+    // address (an in-group block's start, or an external constant) so a side
+    // exit to it can write a constant PC.
+    let in_group = |t: Target| -> Option<usize> {
+        match t {
+            Target::Internal(b) if b < blocks.len() => Some(b),
+            _ => None,
+        }
+    };
+    let has_static_addr = |t: Target| -> bool {
+        matches!(
+            t,
+            Target::Internal(_) | Target::External(pcode::Value::Const(..))
+        ) && in_group(t).map_or(true, |b| b < blocks.len())
+    };
+
+    let mut order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = header;
+    loop {
+        if order.len() >= MAX_BLOCKS {
+            return None;
+        }
+        if !seen.insert(cur) {
+            return None; // revisited a non-header block: not a clean linear loop
+        }
+        order.push(cur);
+        let block = blocks.get(cur)?;
+        // A block whose body cannot fully translate can never be a trace member.
+        if crate::jit::first_bail(&block.pcode).is_some() {
+            return None;
+        }
+        match block.exit {
+            lifter::BlockExit::Jump { target } => match in_group(target) {
+                Some(n) if n == header => return (order.len() >= 2).then_some(order),
+                Some(n) if !seen.contains(&n) => cur = n,
+                _ => return None,
+            },
+            lifter::BlockExit::Branch {
+                target,
+                fallthrough,
+                ..
+            } => {
+                let (t_id, f_id) = (in_group(target), in_group(fallthrough));
+                // Close the loop if either direction returns to the header and
+                // the other side-exits to a static address.
+                if t_id == Some(header) && has_static_addr(fallthrough) && order.len() >= 2 {
+                    return Some(order);
+                }
+                if f_id == Some(header) && has_static_addr(target) && order.len() >= 2 {
+                    return Some(order);
+                }
+                // Otherwise follow one in-group, unvisited successor whose
+                // sibling is a static side exit; prefer the fallthrough.
+                if let Some(n) = f_id.filter(|&n| n != header && !seen.contains(&n)) {
+                    if has_static_addr(target) {
+                        cur = n;
+                        continue;
+                    }
+                }
+                if let Some(n) = t_id.filter(|&n| n != header && !seen.contains(&n)) {
+                    if has_static_addr(fallthrough) {
+                        cur = n;
+                        continue;
+                    }
+                }
+                return None;
+            }
+            _ => return None, // Call / Return / indirect: not traceable
+        }
     }
 }
 
