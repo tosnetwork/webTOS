@@ -164,3 +164,23 @@ Searched for anyone doing what we need, and for pieces we can reuse.
 - **License discipline:** qemu-wasm and QEMU are GPL; nothing from them may be
   copied into this MIT tree. The architecture we would follow is the one
   CheerpX and my own measurements already establish independently.
+
+## The reusable codegen base, verified (`encoder_probe/`)
+
+`wasm-encoder` is the one piece we reuse, and "can we use it" was answered by
+testing, not asserting.
+
+- **License:** Apache-2.0 WITH LLVM-exception — already on the project's
+  allowlist (`LICENSES.tsv`), compatible with MIT. No relicensing.
+- **Compiles to wasm32:** yes. A probe crate depending on it built for
+  `wasm32-unknown-unknown` (174 KB, `opt-level="s"`) — the engine's own target.
+- **Emits runnable wasm at runtime, from inside a wasm module:** yes. The probe
+  built an `add` module *inside* the wasm sandbox (41 bytes), the JS host
+  instantiated it and called `add(40,2)` → 42. That is the whole JIT path in
+  miniature: engine emits bytes → host instantiates → call returns the right
+  answer.
+
+So the split is clean: `wasm-encoder` (permissive) emits the bytes; the
+p-code→wasm mapping above it is ours; the browser instantiates. Nothing GPL,
+no relicensing, and our p-code input keeps the mapping simpler than the
+x86/TCG translators the field built.
