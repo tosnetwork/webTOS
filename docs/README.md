@@ -15,8 +15,8 @@ for kernel development and compatibility validation.
   `hello` and BusyBox through OpenFox, Codex, and Claude Code
 - [Architecture](TOS_ARCHITECTURE.md) - kernel subsystems and execution
   model inherited from the native TOS core
-- [Use cases](USE-CASES.md) - what the browser runtime supports today, what
-  the native agent kernel supports, and what is designed but not built
+- [Use cases](USE-CASES.md) - what the browser runtime supports today, and
+  what it deliberately does not
 
 ## Guides and Examples
 

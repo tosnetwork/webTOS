@@ -1,29 +1,21 @@
 # webTOS Use Cases
 
-webTOS runs unmodified Linux x86-64 programs inside a browser tab, on an
-execution model that meters what they spend and can reproduce what they did.
+webTOS runs unmodified Linux x86-64 programs inside a browser tab, under
+authority the page grants explicitly and budgets the runtime enforces.
 
-That sentence covers two things at very different stages of completion, and
-this document keeps them apart. Reading them as one thing is how the previous
-version of this file came to describe daemons that were never written.
+This document is what that supports, and it is deliberately narrow: only what
+a browser runs today, each claim pointing at the gate that proves it. An
+earlier version also described an agent kernel — capabilities, energy,
+mailboxes, receipts, attestation — which lived in a separate bare-metal kernel
+beside the browser runtime and was never wired into it. That kernel has since
+been removed from the repository, so the scenarios resting on it are gone from
+here too. They survive in git history; nothing below depends on them.
 
-- **The browser runtime** — the x86-64 engine, the Linux compatibility layer,
-  and the browser host — runs real workloads today, gated by tests in
-  Chromium, Firefox, and WebKit. **Part 1** is what it supports.
-- **The agent kernel** — capabilities, energy, mailboxes, keyspaces,
-  receipts, policy, attestation — exists in the native bare-metal kernel and
-  is *not* integrated into the browser runtime. **Part 2** is what it supports
-  natively, and what each scenario still needs to reach a tab.
-- **Part 3** lists what neither has, so that an idea does not get read as a
-  feature a second time.
-
-Every status claim below is traceable: [`ROADMAP.md`](../ROADMAP.md) for
-milestones and their evidence, [`performance.md`](performance.md) for numbers,
+Every status claim is traceable: [`ROADMAP.md`](../ROADMAP.md) for milestones
+and their evidence, [`performance.md`](performance.md) for numbers, and
 [`README.md`](../README.md) for how to run any of it.
 
 ---
-
-# Part 1 — What the browser runtime supports today
 
 ## The capability surface
 
@@ -178,199 +170,44 @@ log never leaving the browser.
 
 ---
 
-# Part 2 — What the native kernel supports
+## 7. Knowing what the tab is about to run
 
-Everything in this part runs on the bare-metal x86-64 kernel in `src/`. None of
-it is wired into the browser runtime yet — in the architecture diagram in
-`README.md` it is the dashed box. Each scenario names what exists and what it
-still needs, so that "webTOS could do this" and "webTOS does this" stay
-distinguishable.
+**Problem**: a page that streams a binary into a runtime is a distribution
+channel, and a distribution channel with no integrity check is a supply chain
+waiting to be attacked.
 
-## What exists natively
+**What webTOS provides**: a signed image manifest, enforced in two halves. The
+host verifies the signature with the platform's audited verifier. The module
+then checks that delivered bytes match what the manifest names, refuses any
+image the manifest does not name, and applies the same check on the streaming
+path so delivery cannot skip it (`crates/webtos-web/src/lib.rs:873`). The
+module deliberately does not verify the signature itself: a hand-rolled
+verifier in a security boundary fails open, which is worse than none.
 
-| Subsystem | File |
-|---|---|
-| Agents, scheduling, energy accounting | `src/agent.rs`, `src/sched.rs`, `src/energy.rs`, `src/cost.rs` |
-| Capabilities: typed, targeted, use-limited, delegated as a subset, revocable by the parent | `src/capability.rs` |
-| Mailboxes | `src/mailbox.rs`, `src/large_msg.rs` |
-| Keyspaces and SHA-256 Merkle state roots | `src/state.rs`, `src/merkle.rs`, `src/persist.rs` |
-| Signed `ExecutionReceipt`, `ReplayBundle`, `ProofBundle` | `src/receipts.rs`, `src/proof.rs` |
-| Checkpoint and replay | `src/checkpoint.rs`, `src/replay.rs` |
-| eBPF-lite policy engine | `src/ebpf/`, `src/policy.rs`, `src/agents/policyd.rs` |
-| TPM 2.0 measured boot and attestation (signs and verifies) | `src/attestation.rs`, `src/arch/x86_64/tpm.rs` |
-| Wasm runtime with runtime classes including ProofGrade | `src/wasm/`, `third_party/wasbi` |
-| `.tos` packages | `src/package.rs`, `src/agents/pkgd.rs` |
-| System agents: accountd, auditd, compactd, netd, pkgd, policyd, skilld, stated | `src/agents/` |
-| CLI: `tos build`, `deploy`, `replay`, `inspect`, `verify` | `sdk/tos-cli/` |
+**Worked example**: a team publishes an internal tool as a page. The manifest
+names one image and its hash. A tampered image, a substituted image, and an
+image nobody declared are all refused before the guest runs one instruction.
+`node web/test_manifest.mjs` is the gate that says so — it checks both that a
+manifest the verifier rejects is never installed and that one it accepts is
+enforced.
 
 ---
 
-## 7. Verifiable agent execution
+## What it does not have
 
-**Problem**: a client who buys an agent's output cannot check what produced
-it — which code version ran, on which input, consuming what.
-
-**What the kernel provides**: an agent exiting produces an `ExecutionReceipt`
-binding `code_hash`, `package_hash`, `input_commitment`,
-`output_commitment`, `initial_state_root`, `final_state_root`,
-`event_log_commitment`, `trace_commitment`, `energy_used`, the tick range, and
-the runtime class, signed with the node's Ed25519 key
-(`src/receipts.rs:78`). A `ReplayBundle` carries what is needed to re-execute
-it; a `ProofBundle` carries what is needed to check it without re-executing.
-
-**Worked example**: a contract-review agent runs in ProofGrade mode. The
-receipt says which model version processed which input, how much energy it
-consumed, and what state it left. An auditor holding the receipt and the
-node's public key can tell whether the provider's claims are consistent with
-it.
-
-**What this still needs**:
-- **Offline signature verification in a tool.** Receipts are signed, but
-  `tos verify` checks a proof's hash chain (`sdk/tos-cli/src/proof.rs`), not
-  the receipt's Ed25519 signature. Until a verifier checks the signature, a
-  third party is trusting the transport.
-- **Browser integration.** No receipt is emitted for a browser session.
-
----
-
-## 8. Metered execution
-
-**Problem**: request-count billing overcharges cheap calls and undercharges
-expensive ones, and neither side can audit the other's meter.
-
-**What the kernel provides**: energy is deducted per instruction, per
-syscall, and per message; an agent that exhausts its budget is suspended by
-the scheduler rather than by a supervisor. `accountd` exposes cumulative
-per-agent consumption over a mailbox, and `energy_used` is a signed field of
-the receipt rather than a log line.
-
-**Worked example**: an analytics endpoint charges by energy. A cheap lookup
-and an expensive aggregation are distinguished by the meter that actually
-stopped the work, and every line item on the invoice has a receipt behind it.
-
-**What this still needs**: pre-execution cost estimation and invoice
-aggregation are not implemented — an earlier draft of this document named
-`quotad` and `billingd` as if they existed. Settlement is also out of scope
-for the kernel: it belongs to the TOS Service layer.
-
----
-
-## 9. Policy-constrained computation with an audit trail
-
-**Problem**: regulated computation must show it followed rules, and an
-operator's word is not evidence.
-
-**What the kernel provides**: capabilities are checked, not assumed — an
-agent without `SendMailbox` cannot send, and cannot acquire the ability at
-runtime, because delegation can only narrow (`is_subset_of`,
-`src/capability.rs:95`). A policy bundle written for the eBPF-lite engine runs
-at capability check points, and `auditd` collects the grant, delegate, revoke,
-renew, and deny events into a queryable log.
-
-**Worked example**: a screening agent is given read access to one keyspace, no
-network capability, and a bounded energy budget. Whether each capability check
-was granted or denied is in the audit log, and the policy that decided it is
-identified by hash in the receipt.
-
-**What this still needs**:
-- **Time-bounded and depth-bounded delegation.** The capability model has a
-  use-count limit and parent-child revocation. It has no expiry, no
-  delegation-depth limit, and no principal revocation list — an earlier draft
-  described all three.
-- **Encryption.** Keyspaces are isolated by capability. They are not
-  encrypted; there is no encryption in the kernel at all.
-
----
-
-## 10. An off-chain execution layer for TOS
-
-**Problem**: every validator re-executing every transaction bounds what an L1
-can compute.
-
-**What the kernel provides**: a deterministic execution class, Merkle state
-roots before and after, a syscall transcript commitment, and a receipt that
-binds them together. The `ProofBundle` format is shaped for a proving
-pipeline: verify a small artifact rather than re-run the work.
-
-**Why this is the strategic one**: it is the seam where webTOS meets the rest
-of the ecosystem. Finalized TOS chain state is the authority; webTOS is where
-the work happens and where the evidence is produced.
-
-**What this still needs**: the proving pipeline itself, and the settlement
-integration. What exists is the evidence format, not the proof system.
-
----
-
-## 11. Attested software supply chain
-
-**Problem**: the gap between "this code was signed" and "this code is
-running" is where supply chain attacks live.
-
-**What exists, and this one reaches the browser**: the browser host already
-enforces the second half. A signed image manifest is verified by the platform's
-audited verifier on the host side; the module then checks that delivered bytes
-match what the manifest names, and refuses any image the manifest does not
-name — including through the streaming path, so delivery cannot skip the
-check (`crates/webtos-web/src/lib.rs:873`). The module deliberately does not
-verify the signature itself: a hand-rolled verifier in a security boundary
-fails open, which is worse than no verifier at all.
-
-Natively, `.tos` packages carry a manifest with declared capabilities and a
-`code_hash` that `pkgd` checks against the installed bytes, and TPM measured
-boot extends the chain down to the kernel image.
-
-**What this still needs**: the `.tos` manifest carries a 64-byte signature
-field, but nothing verifies it — `pkgd` checks the code hash only
-(`src/package.rs:50`). A package signature that is transported but not
-checked is not a signature. Note also that the CLI has no `sign` subcommand;
-an earlier draft of this document documented an `atp sign` workflow that does
-not exist.
-
----
-
-## 12. Isolated multi-party collaboration
-
-**Problem**: two parties want a joint result without either trusting the
-other's execution environment or seeing the other's data.
-
-**What the kernel provides**: each party's agent runs against its own
-keyspace, which the other holds no capability for. They exchange results
-through bounded mailboxes rather than shared memory, and each round leaves a
-receipt the other party can inspect.
-
-**Worked example**: two institutions compute aggregate statistics over their
-own records and exchange only the aggregates. Neither agent can read the
-other's keyspace, because neither was granted the capability, and neither can
-grant itself one.
-
-**What this still needs**: this is isolation, not confidentiality. Keyspaces
-are not encrypted, so the guarantee is against the other *agent*, not against
-whoever operates the node. Positioning it as a substitute for MPC or a TEE
-would be wrong.
-
----
-
-# Part 3 — Designed, not built
-
-Named here so nobody reads them as features. Each was described as working in
-an earlier draft of this document.
+Named so that nothing here gets read as a feature.
 
 | Idea | Reality |
 |---|---|
-| Cross-node agent messaging | `SYS_SEND_REMOTE` is a reserved number that returns `E_INVALID_ARG` (`src/syscall.rs:1365`) |
-| Node membership, failover, placement, agent migration | No such code exists. `PortableCheckpoint` exists; nothing moves it between nodes |
-| Mailbox-based remote administration | No `admind` |
-| Cost estimation and billing aggregation | No `quotad`, no `billingd`. `accountd` reports consumption; nothing prices it |
-| An authority daemon with a revocation list | No `authd`. Revocation is a parent revoking a direct child (`src/capability.rs:200`) |
-| Observability daemon and dashboards | No `observabilityd`. Measurement harnesses exist; no dashboard |
-| Encrypted keyspaces | No encryption anywhere in the kernel |
-| Capability expiry and delegation depth | Neither field exists |
-| Multi-worker browser execution | Deferred; one worker today |
-| Hot-block translation (JIT) | Not started. The interpreter is tiered but does not compile |
+| An agent kernel — capabilities, energy accounting, mailboxes, receipts, attestation | Removed from the repository. It was a separate bare-metal kernel and was never wired into the browser runtime |
+| Multi-worker execution | Deferred. One worker today |
+| Hot-block translation (JIT) | Not started. Lifting is tiered but does not compile |
+| Block-level on-demand image loading | An image streams whole into the guest filesystem, which bounds how large a delivered userland can be |
+| A graphics path | None. Terminals and TUIs, not framebuffers |
 
 ---
 
-# What webTOS is not for
+## What webTOS is not for
 
 | Scenario | Why not |
 |---|---|
@@ -379,21 +216,15 @@ an earlier draft of this document.
 | Graphics, GPU, games | No graphics path exists |
 | Non-x86-64 binaries | One ABI, one architecture |
 | Hard real-time | Deterministic ordering is not a latency guarantee |
-| Distributed clusters | See Part 3. Cross-node execution is a design, not a runtime |
+| Distributed execution | Nothing here spans machines; the tab is the unit |
 | A desktop OS | The Linux surface is what agent workloads need, not a general userland |
 
 ---
 
-# Positioning
+## Positioning
 
-**Part 1 today**: webTOS is the only runtime that executes an unmodified
-Linux x86-64 binary in a browser tab under explicit, deny-by-default
-authority — the real tool, in the user's own browser, with the operator
-holding neither the compute nor the data.
+webTOS runs an unmodified Linux x86-64 binary in a browser tab under explicit,
+deny-by-default authority: the real tool, in the user's own browser, with the
+operator holding neither the compute nor the data.
 
-**Part 2, once the agent kernel reaches the browser**: webTOS becomes the
-substrate that makes an outside party believe *this code really ran the way it
-claims* — because the receipt says which code, on which input, at what cost,
-leaving which state.
-
-The distance between those two sentences is the roadmap.
+Everything above is a way of using that.
