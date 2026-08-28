@@ -33,7 +33,7 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~88% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. Fixtures are pinned by checksum where they are fetched, but not versioned as a set; native QEMU harnesses not re-run since the pivot; measurement harnesses exist but no dashboard |
+| M0 Lock the baseline | 🔶 | ~93% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. The executable fixtures and reference traces are now a pinned set (`test_data/FIXTURES.sha256`); the pre-pivot native QEMU kernel harnesses have been removed with the kernel they validated; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~98% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
 | M3 Dynamic userland | ✅ | ~93% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
@@ -50,7 +50,7 @@ call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
 |---|---|---|---|
-| M0 Lock the baseline | 5% | 88% | 4.4 |
+| M0 Lock the baseline | 5% | 93% | 4.7 |
 | M1 Static `hello` | 5% | 98% | 4.9 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
 | M3 Dynamic userland | 10% | 93% | 9.3 |
@@ -59,7 +59,7 @@ call, so here is the arithmetic rather than the assertion:
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 90% | 18.0 |
 | M8 Performance & release | 14% | 78% | 10.9 |
-| **Total** | **100%** | | **92.3** |
+| **Total** | **100%** | | **92.5** |
 
 The two heaviest remaining items are the back half of M7 and nearly all of M8,
 which together account for about 11 of the 15 points outstanding. Progress from
@@ -233,7 +233,7 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   register for register. Determinism is now gated against a recorded baseline
   rather than only against another run.
 - **Versioned fixtures.** They exist; they are not a formal, pinned set.
-- **Native QEMU validation** has not been re-run since the browser pivot.
+- ~~**Native QEMU validation.**~~ Removed: it validated the Stage-1 kernel, which has been deleted from the repository; the trace suite is the native reference now, reproduced register for register in every browser engine.
 - ~~**A Linux host in the loop.**~~ Partly done: a skip is no longer silent.
   Every fixture goes through one helper that prints `SKIP:` with the fixture
   and how to get it, and `WEBTOS_REQUIRE_FIXTURES=1` turns a skip into a
@@ -305,19 +305,24 @@ policy, resource accounting, and execution records". The first four are
 delivered on the browser line. The last two are not, and no milestone from M0
 to M8 fully covers them:
 
-- **Resource accounting.** M8 lists quotas, but energy accounting per agent —
-  which the native kernel in `src/` has — has no browser counterpart and no
-  gate.
+- **Resource accounting.** M8's quotas cap memory, CPU, storage, network, and
+  the event log per agent. Energy accounting per agent — the TOS agent
+  kernel's model, no longer in this repository — has no browser counterpart
+  and no gate.
 - **Execution records.** Principle 6 says CPU execution, scheduling, external
   input, storage commits, and receipts are one system. Determinism is gated by
   comparing runs to each other; nothing produces a receipt a third party could
   replay against. M5's "record network inputs for replay and receipt
   classification" is the only line item, and it is not started.
 
-Joining the agent kernel's model to the Linux runtime is the largest unscoped
-piece of work in the project, and it is what separates webTOS from a Linux
-emulator that happens to run in a tab. It needs a milestone of its own before
-it can be estimated honestly, which is why it is absent from the 83% above
+Joining the TOS agent kernel's model to the Linux runtime is the largest
+unscoped piece of work, and it is what separates webTOS from a Linux emulator
+that happens to run in a tab. The kernel code that embodied that model has
+been removed from this repository — it lived at the root as a separate
+bare-metal crate the browser pivot left behind — so this is now integration
+across projects rather than within one, and it needs a milestone of its own
+before it can be estimated honestly, which is why it is absent from the total
+above
 rather than dragging it down.
 
 ### Deferred on purpose
@@ -358,11 +363,12 @@ processes, VFS, signals, futex, sockets, epoll, pseudoterminals), and
 `wasm32-unknown-unknown` and executes unmodified Linux x86-64 binaries in
 Chromium, Firefox, and WebKit.
 
-`src/` is the original bare-metal TOS kernel — agent scheduler, capabilities,
-mailboxes, energy accounting, keyspaces, checkpoints, receipts, and a Wasm
-contract engine — which still builds and boots under QEMU. Its concepts are
-where the browser line is headed, but none of its code is on the browser path
-today.
+The original bare-metal TOS kernel — agent scheduler, capabilities, mailboxes,
+energy accounting, keyspaces, checkpoints, receipts, and a Wasm contract
+engine — has been removed from this repository; it was a separate crate the
+browser pivot left behind and nothing on the browser path depended on it. Its
+concepts remain where the browser line is headed, but as a separate project
+to integrate with rather than code in this tree.
 
 | Component | Where it stands |
 |-----------|-----------------|
@@ -503,10 +509,10 @@ browser refactor begins.
 Work:
 
 - Record the current native build, Linux maturity, and runtime validation
-  results from a clean checkout. 🔶 (the native reference build and the trace
-  suite are what a clean checkout reproduces, and they do; the pre-pivot
-  kernel/QEMU validation harnesses named here validated a bootable target the
-  browser pivot replaced and are not applicable to the interpreter)
+  results from a clean checkout. ✅ (a clean checkout reproduces the native
+  reference build and the trace suite, and does; the pre-pivot kernel/QEMU
+  validation harnesses this once named have been removed with the kernel they
+  validated, so nothing here is pending on a target the interpreter replaced)
 - Extract small ELF fixtures for static, PIE, dynamic, TLS, signal, futex,
   filesystem, and socket behavior. ✅ (test_data holds the in-repo fixtures,
   and the executable ones plus the reference traces are now a formal pinned
