@@ -45,7 +45,7 @@ terminal behavior, and recovery after a browser reload.
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 92%**. The weights are a judgement
+Weighted by engineering effort, **roughly 94%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
@@ -58,11 +58,11 @@ call, so here is the arithmetic rather than the assertion:
 | M5 Event loop & networking | 13% | 99% | 12.9 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 90% | 18.0 |
-| M8 Performance & release | 14% | 76% | 10.6 |
-| **Total** | **100%** | | **92.2** |
+| M8 Performance & release | 14% | 85% | 11.9 |
+| **Total** | **100%** | | **93.6** |
 
-The two heaviest remaining items are the back half of M7 and nearly all of M8,
-which together account for about 11 of the 15 points outstanding. Progress from
+The two heaviest remaining items are the back half of M7 and the tail of M8,
+which together account for about 4 of the ~6 points outstanding. Progress from
 here is slower per point than it has been: the milestones that moved quickly
 were the ones where a workload either ran or did not.
 
