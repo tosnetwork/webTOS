@@ -1351,10 +1351,11 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
         }
     };
     let has_static_addr = |t: Target| -> bool {
-        matches!(
-            t,
-            Target::Internal(_) | Target::External(pcode::Value::Const(..))
-        ) && in_group(t).map_or(true, |b| b < blocks.len())
+        match t {
+            Target::Internal(b) => b < blocks.len(),
+            Target::External(pcode::Value::Const(..)) => true,
+            _ => false,
+        }
     };
 
     let mut order = Vec::new();
