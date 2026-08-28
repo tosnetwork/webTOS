@@ -132,6 +132,10 @@ fn main() {
         "  of the non-self-loop, in a looping trace (selector reach): {:.1}% of all",
         pct(cov.covered_trace_insns),
     );
+    println!("  non-self-loop exit shapes (share of all executed insns):");
+    for (kind, weight) in cov.chain_exits.iter().take(10) {
+        println!("    {kind:<22} {:5.1}%", pct(*weight));
+    }
     println!("bail causes (op@width, share of executed insns):");
     for (cause, weight) in cov.bails.iter().take(20) {
         println!("  {cause:<26} {:5.1}%", pct(*weight));

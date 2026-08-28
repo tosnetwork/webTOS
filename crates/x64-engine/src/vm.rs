@@ -336,6 +336,9 @@ pub struct JitCoverage {
     /// actually forms over — the reach of the trace selector, and so the share
     /// a multi-block trace could really capture.
     pub covered_trace_insns: u64,
+    /// How the non-self-loop covered blocks exit, `"kind" -> weight`, heaviest
+    /// first — the control-flow shape of the multi-block opportunity.
+    pub chain_exits: Vec<(String, u64)>,
     /// Distinct hot blocks profiled.
     pub blocks: usize,
     /// Bail causes as `"Op@width" -> weight`, heaviest first.
@@ -439,6 +442,30 @@ impl InterpVm {
         let mut covered_chain = 0u64;
         let mut covered_trace = 0u64;
         let mut hist: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        // How the non-self-loop covered blocks exit, weighted by executed work —
+        // to characterize the shape of the multi-block opportunity.
+        let mut exits: std::collections::HashMap<&'static str, u64> =
+            std::collections::HashMap::new();
+        let internal = |t: Target| matches!(t, Target::Internal(_));
+        let ext_const = |t: Target| matches!(t, Target::External(pcode::Value::Const(..)));
+        let exit_kind = |exit: lifter::BlockExit| -> &'static str {
+            match exit {
+                lifter::BlockExit::Jump { target } if internal(target) => "jump-internal",
+                lifter::BlockExit::Jump { target } if ext_const(target) => "jump-extern-const",
+                lifter::BlockExit::Jump { .. } => "jump-indirect",
+                lifter::BlockExit::Branch {
+                    target,
+                    fallthrough,
+                    ..
+                } => match (internal(target), internal(fallthrough)) {
+                    (true, true) => "branch-both-internal",
+                    (true, false) | (false, true) => "branch-one-internal",
+                    (false, false) => "branch-no-internal",
+                },
+                lifter::BlockExit::Call { .. } => "call",
+                lifter::BlockExit::Return { .. } => "return",
+            }
+        };
         for (addr, prof) in profile {
             let Some(&(id, block)) = by_addr.get(addr) else {
                 continue;
@@ -458,6 +485,7 @@ impl InterpVm {
                         if in_a_trace.contains(&(id as usize)) {
                             covered_trace = covered_trace.saturating_add(weight);
                         }
+                        *exits.entry(exit_kind(block.exit)).or_default() += weight;
                     }
                 }
                 Some(b) => {
@@ -467,12 +495,16 @@ impl InterpVm {
         }
         let mut bails: Vec<(String, u64)> = hist.into_iter().collect();
         bails.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut chain_exits: Vec<(String, u64)> =
+            exits.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+        chain_exits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         Some(JitCoverage {
             hot_insns: hot,
             covered_insns: covered,
             covered_self_loop_insns: covered_self_loop,
             covered_chain_insns: covered_chain,
             covered_trace_insns: covered_trace,
+            chain_exits,
             blocks: profile.len(),
             bails,
         })
