@@ -24,10 +24,11 @@
 
 use std::cell::RefCell;
 
+use icicle_cpu::mem::perm;
 use linux_compat::{net::HostBroker, Machine};
 use pcode::{Op, VarNode};
-use x64_engine::jit::{translate_block, var_offset, REG_SPACE_BYTES};
-use x64_engine::{CpuExit, EngineConfig};
+use x64_engine::jit::{translate_block, var_offset, JitBackend, JitOutcome, REG_SPACE_BYTES};
+use x64_engine::{CpuExit, EngineConfig, ExceptionCode};
 
 mod spec {
     include!(concat!(env!("OUT_DIR"), "/spec_files.rs"));
@@ -360,6 +361,175 @@ pub extern "C" fn wtw_jit_check() -> i32 {
         bytes.copy_from_slice(&state.jit_regs[off..off + 8]);
         i32::from(u64::from_le_bytes(bytes) == JIT_TEST_AV + JIT_TEST_BV)
     })
+}
+
+// ---- Browser JIT backend ----
+//
+// The engine emits a hot block as wasm (`translate_block`); the host compiles
+// it (`jit_compile`) and runs it (`jit_call`) against the engine's own memory,
+// no copy. A block that touches guest memory calls back through the JS imports
+// the host wired to the `wtw_jit_*` shims below, which operate on the CPU set
+// for the duration of the call via `JIT_CPU` — a pointer channel, so a shim
+// does not re-enter the borrowed engine state during a run. `JIT_FAULT` carries
+// where a block stopped back to the backend.
+
+thread_local! {
+    static JIT_CPU: std::cell::Cell<*mut icicle_cpu::Cpu> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static JIT_FAULT: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
+}
+
+#[link(wasm_import_module = "env")]
+extern "C" {
+    /// Hands block bytes to the host to compile; returns a handle, or 0 if the
+    /// host declined (which the engine caches as a permanent bail).
+    fn jit_compile(bytes_ptr: u32, bytes_len: u32) -> u32;
+    /// Runs the compiled block `handle` against the register file at `regs_base`
+    /// (a byte offset into this module's memory).
+    fn jit_call(handle: u32, regs_base: u32);
+}
+
+struct BrowserJit;
+
+impl JitBackend for BrowserJit {
+    fn compile(&mut self, bytes: &[u8]) -> Option<u32> {
+        let handle = unsafe { jit_compile(bytes.as_ptr() as u32, bytes.len() as u32) };
+        (handle != 0).then_some(handle)
+    }
+
+    fn call(&mut self, handle: u32, cpu: &mut icicle_cpu::Cpu) -> JitOutcome {
+        let regs_base = cpu.regs.as_bytes().as_ptr() as u32;
+        JIT_FAULT.with(|f| f.set(-1));
+        JIT_CPU.with(|c| c.set(cpu as *mut icicle_cpu::Cpu));
+        // The shims run synchronously inside this call, reading `JIT_CPU`.
+        unsafe { jit_call(handle, regs_base) };
+        JIT_CPU.with(|c| c.set(std::ptr::null_mut()));
+        match JIT_FAULT.with(|f| f.get()) {
+            i if i < 0 => JitOutcome::Completed,
+            i => JitOutcome::Faulted(i as u32),
+        }
+    }
+}
+
+/// The CPU a `wtw_jit_*` shim acts on, or None outside a JIT call. Safety: the
+/// pointer is set to the live CPU for the duration of one `jit_call`, during
+/// which the shims run synchronously; it is null otherwise.
+fn jit_cpu() -> Option<&'static mut icicle_cpu::Cpu> {
+    let p = JIT_CPU.with(|c| c.get());
+    (!p.is_null()).then(|| unsafe { &mut *p })
+}
+
+/// Reassembles a 64-bit value from the low and high halves the boundary carries
+/// as two `u32`s — the `wtw_*` ABI is `u32`-only, so no JS BigInt is needed.
+fn u64_of(lo: u32, hi: u32) -> u64 {
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// Guest-memory load for a compiled block: reads `size` bytes at the address
+/// `(addr_hi:addr_lo)` through the MMU and writes them into the register file at
+/// `dst_off`. Returns 1, or 0 and sets the exception on a fault.
+#[no_mangle]
+pub extern "C" fn wtw_jit_load(addr_lo: u32, addr_hi: u32, dst_off: u32, size: u32) -> u32 {
+    let addr = u64_of(addr_lo, addr_hi);
+    let Some(cpu) = jit_cpu() else {
+        return 0;
+    };
+    let res = match size {
+        1 => cpu.mem.read::<1>(addr, perm::READ).map(|b| b.to_vec()),
+        2 => cpu.mem.read::<2>(addr, perm::READ).map(|b| b.to_vec()),
+        4 => cpu.mem.read::<4>(addr, perm::READ).map(|b| b.to_vec()),
+        8 => cpu.mem.read::<8>(addr, perm::READ).map(|b| b.to_vec()),
+        _ => return 0,
+    };
+    match res {
+        Ok(bytes) => {
+            let off = dst_off as usize;
+            cpu.regs.as_bytes_mut()[off..off + bytes.len()].copy_from_slice(&bytes);
+            1
+        }
+        Err(e) => {
+            cpu.exception.code = ExceptionCode::from_load_error(e) as u32;
+            cpu.exception.value = addr;
+            0
+        }
+    }
+}
+
+/// Guest-memory store for a compiled block: writes the low `size` bytes of the
+/// value `(value_hi:value_lo)` at the address `(addr_hi:addr_lo)`. Returns 1, or
+/// 0 and sets the exception on a fault.
+#[no_mangle]
+pub extern "C" fn wtw_jit_store(
+    addr_lo: u32,
+    addr_hi: u32,
+    value_lo: u32,
+    value_hi: u32,
+    size: u32,
+) -> u32 {
+    let addr = u64_of(addr_lo, addr_hi);
+    let value = u64_of(value_lo, value_hi);
+    let Some(cpu) = jit_cpu() else {
+        return 0;
+    };
+    let res = match size {
+        1 => cpu
+            .mem
+            .write::<1>(addr, (value as u8).to_le_bytes(), perm::WRITE),
+        2 => cpu
+            .mem
+            .write::<2>(addr, (value as u16).to_le_bytes(), perm::WRITE),
+        4 => cpu
+            .mem
+            .write::<4>(addr, (value as u32).to_le_bytes(), perm::WRITE),
+        8 => cpu.mem.write::<8>(addr, value.to_le_bytes(), perm::WRITE),
+        _ => return 0,
+    };
+    match res {
+        Ok(()) => 1,
+        Err(e) => {
+            cpu.exception.code = ExceptionCode::from_store_error(e) as u32;
+            cpu.exception.value = addr;
+            0
+        }
+    }
+}
+
+/// A compiled block reports it stopped at instruction index `index`; the backend
+/// reads this as its resume point.
+#[no_mangle]
+pub extern "C" fn wtw_jit_fault(index: u32) {
+    JIT_FAULT.with(|f| f.set(index as i32));
+}
+
+/// A compiled block raises exception `code` with value `(value_hi:value_lo)` and
+/// stops at `index`.
+#[no_mangle]
+pub extern "C" fn wtw_jit_raise(code: u32, value_lo: u32, value_hi: u32, index: u32) {
+    if let Some(cpu) = jit_cpu() {
+        cpu.exception.code = ExceptionCode::from_u32(code) as u32;
+        cpu.exception.value = u64_of(value_lo, value_hi);
+    }
+    JIT_FAULT.with(|f| f.set(index as i32));
+}
+
+/// Enables the JIT: hot blocks (entered `after` times) compile to wasm and run
+/// in place of the interpreter. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn wtw_jit_enable(after: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_jit_enable called before wtw_init");
+        };
+        machine.set_jit(Box::new(BrowserJit));
+        machine.set_jit_tiering(Some(after as u64));
+        0
+    })
+}
+
+/// How many times a compiled block ran in place of the interpreter.
+#[no_mangle]
+pub extern "C" fn wtw_jit_dispatch_count() -> u64 {
+    with_state(|state| state.machine.as_ref().map_or(0, |m| m.jit_dispatch_count()))
 }
 
 /// Builds the machine from the embedded SLEIGH specification. Returns 0 on

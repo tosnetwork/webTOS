@@ -10,6 +10,16 @@
 //
 // Usage: node web/test_messages.mjs [path/to/module.wasm]
 import { readFile } from "node:fs/promises";
+import { makeJitHost } from "./jit_host.mjs";
+
+// Instantiate the engine, providing the JIT host imports and binding the
+// exports back so a compiled block can call into wtw_jit_*.
+async function instantiateEngine(source) {
+  const jit = makeJitHost();
+  const r = await WebAssembly.instantiate(source, { env: jit.imports });
+  jit.bind(r.instance.exports);
+  return r;
+}
 
 const wasmPath = process.argv[2] ?? new URL("./webtos_web.wasm", import.meta.url).pathname;
 const bytes = await readFile(wasmPath);
@@ -26,7 +36,7 @@ const bytes = await readFile(wasmPath);
 const BUDGET_MIB = 512;
 
 const fresh = async () => {
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await instantiateEngine(bytes);
   instance.exports.wtw_init();
   instance.exports.wtw_set_memory_budget_kib(BUDGET_MIB * 1024);
   return instance.exports;

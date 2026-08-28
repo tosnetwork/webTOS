@@ -1255,6 +1255,23 @@ impl Machine {
         self.vm.set_lift_tiering(threshold);
     }
 
+    /// Installs a JIT backend that compiles hot blocks to wasm and runs them in
+    /// place of the interpreter. See [`InterpVm::set_jit`].
+    pub fn set_jit(&mut self, backend: Box<dyn x64_engine::jit::JitBackend>) {
+        self.vm.set_jit(backend);
+    }
+
+    /// Compiles a block after it has been entered `after` times; `None` turns
+    /// the JIT off. See [`InterpVm::set_jit_tiering`].
+    pub fn set_jit_tiering(&mut self, after: Option<u64>) {
+        self.vm.set_jit_tiering(after);
+    }
+
+    /// How many times a compiled block ran in place of the interpreter.
+    pub fn jit_dispatch_count(&self) -> u64 {
+        self.vm.jit_dispatch_count()
+    }
+
     /// What the machine occupies, split by what it is spent on. One wasm
     /// linear memory holds all three, and a browser tab's ceiling is roughly
     /// 3.9 GiB (`docs/performance.md`), so they compete: an agent image, the

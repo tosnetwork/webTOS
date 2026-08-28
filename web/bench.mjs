@@ -93,9 +93,39 @@ const benchmark = async (input) => {
     return out;
   };
 
+  // The JIT host imports (inlined; this function runs in the browser page).
+  let e;
+  const jitBlockInstances = [];
+  const jitImports = {
+    jit_compile(ptr, len) {
+      let bi;
+      try {
+        const bytes = new Uint8Array(e.memory.buffer).slice(ptr, ptr + len);
+        const lo = (x) => Number(x & 0xffffffffn);
+        const hi = (x) => Number((x >> 32n) & 0xffffffffn);
+        bi = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+          env: {
+            regs: e.memory,
+            load: (a, d, s) => e.wtw_jit_load(lo(a), hi(a), d, s),
+            store: (a, v, s) => e.wtw_jit_store(lo(a), hi(a), lo(v), hi(v), s),
+            fault: (i) => e.wtw_jit_fault(i),
+            raise: (c, v, i) => e.wtw_jit_raise(c, lo(v), hi(v), i),
+          },
+        });
+      } catch {
+        return 0;
+      }
+      jitBlockInstances.push(bi);
+      return jitBlockInstances.length;
+    },
+    jit_call(handle, regsBase) {
+      jitBlockInstances[handle - 1].exports.run(regsBase);
+    },
+  };
+
   const instantiateStart = performance.now();
-  const { instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), {});
-  const e = instance.exports;
+  const { instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), { env: jitImports });
+  e = instance.exports;
   const instantiateMs = performance.now() - instantiateStart;
 
   const mem = () => new Uint8Array(e.memory.buffer);

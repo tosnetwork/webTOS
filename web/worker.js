@@ -349,10 +349,43 @@ const stage = (value) => {
   return [ptr, data.length];
 };
 
+// The JIT host imports (inlined; this classic worker cannot import a module).
+// A compiled block imports the engine's own memory as env.regs and routes its
+// guest-memory callbacks back into the engine's wtw_jit_* shims.
+const jitBlockInstances = [];
+const jitImports = {
+  jit_compile(ptr, len) {
+    let instance;
+    try {
+      const bytes = new Uint8Array(exports.memory.buffer).slice(ptr, ptr + len);
+      const module = new WebAssembly.Module(bytes);
+      const lo = (x) => Number(x & 0xffffffffn);
+      const hi = (x) => Number((x >> 32n) & 0xffffffffn);
+      instance = new WebAssembly.Instance(module, {
+        env: {
+          regs: exports.memory,
+          load: (a, d, s) => exports.wtw_jit_load(lo(a), hi(a), d, s),
+          store: (a, v, s) => exports.wtw_jit_store(lo(a), hi(a), lo(v), hi(v), s),
+          fault: (i) => exports.wtw_jit_fault(i),
+          raise: (c, v, i) => exports.wtw_jit_raise(c, lo(v), hi(v), i),
+        },
+      });
+    } catch {
+      return 0;
+    }
+    jitBlockInstances.push(instance);
+    return jitBlockInstances.length;
+  },
+  jit_call(handle, regsBase) {
+    jitBlockInstances[handle - 1].exports.run(regsBase);
+  },
+};
+
 async function boot(files, links = []) {
   postMessage({ type: "status", text: "loading wasm module…" });
   const url = new URL("./webtos_web.wasm", self.location.href);
-  const { instance } = await WebAssembly.instantiateStreaming(fetch(url), {});
+  jitBlockInstances.length = 0;
+  const { instance } = await WebAssembly.instantiateStreaming(fetch(url), { env: jitImports });
   exports = instance.exports;
 
   postMessage({ type: "status", text: "compiling SLEIGH specification…" });

@@ -11,11 +11,21 @@
 // Usage: node web/test_manifest.mjs [path/to/module.wasm]
 import { readFile } from "node:fs/promises";
 import { webcrypto, createHash } from "node:crypto";
+import { makeJitHost } from "./jit_host.mjs";
+
+// Instantiate the engine, providing the JIT host imports and binding the
+// exports back so a compiled block can call into wtw_jit_*.
+async function instantiateEngine(source) {
+  const jit = makeJitHost();
+  const r = await WebAssembly.instantiate(source, { env: jit.imports });
+  jit.bind(r.instance.exports);
+  return r;
+}
 
 const wasmPath = process.argv[2] ?? new URL("./webtos_web.wasm", import.meta.url).pathname;
 const bytes = await readFile(wasmPath);
 
-const { instance } = await WebAssembly.instantiate(bytes, {});
+const { instance } = await instantiateEngine(bytes);
 const e = instance.exports;
 if (e.wtw_init() !== 0) throw new Error("init failed");
 

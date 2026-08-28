@@ -4,10 +4,20 @@
 // of BusyBox applets over the persistent in-memory filesystem.
 // Usage: node web/test_node.mjs [path/to/module.wasm]
 import { readFile } from "node:fs/promises";
+import { makeJitHost } from "./jit_host.mjs";
+
+// Instantiate the engine, providing the JIT host imports and binding the
+// exports back so a compiled block can call into wtw_jit_*.
+async function instantiateEngine(source) {
+  const jit = makeJitHost();
+  const r = await WebAssembly.instantiate(source, { env: jit.imports });
+  jit.bind(r.instance.exports);
+  return r;
+}
 
 const wasmPath = process.argv[2] ?? new URL("./webtos_web.wasm", import.meta.url).pathname;
 
-const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), {});
+const { instance } = await instantiateEngine(await readFile(wasmPath));
 const e = instance.exports;
 const mem = () => new Uint8Array(e.memory.buffer);
 const text = (ptr, len) => new TextDecoder().decode(mem().slice(ptr, ptr + len));
@@ -196,7 +206,7 @@ try {
   const snapshot = mem().slice(e.wtw_fs_ptr(), e.wtw_fs_ptr() + e.wtw_fs_len());
   console.log(`[node] snapshot: ${snapshot.length.toLocaleString()} bytes`);
 
-  const fresh = await WebAssembly.instantiate(await readFile(wasmPath), {});
+  const fresh = await instantiateEngine(await readFile(wasmPath));
   const f = fresh.instance.exports;
   const fmem = () => new Uint8Array(f.memory.buffer);
   const ftext = (ptr, len) => new TextDecoder().decode(fmem().slice(ptr, ptr + len));
@@ -269,7 +279,7 @@ try {
 // hold 4 GiB, so refusing is right and quietly doing something smaller is not.
 {
   const fixture = new URL("../test_data/test_size_narrowing.elf", import.meta.url);
-  const fresh = await WebAssembly.instantiate(await readFile(wasmPath), {});
+  const fresh = await instantiateEngine(await readFile(wasmPath));
   const f = fresh.instance.exports;
   const fmem = () => new Uint8Array(f.memory.buffer);
   const fput = (bytes) => {
