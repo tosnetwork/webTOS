@@ -1310,6 +1310,22 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
         )
         .expect("define fault");
 
+    // raise(code, value, index): set the exception (re-canonicalised through
+    // from_u32, as the interpreter does) and record the resume index.
+    linker
+        .func_wrap(
+            "env",
+            "raise",
+            |mut caller: wasmi::Caller<JitHost>, code: i32, value: i64, index: i32| {
+                let host = caller.data_mut();
+                host.vm.cpu.exception.code =
+                    x64_engine::ExceptionCode::from_u32(code as u32) as u32;
+                host.vm.cpu.exception.value = value as u64;
+                host.fault = Some(index as u32);
+            },
+        )
+        .expect("define raise");
+
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiate")
@@ -1474,6 +1490,114 @@ fn mem_cases() -> Vec<MemCase> {
                 (out, 0x4242_4242),
                 (addr, 0x9_0000),
             ],
+            block,
+            region: None,
+        });
+    }
+
+    // Division: normal quotients/remainders across widths and signedness, plus
+    // the two cases the interpreter raises on — a zero divisor and the signed
+    // INT_MIN / -1 overflow. The output is seeded with a sentinel so a fault
+    // that must write nothing shows if it wrongly writes.
+    for &(name, op, size, av, bv) in &[
+        ("IntDiv u32", Op::IntDiv, 4u8, 100u64, 7u64),
+        ("IntRem u32", Op::IntRem, 4, 100, 7),
+        ("IntDiv u8", Op::IntDiv, 1, 200, 7),
+        ("IntDiv u64", Op::IntDiv, 8, 0x1_0000_0003, 2),
+        (
+            "IntSignedDiv i32",
+            Op::IntSignedDiv,
+            4,
+            (-100i32) as u32 as u64,
+            7,
+        ),
+        (
+            "IntSignedRem i32",
+            Op::IntSignedRem,
+            4,
+            (-100i32) as u32 as u64,
+            7,
+        ),
+        (
+            "IntSignedDiv i8",
+            Op::IntSignedDiv,
+            1,
+            (-100i8) as u8 as u64,
+            7,
+        ),
+        (
+            "IntSignedDiv i64 neg",
+            Op::IntSignedDiv,
+            8,
+            (-1000i64) as u64,
+            3,
+        ),
+    ] {
+        let (o, a, b) = (v(1, size), v(5, size), v(6, size));
+        let mut block = pcode::Block::new();
+        block.push((o, op, a, b));
+        cases.push(MemCase {
+            name,
+            seeds: vec![(o, 0xdead_beef_dead_beef), (a, av), (b, bv)],
+            block,
+            region: None,
+        });
+    }
+    for &(name, op, size, av, bv) in &[
+        ("IntDiv by zero", Op::IntDiv, 4u8, 100u64, 0u64),
+        ("IntRem by zero u64", Op::IntRem, 8, 100, 0),
+        (
+            "IntSignedDiv INT_MIN/-1",
+            Op::IntSignedDiv,
+            4,
+            i32::MIN as u32 as u64,
+            (-1i32) as u32 as u64,
+        ),
+        (
+            "IntSignedRem INT_MIN/-1",
+            Op::IntSignedRem,
+            8,
+            i64::MIN as u64,
+            (-1i64) as u64,
+        ),
+        (
+            "IntSignedDiv i8 INT_MIN/-1",
+            Op::IntSignedDiv,
+            1,
+            i8::MIN as u8 as u64,
+            (-1i8) as u8 as u64,
+        ),
+    ] {
+        let (o, a, b) = (v(1, size), v(5, size), v(6, size));
+        let mut block = pcode::Block::new();
+        block.push((o, op, a, b));
+        cases.push(MemCase {
+            name,
+            seeds: vec![(o, 0xdead_beef_dead_beef), (a, av), (b, bv)],
+            block,
+            region: None,
+        });
+    }
+
+    // Exception raises a dynamic code/value and stops; Invalid raises
+    // InvalidInstruction. Both are compared on the resume index and the
+    // exception the interpreter sets.
+    {
+        let mut block = pcode::Block::new();
+        block.push((Op::Exception, (0x1001u32, 0x1234u64)));
+        cases.push(MemCase {
+            name: "Exception op",
+            seeds: vec![],
+            block,
+            region: None,
+        });
+    }
+    {
+        let mut block = pcode::Block::new();
+        block.push(Op::Invalid);
+        cases.push(MemCase {
+            name: "Invalid op",
+            seeds: vec![],
             block,
             region: None,
         });
@@ -1852,6 +1976,170 @@ fn float_cases() -> Vec<FloatCase> {
         Op::FloatIsNan,
         4,
         f32b(f32::NAN),
+        false,
+    ));
+
+    // Conversions: input width and output width differ, so these are built
+    // explicitly rather than through the same-width closures.
+    let conv = |name, op, in_size: u8, out_size: u8, av: u64, out_is_float| {
+        let (o, a) = (reg(1, out_size), reg(2, in_size));
+        let mut block = pcode::Block::new();
+        block.push((o, op, a));
+        FloatCase {
+            name,
+            seeds: vec![(a, av)],
+            block,
+            out: o,
+            out_is_float,
+        }
+    };
+
+    // Signed int -> float.
+    out.push(conv(
+        "IntToFloat i32->f64",
+        Op::IntToFloat,
+        4,
+        8,
+        (-5i32) as u32 as u64,
+        true,
+    ));
+    out.push(conv(
+        "IntToFloat i32->f32",
+        Op::IntToFloat,
+        4,
+        4,
+        (-5i32) as u32 as u64,
+        true,
+    ));
+    out.push(conv(
+        "IntToFloat i8->f64",
+        Op::IntToFloat,
+        1,
+        8,
+        (-3i8) as u8 as u64,
+        true,
+    ));
+    out.push(conv(
+        "IntToFloat i64->f64",
+        Op::IntToFloat,
+        8,
+        8,
+        (-1_000_000i64) as u64,
+        true,
+    ));
+    out.push(conv(
+        "IntToFloat i64->f32 round",
+        Op::IntToFloat,
+        8,
+        4,
+        0x0020_0000_0000_0001,
+        true,
+    ));
+    // Unsigned int -> float.
+    out.push(conv(
+        "UintToFloat u32->f64",
+        Op::UintToFloat,
+        4,
+        8,
+        4_000_000_000,
+        true,
+    ));
+    out.push(conv(
+        "UintToFloat u64->f64 round",
+        Op::UintToFloat,
+        8,
+        8,
+        u64::MAX,
+        true,
+    ));
+    out.push(conv(
+        "UintToFloat u8->f32",
+        Op::UintToFloat,
+        1,
+        4,
+        200,
+        true,
+    ));
+    // float -> float: promote, demote, identity.
+    out.push(conv(
+        "FloatToFloat f32->f64",
+        Op::FloatToFloat,
+        4,
+        8,
+        f32b(1.5),
+        true,
+    ));
+    out.push(conv(
+        "FloatToFloat f64->f32",
+        Op::FloatToFloat,
+        8,
+        4,
+        f64b(0.1),
+        true,
+    ));
+    out.push(conv(
+        "FloatToFloat f32->f32",
+        Op::FloatToFloat,
+        4,
+        4,
+        f32b(-2.5),
+        true,
+    ));
+    out.push(conv(
+        "FloatToFloat f64->f64",
+        Op::FloatToFloat,
+        8,
+        8,
+        f64b(1e100),
+        true,
+    ));
+    // float -> signed int (saturating, exact integer output).
+    out.push(conv(
+        "FloatToInt f64->i32",
+        Op::FloatToInt,
+        8,
+        4,
+        f64b(3.7),
+        false,
+    ));
+    out.push(conv(
+        "FloatToInt f64->i32 neg",
+        Op::FloatToInt,
+        8,
+        4,
+        f64b(-3.7),
+        false,
+    ));
+    out.push(conv(
+        "FloatToInt f64->i32 saturate",
+        Op::FloatToInt,
+        8,
+        4,
+        f64b(1e30),
+        false,
+    ));
+    out.push(conv(
+        "FloatToInt NaN->i32",
+        Op::FloatToInt,
+        8,
+        4,
+        f64b(f64::NAN),
+        false,
+    ));
+    out.push(conv(
+        "FloatToInt f32->i64",
+        Op::FloatToInt,
+        4,
+        8,
+        f32b(3.7),
+        false,
+    ));
+    out.push(conv(
+        "FloatToInt f64->i64 saturate",
+        Op::FloatToInt,
+        8,
+        8,
+        f64b(1e300),
         false,
     ));
 

@@ -61,3 +61,49 @@ decrement fuel and write PC, or a block that should stop on the fuel limit
 would run to completion and a fault's PC would be stale. The gate blocks here
 carry no markers, so the straight-line ops stay correct without it; handling
 it belongs to the execution-wiring step, tracked there.
+
+## Update: the host ABI grew a `raise`, and coverage is now complete
+
+The memory ABI generalised into a four-import **host ABI**, declared together
+whenever a block needs the host (`block_needs_host`): `load` (0), `store` (1),
+`fault` (2), and now `raise` (3) — `raise(code, value, index)` sets a given
+exception (re-canonicalised through `from_u32`, as the interpreter does) and
+records where the block stopped. `run` follows the imports at function 4.
+
+`raise` lets three more things translate without ever letting wasm trap:
+
+- **The four integer divisions.** The interpreter raises `DivisionException`
+  and writes nothing on a zero divisor (and, for the signed ops, on the
+  `INT_MIN / -1` overflow). The emitted code guards exactly those inputs — the
+  only ones wasm's `div`/`rem` would trap on — and raises before dividing;
+  otherwise it divides on the safe path. Sub-word operands are sign- or
+  zero-extended so a 1/2-byte divide is exact, and the overflow guard compares
+  against the varnode-width `INT_MIN`, not the wasm type's.
+- **`Exception`** (dynamic code/value from its inputs) and **`Invalid`**
+  (InvalidInstruction), each a `raise` + stop.
+
+With the conversions (`IntToFloat`/`UintToFloat` via the signed/unsigned wasm
+converts, `FloatToFloat` via promote/demote/identity, `FloatToInt` via the
+*saturating* truncation that matches Rust's saturating `as`), the translator
+now covers every p-code op whose semantics wasm can reproduce. The gate holds
+the division/exception ops through the same two-VM host harness as memory
+(comparing registers, resume index, and `cpu.exception`), and the conversions
+through the register harness with the NaN-aware float comparison. Three canaries
+confirm the new arms: mis-coding the raised exception reddens the division-fault
+cases on the exception, swapping div for rem reddens the value, and an unsigned
+convert on a signed input reddens the sign.
+
+### What still bails, and why it is correct
+
+- **`FloatRound`.** Round-half-away-from-zero (Rust `f64::round`) has no wasm
+  op — `nearest` is half-to-even — and the naive `trunc(x + copysign(0.5, x))`
+  is wrong at the tie just below ½. It stays interpreted.
+- **Non-computational ops.** `Branch`/`PcodeBranch`/`PcodeLabel` are resolved
+  into block structure at lift time and never appear in an executed stream (the
+  interpreter itself panics on them); `MultiEqual`/`Indirect` are SSA
+  placeholders, never executed; `PcodeOp`/`Hook`/`HookIf`/`Arg`/`TracerLoad`/
+  `TracerStore` are escapes into arbitrary host state and instrumentation, not
+  pure computation. A block containing any of them bails whole, which is
+  correct — the interpreter is the floor.
+- **Widths with no wasm type:** the 80-bit x87 extended format (size 10) and
+  the size-2 half floats, and `FloatToInt` into an i16.

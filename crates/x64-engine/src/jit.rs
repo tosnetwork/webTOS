@@ -47,25 +47,48 @@ use wasm_encoder::{
     Instruction, MemArg, MemoryType, Module, TypeSection, ValType,
 };
 
-/// Function indices of the three memory imports, in the order
-/// [`translate_block`] declares them. Imported functions occupy the low end of
-/// the function index space, so these are fixed; the emitted `run` function
-/// follows them. They are declared only for a block that actually loads or
-/// stores (see [`block_needs_mem`]); a block without memory ops imports none of
-/// them and its `run` is function 0.
+/// Function indices of the four host imports, in the order [`translate_block`]
+/// declares them. Imported functions occupy the low end of the function index
+/// space, so these are fixed; the emitted `run` function follows them. They are
+/// declared only for a block that needs the host (see [`block_needs_host`]); a
+/// self-contained register-to-register block imports none of them and its `run`
+/// is function 0.
+///
+/// `load`/`store` reach guest memory; `fault` records where a memory access
+/// stopped the block (the memory import has already set the exception);
+/// `raise` sets a given exception and records where the block stopped, for the
+/// division guards and the `Exception`/`Invalid` ops.
 const IMPORT_LOAD: u32 = 0;
 const IMPORT_STORE: u32 = 1;
 const IMPORT_FAULT: u32 = 2;
+const IMPORT_RAISE: u32 = 3;
 
-/// Whether the block reaches guest memory, and so needs the memory imports.
+/// The exception codes the division guards raise. These mirror
+/// `icicle_cpu::ExceptionCode` discriminants; the `raise` import re-canonicalises
+/// through `from_u32`, so a value here need only match the interpreter's.
+const EXC_DIVISION: u32 = 0x0103;
+const EXC_INVALID_INSTRUCTION: u32 = 0x1001;
+
+/// Whether the block needs the host imports.
 ///
-/// Only `Load`/`Store` do. A block with none of them stays a self-contained
-/// register-to-register function with no imported host calls.
-fn block_needs_mem(block: &pcode::Block) -> bool {
-    block
-        .instructions
-        .iter()
-        .any(|inst| matches!(inst.op, Op::Load(_) | Op::Store(_)))
+/// Guest memory (`Load`/`Store`), the divisions (which raise on a zero or
+/// `INT_MIN/-1` divisor), and the `Exception`/`Invalid` ops all cross into the
+/// host. A block with none of them stays a self-contained register-to-register
+/// function with no imported calls.
+fn block_needs_host(block: &pcode::Block) -> bool {
+    block.instructions.iter().any(|inst| {
+        matches!(
+            inst.op,
+            Op::Load(_)
+                | Op::Store(_)
+                | Op::IntDiv
+                | Op::IntSignedDiv
+                | Op::IntRem
+                | Op::IntSignedRem
+                | Op::Exception
+                | Op::Invalid
+        )
+    })
 }
 
 /// The register space is 0x20000 bytes — two 64 KiB wasm pages.
@@ -182,6 +205,75 @@ fn emit_zext_i64(f: &mut Function, v: Value) -> Option<()> {
     Some(())
 }
 
+/// Pushes an operand as an `i32`, matching the interpreter's `zxt::<u32>()`: the
+/// value zero-extended, or — for an 8-byte operand — truncated to its low 32
+/// bits. Used for an exception code.
+fn emit_zext_i32(f: &mut Function, v: Value) -> Option<()> {
+    let size = v.size();
+    emit_load(f, v, size)?;
+    if matches!(wasm_ty(size)?, ValType::I64) {
+        f.instruction(&Instruction::I32WrapI64);
+    }
+    Some(())
+}
+
+/// Pushes an operand sign-extended to its wasm type: `i32` for widths 1/2/4
+/// (with an explicit sign extension for the sub-word widths, since [`emit_load`]
+/// zero-extends), `i64` for width 8. The signed divisions and the signed
+/// int-to-float conversion read their operands this way.
+fn emit_signed(f: &mut Function, v: Value, size: u8) -> Option<()> {
+    match size {
+        1 => {
+            emit_load(f, v, 1)?;
+            f.instruction(&Instruction::I32Extend8S);
+        }
+        2 => {
+            emit_load(f, v, 2)?;
+            f.instruction(&Instruction::I32Extend16S);
+        }
+        4 => emit_load(f, v, 4)?,
+        8 => emit_load(f, v, 8)?,
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The `iN.eqz` for an operand of this width (i64 at width 8, i32 otherwise).
+fn int_eqz(size: u8) -> Instruction<'static> {
+    match size {
+        8 => Instruction::I64Eqz,
+        _ => Instruction::I32Eqz,
+    }
+}
+
+/// The `iN.eq` for an operand of this width.
+fn int_eq(size: u8) -> Instruction<'static> {
+    match size {
+        8 => Instruction::I64Eq,
+        _ => Instruction::I32Eq,
+    }
+}
+
+/// An `iN.const` of this width. Sub-word widths compute in i32, so their
+/// constants are i32; width 8 is i64.
+fn int_const(size: u8, value: i64) -> Instruction<'static> {
+    match size {
+        8 => Instruction::I64Const(value),
+        _ => Instruction::I32Const(value as i32),
+    }
+}
+
+/// The signed minimum at a varnode width, as an i64 (widened for the i32 path,
+/// where it still compares equal after sign extension).
+fn int_min(size: u8) -> i64 {
+    match size {
+        1 => i8::MIN as i64,
+        2 => i16::MIN as i64,
+        4 => i32::MIN as i64,
+        _ => i64::MIN,
+    }
+}
+
 /// Emits the fault check that follows a memory import: the import left an `ok`
 /// flag on the stack, and if it is zero the access faulted. On a fault the
 /// block stops exactly where the interpreter would — it reports the faulting
@@ -194,6 +286,18 @@ fn emit_fault_check(f: &mut Function, index: u32) {
     f.instruction(&Instruction::Call(IMPORT_FAULT));
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
+}
+
+/// Emits a raise of a constant-coded exception and a `return`: sets
+/// `code`/`value` and records that the block stopped at `index`, exactly as the
+/// interpreter does when `exception()` is followed by the block driver seeing a
+/// pending exception. Used by the division guards and `Invalid`.
+fn emit_raise_const(f: &mut Function, code: u32, value: i64, index: u32) {
+    f.instruction(&Instruction::I32Const(code as i32));
+    f.instruction(&Instruction::I64Const(value));
+    f.instruction(&Instruction::I32Const(index as i32));
+    f.instruction(&Instruction::Call(IMPORT_RAISE));
+    f.instruction(&Instruction::Return);
 }
 
 /// Pushes a float operand: the varnode's (or constant's) bits loaded as an
@@ -243,7 +347,7 @@ pub fn translate_instruction(
     f: &mut Function,
     inst: &pcode::Instruction,
     index: u32,
-    has_mem: bool,
+    has_host: bool,
 ) -> Option<()> {
     let out = inst.output;
     let [a, b] = inst.inputs.get();
@@ -1163,7 +1267,7 @@ pub fn translate_instruction(
         // 1/2/4/8 are handled; anything else bails. On a fault the import has
         // set the exception and returns 0, and the block stops here.
         Op::Load(id) => {
-            if !has_mem || id != pcode::RAM_SPACE || !matches!(out.size, 1 | 2 | 4 | 8) {
+            if !has_host || id != pcode::RAM_SPACE || !matches!(out.size, 1 | 2 | 4 | 8) {
                 return None;
             }
             emit_zext_i64(f, a)?;
@@ -1180,7 +1284,7 @@ pub fn translate_instruction(
         // operand works. Same RAM-only, size-1/2/4/8, fault-stops-here contract
         // as Load.
         Op::Store(id) => {
-            if !has_mem || id != pcode::RAM_SPACE || !matches!(b.size(), 1 | 2 | 4 | 8) {
+            if !has_host || id != pcode::RAM_SPACE || !matches!(b.size(), 1 | 2 | 4 | 8) {
                 return None;
             }
             emit_zext_i64(f, a)?;
@@ -1191,13 +1295,191 @@ pub fn translate_instruction(
             Some(())
         }
 
-        // Everything above translates fully; anything else bails the block to
-        // the interpreter. That deliberately includes the four division ops
-        // (IntDiv/IntSignedDiv/IntRem/IntSignedRem): the interpreter raises an
-        // exception and writes nothing on a zero (or signed INT_MIN/-1)
-        // divisor, whereas wasm's div/rem trap on exactly those inputs —
-        // behaviour a compile-time handler can't reconcile, so they stay
-        // interpreted.
+        // Unsigned division/remainder. The interpreter raises
+        // DivisionException and writes nothing when the divisor is zero, so the
+        // emitted code guards that first — the only input on which wasm's
+        // div_u/rem_u would trap — then divides on the safe path.
+        Op::IntDiv | Op::IntRem => {
+            if !has_host {
+                return None;
+            }
+            let size = same_width(out, a, b)?;
+            emit_load(f, b, size)?;
+            f.instruction(&int_eqz(size));
+            f.instruction(&Instruction::If(BlockType::Empty));
+            emit_raise_const(f, EXC_DIVISION, 0, index);
+            f.instruction(&Instruction::End);
+
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(&match (inst.op, size) {
+                (Op::IntDiv, 8) => Instruction::I64DivU,
+                (Op::IntDiv, _) => Instruction::I32DivU,
+                (Op::IntRem, 8) => Instruction::I64RemU,
+                (_, _) => Instruction::I32RemU,
+            });
+            emit_store(f, out)
+        }
+
+        // Signed division/remainder. The interpreter raises on a zero divisor
+        // and on the one signed overflow, INT_MIN / -1 (checked at the varnode
+        // width, where wasm would either trap at 4/8 or silently not overflow
+        // at 1/2). Both guards come first; operands are sign-extended so a
+        // sub-word divide is exact.
+        Op::IntSignedDiv | Op::IntSignedRem => {
+            if !has_host {
+                return None;
+            }
+            let size = same_width(out, a, b)?;
+            let is64 = size == 8;
+
+            // Guard 1: divisor is zero.
+            emit_load(f, b, size)?;
+            f.instruction(&int_eqz(size));
+            f.instruction(&Instruction::If(BlockType::Empty));
+            emit_raise_const(f, EXC_DIVISION, 0, index);
+            f.instruction(&Instruction::End);
+
+            // Guard 2: dividend is the width's INT_MIN and divisor is -1.
+            emit_signed(f, a, size)?;
+            f.instruction(&int_const(size, int_min(size)));
+            f.instruction(&int_eq(size));
+            emit_signed(f, b, size)?;
+            f.instruction(&int_const(size, -1));
+            f.instruction(&int_eq(size));
+            f.instruction(&Instruction::I32And);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            emit_raise_const(f, EXC_DIVISION, 0, index);
+            f.instruction(&Instruction::End);
+
+            emit_store_addr(f, out);
+            emit_signed(f, a, size)?;
+            emit_signed(f, b, size)?;
+            f.instruction(&match (inst.op, is64) {
+                (Op::IntSignedDiv, true) => Instruction::I64DivS,
+                (Op::IntSignedDiv, false) => Instruction::I32DivS,
+                (Op::IntSignedRem, true) => Instruction::I64RemS,
+                (_, _) => Instruction::I32RemS,
+            });
+            emit_store(f, out)
+        }
+
+        // Signed integer -> float. The source is sign-extended to i32 (widths
+        // 1/2/4) or i64 (width 8); the wasm convert rounds to nearest-even, as
+        // the interpreter's `as f32`/`as f64` does. Output 10 (x87) bails.
+        Op::IntToFloat => {
+            let in_size = a.size();
+            if !matches!(out.size, 4 | 8) || !matches!(in_size, 1 | 2 | 4 | 8) {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_signed(f, a, in_size)?;
+            f.instruction(&match (in_size == 8, out.size) {
+                (false, 4) => Instruction::F32ConvertI32S,
+                (false, _) => Instruction::F64ConvertI32S,
+                (true, 4) => Instruction::F32ConvertI64S,
+                (true, _) => Instruction::F64ConvertI64S,
+            });
+            emit_float_store(f, out.size)
+        }
+
+        // Unsigned integer -> float. Like IntToFloat but zero-extended (which
+        // is what `emit_load` already produces).
+        Op::UintToFloat => {
+            let in_size = a.size();
+            if !matches!(out.size, 4 | 8) || !matches!(in_size, 1 | 2 | 4 | 8) {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            f.instruction(&match (in_size == 8, out.size) {
+                (false, 4) => Instruction::F32ConvertI32U,
+                (false, _) => Instruction::F64ConvertI32U,
+                (true, 4) => Instruction::F32ConvertI64U,
+                (true, _) => Instruction::F64ConvertI64U,
+            });
+            emit_float_store(f, out.size)
+        }
+
+        // float -> float between the two wasm widths. Promote (4->8) and demote
+        // (8->4) map to the wasm ops; same-width is the interpreter's exact
+        // bit round-trip, i.e. a plain copy of the bits. Any half (2) or x87
+        // (10) width bails.
+        Op::FloatToFloat => {
+            let in_size = a.size();
+            match (in_size, out.size) {
+                (4, 4) | (8, 8) => {
+                    emit_store_addr(f, out);
+                    emit_load(f, a, in_size)?;
+                    emit_store(f, out)
+                }
+                (4, 8) => {
+                    emit_store_addr(f, out);
+                    emit_float_operand(f, a, 4)?;
+                    f.instruction(&Instruction::F64PromoteF32);
+                    emit_float_store(f, 8)
+                }
+                (8, 4) => {
+                    emit_store_addr(f, out);
+                    emit_float_operand(f, a, 8)?;
+                    f.instruction(&Instruction::F32DemoteF64);
+                    emit_float_store(f, 4)
+                }
+                _ => None,
+            }
+        }
+
+        // float -> signed integer, truncating toward zero and saturating (NaN
+        // -> 0, out-of-range -> the clamped extreme). wasm's saturating
+        // truncation matches the interpreter's saturating `as iN` exactly.
+        // Output 2 (i16) has no wasm saturating form and bails.
+        Op::FloatToInt => {
+            let in_size = a.size();
+            if !matches!(in_size, 4 | 8) || !matches!(out.size, 4 | 8) {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_float_operand(f, a, in_size)?;
+            f.instruction(&match (in_size, out.size) {
+                (4, 4) => Instruction::I32TruncSatF32S,
+                (8, 4) => Instruction::I32TruncSatF64S,
+                (4, _) => Instruction::I64TruncSatF32S,
+                (_, _) => Instruction::I64TruncSatF64S,
+            });
+            emit_store(f, out)
+        }
+
+        // Raise a dynamic exception: code from input 0, value from input 1,
+        // then stop. The `raise` import re-canonicalises the code through
+        // `from_u32`, matching `exception(from_u32(a), b)`.
+        Op::Exception => {
+            if !has_host {
+                return None;
+            }
+            emit_zext_i32(f, a)?;
+            emit_zext_i64(f, b)?;
+            f.instruction(&Instruction::I32Const(index as i32));
+            f.instruction(&Instruction::Call(IMPORT_RAISE));
+            f.instruction(&Instruction::Return);
+            Some(())
+        }
+
+        // An invalid instruction raises InvalidInstruction (value 0) and stops.
+        Op::Invalid => {
+            if !has_host {
+                return None;
+            }
+            emit_raise_const(f, EXC_INVALID_INSTRUCTION, 0, index);
+            Some(())
+        }
+
+        // Everything above translates fully. What remains bails to the
+        // interpreter and is correct there: FloatRound (the interpreter rounds
+        // half away from zero, wasm `nearest` rounds half to even); the 80-bit
+        // x87 width and the size-2 half floats (no wasm type); and the
+        // helper/hook/tracer/SSA ops (PcodeOp, Hook, Arg, MultiEqual, ...),
+        // which are escapes into arbitrary host state, not pure computation.
         _ => None,
     }
 }
@@ -1213,21 +1495,21 @@ pub fn translate_instruction(
 /// the register memory (and, for a memory-using block, the imports) and calls
 /// `run`.
 pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
-    let has_mem = block_needs_mem(block);
+    let has_host = block_needs_host(block);
 
     let mut body = Function::new([]);
     for (i, inst) in block.instructions.iter().enumerate() {
-        translate_instruction(&mut body, inst, i as u32, has_mem)?;
+        translate_instruction(&mut body, inst, i as u32, has_host)?;
     }
     body.instruction(&Instruction::End);
 
     let mut module = Module::new();
 
-    // Type 0 is always `run`: [] -> []. The memory-import signatures follow it
+    // Type 0 is always `run`: [] -> []. The host-import signatures follow it
     // and exist only when the block uses them.
     let mut types = TypeSection::new();
     types.ty().function([], []); // 0: run
-    if has_mem {
+    if has_host {
         types
             .ty()
             .function([ValType::I64, ValType::I32, ValType::I32], [ValType::I32]); // 1: load
@@ -1235,6 +1517,9 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
             .ty()
             .function([ValType::I64, ValType::I64, ValType::I32], [ValType::I32]); // 2: store
         types.ty().function([ValType::I32], []); // 3: fault
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64, ValType::I32], []); // 4: raise(code, value, index)
     }
     module.section(&types);
 
@@ -1242,7 +1527,7 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     // share it. The host binds `env.regs` to the real register bytes. The
     // function imports, when present, are declared in the order the
     // `IMPORT_*` indices expect (memory imports do not occupy the function
-    // index space, so `load`/`store`/`fault` are 0/1/2).
+    // index space, so `load`/`store`/`fault`/`raise` are 0/1/2/3).
     let mut imports = wasm_encoder::ImportSection::new();
     imports.import(
         "env",
@@ -1255,16 +1540,17 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
             page_size_log2: None,
         }),
     );
-    if has_mem {
+    if has_host {
         imports.import("env", "load", EntityType::Function(1));
         imports.import("env", "store", EntityType::Function(2));
         imports.import("env", "fault", EntityType::Function(3));
+        imports.import("env", "raise", EntityType::Function(4));
     }
     module.section(&imports);
 
     // `run` is type 0. Its function index is 0 when there are no function
-    // imports, or 3 when the three memory imports precede it.
-    let run_index = if has_mem { 3 } else { 0 };
+    // imports, or 4 when the four host imports precede it.
+    let run_index = if has_host { 4 } else { 0 };
 
     let mut funcs = FunctionSection::new();
     funcs.function(0);
