@@ -574,15 +574,11 @@ impl InterpVm {
                     let handle = match self.jit_cache.get(&start).copied() {
                         Some(decided) => decided,
                         None if hot => {
-                            // Compile once. Host blocks (memory, division,
-                            // exceptions) are not dispatched yet, so they cache
-                            // as a bail here.
-                            let compiled = if crate::jit::block_needs_host(&block.pcode) {
-                                None
-                            } else {
-                                crate::jit::translate_block(&block.pcode)
-                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes))
-                            };
+                            // Compile once, or cache a bail. A block that touches
+                            // guest memory, divides, or raises compiles the same
+                            // way; its host callbacks are wired at run time.
+                            let compiled = crate::jit::translate_block(&block.pcode)
+                                .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
                             self.jit_cache.insert(start, compiled);
                             compiled
                         }
@@ -591,7 +587,7 @@ impl InterpVm {
                     if let Some(handle) = handle {
                         if self.cpu.fuel.remaining >= block.num_instructions as u64 {
                             let outcome = match self.jit.as_mut() {
-                                Some(j) => j.call(handle, self.cpu.regs.as_bytes_mut()),
+                                Some(j) => j.call(handle, &mut self.cpu),
                                 None => crate::jit::JitOutcome::Unavailable,
                             };
                             match outcome {
@@ -604,6 +600,19 @@ impl InterpVm {
                                     jit_ran = true;
                                 }
                                 crate::jit::JitOutcome::Faulted(i) => {
+                                    // The block stopped mid-way, at pcode index i.
+                                    // The interpreter, running to there, would have
+                                    // ticked PC and fuel at each guest instruction's
+                                    // marker; reproduce that up to the fault so the
+                                    // exception it raised is seen in the same state.
+                                    let (pc, guest_insns) =
+                                        fault_pc_and_fuel(&block.pcode, i as usize);
+                                    if let Some(pc) = pc {
+                                        self.cpu.write_pc(pc);
+                                    }
+                                    self.cpu.fuel.remaining =
+                                        self.cpu.fuel.remaining.saturating_sub(guest_insns);
+                                    self.jit_dispatches += 1;
                                     self.cpu.block_id = block_id;
                                     self.cpu.block_offset = i as u64;
                                     break;
@@ -884,6 +893,27 @@ impl InterpVm {
             }
         }
     }
+}
+
+/// The PC and the number of guest instructions the interpreter would have
+/// retired reaching pcode index `fault_index`. There is one guest instruction
+/// per `InstructionMarker` up to and including the faulting instruction's, and
+/// that marker's address is the PC. This restores the interpreter's state when
+/// a JIT'd block faults partway, since the JIT emits nothing for the markers.
+fn fault_pc_and_fuel(block: &pcode::Block, fault_index: usize) -> (Option<u64>, u64) {
+    if block.instructions.is_empty() {
+        return (None, 0);
+    }
+    let end = fault_index.min(block.instructions.len() - 1);
+    let mut pc = None;
+    let mut guest_insns = 0u64;
+    for inst in &block.instructions[..=end] {
+        if matches!(inst.op, pcode::Op::InstructionMarker) {
+            pc = Some(inst.inputs.first().as_u64());
+            guest_insns += 1;
+        }
+    }
+    (pc, guest_insns)
 }
 
 /// Adjusts the fuel counter when the interpreter is entered mid-block.

@@ -1625,7 +1625,13 @@ pub trait JitBackend {
     /// permanent bail for that block.
     fn compile(&mut self, bytes: &[u8]) -> Option<u32>;
 
-    /// Runs the compiled block `handle` against `regs`, the whole register
-    /// space, reflecting the block's writes back into it.
-    fn call(&mut self, handle: u32, regs: &mut [u8]) -> JitOutcome;
+    /// Runs the compiled block `handle` against `cpu`.
+    ///
+    /// The block reads and writes `cpu.regs` (the register file), and — for a
+    /// block that touches guest memory, divides, or raises — its host callbacks
+    /// go through `cpu.mem` and set `cpu.exception`, exactly as the interpreter
+    /// would. The backend owns how the register file reaches the compiled code:
+    /// shared with the host's memory in the browser, copied in and out for a
+    /// native runtime.
+    fn call(&mut self, handle: u32, cpu: &mut icicle_cpu::Cpu) -> JitOutcome;
 }
