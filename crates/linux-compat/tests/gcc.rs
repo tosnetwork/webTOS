@@ -138,10 +138,21 @@ fn assemble(shell: Vec<u8>) -> Option<Toolchain> {
         }
     }
 
-    // The objects the linker puts around the program. `crtbegin.o` also names
-    // the directory holding libgcc and the compiler's own headers, which is
-    // mounted whole rather than enumerated.
-    for object in ["crt1.o", "crti.o", "crtn.o", "Scrt1.o", "libc.so"] {
+    // The objects and libraries the linker consumes, located by asking the
+    // driver rather than by guessing a path. `libgcc_s.so.1` is here because
+    // the link needs the file itself, not only the loader's copy.
+    for object in [
+        "crt1.o",
+        "crti.o",
+        "crtn.o",
+        "Scrt1.o",
+        "libc.so",
+        "libc.so.6",
+        "libc.a",
+        "libc_nonshared.a",
+        "libgcc_s.so",
+        "libgcc_s.so.1",
+    ] {
         if let Some(path) = file(object) {
             files.push(path);
         }
