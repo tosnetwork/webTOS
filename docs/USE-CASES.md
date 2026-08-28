@@ -45,9 +45,11 @@ rather than trusting those numbers.
 ## What has actually run
 
 The table above says what the runtime provides. This says what it has been
-pointed at. These five are the examples WebVM shows on its own front page,
-which makes them a fair outside choice rather than a flattering one; they were
-run here unmodified.
+pointed at. Five ordinary Unix workloads, run unmodified, each leaning on a
+different part of the surface: a scripting runtime, a compiler toolchain that
+is really a tree of processes, a binary-analysis tool reading what that
+toolchain produced, a full-screen editor on a terminal, and a network client
+against a live server.
 
 | Workload | Result |
 |---|---|
