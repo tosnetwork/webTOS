@@ -896,3 +896,72 @@ fn an_unbounded_event_log_records_everything() {
          mean anything"
     );
 }
+
+// ── Storage measures live data, not lifetime allocation ──────────────────────
+
+/// A guest that writes a file, deletes it, and writes another must not be
+/// refused for the second on account of the first. A storage ceiling that
+/// counted every byte ever written — rather than what is live now — would
+/// turn a long session that churns temporary files into one that eventually
+/// cannot write at all.
+///
+/// Driven through the guest's own syscalls, because the reclamation a delete
+/// triggers is part of what is under test.
+#[test]
+fn deleting_a_file_frees_its_storage() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data");
+    let Ok(image) = std::fs::read(dir.join("hello_linux.elf")) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine.add_file(b"/bin/x", image, 0o755).expect("add");
+    machine.set_args(vec![b"x".to_vec()], vec![]);
+    machine.load(b"/bin/x").expect("load");
+
+    // A page the guest owns, to hold syscall arguments.
+    const SYS_MMAP: u64 = 9;
+    const SYS_OPENAT: u64 = 257;
+    const SYS_WRITE: u64 = 1;
+    const SYS_CLOSE: u64 = 3;
+    const SYS_UNLINKAT: u64 = 263;
+    const AT_FDCWD: u64 = (-100_i64) as u64;
+    const O_CREAT_WRONLY: u64 = 0o1 | 0o100;
+    let (scratch, _) = machine.issue_syscall(SYS_MMAP, [0, 4096, 3, 0x22, u64::MAX, 0]);
+    let scratch = scratch as u64;
+    let (data_page, _) = machine.issue_syscall(SYS_MMAP, [0, 262_144, 3, 0x22, u64::MAX, 0]);
+    let data_page = data_page as u64;
+
+    // A ceiling that fits one big write but not two live at once.
+    machine.set_storage_budget(Some(400_000));
+
+    let path = b"/tmp/churn\0";
+    machine
+        .vm_mut()
+        .cpu
+        .mem
+        .write_bytes(scratch, path, icicle_mem::perm::NONE)
+        .expect("write path");
+
+    for round in 0..3 {
+        let (fd, _) =
+            machine.issue_syscall(SYS_OPENAT, [AT_FDCWD, scratch, O_CREAT_WRONLY, 0o644, 0, 0]);
+        assert!(fd >= 0, "round {round}: open failed ({fd})");
+        let (written, _) =
+            machine.issue_syscall(SYS_WRITE, [fd as u64, data_page, 200_000, 0, 0, 0]);
+        assert_eq!(
+            written, 200_000,
+            "round {round}: a 200 KB write returned {written}; freed storage was not reclaimed"
+        );
+        machine.issue_syscall(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+        let (removed, _) = machine.issue_syscall(SYS_UNLINKAT, [AT_FDCWD, scratch, 0, 0, 0, 0]);
+        assert_eq!(removed, 0, "round {round}: unlink failed");
+    }
+
+    let live = machine.env().vfs.bytes();
+    assert!(
+        live < 100_000,
+        "live storage is {live} bytes after writing and deleting three 200 KB files; \
+         deleted bytes were not freed"
+    );
+}

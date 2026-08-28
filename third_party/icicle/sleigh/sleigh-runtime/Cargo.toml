@@ -2,6 +2,8 @@
 name = "sleigh-runtime"
 version = "0.1.0"
 edition = "2021"
+# Vendored from the icicle project; see third_party/icicle/LICENCE-MIT and -APACHE.
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 pcode = { path = "../pcode" }
