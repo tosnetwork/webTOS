@@ -95,7 +95,27 @@ valuable:
 Both consume one shared foundation (chunk store + manifest). But the fault path
 is gated on a hard prerequisite, addressed first.
 
-## Prerequisite (prototype-first blocker): a resumable page-in fault
+## Prerequisite (prototype-first blocker): a resumable page-in fault — PROVEN
+
+**Status: the synthetic prototype passes.** A data page is mapped non-resident
+(no `READ`) with its bytes registered to fill on first access
+(`InterpVm::register_lazy_page`); `handle_exception` serves the fault before the
+OS layer turns it into a signal (`try_page_in`), fills the page, and returns
+`Running` so the run loop re-enters at the untouched `block_offset` and re-runs
+exactly that pcode. The gate `a_page_in_retries_identically_to_an_eager_run`
+(`tests/jit_dispatch.rs`) runs a memory scan as a **region** self-loop and as a
+**per-block** two-block loop, each interpreted and JIT'd, and asserts the lazy
+run matches the eager run's result and retired-instruction count with **exactly
+one page-in**. All four combinations pass. By the go/no-go rule (if region JIT
+cannot meet this, ship only read-path laziness), region JIT **meets** it, so the
+mmap-demand-paging design below is viable.
+
+The mechanism turned out simpler than the three items below feared: a JIT fault
+already lands at `block_offset` with the JIT skipped at a non-zero offset, so the
+**retry after a page-in automatically runs through the interpreter** at the
+faulting offset — no separate parked state, no new VM outcome, and x86 fault
+restartability means the instruction committed nothing to redo. Original
+analysis (superseded by the working prototype, kept for the record):
 
 Before any filesystem work, the engine must be able to **take a fault mid-block,
 park only the faulting task, fetch, and resume the *same* pcode instruction**

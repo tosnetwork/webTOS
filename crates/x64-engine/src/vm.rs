@@ -161,6 +161,14 @@ pub struct InterpVm {
     /// [`InterpVm::set_phase_timing`]). Off by default: the `Instant::now` at
     /// each block and exception is only paid when a run is being profiled.
     phase_times: Option<PhaseTimes>,
+    /// Synthetic demand-paging prototype: page-aligned guest addresses that are
+    /// mapped but not yet resident, each with the bytes and final permission to
+    /// fill on first access. A permission fault at one of these fills it and
+    /// retries the faulting instruction, exactly as a real chunk fetch would.
+    /// Empty in production; populated only by the page-in prototype tests.
+    lazy_pages: std::collections::HashMap<u64, (Vec<u8>, u8)>,
+    /// How many synthetic page-ins have been served.
+    page_ins: u64,
     /// Lift-churn counters: groups decoded, groups served from reuse, and code
     /// flushes — to size how much lifting a persistent cache could avoid.
     lift_decoded: u64,
@@ -408,6 +416,8 @@ impl InterpVm {
             jit_dispatches: 0,
             jit_budget: JitBudget::default(),
             phase_times: None,
+            lazy_pages: std::collections::HashMap::new(),
+            page_ins: 0,
             lift_decoded: 0,
             lift_reused: 0,
             flush_count: 0,
@@ -423,6 +433,67 @@ impl InterpVm {
     /// The accumulated phase wall-clock, or `None` if timing is off.
     pub fn phase_times(&self) -> Option<PhaseTimes> {
         self.phase_times
+    }
+
+    /// Registers a page (address is truncated to the page) as mapped-but-not-
+    /// resident: `bytes` (one page) is filled in and `perm` set on the first
+    /// access fault, which then retries. The demand-paging prototype's synthetic
+    /// backing store.
+    pub fn register_lazy_page(&mut self, addr: u64, bytes: Vec<u8>, perm: u8) {
+        self.lazy_pages.insert(addr & !0xfff, (bytes, perm));
+    }
+
+    /// How many synthetic page-ins have been served.
+    pub fn page_in_count(&self) -> u64 {
+        self.page_ins
+    }
+
+    /// If the exception is an access fault on a registered non-resident page,
+    /// fills that page and returns true so the caller retries the faulting
+    /// instruction; otherwise false. This is the resumable page-in: the faulting
+    /// instruction has committed no architectural state (x86 faults are
+    /// restartable), so re-entering the interpreter at the same block offset —
+    /// which is where a JIT fault also lands, since the JIT is skipped at a
+    /// non-zero offset — re-runs exactly that instruction against the now-
+    /// resident page, with icount and PC unchanged.
+    fn try_page_in(&mut self) -> bool {
+        let code = ExceptionCode::from_u32(self.cpu.exception.code);
+        let is_access_fault = matches!(
+            code,
+            ExceptionCode::ReadUnmapped
+                | ExceptionCode::ReadPerm
+                | ExceptionCode::ReadUninitialized
+                | ExceptionCode::WriteUnmapped
+                | ExceptionCode::WritePerm
+                | ExceptionCode::ExecViolation
+        );
+        if !is_access_fault {
+            return false;
+        }
+        let page = self.cpu.exception.value & !0xfff;
+        let Some((bytes, perm)) = self.lazy_pages.remove(&page) else {
+            return false;
+        };
+        // Fill the page's bytes (bypassing permission checks) and grant the
+        // intended permission, then clear the fault so the retry runs clean.
+        if self
+            .cpu
+            .mem
+            .write_bytes(page, &bytes, icicle_cpu::mem::perm::NONE)
+            .is_err()
+            || self
+                .cpu
+                .mem
+                .update_perm(page, bytes.len() as u64, perm)
+                .is_err()
+        {
+            // Could not resolve it; put it back and let the fault stand.
+            self.lazy_pages.insert(page, (bytes, perm));
+            return false;
+        }
+        self.cpu.exception.clear();
+        self.page_ins += 1;
+        true
     }
 
     /// Installs a JIT backend. Blocks that grow hot (see [`set_jit_tiering`])
@@ -757,6 +828,14 @@ impl InterpVm {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return VmExit::Interrupted;
+        }
+
+        // Demand paging: a fault on a registered non-resident page is served and
+        // the faulting instruction retried, before the OS layer could turn the
+        // fault into a signal. `block_id`/`block_offset` are left where the fault
+        // left them, so re-entering the run loop retries exactly that pcode.
+        if !self.lazy_pages.is_empty() && self.try_page_in() {
+            return VmExit::Running;
         }
 
         let started = self.phase_times.map(|_| std::time::Instant::now());

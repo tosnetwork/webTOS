@@ -764,3 +764,138 @@ fn the_code_budget_evicts_and_recompiles() {
         "asid 1 should have recompiled after eviction, not stayed bailed"
     );
 }
+
+// ── Resumable page-in: a fault on a non-resident page is served and the faulting
+//    instruction retried, identically to an eager run ──────────────────────────
+//
+// Synthetic demand-paging prototype (feasibility/lazy_chunk_fs.md, Phase 0): a
+// data page is mapped but left non-resident (no READ), with its bytes registered
+// to fill on first access. The first guest load faults; the engine fills the page
+// and retries the same pcode; the rest of the scan finds it resident. The result,
+// the retired instruction count, and the page-in count must be exactly what an
+// eager run produces — for the interpreter and for the JIT (region) path, which
+// faults out and lets the interpreter retry at the faulting offset.
+
+fn run_page_in_scan(code: &[u8], count: u64, jit: bool, lazy: bool) -> (u64, u64, u64) {
+    let base = 0x40_0000u64;
+    let buf = 0x20_0000u64;
+    let data: Vec<u8> = (0..count).map(|i| (i & 0xff) as u8).collect();
+
+    let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+    vm.cpu.mem.reset_virtual();
+    vm.cpu.reset();
+    vm.cpu.mem.map_memory_len(
+        base,
+        0x1000,
+        Mapping {
+            perm: perm::READ | perm::EXEC,
+            value: 0,
+        },
+    );
+    vm.cpu
+        .mem
+        .write_bytes(base, code, perm::NONE)
+        .expect("code");
+    vm.cpu.mem.map_memory_len(
+        0x7fff_0000_0000,
+        0x10_0000,
+        Mapping {
+            perm: perm::READ | perm::WRITE | perm::INIT,
+            value: 0,
+        },
+    );
+    let sp = vm.cpu.arch.reg_sp;
+    vm.cpu.write_var(sp, 0x7fff_0010_0000u64 & !0xf);
+
+    if lazy {
+        // Mapped but not resident: writable and initialized, but not readable, so
+        // the first load faults. Register the page's bytes to fill on that fault.
+        vm.cpu.mem.map_memory_len(
+            buf,
+            0x1000,
+            Mapping {
+                perm: perm::WRITE | perm::INIT,
+                value: 0,
+            },
+        );
+        let mut page = vec![0u8; 0x1000];
+        page[..data.len()].copy_from_slice(&data);
+        vm.register_lazy_page(buf, page, perm::READ | perm::WRITE | perm::INIT);
+    } else {
+        vm.cpu.mem.map_memory_len(
+            buf,
+            0x1000,
+            Mapping {
+                perm: perm::READ | perm::WRITE | perm::INIT,
+                value: 0,
+            },
+        );
+        vm.cpu
+            .mem
+            .write_bytes(buf, &data, perm::NONE)
+            .expect("data");
+    }
+
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+    for (n, v) in [("RAX", 0u64), ("RSI", buf), ("RCX", count)] {
+        let var = vm.cpu.arch.sleigh.get_varnode(n).expect("varnode");
+        vm.cpu.write_var(var, v);
+    }
+    vm.icount_limit = 20 * count + 100;
+    if jit {
+        vm.set_jit(Box::new(WasmiJit::new()));
+        vm.set_jit_tiering(Some(1));
+    }
+    let _ = vm.run();
+    let rax = vm
+        .cpu
+        .read_reg(vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX"));
+    (rax, vm.cpu.icount(), vm.page_in_count())
+}
+
+#[test]
+fn a_page_in_retries_identically_to_an_eager_run() {
+    // A single-block self-loop (the JIT compiles it as a region), and a two-block
+    // loop whose memory-reading header is not a self-loop (the JIT compiles it on
+    // the per-block path). Both, interpreted and JIT'd, must page in once and
+    // match the eager run.
+    // region form: movzx edx,[rsi]; add rax,rdx; inc rsi; dec rcx; jnz; hlt
+    let region_loop = [
+        0x0f, 0xb6, 0x16, 0x48, 0x01, 0xd0, 0x48, 0xff, 0xc6, 0x48, 0xff, 0xc9, 0x75, 0xf2, 0xf4,
+    ];
+    // per-block form: header A reads memory and conditionally exits (a branch, so
+    // A is its own block, not a self-loop); block B advances and jumps back to A.
+    //   A: movzx edx,[rsi]; add rax,rdx; test rcx,rcx; jz done
+    //   B: inc rsi; dec rcx; jmp A
+    //   done: hlt
+    let per_block_loop = [
+        0x0f, 0xb6, 0x16, 0x48, 0x01, 0xd0, 0x48, 0x85, 0xc9, 0x74, 0x08, 0x48, 0xff, 0xc6, 0x48,
+        0xff, 0xc9, 0xeb, 0xed, 0xf4,
+    ];
+    for (label, code) in [
+        ("region", &region_loop[..]),
+        ("per-block", &per_block_loop[..]),
+    ] {
+        for jit in [false, true] {
+            let mode = if jit { "JIT" } else { "interp" };
+            let eager = run_page_in_scan(code, 512, jit, false);
+            let lazy = run_page_in_scan(code, 512, jit, true);
+            assert_eq!(eager.2, 0, "{label}/{mode}: eager run must not page in");
+            assert_eq!(
+                lazy.2, 1,
+                "{label}/{mode}: lazy run must page in exactly once, got {}",
+                lazy.2
+            );
+            assert_eq!(
+                eager.0, lazy.0,
+                "{label}/{mode}: result diverged (eager {:#x}, lazy {:#x})",
+                eager.0, lazy.0
+            );
+            assert_eq!(
+                eager.1, lazy.1,
+                "{label}/{mode}: retired instruction count diverged (eager {}, lazy {})",
+                eager.1, lazy.1
+            );
+        }
+    }
+}
