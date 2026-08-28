@@ -1,9 +1,0 @@
-[package]
-name = "tos-sdk"
-version = "0.1.0"
-edition = "2021"
-description = "TOS Agent SDK — safe Rust wrappers for TOS syscalls"
-license = "MIT"
-
-[features]
-default = []

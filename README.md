@@ -163,27 +163,25 @@ profiles exist for OpenJDK, Node.js, and Python workloads.
 
 ## Project Status
 
-webTOS is being migrated from the native TOS kernel into a browser-hosted
-runtime. The repository currently contains the mature native kernel and its
-Linux compatibility substrate. The browser execution host and x86-64 Web
-execution engine are the active integration boundary.
+webTOS is the browser-hosted runtime: a WebAssembly x86-64 engine that runs
+real Linux binaries in a tab. The native TOS kernel it grew out of has been
+removed from this repository — it was a separate, bare-metal Stage-1 crate
+that the browser pivot left behind, and the current project under `crates/`
+does not depend on it. What remains is the runtime and its host.
 
 Available in the repository today:
 
-- Bare-metal x86-64 kernel and QEMU development path
-- Agent scheduler, capabilities, mailboxes, energy accounting, and keyspaces
-- Native, Linux-compatible, and WebAssembly runtime classes
-- ELF64 loader and substantial Linux x86-64 system-call compatibility
-- Deterministic time, randomness, scheduling, futex, and event ordering
-- Checkpoints, replay, structured events, and execution receipts
-- Runtime validation tooling for Java, Node.js, and Python
-
-Browser delivery work:
-
-- Browser execution host and worker lifecycle
-- x86-64 instruction execution in the Web runtime
-- Browser-backed persistent storage and networking
-- Browser terminal, image loading, snapshots, and packaging
+- x86-64 instruction decoding, lifting, and interpretation (`crates/x64-engine`)
+- ELF64 loading and substantial Linux x86-64 system-call compatibility, with
+  processes, threads, futexes, signals, sockets, polling, and epoll
+  (`crates/linux-compat`)
+- Deterministic time, randomness, scheduling, and event ordering
+- Checkpoints, filesystem snapshots, structured trace events, and per-agent
+  quotas on memory, CPU, storage, network, and the event log
+- A signed-manifest image path, a dependency-license manifest, and a security
+  policy (`SECURITY.md`)
+- The browser host: a Web Worker, terminal, OPFS persistence, and a network
+  relay, gated in Chromium, Firefox, and WebKit
 - Workload profiles for OpenFox, Codex, and Claude Code
 
 ## Browser Host

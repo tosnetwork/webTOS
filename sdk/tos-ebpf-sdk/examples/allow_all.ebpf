@@ -1,3 +1,0 @@
-; Allow-all policy: return 0 (Action::Allow)
-mov r0, 0
-exit
