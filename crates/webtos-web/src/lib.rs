@@ -25,6 +25,8 @@
 use std::cell::RefCell;
 
 use linux_compat::{net::HostBroker, Machine};
+use pcode::{Op, VarNode};
+use x64_engine::jit::{translate_block, var_offset, REG_SPACE_BYTES};
 use x64_engine::{CpuExit, EngineConfig};
 
 mod spec {
@@ -82,6 +84,12 @@ struct HostState {
     /// Staging buffer for bytes the host hands in repeatedly. See
     /// [`wtw_scratch`].
     scratch: Vec<u8>,
+    /// A register buffer the JIT self-test runs a compiled block against, and
+    /// the block's translated bytes. Both live in this linear memory so a
+    /// compiled block can share the register buffer by importing this memory
+    /// (see `wtw_jit_selftest`).
+    jit_regs: Vec<u8>,
+    jit_block: Vec<u8>,
 }
 
 thread_local! {
@@ -101,6 +109,8 @@ thread_local! {
             error: String::new(),
             allocations: Vec::new(),
             scratch: Vec::new(),
+            jit_regs: Vec::new(),
+            jit_block: Vec::new(),
         })
     };
 }
@@ -261,6 +271,94 @@ pub extern "C" fn wtw_scratch(len: u32) -> u32 {
             state.scratch.resize(len, 0);
         }
         state.scratch.as_ptr() as u32
+    })
+}
+
+// ---- JIT self-test ----
+//
+// Proves, end to end and from JS, that the browser can compile a block this
+// engine emits and run it against the engine's own memory. `wtw_jit_selftest`
+// seeds a register buffer in this linear memory and translates a block that
+// adds two of its registers; JS then compiles that block with `env.regs` bound
+// to this memory and `env.regs_base` set to the buffer's offset, runs it, and
+// `wtw_jit_check` confirms the sum landed in the buffer. No copy: the compiled
+// block writes the very bytes this module reads. This is the browser wiring's
+// shared-memory round trip, provable in Node before it reaches the run loop.
+
+const JIT_TEST_OUT: i16 = 1;
+const JIT_TEST_A: i16 = 2;
+const JIT_TEST_B: i16 = 3;
+const JIT_TEST_AV: u64 = 1000;
+const JIT_TEST_BV: u64 = 337;
+
+/// Seeds the register buffer and translates the self-test block (out = a + b),
+/// leaving its bytes for `wtw_jit_block_ptr`/`_len`. Returns 0 on success, -1
+/// if the block did not translate.
+#[no_mangle]
+pub extern "C" fn wtw_jit_selftest() -> i32 {
+    with_state(|state| {
+        state.jit_regs.clear();
+        state.jit_regs.resize(REG_SPACE_BYTES as usize, 0);
+        let put = |regs: &mut [u8], id: i16, value: u64| {
+            let off = var_offset(VarNode::new(id, 8)) as usize;
+            regs[off..off + 8].copy_from_slice(&value.to_le_bytes());
+        };
+        put(&mut state.jit_regs, JIT_TEST_A, JIT_TEST_AV);
+        put(&mut state.jit_regs, JIT_TEST_B, JIT_TEST_BV);
+
+        let (out, a, b) = (
+            VarNode::new(JIT_TEST_OUT, 8),
+            VarNode::new(JIT_TEST_A, 8),
+            VarNode::new(JIT_TEST_B, 8),
+        );
+        let mut block = pcode::Block::new();
+        block.push((out, Op::IntAdd, a, b));
+        match translate_block(&block) {
+            Some(bytes) => {
+                state.jit_block = bytes;
+                0
+            }
+            None => fail(state, "wtw_jit_selftest: block did not translate"),
+        }
+    })
+}
+
+/// Offset of the translated self-test block's bytes in this linear memory.
+#[no_mangle]
+pub extern "C" fn wtw_jit_block_ptr() -> u32 {
+    with_state(|state| state.jit_block.as_ptr() as u32)
+}
+
+/// Length of the translated self-test block's bytes.
+#[no_mangle]
+pub extern "C" fn wtw_jit_block_len() -> u32 {
+    with_state(|state| state.jit_block.len() as u32)
+}
+
+/// Offset of the register buffer — the value JS supplies as `env.regs_base`.
+#[no_mangle]
+pub extern "C" fn wtw_jit_regs_ptr() -> u32 {
+    with_state(|state| state.jit_regs.as_ptr() as u32)
+}
+
+/// Length of the register buffer.
+#[no_mangle]
+pub extern "C" fn wtw_jit_regs_len() -> u32 {
+    with_state(|state| state.jit_regs.len() as u32)
+}
+
+/// Returns 1 if the self-test's output register holds the expected sum — proof
+/// the compiled block ran and wrote through the shared memory — else 0.
+#[no_mangle]
+pub extern "C" fn wtw_jit_check() -> i32 {
+    with_state(|state| {
+        let off = var_offset(VarNode::new(JIT_TEST_OUT, 8)) as usize;
+        if state.jit_regs.len() < off + 8 {
+            return 0;
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&state.jit_regs[off..off + 8]);
+        i32::from(u64::from_le_bytes(bytes) == JIT_TEST_AV + JIT_TEST_BV)
     })
 }
 

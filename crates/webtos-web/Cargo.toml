@@ -10,4 +10,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 x64-engine = { path = "../x64-engine" }
+pcode = { workspace = true }
 linux-compat = { path = "../linux-compat" }
