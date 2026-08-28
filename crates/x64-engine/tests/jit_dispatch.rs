@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use icicle_cpu::mem::{perm, Mapping};
 use icicle_cpu::{Cpu, ValueSource};
 use x64_engine::build::{build_x64_vm, EngineConfig};
-use x64_engine::jit::{JitBackend, JitOutcome, REG_SPACE_BYTES};
+use x64_engine::jit::{JitBackend, JitOutcome, RegionOutcome, REG_SPACE_BYTES};
 use x64_engine::ExceptionCode;
 
 fn ldef_path() -> PathBuf {
@@ -207,6 +207,42 @@ impl JitBackend for WasmiJit {
             None => JitOutcome::Completed,
         }
     }
+
+    fn call_region(&mut self, handle: u32, cpu: &mut Cpu, max_iters: u64) -> RegionOutcome {
+        if self
+            .memory
+            .write(&mut self.store, 0, cpu.regs.as_bytes())
+            .is_err()
+        {
+            return RegionOutcome::Unavailable;
+        }
+        self.store.data_mut().cpu = cpu as *mut Cpu;
+        self.store.data_mut().fault = None;
+
+        let instance = self.instances[handle as usize];
+        // A region is `run(regs_base: i32, max_iters: i64) -> i64`, returning the
+        // iterations it executed.
+        let run = match instance.get_typed_func::<(i32, i64), i64>(&self.store, "run") {
+            Ok(run) => run,
+            Err(_) => return RegionOutcome::Unavailable,
+        };
+        let ran = run.call(&mut self.store, (0i32, max_iters as i64));
+        self.store.data_mut().cpu = std::ptr::null_mut();
+        let iters = match ran {
+            Ok(iters) => iters as u64,
+            Err(_) => return RegionOutcome::Unavailable,
+        };
+
+        let mut buf = vec![0u8; cpu.regs.as_bytes().len()];
+        if self.memory.read(&self.store, 0, &mut buf).is_err() {
+            return RegionOutcome::Unavailable;
+        }
+        cpu.regs.as_bytes_mut().copy_from_slice(&buf);
+
+        // A register-only region cannot fault, so a normal return is the only
+        // successful outcome; the iteration count charges fuel in the caller.
+        RegionOutcome::Ran(iters)
+    }
 }
 
 /// Assembles a flat code region, seeds registers, optionally maps a data
@@ -314,6 +350,55 @@ fn a_hot_register_block_matches_the_interpreter() {
     let interp = run_program(false, &code, &regs, None, 8 * count + 100);
     let jit = run_program(true, &code, &regs, None, 8 * count + 100);
     assert_matches("register loop", count, interp, jit);
+}
+
+#[test]
+fn a_self_loop_region_matches_the_interpreter() {
+    // add rax, rbx ; add rax, rcx ; dec rdx ; jnz loop ; hlt
+    //
+    // A register-only self-loop: the branch at the end goes back to the block's
+    // own start. It is region-compiled — the whole loop is one wasm function
+    // with an internal back-edge — so thousands of iterations are a handful of
+    // dispatches, not one per iteration, and the result still matches the
+    // interpreter exactly.
+    let code = [
+        0x48, 0x01, 0xD8, 0x48, 0x01, 0xC8, 0x48, 0xFF, 0xCA, 0x75, 0xF5, 0xF4,
+    ];
+    let count = 3_000;
+    let regs = [("RAX", 1), ("RBX", 3), ("RCX", 5), ("RDX", count)];
+    let interp = run_program(false, &code, &regs, None, 8 * count + 100);
+    let jit = run_program(true, &code, &regs, None, 8 * count + 100);
+    assert_matches("self-loop region", count, interp, jit);
+    // The region ran the loop to completion in one fuel slice: a handful of
+    // dispatches, far fewer than the per-block path's one-per-iteration. A large
+    // count here would be ~`count` dispatches without region compilation, so a
+    // small count is what proves the region fired rather than the fallback.
+    assert!(
+        (1..=8).contains(&jit.2),
+        "self-loop region: expected a few region dispatches, got {} (per-iteration would be ~{count})",
+        jit.2
+    );
+}
+
+#[test]
+fn a_self_loop_region_stops_at_the_fuel_budget() {
+    // The same loop, but the instruction limit cuts it off before the counter
+    // reaches zero. The region must stop at exactly the iteration the
+    // interpreter would, with the same registers and retired-instruction count,
+    // and leave control in the loop (re-dispatched, then halted by the limit).
+    let code = [
+        0x48, 0x01, 0xD8, 0x48, 0x01, 0xC8, 0x48, 0xFF, 0xCA, 0x75, 0xF5, 0xF4,
+    ];
+    let count = 5_000; // more iterations than the budget allows
+    let limit = 4_000; // 1000 full iterations of the 4-instruction body
+    let regs = [("RAX", 1), ("RBX", 3), ("RCX", 5), ("RDX", count)];
+    let interp = run_program(false, &code, &regs, None, limit);
+    let jit = run_program(true, &code, &regs, None, limit);
+    assert_matches("self-loop budget", count, interp, jit);
+    assert_eq!(
+        interp.1, limit,
+        "self-loop budget: the interpreter should stop at the instruction limit"
+    );
 }
 
 #[test]

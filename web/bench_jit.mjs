@@ -1,11 +1,16 @@
 // Measures the browser JIT against the interpreter on a compute loop.
 //
-// Honest caveat: the loop body here is a single tiny basic block, so every
-// dispatch pays the run-loop bookkeeping plus the wasm/JS/wasm boundary of one
-// jit_call to run only a few native instructions. This measures exactly that
-// per-dispatch overhead — the win from compiling a *small* block. A large win
-// needs region/trace compilation (a hot loop's back-edge inside one wasm
-// function), which is a later step.
+// The loop body is a single tiny basic block that branches back to itself — a
+// self-loop. It is now region-compiled: the whole loop, back-edge included, is
+// one wasm function with an internal `loop`, so N iterations are ONE jit_call
+// instead of one per iteration. That removes the per-dispatch overhead this
+// bench used to be dominated by.
+//
+// Before region compilation this same loop measured ~2.76x over the interpreter
+// (one jit_call per iteration paid the run-loop bookkeeping plus the
+// wasm/JS/wasm boundary every time); the `dispatches` line below — a handful of
+// fuel slices for tens of millions of iterations, not one per iteration — is
+// what the region bought. See feasibility/jit_browser_measurement.md.
 //
 // Usage: node web/bench_jit.mjs [iterations]
 import { readFile } from "node:fs/promises";
@@ -76,5 +81,6 @@ const rate = (r) => (guestInsns / (r.ns / 1e9) / 1e6).toFixed(1);
 
 console.log(`compute loop, ${guestInsns.toLocaleString()} guest instructions`);
 console.log(`  interpreter: ${(interp.ns / 1e6).toFixed(0)} ms  (${rate(interp)} M-insn/s)  exit ${interp.exit}`);
-console.log(`  browser JIT: ${(jit.ns / 1e6).toFixed(0)} ms  (${rate(jit)} M-insn/s)  exit ${jit.exit}  ${jit.dispatches.toLocaleString()} dispatches`);
-console.log(`  speedup:     ${(interp.ns / jit.ns).toFixed(2)}x  ${jit.exit === interp.exit ? "" : "*** EXIT MISMATCH ***"}`);
+console.log(`  browser JIT: ${(jit.ns / 1e6).toFixed(0)} ms  (${rate(jit)} M-insn/s)  exit ${jit.exit}  ${jit.dispatches.toLocaleString()} dispatches (region)`);
+console.log(`  speedup:     ${(interp.ns / jit.ns).toFixed(2)}x  vs interpreter  (was ~2.76x per-block, one jit_call per iteration)  ${jit.exit === interp.exit ? "" : "*** EXIT MISMATCH ***"}`);
+console.log(`  per-iter dispatches: ${(jit.dispatches / iters).toExponential(1)}  (per-block would be ~1.0)`);
