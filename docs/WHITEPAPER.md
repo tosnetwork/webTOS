@@ -1,29 +1,36 @@
 # webTOS White Paper
 
-**An Operating System for AI Agents, Delivered by the Browser**
+**Linux Software, Delivered by the Browser**
 
-**Version:** Draft v1.2 · 2026-08-27
+**Version:** Draft v2.0 · 2026-08-28
 **Status:** Product and vision white paper
-**Companions:** [Yellow Paper](specs/yellowpaper.md) (engineering specification) ·
-[ROADMAP](../ROADMAP.md) (milestones and exit gates) ·
+**Companions:** [ROADMAP](../ROADMAP.md) (milestones and exit gates) ·
+[Use cases](USE-CASES.md) (what the runtime is for) ·
 [Performance](performance.md) (measured throughput, memory, and method)
 
-This paper states what webTOS is, why it should exist now, who it competes
-with, why it can be defended, and what could kill it. It makes no adoption,
-revenue, or price predictions. Every capability claim is either shipped and
-verifiable in this repository, or explicitly labeled as roadmap.
+This paper states what webTOS is, why it should exist now, where it sits
+against the alternatives, why it can be defended, and what could kill it. It
+makes no adoption, revenue, or price predictions. Every capability claim is
+either shipped and verifiable in this repository, or explicitly labelled as
+roadmap — and the section that says which is which is written to be checked.
 
 ---
 
 ## Abstract
 
-webTOS is an AI-agent-first operating system kernel that runs inside the
-browser. It executes unmodified Linux x86-64 software — up to and including
-real coding agents — locally in a browser tab, on top of a kernel where agents
-are the first-class abstraction: explicit capabilities instead of ambient
-authority, metered energy budgets instead of unbounded execution, auditable
-mailboxes instead of ad-hoc IPC, and hash-chained, replayable execution
-records instead of best-effort logs.
+webTOS runs unmodified Linux x86-64 binaries inside a browser tab. Not a port,
+not a reimplementation in JavaScript, and not a container on someone else's
+machine: the same ELF that runs on a Linux host, executing in the page, on a
+software x86-64 CPU and the operating-system half of the Linux ABI, both
+compiled to WebAssembly.
+
+The workload that makes this worth doing is the coding agent. Agents ship as
+pinned Linux x86-64 releases, and running one for a user currently means a
+choice between two bad options: put it on your server, where you inherit the
+compute bill, the customer's data, and the blast radius; or install it on the
+user's machine, where there is no boundary at all. The browser is the one
+runtime that is already everywhere, already sandboxed, and free to enter — and
+until now it could not run a Linux binary.
 
 The product goal is concrete and falsifiable: a supported browser starts a
 clean webTOS environment and runs pinned releases of OpenFox, Codex, and
@@ -38,65 +45,54 @@ The one-line pitch: **the link is the install, and the tab is the computer.**
 
 ## 1. The Argument in One Page
 
-1. **Software ate the world; agents are now eating software.** The unit of
-   software is shifting from applications operated by humans to agents that
-   act on their own. Agents hire, spend, produce, and transact.
-2. **Agents do not have an operating system.** They run as ordinary processes
-   with their operator's full authority, unmetered and unaudited, on
-   machine-specific installs. Every OS abstraction they inherit — user,
-   process, file, root — was designed for humans.
-3. **An agent OS needs different primitives:** identity, delegated and
-   bounded authority, budgets, auditable communication, and verifiable
-   execution. These must be kernel primitives, not conventions bolted onto a
-   framework.
-4. **The browser is the distribution channel.** It is the most widely
-   deployed, most aggressively sandboxed runtime in existence. Zero install,
-   instant revocation, capability prompts users already understand, and
-   persistent local storage. Distribution is the historical failure mode of
-   new operating systems; the browser removes it.
-5. **The enabling technologies just matured.** WebAssembly is fast and
-   universal; browser workers, OPFS, and modern storage make a persistent
-   kernel host feasible; and — decisively — coding agents became real
-   economic workloads worth running.
-6. **webTOS is the synthesis:** a mature, from-scratch agent kernel (native
-   x86-64 reference implementation with a deterministic Linux compatibility
-   layer already running OpenJDK-class workloads) being delivered through a
-   software x86-64 engine into the browser, gated by real workloads at every
-   milestone.
+1. **The software worth running ships as Linux x86-64 binaries.** Coding
+   agents, developer tools, and the long tail of Unix software are released
+   as pinned ELF binaries. Vendors will not rebuild them for a new ABI on
+   somebody else's schedule.
+2. **Running that software for a user has only had two shapes, and both cost
+   something.** On your server you hold the compute, the data, and the blast
+   radius. On their machine there is an install, no boundary, and no way to
+   say what the program may reach.
+3. **The browser is the third shape, and it was unavailable.** It is the most
+   widely deployed and most aggressively sandboxed runtime in existence, with
+   zero install and a permission model users already understand — but it
+   cannot execute an ELF.
+4. **webTOS makes it able to.** A software x86-64 CPU and the OS side of the
+   Linux ABI, in WebAssembly, with a browser host supplying storage, a
+   terminal, and a relayed network path. No remote compute backend.
+5. **What the tab adds is not just distribution — it is a boundary.** The
+   guest has no network until the page asks for one, and then only to
+   destinations an allowlist names. Memory, CPU, storage, and network bytes
+   are bounded. Credentials are injected at runtime and scoped. Identical
+   input retires an identical instruction stream in every engine, checked
+   against recorded traces.
+6. **The hard part is the compatibility long tail, and it is being walked.**
+   BusyBox, the real `git`, a C toolchain that forks a compiler, an
+   assembler, and a linker, real `vim` on a pseudoterminal, `curl` against a
+   live server, a 52 MB agent binary in a tab, and both modes of a real
+   coding agent — each one run rather than asserted.
 
 ---
 
-## 2. Software Ate the World. Agents Are Eating Software.
+## 2. The Workload That Made This Worth Doing
 
-In 2011, "software is eating the world" was a claim about companies: every
-industry would be run by software. That thesis won. The next shift is
-happening inside software itself: the operator is no longer necessarily a
-person.
+Until recently there was no program worth this much effort to run in a
+browser. Now there is a category.
 
-A coding agent clones a repository, edits files, runs tests, and opens a pull
-request. A procurement agent compares quotes and commits budget. A research
-agent spends compute against a deadline. These are not applications waiting
-for clicks; they are **economic actors** — what analysts call machine
-customers — that discover work, execute it, and settle for it.
+Coding agents — Claude Code, Codex, and open agents such as OpenFox — are run
+for hours, given repository access, handed credentials, and paid for. They are
+also unusually demanding tenants: pseudoterminals with job control, subprocess
+trees, `git`, authenticated HTTPS, file watching, and sessions that must
+survive interruption. That makes them the right forcing function. A runtime
+that hosts them hosts almost anything in their class, and the failures they
+expose are the failures every other Unix program would have exposed later.
 
-Every layer of the modern stack is being rebuilt for this shift — models,
-frameworks, payment rails, identity. Except the layer at the bottom. When an
-agent actually executes, it lands on an operating system designed in the
-1970s for human operators:
-
-| The OS gives agents | What agent operation actually requires |
-|---|---|
-| Processes and threads | Agents with budgets and parent-child delegation |
-| Ambient user permissions | Explicit, delegatable, revocable capabilities |
-| A shared filesystem | Isolated, provable state |
-| Unmetered CPU | Metered execution that maps to cost |
-| Ad-hoc pipes and sockets | Typed, auditable communication |
-| Best-effort logs | Replayable, verifiable execution records |
-
-Today the gap is papered over with containers, cloud sandboxes, and
-framework-level conventions. Those are perimeter defenses around the wrong
-abstraction. webTOS's position is that the agent is the correct kernel
-abstraction, and the operating system should be rebuilt around it.
+They also sharpen the question of *where* software should run. An agent that
+edits your repository, reads your data, and holds your credentials is exactly
+the workload you least want on a multi-tenant server you cannot inspect — and
+exactly the one you least want running unbounded on the machine itself. The
+interesting position is neither: the user's own hardware, inside a sandbox,
+under authority someone had to grant on purpose.
 
 ---
 
@@ -104,29 +100,22 @@ abstraction, and the operating system should be rebuilt around it.
 
 Three curves crossed.
 
-**The workloads became real.** Until recently there was no economically
-meaningful program worth this effort. Now there is a category: coding agents
-(Claude Code, Codex, and open agents such as OpenFox) that people run for
-hours, give repository access, and pay for. They are also demanding tenants —
-PTYs, subprocess trees, git, HTTPS, file watching — which makes them the
-perfect forcing function: an OS that runs them runs almost anything in their
-class.
+**The workloads became real.** See §2. Five years ago the honest answer to
+"why would you run a Linux binary in a browser" was "for a demo".
 
 **The browser became an OS-grade target.** WebAssembly is mature and
-near-universal; workers give real parallel execution contexts; OPFS gives
-fast, persistent, origin-private storage; the security model is the most
-battle-tested sandbox ever deployed. It is now feasible to host a kernel,
-a software CPU, and a filesystem entirely inside a tab — with no server-side
+near-universal; workers give real execution contexts; OPFS gives fast,
+persistent, origin-private storage; and the security model is the most
+battle-tested sandbox ever deployed. Hosting a software CPU, a filesystem, and
+a process model entirely inside a tab is now feasible with no server-side
 execution at all.
 
-**The trust gap became a blocker.** Enterprises adopting agents hit the same
-wall: agents act with their operator's full authority and leave no verifiable
-record. "What exactly did the agent do, with what authority, at what cost?"
-currently has no cryptographic answer. Verifiable, metered execution — long
-argued as the missing infrastructure for machine-to-machine commerce — is
-exactly what a receipt-producing deterministic kernel provides.
-
-None of these three existed five years ago. All three exist now.
+**The trust question became a blocker.** Enterprises adopting agents hit the
+same wall: the agent acts with its operator's full authority, over a network
+nobody scoped, leaving a log nobody can check. "What could this program
+reach, and what did it actually do?" deserves a better answer than a promise,
+and the answer is easier to give when execution is bounded and reproducible
+by construction rather than by policy.
 
 ---
 
@@ -134,24 +123,25 @@ None of these three existed five years ago. All three exist now.
 
 ### 4.1 What webTOS is
 
-webTOS puts a complete operating system — scheduler, virtual memory, virtual
-filesystem, capability system, and a software x86-64 CPU — inside a browser
-tab. Unmodified Linux x86-64 binaries run against it. The browser supplies
-distribution, sandboxing, storage, and transport; it does not supply the OS
-model. No remote compute backend is required: guest execution and kernel
-state stay in the browser.
+webTOS puts the operating-system half of Linux — scheduler, virtual memory,
+virtual filesystem, processes, signals, sockets, terminals — plus a software
+x86-64 CPU inside a browser tab. Unmodified Linux x86-64 binaries run against
+it. The browser supplies distribution, sandboxing, storage, and transport; it
+does not supply the execution model. Guest execution and runtime state stay in
+the browser.
 
-For the user, the experience is: open a link, get a Linux machine with an
-agent in it. Close the tab; reopen it; the filesystem and the session are
-still there. Share the link; the recipient gets the same environment with
+For the user, the experience is: open a link, get a Linux environment with the
+tool already in it. Close the tab; reopen it; the filesystem and the session
+are still there. Share the link; the recipient gets the same environment with
 zero installation. Nothing touches the host machine outside the browser
 sandbox.
 
-For the agent, the environment is stricter than any Linux box: it has an
-identity, a capability set, an energy budget, mailboxes, and a private
-keyspace. Network access is denied by default and brokered when granted.
-Every instruction and syscall is metered. Execution is deterministic and
-produces replayable, hash-chained records.
+For the program, the environment is stricter than a Linux box. It starts with
+no network at all. It gets one only when the page configures a relay, and then
+only to the destinations that relay was told to allow. Its memory, CPU,
+storage, and network use are capped, and crossing a cap produces an errno it
+already knows how to handle rather than a dead tab. Its execution is
+deterministic and can be recorded and replayed.
 
 ### 4.2 The gates
 
@@ -166,47 +156,60 @@ static hello
     -> Codex and Claude Code
 ```
 
-The final gate requires real interactive sessions: child processes,
-repository access, persistent configuration, authenticated HTTPS, correct
-terminal behavior, and recovery after a browser reload — per pinned agent
-version, with published compatibility evidence. A demo that reaches its first
-prompt does not pass a gate.
+The final gate requires real interactive sessions: child processes, repository
+access, persistent configuration, authenticated HTTPS, correct terminal
+behaviour, and recovery after a browser reload — per pinned agent version,
+with published compatibility evidence. A demo that reaches its first prompt
+does not pass a gate.
 
-### 4.3 What exists today (honest status)
+### 4.3 What exists today
 
-- **The native reference kernel is mature.** A from-scratch bare-metal x86-64
-  kernel with agents, capabilities, mailboxes, energy accounting, Merkle
-  state, checkpoints, execution receipts, and a deterministic Linux
-  compatibility layer (100+ syscalls) that runs OpenJDK-, Node.js-, and
-  CPython-class workloads under QEMU, with validation harnesses in-repo.
-- **The browser x86-64 engine is running, in three engines.** A pure-Rust
-  software CPU (interpreter over a production-grade instruction decoder)
-  compiles to WebAssembly and executes unmodified Linux binaries. A matrix of
-  27 checks runs in Chromium, Firefox and WebKit on every change, and it
-  compares instruction counts across them: identical input retires an
-  identical instruction stream in all three.
+- **The engine runs in three browsers, and they agree.** A pure-Rust software
+  CPU — an interpreter over a production-grade instruction decoder — compiles
+  to WebAssembly and executes unmodified Linux binaries. A 35-check matrix
+  runs in Chromium, Firefox, and WebKit on every change and compares
+  instruction counts across them: identical input retires an identical
+  instruction stream in all three, and one recorded architectural trace is
+  reproduced register for register in each.
 - **The Linux userland is deep.** Dynamic linking through the real musl and
-  glibc loaders; copy-on-write fork, vfork semantics, threads, futexes, and
-  real signal delivery over a deterministic cooperative scheduler; brokered
-  networking (denied by default) with guest TLS; filesystem snapshots that
-  persist across reload.
-- **A real coding agent completes real work.** The stock, statically linked
-  Codex CLI (0.149.1) runs an authenticated `exec` end to end: it discovers
-  the CA store, performs TLS handshakes, calls the OpenAI API, edits a file,
-  runs a shell command, prints the model's summary, and exits cleanly — 2.37
-  billion instructions. Its interactive TUI renders full-screen on a
-  pseudoterminal, takes keystrokes, and quits cleanly. Both natively, under
-  `run_guest`.
+  glibc loaders; copy-on-write fork, vfork, threads, futexes, and real signal
+  delivery over a deterministic scheduler; process groups and job control on
+  pseudoterminals; brokered networking, denied by default, with the guest
+  performing its own DNS and TLS; filesystem snapshots that survive a reload.
+- **Real software runs, and not only the software we chose.** BusyBox applets
+  and a shell; the host `git` doing real repository operations; a C toolchain
+  where a shell forks the compiler driver, which execs the compiler, the
+  assembler, and the linker, and then runs the binary that came out; real
+  `vim` with eleven shared libraries and an embedded Python, full-screen on a
+  pseudoterminal; `curl` against a live streaming server. Details and numbers
+  are in [Use cases](USE-CASES.md).
+- **A real coding agent completes real work.** The stock Codex CLI runs an
+  authenticated non-interactive session end to end — discovering the CA store,
+  performing TLS handshakes, calling the API, editing a file, running a shell
+  command through a pseudoterminal it allocated, reporting what that
+  subprocess printed, and exiting cleanly. Its interactive TUI renders
+  full-screen, takes keystrokes, and quits cleanly. Both on the native runner.
 - **A real agent image runs in a tab.** A 52 MB Linux x86-64 agent binary
   streams into the guest filesystem and a browser cache as it downloads,
   reaches a shell prompt in about three seconds, and executes — in all three
   engines. The browser also has an interactive shell on a pseudoterminal, a
-  full-screen editor that repaints when the window is resized, and networking
-  through a relay that refuses every destination its allowlist does not name.
-- What remains is roadmap with exit criteria written down: carrying Codex
-  itself into the browser (five times larger, and needing credentials that
-  must not be baked into an image), per-agent secret handles, checkpoint
-  resume across a reload, the long soaks, and Claude Code.
+  full-screen editor that repaints when the window is resized, networking
+  through a relay that refuses every destination its allowlist does not name,
+  and a session that resumes after a real page reload.
+- **The boundaries have been swept rather than assumed.** Every argument
+  position of every syscall number against a corpus of the ways a number
+  breaks code that trusts it — 7,128,576 cases, which found five defects,
+  four of them wrapped arithmetic visible only under an overflow-checking
+  profile. Every opcode in all four decoder maps under seventeen prefix
+  combinations, then again truncated against a mapping boundary — 365,568
+  sequences. Snapshot restore and ELF loading, both of which failed closed
+  only after the sweep found what they did not.
+- **What remains is roadmap with exit criteria written down:** carrying
+  Codex's own image into the browser, the Claude Code profile, hot-block
+  translation, and the release work of milestone 8.
+
+Weighted by engineering effort the roadmap is roughly 92% complete; the
+milestone table and its evidence are in [ROADMAP](../ROADMAP.md).
 
 Principles that govern all of it: correctness before speed (interpreter
 first, translation later); no silent compatibility lies (unsupported means a
@@ -221,71 +224,72 @@ The obvious objection first: *"Browsers are for documents and apps. Serious
 compute belongs in the cloud."* Four answers.
 
 **Distribution is the moat nobody prices in.** Every previous attempt to ship
-a new operating system — or even a new sandbox runtime — died on
-distribution: installers, drivers, IT approval, platform gatekeepers. The
-browser is the one runtime already deployed on effectively every machine on
-earth, with an update channel and a permission model users already trust. A
-new OS delivered as a URL skips the entire historical graveyard. The next big
-thing tends to look like a toy; a Linux shell in a tab looks like a toy in
-precisely that way.
+a new runtime died on distribution: installers, drivers, IT approval, platform
+gatekeepers. The browser is the one runtime already deployed on effectively
+every machine on earth, with an update channel and a permission model users
+already trust. A runtime delivered as a URL skips the entire historical
+graveyard. The next big thing tends to look like a toy; a Linux shell in a tab
+looks like a toy in precisely that way.
 
-**Local-first is the right trust posture for agents.** An agent editing your
-repository, reading your data, and holding your credentials is exactly the
-workload you want on your machine, inside a sandbox, under capability
-prompts — not on a multi-tenant server you cannot inspect. Local execution
-also means the user's own silicon does the work: no per-second sandbox
-billing, no cold starts, functional offline.
+**Local-first is the right trust posture.** An agent editing your repository
+and holding your credentials is the workload you want on your own machine,
+inside a sandbox, under permissions someone granted deliberately — not on a
+multi-tenant server you cannot inspect. Local execution also means the user's
+own silicon does the work: no per-second sandbox billing, no cold starts, and
+no bill that scales with your users' idle tabs.
 
 **The sandbox is a feature, not a limitation.** webTOS does not fight the
 browser's restrictions; it aligns with them. The browser enforces the outer
-wall; webTOS enforces the inner order (capabilities, budgets, receipts).
-Storage, network, and credentials cross the boundary only through explicit,
-capability-checked adapters.
+wall; webTOS enforces the inner order. Storage, network, and credentials cross
+the boundary only through explicit host adapters — which is also why the same
+runtime can enforce one policy in a tab and a different one natively, without
+the guest knowing the difference.
 
-**Snapshot and resume come naturally.** A kernel whose entire state lives in
+**Snapshot and resume come naturally.** A runtime whose entire state lives in
 managed memory and origin-private storage can checkpoint, survive a reload,
-and resume a multi-hour agent session — a first-class requirement in the
-final gate, and a genuinely hard property for native ad-hoc setups.
+and resume a long session — a first-class requirement in the final gate, and a
+genuinely hard property for native ad-hoc setups.
 
-The cloud is not the enemy; it is the complement. webTOS is the local,
-personal, verifiable edge of agent execution. Heavy fleets stay in
-datacenters. The two meet through the same protocol layer (§8).
+The cloud is not the enemy; it is the complement. Heavy fleets stay in
+datacentres. The browser gets the person.
 
 ---
 
-## 6. The Kernel Primitives (Why Processes Are Not Enough)
+## 6. What the Runtime Enforces
 
-Frameworks try to provide agent governance in userland: permission wrappers,
-spend limits in YAML, audit logs in a database. Anything provided by
-convention is optional under pressure — a prompt-injected agent does not
-respect a convention. webTOS makes the guarantees structural:
+A sandbox that only promises is a convention, and a convention is optional
+under pressure. Four properties are structural here, and each is gated by a
+test rather than by intent.
 
-- **Capabilities, no ambient authority.** There is no root in the agent
-  model. Network, state, spawning, and inter-agent communication each require
-  an explicit capability record — inspectable, delegatable, revocable. A
-  parent agent can delegate only a subset of its own authority to a child.
-- **Energy: metered execution as a kernel invariant.** Every instruction,
-  syscall, and message has a cost. Budgets are subdivided parent-to-child,
-  never created; exhaustion suspends the agent. Cost control is not a billing
-  afterthought — it is the scheduler.
-- **Mailboxes: auditable communication.** Bounded, typed, deterministic
-  delivery. Every inter-agent interaction is an event on the record.
-- **Keyspaces: provable state.** Each agent's storage is an isolated,
-  Merkle-backed keyspace; state transitions produce roots that proofs can be
-  checked against.
-- **Deterministic execution and receipts.** The Linux compatibility layer
-  replaces every source of non-determinism at the syscall boundary — time,
-  randomness, thread interleaving, lock ordering, address layout, event
-  ordering — with deterministic equivalents; external inputs are recorded
-  for replay. An execution can therefore bind output to code, input, state,
-  and event sequence in a signed receipt that a third party verifies without
-  re-running and without trusting the operator.
+- **No ambient network.** The guest starts with no network whatsoever. It
+  gets one only when the page attaches a relay, and the relay refuses every
+  destination an `--allow` rule does not name — matched by address, because
+  the guest resolves DNS itself and connects to an address. With no rules it
+  starts and refuses everything, loudly. It logs every decision, allowed and
+  refused alike.
+- **Bounds that produce an errno.** Memory, CPU, storage, network bytes, and
+  the event log all have ceilings. A workload that will not fit is refused at
+  the request rather than dying part-way through; a guest over a limit sees an
+  error it already knows how to handle. A program that computes without ever
+  entering the kernel used to be outside every mechanism for stopping it —
+  that gap is closed.
+- **Scoped credentials.** Secrets are injected at runtime, scoped so that a
+  program reaches only the files the host named, and kept out of filesystem
+  snapshots. An out-of-scope program reads a placeholder rather than an empty
+  value that would read as "no key configured".
+- **Determinism, checked against a record.** The compatibility layer replaces
+  every source of non-determinism at the syscall boundary — time, randomness,
+  thread interleaving, address layout, event ordering — with deterministic
+  equivalents, and external inputs are recorded for replay. That is gated
+  against recorded architectural traces rather than only against another run,
+  and reproduced in every browser engine.
 
-This is the infrastructure answer to the machine-customer question: agents
-that transact need execution that can be *priced* (energy), *bounded*
-(capabilities and budgets), and *proven* (deterministic replay and receipts).
-A generic sandbox provides none of the three; webTOS provides all three at
-the kernel layer, whether or not any blockchain is attached.
+What is deliberately *not* claimed: an execution record a third party could
+check. Determinism and replay exist; nothing today produces a signed artifact
+that binds an output to the code, input, and state that produced it. An
+earlier version of this paper described such a system as shipped. It was a
+separate bare-metal kernel, it has been removed from this repository, and the
+claim went with it.
 
 ---
 
@@ -316,149 +320,83 @@ Two things this architecture deliberately does **not** claim:
 
 - It is not a PC emulator. webTOS is a focused Linux x86-64 userspace
   environment; there is no BIOS, no device model, no guest kernel.
-- It does not claim hardware attestation in the browser. On the native
-  reference substrate, isolation and attestation are hardware-backed
-  (page tables, TPM measured boot). In the browser, the sandbox belongs to
-  the browser's TCB, and webTOS's verifiability claim rests on determinism
-  and replay alone. The trust argument changes shape honestly rather than
-  silently.
-
-Full specification: the [Yellow Paper](specs/yellowpaper.md).
+- It does not claim hardware attestation. In the browser the sandbox belongs
+  to the browser's trusted computing base, and webTOS's reproducibility claim
+  rests on determinism and replay alone.
 
 ### 7.1 Execution model: an interpreter, on purpose
 
 The question a technical reader asks first is whether this is a JIT. It is
-not, and the reason is the product rather than the schedule.
+not, and for now the reason is the product rather than the schedule.
 
 webTOS lifts each basic block of x86-64 once into an intermediate
 representation, caches it, and interprets it. Blocks link directly to their
 successors, so the loop stays inside the interpreter rather than returning to
 a dispatcher. No native code and no WebAssembly is generated at run time.
-Hot-block translation is the third tier of a written strategy — reference
-interpreter, cached interpreter, translator — and it is deliberately last.
+Hot-block translation is the third tier of a written strategy and is
+deliberately last.
 
-**Why last.** The claim webTOS sells is that the same input produces the same
-execution, reproducibly, so a third party can replay it. That is recorded, not
-asserted. `test_data/traces/` holds architectural traces — the syscall stream
-with its arguments and results, delivered signals, and register and flag
-samples taken at exact instruction counts — committed to the repository, and
-every browser engine reproduces one of them register for register on each run.
-A translation tier has to produce those same files or the claim is gone, which
-is why the milestone gate for it reads "optimized and interpreter modes pass
-the same architectural trace suite". The harness for that gate is the one
-already running. An engine whose goal is to run
-Linux in a tab does not carry that constraint. One whose goal is verifiable
-execution does, and it is cheaper to add a translator to a correct interpreter
-than to retrofit determinism onto a translator.
+**Why last.** The claim webTOS makes is that the same input produces the same
+instruction stream everywhere. A translation tier has to reproduce that stream
+exactly, which is far easier to verify against an interpreter that already
+passes the trace suite than to build alongside one that does not.
 
-**What it costs, measured.** Full figures and method are in
-[performance.md](performance.md); the shape:
+**What the measurements said.** The interpreter sustains roughly half of
+native throughput in the fast browser engines — about 11 M instructions per
+second against 21 M — and about a tenth of that in the slowest. Profiling a
+real agent's startup found no hot path worth translating; the first
+optimization that paid was a content-addressed lift cache, which took `execve`
+from 48.8 ms to about 2 ms, and tiered lifting, which cut a cold agent start
+from 5.3 s to 1.4 s. Neither is a translator.
 
-| | Sustained interpretation | Notes |
-|---|---|---|
-| Native | ~21 M inst/s | reference |
-| Chromium / WebKit | ~11 M inst/s | about half of native |
-| One engine's test build | ~1.4 M inst/s | see below |
-
-Two findings worth stating plainly. The browser is not the bottleneck: on the
-fast engines the interpreter runs within about a factor of two of native,
-which is a smaller gap than the architecture suggests. And the outlier is not
-a webTOS problem — a few-hundred-byte control module shows the same spread, so
-that column measures a browser build that compiles WebAssembly with its
-baseline compiler only. The control ships in the benchmark so the mistake is
-not made twice.
-
-**A translator is not free in a browser.** You cannot emit machine code; you
-emit WebAssembly, and the browser's own compiler joins your inner loop. That
-compilation is itself tiered — forcing Chromium to its baseline tier costs
-2.7x — so the payoff of a translator depends on a variable nobody outside the
-browser controls. Real implementations therefore batch large regions rather
-than translating per block, and keep an interpreter for cold code regardless.
-
-**Measurement changed what we did first.** The first optimization was not a
-translator at all. An `execve` of an image whose blocks were already lifted
-cost 48.8 ms to retire 22,272 instructions — about seventy times below the
-interpreter's own sustained rate, because the block cache keyed on *which
-process was looking* rather than *what the memory contained*. Keying it by
-content took that to roughly 2 ms, and a shell pipeline from 1.06 s to 0.28 s.
-It also exposed a live bug: two images sharing a load address shared their
-lifted code, so one program ran another's. Translation work that had been
-assumed necessary turned out to be a caching mistake worth twenty-fold — which
-is the argument for measuring before optimizing, and for publishing the
-harness rather than the conclusion.
+**Where it is genuinely needed.** Not for agents, whose bottleneck is the
+model and the network. For compute: a C compiler takes about twelve seconds to
+build a trivial program, which is usable and not comfortable. Translation is
+what closes that gap, and the numbers are in [Performance](performance.md).
 
 ---
 
-## 8. Come for the Tool, Stay for the Network
+## 8. Competitive Position
 
-webTOS is designed as the local execution edge of the TOS Network — an open
-coordination and settlement layer where agents hold decentralized identities,
-discover each other, negotiate bounded service terms, and settle work against
-signed receipts, while providers keep custody of their hardware, models, and
-data.
+Every category below contains respectable work; none occupies the same
+position.
 
-The sequencing follows the classic pattern: **come for the tool, stay for the
-network.**
-
-- **The tool** is single-player and immediately useful with no network
-  attached: run a coding agent in a tab, locally, safely, resumably. webTOS
-  is MIT-licensed and requires no token, no account, and no chain to use.
-- **The network** becomes valuable when many such agents exist: an OpenFox
-  instance running in a browser tab can discover paid work, execute it
-  locally under capability and budget constraints, and settle — because its
-  execution already produces exactly the bounded, priced, provable artifacts
-  a settlement layer needs. webTOS's receipts are the supply side's evidence.
-
-This ordering also answers the cold-start question honestly: webTOS does not
-depend on the network succeeding. It is a standalone product whose adoption
-makes the network possible, not a network whose adoption the product waits
-for.
-
----
-
-## 9. Competitive Landscape
-
-Every row below is a respectable project; none occupies webTOS's position.
-
-| System | What it is | Where it differs |
+| Approach | What it is | Where it differs |
 |---|---|---|
-| **Cloud agent sandboxes** (microVM/container services) | Server-side isolated execution for agents | Remote, per-instance billing, cold starts, no local data, no user-side verifiability; trusts the operator. Complement more than competitor. |
-| **WebContainers-class runtimes** | Node.js/toolchain runtime in the browser | Language-runtime scope, not an OS: no unmodified x86-64 binaries, no agent primitives, no determinism or receipts. |
-| **In-browser x86 emulators** (v86-class, CheerpX-class) | Full machine or userspace x86 emulation in the browser, typically booting a Linux guest; the mature ones are publicly described as translating x86 to WebAssembly at run time | Proves in-browser x86 is viable — and shares its distribution logic. But they reproduce a *human* OS in a tab: ambient authority inside the guest, no capability model, no metering, no deterministic replay, no receipts. webTOS replaces the guest OS itself with an agent kernel, and interprets rather than translates because a translation tier has to reproduce the interpreter's instruction stream exactly (see §7.1). |
-| **Syscall-interception sandboxes** (gVisor-class) | User-space Linux syscall reimplementation for containers | Server-side hardening layer; inherits Linux's non-determinism and ambient model; no browser story. |
-| **WASI / recompile-the-world** | Portable Wasm system interface | Requires recompilation and often source access. Agents ship as Linux x86-64 releases; the binary you must run is the binary the vendor pinned. webTOS meets software where it ships. |
-| **Agent framework governance** (permissions/limits in frameworks) | Userland conventions for agent control | Optional under pressure; not enforced beneath the agent. webTOS enforces the same intent at the kernel boundary. |
+| Cloud agent sandboxes | Server-side isolated execution, billed per instance | Remote: cold starts, per-second billing, the operator holds the data and the blast radius. A complement more than a competitor |
+| Language-runtime shells in the browser | A JavaScript or toolchain runtime running in a tab | Runtime scope, not OS scope: no unmodified x86-64 binaries, so the tool is a reimplementation of the tool |
+| In-browser x86 engines | Machine or userspace x86 emulation in a tab, the mature ones translating x86 to WebAssembly at run time | Proves the approach and are faster today. The mature ones are proprietary and separately licensed, which makes the engine somebody else's to fix and to price. webTOS's engine is MIT and in this repository, and it is built around a determinism claim those are not |
+| Syscall-interception sandboxes | User-space Linux syscall reimplementation for containers | Server-side hardening; inherits Linux's ambient model; no browser story |
+| Recompile-to-Wasm system interfaces | A portable Wasm system interface | Requires recompilation and often source. The binary you must run is the one the vendor pinned |
 
 The defensible intersection: **unmodified Linux x86-64 software + fully local
-browser execution + agent-first kernel primitives + verifiable deterministic
-execution.** Each pairwise combination exists somewhere; no system ships all
-four.
+browser execution + explicit, deny-by-default authority + determinism that is
+gated rather than asserted — on an engine that is open and ours.** Each
+pairwise combination exists somewhere; the four together do not.
 
 ---
 
-## 10. Moat
+## 9. Moat
 
 **The compatibility grind.** Running real software is a long-tail war —
-instruction quirks, syscall semantics, loader behavior, PTY edge cases —
+instruction quirks, syscall semantics, loader behaviour, PTY edge cases —
 fought binary by binary, and largely serial: failures are discovered by
 running real workloads, not enumerated up front. Wine and Proton demonstrate
-both the size of that moat and its durability. webTOS starts with an unusual
-head start: a native kernel whose Linux layer already carries OpenJDK-class
-workloads, a versioned fixture-and-trace corpus, and per-workload validation
-harnesses. The corpus compounds; a well-funded fast-follower still has to
-walk the same tail.
+both the size of that moat and its durability. The corpus compounds: 98 native
+cases, a pinned fixture-and-trace set, a 35-check matrix per browser engine,
+and workload gates that include a compiler toolchain and an hour-long soak. A
+well-funded fast-follower still has to walk the same tail.
 
 **Determinism is architectural.** End-to-end determinism — CPU, scheduling,
 time, randomness, lock ordering, external input recording — cannot be
 retrofitted onto a runtime built without it; it constrains every subsystem
-from day one. Competitors adding "replay" later face a rewrite, not a
-feature.
+from day one. A competitor adding replay later faces a rewrite, not a feature.
 
-**Receipts are a standard-shaped asset.** If bounded, verifiable agent
-execution becomes how agent work is bought and audited, the format that
-accumulated the tooling and the integrations becomes infrastructure.
-Standards positions are won by shipping first and being open; webTOS is MIT
-and ships its verifier with its kernel.
+**Owning the engine.** The fastest in-browser x86 engines are proprietary and
+licensed. Anyone building on one inherits somebody else's roadmap, bug
+queue, and price list. webTOS's engine is MIT and in this repository, from the
+instruction specification up. That is slower today and unblockable
+tomorrow.
 
 **Distribution compounds.** Every shared webTOS link is also a distribution
 event for the runtime itself. Tools with zero-install sharing loops
@@ -466,144 +404,145 @@ historically out-distribute technically superior installed alternatives.
 
 What is *not* claimed as moat: the browser APIs (available to everyone), the
 interpreter technique (established), or secrecy (the code is open). The moat
-is accumulated correctness, an architecture competitors must start over to
-match, and position in an ecosystem that turns execution into settlement.
+is accumulated correctness and an architecture a competitor would have to
+start over to match.
 
 ---
 
-## 11. Who Needs This
+## 10. Who Needs This
 
-Stated as segments with a concrete first user, not as a top-down TAM:
+Stated as segments with a concrete first user, not as a top-down market size:
 
-- **Agent developers and vendors** — ship an agent as a link: sandboxed
-  demo-to-production environments, reproducible bug reports (a failing
-  session is a replayable artifact), per-version compatibility evidence.
-- **Enterprises adopting agents** — the audit answer: capability-scoped
-  authority, credential injection without baking secrets into images, and
-  signed records of what an agent actually did. Runs on the employee's
-  machine inside the browser's security model IT already governs.
-- **Operators of autonomous agents** (the OpenFox profile) — a $0-infra,
-  always-available local runtime for agents that earn: metered cost,
-  bounded authority, settlement-grade receipts.
-- **Education and evaluation** — a full Linux + agent environment for
-  anyone with a browser: courses, CTFs, agent benchmarks, replayable
-  research artifacts.
+- **Agent and tool vendors** — ship the thing as a link: sandboxed
+  demo-to-production environments, reproducible bug reports where a failing
+  session is a replayable artifact, and per-version compatibility evidence.
+- **Enterprises adopting agents** — a defensible answer to "what could it
+  reach": no network but the allowlist, credentials injected rather than baked
+  into an image, bounded resources, and execution on the employee's own
+  machine inside the security model IT already governs.
+- **Anyone running untrusted code** — online judges, CTF platforms, plugin
+  systems, and "run this user's script" features, where the compute is the
+  submitter's own browser and an escape meets a trapped tab rather than your
+  infrastructure.
+- **Privacy-bound processing** — legal, medical, and financial files handled
+  by the mature command-line tools that already exist for them, with no
+  gateway configured and therefore nothing to leak through.
+- **Education and evaluation** — a full Linux environment for anyone with a
+  browser: courses, CTFs, benchmarks, and research artifacts that replay
+  identically for everyone who opens them.
 
 The wedge is deliberately narrow: **run a pinned coding agent in a tab,
 well.** That single capability is independently valuable, brutally hard to
-fake (hence the gates), and generalizes — an environment good enough for
-Claude Code is good enough for most of the agent long tail.
+fake — hence the gates — and generalizes: an environment good enough for a
+coding agent is good enough for most of the long tail.
 
-On business model: the kernel and runtime are MIT open source, and this
-paper makes no revenue projections. The monetizable surfaces, when the
-workload gates are passed, are the classic open-core set — enterprise
-deployment and compliance tooling, managed persistence/network brokerage,
-and participation in TOS Network settlement rails — each priced on value
-delivered above the free runtime, never by closing the runtime.
+On business model: the runtime is MIT open source and this paper makes no
+revenue projections. The monetizable surfaces, when the workload gates are
+passed, are the classic open-core set — enterprise deployment and compliance
+tooling, managed persistence and network brokerage — each priced on value
+above the free runtime, never by closing the runtime.
 
 ---
 
-## 12. What Could Kill This (Risks, Stated Plainly)
+## 11. What Could Kill This
 
 | Risk | Reality | Response |
 |---|---|---|
-| **Performance ceiling** | An interpreter in Wasm runs at single-digit-to-tens of MIPS — orders of magnitude below native. Some workloads will never fit. | Coding agents are I/O- and network-bound at interactive timescales; gates are latency-budget based, not MIPS based. Tiered execution (block caching, then hot-block Wasm translation) is roadmap Milestone 8, attempted only after correctness gates, with trace-equivalence required. If interactive budgets cannot be met for the pinned workloads, that gate fails visibly — by design. |
-| **Long-tail incompatibility** | A pinned agent release may fail deep in startup on one missing instruction or syscall. | The entire methodology exists for this: trace pinned workloads, fail explicitly, grow fixtures. Never fake success — a wrong result is worse than a loud failure. |
-| **Browser platform drift** | Memory limits, OPFS quotas, worker semantics, and store policies differ and change. | Sparse paging and quotas from day one; a compatibility dashboard per supported browser is part of the release definition; no dependency on any single vendor's non-standard API. |
-| **Workload release drift** | New agent versions change runtime requirements. | Version pinning with published per-version compatibility reports; drift becomes a documented delta, not a silent break. |
-| **A platform vendor ships it natively** | A browser or model vendor could ship a first-party agent sandbox. | Likely partial overlap (their own agent, their own browser). webTOS's position — vendor-neutral, unmodified-binary, verifiable, open — is exactly the part a first-party offering structurally does not build. Being MIT makes adoption cheaper than replication. |
-| **Security of the broker boundary** | The credential and network broker is the highest-value target. | Deny-by-default network, handle-based secret injection, snapshot exclusion of credentials, fuzzing of every parser and boundary (Milestone 8), fail-closed on corrupt input. |
-| **Believing our own demos** | The perennial emulation failure mode: the demo works, the semantics are stubbed. | The gates forbid it: soak tests, reload recovery, explicit-error policy, and receipts that expose what actually executed. |
+| **Performance ceiling** | An interpreter in Wasm runs orders of magnitude below native. Some workloads will never fit | Agent workloads are I/O- and network-bound at interactive timescales, and gates are latency-budget based rather than throughput based. Compute-bound work genuinely needs the translation tier, which is roadmap milestone 8, attempted only after correctness gates and required to pass the same traces. If interactive budgets cannot be met for the pinned workloads, that gate fails visibly — by design |
+| **Long-tail incompatibility** | A pinned release may fail deep in startup on one missing instruction or syscall | The entire methodology exists for this: trace pinned workloads, fail explicitly, grow fixtures. Never fake success — a wrong result is worse than a loud failure |
+| **Browser platform drift** | Memory limits, storage quotas, worker semantics, and store policies differ and change | Sparse paging and quotas from day one; a per-browser compatibility matrix is part of the release definition; no dependency on any single vendor's non-standard API |
+| **Workload release drift** | New agent versions change runtime requirements | Version pinning with published per-version compatibility reports; drift becomes a documented delta, not a silent break |
+| **A platform vendor ships it natively** | A browser or model vendor could ship a first-party agent sandbox | Likely partial overlap — their own agent, their own browser. A neutral substrate that runs all of them, locally, under one authority model, is a different product. Being MIT makes adoption cheaper than replication |
+| **Security of the broker boundary** | The credential and network broker is the highest-value target | Deny-by-default network, scoped secret injection, snapshot exclusion of credentials, adversarial sweeps of every parser and boundary, fail-closed on corrupt input |
+| **Believing our own demos** | The perennial emulation failure mode: the demo works, the semantics are stubbed | The gates forbid it: soak tests, reload recovery, an explicit-error policy, and a rule that a test which cannot fail is not evidence |
 
 ---
 
-## 13. Milestones and How to Verify
+## 12. Milestones and How to Verify
 
-Full details with exit criteria live in [ROADMAP](../ROADMAP.md):
+Full details with exit criteria live in [ROADMAP](../ROADMAP.md).
 
 | Milestone | Outcome | Status |
 |---|---|---|
-| M0 | Native baseline locked; fixtures and traces versioned | Partial (fixtures exist; trace format pending) |
-| M1 | Static `hello` in a browser worker | Done; the three-engine matrix passes and the engines agree instruction for instruction |
+| M0 | Baseline locked; fixtures and traces pinned and versioned | ~93%: four reference traces reproduced natively and in three engines; `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure |
+| M1 | Static `hello` in a browser worker | Done; the engines agree instruction for instruction |
 | M2 | Static BusyBox: shell, files, persistence across reload | Done, verified in all three engines |
-| M3 | Dynamic Linux ELF via the real loader | Done (musl and glibc, native + browser) |
-| M4 | Threads, fork/exec, deterministic scheduling | Done incl. determinism and adversarial gates |
-| M5 | Event loops, brokered networking, HTTPS | Largely done: guest TLS natively, and the browser reaches the network through a deny-by-default relay; recording and soak pending |
-| M6 | OpenFox completes a real agent task | Done natively, and the image now streams into a browser and runs there; the 60-minute soak remains |
-| M7 | Codex and Claude Code: sustained interactive sessions | ~74%: both Codex modes run end to end natively, including the interactive TUI on a pseudoterminal; the browser has the terminal half. Carrying Codex's own image, per-agent secrets, and Claude Code remain |
-| M8 | Performance tiers, fuzzing, quotas, signed releases | Started: a measured baseline (native, per-engine, and a control module), and the first optimization — a content-addressed lift cache worth roughly twenty-fold on process startup |
+| M3 | Dynamic Linux ELF via the real loader | Done, musl and glibc |
+| M4 | Threads, fork/exec, deterministic scheduling, signals | Done, including adversarial and blocked-signal gates |
+| M5 | Event loops, brokered networking, HTTPS | Done: guest TLS, deny-by-default relay in three engines, recording and offline replay, interruptible waits gated through a socket |
+| M6 | OpenFox completes a real agent task | Done, including in a browser, and a 1,000-round soak bounded in memory, filesystem, and block table |
+| M7 | Codex and Claude Code: sustained interactive sessions | ~90%: both Codex modes run end to end and a session that does work finishes; carrying Codex's image into a tab and the Claude Code profile remain |
+| M8 | Performance tiers, sweeps, quotas, signed releases | ~76%: measured baseline, lift cache and tiered lifting landed, four boundaries swept, every resource capped; hot-block translation not started |
 
-Verification is the point: the repository builds, the native suites run (58
-cases), the wasm host runs, and a 27-check matrix runs in three browser
-engines. Every completed claim above corresponds to tests and fixtures
-in-tree, and the performance claims to harnesses that print their numbers
-rather than assert them. Claims and code travel together.
+Verification is the point: the repository builds, the native suite runs 98
+cases with skipping forbidden on a host that can run everything, and a
+35-check matrix runs per browser engine. Every completed claim above
+corresponds to tests and fixtures in-tree, and the performance claims to
+harnesses that print their numbers rather than assert them. Claims and code
+travel together.
 
 ---
 
-## 14. Anticipated Questions
+## 13. Anticipated Questions
 
-**"Isn't this just a slower VM?"** A VM reproduces a machine; webTOS replaces
-the OS. The product is not cycles — it is bounded authority, metered cost,
-deterministic replay, and receipts for agent execution, with zero-install
-distribution. Slow-and-verifiable already wins whole categories (consider
-what blockchains trade for auditability); here the workloads are interactive
-tools whose bottleneck is the model and the network, not the CPU. On the
-measured side the gap is smaller than the architecture suggests: the
-interpreter sustains roughly half of native throughput in the fast browser
-engines (§7.1).
+**"Isn't this just a slower VM?"** A VM reproduces a machine; webTOS supplies
+the operating system a Linux binary expects and nothing else. What it sells is
+not cycles: it is the real binary, on the user's own machine, reachable by a
+link, under authority someone had to grant. On the measured side the gap is
+smaller than the architecture suggests — roughly half of native throughput in
+the fast engines (§7.1).
 
-**"Is it a JIT?"** No — it lifts each block once, caches it, and interprets.
+**"Is it a JIT?"** No. It lifts each block once, caches it, and interprets.
 Translation to WebAssembly is the last of three planned tiers, and it is last
 because a translator must reproduce the interpreter's instruction stream
-exactly or the replay claim is gone. §7.1 has the reasoning and the numbers,
-including why the first optimization worth doing turned out not to be a
-translator at all.
+exactly or the determinism claim is gone. §7.1 has the reasoning, the numbers,
+and why the first optimization worth doing turned out not to be a translator.
 
-**"Why would anyone run agents locally when clouds exist?"** Data gravity
-(the repository and credentials are here), cost (the user's silicon is free),
-trust (sandbox + capabilities + receipts beat a remote black box), and
-distribution (a link, not an account). The cloud keeps the fleets; the
-browser gets the person.
+**"Why would anyone run this locally when clouds exist?"** Data gravity (the
+repository and the credentials are here), cost (the user's silicon is free and
+an idle tab bills nobody), trust (a sandbox with a named allowlist beats a
+remote black box), and distribution (a link, not an account).
 
-**"Is this a crypto project?"** No token is required to use webTOS, and this
-paper prices nothing. webTOS is a runtime. It is *settlement-ready* — its
-receipts and energy accounting are the artifacts a settlement layer consumes
-— and it plugs into the TOS Network where that is wanted. The runtime stands
-alone; the network is upside.
+**"Is this a crypto project?"** No. No token is required, and this paper
+prices nothing. An earlier version described execution receipts feeding a
+settlement layer; that code lived in a separate bare-metal kernel which has
+been removed, and nothing in the runtime produces such a record today. If that
+capability returns it will arrive as a milestone with an exit gate, and this
+paper will say so before it says anything else.
 
-**"Why not WASI and recompilation?"** Because the software that matters ships
-as pinned Linux x86-64 releases, and vendors will not rebuild for a new ABI
-on a new platform's schedule. Meeting binaries where they ship is the entire
-lesson of Wine, Proton, and Rosetta.
+**"Why not recompile everything to Wasm?"** Because the software that matters
+ships as pinned Linux x86-64 releases, and vendors will not rebuild for a new
+ABI on a new platform's schedule. Meeting binaries where they ship is the
+entire lesson of Wine, Proton, and Rosetta.
 
-**"What if Anthropic or OpenAI ship their own sandbox?"** They likely will —
-for their own agent, on their own infrastructure. The neutral substrate that
-runs *all* of them, locally, verifiably, under one capability and audit
-model, is a different product with a different owner. Neutrality here is not
-a weakness; it is the spec.
+**"What if a model vendor ships their own sandbox?"** They likely will — for
+their own agent, on their own infrastructure. The neutral substrate that runs
+all of them, locally, under one authority model, is a different product with a
+different owner. Neutrality here is not a weakness; it is the specification.
 
-**"What's genuinely hard here?"** The compatibility long tail (years of
-accumulated fixtures — that is the moat), and end-to-end determinism (an
-architectural property competitors cannot retrofit). Both are grind-shaped,
+**"What's genuinely hard here?"** The compatibility long tail — years of
+accumulated fixtures, which is the moat — and end-to-end determinism, an
+architectural property a competitor cannot retrofit. Both are grind-shaped,
 which is precisely why they defend.
 
 **"How do we know the team won't fake progress?"** The methodology makes
-faking expensive: workload gates with soak tests and reload recovery,
-explicit-failure policy, receipts binding outputs to executions, and a public
-rule that no milestone closes on a stub. The honest-status section of this
-paper and the `[IMPL]` markers in the Yellow Paper exist for the same reason.
+faking expensive: workload gates with soak tests and reload recovery, an
+explicit-failure policy, a requirement that a new test be shown to fail before
+it is believed, and a status section written to be checked line by line. This
+paper lost a section to that rule rather than keeping a claim whose code had
+been deleted.
 
 ---
 
-## 15. Closing
+## 14. Closing
 
-The last platform shift put a computer in every pocket. This one puts an
-economic actor in every piece of software. Those actors need what every actor
-in an economy needs: identity, bounded authority, budgets, and records that
-can be trusted by counterparties.
+The software people want to run ships as Linux binaries, and the machine they
+most want to run it on is their own. Until now those two facts pointed in
+opposite directions: running it locally meant an install and no boundary,
+running it safely meant running it somewhere else.
 
-webTOS is the operating system built for them — delivered through the one
-runtime everyone already has.
+webTOS is the third answer — the real binary, on the user's own machine,
+inside the sandbox everybody already has, reachable by a link and bounded by
+something other than a promise.
 
-The link is the install. The tab is the computer. The receipt is the proof.
+The link is the install. The tab is the computer.
