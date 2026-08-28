@@ -25,7 +25,11 @@ fn main() {
     machine
         .add_file(b"/bin/guest", image, 0o755)
         .expect("add guest");
-    let mut argv: Vec<Vec<u8>> = vec![b"/bin/guest".to_vec()];
+    // argv[0] the guest sees. Defaults to its path; GUEST_ARGV0 overrides it,
+    // which a multicall binary like BusyBox needs (its applet is chosen by
+    // argv[0]'s basename, so run it as `GUEST_ARGV0=busybox ... sha256sum f`).
+    let argv0 = std::env::var("GUEST_ARGV0").unwrap_or_else(|_| "/bin/guest".to_string());
+    let mut argv: Vec<Vec<u8>> = vec![argv0.into_bytes()];
     argv.extend(args[1..].iter().map(|a| a.as_bytes().to_vec()));
     machine.set_args(argv, vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()]);
     machine.load(b"/bin/guest").expect("load");
