@@ -952,6 +952,26 @@ pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Opt
             emit_store(f, out)
         }
 
+        // out = cond != 0 ? a : b, a conditional move. `cond` is the 1-byte
+        // varnode named by the op; the interpreter reads it as u8 and copies
+        // whichever input into `out`. Wasm's `select` is exactly this — it
+        // pops [first, second, cond] and yields `first` when cond != 0 — so a
+        // is pushed first (chosen when cond != 0), then b, then the loaded
+        // condition byte. Inputs and output share `out`'s width.
+        Op::Select(cond_var) => {
+            let size = out.size;
+            wasm_ty(size)?;
+            if a.size() != size || b.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            emit_load(f, Value::Var(VarNode::new(cond_var, 1)), 1)?;
+            f.instruction(&Instruction::Select);
+            emit_store(f, out)
+        }
+
         // Everything above translates fully; anything else bails the block to
         // the interpreter. That deliberately includes the four division ops
         // (IntDiv/IntSignedDiv/IntRem/IntSignedRem): the interpreter raises an

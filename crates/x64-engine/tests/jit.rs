@@ -908,6 +908,34 @@ fn cases() -> Vec<Case> {
         });
     }
 
+    // Select (conditional move): out = cond != 0 ? a : b. The condition is a
+    // separate 1-byte varnode named by the op. One case per branch, so a wrong
+    // operand order or a dropped condition load shows immediately.
+    {
+        let (o, a, b, cond) = (reg(1, 4), reg(2, 4), reg(3, 4), reg(4, 1));
+        let mut block = pcode::Block::new();
+        block.push((o, Op::Select(cond.id), a, b));
+        out.push(Case {
+            name: "Select cond != 0 picks a",
+            seeds: vec![(a, 0xaaaa_aaaa), (b, 0x5555_5555), (cond, 1)],
+            block,
+        });
+    }
+    {
+        let (o, a, b, cond) = (reg(1, 8), reg(2, 8), reg(3, 8), reg(4, 1));
+        let mut block = pcode::Block::new();
+        block.push((o, Op::Select(cond.id), a, b));
+        out.push(Case {
+            name: "Select cond == 0 picks b (u64)",
+            seeds: vec![
+                (a, 0xaaaa_aaaa_aaaa_aaaa),
+                (b, 0x5555_5555_5555_5555),
+                (cond, 0),
+            ],
+            block,
+        });
+    }
+
     out
 }
 
