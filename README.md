@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>An AI-agent-first bare-metal operating system kernel that runs in the browser.</strong>
+  <strong>Unmodified Linux x86-64 programs, running in a browser tab.</strong>
 </p>
 
 <p align="center">
@@ -11,32 +11,26 @@
   <a href="#architecture">Architecture</a> &middot;
   <a href="#project-status">Status</a> &middot;
   <a href="ROADMAP.md">Roadmap</a> &middot;
-  <a href="#native-development">Development</a> &middot;
+  <a href="#running-natively">Development</a> &middot;
   <a href="LICENSE">MIT License</a>
 </p>
 
 ## Overview
 
-webTOS is an **AI-agent-first bare-metal operating system kernel designed to
-run inside the browser**. It brings the isolation, scheduling, resource
-accounting, Linux compatibility, and verifiable execution model of TOS to a
-portable Web runtime.
+webTOS runs **unmodified Linux x86-64 binaries inside a browser tab**. Not a
+port, not a reimplementation in JavaScript, and not a container on someone
+else's machine: the same ELF that runs on a Linux host, executing in the page.
 
-Instead of treating AI agents as ordinary processes, webTOS makes them a
-first-class operating-system abstraction. Each agent has explicit authority,
-private state, a metered execution budget, and auditable communication
-channels.
+It is a WebAssembly x86-64 execution engine with the operating-system half of
+the Linux ABI on top of it — processes, threads, signals, a virtual
+filesystem, sockets, and pseudoterminals — plus a browser host that supplies
+storage, a terminal, and a network path.
 
-The same kernel architecture supports three workload models:
-
-- **Native x86-64 agents** using the TOS system-call ABI
-- **Linux x86-64 ELF programs** using the Linux compatibility layer
-- **WebAssembly agents** using the built-in deterministic Wasm runtime
-
-The browser is the deployment environment, not the operating-system model.
-webTOS keeps its own scheduler, virtual memory model, process and agent state,
-virtual filesystem, capabilities, and execution records rather than exposing
-ambient browser authority directly to workloads.
+The browser is the deployment environment, not the execution model. webTOS
+owns its own scheduler, guest memory, process state, and filesystem rather
+than exposing ambient browser authority to what it runs: a guest reaches the
+network only through a relay the page configured, and its memory, CPU,
+storage, and network use are all bounded.
 
 ### Primary Goal
 
@@ -58,64 +52,68 @@ exit criteria, risks, and the product definition of done.
 
 ## Why webTOS?
 
-Most execution environments were designed around applications and human
-users. webTOS starts with a different question: what should an operating
-system look like when its primary users are autonomous AI agents?
+Running a real program in a browser usually means one of three things, and
+each gives something up. Reimplementing the tool in JavaScript means it is no
+longer the tool. Renting a container means the operator holds the compute and
+the data. Using a proprietary browser VM means the engine is somebody else's
+to license and to fix.
 
-| Traditional environment | webTOS |
-|-------------------------|--------|
-| Processes and threads | Agents with budgets and parent-child relationships |
-| Ambient permissions | Explicit, delegatable capabilities |
-| Shared filesystem | Isolated, Merkle-backed keyspaces |
-| Unmetered execution | Instruction and system-call energy accounting |
-| Ad-hoc IPC | Typed, auditable mailboxes |
-| Best-effort logs | Hash-chained events and replayable receipts |
-| Machine-specific deployment | Portable browser execution |
+webTOS is the third option built differently: the real binary, in the user's
+own browser, on an engine that is MIT-licensed and in this repository.
 
-## Core Model
+## What it gives you
 
-### Agents
+### The program, not a port
 
-An agent is the primary execution unit. It owns an execution context, energy
-budget, capabilities, mailboxes, and state keyspace. Parent agents can create
-children and delegate only a subset of their own authority.
+An ELF built for Linux x86-64 runs as-is. BusyBox applets, the host `git`
+doing real repository work, and a 52 MB agent binary all run unmodified. So
+does a C toolchain: a shell forks `gcc`, which execs the compiler, the
+assembler, and the linker, and then runs what came out
+(`crates/linux-compat/tests/gcc.rs`). What the runtime is for is in
+[`docs/USE-CASES.md`](docs/USE-CASES.md).
 
-### Capabilities
+### Authority the page grants explicitly
 
-There is no ambient root authority in the agent model. Access to networking,
-state, agent creation, and inter-agent communication is represented by
-explicit capability records that can be inspected and audited.
+A guest has no network at all until the page asks for one, and then only to
+destinations an allowlist names. Credentials are injected at runtime, scoped
+to the workload that should see them, and kept out of filesystem snapshots.
+Guest socket operations become a command stream the host carries out, which
+is why the browser and a native host can enforce different policies over the
+same runtime.
 
-### Mailboxes
+### Bounds that produce an errno, not a dead tab
 
-Agents communicate through bounded mailboxes. This gives the scheduler a
-deterministic and observable boundary for local services, networking, and
-cross-agent workflows.
+Memory, CPU, storage, network bytes, and the event log all have ceilings. A
+workload that will not fit is refused at the request rather than dying
+part-way through, and a guest over a limit sees an error it already knows how
+to handle.
 
-### Energy
+### Determinism that is gated, not claimed
 
-Every instruction, system call, and message has a cost. When an agent exhausts
-its energy budget it is suspended, making resource control part of the kernel
-execution model rather than an external convention.
+The same input retires the same instruction stream in Chromium, Firefox, and
+WebKit, checked against recorded architectural traces — the syscall stream
+with its arguments, delivered signals, and register samples at exact
+instruction counts. A session can be recorded and replayed later with no
+network.
 
-### Verifiable Execution
+### State that survives a reload
 
-webTOS records structured, hash-chained events and supports deterministic
-replay. Execution receipts can bind an output to the code, input, state, and
-event sequence that produced it.
+The guest filesystem is snapshotted to OPFS and restored into a fresh
+machine, so a session resumes where it stopped.
 
 ## Architecture
 
 <p align="center">
   <img src="webTOS-architecture.png"
-       alt="webTOS architecture: Linux x86-64 applications (OpenFox, Codex, BusyBox) enter through the browser host (Web Worker, terminal, OPFS, network relay), are loaded as ELF against the Linux ABI, and run inside the WebAssembly module webtos-web, whose linux-compat layer provides processes, VFS, signals, futexes, sockets, epoll, and PTYs on top of the x64-engine that decodes, lifts, interprets, and owns guest memory; the agent kernel and the TOS network sit alongside as future integration."
+       alt="webTOS architecture: Linux x86-64 applications (OpenFox, Codex, BusyBox) enter through the browser host (Web Worker, terminal, OPFS, network relay), are loaded as ELF against the Linux ABI, and run inside the WebAssembly module webtos-web, whose linux-compat layer provides processes, VFS, signals, futexes, sockets, epoll, and PTYs on top of the x64-engine that decodes, lifts, interprets, and owns guest memory."
        width="760">
 </p>
 
 <p align="center">
-  <em>The solid path is what executes in a browser today. The agent kernel —
-  capabilities, energy, events, receipts, secrets — is drawn dashed because it
-  is not integrated yet; see <a href="#project-status">Project Status</a>.</em>
+  <em>The solid path is what executes in a browser. The dashed boxes are from
+  an earlier drawing: the agent kernel they name has been removed from this
+  repository, and the diagram has not been redrawn — see
+  <a href="#project-status">Project Status</a>.</em>
 </p>
 
 The same structure in text:
@@ -129,13 +127,11 @@ Browser
   +-- Worker-based execution host
           |
           v
-      webTOS kernel
+      webtos-web (WebAssembly module)
           |
-          +-- Agent scheduler and energy accounting
-          +-- Capabilities and mailboxes
-          +-- Keyspaces, events, checkpoints, and receipts
           +-- Linux x86-64 compatibility layer
-          +-- WebAssembly runtime
+          +-- x86-64 execution engine
+          +-- Scheduling, budgets, snapshots, and trace events
 ```
 
 For Linux workloads, webTOS provides the operating-system side of the Linux
@@ -153,13 +149,12 @@ Linux x86-64 ELF program
   Linux compatibility layer
           |
           v
-  webTOS kernel services
+  webTOS runtime services
 ```
 
 The compatibility layer includes ELF64 loading, virtual memory areas, dynamic
 linker support, file descriptors, VFS operations, processes, threads, futexes,
-signals, sockets, polling, and epoll-style event handling. Runtime validation
-profiles exist for OpenJDK, Node.js, and Python workloads.
+signals, sockets, polling, and epoll-style event handling.
 
 ## Project Status
 
@@ -322,55 +317,30 @@ cd crates && WEBTOS_REQUIRE_FIXTURES=1 cargo test -p linux-compat --release
 
 The x86-64 Linux host passes that way with no skips.
 
-## Native Development
+## Running natively
 
-The native build remains the reference environment while the browser host is
-integrated.
-
-### Prerequisites
-
-- Rust nightly
-- NASM
-- QEMU with x86-64 system emulation
-- GNU binutils (`objcopy`)
-
-On Ubuntu or Debian:
+The same engine runs outside a browser, which is the faster way to iterate and
+the only way to run the parts of the suite a browser cannot host. Rust nightly
+is the only prerequisite; cargo runs from `crates/`, never the repository
+root.
 
 ```bash
-sudo apt install nasm qemu-system-x86 binutils
+cd crates
+GUEST_MOUNT="/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu,/lib64:/lib64" \
+cargo run --release -p linux-compat --example run_guest -- /usr/bin/git --version
 ```
 
-### Build and Run
+`SYSCALL_ERR_TRACE=1` prints every syscall that returned an error, with the
+path for `openat`; `RUST_LOG=linux_compat=trace` prints all of them. On a
+fault the runner reports the faulting page's permissions, which separates
+"jumped into nothing" from "jumped into a page the loader left
+non-executable".
+
+On a macOS or ARM development machine, run the suite against the host — tests
+whose fixtures need an x86-64 Linux toolchain skip themselves:
 
 ```bash
-git clone https://github.com/tosnetwork/webTOS.git
-cd webTOS
-make run
-```
-
-Other useful commands:
-
-```bash
-make build       # Build the release kernel
-make debug-run   # Launch QEMU with a GDB stub
-make uefi-run    # Boot with UEFI firmware
-make test        # Run the native smoke suite
-```
-
-## SDKs
-
-```bash
-# Native agent SDK
-cd sdk/tos-sdk && cargo build --target x86_64-unknown-none
-
-# WebAssembly agent SDK
-cd sdk/tos-wasm-sdk && cargo build --target wasm32-unknown-unknown --release
-
-# Kernel policy SDK
-cd sdk/tos-ebpf-sdk && cargo build --release
-
-# Build, deploy, inspect, replay, and verification tools
-cd sdk/tos-cli && cargo build --release
+cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
 ```
 
 ## Documentation
@@ -379,12 +349,16 @@ cd sdk/tos-cli && cargo build --release
   notes, and engineering roadmaps
 - [Roadmap](ROADMAP.md) - browser x86-64 architecture, workload milestones,
   acceptance gates, and release definition
-- [Yellow Paper](docs/specs/yellowpaper.md) - kernel architecture and execution model
+- [Use cases](docs/USE-CASES.md) - what the runtime supports today, and what
+  it deliberately does not
 - [Linux Compatibility Notes](docs/LinuxCompat.md) - Linux ABI translation and runtime bring-up
-- [WebAssembly Runtime Specification](docs/specs/WASM-runtime-spec.md) - Wasm execution and host ABI
-- [Wasm Engine Integration](docs/wasm-engine-integration.md) - engine and
-  kernel responsibility boundary
-- [Kernel Policy Specification](docs/specs/eBPF-lite-spec.md) - policy runtime, helpers, maps, and hooks
+- [Performance and memory](docs/performance.md) - what the interpreter costs
+  per browser engine, and what a tab grants it
+
+Several documents under `docs/` describe the bare-metal kernel that has been
+removed — the yellow paper, the Wasm runtime and engine-integration notes, the
+policy specification, and the package manager. They are kept as history and
+are not linked here, because they no longer describe anything in this tree.
 
 ## License
 

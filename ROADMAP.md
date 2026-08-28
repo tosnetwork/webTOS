@@ -2,8 +2,8 @@
 
 ## Mission
 
-webTOS is an AI-agent-first bare-metal operating system kernel designed to run
-inside the browser. Its primary product goal is:
+webTOS is a runtime that executes unmodified Linux x86-64 binaries inside a
+browser tab. Its primary product goal is:
 
 > Run unmodified Linux x86-64 AI agent software locally in the browser, with
 > webTOS-owned isolation, scheduling, storage, networking policy, resource
@@ -315,15 +315,13 @@ to M8 fully covers them:
   replay against. M5's "record network inputs for replay and receipt
   classification" is the only line item, and it is not started.
 
-Joining the TOS agent kernel's model to the Linux runtime is the largest
-unscoped piece of work, and it is what separates webTOS from a Linux emulator
-that happens to run in a tab. The kernel code that embodied that model has
-been removed from this repository — it lived at the root as a separate
-bare-metal crate the browser pivot left behind — so this is now integration
-across projects rather than within one, and it needs a milestone of its own
-before it can be estimated honestly, which is why it is absent from the total
-above
-rather than dragging it down.
+An execution record a third party could check — binding an output to the code,
+the input, and the state that produced it — is the largest unscoped piece of
+work. The bare-metal kernel that once carried that model has been removed from
+this repository, so it is not a matter of wiring up code that is already here;
+it needs a design and a milestone of its own before it can be estimated
+honestly, which is why it is absent from the total above rather than dragging
+it down.
 
 ### Deferred on purpose
 
@@ -332,6 +330,7 @@ rather than dragging it down.
   correct.
 - **Worker cancellation leaving storage consistent** is browser-host work that
   has not started.
+
 ## Product Principles
 
 1. **Correctness before translation speed.** Start with an interpreter. Add
@@ -340,7 +339,7 @@ rather than dragging it down.
    diagnostics, not completion criteria.
 3. **No silent compatibility lies.** An unsupported syscall or instruction
    must return a defined error or trap; it must never report fake success.
-4. **Keep the kernel portable.** Linux semantics must not depend directly on
+4. **Keep the runtime portable.** Linux semantics must not depend directly on
    native page tables, privileged registers, hardware drivers, or raw user
    pointers.
 5. **Browser authority is explicit.** Storage, network, clipboard, files, and
@@ -353,22 +352,19 @@ rather than dragging it down.
 
 ## Current Baseline
 
-The repository holds two stacks, and it is worth being clear about which one
-the milestones above measure.
-
-`crates/` is the browser line and the subject of this roadmap: `x64-engine`
-(interpreter, decoder, guest memory), `linux-compat` (ELF, syscalls,
-processes, VFS, signals, futex, sockets, epoll, pseudoterminals), and
-`webtos-web` + `web/` (the wasm module and its browser host). It compiles to
-`wasm32-unknown-unknown` and executes unmodified Linux x86-64 binaries in
+The repository holds one stack, and this roadmap measures it. `crates/` is
+`x64-engine` (interpreter, decoder, guest memory), `linux-compat` (ELF,
+syscalls, processes, VFS, signals, futex, sockets, epoll, pseudoterminals),
+and `webtos-web` + `web/` (the wasm module and its browser host). It compiles
+to `wasm32-unknown-unknown` and executes unmodified Linux x86-64 binaries in
 Chromium, Firefox, and WebKit.
 
-The original bare-metal TOS kernel — agent scheduler, capabilities, mailboxes,
-energy accounting, keyspaces, checkpoints, receipts, and a Wasm contract
-engine — has been removed from this repository; it was a separate crate the
-browser pivot left behind and nothing on the browser path depended on it. Its
-concepts remain where the browser line is headed, but as a separate project
-to integrate with rather than code in this tree.
+It used to hold two. The original bare-metal TOS kernel — agent scheduler,
+capabilities, mailboxes, energy accounting, keyspaces, checkpoints, receipts,
+and a Wasm contract engine — has been removed; it was a separate crate the
+browser pivot left behind and nothing on the browser path depended on it.
+Where those concepts belong now is an open question rather than pending
+integration work in this tree.
 
 | Component | Where it stands |
 |-----------|-----------------|
@@ -376,12 +372,12 @@ to integrate with rather than code in this tree.
 | ELF64 loading | Static and dynamic (musl and glibc loaders) into sparse guest memory |
 | Linux compatibility | Processes, VFS, memory, signals, futex, sockets, poll/epoll, pseudoterminals — all portable, no native x86-64 dependency |
 | Browser host | Workers, terminal, OPFS persistence, relayed networking, and streamed image delivery, gated in three engines |
-| Agent kernel (`src/`) | Scheduler, capabilities, mailboxes, energy, events, keyspaces, checkpoints, receipts — native only; no platform-neutral host boundary yet |
-| Runtime validation | Native Java, Node.js, Python, and Linux maturity harnesses; browser workload and recovery gates are partial |
+| Resource control | Memory, CPU, storage, network bytes, and the event log all have enforced ceilings; over-budget returns an errno |
+| Execution records | Deterministic replay and recorded traces exist; nothing produces a record a third party could check |
 
-The central new component, the x86-64 execution engine, exists. What is not
-yet joined up is the agent kernel's model — capabilities, energy, receipts —
-with the Linux runtime that now works in the browser.
+The central component, the x86-64 execution engine, exists and the Linux
+runtime on top of it works in a browser. What does not exist is any way for
+someone outside the tab to verify what ran in it.
 
 ## Target Architecture
 
@@ -1247,7 +1243,6 @@ The intended source layout is:
 crates/
   x64-engine/       # CPU, decoder, interpreter, guest memory, block cache
   linux-compat/     # ELF and Linux userspace semantics over portable traits
-  webtos-kernel/    # agents, capabilities, scheduler, state, receipts
   browser-host/     # Web-facing platform adapters and worker protocol
 web/
   app/              # terminal and control interface
