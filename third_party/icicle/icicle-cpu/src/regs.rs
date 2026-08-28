@@ -109,6 +109,20 @@ impl Regs {
         self.0.fill(val);
     }
 
+    /// The whole register space as raw bytes. The JIT emits wasm that reads
+    /// and writes these same offsets, so a bit-for-bit comparison of this
+    /// against a JIT run is the block-level form of the trace-suite gate.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    /// The size of the register space in bytes.
+    pub const SIZE: usize = REGISTER_SPACE_BYTES;
+
     #[inline(always)]
     pub fn var_offset(var: pcode::VarNode) -> isize {
         REG_OFFSET + (var.id as isize * 16 + var.offset as isize)

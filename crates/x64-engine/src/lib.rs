@@ -15,6 +15,7 @@
 pub mod build;
 pub mod decode;
 pub mod linux_min;
+pub mod jit;
 pub mod vm;
 
 pub use build::{build_x64_vm, BuildError, EngineConfig};
