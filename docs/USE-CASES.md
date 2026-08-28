@@ -1,361 +1,399 @@
-# TOS Use Cases
+# webTOS Use Cases
 
-TOS is a minimal trusted execution substrate for autonomous agents. It is not a general-purpose operating system. Its value comes from a unique combination of capabilities that no single existing platform provides together:
+webTOS runs unmodified Linux x86-64 programs inside a browser tab, on an
+execution model that meters what they spend and can reproduce what they did.
 
-- Deterministic execution with cryptographic receipts
-- Capability-based agent isolation
-- Energy metering (execution budgets)
-- Cross-node agent migration
-- SHA-256 Merkle state proofs
-- Ed25519 signed authority chains
-- TPM 2.0 measured boot attestation
+That sentence covers two things at very different stages of completion, and
+this document keeps them apart. Reading them as one thing is how the previous
+version of this file came to describe daemons that were never written.
 
-This document describes 13 application scenarios where these capabilities provide real value, each with a concrete usage example.
+- **The browser runtime** — the x86-64 engine, the Linux compatibility layer,
+  and the browser host — runs real workloads today, gated by tests in
+  Chromium, Firefox, and WebKit. **Part 1** is what it supports.
+- **The agent kernel** — capabilities, energy, mailboxes, keyspaces,
+  receipts, policy, attestation — exists in the native bare-metal kernel and
+  is *not* integrated into the browser runtime. **Part 2** is what it supports
+  natively, and what each scenario still needs to reach a tab.
+- **Part 3** lists what neither has, so that an idea does not get read as a
+  feature a second time.
 
----
-
-## 1. Trusted AI Agent Execution
-
-**Problem**: AI agents (LangChain, AutoGPT, custom models) run in opaque environments. Clients cannot verify what the agent actually did, whether it consumed the claimed resources, or whether the output is authentic.
-
-**How TOS solves it**:
-
-```
-User → deploys AI agent as WASM package (.tos)
-TOS → executes in ProofGrade mode (deterministic, no floats/SIMD)
-     → generates ExecutionReceipt with:
-       - code_hash (what ran)
-       - input_commitment / output_commitment (what went in and came out)
-       - initial_state_root / final_state_root (how state changed)
-       - energy_used (how much compute was consumed)
-       - Ed25519 signature (which node attests to the result)
-Third party → verifies receipt offline without re-executing
-```
-
-**Example**: A legal tech company deploys an AI contract review agent. The client submits a 50-page contract as input. TOS runs the agent in ProofGrade mode, producing a receipt that proves: the exact model version `code_hash=0xA3F2...` processed input `input_commitment=0x7B01...`, consumed 340,000 energy units, and produced output `output_commitment=0xE891...`. The client's auditor verifies the receipt with the verifier SDK — no need to re-run the model or trust the provider's infrastructure.
-
-**Target users**: AI SaaS providers, enterprise AI automation, AI auditing platforms.
-
-**Key TOS features used**: RuntimeClass (ProofGrade), ExecutionReceipt, Ed25519 signing, fuel metering.
+Every status claim below is traceable: [`ROADMAP.md`](../ROADMAP.md) for
+milestones and their evidence, [`performance.md`](performance.md) for numbers,
+[`README.md`](../README.md) for how to run any of it.
 
 ---
 
-## 2. Billable Compute Marketplace
+# Part 1 — What the browser runtime supports today
 
-**Problem**: Decentralized compute networks (Akash, Golem, Flux) lack fine-grained, verifiable billing. Providers can overcharge; requesters can dispute without evidence.
+## The capability surface
 
-**How TOS solves it**:
+| Capability | Where it is proven |
+|---|---|
+| Unmodified Linux x86-64 ELF, static and dynamic (musl and glibc loaders) | M1–M3, green natively and in all three engines |
+| Processes, threads, futexes, signals, process groups, job control | M4; `EINTR`/`SA_RESTART` semantics gated through both a terminal and a socket |
+| Pseudoterminals, full-screen TUIs, SIGWINCH on resize | M7; `vi` and the real Codex TUI both render and take keystrokes |
+| Sockets, epoll, DNS and TLS performed by the guest itself | M5; the guest terminates its own TLS, so the host relays bytes, not requests |
+| Network reachable only through a deny-by-default relay | `tools/webtos_gateway.mjs`; with no `--allow` rule it starts and refuses everything |
+| Filesystem persistence across a real page reload | M2/M6; OPFS-backed snapshot, restored into a fresh machine |
+| Deterministic execution | identical instruction counts across Chromium, Firefox, and WebKit, gated against recorded architectural traces |
+| Session record and offline replay | M5; a recorded session replays with no network at all |
+| Budgets on memory, storage, network bytes, CPU, and the event log | `wtw_set_*_budget_*`; over-budget returns an errno the guest already handles |
+| Per-agent secret injection, kept out of disk snapshots | M5; an out-of-scope program reads a placeholder, not an empty value |
+| Signed image manifests | host verifies the signature, the module enforces the content hashes and refuses an image the manifest does not name |
+| Streamed image delivery | a 52 MB agent binary reaches a shell prompt in about three seconds without ever being held whole |
 
-```
-Compute provider → runs TOS nodes
-Requester → submits WASM workload + energy budget
-TOS → executes with fuel metering
-     → produces receipt (energy_used, pricing_class, state transition proof)
-Requester → verifies receipt, settles payment based on actual consumption
-```
-
-No blockchain consensus needed for billing — the receipt itself is the verifiable invoice. Cheaper than Ethereum (no global re-execution), more trustworthy than AWS Lambda (cryptographic proof of execution).
-
-**Example**: A machine learning team submits a feature engineering WASM module to a compute marketplace. They pre-pay 1,000,000 energy units. The TOS node executes the module, consuming 847,293 energy units. The receipt shows `energy_used=847293`, `pricing_class=2` (ProofGradeWasm). The quotad agent estimated 900,000 before execution — close to actual. The team pays only for 847,293 units. The billingd agent aggregates this into their monthly invoice, keyed by their `principal_id`.
-
-**Target users**: Decentralized compute networks, pay-per-use AI inference, edge compute billing.
-
-**Key TOS features used**: FuelCosts (dynamic metering), ExecutionReceipt, quotad (cost estimation), billingd (settlement).
-
----
-
-## 3. Regulated Computation with Compliance Audit
-
-**Problem**: Financial and healthcare computation must prove it followed specific rules. Current systems rely on trust in the operator, not cryptographic evidence.
-
-**How TOS solves it**:
-
-```
-Regulator → defines policy bundle (eBPF rules + authority roots)
-Enterprise → runs regulated computation on TOS
-TOS → enforces policy at every capability check
-     → emits authority audit trail (AuthGrant/AuthDeny/AuthRevoke events)
-     → generates receipt with policy_bundle_hash + policy_decision_commitment
-Regulator → verifies receipt + audit trail offline
-```
-
-The receipt proves: this code ran, under this policy, with this authority, producing this state change. No need to trust the operator's word.
-
-**Example**: A bank runs an anti-money-laundering (AML) screening agent on TOS. The regulator provides a policy bundle that restricts the agent to: read-only access to the transaction keyspace, no network capability, 60-second execution timeout (energy limit). TOS enforces these rules — the agent cannot `sys_send` because it lacks `SendMailbox` capability. After execution, the receipt includes `policy_bundle_hash=0x9C44...` and the auditd log shows exactly which capabilities were checked and whether each was granted or denied. The regulator's compliance tool verifies the receipt against the known-good policy hash.
-
-**Target users**: Financial institutions, healthcare data processing, government compliance systems.
-
-**Key TOS features used**: PolicyBundle, authd/auditd, capability leases with expiry, receipt authority_commitment.
+Throughput is roughly half of native on Chromium and WebKit (about 11 M
+instructions/s against 21 M), and about a tenth of that on Firefox. A tab
+grants roughly 3.9 GiB. Read [`performance.md`](performance.md) before
+committing to a workload; run the harnesses on the machine you care about
+rather than trusting those numbers.
 
 ---
 
-## 4. Edge AI Inference Nodes
+## 1. Zero-install development environments
 
-**Problem**: AI inference on edge devices (autonomous vehicles, IoT, defense) must prove the model ran correctly and was not tampered with. Edge devices cannot run full Linux + container stacks.
+**Problem**: browser IDEs either ship a JavaScript reimplementation of the
+tools (so the tool is not the tool), or rent a container per user (so every
+idle tab costs money and every user's code runs on your infrastructure).
 
-**How TOS solves it**:
+**What webTOS provides**: the actual binaries. The host `git` runs real
+repository operations in the guest — status, diff, add, commit, log. BusyBox
+provides a shell with pipelines and job control. `vi` runs full-screen on a
+pseudoterminal that turns `^C` and `^Z` into signals on the foreground
+process group, and `fg` resumes what `^Z` stopped.
 
-```
-Cloud → packages AI model as signed .tos WASM package
-Edge device → boots TOS (bare metal, no Linux, ~100KB kernel)
-           → ProofGrade execution + generates receipt
-Cloud → verifies inference result authenticity via receipt
-```
+**Worked example**: a documentation site embeds a working checkout of the
+project being documented. The reader edits a file in `vi`, runs the project's
+own build command, and sees it fail the same way it fails locally — because it
+is the same binary reading the same bytes. Nothing was ported, and the tab is
+the entire backend.
 
-TOS boots in milliseconds on bare metal, runs WASM with deterministic execution, and produces a cryptographic receipt — all without an OS, container runtime, or network dependency.
-
-**Example**: An autonomous vehicle manufacturer deploys a pedestrian detection model on edge compute units inside each vehicle. The model is compiled to WASM, signed with Ed25519 (`atp build model.wasm -o detector.tos && atp sign detector.tos`), and installed via pkgd. Every inference run produces a receipt with `code_hash` matching the signed package. After an incident, the manufacturer can prove to regulators: "This exact model version ran, on an attested device (TPM PCR 0 = kernel hash), and produced this classification output at tick 47,291." The TPM measured boot chain proves the TOS kernel itself was unmodified.
-
-**Target users**: Autonomous vehicle verification, IoT secure inference, aerospace/defense.
-
-**Key TOS features used**: no_std bare-metal boot, wasbi (WASM engine), ProofGrade RuntimeClass, UEFI boot, TPM 2.0 measured boot, .tos signed packages.
-
----
-
-## 5. Multi-Party Computation Coordination
-
-**Problem**: Multiple parties need to compute on private data and share results, but neither party trusts the other's execution environment.
-
-**How TOS solves it**:
-
-```
-Party A → submits agent (processes A's private data in encrypted keyspace)
-Party B → submits agent (processes B's private data in encrypted keyspace)
-TOS → executes both in isolated keyspaces (capability prevents cross-access)
-     → agents exchange results via mailbox (no direct memory access)
-     → each party receives the other's ExecutionReceipt as evidence
-     → neither party sees the other's raw data
-```
-
-Agent isolation (capability-scoped access) + encrypted keyspaces + receipts provide a lightweight multi-party computation framework without MPC protocols or TEE hardware.
-
-**Example**: Hospital A and Hospital B want to jointly train a disease prediction model without sharing patient records. Each hospital deploys an agent on TOS that computes gradient updates from their local data (stored in their encrypted keyspace). The agents exchange only aggregated gradients via mailbox — never raw patient data. Each round produces two receipts. Hospital A can verify Hospital B's receipt to confirm: the correct model code ran (`code_hash`), the state changed as expected (`final_state_root`), and the computation consumed the agreed energy budget. Neither hospital can read the other's keyspace because neither holds the `StateRead` capability for the other's keyspace.
-
-**Target users**: Federated learning, cross-institutional data collaboration, privacy-preserving analytics.
-
-**Key TOS features used**: Capability isolation, encrypted keyspaces, mailbox IPC, ExecutionReceipt.
+**What it costs**: compute is the reader's, not yours. What you serve is a
+wasm module and an image.
 
 ---
 
-## 6. Off-Chain Execution Layer for gtos L1
+## 2. Agents that run in the user's browser
 
-**Problem**: Layer 1 blockchains cannot scale complex computation on-chain. Every validator re-executing every transaction is the bottleneck.
+**Problem**: an AI coding agent needs a filesystem, subprocesses, a terminal,
+and network access. Giving it those on a server means the operator inherits
+the blast radius; giving it those on the user's machine directly means no
+boundary at all.
 
-**How TOS solves it**:
+**What webTOS provides**: the boundary is the tab, and the authority is
+explicit. The guest has no network whatsoever until the page asks for one, and
+then only to destinations an `--allow` rule names. Credentials are injected at
+runtime, scoped to the agent that should see them, and stay out of filesystem
+snapshots. Memory, CPU, storage, and network bytes all have ceilings, and
+crossing one produces an errno rather than a dead tab.
 
-```
-gtos L1 → submits complex computation to TOS execution node
-TOS → ProofGrade WASM execution
-     → generates ExecutionReceipt with:
-       - initial_state_root (Merkle root before)
-       - final_state_root (Merkle root after)
-       - trace_commitment (syscall transcript hash)
-gtos → verifies receipt (fast: check signature + state roots)
-     → optionally generates Halo 2 ZK proof from receipt + transcript
-     → on-chain: verify proof in O(1), no re-execution needed
-```
+**Worked example**: OpenFox — a 52 MB static Linux agent — streams into a
+clean browser profile, reaches a prompt in about three seconds, and performs a
+scripted network-backed task against a mounted repository. Its configuration
+and repository changes survive a reload. A 1,000-round soak ran 3,673 seconds
+with the filesystem, guest physical memory, and the lifted-block table all
+bounded.
 
-This is TOS's most strategic use case. The ExecutionReceipt format is designed to feed directly into gtos's Halo 2 proving pipeline. TOS provides the trusted execution; gtos provides the consensus and settlement.
-
-**Example**: A DeFi protocol on gtos needs to compute a complex portfolio rebalancing across 10,000 positions — too expensive for on-chain execution. The protocol submits the rebalancing logic as a WASM agent to an TOS execution node. TOS runs it in ProofGrade mode, recording every syscall in the transcript. The receipt shows `initial_state_root=0x1A2B...` → `final_state_root=0x5C6D...` with `energy_used=2,400,000`. The gtos node feeds the receipt + ReplayBundle into its Halo 2 prover (`tos-prover`), which generates a SNARK proof that the state transition is valid. On-chain, validators verify the 5KB proof in 2ms — no need to re-execute the 2.4M-instruction computation.
-
-**Target users**: gtos / TOS Network, any L1/L2 needing verifiable off-chain execution.
-
-**Key TOS features used**: ProofGrade WASM (wasbi), ExecutionReceipt, SHA-256 Merkle state roots, replay transcript, ReplayBundle/ProofBundle.
-
----
-
-## 7. Autonomous Agent Orchestration
-
-**Problem**: Complex workflows require multiple agents cooperating across machines — but agents crash, machines fail, and state gets lost.
-
-**How TOS solves it**:
-
-```
-Orchestrator → spawns agents across TOS nodes via routerd
-Agent A (Node 1) → processes data, sends result to Agent B via cross-node mailbox
-Agent B (Node 2) → receives, processes, updates state
-Node 2 fails → failover_d detects via membership_d heartbeat timeout
-            → restores Agent B from PortableCheckpoint on Node 3
-            → Agent B resumes with full state + authority context preserved
-```
-
-Agent state, authority, and mailbox continuity survive node failures. The checkpoint includes not just data but the agent's capability set and energy budget.
-
-**Example**: A logistics company runs a multi-agent supply chain optimization system. Agent A (demand forecasting) runs on Node 1 in a US data center. Agent B (route planning) runs on Node 2 in Europe. Agent A completes its forecast and sends the result to Agent B via `SYS_SEND_REMOTE` — routerd wraps the message with a signed RoutingHeader and delivers over UDP. Midway through Agent B's computation, Node 2 crashes. The membership_d on Node 1 detects the missed heartbeat after 30 seconds. failover_d finds Agent B in its watch list, queries placement_d for the best alternate node (Node 3, in the same region, with available energy), and restores Agent B from its last PortableCheckpoint. Agent B resumes with its full keyspace state, capability set, and remaining energy budget intact.
-
-**Target users**: Multi-agent AI systems, distributed workflow engines, resilient automation.
-
-**Key TOS features used**: PortableCheckpoint, routerd (cross-node routing with Ed25519 verification), membership_d, failover_d, placement_d, SYS_SEND_REMOTE.
+**Status**: OpenFox is M6 ✅. Codex runs end to end on the native host in both
+non-interactive and interactive modes, and the browser has the terminal half
+of it; carrying Codex's own image into a tab is the open half of M7.
 
 ---
 
-## 8. Zero-Trust Remote Administration
+## 3. Client-side sandboxing of untrusted binaries
 
-**Problem**: Traditional systems use SSH/shell for remote administration, which grants broad access and is difficult to audit. Compromised SSH keys can lead to complete system takeover.
+**Problem**: online judges, CTF platforms, plugin systems, and
+"run this user's script" features all need to execute code nobody trusts. The
+usual answer is a container fleet — cost, isolation, and abuse handling all at
+once.
 
-**How TOS solves it**:
+**What webTOS provides**: the untrusted code runs inside the submitter's own
+browser, inside a wasm module, with no ambient authority. It cannot reach the
+network unless a relay rule names the destination. It cannot outrun its CPU
+budget, outgrow its memory cap, or fill storage. The x86-64 decoder and the
+syscall argument surface have both been swept adversarially — every opcode in
+all four maps under seventeen prefix combinations, and every argument position
+of every syscall number against a corpus of the ways a number breaks code that
+trusts it.
 
-```
-Operator → sends signed admin command via mailbox to admind
-admind → verifies operator's principal_id + capability lease
-       → checks policy bundle allows the operation
-       → executes command (STATUS, AGENT_LIST, AGENT_KILL, etc.)
-       → emits audit event for every admin action
-       → returns result via mailbox
-```
-
-No shell, no SSH, no root login. Every admin action goes through authenticated, capability-checked, audited mailbox messages.
-
-**Example**: A cloud operator needs to check the health of an TOS appliance and terminate a misbehaving agent. They send a `STATUS` (0x01) command to admind's mailbox using their Ed25519-signed principal credential. admind verifies the principal is active (not revoked), checks the capability lease hasn't expired, and returns system metrics: 12 agents running, 847M energy consumed, 3.2M syscalls processed. The operator then sends `AGENT_KILL` (0x03) for agent ID 7 — admind verifies the operator holds the `AgentTerminate` capability, terminates the agent, and emits an `AuthGrant` audit event. The entire interaction is recorded in auditd's log — who did what, when, under what authority.
-
-**Target users**: Cloud operators, managed service providers, security-conscious enterprises.
-
-**Key TOS features used**: admind (mailbox-based administration), capability leases with expiry, authd/auditd, Ed25519 principal verification, no shell access.
-
----
-
-## 9. Verifiable AI Training Pipeline
-
-**Problem**: AI model training can be tampered with — poisoned data, modified hyperparameters, or swapped model checkpoints. Downstream consumers have no way to verify the training process was legitimate.
-
-**How TOS solves it**:
-
-```
-Training pipeline → each training step is an TOS agent
-                  → each step produces a receipt with:
-                    - code_hash (training code version)
-                    - input_commitment (dataset hash)
-                    - output_commitment (model checkpoint hash)
-                    - initial_state_root → final_state_root (parameter changes)
-                    - trace_commitment (full syscall transcript)
-Auditor → chains the receipts to verify: correct code + correct data → correct model
-```
-
-**Example**: A pharmaceutical company trains a drug interaction prediction model. The training has 3 steps: data preprocessing, model training, and evaluation. Each step runs as a ProofGrade WASM agent on TOS. The preprocessing agent produces receipt R1 with `output_commitment=hash(cleaned_dataset)`. The training agent takes `input_commitment=hash(cleaned_dataset)` (matching R1's output) and produces receipt R2 with `output_commitment=hash(model_weights)`. The evaluation agent takes the model weights and test data, producing receipt R3 with the accuracy score in its output. An FDA auditor can chain R1→R2→R3 to verify: the correct preprocessing code ran on the declared dataset, the correct training code produced the model, and the evaluation used the same model. Any tampering breaks the hash chain.
-
-**Target users**: Pharma/biotech model validation, AI safety auditing, ML governance platforms.
-
-**Key TOS features used**: ProofGrade execution, ExecutionReceipt chain (input_commitment matches prior output_commitment), transcript, code_hash verification.
+**Worked example**: a judge serves the problem's reference binary and the
+submitted one, runs both in the tab, and compares outputs. A submission that
+tries to escape meets a module whose failure mode is a trapped tab, not a
+compromised host. Determinism means the same submission produces the same
+instruction count on every grader's machine.
 
 ---
 
-## 10. Cross-Organization Agent Delegation
+## 4. Local processing of data that must not leave
 
-**Problem**: Organizations need to grant temporary, scoped execution authority to partners — but traditional API keys are all-or-nothing and don't expire safely.
+**Problem**: legal, medical, and financial documents are exactly the files
+that cannot be uploaded, and exactly the files with mature command-line tools
+for processing them.
 
-**How TOS solves it**:
+**What webTOS provides**: those tools, unmodified, running where the file
+already is. With no relay configured, there is no network to leak through —
+not as a policy, but as a fact about the runtime.
 
-```
-Org A → creates capability lease for Org B:
-        - scope: read Org A's public data keyspace
-        - expiry: 24 hours
-        - delegation_depth: 0 (B cannot re-delegate)
-        - Ed25519 signed by Org A's principal
-Org B → deploys agent on TOS with the leased capability
-TOS → enforces expiry on every capability check
-     → after 24 hours, Org B's agent loses access automatically
-```
-
-**Example**: A supply chain consortium has 5 organizations. Org A (manufacturer) grants Org B (logistics) a 48-hour read capability on its inventory keyspace, with `delegation_depth=1` so Org B can sub-delegate to its trucking partner Org C. Org B's agent reads inventory levels and sends logistics plans to Org A via mailbox. After 48 hours, `is_expired()` returns true and all of Org B's (and Org C's) access is revoked — no manual cleanup needed. If Org A discovers Org B is misbehaving, it sends a REVOKE command to authd, which immediately adds Org B's principal to the revocation list. The next time Org B's agent tries any capability-gated operation, `is_principal_revoked()` blocks it.
-
-**Target users**: Supply chain consortiums, B2B data sharing, temporary partner access.
-
-**Key TOS features used**: Capability leases (expiry_ticks, delegation_depth), Ed25519 signed delegation, authd revocation, automatic expiry enforcement.
+**Worked example**: a clinic's intake tool runs an existing de-identification
+pipeline in the browser. Records are read from the local filesystem, processed
+by the same binary the compliance team already reviewed, and written back. The
+audit question "could this have transmitted anything?" is answered by the
+absence of a gateway, and by the relay's log if one was configured at all.
 
 ---
 
-## 11. Metered API Gateway
+## 5. Reproducible teaching, demonstration, and bug reproduction
 
-**Problem**: Traditional API billing is based on request counts or time — not actual computation consumed. Providers eat the cost of expensive queries; consumers overpay for cheap ones.
+**Problem**: "works on my machine" is expensive at every scale — a course
+where a third of the class cannot install the toolchain, a support ticket that
+cannot be reproduced, a security demonstration that needs a VM.
 
-**How TOS solves it**:
+**What webTOS provides**: identical input retires an identical instruction
+stream in every engine, and that is gated rather than assumed —
+`test_data/traces/` holds architectural traces (the syscall stream with its
+arguments, delivered signals, and register and flag samples at exact
+instruction counts) that the browser matrix reproduces register for register.
+A session can be recorded and replayed later with no network.
 
-```
-API consumer → sends request to TOS-backed API endpoint
-TOS → quotad estimates cost before execution
-     → consumer confirms or rejects
-     → execution runs with fuel metering
-     → receipt shows exact energy_used
-     → billingd aggregates by principal_id
-     → monthly invoice reflects actual computation, not request count
-```
-
-**Example**: A data analytics API charges per computation, not per request. A simple lookup costs 500 energy units; a complex aggregation costs 50,000. Consumer submits a query — quotad returns an estimate of 12,000 energy units. Consumer approves. TOS executes and produces a receipt with `energy_used=11,847`. The consumer pays for 11,847 units. Next month, billingd produces an invoice for the consumer's `principal_id` showing: 342 requests, 2,847,291 total energy, $28.47 at $0.00001/energy. Every line item is backed by a verifiable receipt.
-
-**Target users**: API-as-a-service platforms, metered SaaS, compute-intensive API providers.
-
-**Key TOS features used**: quotad (pre-execution cost estimation), FuelCosts (per-instruction metering), billingd (per-principal aggregation), ExecutionReceipt.
+**Worked example**: a bug report ships as a URL and a recorded session. Whoever
+opens it gets the same instructions, the same syscall returns, and the same
+failure — including the network responses, replayed from the recording rather
+than re-fetched. A course assignment ships the same way, and a student's
+environment cannot drift from the instructor's.
 
 ---
 
-## 12. Signed Software Supply Chain
+## 6. Distributing a command-line tool as a link
 
-**Problem**: Software supply chain attacks (SolarWinds, Log4j) exploit the gap between "code was built" and "code is running." There's no cryptographic proof that the binary running in production matches the signed source.
+**Problem**: an internal x86-64 tool has users who cannot install it —
+wrong platform, no admin rights, or not worth the support burden.
 
-**How TOS solves it**:
+**What webTOS provides**: publish the binary and the module. The tool becomes
+a URL. No port, no container, no installer, no rebuild.
 
-```
-Developer → atp build agent.wasm -o agent.tos
-         → atp sign agent.tos (Ed25519 signature over manifest + code hash)
-CI/CD    → atp verify agent.tos (checks signature + code hash)
-         → submits to pkgd on TOS node
-pkgd     → verifies manifest signature
-         → checks code_hash matches actual binary
-         → installs package
-TOS     → every execution receipt includes code_hash
-         → TPM measured boot proves kernel integrity
-         → full chain: developer → build → sign → deploy → execute → receipt
-```
-
-**Example**: A security team deploys a threat detection agent. The developer builds `threat_detector.tos` with `atp build`, signs it with the team's Ed25519 key, and pushes to the TOS node. pkgd verifies the signature matches the team's registered principal. On every execution, the receipt includes `code_hash=0xB7F3...` which matches the signed manifest. If an attacker tries to swap the binary, the code hash won't match the signed manifest — pkgd rejects the installation. If the attacker compromises the kernel, the TPM PCR values change — remote attestation fails. The chain is: signed source → verified build → attested kernel → receipt-proven execution.
-
-**Target users**: Security-sensitive deployments, government/military, regulated industries.
-
-**Key TOS features used**: atp CLI (build/sign/verify), pkgd (signature verification), .tos package format, TPM 2.0 measured boot, ExecutionReceipt code_hash.
+**Worked example**: an infrastructure team's log analyzer is a static Go
+binary. It is put behind a page. Support engineers paste a log into the tab
+and get the same output the on-call engineer gets from their shell, with the
+log never leaving the browser.
 
 ---
 
-## 13. Disaster Recovery Orchestration
+# Part 2 — What the native kernel supports
 
-**Problem**: When infrastructure fails, restoring distributed agent workloads requires manual intervention — finding checkpoints, re-provisioning, restoring state, and re-establishing authority.
+Everything in this part runs on the bare-metal x86-64 kernel in `src/`. None of
+it is wired into the browser runtime yet — in the architecture diagram in
+`README.md` it is the dashed box. Each scenario names what exists and what it
+still needs, so that "webTOS could do this" and "webTOS does this" stay
+distinguishable.
 
-**How TOS solves it**:
+## What exists natively
 
-```
-Normal operation:
-  failover_d → watches critical agents via WATCH_AGENT
-  membership_d → monitors node heartbeats
-
-Node failure detected:
-  membership_d → reports NODE_DOWN to failover_d
-  failover_d → for each affected agent:
-    1. Queries placement_d for best alternate node
-    2. Loads PortableCheckpoint (state + authority + energy)
-    3. Restores agent on alternate node
-    4. Emits AgentMigrate event for audit trail
-```
-
-**Example**: A financial services firm runs 50 TOS agents across 5 nodes for real-time risk calculation. Node 3 (hosting 12 agents) suffers a hardware failure. Within 30 seconds, membership_d on the remaining nodes detect the missed heartbeat. failover_d identifies the 12 affected agents from its watch table. For each agent, it queries placement_d — which selects the node with the most available energy and matching hardware class. The agents are restored from their PortableCheckpoints on Nodes 1, 2, 4, and 5, resuming with their full keyspace state, capability sets, and remaining energy budgets. The firm's monitoring dashboard (connected to observabilityd) shows the migration events in real time. Total recovery time: under 60 seconds, zero data loss, zero manual intervention.
-
-**Target users**: Financial services, critical infrastructure, high-availability enterprise systems.
-
-**Key TOS features used**: failover_d (automated recovery), membership_d (heartbeat monitoring), placement_d (intelligent node selection), PortableCheckpoint (full state + authority serialization), routerd (cross-node coordination).
+| Subsystem | File |
+|---|---|
+| Agents, scheduling, energy accounting | `src/agent.rs`, `src/sched.rs`, `src/energy.rs`, `src/cost.rs` |
+| Capabilities: typed, targeted, use-limited, delegated as a subset, revocable by the parent | `src/capability.rs` |
+| Mailboxes | `src/mailbox.rs`, `src/large_msg.rs` |
+| Keyspaces and SHA-256 Merkle state roots | `src/state.rs`, `src/merkle.rs`, `src/persist.rs` |
+| Signed `ExecutionReceipt`, `ReplayBundle`, `ProofBundle` | `src/receipts.rs`, `src/proof.rs` |
+| Checkpoint and replay | `src/checkpoint.rs`, `src/replay.rs` |
+| eBPF-lite policy engine | `src/ebpf/`, `src/policy.rs`, `src/agents/policyd.rs` |
+| TPM 2.0 measured boot and attestation (signs and verifies) | `src/attestation.rs`, `src/arch/x86_64/tpm.rs` |
+| Wasm runtime with runtime classes including ProofGrade | `src/wasm/`, `third_party/wasbi` |
+| `.tos` packages | `src/package.rs`, `src/agents/pkgd.rs` |
+| System agents: accountd, auditd, compactd, netd, pkgd, policyd, skilld, stated | `src/agents/` |
+| CLI: `tos build`, `deploy`, `replay`, `inspect`, `verify` | `sdk/tos-cli/` |
 
 ---
 
-## What TOS Is Not For
+## 7. Verifiable agent execution
+
+**Problem**: a client who buys an agent's output cannot check what produced
+it — which code version ran, on which input, consuming what.
+
+**What the kernel provides**: an agent exiting produces an `ExecutionReceipt`
+binding `code_hash`, `package_hash`, `input_commitment`,
+`output_commitment`, `initial_state_root`, `final_state_root`,
+`event_log_commitment`, `trace_commitment`, `energy_used`, the tick range, and
+the runtime class, signed with the node's Ed25519 key
+(`src/receipts.rs:78`). A `ReplayBundle` carries what is needed to re-execute
+it; a `ProofBundle` carries what is needed to check it without re-executing.
+
+**Worked example**: a contract-review agent runs in ProofGrade mode. The
+receipt says which model version processed which input, how much energy it
+consumed, and what state it left. An auditor holding the receipt and the
+node's public key can tell whether the provider's claims are consistent with
+it.
+
+**What this still needs**:
+- **Offline signature verification in a tool.** Receipts are signed, but
+  `tos verify` checks a proof's hash chain (`sdk/tos-cli/src/proof.rs`), not
+  the receipt's Ed25519 signature. Until a verifier checks the signature, a
+  third party is trusting the transport.
+- **Browser integration.** No receipt is emitted for a browser session.
+
+---
+
+## 8. Metered execution
+
+**Problem**: request-count billing overcharges cheap calls and undercharges
+expensive ones, and neither side can audit the other's meter.
+
+**What the kernel provides**: energy is deducted per instruction, per
+syscall, and per message; an agent that exhausts its budget is suspended by
+the scheduler rather than by a supervisor. `accountd` exposes cumulative
+per-agent consumption over a mailbox, and `energy_used` is a signed field of
+the receipt rather than a log line.
+
+**Worked example**: an analytics endpoint charges by energy. A cheap lookup
+and an expensive aggregation are distinguished by the meter that actually
+stopped the work, and every line item on the invoice has a receipt behind it.
+
+**What this still needs**: pre-execution cost estimation and invoice
+aggregation are not implemented — an earlier draft of this document named
+`quotad` and `billingd` as if they existed. Settlement is also out of scope
+for the kernel: it belongs to the TOS Service layer.
+
+---
+
+## 9. Policy-constrained computation with an audit trail
+
+**Problem**: regulated computation must show it followed rules, and an
+operator's word is not evidence.
+
+**What the kernel provides**: capabilities are checked, not assumed — an
+agent without `SendMailbox` cannot send, and cannot acquire the ability at
+runtime, because delegation can only narrow (`is_subset_of`,
+`src/capability.rs:95`). A policy bundle written for the eBPF-lite engine runs
+at capability check points, and `auditd` collects the grant, delegate, revoke,
+renew, and deny events into a queryable log.
+
+**Worked example**: a screening agent is given read access to one keyspace, no
+network capability, and a bounded energy budget. Whether each capability check
+was granted or denied is in the audit log, and the policy that decided it is
+identified by hash in the receipt.
+
+**What this still needs**:
+- **Time-bounded and depth-bounded delegation.** The capability model has a
+  use-count limit and parent-child revocation. It has no expiry, no
+  delegation-depth limit, and no principal revocation list — an earlier draft
+  described all three.
+- **Encryption.** Keyspaces are isolated by capability. They are not
+  encrypted; there is no encryption in the kernel at all.
+
+---
+
+## 10. An off-chain execution layer for TOS
+
+**Problem**: every validator re-executing every transaction bounds what an L1
+can compute.
+
+**What the kernel provides**: a deterministic execution class, Merkle state
+roots before and after, a syscall transcript commitment, and a receipt that
+binds them together. The `ProofBundle` format is shaped for a proving
+pipeline: verify a small artifact rather than re-run the work.
+
+**Why this is the strategic one**: it is the seam where webTOS meets the rest
+of the ecosystem. Finalized TOS chain state is the authority; webTOS is where
+the work happens and where the evidence is produced.
+
+**What this still needs**: the proving pipeline itself, and the settlement
+integration. What exists is the evidence format, not the proof system.
+
+---
+
+## 11. Attested software supply chain
+
+**Problem**: the gap between "this code was signed" and "this code is
+running" is where supply chain attacks live.
+
+**What exists, and this one reaches the browser**: the browser host already
+enforces the second half. A signed image manifest is verified by the platform's
+audited verifier on the host side; the module then checks that delivered bytes
+match what the manifest names, and refuses any image the manifest does not
+name — including through the streaming path, so delivery cannot skip the
+check (`crates/webtos-web/src/lib.rs:873`). The module deliberately does not
+verify the signature itself: a hand-rolled verifier in a security boundary
+fails open, which is worse than no verifier at all.
+
+Natively, `.tos` packages carry a manifest with declared capabilities and a
+`code_hash` that `pkgd` checks against the installed bytes, and TPM measured
+boot extends the chain down to the kernel image.
+
+**What this still needs**: the `.tos` manifest carries a 64-byte signature
+field, but nothing verifies it — `pkgd` checks the code hash only
+(`src/package.rs:50`). A package signature that is transported but not
+checked is not a signature. Note also that the CLI has no `sign` subcommand;
+an earlier draft of this document documented an `atp sign` workflow that does
+not exist.
+
+---
+
+## 12. Isolated multi-party collaboration
+
+**Problem**: two parties want a joint result without either trusting the
+other's execution environment or seeing the other's data.
+
+**What the kernel provides**: each party's agent runs against its own
+keyspace, which the other holds no capability for. They exchange results
+through bounded mailboxes rather than shared memory, and each round leaves a
+receipt the other party can inspect.
+
+**Worked example**: two institutions compute aggregate statistics over their
+own records and exchange only the aggregates. Neither agent can read the
+other's keyspace, because neither was granted the capability, and neither can
+grant itself one.
+
+**What this still needs**: this is isolation, not confidentiality. Keyspaces
+are not encrypted, so the guarantee is against the other *agent*, not against
+whoever operates the node. Positioning it as a substitute for MPC or a TEE
+would be wrong.
+
+---
+
+# Part 3 — Designed, not built
+
+Named here so nobody reads them as features. Each was described as working in
+an earlier draft of this document.
+
+| Idea | Reality |
+|---|---|
+| Cross-node agent messaging | `SYS_SEND_REMOTE` is a reserved number that returns `E_INVALID_ARG` (`src/syscall.rs:1365`) |
+| Node membership, failover, placement, agent migration | No such code exists. `PortableCheckpoint` exists; nothing moves it between nodes |
+| Mailbox-based remote administration | No `admind` |
+| Cost estimation and billing aggregation | No `quotad`, no `billingd`. `accountd` reports consumption; nothing prices it |
+| An authority daemon with a revocation list | No `authd`. Revocation is a parent revoking a direct child (`src/capability.rs:200`) |
+| Observability daemon and dashboards | No `observabilityd`. Measurement harnesses exist; no dashboard |
+| Encrypted keyspaces | No encryption anywhere in the kernel |
+| Capability expiry and delegation depth | Neither field exists |
+| Multi-worker browser execution | Deferred; one worker today |
+| Hot-block translation (JIT) | Not started. The interpreter is tiered but does not compile |
+
+---
+
+# What webTOS is not for
 
 | Scenario | Why not |
-|----------|---------|
-| Desktop / server OS | No file system, no POSIX, no GUI, no shell |
-| High-throughput transaction processing | Direct interpreter, not JIT — use wasmi or wasmtime |
-| General container orchestration | No Docker / Kubernetes compatibility |
-| Hard real-time systems | No real-time scheduling guarantees |
-| Running existing Linux applications | No Linux syscall compatibility (Stage 12, future) |
+|---|---|
+| CPU-bound compute | An interpreter with no JIT: about half of native at best, a tenth of that on Firefox |
+| Workloads over ~3.9 GiB | That is what a tab grants, and it is the same ceiling in all three engines |
+| Graphics, GPU, games | No graphics path exists |
+| Non-x86-64 binaries | One ABI, one architecture |
+| Hard real-time | Deterministic ordering is not a latency guarantee |
+| Distributed clusters | See Part 3. Cross-node execution is a design, not a runtime |
+| A desktop OS | The Linux surface is what agent workloads need, not a general userland |
 
 ---
 
-## One-Line Positioning
+# Positioning
 
-**TOS is the minimum trusted execution substrate that makes external systems believe "this code really ran the way it claims."**
+**Part 1 today**: webTOS is the only runtime that executes an unmodified
+Linux x86-64 binary in a browser tab under explicit, deny-by-default
+authority — the real tool, in the user's own browser, with the operator
+holding neither the compute nor the data.
+
+**Part 2, once the agent kernel reaches the browser**: webTOS becomes the
+substrate that makes an outside party believe *this code really ran the way it
+claims* — because the receipt says which code, on which input, at what cost,
+leaving which state.
+
+The distance between those two sentences is the roadmap.
