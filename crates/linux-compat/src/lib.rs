@@ -16,6 +16,7 @@
 pub mod abi;
 pub mod digest;
 pub mod fd;
+pub mod liftcache;
 pub mod manifest;
 pub mod net;
 pub mod proc;
@@ -883,6 +884,51 @@ impl Environment for LinuxEnv {
     fn restore(&mut self, _: &Box<dyn std::any::Any>) {}
 }
 
+/// A digest over the SLEIGH source files a browser host provides, sorted by
+/// name so the order the host happened to hand them in does not change the
+/// answer. Two hosts with the same spec get the same fingerprint; a changed
+/// grammar file changes it.
+fn fingerprint_spec_files(files: &HashMap<String, String>) -> [u8; 32] {
+    let mut names: Vec<&String> = files.keys().collect();
+    names.sort();
+    let mut hasher = crate::digest::Sha256::new();
+    for name in names {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        let content = &files[name];
+        hasher.update(&(content.len() as u64).to_le_bytes());
+        hasher.update(content.as_bytes());
+    }
+    hasher.finish()
+}
+
+/// The same, over the files in a spec directory on disk. Unreadable entries
+/// are skipped rather than failing the build: the fingerprint is an
+/// identity, and a directory that cannot be fully read still has a stable
+/// identity among the files that can. A directory that changes what it lifts
+/// changes at least one readable file.
+fn fingerprint_spec_dir(dir: &Path) -> [u8; 32] {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return [0; 32];
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Ok(bytes) = std::fs::read(entry.path()) {
+            entries.push((name, bytes));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = crate::digest::Sha256::new();
+    for (name, bytes) in &entries {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hasher.finish()
+}
+
 pub(crate) fn align_up(value: u64, align: u64) -> u64 {
     let mask = !(align - 1);
     value.checked_add(align - 1).map_or(mask, |v| v & mask)
@@ -901,6 +947,16 @@ pub struct Machine {
     /// Ceiling on recorded trace events, or None for unbounded. See
     /// [`Machine::set_event_log_budget`].
     event_log_budget: Option<usize>,
+    /// A digest of the SLEIGH specification this machine lifts under.
+    ///
+    /// Lifting is a pure function of the guest bytes, the address, the
+    /// context, and the specification. The in-process lift cache already
+    /// keys on the first three; this is the fourth. Anything persisted from
+    /// the cache would be p-code produced under exactly this spec, and
+    /// executing p-code lifted under a different one against this register
+    /// file is silent wrong execution — so a persisted artifact carries this,
+    /// and a mismatch is refused rather than trusted.
+    spec_fingerprint: [u8; 32],
 }
 
 /// What a machine occupies, split by what it is spent on. All three live in
@@ -920,7 +976,14 @@ impl Machine {
     /// Builds a machine from a SLEIGH `.ldefs` path (native hosts).
     pub fn from_ldef(ldef_path: &Path, config: &EngineConfig) -> Result<Self, String> {
         let vm = build_x64_vm(ldef_path, config).map_err(|e| e.to_string())?;
-        Self::finish(vm)
+        // The ldef names a grammar spread across a directory of includes;
+        // fingerprint the directory, since any of those files changing
+        // changes what the bytes lift to.
+        let fingerprint = ldef_path
+            .parent()
+            .map(fingerprint_spec_dir)
+            .unwrap_or([0; 32]);
+        Self::finish(vm, fingerprint)
     }
 
     /// Builds a machine from in-memory SLEIGH sources (browser hosts).
@@ -928,11 +991,12 @@ impl Machine {
         files: HashMap<String, String>,
         config: &EngineConfig,
     ) -> Result<Self, String> {
+        let fingerprint = fingerprint_spec_files(&files);
         let vm = build_x64_vm_from_files(files, config).map_err(|e| e.to_string())?;
-        Self::finish(vm)
+        Self::finish(vm, fingerprint)
     }
 
-    fn finish(mut vm: InterpVm) -> Result<Self, String> {
+    fn finish(mut vm: InterpVm, spec_fingerprint: [u8; 32]) -> Result<Self, String> {
         let env = LinuxEnv::new(&vm.cpu)?;
         vm.set_env(env);
         Ok(Self {
@@ -940,7 +1004,16 @@ impl Machine {
             memory_budget: None,
             cpu_budget: None,
             event_log_budget: None,
+            spec_fingerprint,
         })
+    }
+
+    /// The digest of the SLEIGH specification this machine lifts under. Any
+    /// artifact persisted from the lift cache must carry this and be refused
+    /// on a mismatch, because p-code lifted under one spec is not valid under
+    /// another.
+    pub fn spec_fingerprint(&self) -> [u8; 32] {
+        self.spec_fingerprint
     }
 
     pub fn env(&mut self) -> &mut LinuxEnv {

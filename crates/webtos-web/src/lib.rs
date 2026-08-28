@@ -916,6 +916,29 @@ pub extern "C" fn wtw_manifest_len() -> u32 {
     })
 }
 
+/// Writes the 32-byte digest of the SLEIGH specification this engine lifts
+/// under into the scratch buffer, and returns its offset.
+///
+/// A host stores this beside any artifact it persists from the lift cache. A
+/// cache built under a different spec is not merely stale — p-code lifted
+/// under one spec, run under another, is silent wrong execution — so the
+/// fingerprint is what a host checks before trusting a cache it saved.
+#[no_mangle]
+pub extern "C" fn wtw_spec_fingerprint() -> u32 {
+    with_state(|state| {
+        let fingerprint = state
+            .machine
+            .as_ref()
+            .map(Machine::spec_fingerprint)
+            .unwrap_or([0; 32]);
+        if state.scratch.len() < 32 {
+            state.scratch.resize(32, 0);
+        }
+        state.scratch[..32].copy_from_slice(&fingerprint);
+        state.scratch.as_ptr() as u32
+    })
+}
+
 /// Records that `ms` of real time passed while nothing ran.
 ///
 /// A browser stops scheduling a background tab. This machine's clock is
