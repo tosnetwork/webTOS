@@ -42,6 +42,45 @@ function loopElf(count) {
   return buf;
 }
 
+// xor eax,eax; mov esi,dataAddr; mov ecx,count;
+// loop: movzx edx,[rsi]; add rax,rdx; inc rsi; dec rcx; jnz loop;
+// mov edi,eax; mov eax,60; syscall.
+//
+// A HOST self-loop: the byte load takes the softmmu callback every iteration.
+// It now region-compiles too — the whole loop, load included, is one wasm
+// function that faults back to the interpreter only if a load ever faults — so
+// the scan is a handful of dispatches, not one per byte.
+function memScanElf(count) {
+  const codeOff = 120;
+  const vaddr = 0x400000n;
+  const dataAddr = Number(vaddr) + codeOff + 35; // after the 35-byte code
+  const code = [
+    0x31, 0xc0, // xor eax, eax
+    0xbe, dataAddr & 0xff, (dataAddr >> 8) & 0xff, (dataAddr >> 16) & 0xff, (dataAddr >>> 24) & 0xff,
+    0xb9, count & 0xff, (count >> 8) & 0xff, (count >> 16) & 0xff, (count >>> 24) & 0xff,
+    0x0f, 0xb6, 0x16, // loop: movzx edx, byte [rsi]
+    0x48, 0x01, 0xd0, //       add rax, rdx
+    0x48, 0xff, 0xc6, //       inc rsi
+    0x48, 0xff, 0xc9, //       dec rcx
+    0x75, 0xf2, //             jnz loop
+    0x89, 0xc7, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
+  ];
+  const data = Array.from({ length: count }, (_, i) => i & 0xff);
+  const body = code.concat(data);
+  const total = codeOff + body.length;
+  const buf = new Uint8Array(total), dv = new DataView(buf.buffer);
+  buf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0], 0);
+  dv.setUint16(16, 2, true); dv.setUint16(18, 0x3e, true); dv.setUint32(20, 1, true);
+  dv.setBigUint64(24, vaddr + BigInt(codeOff), true); dv.setBigUint64(32, 64n, true);
+  dv.setUint16(52, 64, true); dv.setUint16(54, 56, true); dv.setUint16(56, 1, true);
+  dv.setUint32(64, 1, true); dv.setUint32(68, 7, true); // R+W+X (the loop reads the data area)
+  dv.setBigUint64(80, vaddr, true); dv.setBigUint64(88, vaddr, true);
+  dv.setBigUint64(96, BigInt(total), true); dv.setBigUint64(104, BigInt(total), true);
+  dv.setBigUint64(112, 0x1000n, true);
+  buf.set(body, codeOff);
+  return buf;
+}
+
 async function timeRun(elf, enableJit) {
   const jit = makeJitHost();
   const { instance } = await WebAssembly.instantiate(wasmBytes, { env: jit.imports });
@@ -84,3 +123,18 @@ console.log(`  interpreter: ${(interp.ns / 1e6).toFixed(0)} ms  (${rate(interp)}
 console.log(`  browser JIT: ${(jit.ns / 1e6).toFixed(0)} ms  (${rate(jit)} M-insn/s)  exit ${jit.exit}  ${jit.dispatches.toLocaleString()} dispatches (region)`);
 console.log(`  speedup:     ${(interp.ns / jit.ns).toFixed(2)}x  vs interpreter  (was ~2.76x per-block, one jit_call per iteration)  ${jit.exit === interp.exit ? "" : "*** EXIT MISMATCH ***"}`);
 console.log(`  per-iter dispatches: ${(jit.dispatches / iters).toExponential(1)}  (per-block would be ~1.0)`);
+
+// A HOST self-loop: the byte-scan loop now region-compiles as well, so the
+// softmmu load rides inside one region call instead of forcing a per-block
+// dispatch every iteration.
+const scanCount = 4_000_000;
+await timeRun(memScanElf(100000), true); // warm up
+const scanInterp = await timeRun(memScanElf(scanCount), false);
+const scanJit = await timeRun(memScanElf(scanCount), true);
+const scanInsns = scanCount * 4; // movzx, add, inc, dec, jnz counted as the body
+const scanRate = (r) => (scanInsns / (r.ns / 1e9) / 1e6).toFixed(1);
+console.log(`\nmemory scan (HOST self-loop), ${scanCount.toLocaleString()} byte loads`);
+console.log(`  interpreter: ${(scanInterp.ns / 1e6).toFixed(0)} ms  (${scanRate(scanInterp)} M-insn/s)  exit ${scanInterp.exit}`);
+console.log(`  browser JIT: ${(scanJit.ns / 1e6).toFixed(0)} ms  (${scanRate(scanJit)} M-insn/s)  exit ${scanJit.exit}  ${scanJit.dispatches.toLocaleString()} dispatches (region)`);
+console.log(`  speedup:     ${(scanInterp.ns / scanJit.ns).toFixed(2)}x  vs interpreter  ${scanJit.exit === scanInterp.exit ? "" : "*** EXIT MISMATCH ***"}`);
+console.log(`  per-iter dispatches: ${(scanJit.dispatches / scanCount).toExponential(1)}  (per-block would be ~1.0)`);

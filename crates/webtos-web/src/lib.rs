@@ -425,9 +425,14 @@ impl JitBackend for BrowserJit {
         max_iters: u64,
     ) -> RegionOutcome {
         // Shares the engine's memory directly (no copy): the region reads and
-        // writes the register file in place. A register-only region cannot
-        // fault, so there is no callback channel to arm.
+        // writes the register file in place. A host region's guest-memory and
+        // raise callbacks reach the CPU through `JIT_CPU` and record a mid-loop
+        // fault in `JIT_FAULT`, exactly as the per-block path does; a
+        // register-only region touches neither.
         let regs_base = cpu.regs.as_bytes().as_ptr() as u32;
+        JIT_FAULT.with(|f| f.set(-1));
+        JIT_CPU.with(|c| c.set(cpu as *mut icicle_cpu::Cpu));
+        // The shims run synchronously inside this call, reading `JIT_CPU`.
         let iters = unsafe {
             jit_call_region(
                 handle,
@@ -436,7 +441,12 @@ impl JitBackend for BrowserJit {
                 (max_iters >> 32) as u32,
             )
         };
-        RegionOutcome::Ran(u64::from(iters))
+        JIT_CPU.with(|c| c.set(std::ptr::null_mut()));
+        let iters = u64::from(iters);
+        match JIT_FAULT.with(|f| f.get()) {
+            i if i < 0 => RegionOutcome::Ran(iters),
+            i => RegionOutcome::Faulted(iters, i as u32),
+        }
     }
 }
 

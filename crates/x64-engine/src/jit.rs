@@ -362,11 +362,21 @@ fn int_min(size: u8) -> i64 {
 /// block stops exactly where the interpreter would — it reports the faulting
 /// instruction's index (the import has already set the exception) and returns,
 /// leaving every earlier instruction's effects in place and this one's undone.
-fn emit_fault_check(f: &mut Function, index: u32) {
+///
+/// `region_iter` distinguishes the two kinds of `run` this feeds. For a
+/// per-block `run() -> ()` it is `None` and the emitter returns nothing. For a
+/// region `run(..) -> i64` it is `Some(iter_local)`: the completed-iteration
+/// counter is pushed just before the `return`, so a mid-loop fault reports how
+/// many whole iterations retired (the fault happens before `iter` is
+/// incremented, so `iter` is exactly the count of fully-completed iterations).
+fn emit_fault_check(f: &mut Function, index: u32, region_iter: Option<u32>) {
     f.instruction(&Instruction::I32Eqz);
     f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::I32Const(index as i32));
     f.instruction(&Instruction::Call(IMPORT_FAULT));
+    if let Some(iter) = region_iter {
+        f.instruction(&Instruction::LocalGet(iter));
+    }
     f.instruction(&Instruction::Return);
     f.instruction(&Instruction::End);
 }
@@ -375,11 +385,17 @@ fn emit_fault_check(f: &mut Function, index: u32) {
 /// `code`/`value` and records that the block stopped at `index`, exactly as the
 /// interpreter does when `exception()` is followed by the block driver seeing a
 /// pending exception. Used by the division guards and `Invalid`.
-fn emit_raise_const(f: &mut Function, code: u32, value: i64, index: u32) {
+///
+/// `region_iter` works as in [`emit_fault_check`]: `Some(iter_local)` pushes the
+/// completed-iteration count before the `return` of a region `run`.
+fn emit_raise_const(f: &mut Function, code: u32, value: i64, index: u32, region_iter: Option<u32>) {
     f.instruction(&Instruction::I32Const(code as i32));
     f.instruction(&Instruction::I64Const(value));
     f.instruction(&Instruction::I32Const(index as i32));
     f.instruction(&Instruction::Call(IMPORT_RAISE));
+    if let Some(iter) = region_iter {
+        f.instruction(&Instruction::LocalGet(iter));
+    }
     f.instruction(&Instruction::Return);
 }
 
@@ -422,11 +438,18 @@ fn emit_float_store(f: &mut Function, out: VarNode) -> Option<()> {
 /// This is the dispatch the op handlers plug into. `IntAdd` is the worked
 /// reference; each remaining integer op is one arm here, mostly a single wasm
 /// binary instruction between the shared load/store helpers.
+///
+/// `region_iter` selects how a host op stops the emitted `run` on a fault: it is
+/// `None` in a per-block `run() -> ()` (the fault emitters return nothing), and
+/// `Some(iter_local)` in a region `run(..) -> i64` (they push the
+/// completed-iteration counter before returning it). It threads straight through
+/// to [`emit_fault_check`]/[`emit_raise_const`] and the inline `Exception` stop.
 pub fn translate_instruction(
     f: &mut Function,
     inst: &pcode::Instruction,
     index: u32,
     has_host: bool,
+    region_iter: Option<u32>,
 ) -> Option<()> {
     let out = inst.output;
     let [a, b] = inst.inputs.get();
@@ -1410,7 +1433,7 @@ pub fn translate_instruction(
                     f.instruction(&Instruction::I32Const(var_offset(out.slice(off, 8)) as i32));
                     f.instruction(&Instruction::I32Const(8));
                     f.instruction(&Instruction::Call(IMPORT_LOAD));
-                    emit_fault_check(f, index);
+                    emit_fault_check(f, index, region_iter);
                 }
                 return Some(());
             }
@@ -1418,7 +1441,7 @@ pub fn translate_instruction(
             f.instruction(&Instruction::I32Const(var_offset(out) as i32));
             f.instruction(&Instruction::I32Const(out.size as i32));
             f.instruction(&Instruction::Call(IMPORT_LOAD));
-            emit_fault_check(f, index);
+            emit_fault_check(f, index, region_iter);
             Some(())
         }
 
@@ -1444,7 +1467,7 @@ pub fn translate_instruction(
                     emit_zext_i64(f, b.slice(off, 8))?;
                     f.instruction(&Instruction::I32Const(8));
                     f.instruction(&Instruction::Call(IMPORT_STORE));
-                    emit_fault_check(f, index);
+                    emit_fault_check(f, index, region_iter);
                 }
                 return Some(());
             }
@@ -1452,7 +1475,7 @@ pub fn translate_instruction(
             emit_zext_i64(f, b)?;
             f.instruction(&Instruction::I32Const(b.size() as i32));
             f.instruction(&Instruction::Call(IMPORT_STORE));
-            emit_fault_check(f, index);
+            emit_fault_check(f, index, region_iter);
             Some(())
         }
 
@@ -1468,7 +1491,7 @@ pub fn translate_instruction(
             emit_load(f, b, size)?;
             f.instruction(&int_eqz(size));
             f.instruction(&Instruction::If(BlockType::Empty));
-            emit_raise_const(f, EXC_DIVISION, 0, index);
+            emit_raise_const(f, EXC_DIVISION, 0, index, region_iter);
             f.instruction(&Instruction::End);
 
             emit_store_addr(f);
@@ -1499,7 +1522,7 @@ pub fn translate_instruction(
             emit_load(f, b, size)?;
             f.instruction(&int_eqz(size));
             f.instruction(&Instruction::If(BlockType::Empty));
-            emit_raise_const(f, EXC_DIVISION, 0, index);
+            emit_raise_const(f, EXC_DIVISION, 0, index, region_iter);
             f.instruction(&Instruction::End);
 
             // Guard 2: dividend is the width's INT_MIN and divisor is -1.
@@ -1511,7 +1534,7 @@ pub fn translate_instruction(
             f.instruction(&int_eq(size));
             f.instruction(&Instruction::I32And);
             f.instruction(&Instruction::If(BlockType::Empty));
-            emit_raise_const(f, EXC_DIVISION, 0, index);
+            emit_raise_const(f, EXC_DIVISION, 0, index, region_iter);
             f.instruction(&Instruction::End);
 
             emit_store_addr(f);
@@ -1622,6 +1645,9 @@ pub fn translate_instruction(
             emit_zext_i64(f, b)?;
             f.instruction(&Instruction::I32Const(index as i32));
             f.instruction(&Instruction::Call(IMPORT_RAISE));
+            if let Some(iter) = region_iter {
+                f.instruction(&Instruction::LocalGet(iter));
+            }
             f.instruction(&Instruction::Return);
             Some(())
         }
@@ -1631,7 +1657,7 @@ pub fn translate_instruction(
             if !has_host {
                 return None;
             }
-            emit_raise_const(f, EXC_INVALID_INSTRUCTION, 0, index);
+            emit_raise_const(f, EXC_INVALID_INSTRUCTION, 0, index, region_iter);
             Some(())
         }
 
@@ -1660,7 +1686,8 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
 
     let mut body = Function::new([]);
     for (i, inst) in block.instructions.iter().enumerate() {
-        translate_instruction(&mut body, inst, i as u32, has_host)?;
+        // Per-block `run` returns nothing, so a fault emits a bare `return`.
+        translate_instruction(&mut body, inst, i as u32, has_host, None)?;
     }
     body.instruction(&Instruction::End);
 
@@ -1767,16 +1794,21 @@ const REGION_ITER_LOCAL: u32 = 2;
 /// exits with `iter < max_iters`; either way the register file, not `iter`,
 /// decides where control goes next.
 ///
-/// Register-only: a block that needs the host imports (guest memory, division,
-/// the exception ops) is rejected here and stays on the per-block path, whose
-/// mid-block fault handling is already correct. Returns `None` if the block
-/// needs the host, if a conditional `cond` is not a variable (a constant
+/// Host self-loops are supported: a body that reaches guest memory (the
+/// memcpy/hash/scan loops that dominate real workloads), divides, or raises
+/// declares the same four function imports [`translate_block`] uses, and a
+/// mid-loop fault stops the region exactly where the interpreter would. Because
+/// the region's `run` returns the iteration count, a fault pushes that count
+/// before returning (see [`emit_fault_check`]), so the host learns BOTH how many
+/// whole iterations retired and — via the reported index — where the partial
+/// iteration stopped. A register-only self-loop declares no function imports and
+/// its `run` is function 0, byte-for-byte as before.
+///
+/// Returns `None` if a conditional `cond` is not a variable (a constant
 /// condition is a [`pcode`] `Jump`, never a `Branch`), or if any instruction
 /// does not translate.
 pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec<u8>> {
-    if block_needs_host(block) {
-        return None;
-    }
+    let has_host = block_needs_host(block);
     let cond_var = match cond {
         Some(Value::Var(v)) => Some(v),
         Some(Value::Const(..)) => return None,
@@ -1787,9 +1819,11 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
     let mut body = Function::new([(1, ValType::I64)]);
     body.instruction(&Instruction::Loop(BlockType::Empty));
     for (i, inst) in block.instructions.iter().enumerate() {
-        // has_host is false: a register-only body emits no host `return`, so the
-        // region has no returns and its loop is the only control flow.
-        translate_instruction(&mut body, inst, i as u32, false)?;
+        // A host op that faults stops the region by returning the current
+        // iteration count (`REGION_ITER_LOCAL`), so the host can reproduce the
+        // interpreter's mid-loop stop; a register-only body emits no such
+        // `return` and its loop is the only control flow.
+        translate_instruction(&mut body, inst, i as u32, has_host, Some(REGION_ITER_LOCAL))?;
     }
     // iter += 1
     body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
@@ -1817,14 +1851,31 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
 
     let mut module = Module::new();
 
+    // Type 0 is always the region `run(regs_base, max_iters) -> iters`. The
+    // host-import signatures follow it and exist only when the block uses them,
+    // declared exactly as `translate_block` does so `IMPORT_LOAD/STORE/FAULT/
+    // RAISE` (0/1/2/3) stay valid.
     let mut types = TypeSection::new();
     types
         .ty()
         .function([ValType::I32, ValType::I64], [ValType::I64]); // 0: run(regs_base, max_iters) -> iters
+    if has_host {
+        types
+            .ty()
+            .function([ValType::I64, ValType::I32, ValType::I32], [ValType::I32]); // 1: load
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64, ValType::I32], [ValType::I32]); // 2: store
+        types.ty().function([ValType::I32], []); // 3: fault
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64, ValType::I32], []); // 4: raise(code, value, index)
+    }
     module.section(&types);
 
-    // A register-only region imports only the register memory — no host
-    // functions — so `run` is function 0.
+    // Import the register memory; a host region also imports the four functions
+    // in the order the `IMPORT_*` indices expect (memory imports do not occupy
+    // the function index space, so `load`/`store`/`fault`/`raise` are 0/1/2/3).
     let mut imports = wasm_encoder::ImportSection::new();
     imports.import(
         "env",
@@ -1837,14 +1888,24 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
             page_size_log2: None,
         }),
     );
+    if has_host {
+        imports.import("env", "load", EntityType::Function(1));
+        imports.import("env", "store", EntityType::Function(2));
+        imports.import("env", "fault", EntityType::Function(3));
+        imports.import("env", "raise", EntityType::Function(4));
+    }
     module.section(&imports);
+
+    // `run` is type 0. Its function index is 0 when there are no function
+    // imports, or 4 when the four host imports precede it.
+    let run_index = if has_host { 4 } else { 0 };
 
     let mut funcs = FunctionSection::new();
     funcs.function(0);
     module.section(&funcs);
 
     let mut exports = ExportSection::new();
-    exports.export("run", ExportKind::Func, 0);
+    exports.export("run", ExportKind::Func, run_index);
     module.section(&exports);
 
     let mut code = CodeSection::new();
@@ -1879,6 +1940,16 @@ pub enum RegionOutcome {
     /// host charges `iters * num_instructions` fuel and lets its own
     /// `block_exit` read the live condition to pick the next block.
     Ran(u64),
+    /// A host op faulted partway through, after `iters` fully completed
+    /// iterations, at pcode instruction `index`. The counter is not yet
+    /// incremented at the fault, so `iters` is exactly the count of whole
+    /// iterations that retired; the backend has already set the exception, as
+    /// for a per-block [`JitOutcome::Faulted`]. The host charges
+    /// `iters * num_instructions` for the completed iterations, then the guest
+    /// instructions of the partial faulting iteration up to `index`, and resumes
+    /// the interpreter at `index`. Only a host region can fault; a register-only
+    /// one never does.
+    Faulted(u64, u32),
     /// The backend declined or could not run the region; fall back to the
     /// per-block path (always correct) for this entry.
     Unavailable,
@@ -1939,7 +2010,7 @@ pub fn first_bail(block: &pcode::Block) -> Option<Bail> {
     let has_host = block_needs_host(block);
     for (i, inst) in block.instructions.iter().enumerate() {
         let mut scratch = Function::new([]);
-        if translate_instruction(&mut scratch, inst, i as u32, has_host).is_none() {
+        if translate_instruction(&mut scratch, inst, i as u32, has_host, None).is_none() {
             let out = inst.output.size;
             let in_max = inst
                 .inputs

@@ -667,18 +667,47 @@ impl InterpVm {
                                     Some(j) => j.call_region(handle, &mut self.cpu, max_iters),
                                     None => crate::jit::RegionOutcome::Unavailable,
                                 };
-                                if let crate::jit::RegionOutcome::Ran(iters) = outcome {
-                                    // Each iteration retired the whole block and
-                                    // ticks no per-instruction fuel; charge it here
-                                    // so icount stays exact. The register file now
-                                    // holds the post-iteration state, so block_exit
-                                    // below reads the live condition and goes to the
-                                    // loop target (budget spent, still live) or the
-                                    // fallthrough (condition went false) exactly as
-                                    // the interpreter would.
-                                    self.cpu.fuel.remaining -= iters.saturating_mul(num);
-                                    self.jit_dispatches += 1;
-                                    jit_ran = true;
+                                match outcome {
+                                    crate::jit::RegionOutcome::Ran(iters) => {
+                                        // Each iteration retired the whole block and
+                                        // ticks no per-instruction fuel; charge it here
+                                        // so icount stays exact. The register file now
+                                        // holds the post-iteration state, so block_exit
+                                        // below reads the live condition and goes to the
+                                        // loop target (budget spent, still live) or the
+                                        // fallthrough (condition went false) exactly as
+                                        // the interpreter would.
+                                        self.cpu.fuel.remaining -= iters.saturating_mul(num);
+                                        self.jit_dispatches += 1;
+                                        jit_ran = true;
+                                    }
+                                    crate::jit::RegionOutcome::Faulted(iters, index) => {
+                                        // A host op faulted mid-loop. Charge the fully
+                                        // completed iterations first (each retired the
+                                        // whole block), then reproduce the interpreter's
+                                        // partial faulting iteration exactly as the
+                                        // per-block Faulted arm does: tick PC and fuel up
+                                        // to the fault so the exception the import raised
+                                        // is seen in the same state, and resume the
+                                        // interpreter at the faulting pcode index.
+                                        self.cpu.fuel.remaining = self
+                                            .cpu
+                                            .fuel
+                                            .remaining
+                                            .saturating_sub(iters.saturating_mul(num));
+                                        let (pc, guest_insns) =
+                                            fault_pc_and_fuel(&block.pcode, index as usize);
+                                        if let Some(pc) = pc {
+                                            self.cpu.write_pc(pc);
+                                        }
+                                        self.cpu.fuel.remaining =
+                                            self.cpu.fuel.remaining.saturating_sub(guest_insns);
+                                        self.jit_dispatches += 1;
+                                        self.cpu.block_id = block_id;
+                                        self.cpu.block_offset = index as u64;
+                                        break;
+                                    }
+                                    crate::jit::RegionOutcome::Unavailable => {}
                                 }
                             }
                         }
