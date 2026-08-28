@@ -5,10 +5,11 @@ unmodified Linux x86-64 binaries inside a browser tab: a WebAssembly x86-64
 engine, the operating-system half of the Linux ABI on top of it, and a browser
 host supplying storage, a terminal, and a relayed network path.
 
-Six documents, and they are all current. There is no historical section,
-because the documents that described the removed bare-metal kernel were
-deleted with it rather than left to be mistaken for present behaviour; `git
-log` has them.
+The documents below describe the current browser runtime. Status labels mark
+whether a statement is a regression gate, a recorded run, or roadmap work;
+they are not interchangeable. There is no historical section, because the
+documents that described the removed bare-metal kernel were deleted with it
+rather than left to be mistaken for present behaviour; `git log` has them.
 
 ## Start here
 
@@ -23,13 +24,13 @@ log` has them.
 
 ## Measurement and workloads
 
-- [Performance and memory](performance.md) - what the interpreter costs
-  natively and per browser engine, what a tab grants it, and what that
-  implies for milestone 8
+- [Performance and memory](performance.md) - interpreter and hot-block JIT
+  measurements natively and per browser engine, what a tab grants it, and what
+  that implies for milestone 8
 - [OpenFox workload profile](workloads/openfox.md) - the milestone-6 agent:
   its gates and what each one covers
-- [Node.js workload profile](workloads/node.md) - a demanding dynamic
-  runtime, used as milestone-7 groundwork
+- [Node.js and agent runtime notes](workloads/node.md) - Node, Codex, and
+  Claude Code compatibility evidence and the remaining milestone-7 boundaries
 
 ## Status conventions
 

@@ -205,10 +205,11 @@ does not pass a gate.
   sequences. Snapshot restore and ELF loading, both of which failed closed
   only after the sweep found what they did not.
 - **What remains is roadmap with exit criteria written down:** carrying
-  Codex's own image into the browser, the Claude Code profile, hot-block
-  translation, and the release work of milestone 8.
+  Codex's own image into the browser, sustained Claude Code work, general
+  multi-block JIT regions, the remaining 128-bit arithmetic coverage, and the
+  release work of milestone 8.
 
-Weighted by engineering effort the roadmap is roughly 92% complete; the
+Weighted by engineering effort the roadmap is roughly 94% complete; the
 milestone table and its evidence are in [ROADMAP](../ROADMAP.md).
 
 Principles that govern all of it: correctness before speed (interpreter
@@ -324,22 +325,20 @@ Two things this architecture deliberately does **not** claim:
   to the browser's trusted computing base, and webTOS's reproducibility claim
   rests on determinism and replay alone.
 
-### 7.1 Execution model: an interpreter, on purpose
+### 7.1 Execution model: interpreter first, JIT verified second
 
-The question a technical reader asks first is whether this is a JIT. It is
-not, and for now the reason is the product rather than the schedule.
+webTOS lifts each basic block of x86-64 into an intermediate representation,
+caches it, and interprets it as the reference execution path. Hot blocks can
+then translate from p-code to WebAssembly at run time: the browser compiles the
+generated Wasm and runs it against the engine's shared memory. Register-only
+self-loops and host-memory self-loops can become one Wasm region, while a
+block that is unsupported, cold, exceptional, or debugging-sensitive remains
+on the interpreter path.
 
-webTOS lifts each basic block of x86-64 once into an intermediate
-representation, caches it, and interprets it. Blocks link directly to their
-successors, so the loop stays inside the interpreter rather than returning to
-a dispatcher. No native code and no WebAssembly is generated at run time.
-Hot-block translation is the third tier of a written strategy and is
-deliberately last.
-
-**Why last.** The claim webTOS makes is that the same input produces the same
-instruction stream everywhere. A translation tier has to reproduce that stream
-exactly, which is far easier to verify against an interpreter that already
-passes the trace suite than to build alongside one that does not.
+**Why interpreter first.** The claim webTOS makes is that the same input
+produces the same instruction stream everywhere. The translation tier is held
+to the interpreter's result and to architectural traces, including faults and
+fuel accounting, rather than being a second source of semantics.
 
 **What the measurements said.** The interpreter sustains roughly half of
 native throughput in the fast browser engines — about 11 M instructions per
@@ -347,7 +346,10 @@ second against 21 M — and about a tenth of that in the slowest. Profiling a
 real agent's startup found no hot path worth translating; the first
 optimization that paid was a content-addressed lift cache, which took `execve`
 from 48.8 ms to about 2 ms, and tiered lifting, which cut a cold agent start
-from 5.3 s to 1.4 s. Neither is a translator.
+from 5.3 s to 1.4 s. The JIT then removed the hot-loop ceiling: self-loop
+regions reach roughly 30x the interpreter in V8 for both register and
+fast-path memory loops. Its remaining coverage work is cross-lane 128-bit
+arithmetic and general multi-block regions.
 
 **Where it is genuinely needed.** Not for agents, whose bottleneck is the
 model and the network. For compute: a C compiler takes about twelve seconds to
@@ -469,10 +471,10 @@ Full details with exit criteria live in [ROADMAP](../ROADMAP.md).
 | M2 | Static BusyBox: shell, files, persistence across reload | Done, verified in all three engines |
 | M3 | Dynamic Linux ELF via the real loader | Done, musl and glibc |
 | M4 | Threads, fork/exec, deterministic scheduling, signals | Done, including adversarial and blocked-signal gates |
-| M5 | Event loops, brokered networking, HTTPS | Done: guest TLS, deny-by-default relay in three engines, recording and offline replay, interruptible waits gated through a socket |
+| M5 | Event loops, brokered networking, HTTPS | Done: guest TLS, deny-by-default relay in three engines, interruptible waits gated through a socket; native recording and offline replay exist, while browser-host replay integration remains open |
 | M6 | OpenFox completes a real agent task | Done, including in a browser, and a 1,000-round soak bounded in memory, filesystem, and block table |
 | M7 | Codex and Claude Code: sustained interactive sessions | ~90%: both Codex modes run end to end and a session that does work finishes; carrying Codex's image into a tab and the Claude Code profile remain |
-| M8 | Performance tiers, sweeps, quotas, signed releases | ~76%: measured baseline, lift cache and tiered lifting landed, four boundaries swept, every resource capped; hot-block translation not started |
+| M8 | Performance tiers, sweeps, quotas, signed releases | ~89%: measured baseline, lift cache, tiered lifting, hot-block translation, regions, and resource caps landed; general multi-block regions, 128-bit arithmetic coverage, and release integration remain |
 
 Verification is the point: the repository builds, the native suite runs 98
 cases with skipping forbidden on a host that can run everything, and a
@@ -492,11 +494,11 @@ link, under authority someone had to grant. On the measured side the gap is
 smaller than the architecture suggests — roughly half of native throughput in
 the fast engines (§7.1).
 
-**"Is it a JIT?"** No. It lifts each block once, caches it, and interprets.
-Translation to WebAssembly is the last of three planned tiers, and it is last
-because a translator must reproduce the interpreter's instruction stream
-exactly or the determinism claim is gone. §7.1 has the reasoning, the numbers,
-and why the first optimization worth doing turned out not to be a translator.
+**"Is it a JIT?"** It is interpreter-first with a hot-block JIT. P-code blocks
+that the translator understands become WebAssembly; self-loop regions avoid a
+call per iteration, while unsupported or uncommon paths fall back to the
+interpreter. §7.1 explains the trace-equivalence gate and the remaining
+general-region and 128-bit coverage work.
 
 **"Why would anyone run this locally when clouds exist?"** Data gravity (the
 repository and the credentials are here), cost (the user's silicon is free and

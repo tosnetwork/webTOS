@@ -29,8 +29,8 @@ storage, a terminal, and a network path.
 The browser is the deployment environment, not the execution model. webTOS
 owns its own scheduler, guest memory, process state, and filesystem rather
 than exposing ambient browser authority to what it runs: a guest reaches the
-network only through a relay the page configured, and its memory, CPU,
-storage, and network use are all bounded.
+network only through a relay the page configured, and a deployment can bound
+its memory, CPU, storage, and network use with runtime-enforced budgets.
 
 ### Primary Goal
 
@@ -83,18 +83,20 @@ same runtime.
 
 ### Bounds that produce an errno, not a dead tab
 
-Memory, CPU, storage, network bytes, and the event log all have ceilings. A
-workload that will not fit is refused at the request rather than dying
-part-way through, and a guest over a limit sees an error it already knows how
-to handle.
+Memory, CPU, storage, network bytes, and the event log each have a
+runtime-enforced budget a deployment can set. A workload that will not fit a
+configured budget is refused at the request rather than dying part-way
+through, and a guest over a limit sees an error it already knows how to
+handle.
 
 ### Determinism that is gated, not claimed
 
 The same input retires the same instruction stream in Chromium, Firefox, and
 WebKit, checked against recorded architectural traces — the syscall stream
 with its arguments, delivered signals, and register samples at exact
-instruction counts. A session can be recorded and replayed later with no
-network.
+instruction counts. The runtime's native network-recording layer can replay a
+recorded session without a network; browser-host recording and replay is not
+yet an exported user-facing flow.
 
 ### State that survives a reload
 
@@ -103,20 +105,7 @@ machine, so a session resumes where it stopped.
 
 ## Architecture
 
-<p align="center">
-  <img src="webTOS-architecture.png"
-       alt="webTOS architecture: Linux x86-64 applications (OpenFox, Codex, BusyBox) enter through the browser host (Web Worker, terminal, OPFS, network relay), are loaded as ELF against the Linux ABI, and run inside the WebAssembly module webtos-web, whose linux-compat layer provides processes, VFS, signals, futexes, sockets, epoll, and PTYs on top of the x64-engine that decodes, lifts, interprets, and owns guest memory."
-       width="760">
-</p>
-
-<p align="center">
-  <em>The solid path is what executes in a browser. The dashed boxes are from
-  an earlier drawing: the agent kernel they name has been removed from this
-  repository, and the diagram has not been redrawn — see
-  <a href="#project-status">Project Status</a>.</em>
-</p>
-
-The same structure in text:
+The current architecture, in text:
 
 ```text
 Browser
@@ -166,18 +155,22 @@ does not depend on it. What remains is the runtime and its host.
 
 Available in the repository today:
 
-- x86-64 instruction decoding, lifting, and interpretation (`crates/x64-engine`)
+- x86-64 instruction decoding, lifting, interpretation, and hot-block
+  p-code-to-WebAssembly translation (`crates/x64-engine`)
 - ELF64 loading and substantial Linux x86-64 system-call compatibility, with
   processes, threads, futexes, signals, sockets, polling, and epoll
   (`crates/linux-compat`)
 - Deterministic time, randomness, scheduling, and event ordering
-- Checkpoints, filesystem snapshots, structured trace events, and per-agent
-  quotas on memory, CPU, storage, network, and the event log
-- A signed-manifest image path, a dependency-license manifest, and a security
-  policy (`SECURITY.md`)
+- Checkpoints, filesystem snapshots, structured trace events, and configurable
+  per-agent budgets on memory, CPU, storage, network, and the event log
+- A manifest-enforcement path: a host can verify a signature with platform
+  cryptography, then the module enforces the manifest's image hashes and paths;
+  the stock demo worker does not yet install a signed manifest
+- A dependency-license manifest and a security policy (`SECURITY.md`)
 - The browser host: a Web Worker, terminal, OPFS persistence, and a network
   relay, gated in Chromium, Firefox, and WebKit
-- Workload profiles for OpenFox, Codex, and Claude Code
+- A gated OpenFox workload profile, plus Node/Codex/Claude Code compatibility
+  evidence; complete Codex and Claude Code browser-image profiles remain M7 work
 
 ## Browser Host
 

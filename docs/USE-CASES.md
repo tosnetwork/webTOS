@@ -28,10 +28,10 @@ and their evidence, [`performance.md`](performance.md) for numbers, and
 | Network reachable only through a deny-by-default relay | `tools/webtos_gateway.mjs`; with no `--allow` rule it starts and refuses everything |
 | Filesystem persistence across a real page reload | M2/M6; OPFS-backed snapshot, restored into a fresh machine |
 | Deterministic execution | identical instruction counts across Chromium, Firefox, and WebKit, gated against recorded architectural traces |
-| Session record and offline replay | M5; a recorded session replays with no network at all |
-| Budgets on memory, storage, network bytes, CPU, and the event log | `wtw_set_*_budget_*`; over-budget returns an errno the guest already handles |
+| Session record and offline replay | native `netrecord` gate; a recorded session replays with no network. Browser-host export and persistence of recordings remain to be wired |
+| Configurable budgets on memory, storage, network bytes, CPU, and the event log | `wtw_set_*_budget_*`; a deployment that sets a budget gets an errno the guest already handles on overage |
 | Per-agent secret injection, kept out of disk snapshots | M5; an out-of-scope program reads a placeholder, not an empty value |
-| Signed image manifests | host verifies the signature, the module enforces the content hashes and refuses an image the manifest does not name |
+| Manifest enforcement | `web/test_manifest.mjs` composes host signature verification with module hash/path enforcement. The stock browser demo has not yet wired manifest installation into its delivery flow |
 | Streamed image delivery | a 52 MB agent binary reaches a shell prompt in about three seconds without ever being held whole |
 
 Throughput is roughly half of native on Chromium and WebKit (about 11 M
@@ -115,8 +115,8 @@ boundary at all.
 explicit. The guest has no network whatsoever until the page asks for one, and
 then only to destinations an `--allow` rule names. Credentials are injected at
 runtime, scoped to the agent that should see them, and stay out of filesystem
-snapshots. Memory, CPU, storage, and network bytes all have ceilings, and
-crossing one produces an errno rather than a dead tab.
+snapshots. A deployment can configure budgets for memory, CPU, storage, and
+network bytes; crossing one produces an errno rather than a dead tab.
 
 **Worked example**: OpenFox — a 52 MB static Linux agent — streams into a
 clean browser profile, reaches a prompt in about three seconds, and performs a
@@ -215,20 +215,19 @@ log never leaving the browser.
 channel, and a distribution channel with no integrity check is a supply chain
 waiting to be attacked.
 
-**What webTOS provides**: a signed image manifest, enforced in two halves. The
-host verifies the signature with the platform's audited verifier. The module
-then checks that delivered bytes match what the manifest names, refuses any
-image the manifest does not name, and applies the same check on the streaming
-path so delivery cannot skip it (`crates/webtos-web/src/lib.rs:873`). The
-module deliberately does not verify the signature itself: a hand-rolled
-verifier in a security boundary fails open, which is worse than none.
+**What webTOS provides today**: a manifest-enforcement mechanism in two
+halves. A host can verify a manifest signature with the platform's audited
+verifier, then install it; the module checks that delivered bytes match what
+the manifest names and refuses an image the manifest does not name. The module
+deliberately does not verify the signature itself. The stock browser demo does
+not yet install a signed manifest, so this is an integration mechanism and
+gate, not a claim that every demo image is signed.
 
-**Worked example**: a team publishes an internal tool as a page. The manifest
-names one image and its hash. A tampered image, a substituted image, and an
-image nobody declared are all refused before the guest runs one instruction.
-`node web/test_manifest.mjs` is the gate that says so — it checks both that a
-manifest the verifier rejects is never installed and that one it accepts is
-enforced.
+**Integration gate**: `node web/test_manifest.mjs` checks both halves: a
+manifest the host verifier rejects is never installed, and a manifest it
+accepts is enforced before the guest runs. Wiring that protocol into a
+published page remains required before it can be called a signed demo-image
+delivery path.
 
 ---
 
@@ -240,7 +239,7 @@ Named so that nothing here gets read as a feature.
 |---|---|
 | An agent kernel — capabilities, energy accounting, mailboxes, receipts, attestation | Removed from the repository. It was a separate bare-metal kernel and was never wired into the browser runtime |
 | Multi-worker execution | Deferred. One worker today |
-| Hot-block translation (JIT) | Not started. Lifting is tiered but does not compile |
+| General multi-block JIT regions | Hot p-code blocks already translate to WebAssembly, including self-loop regions and inline softmmu fast paths. Cross-lane 128-bit arithmetic and general multi-block regions remain |
 | Block-level on-demand image loading | An image streams whole into the guest filesystem, which bounds how large a delivered userland can be |
 | A graphics path | None. Terminals and TUIs, not framebuffers |
 
@@ -250,7 +249,7 @@ Named so that nothing here gets read as a feature.
 
 | Scenario | Why not |
 |---|---|
-| CPU-bound compute | An interpreter with no JIT: about half of native at best, a tenth of that on Firefox |
+| CPU-bound compute | Hot loops have a JIT path, but coverage is incomplete and browser throughput remains workload- and engine-dependent; it is not a general high-performance compute platform |
 | Workloads over ~3.9 GiB | That is what a tab grants, and it is the same ceiling in all three engines |
 | Graphics, GPU, games | No graphics path exists |
 | Non-x86-64 binaries | One ABI, one architecture |

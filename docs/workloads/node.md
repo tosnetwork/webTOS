@@ -92,10 +92,10 @@ Measured 2026-08-27 against the same `webtos_web.wasm` a browser loads.
 static-pie binary delivered in one file, 531 MB resident. Nothing about it
 needed changing.
 
-**Claude Code does not, yet — and it is not a Node application.** Version
-2.1.247 is a 239 MB **Bun** binary (Bun 1.4.1), dynamically linked. That
-matters for the milestone: "both are Node applications, so a stock Node is
-the reduction" holds for Codex and no longer holds here.
+**Claude Code runs at the version-command gate, and it is not a Node
+application.** Version 2.1.247 is a 239 MB **Bun** binary (Bun 1.4.1),
+dynamically linked. That matters for the milestone: "both are Node
+applications, so a stock Node is the reduction" holds for neither binary.
 
 Three defects were in the way, all fixed and all general rather than
 Bun-specific:
@@ -143,7 +143,7 @@ answer than an invented one. Bun also probes `/proc/self/cgroup`,
 `/proc/stat`, `/proc/sys/vm/*`, and `/sys/devices/system/cpu/online`, and
 carries on without them.
 
-## What a session still cannot do
+## From version checks to real sessions
 
 `--version` is not the product. Taking Codex further, on 2026-08-27:
 
@@ -152,9 +152,9 @@ module in 2.2 s, with the real `auth.json` arriving as a scoped secret — the
 guest file holds only `${CODEX_AUTH}`, and the snapshot afterwards holds the
 placeholder, checked rather than assumed.
 
-**A working session does not complete.** `codex exec` with a small task —
-read a file, change a value, run a command, report — does not finish, and not
-only in the browser:
+**The first working-session investigation did not complete.** An earlier
+`codex exec` task — read a file, change a value, run a command, report —
+stalled in both wasm and native runs:
 
 - In the wasm module it runs steadily at ~13 M inst/s past 1.95 billion
   instructions, footprint flat at 567 MB, producing no output and issuing no
@@ -333,8 +333,9 @@ intrinsic over many random inputs.
   their p-code semantics are unvalidated, so CPUID keeps userspace on SSE.
 - **VEX-AES / PCLMULQDQ / XOP** are still unlifted (the ~0.0049% Node decode
   residual); reached only if AES-NI is advertised, which it is not.
-- Codex and Claude Code images, PTY behavior, Git, and authenticated HTTPS
-  from the CLIs — the next milestone-7 work now that Node runs.
+- Browser delivery and sustained task gates for Codex and Claude Code. Codex
+  and Claude Code both run in the wasm module; the OpenFox image is the only
+  agent image currently carried through the browser delivery profile.
 
 ## Tools
 
