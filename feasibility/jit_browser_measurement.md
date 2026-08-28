@@ -37,3 +37,29 @@ ops (see the memory note on the wide-op coverage wall), so the fraction of hot
 blocks that qualify — not this micro-loop's speedup — is what a real guest's
 end-to-end number will turn on. Measure the bail-cause histogram over node /
 claude hot blocks before optimizing further.
+
+## Update: host self-loops region-compile too
+
+Region compilation was extended from register-only self-loops to host self-loops
+— loops whose body loads/stores/divides, i.e. the memcpy/hashing/scan loops that
+dominate real code. The only new machinery is fault-in-region accounting: a load
+that faults at iteration k stops the region, and the dispatcher charges k full
+iterations of fuel plus the partial faulting iteration and restores PC, matching
+the interpreter's mid-loop stop exactly (gated, with a fault case whose icount is
+exact to the instruction).
+
+Measured (`web/bench_jit.mjs`, `web/test_jit_run.mjs`, Node V8):
+
+| loop | dispatches (per-block → region) | speedup |
+|---|---|---|
+| register compute (splitmix) | ~20M → 77 | ~30x |
+| host memory scan (byte load per iter) | ~4M → 20 | ~4.6x |
+
+The memory scan's ~4.6x is lower than compute's ~30x for a clear reason: each
+iteration still pays the softmmu callback (wasm→JS→engine→`cpu.mem`→back) for its
+load, once per byte. The per-*dispatch* overhead is gone (20 dispatches for 4M
+iterations), but the per-*access* callback is not. That is the next bottleneck
+for memory loops — an inline softmmu fast path (a TLB in the shared linear
+memory, checked in wasm, calling back only on a miss) would remove it, the way a
+softmmu JIT normally does. Until then, region compilation still turns the memory
+loop from interpreter speed into ~4.6x, correctly.

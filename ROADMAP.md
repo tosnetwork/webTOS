@@ -149,11 +149,15 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   images loaded into one machine shared a load address and so shared blocks,
   and the second one ran the first one's code.
 - **Hot-block translation** landed (p-code→wasm, gated bit-for-bit, dispatched
-  in the run loop natively and in the browser), and region compilation of hot
-  self-loops on top of it: a loop's back-edge folded into one wasm function,
-  ~26x on a compute loop (up from 2.76x per block). What remains is host
-  self-loops and cross-block regions, and the 128-bit move/widen quartet for the
-  glibc/SIMD class the coverage histogram scoped.
+  in the run loop natively and in the browser), then region compilation of hot
+  self-loops on top of it — a loop's back-edge folded into one wasm function,
+  register loops ~30x and memory-scan loops ~4.6x, both a handful of dispatches
+  for millions of iterations — and the 128-bit move/widen/logic quartet (codex
+  95.9→97.6%, Node 89.9→94.3% JIT-able). What remains: an inline softmmu fast
+  path (the memory loop still pays a callback per access, which is why it is
+  4.6x not 30x), the 128-bit *arithmetic* ops (IntMul/shift at width 16, the
+  cross-lane residue the quartet cannot decompose), and true multi-block regions
+  (a relooper).
 - **Persist the lift cache across sessions.** Worth about half a second on a
   cold agent start now that tiered lifting has taken the other four, so it
   ranks below the risk of serialising lifted code.
