@@ -42,18 +42,20 @@ export function makeJitHost() {
       return instances.length;
     },
 
-    // Run the compiled block against the register file at regsBase.
-    jit_call(handle, regsBase) {
-      instances[handle - 1].exports.run(regsBase);
+    // Run the compiled block against the register file at regsBase, with tlbBase
+    // pointing at icicle's live translation cache in the same memory (the inline
+    // memory fast path reads it directly).
+    jit_call(handle, regsBase, tlbBase) {
+      instances[handle - 1].exports.run(regsBase, tlbBase);
     },
 
     // Run a compiled self-loop region against the register file at regsBase for
     // up to maxIters iterations (carried as two u32 halves). The region's run is
-    // `(regsBase: i32, maxIters: i64) -> iters: i64`; return the count as a u32,
-    // which is enough since a slice bounds it.
-    jit_call_region(handle, regsBase, maxItersLo, maxItersHi) {
+    // `(regsBase: i32, tlbBase: i32, maxIters: i64) -> iters: i64`; return the
+    // count as a u32, which is enough since a slice bounds it.
+    jit_call_region(handle, regsBase, tlbBase, maxItersLo, maxItersHi) {
       const maxIters = BigInt(maxItersLo >>> 0) | (BigInt(maxItersHi >>> 0) << 32n);
-      const iters = instances[handle - 1].exports.run(regsBase, maxIters);
+      const iters = instances[handle - 1].exports.run(regsBase, tlbBase, maxIters);
       return Number(BigInt(iters) & 0xffffffffn);
     },
   };

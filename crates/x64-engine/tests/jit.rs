@@ -1061,9 +1061,10 @@ fn jit(case: &Case) -> Option<Vec<u8>> {
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<i32, ()>(&store, "run")
+        .get_typed_func::<(i32, i32), ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, 0).expect("run");
+    // Register-only blocks: tlb_base is unused, so 0.
+    run.call(&mut store, (0, 0)).expect("run");
 
     let mut out = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, 0, &mut out).expect("read memory");
@@ -1103,9 +1104,10 @@ fn jit_at_base(case: &Case, base: u32) -> Vec<u8> {
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<i32, ()>(&store, "run")
+        .get_typed_func::<(i32, i32), ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, base as i32).expect("run");
+    // Register-only blocks: tlb_base is unused, so 0.
+    run.call(&mut store, (base as i32, 0)).expect("run");
 
     let mut out = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, base as usize, &mut out).expect("read");
@@ -1249,6 +1251,11 @@ fn subpiece_matches_lowered_copy() {
 use icicle_cpu::mem::{perm, Mapping};
 use pcode::{Inputs, RAM_SPACE};
 
+/// Bytes of an `icicle_mem::tlb::TranslationCache` image: two `[TLBEntry; 1024]`
+/// arrays (read then write), 16 bytes each. Placed after the register file in
+/// the wasm memory so the inline fast path can read it at `tlb_base`.
+const TLB_BYTES: u32 = 2 * 1024 * 16;
+
 /// The state the memory imports act on: a VM providing the real MMU (guest
 /// memory and the exception it sets on a fault), the register memory the load
 /// import writes into, and the index a fault reported.
@@ -1355,12 +1362,27 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
             fault: None,
         },
     );
-    let mem_ty = wasmi::MemoryType::new(REG_SPACE_BYTES / 65536, None);
+    // The memory holds the register file, then an all-invalid TLB image so the
+    // inline memory fast path always misses and defers to the host callbacks —
+    // this harness is the slow-path reference (the fast path is exercised warm by
+    // the `fastmem` gate below). `tlb_base` points at that TLB region; filling it
+    // with 0xFF makes every tag `u64::MAX` (invalid), so the tag guard never
+    // matches and the page math (which could read out of bounds) never runs.
+    let tlb_base = REG_SPACE_BYTES;
+    let total = REG_SPACE_BYTES + TLB_BYTES;
+    let mem_ty = wasmi::MemoryType::new(total.div_ceil(65536), None);
     let memory = wasmi::Memory::new(&mut store, mem_ty).expect("memory");
     store.data_mut().regs = Some(memory);
     memory
         .write(&mut store, 0, &seed_regs_bytes(&case.seeds))
         .expect("seed memory");
+    memory
+        .write(
+            &mut store,
+            tlb_base as usize,
+            &vec![0xffu8; TLB_BYTES as usize],
+        )
+        .expect("invalidate tlb");
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
@@ -1472,9 +1494,9 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
         .start(&mut store)
         .expect("start");
     let run = instance
-        .get_typed_func::<i32, ()>(&store, "run")
+        .get_typed_func::<(i32, i32), ()>(&store, "run")
         .expect("run export");
-    run.call(&mut store, 0).expect("run");
+    run.call(&mut store, (0, tlb_base as i32)).expect("run");
 
     let mut regs = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, 0, &mut regs).expect("read memory");
@@ -2353,4 +2375,779 @@ fn clone_block(block: &pcode::Block) -> pcode::Block {
         out.instructions.push(*inst);
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Inline softmmu fast-path gate (`fastmem`).
+//
+// The whole risk of the fast path is silent corruption: it reads icicle's live
+// TLB and the resolved guest page directly, in wasm, and only a *wrong* fast
+// path — a bad tag compare, a bad permission mask, a stale mapping — would
+// diverge from the host callback while still producing a plausible answer. So
+// this gate is brutal about it.
+//
+// The browser shares one linear memory, so the compiled block reads the *same*
+// TLB and pages the engine writes; the Node gates (`web/test_jit_run.mjs`
+// memory scan, region-compiled) exercise that literal wiring against the real
+// interpreter. This native harness reproduces that single-memory model so the
+// *emitted fast-path wasm* can be held to the interpreter here too: one wasm
+// memory holds the register file, then a TLB image, then a pool of guest-page
+// images. The load/store host callbacks route through a real `Cpu` (so faults
+// are the engine's real faults) and, on success, mirror the touched page into
+// the pool and fill the in-wasm TLB — exactly as `Mmu::read`/`write` fill the
+// live TLB in the browser. A host-call counter proves the fast path actually
+// fires: once a page is warm, re-running the block calls the host zero more
+// times.
+//
+// What each test proves:
+//   - hit + counter: a warm access is served inline and matches the
+//     interpreter, and the host is not called again (so it is not silently
+//     always-slow).
+//   - cross-page: an 8-byte straddling access always defers to the host and
+//     matches.
+//   - coherence: after the mapping changes and the (live) TLB entry is
+//     invalidated — as icicle does on unmap/mprotect — the next access does NOT
+//     use the stale translation; it faults exactly as the interpreter does.
+//   - permission: when the resolved page's perm bytes lose a required bit, the
+//     fast path defers and the host raises the exact fault.
+// Breaking the tag compare reddens the coherence test; dropping INIT from the
+// perm mask reddens the permission test (the discrimination checks in the task
+// report).
+
+/// Byte offset of the TLB image within the fast-path harness memory (right after
+/// the register file).
+const FASTMEM_TLB_BASE: u32 = REG_SPACE_BYTES;
+/// Byte offset of the guest-page image pool (after the TLB image).
+const FASTMEM_POOL_BASE: u32 = REG_SPACE_BYTES + TLB_BYTES;
+/// Bytes per page image: `data[4096]` then `perm[4096]`, matching `PageData`.
+const FASTMEM_PAGE_IMG: u32 = 8192;
+/// Page-image slots the pool holds (the gate's blocks touch only a few pages).
+const FASTMEM_MAX_SLOTS: u32 = 8;
+/// The TLB tag mask (`addr & 0xFFFF_FFFF_FFC0_0000`).
+const FASTMEM_TAG_MASK: u64 = 0xFFFF_FFFF_FFC0_0000;
+
+/// State the fast-path harness callbacks act on: a real VM (guest memory and the
+/// exception a fault sets), the wasm memory the register file / TLB / page pool
+/// live in, the resume index a fault reports, the page→slot table, and the count
+/// of host callbacks (which stops growing once the fast path is warm).
+struct FastHost {
+    vm: x64_engine::InterpVm,
+    memory: Option<wasmi::Memory>,
+    fault: Option<u32>,
+    pages: Vec<(u64, u32)>,
+    next_slot: u32,
+    host_calls: u64,
+}
+
+/// Mirrors the resident guest page containing `page_addr` (data + perm) into its
+/// pool slot and fills the in-wasm TLB entry so a subsequent access to it is
+/// served inline — the harness's stand-in for `Mmu::read`/`write` caching a
+/// translation. A store re-mirrors the page (which now carries the write and its
+/// `INIT` bits) and fills the WRITE array; a load fills the READ array.
+fn fastmem_ensure_page(caller: &mut wasmi::Caller<FastHost>, page_addr: u64, is_write: bool) {
+    // Find or allocate the slot for this page.
+    let slot = {
+        let host = caller.data_mut();
+        match host.pages.iter().find(|(pa, _)| *pa == page_addr) {
+            Some((_, s)) => *s,
+            None => {
+                let s = host.next_slot;
+                assert!(s < FASTMEM_MAX_SLOTS, "fastmem page pool exhausted");
+                host.next_slot += 1;
+                host.pages.push((page_addr, s));
+                s
+            }
+        }
+    };
+
+    // Copy the resident page's data+perm out of the real MMU.
+    let mut buf = [0u8; FASTMEM_PAGE_IMG as usize];
+    {
+        let mem = &mut caller.data_mut().vm.cpu.mem;
+        if let Some(idx) = mem.get_physical_index(page_addr) {
+            let pd = mem.get_physical(idx).data();
+            buf[..4096].copy_from_slice(&pd.data);
+            buf[4096..].copy_from_slice(&pd.perm);
+        }
+    }
+    let memory = caller.data().memory.expect("memory");
+    let slot_off = FASTMEM_POOL_BASE as usize + slot as usize * FASTMEM_PAGE_IMG as usize;
+    memory
+        .write(&mut *caller, slot_off, &buf)
+        .expect("mirror page");
+
+    // Fill the TLB entry: tag = page tag, guest_to_host_offset = image base -
+    // page base, so `addr + g2h` lands on the addressed byte in the image.
+    let index = ((page_addr >> 12) & 0x3ff) as usize;
+    let tag = page_addr & FASTMEM_TAG_MASK;
+    let g2h = (slot_off as u64).wrapping_sub(page_addr);
+    let array = if is_write { 0x4000 } else { 0 };
+    let entry_off = FASTMEM_TLB_BASE as usize + array + index * 16;
+    let mut entry = [0u8; 16];
+    entry[..8].copy_from_slice(&tag.to_le_bytes());
+    entry[8..].copy_from_slice(&g2h.to_le_bytes());
+    memory
+        .write(&mut *caller, entry_off, &entry)
+        .expect("tlb entry");
+}
+
+/// The fast-path harness: one wasm memory (register file + TLB + page pool) plus
+/// a real VM the callbacks route through. Built around one translated block that
+/// it runs repeatedly, warming the TLB after the first run.
+struct FastRunner {
+    store: wasmi::Store<FastHost>,
+    memory: wasmi::Memory,
+    run: wasmi::TypedFunc<(i32, i32), ()>,
+}
+
+impl FastRunner {
+    /// Builds the harness for `block`, mapping and seeding `region` (base, bytes)
+    /// in the VM and seeding the register file. Returns `None` if the block does
+    /// not translate.
+    fn new(
+        block: &pcode::Block,
+        seeds: &[(VarNode, u64)],
+        region: &[(u64, Vec<u8>)],
+    ) -> Option<Self> {
+        let bytes = translate_block(block)?;
+        let engine = wasmi::Engine::default();
+        let module = wasmi::Module::new(&engine, &bytes[..]).expect("emitted wasm is valid");
+
+        let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+        vm.cpu.regs.fill(0);
+        for (base, data) in region {
+            map_region(&mut vm.cpu.mem, *base, data);
+        }
+
+        let mut store = wasmi::Store::new(
+            &engine,
+            FastHost {
+                vm,
+                memory: None,
+                fault: None,
+                pages: Vec::new(),
+                next_slot: 0,
+                host_calls: 0,
+            },
+        );
+        let total = FASTMEM_POOL_BASE + FASTMEM_MAX_SLOTS * FASTMEM_PAGE_IMG;
+        let mem_ty = wasmi::MemoryType::new(total.div_ceil(65536), None);
+        let memory = wasmi::Memory::new(&mut store, mem_ty).expect("memory");
+        store.data_mut().memory = Some(memory);
+        // Seed the register file; start the TLB all-invalid (0xFF tags).
+        memory
+            .write(&mut store, 0, &seed_regs_bytes(seeds))
+            .expect("seed regs");
+        memory
+            .write(
+                &mut store,
+                FASTMEM_TLB_BASE as usize,
+                &vec![0xffu8; TLB_BYTES as usize],
+            )
+            .expect("invalidate tlb");
+
+        let mut linker = wasmi::Linker::new(&engine);
+        linker.define("env", "regs", memory).expect("define memory");
+        linker
+            .func_wrap(
+                "env",
+                "load",
+                |mut caller: wasmi::Caller<FastHost>, addr: i64, dst_off: i32, size: i32| -> i32 {
+                    caller.data_mut().host_calls += 1;
+                    let addr = addr as u64;
+                    let res = {
+                        let mem = &mut caller.data_mut().vm.cpu.mem;
+                        match size {
+                            1 => mem.read::<1>(addr, perm::READ).map(|b| b.to_vec()),
+                            2 => mem.read::<2>(addr, perm::READ).map(|b| b.to_vec()),
+                            4 => mem.read::<4>(addr, perm::READ).map(|b| b.to_vec()),
+                            8 => mem.read::<8>(addr, perm::READ).map(|b| b.to_vec()),
+                            _ => return 0,
+                        }
+                    };
+                    match res {
+                        Ok(loaded) => {
+                            fastmem_ensure_page(&mut caller, addr & !0xfff, false);
+                            let regs = caller.data().memory.expect("memory");
+                            regs.write(&mut caller, dst_off as usize, &loaded)
+                                .expect("write regs");
+                            1
+                        }
+                        Err(e) => {
+                            let code = x64_engine::ExceptionCode::from_load_error(e) as u32;
+                            let cpu = &mut caller.data_mut().vm.cpu;
+                            cpu.exception.code = code;
+                            cpu.exception.value = addr;
+                            0
+                        }
+                    }
+                },
+            )
+            .expect("define load");
+        linker
+            .func_wrap(
+                "env",
+                "store",
+                |mut caller: wasmi::Caller<FastHost>, addr: i64, value: i64, size: i32| -> i32 {
+                    caller.data_mut().host_calls += 1;
+                    let addr = addr as u64;
+                    let v = value as u64;
+                    let res = {
+                        let mem = &mut caller.data_mut().vm.cpu.mem;
+                        match size {
+                            1 => mem.write::<1>(addr, (v as u8).to_le_bytes(), perm::WRITE),
+                            2 => mem.write::<2>(addr, (v as u16).to_le_bytes(), perm::WRITE),
+                            4 => mem.write::<4>(addr, (v as u32).to_le_bytes(), perm::WRITE),
+                            8 => mem.write::<8>(addr, v.to_le_bytes(), perm::WRITE),
+                            _ => return 0,
+                        }
+                    };
+                    match res {
+                        Ok(()) => {
+                            fastmem_ensure_page(&mut caller, addr & !0xfff, true);
+                            1
+                        }
+                        Err(e) => {
+                            let code = x64_engine::ExceptionCode::from_store_error(e) as u32;
+                            let cpu = &mut caller.data_mut().vm.cpu;
+                            cpu.exception.code = code;
+                            cpu.exception.value = addr;
+                            0
+                        }
+                    }
+                },
+            )
+            .expect("define store");
+        linker
+            .func_wrap(
+                "env",
+                "fault",
+                |mut caller: wasmi::Caller<FastHost>, index: i32| {
+                    caller.data_mut().fault = Some(index as u32);
+                },
+            )
+            .expect("define fault");
+        linker
+            .func_wrap(
+                "env",
+                "raise",
+                |mut caller: wasmi::Caller<FastHost>, code: i32, value: i64, index: i32| {
+                    let cpu = &mut caller.data_mut().vm.cpu;
+                    cpu.exception.code = x64_engine::ExceptionCode::from_u32(code as u32) as u32;
+                    cpu.exception.value = value as u64;
+                    caller.data_mut().fault = Some(index as u32);
+                },
+            )
+            .expect("define raise");
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate")
+            .start(&mut store)
+            .expect("start");
+        let run = instance
+            .get_typed_func::<(i32, i32), ()>(&store, "run")
+            .expect("run export");
+
+        Some(Self { store, memory, run })
+    }
+
+    /// Runs the block once against the shared memory. Returns how many host
+    /// callbacks it made and the fault index it stopped at, if any.
+    fn run_once(&mut self) -> (u64, Option<u32>) {
+        self.store.data_mut().fault = None;
+        let before = self.store.data().host_calls;
+        self.run
+            .call(&mut self.store, (0, FASTMEM_TLB_BASE as i32))
+            .expect("run");
+        let calls = self.store.data().host_calls - before;
+        (calls, self.store.data().fault)
+    }
+
+    fn mem(&mut self) -> &mut icicle_cpu::mem::Mmu {
+        &mut self.store.data_mut().vm.cpu.mem
+    }
+
+    fn exception(&self) -> (u32, u64) {
+        let e = &self.store.data().vm.cpu.exception;
+        (e.code, e.value)
+    }
+
+    /// Reads back the register file window `[0, REG_SPACE)`.
+    fn regs(&self) -> Vec<u8> {
+        let mut out = vec![0u8; REG_SPACE_BYTES as usize];
+        self.memory
+            .read(&self.store, 0, &mut out)
+            .expect("read regs");
+        out
+    }
+
+    /// Flushes each mirrored page's data back into the real MMU (so a fast-path
+    /// store, which wrote only the image, is reflected), then reads the region.
+    fn guest(&mut self, base: u64, len: usize) -> Vec<u8> {
+        let pages: Vec<(u64, u32)> = self.store.data().pages.clone();
+        for (page_addr, slot) in pages {
+            let mut data = vec![0u8; 4096];
+            let off = FASTMEM_POOL_BASE as usize + slot as usize * FASTMEM_PAGE_IMG as usize;
+            self.memory
+                .read(&self.store, off, &mut data)
+                .expect("read image");
+            // Best-effort: an unmapped page (coherence test) cannot be written.
+            let _ = self
+                .store
+                .data_mut()
+                .vm
+                .cpu
+                .mem
+                .write_bytes(page_addr, &data, perm::NONE);
+        }
+        let mut buf = vec![0u8; len];
+        self.store
+            .data_mut()
+            .vm
+            .cpu
+            .mem
+            .read_bytes(base, &mut buf, perm::NONE)
+            .expect("read guest");
+        buf
+    }
+
+    /// Marks a warm TLB entry invalid (as icicle's flush does on unmap/mprotect),
+    /// in both arrays, so the fast path can no longer use its stale translation.
+    fn invalidate_tlb(&mut self, addr: u64) {
+        let index = ((addr >> 12) & 0x3ff) as usize;
+        for array in [0usize, 0x4000] {
+            let off = FASTMEM_TLB_BASE as usize + array + index * 16;
+            self.memory
+                .write(&mut self.store, off, &[0xffu8; 16])
+                .expect("invalidate tlb");
+        }
+    }
+
+    /// ANDs the perm bytes of the mirrored page for `addr` over `len` with
+    /// `keep`, to simulate a permission change on an already-resident page (the
+    /// TLB entry stays valid; only the page's perms change).
+    fn clear_mirror_perm(&mut self, addr: u64, len: usize, keep: u8) {
+        let page_addr = addr & !0xfff;
+        let slot = self
+            .store
+            .data()
+            .pages
+            .iter()
+            .find(|(pa, _)| *pa == page_addr)
+            .map(|(_, s)| *s)
+            .expect("page mirrored");
+        let page_off = (addr & 0xfff) as usize;
+        let base = FASTMEM_POOL_BASE as usize + slot as usize * FASTMEM_PAGE_IMG as usize + 4096;
+        let mut perm = vec![0u8; len];
+        self.memory
+            .read(&self.store, base + page_off, &mut perm)
+            .expect("read perm");
+        for p in &mut perm {
+            *p &= keep;
+        }
+        self.memory
+            .write(&mut self.store, base + page_off, &perm)
+            .expect("write perm");
+    }
+}
+
+/// A parallel interpreter reference: the same block over the same seeds/region,
+/// run one execution at a time so a test can apply the same mapping change to it
+/// and the JIT harness between runs.
+struct InterpRef {
+    vm: x64_engine::InterpVm,
+    block: pcode::Block,
+}
+
+impl InterpRef {
+    fn new(block: &pcode::Block, seeds: &[(VarNode, u64)], region: &[(u64, Vec<u8>)]) -> Self {
+        let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+        vm.cpu.regs.fill(0);
+        for (base, data) in region {
+            map_region(&mut vm.cpu.mem, *base, data);
+        }
+        for &(var, value) in seeds {
+            let off = x64_engine::jit::var_offset(var) as usize;
+            let n = var.size as usize;
+            vm.cpu.regs.as_bytes_mut()[off..off + n].copy_from_slice(&value.to_le_bytes()[..n]);
+        }
+        Self {
+            vm,
+            block: clone_block(block),
+        }
+    }
+
+    fn run_once(&mut self) -> Option<usize> {
+        // Safety: the block is well-formed p-code built by the test.
+        unsafe { self.vm.cpu.interpret_block_unchecked(&self.block, 0) }
+    }
+
+    fn mem(&mut self) -> &mut icicle_cpu::mem::Mmu {
+        &mut self.vm.cpu.mem
+    }
+
+    fn exception(&self) -> (u32, u64) {
+        (self.vm.cpu.exception.code, self.vm.cpu.exception.value)
+    }
+
+    fn regs(&self) -> Vec<u8> {
+        self.vm.cpu.regs.as_bytes().to_vec()
+    }
+
+    fn guest(&mut self, base: u64, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        self.vm
+            .cpu
+            .mem
+            .read_bytes(base, &mut buf, perm::NONE)
+            .expect("read guest");
+        buf
+    }
+}
+
+/// Asserts the JIT-with-fast-path state (regs, guest bytes, fault, exception)
+/// equals the interpreter's after the same execution.
+fn fastmem_assert_same(
+    label: &str,
+    interp: &mut InterpRef,
+    jit: &mut FastRunner,
+    ifault: Option<usize>,
+    jfault: Option<u32>,
+    base: u64,
+    len: usize,
+) {
+    assert_eq!(
+        ifault,
+        jfault.map(|i| i as usize),
+        "{label}: fault index diverged (interp {ifault:?}, jit {jfault:?})"
+    );
+    assert_eq!(
+        interp.exception(),
+        jit.exception(),
+        "{label}: exception diverged"
+    );
+    assert_eq!(interp.regs(), jit.regs(), "{label}: register file diverged");
+    if len > 0 {
+        assert_eq!(
+            interp.guest(base, len),
+            jit.guest(base, len),
+            "{label}: guest memory diverged"
+        );
+    }
+}
+
+/// A single-Load block: `out(size) = *addr`, address in varnode 5.
+fn load_block(size: u8) -> (pcode::Block, VarNode, VarNode) {
+    let (out, addr) = (v(1, size), v(5, 8));
+    let mut block = pcode::Block::new();
+    block.push((out, Op::Load(RAM_SPACE), addr));
+    (block, out, addr)
+}
+
+/// A single-Store block: `*addr = val(size)`, address in 5, value in 6.
+fn store_block(size: u8) -> (pcode::Block, VarNode, VarNode) {
+    let (addr, val) = (v(5, 8), v(6, size));
+    let mut block = pcode::Block::new();
+    block.push((Op::Store(RAM_SPACE), Inputs::new(addr, val)));
+    (block, addr, val)
+}
+
+#[test]
+fn fastmem_load_hit_matches_and_warms() {
+    // A warm load of each width is served inline (no host call on the second
+    // run) and matches the interpreter.
+    const BASE: u64 = 0x1_0000;
+    let seed: Vec<u8> = (0..64u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    for size in [1u8, 2, 4, 8] {
+        let off = 16u64; // aligned for every width
+        let (block, _out, addr) = load_block(size);
+        let seeds = vec![(addr, BASE + off)];
+        let region = vec![(BASE, seed.clone())];
+
+        let mut interp = InterpRef::new(&block, &seeds, &region);
+        let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+
+        // First run warms the TLB (a host call), second must be pure fast path.
+        let i1 = interp.run_once();
+        let (c1, f1) = jit.run_once();
+        fastmem_assert_same(
+            &format!("load u{} run1", size * 8),
+            &mut interp,
+            &mut jit,
+            i1,
+            f1,
+            BASE,
+            seed.len(),
+        );
+        assert!(
+            c1 > 0,
+            "load u{}: first run should miss and call the host",
+            size * 8
+        );
+
+        let i2 = interp.run_once();
+        let (c2, f2) = jit.run_once();
+        fastmem_assert_same(
+            &format!("load u{} run2", size * 8),
+            &mut interp,
+            &mut jit,
+            i2,
+            f2,
+            BASE,
+            seed.len(),
+        );
+        assert_eq!(
+            c2,
+            0,
+            "load u{}: warm run still called the host {c2}x — the fast path did not fire",
+            size * 8
+        );
+    }
+}
+
+#[test]
+fn fastmem_store_hit_matches_and_warms() {
+    // A warm store of each width writes through inline (no host call once warm)
+    // and the written-back memory matches the interpreter.
+    const BASE: u64 = 0x1_0000;
+    for (size, val) in [
+        (1u8, 0xa5u64),
+        (2, 0xbeef),
+        (4, 0xdead_beef),
+        (8, 0xcafe_f00d_1234_5678),
+    ] {
+        let off = 24u64;
+        let (block, addr, valv) = store_block(size);
+        let seeds = vec![(addr, BASE + off), (valv, val)];
+        let region = vec![(BASE, vec![0u8; 64])];
+
+        let mut interp = InterpRef::new(&block, &seeds, &region);
+        let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+
+        let i1 = interp.run_once();
+        let (c1, f1) = jit.run_once();
+        fastmem_assert_same(
+            &format!("store u{} run1", size * 8),
+            &mut interp,
+            &mut jit,
+            i1,
+            f1,
+            BASE,
+            64,
+        );
+        assert!(c1 > 0, "store u{}: first run should miss", size * 8);
+
+        let i2 = interp.run_once();
+        let (c2, f2) = jit.run_once();
+        fastmem_assert_same(
+            &format!("store u{} run2", size * 8),
+            &mut interp,
+            &mut jit,
+            i2,
+            f2,
+            BASE,
+            64,
+        );
+        assert_eq!(
+            c2,
+            0,
+            "store u{}: warm run still called the host — fast path did not fire",
+            size * 8
+        );
+    }
+}
+
+#[test]
+fn fastmem_cross_page_load_always_defers() {
+    // An 8-byte load straddling a page boundary must always take the slow path
+    // (the cross-page guard), even after neighbouring accesses warm the TLB, and
+    // must still match the interpreter (which reads it byte by byte).
+    const BASE: u64 = 0x1_0000; // two pages: [0x10000, 0x12000)
+    let bytes: Vec<u8> = (0..0x2000u32).map(|i| (i as u8).wrapping_mul(3)).collect();
+    let straddle = 0x1_1000 - 4; // [0x10ffc, 0x11004): crosses the 0x11000 boundary
+    let (block, _out, addr) = load_block(8);
+    let seeds = vec![(addr, straddle)];
+    let region = vec![(BASE, bytes.clone())];
+
+    let mut interp = InterpRef::new(&block, &seeds, &region);
+    let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+
+    for run in 0..2 {
+        let i = interp.run_once();
+        let (c, f) = jit.run_once();
+        fastmem_assert_same(
+            &format!("cross-page run{run}"),
+            &mut interp,
+            &mut jit,
+            i,
+            f,
+            BASE,
+            bytes.len(),
+        );
+        assert!(
+            c > 0,
+            "cross-page run{run}: a straddling load must defer to the host every time"
+        );
+    }
+}
+
+#[test]
+fn fastmem_coherence_after_unmap() {
+    // Warm a page through the fast path, then unmap it (and invalidate the TLB
+    // entry, as icicle's flush does). The next access must NOT use the stale
+    // translation: it faults exactly as the interpreter does. This is the
+    // correctness crux — breaking the tag compare reddens it.
+    const BASE: u64 = 0x1_0000;
+    let seed: Vec<u8> = (0..64u8).collect();
+    let (block, _out, addr) = load_block(8);
+    let seeds = vec![(addr, BASE)];
+    let region = vec![(BASE, seed.clone())];
+
+    let mut interp = InterpRef::new(&block, &seeds, &region);
+    let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+
+    // Warm.
+    let i1 = interp.run_once();
+    let (c1, f1) = jit.run_once();
+    fastmem_assert_same(
+        "coherence warm",
+        &mut interp,
+        &mut jit,
+        i1,
+        f1,
+        BASE,
+        seed.len(),
+    );
+    assert!(c1 > 0, "coherence: first run should warm the TLB");
+    let (c2, _) = jit.run_once();
+    let _ = interp.run_once();
+    assert_eq!(c2, 0, "coherence: page should be warm before the unmap");
+
+    // Unmap in both; icicle flushes the live TLB, which the harness mirrors by
+    // invalidating the entry the JIT reads.
+    interp.mem().unmap_memory_len(BASE, 0x1000);
+    jit.mem().unmap_memory_len(BASE, 0x1000);
+    jit.invalidate_tlb(BASE);
+
+    let i3 = interp.run_once();
+    let (c3, f3) = jit.run_once();
+    fastmem_assert_same(
+        "coherence after unmap",
+        &mut interp,
+        &mut jit,
+        i3,
+        f3,
+        BASE,
+        0,
+    );
+    assert!(f3.is_some(), "coherence: the access after unmap must fault");
+    assert!(c3 > 0, "coherence: the faulting access must reach the host");
+}
+
+#[test]
+fn fastmem_tlb_index_aliasing() {
+    // Two pages that map to the SAME TLB index (their addresses differ by a
+    // multiple of the index span, 0x40_0000). A block loads from both: the first
+    // load warms the shared index with page A's translation, the second must NOT
+    // reuse it for page B — the tag differs, so it misses and reads B. This is
+    // exactly what the tag compare exists for; accepting any tag makes the second
+    // load resolve through A's translation and diverge (a wrong address, here out
+    // of bounds), so breaking the tag compare reddens this test.
+    let a_base = 0x10_0000u64; // index (0x100000 >> 12) & 0x3ff = 0x100
+    let b_base = 0x10_0000u64 + 0x40_0000; // 0x500000, index 0x100 as well
+    assert_eq!(
+        (a_base >> 12) & 0x3ff,
+        (b_base >> 12) & 0x3ff,
+        "same TLB index"
+    );
+    let region = vec![(a_base, vec![0x11u8; 4096]), (b_base, vec![0x22u8; 4096])];
+
+    let (oa, ob) = (v(1, 1), v(2, 1));
+    let (aa, ab) = (v(5, 8), v(6, 8));
+    let mut block = pcode::Block::new();
+    block.push((oa, Op::Load(RAM_SPACE), aa));
+    block.push((ob, Op::Load(RAM_SPACE), ab));
+    let seeds = vec![(aa, a_base), (ab, b_base)];
+
+    let mut interp = InterpRef::new(&block, &seeds, &region);
+    let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+    // Two runs, so the second sees both indices warm and the aliasing is live.
+    for run in 0..2 {
+        let i = interp.run_once();
+        let (_c, f) = jit.run_once();
+        fastmem_assert_same(
+            &format!("aliasing run{run}"),
+            &mut interp,
+            &mut jit,
+            i,
+            f,
+            0,
+            0,
+        );
+    }
+    // The second load must have read page B (0x22), not page A (0x11).
+    assert_eq!(
+        jit.regs()[x64_engine::jit::var_offset(ob) as usize],
+        0x22,
+        "aliasing: the second load must read page B, not A's stale translation"
+    );
+}
+
+#[test]
+fn fastmem_permission_fault_after_mprotect() {
+    // Warm a readable page, then drop READ from its perms (mprotect) — updating
+    // the resident page's perm bytes but leaving the TLB entry valid. The fast
+    // path's permission guard must reject it and defer to the host, which raises
+    // the exact ReadViolation the interpreter does. Dropping INIT from the perm
+    // mask reddens this.
+    const BASE: u64 = 0x1_0000;
+    let seed: Vec<u8> = (0..64u8).collect();
+    let (block, _out, addr) = load_block(8);
+    let seeds = vec![(addr, BASE)];
+    let region = vec![(BASE, seed.clone())];
+
+    let mut interp = InterpRef::new(&block, &seeds, &region);
+    let mut jit = FastRunner::new(&block, &seeds, &region).expect("translates");
+
+    let i1 = interp.run_once();
+    let (c1, f1) = jit.run_once();
+    fastmem_assert_same("perm warm", &mut interp, &mut jit, i1, f1, BASE, seed.len());
+    assert!(c1 > 0);
+    let (c2, _) = jit.run_once();
+    let _ = interp.run_once();
+    assert_eq!(c2, 0, "perm: page should be warm before the mprotect");
+
+    // mprotect to write-only (no READ) in both. The TLB entry stays valid; only
+    // the resident page's perms change, so the fast path's perm guard is what
+    // must catch it.
+    interp
+        .mem()
+        .update_perm(BASE, 0x1000, perm::WRITE)
+        .expect("mprotect");
+    jit.mem()
+        .update_perm(BASE, 0x1000, perm::WRITE)
+        .expect("mprotect");
+    jit.clear_mirror_perm(BASE, 8, !perm::READ);
+
+    let i3 = interp.run_once();
+    let (c3, f3) = jit.run_once();
+    fastmem_assert_same(
+        "perm after mprotect",
+        &mut interp,
+        &mut jit,
+        i3,
+        f3,
+        BASE,
+        0,
+    );
+    assert!(f3.is_some(), "perm: the read of a no-read page must fault");
+    assert!(c3 > 0, "perm: the faulting access must defer to the host");
+    assert_eq!(
+        jit.exception().0,
+        x64_engine::ExceptionCode::from_load_error(icicle_cpu::mem::MemError::ReadViolation) as u32,
+        "perm: expected a ReadViolation"
+    );
 }

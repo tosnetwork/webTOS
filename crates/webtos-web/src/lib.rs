@@ -386,15 +386,24 @@ extern "C" {
     /// Hands block bytes to the host to compile; returns a handle, or 0 if the
     /// host declined (which the engine caches as a permanent bail).
     fn jit_compile(bytes_ptr: u32, bytes_len: u32) -> u32;
-    /// Runs the compiled block `handle` against the register file at `regs_base`
-    /// (a byte offset into this module's memory).
-    fn jit_call(handle: u32, regs_base: u32);
+    /// Runs the compiled block `handle` against the register file at `regs_base`,
+    /// with `tlb_base` pointing at icicle's live translation cache (both byte
+    /// offsets into this module's memory). The inline memory fast path reads the
+    /// TLB and the resolved guest page directly from that memory.
+    fn jit_call(handle: u32, regs_base: u32, tlb_base: u32);
     /// Runs a compiled self-loop region `handle` against the register file at
-    /// `regs_base` for up to `max_iters` iterations (split into low and high
-    /// `u32` halves, since the boundary is `u32`-only), returning the number of
-    /// iterations executed. The count is bounded by `max_iters`, which is
-    /// bounded by a fuel slice, so it fits in a `u32`.
-    fn jit_call_region(handle: u32, regs_base: u32, max_iters_lo: u32, max_iters_hi: u32) -> u32;
+    /// `regs_base`, with `tlb_base` as in `jit_call`, for up to `max_iters`
+    /// iterations (split into low and high `u32` halves, since the boundary is
+    /// `u32`-only), returning the number of iterations executed. The count is
+    /// bounded by `max_iters`, which is bounded by a fuel slice, so it fits in a
+    /// `u32`.
+    fn jit_call_region(
+        handle: u32,
+        regs_base: u32,
+        tlb_base: u32,
+        max_iters_lo: u32,
+        max_iters_hi: u32,
+    ) -> u32;
 }
 
 struct BrowserJit;
@@ -407,10 +416,14 @@ impl JitBackend for BrowserJit {
 
     fn call(&mut self, handle: u32, cpu: &mut icicle_cpu::Cpu) -> JitOutcome {
         let regs_base = cpu.regs.as_bytes().as_ptr() as u32;
+        // The engine's memory is one linear space, so icicle's live TLB is
+        // reachable at this offset; the fast path reads it and the guest pages
+        // directly, no copy.
+        let tlb_base = cpu.mem.tlb_ptr() as u32;
         JIT_FAULT.with(|f| f.set(-1));
         JIT_CPU.with(|c| c.set(cpu as *mut icicle_cpu::Cpu));
         // The shims run synchronously inside this call, reading `JIT_CPU`.
-        unsafe { jit_call(handle, regs_base) };
+        unsafe { jit_call(handle, regs_base, tlb_base) };
         JIT_CPU.with(|c| c.set(std::ptr::null_mut()));
         match JIT_FAULT.with(|f| f.get()) {
             i if i < 0 => JitOutcome::Completed,
@@ -430,6 +443,7 @@ impl JitBackend for BrowserJit {
         // fault in `JIT_FAULT`, exactly as the per-block path does; a
         // register-only region touches neither.
         let regs_base = cpu.regs.as_bytes().as_ptr() as u32;
+        let tlb_base = cpu.mem.tlb_ptr() as u32;
         JIT_FAULT.with(|f| f.set(-1));
         JIT_CPU.with(|c| c.set(cpu as *mut icicle_cpu::Cpu));
         // The shims run synchronously inside this call, reading `JIT_CPU`.
@@ -437,6 +451,7 @@ impl JitBackend for BrowserJit {
             jit_call_region(
                 handle,
                 regs_base,
+                tlb_base,
                 max_iters as u32,
                 (max_iters >> 32) as u32,
             )
