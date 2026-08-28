@@ -1526,3 +1526,374 @@ fn memory_ops_match_the_interpreter() {
     );
     assert!(ran > 0, "no cases ran");
 }
+
+// ---------------------------------------------------------------------------
+// Float ops (sizes 4 and 8).
+//
+// These are register-only, so they reuse `jit()`/`interpret()` above. The one
+// difference is the comparison: a NaN *result* can carry a different payload
+// under a native interpreter build (Rust f64) than under wasm, even though a
+// wasm interpreter build — the real target — computes them with the same wasm
+// ops and agrees bit for bit. So the output slot of a float-producing op is
+// compared NaN-aware (both-NaN is a match); everything else, including every
+// boolean result, is compared exactly.
+
+/// A float gate case: like the register cases, plus which varnode is the
+/// output and whether that output is itself a float (so a NaN there is
+/// compared leniently) rather than a boolean (compared exactly).
+struct FloatCase {
+    name: &'static str,
+    seeds: Vec<(VarNode, u64)>,
+    block: pcode::Block,
+    out: VarNode,
+    out_is_float: bool,
+}
+
+fn f32b(x: f32) -> u64 {
+    x.to_bits() as u64
+}
+fn f64b(x: f64) -> u64 {
+    x.to_bits()
+}
+
+fn is_nan_bits(bytes: &[u8], size: u8) -> bool {
+    match size {
+        4 => f32::from_bits(u32::from_le_bytes(bytes.try_into().unwrap())).is_nan(),
+        8 => f64::from_bits(u64::from_le_bytes(bytes.try_into().unwrap())).is_nan(),
+        _ => false,
+    }
+}
+
+/// `None` if the two register spaces match (NaN-aware within a float output
+/// slot), else a description of the first divergence.
+fn float_diff(interp: &[u8], jit: &[u8], case: &FloatCase) -> Option<String> {
+    let off = x64_engine::jit::var_offset(case.out) as usize;
+    let n = case.out.size as usize;
+    for i in 0..interp.len() {
+        if (off..off + n).contains(&i) {
+            continue;
+        }
+        if interp[i] != jit[i] {
+            return Some(format!(
+                "byte {i:#x}: interp {:#04x} jit {:#04x}",
+                interp[i], jit[i]
+            ));
+        }
+    }
+    let (ib, jb) = (&interp[off..off + n], &jit[off..off + n]);
+    if ib == jb {
+        return None;
+    }
+    if case.out_is_float && is_nan_bits(ib, case.out.size) && is_nan_bits(jb, case.out.size) {
+        return None;
+    }
+    Some(format!("output slot: interp {ib:02x?} jit {jb:02x?}"))
+}
+
+fn float_cases() -> Vec<FloatCase> {
+    let mut out = Vec::new();
+
+    let binary = |name, op, size, av: u64, bv: u64, out_is_float| {
+        let (o, a, b) = (
+            reg(1, if out_is_float { size } else { 1 }),
+            reg(2, size),
+            reg(3, size),
+        );
+        let mut block = pcode::Block::new();
+        block.push((o, op, a, b));
+        FloatCase {
+            name,
+            seeds: vec![(a, av), (b, bv)],
+            block,
+            out: o,
+            out_is_float,
+        }
+    };
+    let unary = |name, op, size, av: u64, out_is_float| {
+        let (o, a) = (reg(1, if out_is_float { size } else { 1 }), reg(2, size));
+        let mut block = pcode::Block::new();
+        block.push((o, op, a));
+        FloatCase {
+            name,
+            seeds: vec![(a, av)],
+            block,
+            out: o,
+            out_is_float,
+        }
+    };
+
+    // Arithmetic on finite operands: exact results.
+    out.push(binary(
+        "FloatAdd f64",
+        Op::FloatAdd,
+        8,
+        f64b(1.5),
+        f64b(2.25),
+        true,
+    ));
+    out.push(binary(
+        "FloatAdd f32",
+        Op::FloatAdd,
+        4,
+        f32b(1.5),
+        f32b(2.25),
+        true,
+    ));
+    out.push(binary(
+        "FloatSub f64",
+        Op::FloatSub,
+        8,
+        f64b(10.0),
+        f64b(3.5),
+        true,
+    ));
+    out.push(binary(
+        "FloatMul f64",
+        Op::FloatMul,
+        8,
+        f64b(2.5),
+        f64b(4.0),
+        true,
+    ));
+    out.push(binary(
+        "FloatMul f32",
+        Op::FloatMul,
+        4,
+        f32b(2.5),
+        f32b(4.0),
+        true,
+    ));
+    out.push(binary(
+        "FloatDiv f64",
+        Op::FloatDiv,
+        8,
+        f64b(7.0),
+        f64b(2.0),
+        true,
+    ));
+    out.push(binary(
+        "FloatDiv f32",
+        Op::FloatDiv,
+        4,
+        f32b(7.0),
+        f32b(2.0),
+        true,
+    ));
+
+    // Arithmetic producing NaN: compared NaN-aware.
+    out.push(binary(
+        "FloatDiv 0/0 f64",
+        Op::FloatDiv,
+        8,
+        f64b(0.0),
+        f64b(0.0),
+        true,
+    ));
+    out.push(binary(
+        "FloatAdd inf+-inf f64",
+        Op::FloatAdd,
+        8,
+        f64b(f64::INFINITY),
+        f64b(f64::NEG_INFINITY),
+        true,
+    ));
+    out.push(binary(
+        "FloatMul 0*inf f32",
+        Op::FloatMul,
+        4,
+        f32b(0.0),
+        f32b(f32::INFINITY),
+        true,
+    ));
+
+    // Unary on finite operands.
+    out.push(unary(
+        "FloatNegate f64",
+        Op::FloatNegate,
+        8,
+        f64b(3.0),
+        true,
+    ));
+    out.push(unary(
+        "FloatNegate f32",
+        Op::FloatNegate,
+        4,
+        f32b(-3.0),
+        true,
+    ));
+    out.push(unary("FloatAbs f64", Op::FloatAbs, 8, f64b(-3.5), true));
+    out.push(unary("FloatSqrt f64", Op::FloatSqrt, 8, f64b(2.0), true));
+    out.push(unary("FloatSqrt f32", Op::FloatSqrt, 4, f32b(4.0), true));
+    out.push(unary("FloatCeil f64 +", Op::FloatCeil, 8, f64b(2.3), true));
+    out.push(unary("FloatCeil f64 -", Op::FloatCeil, 8, f64b(-2.3), true));
+    out.push(unary(
+        "FloatFloor f64 +",
+        Op::FloatFloor,
+        8,
+        f64b(2.7),
+        true,
+    ));
+    out.push(unary(
+        "FloatFloor f32 -",
+        Op::FloatFloor,
+        4,
+        f32b(-2.3),
+        true,
+    ));
+    // Unary producing NaN.
+    out.push(unary(
+        "FloatSqrt -1 f64",
+        Op::FloatSqrt,
+        8,
+        f64b(-1.0),
+        true,
+    ));
+
+    // Comparisons: boolean output, exact.
+    out.push(binary(
+        "FloatEqual eq f64",
+        Op::FloatEqual,
+        8,
+        f64b(2.0),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatEqual ne f64",
+        Op::FloatEqual,
+        8,
+        f64b(2.0),
+        f64b(3.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatNotEqual f64",
+        Op::FloatNotEqual,
+        8,
+        f64b(1.0),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatLess lt f64",
+        Op::FloatLess,
+        8,
+        f64b(1.0),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatLess ge f64",
+        Op::FloatLess,
+        8,
+        f64b(2.0),
+        f64b(1.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatLessEqual f64",
+        Op::FloatLessEqual,
+        8,
+        f64b(2.0),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatLess f32",
+        Op::FloatLess,
+        4,
+        f32b(1.0),
+        f32b(2.0),
+        false,
+    ));
+    // NaN comparisons: all false but not-equal.
+    out.push(binary(
+        "FloatEqual NaN f64",
+        Op::FloatEqual,
+        8,
+        f64b(f64::NAN),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatNotEqual NaN f64",
+        Op::FloatNotEqual,
+        8,
+        f64b(f64::NAN),
+        f64b(2.0),
+        false,
+    ));
+    out.push(binary(
+        "FloatLess NaN f64",
+        Op::FloatLess,
+        8,
+        f64b(f64::NAN),
+        f64b(2.0),
+        false,
+    ));
+
+    // IsNan: boolean output.
+    out.push(unary(
+        "FloatIsNan NaN f64",
+        Op::FloatIsNan,
+        8,
+        f64b(f64::NAN),
+        false,
+    ));
+    out.push(unary(
+        "FloatIsNan finite f64",
+        Op::FloatIsNan,
+        8,
+        f64b(1.0),
+        false,
+    ));
+    out.push(unary(
+        "FloatIsNan NaN f32",
+        Op::FloatIsNan,
+        4,
+        f32b(f32::NAN),
+        false,
+    ));
+
+    out
+}
+
+#[test]
+fn float_ops_match_the_interpreter() {
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for case in float_cases() {
+        // Reuse the register-only harness: float ops touch no guest memory.
+        let reg_case = Case {
+            name: case.name,
+            seeds: case.seeds.clone(),
+            block: clone_block(&case.block),
+        };
+        let Some(jit_regs) = jit(&reg_case) else {
+            failures.push(format!("{}: did not translate", case.name));
+            continue;
+        };
+        let interp_regs = interpret(&reg_case);
+        ran += 1;
+        if let Some(why) = float_diff(&interp_regs, &jit_regs, &case) {
+            failures.push(format!("{}: {why}", case.name));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} float blocks diverged from the interpreter:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+    assert!(ran > 0, "no cases ran");
+}
+
+/// A shallow clone of a block's instructions, so a `FloatCase` can be run
+/// through the register-only `Case` harness without moving its block.
+fn clone_block(block: &pcode::Block) -> pcode::Block {
+    let mut out = pcode::Block::new();
+    for inst in &block.instructions {
+        out.instructions.push(*inst);
+    }
+    out
+}

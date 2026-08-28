@@ -196,6 +196,42 @@ fn emit_fault_check(f: &mut Function, index: u32) {
     f.instruction(&Instruction::End);
 }
 
+/// Pushes a float operand: the varnode's (or constant's) bits loaded as an
+/// integer, then reinterpreted as `f32`/`f64`. Going through [`emit_load`] means
+/// a constant immediate and a register both work, and the register bytes are
+/// the IEEE bits already, so the reinterpret is free. Only the two wasm float
+/// widths, 4 and 8, are handled.
+fn emit_float_operand(f: &mut Function, v: Value, size: u8) -> Option<()> {
+    match size {
+        4 => {
+            emit_load(f, v, 4)?;
+            f.instruction(&Instruction::F32ReinterpretI32);
+        }
+        8 => {
+            emit_load(f, v, 8)?;
+            f.instruction(&Instruction::F64ReinterpretI64);
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Stores the float on top of the stack to the address underneath it, writing
+/// its IEEE bits. The output width picks `f32`/`f64`.
+fn emit_float_store(f: &mut Function, size: u8) -> Option<()> {
+    let arg = MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    };
+    match size {
+        4 => f.instruction(&Instruction::F32Store(arg)),
+        8 => f.instruction(&Instruction::F64Store(arg)),
+        _ => return None,
+    };
+    Some(())
+}
+
 /// Translates one p-code instruction into wasm appended to `f`, or returns
 /// `None` if the op (or a size it uses) is not handled — which bails the whole
 /// block to the interpreter.
@@ -1022,6 +1058,101 @@ pub fn translate_instruction(
             emit_load(f, b, size)?;
             emit_load(f, Value::Var(VarNode::new(cond_var, 1)), 1)?;
             f.instruction(&Instruction::Select);
+            emit_store(f, out)
+        }
+
+        // Float arithmetic: out = a <op> b, all one IEEE width (4 or 8). The
+        // operands are reinterpreted from their bits, the wasm float op runs,
+        // and the result's bits are stored. NaN payloads may differ between a
+        // native interpreter build and wasm, but a wasm interpreter build (the
+        // real target) computes these with the same wasm ops, so they agree
+        // there; the gate compares NaN-aware for exactly this reason.
+        Op::FloatAdd | Op::FloatSub | Op::FloatMul | Op::FloatDiv => {
+            let size = out.size;
+            if !matches!(size, 4 | 8) || a.size() != size || b.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_float_operand(f, a, size)?;
+            emit_float_operand(f, b, size)?;
+            f.instruction(&match (inst.op, size) {
+                (Op::FloatAdd, 4) => Instruction::F32Add,
+                (Op::FloatAdd, _) => Instruction::F64Add,
+                (Op::FloatSub, 4) => Instruction::F32Sub,
+                (Op::FloatSub, _) => Instruction::F64Sub,
+                (Op::FloatMul, 4) => Instruction::F32Mul,
+                (Op::FloatMul, _) => Instruction::F64Mul,
+                (Op::FloatDiv, 4) => Instruction::F32Div,
+                (_, _) => Instruction::F64Div,
+            });
+            emit_float_store(f, size)
+        }
+
+        // Float unary: out = <op> a, same IEEE width. FloatRound is *not* here
+        // — the interpreter's round is half-away-from-zero (Rust `f64::round`)
+        // while wasm `nearest` is half-to-even, so it bails to the interpreter.
+        Op::FloatNegate | Op::FloatAbs | Op::FloatSqrt | Op::FloatCeil | Op::FloatFloor => {
+            let size = out.size;
+            if !matches!(size, 4 | 8) || a.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_float_operand(f, a, size)?;
+            f.instruction(&match (inst.op, size) {
+                (Op::FloatNegate, 4) => Instruction::F32Neg,
+                (Op::FloatNegate, _) => Instruction::F64Neg,
+                (Op::FloatAbs, 4) => Instruction::F32Abs,
+                (Op::FloatAbs, _) => Instruction::F64Abs,
+                (Op::FloatSqrt, 4) => Instruction::F32Sqrt,
+                (Op::FloatSqrt, _) => Instruction::F64Sqrt,
+                (Op::FloatCeil, 4) => Instruction::F32Ceil,
+                (Op::FloatCeil, _) => Instruction::F64Ceil,
+                (Op::FloatFloor, 4) => Instruction::F32Floor,
+                (_, _) => Instruction::F64Floor,
+            });
+            emit_float_store(f, size)
+        }
+
+        // Float comparison: out (1 byte) = a <cmp> b. IEEE comparison already
+        // yields the interpreter's booleans, including every NaN case (all
+        // false but not-equal), so the i32 result stores straight into the
+        // 1-byte output.
+        Op::FloatEqual | Op::FloatNotEqual | Op::FloatLess | Op::FloatLessEqual => {
+            let size = a.size();
+            if out.size != 1 || !matches!(size, 4 | 8) || b.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_float_operand(f, a, size)?;
+            emit_float_operand(f, b, size)?;
+            f.instruction(&match (inst.op, size) {
+                (Op::FloatEqual, 4) => Instruction::F32Eq,
+                (Op::FloatEqual, _) => Instruction::F64Eq,
+                (Op::FloatNotEqual, 4) => Instruction::F32Ne,
+                (Op::FloatNotEqual, _) => Instruction::F64Ne,
+                (Op::FloatLess, 4) => Instruction::F32Lt,
+                (Op::FloatLess, _) => Instruction::F64Lt,
+                (Op::FloatLessEqual, 4) => Instruction::F32Le,
+                (_, _) => Instruction::F64Le,
+            });
+            emit_store(f, out)
+        }
+
+        // out (1 byte) = a is NaN. A value is NaN iff it does not equal itself,
+        // so the operand is loaded twice and compared not-equal — matching the
+        // interpreter's `is_nan`.
+        Op::FloatIsNan => {
+            let size = a.size();
+            if out.size != 1 || !matches!(size, 4 | 8) {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_float_operand(f, a, size)?;
+            emit_float_operand(f, a, size)?;
+            f.instruction(&match size {
+                4 => Instruction::F32Ne,
+                _ => Instruction::F64Ne,
+            });
             emit_store(f, out)
         }
 
