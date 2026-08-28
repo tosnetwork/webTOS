@@ -461,7 +461,14 @@ impl LinuxEnv {
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
-        self.check_against_manifest(path, &crate::digest::sha256(&bytes), bytes.len())?;
+        // Only hash when a manifest is installed to check against; with no
+        // manifest — the default — the digest is discarded, so computing it over
+        // the whole file (a mounted tree, a hundred-megabyte agent image) is
+        // pure waste. Streamed delivery (`create_file`) already gates its digest
+        // this way.
+        if self.manifest.is_some() {
+            self.check_against_manifest(path, &crate::digest::sha256(&bytes), bytes.len())?;
+        }
         let added = self
             .vfs
             .add_node(path, NodeKind::File(bytes), mode)
