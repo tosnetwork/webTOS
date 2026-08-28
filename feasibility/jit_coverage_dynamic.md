@@ -146,3 +146,24 @@ narrow, high-yield first slice.
   with the 128-bit move/widen/load quartet above; they alone recover most of
   the ~9% that bails before any user code runs, and they are prerequisites for
   region compilation to reach the vectorised hot loops at all.
+
+## Follow-up: the 128-bit move/widen/logic quartet landed
+
+Implemented the recommended slice (Copy, ZeroExtend, SignExtend, IntNot,
+IntXor/Or/And, Load, Store at width 16, as two 8-byte lanes — no wasm SIMD).
+Re-measured on the same host at commit `5b9d99d`:
+
+| workload | before | after |
+|---|---|---|
+| codex --version (static-pie) | 95.9% | **97.6%** |
+| node --version (glibc + V8) | 89.9% | **94.3%** |
+
+The move/widen/logic `@16` bails are gone. What remains at `@16` is now
+*arithmetic* — `IntMul@16` (node 2.3%, codex 1.6%), `IntRight@16` (1.4%),
+`IntLeft@16` (0.5%), `IntDiv@16` (0.4%) — plus the non-width `PcodeOp` (~1%,
+a CALLOTHER intrinsic the lifter models, not a width bail). Those 128-bit
+arithmetic ops are genuinely cross-lane (a multiply carries across the lane
+boundary, a shift moves bits across it), so unlike the quartet they cannot
+decompose into independent i64 lanes; they need real wasm `v128` SIMD or stay
+interpreted. That is the next wide-op slice, and a smaller one — ~4-5% of
+executed work for Node now, down from ~9%.
