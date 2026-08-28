@@ -1623,3 +1623,38 @@ pub trait JitBackend {
     /// native runtime.
     fn call(&mut self, handle: u32, cpu: &mut icicle_cpu::Cpu) -> JitOutcome;
 }
+
+/// Where a block first fails to translate, for the coverage diagnostic. `width`
+/// is the largest of the output and input byte sizes at that instruction, so a
+/// 16-byte SIMD or i128 op reads as width 16.
+pub struct Bail {
+    pub op: String,
+    pub width: u8,
+}
+
+/// The first instruction in `block` that [`translate_instruction`] cannot
+/// handle, or `None` if the whole block translates. Used to attribute why a hot
+/// block bailed, so coverage work can be aimed at what actually executes.
+pub fn first_bail(block: &pcode::Block) -> Option<Bail> {
+    let has_host = block_needs_host(block);
+    for (i, inst) in block.instructions.iter().enumerate() {
+        let mut scratch = Function::new([]);
+        if translate_instruction(&mut scratch, inst, i as u32, has_host).is_none() {
+            let out = inst.output.size;
+            let in_max = inst
+                .inputs
+                .get()
+                .iter()
+                .map(|v| v.size())
+                .max()
+                .unwrap_or(0);
+            let dbg = format!("{:?}", inst.op);
+            let op = dbg.split('(').next().unwrap_or(&dbg).to_string();
+            return Some(Bail {
+                op,
+                width: out.max(in_max),
+            });
+        }
+    }
+    None
+}

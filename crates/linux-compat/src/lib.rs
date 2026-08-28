@@ -1272,6 +1272,18 @@ impl Machine {
         self.vm.jit_dispatch_count()
     }
 
+    /// Records per-block entry counts, so [`jit_coverage`](Self::jit_coverage)
+    /// can weigh JIT coverage by what actually executed.
+    pub fn profile_blocks(&mut self, enabled: bool) {
+        self.vm.profile_blocks(enabled);
+    }
+
+    /// How well the JIT covers the blocks a profiled run executed; `None` if
+    /// profiling was not on. See [`InterpVm::jit_coverage`].
+    pub fn jit_coverage(&self) -> Option<x64_engine::vm::JitCoverage> {
+        self.vm.jit_coverage()
+    }
+
     /// What the machine occupies, split by what it is spent on. One wasm
     /// linear memory holds all three, and a browser tab's ceiling is roughly
     /// 3.9 GiB (`docs/performance.md`), so they compete: an agent image, the

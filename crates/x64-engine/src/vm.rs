@@ -162,6 +162,21 @@ pub struct BlockProfile {
     pub instructions: u64,
 }
 
+/// How well the JIT covers a profiled run's executed blocks. See
+/// [`InterpVm::jit_coverage`].
+#[derive(Debug, Clone, Default)]
+pub struct JitCoverage {
+    /// Weighted guest instructions executed across profiled blocks
+    /// (`entries * instructions`).
+    pub hot_insns: u64,
+    /// Of those, the weight in blocks that translate whole.
+    pub covered_insns: u64,
+    /// Distinct hot blocks profiled.
+    pub blocks: usize,
+    /// Bail causes as `"Op@width" -> weight`, heaviest first.
+    pub bails: Vec<(String, u64)>,
+}
+
 impl InterpVm {
     pub fn new(cpu: Box<Cpu>, lifter: lifter::BlockLifter) -> Self {
         Self {
@@ -208,6 +223,49 @@ impl InterpVm {
     /// How many times a compiled block ran in place of the interpreter.
     pub fn jit_dispatch_count(&self) -> u64 {
         self.jit_dispatches
+    }
+
+    /// How well the JIT covers the blocks a profiled run actually executed.
+    ///
+    /// Weighs each profiled block by `entries * instructions` (the guest
+    /// instructions it retired), so the answer is about executed work, not the
+    /// static op count. Requires [`profile_blocks`] to have been on during the
+    /// run. `None` if it was not.
+    pub fn jit_coverage(&self) -> Option<JitCoverage> {
+        let profile = self.profile.as_ref()?;
+        // Latest lifted block at each address (a re-lift replaces an earlier one).
+        let mut by_addr: std::collections::HashMap<u64, &lifter::Block> =
+            std::collections::HashMap::new();
+        for block in &self.code.blocks {
+            by_addr.insert(block.start, block);
+        }
+        let mut hot = 0u64;
+        let mut covered = 0u64;
+        let mut hist: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for (addr, prof) in profile {
+            let Some(block) = by_addr.get(addr) else {
+                continue;
+            };
+            let weight = prof.entries.saturating_mul(prof.instructions);
+            if weight == 0 {
+                continue;
+            }
+            hot = hot.saturating_add(weight);
+            match crate::jit::first_bail(&block.pcode) {
+                None => covered = covered.saturating_add(weight),
+                Some(b) => {
+                    *hist.entry(format!("{}@{}", b.op, b.width)).or_default() += weight;
+                }
+            }
+        }
+        let mut bails: Vec<(String, u64)> = hist.into_iter().collect();
+        bails.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Some(JitCoverage {
+            hot_insns: hot,
+            covered_insns: covered,
+            blocks: profile.len(),
+            bails,
+        })
     }
 
     /// Lifts blocks without the p-code optimizer until one has been entered
