@@ -63,6 +63,13 @@ const IMPORT_STORE: u32 = 1;
 const IMPORT_FAULT: u32 = 2;
 const IMPORT_RAISE: u32 = 3;
 
+/// Index of the imported `env.regs_base` global — the byte offset of the
+/// register file within the host's memory, added to every varnode address (see
+/// [`reg_arg`]). Every block imports it, since every block touches registers;
+/// globals have their own index space, so this is 0 regardless of the function
+/// imports.
+const REGS_BASE_GLOBAL: u32 = 0;
+
 /// The exception codes the division guards raise. These mirror
 /// `icicle_cpu::ExceptionCode` discriminants; the `raise` import re-canonicalises
 /// through `from_u32`, so a value here need only match the interpreter's.
@@ -132,11 +139,34 @@ pub fn same_width(out: VarNode, a: Value, b: Value) -> Option<u8> {
     Some(size)
 }
 
-/// Pushes the byte address of `out` in the register space, so a following
-/// `store` writes there. Wasm `store` consumes `[address, value]`, address
-/// first, which is why this is emitted before the value is computed.
-pub fn emit_store_addr(f: &mut Function, out: VarNode) {
-    f.instruction(&Instruction::I32Const(var_offset(out) as i32));
+/// A `MemArg` addressing a varnode: the register-space byte offset goes in the
+/// static offset immediate, and the dynamic address is `regs_base` (pushed by
+/// [`emit_regs_base`]), so the effective address is `regs_base + var_offset`.
+/// That is what lets a block run against the register file wherever it sits in
+/// the host's memory — offset 0 in the gate's dedicated memory, or deep inside
+/// the engine's memory in the browser.
+fn reg_arg(var: VarNode) -> MemArg {
+    MemArg {
+        offset: var_offset(var) as u64,
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// Pushes `regs_base`, the dynamic part of every register address. It is an
+/// imported immutable global so the same translated block works at any base —
+/// the host supplies the base at instantiate time (0 for a dedicated register
+/// memory).
+fn emit_regs_base(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(REGS_BASE_GLOBAL));
+}
+
+/// Pushes the base address for a following `store` to a varnode. Wasm `store`
+/// consumes `[address, value]`, address first, which is why this is emitted
+/// before the value is computed; the varnode's offset rides the store's
+/// immediate (see [`reg_arg`]).
+pub fn emit_store_addr(f: &mut Function) {
+    emit_regs_base(f);
 }
 
 /// Pushes an operand onto the wasm stack in the wasm type for `size`.
@@ -154,13 +184,8 @@ pub fn emit_load(f: &mut Function, value: Value, size: u8) -> Option<()> {
             _ => return None,
         },
         Value::Var(var) => {
-            let addr = var_offset(var);
-            f.instruction(&Instruction::I32Const(addr as i32));
-            let arg = MemArg {
-                offset: 0,
-                align: 0,
-                memory_index: 0,
-            };
+            emit_regs_base(f);
+            let arg = reg_arg(var);
             match size {
                 1 => f.instruction(&Instruction::I32Load8U(arg)),
                 2 => f.instruction(&Instruction::I32Load16U(arg)),
@@ -173,15 +198,12 @@ pub fn emit_load(f: &mut Function, value: Value, size: u8) -> Option<()> {
     Some(())
 }
 
-/// Stores the value on top of the stack to `out`, given the address `emit_store_addr`
-/// pushed underneath it. Sub-word sizes store only their low bytes.
+/// Stores the value on top of the stack to `out`, given the base address
+/// `emit_store_addr` pushed underneath it. Sub-word sizes store only their low
+/// bytes; the varnode's offset rides the store's immediate.
 pub fn emit_store(f: &mut Function, out: VarNode) -> Option<()> {
     wasm_ty(out.size)?;
-    let arg = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
+    let arg = reg_arg(out);
     match out.size {
         1 => f.instruction(&Instruction::I32Store8(arg)),
         2 => f.instruction(&Instruction::I32Store16(arg)),
@@ -320,15 +342,11 @@ fn emit_float_operand(f: &mut Function, v: Value, size: u8) -> Option<()> {
     Some(())
 }
 
-/// Stores the float on top of the stack to the address underneath it, writing
-/// its IEEE bits. The output width picks `f32`/`f64`.
-fn emit_float_store(f: &mut Function, size: u8) -> Option<()> {
-    let arg = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
-    match size {
+/// Stores the float on top of the stack to `out`, given the base address
+/// underneath it, writing its IEEE bits. The output width picks `f32`/`f64`.
+fn emit_float_store(f: &mut Function, out: VarNode) -> Option<()> {
+    let arg = reg_arg(out);
+    match out.size {
         4 => f.instruction(&Instruction::F32Store(arg)),
         8 => f.instruction(&Instruction::F64Store(arg)),
         _ => return None,
@@ -379,7 +397,7 @@ pub fn translate_instruction(
         //   store-addr(out); load(a); load(b); iN.add; store(out)
         Op::IntAdd => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -392,7 +410,7 @@ pub fn translate_instruction(
         // out = a - b, all one width. Wasm sub wraps, matching wrapping_sub.
         Op::IntSub => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -405,7 +423,7 @@ pub fn translate_instruction(
         // out = a ^ b, all one width.
         Op::IntXor => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -418,7 +436,7 @@ pub fn translate_instruction(
         // out = a | b, all one width.
         Op::IntOr => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -431,7 +449,7 @@ pub fn translate_instruction(
         // out = a & b, all one width.
         Op::IntAnd => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -445,7 +463,7 @@ pub fn translate_instruction(
         // store keeps only the low `size` bytes.
         Op::IntMul => {
             let size = same_width(out, a, b)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -464,7 +482,7 @@ pub fn translate_instruction(
             if a.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             match ty {
                 ValType::I64 => {
@@ -487,7 +505,7 @@ pub fn translate_instruction(
             if a.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             match ty {
                 ValType::I64 => f.instruction(&Instruction::I64Const(0)),
                 _ => f.instruction(&Instruction::I32Const(0)),
@@ -516,7 +534,7 @@ pub fn translate_instruction(
             wasm_ty(b.size())?;
             let width = size as i32 * 8;
 
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             // In-range result: x << y (or x >> y). The count is `y` in the value
             // type; masking is a no-op here because `select` discards this value
             // unless y < width.
@@ -567,7 +585,7 @@ pub fn translate_instruction(
             wasm_ty(b.size())?;
             let clamp = size as i32 * 8 - 1;
 
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             // Value, sign-extended to the wasm type (4/8-byte loads already fill
             // the type; 1/2-byte loads are zero-extended and need fixing up).
             emit_load(f, a, size)?;
@@ -614,7 +632,7 @@ pub fn translate_instruction(
                 (false, 8) => Instruction::I64Rotr,
                 _ => return None,
             };
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             f.instruction(&op);
@@ -641,7 +659,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -657,7 +675,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -673,7 +691,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -689,7 +707,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match size {
@@ -705,7 +723,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             match size {
                 1 => f.instruction(&Instruction::I32Extend8S),
@@ -731,7 +749,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             match size {
                 1 => f.instruction(&Instruction::I32Extend8S),
@@ -763,7 +781,7 @@ pub fn translate_instruction(
             if a.size() != 1 || b.size() != 1 || out.size != 1 {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, 1)?;
             emit_load(f, b, 1)?;
             f.instruction(&Instruction::I32And);
@@ -776,7 +794,7 @@ pub fn translate_instruction(
             if a.size() != 1 || b.size() != 1 || out.size != 1 {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, 1)?;
             emit_load(f, b, 1)?;
             f.instruction(&Instruction::I32Or);
@@ -789,7 +807,7 @@ pub fn translate_instruction(
             if a.size() != 1 || b.size() != 1 || out.size != 1 {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, 1)?;
             emit_load(f, b, 1)?;
             f.instruction(&Instruction::I32Xor);
@@ -802,7 +820,7 @@ pub fn translate_instruction(
             if a.size() != 1 || out.size != 1 {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, 1)?;
             f.instruction(&Instruction::I32Eqz);
             emit_store(f, out)
@@ -817,7 +835,7 @@ pub fn translate_instruction(
                 return None;
             }
             wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_store(f, out)
         }
@@ -835,7 +853,7 @@ pub fn translate_instruction(
             if out_size < in_size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             match (in_ty, out_ty) {
                 (ValType::I32, ValType::I32) => {}
@@ -860,7 +878,7 @@ pub fn translate_instruction(
             if out_size <= in_size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             match out_size {
                 1 | 2 | 4 => match in_size {
@@ -905,7 +923,7 @@ pub fn translate_instruction(
             if offset + out_size as u64 > in_size as u64 {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             if offset > 0 {
                 match in_ty {
@@ -940,7 +958,7 @@ pub fn translate_instruction(
             }
             let size = a.size();
             let ty = wasm_ty(size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             match ty {
@@ -976,7 +994,7 @@ pub fn translate_instruction(
             let size = a.size();
             let ty = wasm_ty(size)?;
             let is64 = matches!(ty, ValType::I64);
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             // a ^ sum
             emit_load(f, a, size)?;
             emit_load(f, a, size)?;
@@ -1036,7 +1054,7 @@ pub fn translate_instruction(
             let size = a.size();
             let ty = wasm_ty(size)?;
             let is64 = matches!(ty, ValType::I64);
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             // a ^ b
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
@@ -1094,7 +1112,7 @@ pub fn translate_instruction(
             let in_size = a.size();
             let in_ty = wasm_ty(in_size)?;
             let out_ty = wasm_ty(out.size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             match in_ty {
                 ValType::I64 => {
@@ -1123,7 +1141,7 @@ pub fn translate_instruction(
             let in_size = a.size();
             let in_ty = wasm_ty(in_size)?;
             let out_ty = wasm_ty(out.size)?;
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             match in_ty {
                 ValType::I64 => {
@@ -1157,7 +1175,7 @@ pub fn translate_instruction(
             if a.size() != size || b.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             emit_load(f, Value::Var(VarNode::new(cond_var, 1)), 1)?;
@@ -1176,7 +1194,7 @@ pub fn translate_instruction(
             if !matches!(size, 4 | 8) || a.size() != size || b.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_float_operand(f, a, size)?;
             emit_float_operand(f, b, size)?;
             f.instruction(&match (inst.op, size) {
@@ -1189,7 +1207,7 @@ pub fn translate_instruction(
                 (Op::FloatDiv, 4) => Instruction::F32Div,
                 (_, _) => Instruction::F64Div,
             });
-            emit_float_store(f, size)
+            emit_float_store(f, out)
         }
 
         // Float unary: out = <op> a, same IEEE width. FloatRound is *not* here
@@ -1200,7 +1218,7 @@ pub fn translate_instruction(
             if !matches!(size, 4 | 8) || a.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_float_operand(f, a, size)?;
             f.instruction(&match (inst.op, size) {
                 (Op::FloatNegate, 4) => Instruction::F32Neg,
@@ -1214,7 +1232,7 @@ pub fn translate_instruction(
                 (Op::FloatFloor, 4) => Instruction::F32Floor,
                 (_, _) => Instruction::F64Floor,
             });
-            emit_float_store(f, size)
+            emit_float_store(f, out)
         }
 
         // Float comparison: out (1 byte) = a <cmp> b. IEEE comparison already
@@ -1226,7 +1244,7 @@ pub fn translate_instruction(
             if out.size != 1 || !matches!(size, 4 | 8) || b.size() != size {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_float_operand(f, a, size)?;
             emit_float_operand(f, b, size)?;
             f.instruction(&match (inst.op, size) {
@@ -1250,7 +1268,7 @@ pub fn translate_instruction(
             if out.size != 1 || !matches!(size, 4 | 8) {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_float_operand(f, a, size)?;
             emit_float_operand(f, a, size)?;
             f.instruction(&match size {
@@ -1310,7 +1328,7 @@ pub fn translate_instruction(
             emit_raise_const(f, EXC_DIVISION, 0, index);
             f.instruction(&Instruction::End);
 
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, size)?;
             emit_load(f, b, size)?;
             f.instruction(&match (inst.op, size) {
@@ -1353,7 +1371,7 @@ pub fn translate_instruction(
             emit_raise_const(f, EXC_DIVISION, 0, index);
             f.instruction(&Instruction::End);
 
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_signed(f, a, size)?;
             emit_signed(f, b, size)?;
             f.instruction(&match (inst.op, is64) {
@@ -1373,7 +1391,7 @@ pub fn translate_instruction(
             if !matches!(out.size, 4 | 8) || !matches!(in_size, 1 | 2 | 4 | 8) {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_signed(f, a, in_size)?;
             f.instruction(&match (in_size == 8, out.size) {
                 (false, 4) => Instruction::F32ConvertI32S,
@@ -1381,7 +1399,7 @@ pub fn translate_instruction(
                 (true, 4) => Instruction::F32ConvertI64S,
                 (true, _) => Instruction::F64ConvertI64S,
             });
-            emit_float_store(f, out.size)
+            emit_float_store(f, out)
         }
 
         // Unsigned integer -> float. Like IntToFloat but zero-extended (which
@@ -1391,7 +1409,7 @@ pub fn translate_instruction(
             if !matches!(out.size, 4 | 8) || !matches!(in_size, 1 | 2 | 4 | 8) {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_load(f, a, in_size)?;
             f.instruction(&match (in_size == 8, out.size) {
                 (false, 4) => Instruction::F32ConvertI32U,
@@ -1399,7 +1417,7 @@ pub fn translate_instruction(
                 (true, 4) => Instruction::F32ConvertI64U,
                 (true, _) => Instruction::F64ConvertI64U,
             });
-            emit_float_store(f, out.size)
+            emit_float_store(f, out)
         }
 
         // float -> float between the two wasm widths. Promote (4->8) and demote
@@ -1410,21 +1428,21 @@ pub fn translate_instruction(
             let in_size = a.size();
             match (in_size, out.size) {
                 (4, 4) | (8, 8) => {
-                    emit_store_addr(f, out);
+                    emit_store_addr(f);
                     emit_load(f, a, in_size)?;
                     emit_store(f, out)
                 }
                 (4, 8) => {
-                    emit_store_addr(f, out);
+                    emit_store_addr(f);
                     emit_float_operand(f, a, 4)?;
                     f.instruction(&Instruction::F64PromoteF32);
-                    emit_float_store(f, 8)
+                    emit_float_store(f, out)
                 }
                 (8, 4) => {
-                    emit_store_addr(f, out);
+                    emit_store_addr(f);
                     emit_float_operand(f, a, 8)?;
                     f.instruction(&Instruction::F32DemoteF64);
-                    emit_float_store(f, 4)
+                    emit_float_store(f, out)
                 }
                 _ => None,
             }
@@ -1439,7 +1457,7 @@ pub fn translate_instruction(
             if !matches!(in_size, 4 | 8) || !matches!(out.size, 4 | 8) {
                 return None;
             }
-            emit_store_addr(f, out);
+            emit_store_addr(f);
             emit_float_operand(f, a, in_size)?;
             f.instruction(&match (in_size, out.size) {
                 (4, 4) => Instruction::I32TruncSatF32S,
@@ -1538,6 +1556,18 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
             memory64: false,
             shared: false,
             page_size_log2: None,
+        }),
+    );
+    // The base of the register file within `env.regs`, added to every varnode
+    // address. Immutable, supplied at instantiate time (0 for a dedicated
+    // register memory).
+    imports.import(
+        "env",
+        "regs_base",
+        EntityType::Global(wasm_encoder::GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
         }),
     );
     if has_host {

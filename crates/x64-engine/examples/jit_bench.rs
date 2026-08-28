@@ -181,6 +181,10 @@ fn run_jit(bench: &Bench, calls: u64) -> (Vec<u8>, std::time::Duration) {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define regs");
+    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
+    linker
+        .define("env", "regs_base", regs_base)
+        .expect("define regs_base");
 
     // The block only loads, but a host block declares all four imports; the
     // unused ones are inert stubs.

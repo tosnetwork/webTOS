@@ -980,6 +980,10 @@ fn jit(case: &Case) -> Option<Vec<u8>> {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
+    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
+    linker
+        .define("env", "regs_base", regs_base)
+        .expect("define regs_base");
     let instance = linker
         .instantiate(&mut store, &module)
         .expect("instantiate")
@@ -993,6 +997,79 @@ fn jit(case: &Case) -> Option<Vec<u8>> {
     let mut out = vec![0u8; REG_SPACE_BYTES as usize];
     memory.read(&store, 0, &mut out).expect("read memory");
     Some(out)
+}
+
+/// Runs a register-only block with the register file placed at `base` bytes
+/// into a larger memory, supplying `env.regs_base = base`. This is the browser's
+/// case, where the register file sits deep inside the engine's memory rather
+/// than at offset 0. Returns the register window `[base, base + REG_SPACE)`.
+fn jit_at_base(case: &Case, base: u32) -> Vec<u8> {
+    let bytes = translate_block(&case.block).expect("translates");
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, &bytes[..]).expect("valid wasm");
+    let mut store = wasmi::Store::new(&engine, ());
+
+    let total = base + REG_SPACE_BYTES;
+    let pages = total.div_ceil(65536);
+    let memory = wasmi::Memory::new(&mut store, wasmi::MemoryType::new(pages, None)).expect("mem");
+
+    // Seed each varnode at base + its offset.
+    let mut regs = vec![0u8; REG_SPACE_BYTES as usize];
+    for &(var, value) in &case.seeds {
+        let off = x64_engine::jit::var_offset(var) as usize;
+        let n = var.size as usize;
+        regs[off..off + n].copy_from_slice(&value.to_le_bytes()[..n]);
+    }
+    memory
+        .write(&mut store, base as usize, &regs)
+        .expect("seed");
+
+    let mut linker = wasmi::Linker::new(&engine);
+    linker.define("env", "regs", memory).expect("define memory");
+    let regs_base = wasmi::Global::new(
+        &mut store,
+        wasmi::Val::I32(base as i32),
+        wasmi::Mutability::Const,
+    );
+    linker
+        .define("env", "regs_base", regs_base)
+        .expect("define regs_base");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate")
+        .start(&mut store)
+        .expect("start");
+    let run = instance
+        .get_typed_func::<(), ()>(&store, "run")
+        .expect("run export");
+    run.call(&mut store, ()).expect("run");
+
+    let mut out = vec![0u8; REG_SPACE_BYTES as usize];
+    memory.read(&store, base as usize, &mut out).expect("read");
+    out
+}
+
+#[test]
+fn translated_blocks_run_at_a_nonzero_base() {
+    // A base that is not page-aligned relative to the register offsets, to catch
+    // an address computed with the wrong term.
+    let base = 0x4_1230;
+    let mut failures = Vec::new();
+    for case in cases() {
+        let interp = interpret(&case);
+        let jit = jit_at_base(&case, base);
+        if let Some(off) = first_difference(&interp, &jit) {
+            failures.push(format!(
+                "{}: diverged at register byte {off:#x} (interp {:#04x}, jit {:#04x})",
+                case.name, interp[off], jit[off]
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "blocks run at base {base:#x} diverged from the interpreter:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[test]
@@ -1224,6 +1301,10 @@ fn mem_jit(case: &MemCase) -> Option<MemOut> {
 
     let mut linker = wasmi::Linker::new(&engine);
     linker.define("env", "regs", memory).expect("define memory");
+    let regs_base = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Const);
+    linker
+        .define("env", "regs_base", regs_base)
+        .expect("define regs_base");
 
     // load(addr, dst_off, size) -> ok: read `size` bytes through the MMU and,
     // on success, write them into the register space at dst_off (little-endian
