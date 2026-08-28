@@ -870,6 +870,52 @@ pub extern "C" fn wtw_memory_headroom_kib() -> i32 {
 /// writes — past the cap a guest write fails with `ENOSPC` instead of
 /// growing the tab's memory until it dies. The cap covers the whole
 /// filesystem, images included, so set it above what was loaded.
+/// Installs the manifest the host has committed to; a zero length clears it.
+///
+/// The signature over the manifest is the host's to check, before this call,
+/// with the platform's verifier — `crypto.subtle` in a browser, `node:crypto`
+/// outside one. Hand-rolling a signature verifier here would be the wrong
+/// trade: a wrong one fails open, accepting what it should not while nothing
+/// says so, and the platform already ships an audited one. What this layer
+/// owes is the other half, which a known-answer test can settle: that the
+/// bytes delivered are the bytes the manifest names.
+///
+/// With a manifest installed, an image is checked before the guest runs it —
+/// not when it arrives, so a host that forgets to say a stream finished
+/// cannot skip the check that way — and an image the manifest does not name
+/// is refused, because a manifest is a list of what may be delivered.
+#[no_mangle]
+pub extern "C" fn wtw_set_manifest(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_manifest called before wtw_init");
+        };
+        if len == 0 {
+            let _ = machine.set_manifest(None);
+            return 0;
+        }
+        let Some(text) = slice_arg(ptr, len) else {
+            return fail(state, "manifest is not inside the module's memory");
+        };
+        match machine.set_manifest(Some(&text)) {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// How many images the installed manifest names; zero when none is
+/// installed, so a host can tell "nothing to check" from "nothing named".
+#[no_mangle]
+pub extern "C" fn wtw_manifest_len() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_mut()
+            .map_or(0, |machine| machine.manifest_paths().len() as u32)
+    })
+}
+
 /// Records that `ms` of real time passed while nothing ran.
 ///
 /// A browser stops scheduling a background tab. This machine's clock is

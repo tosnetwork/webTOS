@@ -14,7 +14,9 @@
 //! portable rebuild of the native kernel's `src/linux_compat` substrate.
 
 pub mod abi;
+pub mod digest;
 pub mod fd;
+pub mod manifest;
 pub mod net;
 pub mod proc;
 pub mod syscall;
@@ -160,6 +162,13 @@ pub struct LinuxEnv {
     /// fixed instant for reproducibility; hosts override it with the real
     /// wall clock when the guest talks to real services.
     pub(crate) epoch_base_sec: i64,
+    /// What the host has committed to delivering, when it has. None means no
+    /// manifest was installed and delivery is unchecked, which is the old
+    /// behaviour and stays the default: a host that has nothing to verify
+    /// against should not be stopped from running.
+    pub(crate) manifest: Option<crate::manifest::Manifest>,
+    /// Running digests for images still arriving in pieces, by guest path.
+    pub(crate) in_flight: std::collections::BTreeMap<Vec<u8>, (crate::digest::Sha256, usize)>,
     /// Live inotify instances. A change to the filesystem has to reach every
     /// watcher, and a watcher is reachable only through the descriptor that
     /// holds it — so they are registered here as well, and entries no
@@ -213,6 +222,8 @@ impl LinuxEnv {
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
             epoch_base_sec: EPOCH_BASE_SEC,
+            manifest: None,
+            in_flight: std::collections::BTreeMap::new(),
             inotify: Vec::new(),
             inotify_cookie: 0,
             ptys: std::collections::BTreeMap::new(),
@@ -448,6 +459,7 @@ impl LinuxEnv {
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
+        self.check_against_manifest(path, &crate::digest::sha256(&bytes), bytes.len())?;
         let added = self
             .vfs
             .add_node(path, NodeKind::File(bytes), mode)
@@ -466,6 +478,12 @@ impl LinuxEnv {
     /// one whole copy on the way in is the difference between fitting in a
     /// tab and not.
     pub fn create_file(&mut self, path: &[u8], capacity: usize, mode: u32) -> Result<(), String> {
+        // A streamed image is judged when the last piece lands, not here:
+        // nothing is known about its bytes yet. Start the digest.
+        if self.manifest.is_some() {
+            self.in_flight
+                .insert(path.to_vec(), (crate::digest::Sha256::new(), 0));
+        }
         let created = self
             .vfs
             .create_file_with_capacity(path, capacity, mode)
@@ -476,8 +494,55 @@ impl LinuxEnv {
         created
     }
 
+    /// Refuses an image the manifest does not vouch for, at the moment
+    /// before it runs.
+    ///
+    /// A streamed image was hashed as it arrived, so this costs nothing for
+    /// the large ones; anything else is hashed here. With no manifest
+    /// installed nothing is checked, which is the default.
+    pub(crate) fn verify_image(&mut self, path: &[u8]) -> Result<(), String> {
+        if self.manifest.is_none() {
+            return Ok(());
+        }
+        let (digest, size) = match self.in_flight.remove(path) {
+            Some((hasher, size)) => (hasher.finish(), size),
+            None => {
+                let bytes = self
+                    .vfs
+                    .read_file(path)
+                    .ok_or_else(|| format!("cannot load {}: no such file", path.escape_ascii()))?;
+                (crate::digest::sha256(bytes), bytes.len())
+            }
+        };
+        self.check_against_manifest(path, &digest, size)
+    }
+
+    /// Whether a delivered image is the one the manifest names.
+    ///
+    /// With no manifest, everything passes: a host with nothing to verify
+    /// against is not stopped from running. With one, an image it does not
+    /// name is refused too — a manifest is a list of what may be delivered,
+    /// and waving through what it does not mention is how an image gets in.
+    fn check_against_manifest(
+        &self,
+        path: &[u8],
+        digest: &[u8; 32],
+        size: usize,
+    ) -> Result<(), String> {
+        let Some(manifest) = self.manifest.as_ref() else {
+            return Ok(());
+        };
+        manifest
+            .check(path, digest, size)
+            .map_err(|why| format!("refused: {why}"))
+    }
+
     /// Appends one piece to a file started with [`create_file`].
     pub fn append_file(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), String> {
+        if let Some((hasher, size)) = self.in_flight.get_mut(path) {
+            hasher.update(bytes);
+            *size += bytes.len();
+        }
         self.vfs
             .append_file(path, bytes)
             .map_err(|e| format!("cannot append to {}: errno {e}", path.escape_ascii()))
@@ -1150,6 +1215,32 @@ impl Machine {
             .map(|budget| budget.saturating_sub(self.footprint().total_bytes))
     }
 
+    /// Installs the manifest the host has committed to, or clears it with
+    /// None.
+    ///
+    /// The signature over it is the host's to check, with the platform's
+    /// verifier, before this is called: what arrives here is already
+    /// authenticated, and this layer is responsible only for the bytes
+    /// matching what it says.
+    pub fn set_manifest(&mut self, text: Option<&[u8]>) -> Result<(), String> {
+        let parsed = match text {
+            Some(text) => Some(crate::manifest::Manifest::parse(text)?),
+            None => None,
+        };
+        self.env().manifest = parsed;
+        Ok(())
+    }
+
+    /// The paths the installed manifest names, for a host that wants to
+    /// report what it is committed to. Empty when none is installed.
+    pub fn manifest_paths(&mut self) -> Vec<Vec<u8>> {
+        self.env()
+            .manifest
+            .as_ref()
+            .map(|m| m.paths().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Sets a ceiling on the instructions the workload may retire over its
     /// life, or clears it with None.
     ///
@@ -1399,6 +1490,10 @@ impl Machine {
 
     /// Loads a Linux ELF from the guest filesystem as a fresh root process.
     pub fn load(&mut self, path: &[u8]) -> Result<(), String> {
+        // The check gates execution, not delivery. A host that forgets to
+        // announce that a stream finished cannot skip it that way, and the
+        // moment that matters is the one before the guest runs the bytes.
+        self.env().verify_image(path)?;
         let InterpVm { cpu, env, .. } = &mut self.vm;
         env.load(cpu, path)
     }

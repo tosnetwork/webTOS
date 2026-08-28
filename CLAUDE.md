@@ -82,7 +82,9 @@ In the browser's engine: build with `bash web/build.sh`, then drive
 - `cargo clippy -p linux-compat --lib -- -D warnings` must be clean.
 - Browser gates: `node web/test_node.mjs`, then `node web/test_browsers.mjs`
   (Chromium, Firefox, WebKit; several minutes). `node web/test_messages.mjs`
-  sweeps the exported `wtw_*` boundary with arguments a page made up; it
+  sweeps the exported `wtw_*` boundary with arguments a page made up, and
+  `node web/test_manifest.mjs` checks that a manifest the platform verifier
+  rejects is never installed and one it accepts is enforced; both
   needs a freshly built `web/webtos_web.wasm`, so run `bash web/build.sh`
   after changing anything under `crates/`.
 - A change to what the CPU does moves `test_data/traces/*.trace`. That is the
