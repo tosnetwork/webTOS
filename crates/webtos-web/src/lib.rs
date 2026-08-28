@@ -27,7 +27,9 @@ use std::cell::RefCell;
 use icicle_cpu::mem::perm;
 use linux_compat::{net::HostBroker, Machine};
 use pcode::{Op, VarNode};
-use x64_engine::jit::{translate_block, var_offset, JitBackend, JitOutcome, REG_SPACE_BYTES};
+use x64_engine::jit::{
+    translate_block, var_offset, JitBackend, JitOutcome, RegionOutcome, REG_SPACE_BYTES,
+};
 use x64_engine::{CpuExit, EngineConfig, ExceptionCode};
 
 mod spec {
@@ -387,6 +389,12 @@ extern "C" {
     /// Runs the compiled block `handle` against the register file at `regs_base`
     /// (a byte offset into this module's memory).
     fn jit_call(handle: u32, regs_base: u32);
+    /// Runs a compiled self-loop region `handle` against the register file at
+    /// `regs_base` for up to `max_iters` iterations (split into low and high
+    /// `u32` halves, since the boundary is `u32`-only), returning the number of
+    /// iterations executed. The count is bounded by `max_iters`, which is
+    /// bounded by a fuel slice, so it fits in a `u32`.
+    fn jit_call_region(handle: u32, regs_base: u32, max_iters_lo: u32, max_iters_hi: u32) -> u32;
 }
 
 struct BrowserJit;
@@ -408,6 +416,27 @@ impl JitBackend for BrowserJit {
             i if i < 0 => JitOutcome::Completed,
             i => JitOutcome::Faulted(i as u32),
         }
+    }
+
+    fn call_region(
+        &mut self,
+        handle: u32,
+        cpu: &mut icicle_cpu::Cpu,
+        max_iters: u64,
+    ) -> RegionOutcome {
+        // Shares the engine's memory directly (no copy): the region reads and
+        // writes the register file in place. A register-only region cannot
+        // fault, so there is no callback channel to arm.
+        let regs_base = cpu.regs.as_bytes().as_ptr() as u32;
+        let iters = unsafe {
+            jit_call_region(
+                handle,
+                regs_base,
+                max_iters as u32,
+                (max_iters >> 32) as u32,
+            )
+        };
+        RegionOutcome::Ran(u64::from(iters))
     }
 }
 

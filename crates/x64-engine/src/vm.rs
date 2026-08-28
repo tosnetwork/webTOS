@@ -137,6 +137,12 @@ pub struct InterpVm {
     /// Per-block-address compiled handles: `Some(handle)` once compiled,
     /// `None` once the block is known not to JIT (so it is never retried).
     jit_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Per-block-address compiled *region* (self-loop) handles, keyed the same
+    /// way: `Some(handle)` once the block compiled as a region, `None` once it
+    /// is known not to (not a self-loop, or not region-translatable), so it is
+    /// never retried. Separate from `jit_cache` because a region is a different
+    /// wasm module (an internal loop) than the per-block function.
+    jit_region_cache: std::collections::HashMap<u64, Option<u32>>,
     /// Per-block-address entry counts, to decide when a block is hot enough to
     /// compile. Separate from `entries`, which counts only external re-entries.
     jit_entries: std::collections::HashMap<u64, u64>,
@@ -197,6 +203,7 @@ impl InterpVm {
             jit: None,
             jit_after: None,
             jit_cache: std::collections::HashMap::new(),
+            jit_region_cache: std::collections::HashMap::new(),
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
         }
@@ -218,6 +225,7 @@ impl InterpVm {
         self.jit_after = after;
         self.jit_entries.clear();
         self.jit_cache.clear();
+        self.jit_region_cache.clear();
     }
 
     /// How many times a compiled block ran in place of the interpreter.
@@ -618,10 +626,14 @@ impl InterpVm {
 
             // JIT dispatch: at a fresh block entry (not a mid-block re-entry)
             // with no breakpoint, a hot fully-translatable block runs as
-            // compiled wasm instead of being interpreted. Anything else — not
-            // hot, not translatable, a block the backend declined, or one that
-            // would cross the fuel limit — falls through to the interpreter,
-            // which stays the floor.
+            // compiled wasm instead of being interpreted. A self-loop — a block
+            // that conditionally branches back to its own start — compiles as a
+            // region (one wasm function with an internal loop), so many
+            // iterations are one dispatch; every other hot block runs as a
+            // single-shot per-block function. Anything else — not hot, not
+            // translatable, a block the backend declined, or one that would
+            // cross the fuel limit — falls through to the interpreter, which
+            // stays the floor.
             let mut jit_ran = false;
             if offset == 0 && !block.has_breakpoint() {
                 if let Some(after) = self.jit_after {
@@ -629,53 +641,99 @@ impl InterpVm {
                     let count = self.jit_entries.entry(start).or_insert(0);
                     *count += 1;
                     let hot = *count >= after;
-                    let handle = match self.jit_cache.get(&start).copied() {
-                        Some(decided) => decided,
-                        None if hot => {
-                            // Compile once, or cache a bail. A block that touches
-                            // guest memory, divides, or raises compiles the same
-                            // way; its host callbacks are wired at run time.
-                            let compiled = crate::jit::translate_block(&block.pcode)
-                                .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
-                            self.jit_cache.insert(start, compiled);
-                            compiled
-                        }
-                        None => None,
-                    };
-                    if let Some(handle) = handle {
-                        if self.cpu.fuel.remaining >= block.num_instructions as u64 {
-                            let outcome = match self.jit.as_mut() {
-                                Some(j) => j.call(handle, &mut self.cpu),
-                                None => crate::jit::JitOutcome::Unavailable,
-                            };
-                            match outcome {
-                                crate::jit::JitOutcome::Completed => {
-                                    // The compiled block ticks no per-instruction
-                                    // fuel the way InstructionMarker does; charge
-                                    // the whole block here so icount stays exact.
-                                    self.cpu.fuel.remaining -= block.num_instructions as u64;
+
+                    // Region (self-loop) path. A register-only self-loop runs its
+                    // whole loop in one call; a self-loop that needs the host
+                    // caches a bail here and takes the per-block path below.
+                    if let Some(cond) = self_loop_kind(block, block_id) {
+                        let handle = match self.jit_region_cache.get(&start).copied() {
+                            Some(decided) => decided,
+                            None if hot => {
+                                let compiled = crate::jit::translate_region(&block.pcode, cond)
+                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
+                                self.jit_region_cache.insert(start, compiled);
+                                compiled
+                            }
+                            None => None,
+                        };
+                        if let Some(handle) = handle {
+                            let num = block.num_instructions as u64;
+                            if num > 0 && self.cpu.fuel.remaining >= num {
+                                // Bound the region to the fuel budget so it never
+                                // retires more than the interpreter would in this
+                                // slice; at least one iteration by the guard above.
+                                let max_iters = self.cpu.fuel.remaining / num;
+                                let outcome = match self.jit.as_mut() {
+                                    Some(j) => j.call_region(handle, &mut self.cpu, max_iters),
+                                    None => crate::jit::RegionOutcome::Unavailable,
+                                };
+                                if let crate::jit::RegionOutcome::Ran(iters) = outcome {
+                                    // Each iteration retired the whole block and
+                                    // ticks no per-instruction fuel; charge it here
+                                    // so icount stays exact. The register file now
+                                    // holds the post-iteration state, so block_exit
+                                    // below reads the live condition and goes to the
+                                    // loop target (budget spent, still live) or the
+                                    // fallthrough (condition went false) exactly as
+                                    // the interpreter would.
+                                    self.cpu.fuel.remaining -= iters.saturating_mul(num);
                                     self.jit_dispatches += 1;
                                     jit_ran = true;
                                 }
-                                crate::jit::JitOutcome::Faulted(i) => {
-                                    // The block stopped mid-way, at pcode index i.
-                                    // The interpreter, running to there, would have
-                                    // ticked PC and fuel at each guest instruction's
-                                    // marker; reproduce that up to the fault so the
-                                    // exception it raised is seen in the same state.
-                                    let (pc, guest_insns) =
-                                        fault_pc_and_fuel(&block.pcode, i as usize);
-                                    if let Some(pc) = pc {
-                                        self.cpu.write_pc(pc);
+                            }
+                        }
+                    }
+
+                    // Per-block (single-shot) path, when the region did not run.
+                    if !jit_ran {
+                        let handle = match self.jit_cache.get(&start).copied() {
+                            Some(decided) => decided,
+                            None if hot => {
+                                // Compile once, or cache a bail. A block that touches
+                                // guest memory, divides, or raises compiles the same
+                                // way; its host callbacks are wired at run time.
+                                let compiled = crate::jit::translate_block(&block.pcode)
+                                    .and_then(|bytes| self.jit.as_mut()?.compile(&bytes));
+                                self.jit_cache.insert(start, compiled);
+                                compiled
+                            }
+                            None => None,
+                        };
+                        if let Some(handle) = handle {
+                            if self.cpu.fuel.remaining >= block.num_instructions as u64 {
+                                let outcome = match self.jit.as_mut() {
+                                    Some(j) => j.call(handle, &mut self.cpu),
+                                    None => crate::jit::JitOutcome::Unavailable,
+                                };
+                                match outcome {
+                                    crate::jit::JitOutcome::Completed => {
+                                        // The compiled block ticks no per-instruction
+                                        // fuel the way InstructionMarker does; charge
+                                        // the whole block here so icount stays exact.
+                                        self.cpu.fuel.remaining -= block.num_instructions as u64;
+                                        self.jit_dispatches += 1;
+                                        jit_ran = true;
                                     }
-                                    self.cpu.fuel.remaining =
-                                        self.cpu.fuel.remaining.saturating_sub(guest_insns);
-                                    self.jit_dispatches += 1;
-                                    self.cpu.block_id = block_id;
-                                    self.cpu.block_offset = i as u64;
-                                    break;
+                                    crate::jit::JitOutcome::Faulted(i) => {
+                                        // The block stopped mid-way, at pcode index i.
+                                        // The interpreter, running to there, would have
+                                        // ticked PC and fuel at each guest instruction's
+                                        // marker; reproduce that up to the fault so the
+                                        // exception it raised is seen in the same state.
+                                        let (pc, guest_insns) =
+                                            fault_pc_and_fuel(&block.pcode, i as usize);
+                                        if let Some(pc) = pc {
+                                            self.cpu.write_pc(pc);
+                                        }
+                                        self.cpu.fuel.remaining =
+                                            self.cpu.fuel.remaining.saturating_sub(guest_insns);
+                                        self.jit_dispatches += 1;
+                                        self.cpu.block_id = block_id;
+                                        self.cpu.block_offset = i as u64;
+                                        break;
+                                    }
+                                    crate::jit::JitOutcome::Unavailable => {}
                                 }
-                                crate::jit::JitOutcome::Unavailable => {}
                             }
                         }
                     }
@@ -950,6 +1008,34 @@ impl InterpVm {
                 }
             }
         }
+    }
+}
+
+/// If `block` is a self-loop — its structured exit branches back to the block's
+/// own start — returns how it loops, for [`crate::jit::translate_region`]:
+///
+/// - `Some(Some(cond))`: a conditional branch that loops while `cond` is taken
+///   (and falls through to its other target when the condition goes false).
+/// - `Some(None)`: an unconditional jump back to its own start — an infinite
+///   loop that a fuel slice bounds (a `hlt`/`jmp $` spin), and whose region
+///   simply runs the body up to the iteration budget.
+/// - `None`: not a self-loop (a call, a return, or an exit that leaves the
+///   block).
+///
+/// The taken target resolves to this block whether it is an internal target
+/// (the same block index) or an external jump back to the block's start address.
+fn self_loop_kind(block: &lifter::Block, block_id: u64) -> Option<Option<pcode::Value>> {
+    let resolves_to_self = |target: Target| match target {
+        Target::Internal(id) => id as u64 == block_id,
+        Target::External(pcode::Value::Const(addr, _)) => addr == block.start,
+        _ => false,
+    };
+    match block.exit {
+        lifter::BlockExit::Branch { cond, target, .. } if resolves_to_self(target) => {
+            Some(Some(cond))
+        }
+        lifter::BlockExit::Jump { target } if resolves_to_self(target) => Some(None),
+        _ => None,
     }
 }
 

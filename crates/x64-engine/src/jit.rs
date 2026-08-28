@@ -1585,6 +1585,132 @@ pub fn translate_block(block: &pcode::Block) -> Option<Vec<u8>> {
     Some(module.finish())
 }
 
+/// Local index of a region `run`'s second parameter, `max_iters` — the cap on
+/// how many loop iterations one call may execute (the fuel budget divided by the
+/// block's instruction count).
+const REGION_MAX_ITERS_PARAM: u32 = 1;
+
+/// Local index of a region's iteration counter, an `i64` declared after the two
+/// parameters.
+const REGION_ITER_LOCAL: u32 = 2;
+
+/// Translates a register-only self-loop block into a wasm *region* function.
+///
+/// A self-loop is a block whose structured exit branches back to its own start.
+/// `cond` says how it loops: `Some(v)` is a conditional branch that stays in the
+/// loop while the branch condition varnode `v` reads non-zero; `None` is an
+/// unconditional jump back to the start (an infinite spin — `hlt`/`jmp $` — that
+/// only a fuel slice ends). Where [`translate_block`] emits one straight-line
+/// pass and the host re-dispatches once per iteration, this emits an internal
+/// wasm `loop`, so N iterations are one call:
+///
+/// ```text
+/// run(regs_base: i32, max_iters: i64) -> i64      ; returns iterations executed
+///   loop
+///     <block body>                                ; the per-instruction emitters
+///     iter += 1
+///     if iter < max_iters [ && cond-byte != 0 ] { continue }   ; else exit
+///   end
+///   return iter
+/// ```
+///
+/// The count `iter` includes the terminal iteration whose branch went false
+/// (that block execution ran in full, exactly as the interpreter would run it),
+/// so the host charges `iter * num_instructions` fuel and the register file
+/// holds the post-iteration state — from which the host's `block_exit` reads the
+/// live condition and goes to the loop target or the fallthrough itself. The
+/// combined `iter < max_iters` guard means a run that hits the budget exits with
+/// `iter == max_iters` (the loop still live) and one that the condition ends
+/// exits with `iter < max_iters`; either way the register file, not `iter`,
+/// decides where control goes next.
+///
+/// Register-only: a block that needs the host imports (guest memory, division,
+/// the exception ops) is rejected here and stays on the per-block path, whose
+/// mid-block fault handling is already correct. Returns `None` if the block
+/// needs the host, if a conditional `cond` is not a variable (a constant
+/// condition is a [`pcode`] `Jump`, never a `Branch`), or if any instruction
+/// does not translate.
+pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec<u8>> {
+    if block_needs_host(block) {
+        return None;
+    }
+    let cond_var = match cond {
+        Some(Value::Var(v)) => Some(v),
+        Some(Value::Const(..)) => return None,
+        None => None,
+    };
+
+    // One extra local: the i64 iteration counter (index 2, after the params).
+    let mut body = Function::new([(1, ValType::I64)]);
+    body.instruction(&Instruction::Loop(BlockType::Empty));
+    for (i, inst) in block.instructions.iter().enumerate() {
+        // has_host is false: a register-only body emits no host `return`, so the
+        // region has no returns and its loop is the only control flow.
+        translate_instruction(&mut body, inst, i as u32, false)?;
+    }
+    // iter += 1
+    body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+    body.instruction(&Instruction::I64Const(1));
+    body.instruction(&Instruction::I64Add);
+    body.instruction(&Instruction::LocalSet(REGION_ITER_LOCAL));
+    // Continue while iter < max_iters (the budget) ...
+    body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+    body.instruction(&Instruction::LocalGet(REGION_MAX_ITERS_PARAM));
+    body.instruction(&Instruction::I64LtU);
+    // ... and, for a conditional self-loop, while the branch condition byte is
+    // non-zero (matching the interpreter's `read::<u8>(cond) != 0`). Normalise
+    // the byte to 0/1 so a value like 2 does not clear a bit under `and`.
+    if let Some(v) = cond_var {
+        emit_load(&mut body, Value::Var(v), 1)?;
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Ne);
+        body.instruction(&Instruction::I32And);
+    }
+    body.instruction(&Instruction::BrIf(0));
+    // Fell through: the budget is spent, or the condition went false.
+    body.instruction(&Instruction::End); // end loop
+    body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+    body.instruction(&Instruction::End); // end function
+
+    let mut module = Module::new();
+
+    let mut types = TypeSection::new();
+    types
+        .ty()
+        .function([ValType::I32, ValType::I64], [ValType::I64]); // 0: run(regs_base, max_iters) -> iters
+    module.section(&types);
+
+    // A register-only region imports only the register memory — no host
+    // functions — so `run` is function 0.
+    let mut imports = wasm_encoder::ImportSection::new();
+    imports.import(
+        "env",
+        "regs",
+        EntityType::Memory(MemoryType {
+            minimum: REG_PAGES,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    );
+    module.section(&imports);
+
+    let mut funcs = FunctionSection::new();
+    funcs.function(0);
+    module.section(&funcs);
+
+    let mut exports = ExportSection::new();
+    exports.export("run", ExportKind::Func, 0);
+    module.section(&exports);
+
+    let mut code = CodeSection::new();
+    code.function(&body);
+    module.section(&code);
+
+    Some(module.finish())
+}
+
 /// The outcome of running a compiled block through a [`JitBackend`].
 pub enum JitOutcome {
     /// Ran to completion; the register file is updated and control falls
@@ -1597,6 +1723,21 @@ pub enum JitOutcome {
     Faulted(u32),
     /// The backend declined or could not run the block; fall back to the
     /// interpreter for this entry.
+    Unavailable,
+}
+
+/// The outcome of running a compiled self-loop region (see
+/// [`translate_region`]) through a [`JitBackend`].
+pub enum RegionOutcome {
+    /// The loop body ran `iters` full iterations against the register file,
+    /// which now holds the post-iteration state. `iters` is the iteration
+    /// budget when the budget was spent (the loop is still live), or fewer when
+    /// the branch condition went false (the loop has exited). Either way the
+    /// host charges `iters * num_instructions` fuel and lets its own
+    /// `block_exit` read the live condition to pick the next block.
+    Ran(u64),
+    /// The backend declined or could not run the region; fall back to the
+    /// per-block path (always correct) for this entry.
     Unavailable,
 }
 
@@ -1622,6 +1763,22 @@ pub trait JitBackend {
     /// shared with the host's memory in the browser, copied in and out for a
     /// native runtime.
     fn call(&mut self, handle: u32, cpu: &mut icicle_cpu::Cpu) -> JitOutcome;
+
+    /// Runs a compiled self-loop region `handle` against `cpu` for up to
+    /// `max_iters` iterations, returning how many the loop body executed.
+    ///
+    /// The region is a [`translate_region`] function: `run(regs_base,
+    /// max_iters) -> iters`. `max_iters` bounds the run to the fuel budget, so
+    /// the region never retires more than the interpreter would in one slice.
+    /// A backend that does not support regions returns
+    /// [`RegionOutcome::Unavailable`], and the host falls back to the per-block
+    /// path.
+    fn call_region(
+        &mut self,
+        handle: u32,
+        cpu: &mut icicle_cpu::Cpu,
+        max_iters: u64,
+    ) -> RegionOutcome;
 }
 
 /// Where a block first fails to translate, for the coverage diagnostic. `width`
