@@ -159,6 +159,23 @@ pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Opt
     let out = inst.output;
     let [a, b] = inst.inputs.get();
 
+    // Pushes the p-code shift count as an `i32` holding the interpreter's
+    // `read_dynamic(b).zxt::<u32>()`: the count zero-extended, and — for an
+    // 8-byte count — truncated to its low 32 bits (`i32.wrap_i64`), which is
+    // what a `u128 -> u32` zxt does. Used for the width comparison, and (after
+    // widening) as the shift amount itself.
+    fn emit_shift_count_u32(f: &mut Function, b: Value) -> Option<()> {
+        match b.size() {
+            1 | 2 | 4 => emit_load(f, b, b.size())?,
+            8 => {
+                emit_load(f, b, 8)?;
+                f.instruction(&Instruction::I32WrapI64);
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
     match inst.op {
         // Metadata: marks an instruction boundary. No machine effect; the
         // interpreter uses it for the instruction count, which the block
@@ -179,8 +196,769 @@ pub fn translate_instruction(f: &mut Function, inst: &pcode::Instruction) -> Opt
             emit_store(f, out)
         }
 
-        // Everything else is not handled yet — the three op slices land here.
-        // Until then, any block containing another op bails to the interpreter.
+        // out = a - b, all one width. Wasm sub wraps, matching wrapping_sub.
+        Op::IntSub => {
+            let size = same_width(out, a, b)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Sub),
+                _ => f.instruction(&Instruction::I32Sub),
+            };
+            emit_store(f, out)
+        }
+
+        // out = a ^ b, all one width.
+        Op::IntXor => {
+            let size = same_width(out, a, b)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Xor),
+                _ => f.instruction(&Instruction::I32Xor),
+            };
+            emit_store(f, out)
+        }
+
+        // out = a | b, all one width.
+        Op::IntOr => {
+            let size = same_width(out, a, b)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Or),
+                _ => f.instruction(&Instruction::I32Or),
+            };
+            emit_store(f, out)
+        }
+
+        // out = a & b, all one width.
+        Op::IntAnd => {
+            let size = same_width(out, a, b)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64And),
+                _ => f.instruction(&Instruction::I32And),
+            };
+            emit_store(f, out)
+        }
+
+        // out = a * b, all one width. Wasm mul wraps, matching wrapping_mul; the
+        // store keeps only the low `size` bytes.
+        Op::IntMul => {
+            let size = same_width(out, a, b)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Mul),
+                _ => f.instruction(&Instruction::I32Mul),
+            };
+            emit_store(f, out)
+        }
+
+        // out = !a. Wasm has no bitwise-not, so xor with all-ones. The store
+        // truncates, so setting the high wasm bits for a sub-word `a` is
+        // harmless.
+        Op::IntNot => {
+            let size = out.size;
+            let ty = wasm_ty(size)?;
+            if a.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            match ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64Const(-1));
+                    f.instruction(&Instruction::I64Xor);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32Const(-1));
+                    f.instruction(&Instruction::I32Xor);
+                }
+            };
+            emit_store(f, out)
+        }
+
+        // out = -a = 0 - a, matching wrapping_neg. Wasm sub wraps; the store
+        // keeps only the low `size` bytes.
+        Op::IntNegate => {
+            let size = out.size;
+            let ty = wasm_ty(size)?;
+            if a.size() != size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            match ty {
+                ValType::I64 => f.instruction(&Instruction::I64Const(0)),
+                _ => f.instruction(&Instruction::I32Const(0)),
+            };
+            emit_load(f, a, size)?;
+            match ty {
+                ValType::I64 => f.instruction(&Instruction::I64Sub),
+                _ => f.instruction(&Instruction::I32Sub),
+            };
+            emit_store(f, out)
+        }
+
+        // Logical shifts. The interpreter computes `if y >= width { 0 } else
+        // { x <shift> y }`, where `width` is the *output* bit width and `y` is
+        // the count. Wasm shifts instead mask the count modulo the wasm type
+        // width (32 or 64), so an out-of-range count would wrap rather than
+        // zero. We reproduce the interpreter by computing the in-range shift and
+        // selecting zero when `y >= width`. `a` must match the output width; the
+        // count may be any handled size.
+        Op::IntLeft | Op::IntRight => {
+            let size = out.size;
+            let ty = wasm_ty(size)?;
+            if a.size() != size {
+                return None;
+            }
+            wasm_ty(b.size())?;
+            let width = size as i32 * 8;
+
+            emit_store_addr(f, out);
+            // In-range result: x << y (or x >> y). The count is `y` in the value
+            // type; masking is a no-op here because `select` discards this value
+            // unless y < width.
+            emit_load(f, a, size)?;
+            emit_shift_count_u32(f, b)?;
+            let left = matches!(inst.op, Op::IntLeft);
+            match (left, ty) {
+                (true, ValType::I64) => {
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64Shl);
+                }
+                (false, ValType::I64) => {
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64ShrU);
+                }
+                (true, _) => {
+                    f.instruction(&Instruction::I32Shl);
+                }
+                (false, _) => {
+                    f.instruction(&Instruction::I32ShrU);
+                }
+            }
+            // Zero alternative.
+            match ty {
+                ValType::I64 => f.instruction(&Instruction::I64Const(0)),
+                _ => f.instruction(&Instruction::I32Const(0)),
+            };
+            // Condition: y < width. select keeps the shifted value when true,
+            // zero otherwise.
+            emit_shift_count_u32(f, b)?;
+            f.instruction(&Instruction::I32Const(width));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::Select);
+            emit_store(f, out)
+        }
+
+        // Arithmetic (sign-propagating) shift right. The interpreter clamps the
+        // count to `width - 1` and sign-extends `a` before shifting, so an
+        // out-of-range count fills the result with the sign bit. Wasm `shr_s`
+        // sign-propagates but masks the count, so we clamp explicitly and
+        // sign-extend a sub-word `a` up to its wasm type first.
+        Op::IntSignedRight => {
+            let size = out.size;
+            let ty = wasm_ty(size)?;
+            if a.size() != size {
+                return None;
+            }
+            wasm_ty(b.size())?;
+            let clamp = size as i32 * 8 - 1;
+
+            emit_store_addr(f, out);
+            // Value, sign-extended to the wasm type (4/8-byte loads already fill
+            // the type; 1/2-byte loads are zero-extended and need fixing up).
+            emit_load(f, a, size)?;
+            match size {
+                1 => {
+                    f.instruction(&Instruction::I32Extend8S);
+                }
+                2 => {
+                    f.instruction(&Instruction::I32Extend16S);
+                }
+                _ => {}
+            }
+            // Count = min(y, width - 1) as i32: select y when y < width-1 else
+            // width-1.
+            emit_shift_count_u32(f, b)?;
+            f.instruction(&Instruction::I32Const(clamp));
+            emit_shift_count_u32(f, b)?;
+            f.instruction(&Instruction::I32Const(clamp));
+            f.instruction(&Instruction::I32LtU);
+            f.instruction(&Instruction::Select);
+            match ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64ExtendI32U);
+                    f.instruction(&Instruction::I64ShrS);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32ShrS);
+                }
+            }
+            emit_store(f, out)
+        }
+
+        // Rotates. The interpreter rotates at the value's native width, so wasm
+        // `rotl`/`rotr` only match for the 4- and 8-byte types (whose native
+        // width equals the wasm type width); 1- and 2-byte rotates would use the
+        // wrong modulus and bail.
+        Op::IntRotateLeft | Op::IntRotateRight => {
+            let size = same_width(out, a, b)?;
+            let left = matches!(inst.op, Op::IntRotateLeft);
+            let op = match (left, size) {
+                (true, 4) => Instruction::I32Rotl,
+                (true, 8) => Instruction::I64Rotl,
+                (false, 4) => Instruction::I32Rotr,
+                (false, 8) => Instruction::I64Rotr,
+                _ => return None,
+            };
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(&op);
+            emit_store(f, out)
+        }
+
+        // --- Comparisons -----------------------------------------------------
+        //
+        // Both inputs are `size` bytes and equal width; the output is exactly
+        // one byte holding 0 or 1 (the interpreter writes `<Op>::eval(a, b) as
+        // u8`). A wasm `iN.*` comparison yields an `i32` 0/1 regardless of
+        // operand width — including the `i64.*` forms — so the result stores
+        // straight to the 1-byte output via `emit_store` (`i32.store8`).
+        //
+        // Equality and the unsigned relations compare the operands as loaded:
+        // `emit_load` zero-extends the sub-word sizes, and unsigned/equality
+        // comparisons of equally zero-extended values agree with the sub-word
+        // comparison. The signed relations must instead sign-extend each
+        // sub-word operand into its wasm register first, since a byte 0xff is
+        // -1 as `i8` but 255 as a zero-extended `i32`.
+        Op::IntEqual => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Eq),
+                _ => f.instruction(&Instruction::I32Eq),
+            };
+            emit_store(f, out)
+        }
+
+        Op::IntNotEqual => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64Ne),
+                _ => f.instruction(&Instruction::I32Ne),
+            };
+            emit_store(f, out)
+        }
+
+        Op::IntLess => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64LtU),
+                _ => f.instruction(&Instruction::I32LtU),
+            };
+            emit_store(f, out)
+        }
+
+        Op::IntLessEqual => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match size {
+                8 => f.instruction(&Instruction::I64LeU),
+                _ => f.instruction(&Instruction::I32LeU),
+            };
+            emit_store(f, out)
+        }
+
+        Op::IntSignedLess => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            match size {
+                1 => f.instruction(&Instruction::I32Extend8S),
+                2 => f.instruction(&Instruction::I32Extend16S),
+                _ => f,
+            };
+            emit_load(f, b, size)?;
+            match size {
+                1 => f.instruction(&Instruction::I32Extend8S),
+                2 => f.instruction(&Instruction::I32Extend16S),
+                _ => f,
+            };
+            match size {
+                8 => f.instruction(&Instruction::I64LtS),
+                _ => f.instruction(&Instruction::I32LtS),
+            };
+            emit_store(f, out)
+        }
+
+        Op::IntSignedLessEqual => {
+            let size = a.size();
+            if b.size() != size || out.size != 1 {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            match size {
+                1 => f.instruction(&Instruction::I32Extend8S),
+                2 => f.instruction(&Instruction::I32Extend16S),
+                _ => f,
+            };
+            emit_load(f, b, size)?;
+            match size {
+                1 => f.instruction(&Instruction::I32Extend8S),
+                2 => f.instruction(&Instruction::I32Extend16S),
+                _ => f,
+            };
+            match size {
+                8 => f.instruction(&Instruction::I64LeS),
+                _ => f.instruction(&Instruction::I32LeS),
+            };
+            emit_store(f, out)
+        }
+
+        // --- Booleans --------------------------------------------------------
+        //
+        // 1-byte operands and a 1-byte output. The interpreter evaluates each
+        // as a bitwise op on the raw bytes followed by `!= 0` (e.g. BoolAnd is
+        // `a & b != 0`), so the emitted code mirrors that exactly: the bitwise
+        // wasm op, then `i32.ne 0` to normalise to 0/1. Doing the `!= 0` rather
+        // than storing the raw bitwise result matters when an operand is not a
+        // strict 0/1 boolean. BoolNot is `a == 0`, which is `i32.eqz`.
+        Op::BoolAnd => {
+            if a.size() != 1 || b.size() != 1 || out.size != 1 {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, 1)?;
+            emit_load(f, b, 1)?;
+            f.instruction(&Instruction::I32And);
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Ne);
+            emit_store(f, out)
+        }
+
+        Op::BoolOr => {
+            if a.size() != 1 || b.size() != 1 || out.size != 1 {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, 1)?;
+            emit_load(f, b, 1)?;
+            f.instruction(&Instruction::I32Or);
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Ne);
+            emit_store(f, out)
+        }
+
+        Op::BoolXor => {
+            if a.size() != 1 || b.size() != 1 || out.size != 1 {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, 1)?;
+            emit_load(f, b, 1)?;
+            f.instruction(&Instruction::I32Xor);
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Ne);
+            emit_store(f, out)
+        }
+
+        Op::BoolNot => {
+            if a.size() != 1 || out.size != 1 {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, 1)?;
+            f.instruction(&Instruction::I32Eqz);
+            emit_store(f, out)
+        }
+
+        // --- Move / resize ---------------------------------------------------
+
+        // out = a, same width. A load then a store of the same size.
+        Op::Copy => {
+            let size = out.size;
+            if a.size() != size {
+                return None;
+            }
+            wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_store(f, out)
+        }
+
+        // out = zero-extend(a), out wider than a. `emit_load` already
+        // zero-extends a sub-word load into its `i32`, so for an `i32` output
+        // the value stores directly (the high output bytes are already zero).
+        // Only widening the `i32`-typed load to an `i64` output needs an
+        // explicit `i64.extend_i32_u`.
+        Op::ZeroExtend => {
+            let in_size = a.size();
+            let out_size = out.size;
+            let in_ty = wasm_ty(in_size)?;
+            let out_ty = wasm_ty(out_size)?;
+            if out_size < in_size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            match (in_ty, out_ty) {
+                (ValType::I32, ValType::I32) => {}
+                (ValType::I32, ValType::I64) => {
+                    f.instruction(&Instruction::I64ExtendI32U);
+                }
+                (ValType::I64, ValType::I64) => {}
+                _ => return None,
+            }
+            emit_store(f, out)
+        }
+
+        // out = sign-extend(a), out strictly wider than a. The sub-word load is
+        // zero-extended, so sign-extension is explicit: `i32.extend8_s` /
+        // `i32.extend16_s` fill the sign within an `i32`, and `i64.extend_i32_s`
+        // widens a sign-filled `i32` to an `i64` output.
+        Op::SignExtend => {
+            let in_size = a.size();
+            let out_size = out.size;
+            wasm_ty(in_size)?;
+            wasm_ty(out_size)?;
+            if out_size <= in_size {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            match out_size {
+                1 | 2 | 4 => match in_size {
+                    1 => {
+                        f.instruction(&Instruction::I32Extend8S);
+                    }
+                    2 => {
+                        f.instruction(&Instruction::I32Extend16S);
+                    }
+                    _ => return None,
+                },
+                8 => match in_size {
+                    1 => {
+                        f.instruction(&Instruction::I32Extend8S);
+                        f.instruction(&Instruction::I64ExtendI32S);
+                    }
+                    2 => {
+                        f.instruction(&Instruction::I32Extend16S);
+                        f.instruction(&Instruction::I64ExtendI32S);
+                    }
+                    4 => {
+                        f.instruction(&Instruction::I64ExtendI32S);
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+            emit_store(f, out)
+        }
+
+        // out = a's bytes starting at byte `offset`, truncated to out.size
+        // (the interpreter reaches this as a copy of `a.slice(offset,
+        // out.size)`). Load a whole, shift right by offset*8, then the store
+        // truncates to the output width. Only the in-bounds case is emitted;
+        // a slice reaching past `a` (which would zero-fill high bytes) bails.
+        Op::Subpiece(offset) => {
+            let in_size = a.size();
+            let out_size = out.size;
+            let in_ty = wasm_ty(in_size)?;
+            wasm_ty(out_size)?;
+            let offset = offset as u64;
+            if offset + out_size as u64 > in_size as u64 {
+                return None;
+            }
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            if offset > 0 {
+                match in_ty {
+                    ValType::I64 => {
+                        f.instruction(&Instruction::I64Const((offset * 8) as i64));
+                        f.instruction(&Instruction::I64ShrU);
+                    }
+                    _ => {
+                        f.instruction(&Instruction::I32Const((offset * 8) as i32));
+                        f.instruction(&Instruction::I32ShrU);
+                    }
+                }
+            }
+            // Reconcile the input's wasm type with the output store's type: an
+            // i64 value feeding an i32-typed (<=4 byte) output must be wrapped.
+            if in_ty == ValType::I64 && out_size <= 4 {
+                f.instruction(&Instruction::I32WrapI64);
+            }
+            emit_store(f, out)
+        }
+
+        // Flags. Each writes a 1-byte boolean to `out` from two W-wide inputs
+        // (interpreter: `cmp_op!`). Output must be size 1; inputs share width W
+        // in {1,2,4,8}. Size 16 bails via `wasm_ty`.
+        //
+        // IntCarry: unsigned add carry-out, `a.checked_add(b).is_none()`, i.e.
+        // the width-W sum wraps. Compute (a+b), mask to W bits (for the sub-word
+        // i32 sizes; identity at 4 and unneeded at 8), then `sum <u a`.
+        Op::IntCarry => {
+            if out.size != 1 || b.size() != a.size() {
+                return None;
+            }
+            let size = a.size();
+            let ty = wasm_ty(size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            match ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64Add);
+                    emit_load(f, a, size)?;
+                    f.instruction(&Instruction::I64LtU);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32Add);
+                    if size != 4 {
+                        let mask = ((1u32 << (size as u32 * 8)) - 1) as i32;
+                        f.instruction(&Instruction::I32Const(mask));
+                        f.instruction(&Instruction::I32And);
+                    }
+                    emit_load(f, a, size)?;
+                    f.instruction(&Instruction::I32LtU);
+                }
+            }
+            emit_store(f, out)
+        }
+
+        // IntSignedCarry: signed add overflow,
+        // `a.to_signed().checked_add(b.to_signed()).is_none()`. Overflow iff the
+        // operands share a sign and the sum's sign differs:
+        //   ((a ^ sum) & (b ^ sum) & signbit) != 0,  sum = a + b (width W).
+        // The final `& signbit` isolates bit W*8-1, so `sum` needs no masking —
+        // higher stray bits from the i32 add fall outside the mask.
+        Op::IntSignedCarry => {
+            if out.size != 1 || b.size() != a.size() {
+                return None;
+            }
+            let size = a.size();
+            let ty = wasm_ty(size)?;
+            let is64 = matches!(ty, ValType::I64);
+            emit_store_addr(f, out);
+            // a ^ sum
+            emit_load(f, a, size)?;
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(if is64 {
+                &Instruction::I64Add
+            } else {
+                &Instruction::I32Add
+            });
+            f.instruction(if is64 {
+                &Instruction::I64Xor
+            } else {
+                &Instruction::I32Xor
+            });
+            // b ^ sum
+            emit_load(f, b, size)?;
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(if is64 {
+                &Instruction::I64Add
+            } else {
+                &Instruction::I32Add
+            });
+            f.instruction(if is64 {
+                &Instruction::I64Xor
+            } else {
+                &Instruction::I32Xor
+            });
+            f.instruction(if is64 {
+                &Instruction::I64And
+            } else {
+                &Instruction::I32And
+            });
+            if is64 {
+                f.instruction(&Instruction::I64Const(1i64 << 63));
+                f.instruction(&Instruction::I64And);
+                f.instruction(&Instruction::I64Const(0));
+                f.instruction(&Instruction::I64Ne);
+            } else {
+                let signbit = (1u32 << (size as u32 * 8 - 1)) as i32;
+                f.instruction(&Instruction::I32Const(signbit));
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::I32Ne);
+            }
+            emit_store(f, out)
+        }
+
+        // IntSignedBorrow: signed subtract overflow,
+        // `a.to_signed().checked_sub(b.to_signed()).is_none()`. Overflow iff the
+        // operands differ in sign and the difference's sign differs from a's:
+        //   ((a ^ b) & (a ^ diff) & signbit) != 0,  diff = a - b (width W).
+        Op::IntSignedBorrow => {
+            if out.size != 1 || b.size() != a.size() {
+                return None;
+            }
+            let size = a.size();
+            let ty = wasm_ty(size)?;
+            let is64 = matches!(ty, ValType::I64);
+            emit_store_addr(f, out);
+            // a ^ b
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(if is64 {
+                &Instruction::I64Xor
+            } else {
+                &Instruction::I32Xor
+            });
+            // a ^ diff
+            emit_load(f, a, size)?;
+            emit_load(f, a, size)?;
+            emit_load(f, b, size)?;
+            f.instruction(if is64 {
+                &Instruction::I64Sub
+            } else {
+                &Instruction::I32Sub
+            });
+            f.instruction(if is64 {
+                &Instruction::I64Xor
+            } else {
+                &Instruction::I32Xor
+            });
+            f.instruction(if is64 {
+                &Instruction::I64And
+            } else {
+                &Instruction::I32And
+            });
+            if is64 {
+                f.instruction(&Instruction::I64Const(1i64 << 63));
+                f.instruction(&Instruction::I64And);
+                f.instruction(&Instruction::I64Const(0));
+                f.instruction(&Instruction::I64Ne);
+            } else {
+                let signbit = (1u32 << (size as u32 * 8 - 1)) as i32;
+                f.instruction(&Instruction::I32Const(signbit));
+                f.instruction(&Instruction::I32And);
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::I32Ne);
+            }
+            emit_store(f, out)
+        }
+
+        // Bit counts (interpreter: `write_trunc(out, read::<uW>(a).count_ones())`
+        // / `.leading_zeros()`). The count is computed over the *input* width and
+        // truncated into `out` (any handled size); the count is at most 64, so it
+        // always fits in one byte and the truncation is lossless.
+        //
+        // IntCountOnes: popcount over the input width. Zero-extended sub-word
+        // loads carry only their low bits, so a 32-bit popcnt is exact for sizes
+        // 1/2/4; size 8 uses the 64-bit popcnt.
+        Op::IntCountOnes => {
+            if b.size() != 0 {
+                return None;
+            }
+            let in_size = a.size();
+            let in_ty = wasm_ty(in_size)?;
+            let out_ty = wasm_ty(out.size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            match in_ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64Popcnt);
+                    f.instruction(&Instruction::I32WrapI64);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32Popcnt);
+                }
+            }
+            if matches!(out_ty, ValType::I64) {
+                f.instruction(&Instruction::I64ExtendI32U);
+            }
+            emit_store(f, out)
+        }
+
+        // IntCountLeadingZeroes: leading zeros counted within the input width, not
+        // in 32/64 bits. wasm `clz` counts in the full register width, so a
+        // sub-word i32 load (zero-extended) over-counts by the padding bits —
+        // subtract 32 - W*8 to recover the width-W count. Size 8's i64 clz already
+        // counts in 64 bits, and size 4 needs no adjustment.
+        Op::IntCountLeadingZeroes => {
+            if b.size() != 0 {
+                return None;
+            }
+            let in_size = a.size();
+            let in_ty = wasm_ty(in_size)?;
+            let out_ty = wasm_ty(out.size)?;
+            emit_store_addr(f, out);
+            emit_load(f, a, in_size)?;
+            match in_ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64Clz);
+                    f.instruction(&Instruction::I32WrapI64);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32Clz);
+                    let adjust = 32 - (in_size as i32 * 8);
+                    if adjust != 0 {
+                        f.instruction(&Instruction::I32Const(adjust));
+                        f.instruction(&Instruction::I32Sub);
+                    }
+                }
+            }
+            if matches!(out_ty, ValType::I64) {
+                f.instruction(&Instruction::I64ExtendI32U);
+            }
+            emit_store(f, out)
+        }
+
+        // Everything above translates fully; anything else bails the block to
+        // the interpreter. That deliberately includes the four division ops
+        // (IntDiv/IntSignedDiv/IntRem/IntSignedRem): the interpreter raises an
+        // exception and writes nothing on a zero (or signed INT_MIN/-1)
+        // divisor, whereas wasm's div/rem trap on exactly those inputs —
+        // behaviour a compile-time handler can't reconcile, so they stay
+        // interpreted.
         _ => None,
     }
 }
