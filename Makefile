@@ -1,10 +1,15 @@
-.PHONY: build run release clean debug test test-crossnode test-disk java-test java-deadlock-probe python-api-test node-api-test linux-maturity-test jtreg-prepare jtreg-java-base jtreg-java-lang jtreg-java-deadlock userland-env-test
+# This Makefile builds and boots the dormant Stage-1 kernel (`tos`) at the
+# repository root under QEMU/UEFI. It is not the current project: webTOS is the
+# browser x86-64 runtime under `crates/`, built with cargo from that directory
+# and with `web/build.sh`. The pre-pivot kernel-validation targets (jtreg, the
+# phase runners, the API and cross-node harnesses) and their scripts were
+# removed; what remains here builds and boots the kernel itself.
+.PHONY: build run debug-build debug-run clean uefi-build uefi-run uefi-test uefi-img
 
 KERNEL_DEBUG = target/x86_64-unknown-tos/debug/tos
 KERNEL_RELEASE = target/x86_64-unknown-tos/release/tos
 KERNEL_ELF32 = target/tos_32.elf
 QEMU_MEMORY ?= 1024M
-TEST_DISK ?= /tmp/tos_test.img
 
 build:
 	cargo build --release
@@ -20,50 +25,6 @@ debug-run: debug-build
 	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_DEBUG) $(KERNEL_ELF32)
 	qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) -no-reboot -no-shutdown -s -S &
 	@echo "GDB: target remote :1234"
-
-test-disk:
-	./tools/create_test_disk.sh "$(TEST_DISK)"
-
-test: build test-disk
-	@echo "Running single-node test..."
-	objcopy -I elf64-x86-64 -O elf32-i386 $(KERNEL_RELEASE) $(KERNEL_ELF32)
-	timeout 8 qemu-system-x86_64 -m $(QEMU_MEMORY) -serial stdio -display none -kernel $(KERNEL_ELF32) \
-		-device virtio-net-pci,netdev=n0 -netdev user,id=n0 \
-		-drive file=$(TEST_DISK),format=raw,if=ide \
-		-no-reboot -no-shutdown 2>&1 | head -50
-
-test-crossnode:
-	./tools/test_crossnode.sh
-
-java-test:
-	./tools/java_runtime_validation.sh
-
-java-deadlock-probe:
-	./tools/java_deadlock_probe.sh
-
-python-api-test:
-	./tools/python_api_validation.sh
-
-node-api-test:
-	./tools/node_api_validation.sh
-
-linux-maturity-test:
-	./tools/linux_maturity_validation.sh
-
-jtreg-prepare:
-	./tools/prepare_jtreg_assets.sh
-
-jtreg-java-base:
-	./tools/jtreg_java_base_smoke.sh
-
-jtreg-java-lang:
-	./tools/jtreg_java_lang.sh
-
-jtreg-java-deadlock:
-	./tools/jtreg_java_deadlock.sh
-
-userland-env-test:
-	./tools/userland_env_validation.sh
 
 # ─── UEFI targets ─────────────────────────────────────────────
 OVMF = /usr/share/ovmf/OVMF.fd
