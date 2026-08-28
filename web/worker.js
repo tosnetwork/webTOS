@@ -850,6 +850,15 @@ self.onmessage = async (event) => {
           : "cpu budget cleared",
       });
     }
+    // The page noticed it was away — `document.visibilitychange` and a wall
+    // clock are how a host knows. Without telling the guest, it comes back
+    // believing no time passed.
+    if (msg.type === "skipTime") {
+      if (exports.wtw_skip_time_ms(Math.max(0, Math.round(msg.ms ?? 0))) !== 0) {
+        throw new Error(`skip time: ${lastError()}`);
+      }
+      postMessage({ type: "status", text: `${Math.round((msg.ms ?? 0) / 1000)}s of real time skipped` });
+    }
     if (msg.type === "eventLogBudget") {
       if (exports.wtw_set_event_log_budget(Math.round(msg.events ?? 0)) !== 0) {
         throw new Error(`event log budget: ${lastError()}`);

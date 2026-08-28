@@ -1279,6 +1279,26 @@ impl Machine {
         self.env().net_meter.borrow().headroom()
     }
 
+    /// Records that `nanos` of real time passed while nothing ran.
+    ///
+    /// A browser suspends a background tab: the worker stops being scheduled,
+    /// and when it comes back, minutes have gone by outside. Nothing in a
+    /// deterministic clock notices that on its own — this machine's time is
+    /// retired instructions plus the idle warp, and neither moves while the
+    /// host is not calling `run`. Without a way to say so, a resumed guest
+    /// believes no time passed: its timers are still pending, its timeouts
+    /// have not expired, and its idea of now disagrees with every peer it
+    /// talks to.
+    ///
+    /// Both clocks move, because both move on a real machine whose process
+    /// merely was not scheduled. Timers armed for a moment now past fire on
+    /// the next run, and a periodic one reports how many periods it missed
+    /// rather than firing once for each of them.
+    pub fn skip_time(&mut self, nanos: u64) {
+        let env = self.env();
+        env.warp_nanos = env.warp_nanos.saturating_add(nanos);
+    }
+
     /// Raises or lowers the guest's physical-memory cap, in mebibytes. The
     /// default is 1 GiB; a large runtime forking under load needs more, and a
     /// browser tab may have less to give. Returns false when the guest has

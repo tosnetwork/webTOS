@@ -870,6 +870,24 @@ pub extern "C" fn wtw_memory_headroom_kib() -> i32 {
 /// writes — past the cap a guest write fails with `ENOSPC` instead of
 /// growing the tab's memory until it dies. The cap covers the whole
 /// filesystem, images included, so set it above what was loaded.
+/// Records that `ms` of real time passed while nothing ran.
+///
+/// A browser stops scheduling a background tab. This machine's clock is
+/// retired instructions plus an idle warp, and neither moves while the host
+/// is not calling `wtw_run` — so without this a resumed guest believes no
+/// time passed, with its timers still pending and its idea of now
+/// disagreeing with every peer it talks to.
+#[no_mangle]
+pub extern "C" fn wtw_skip_time_ms(ms: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_skip_time_ms called before wtw_init");
+        };
+        machine.skip_time((ms as u64).saturating_mul(1_000_000));
+        0
+    })
+}
+
 /// Caps the instructions the workload may retire, in thousands; 0 clears it.
 ///
 /// Thousands because a `u32` of instructions is about two seconds of guest

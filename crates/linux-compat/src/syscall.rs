@@ -3980,10 +3980,17 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                 let mut inner = timer.borrow_mut();
                 match inner.next_expiry {
                     Some(expiry) if now >= expiry => {
+                        // How many periods went by while nothing read this.
+                        // Across a suspended tab that is a large number, and
+                        // the interval is the guest's own — so the next
+                        // expiry is computed with arithmetic that cannot
+                        // wrap. A wrapped one lands in the past and the timer
+                        // fires forever.
                         match (now - expiry).checked_div(inner.interval) {
                             Some(periods) => {
-                                let n = 1 + periods;
-                                inner.next_expiry = Some(expiry + n * inner.interval);
+                                let n = periods.saturating_add(1);
+                                inner.next_expiry =
+                                    Some(expiry.saturating_add(n.saturating_mul(inner.interval)));
                                 n
                             }
                             None => {
