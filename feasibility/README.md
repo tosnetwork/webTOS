@@ -82,3 +82,55 @@ The next step is a scoped p-code→wasm translator for the hot-block subset the
 profiler already identifies, gated the only honest way: a hot block run
 through the JIT must produce the interpreter's result bit for bit — which is
 exactly the "optimized and interpreter modes pass the same trace suite" gate.
+
+## How the field does it
+
+We are not the first to run x86 in a browser. What the leading systems do
+confirms the approach above and adds three constraints the prototype did not
+hit.
+
+### WebVM / CheerpX (proprietary)
+
+WebVM's engine is CheerpX (Leaning Technologies). Its core is exactly
+"translate to WebAssembly": a tiered engine that interprets cold code and
+JIT-compiles hot code to wasm modules generated at runtime — the "interpret
+cold, JIT hot" shape we already have the first half of (tiered lifting).
+Proprietary, so no code to reuse, but the architecture is described publicly.
+
+### v86 (open source)
+
+copy.sh's v86 is an open x86 emulator with a JIT that emits wasm modules for
+hot loops — a readable reference for the runtime-wasm-generation mechanism
+CheerpX does not expose.
+
+### Constraints their experience adds
+
+- **Compile regions, not single blocks.** Each generated wasm module costs a
+  fixed instantiate (0.29 ms measured). One-module-per-block does not amortize
+  it; CheerpX and v86 compile a larger region — a function or a hot loop nest —
+  into one module.
+- **Synchronous main-thread compilation is size-limited.** `new
+  WebAssembly.Module` (sync) is capped on the browser main thread to avoid
+  jank. The 100-byte prototype cleared it; a real region will not. Real JITs
+  use `WebAssembly.compile` (async, off the main thread or in a worker), keep
+  interpreting while it compiles, and swap the compiled region in when ready.
+- **Self-modifying code invalidates compiled regions** — the same problem as
+  our `SelfModifyingCode` flush, which we already handle for the lift cache.
+
+### Where we differ, and where it helps
+
+CheerpX and v86 translate x86 directly to wasm. We already lift to p-code — a
+clean typed IR (the 72-op enum), closer to wasm's semantics than raw x86. The
+decode, prefix, and addressing complexity SLEIGH already digested is
+complexity a p-code→wasm translator does not re-solve, so our JIT may be
+simpler than theirs: it walks regular p-code, not x86.
+
+### The refined architecture
+
+The prototype's direction — interpret cold, JIT hot blocks to wasm, share the
+guest memory, verify against the interpreter with the trace-suite gate —
+matches the field. The engineering to add, learned from theirs:
+
+1. Compile a hot *region*, not a single block, to amortize instantiation.
+2. Compile asynchronously; keep interpreting; swap in when ready.
+3. Translate from p-code, not x86 — our advantage over CheerpX and v86.
