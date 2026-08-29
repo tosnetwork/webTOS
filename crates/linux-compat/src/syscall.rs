@@ -2964,7 +2964,7 @@ fn sys_prlimit64(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> SysRe
 
 // ── Processes, threads, and scheduling (milestone 4) ────────────────────────
 
-use crate::proc::{ParkState, ParkedTask, Process, Zombie, ROOT_PID};
+use crate::proc::{ParkState, ParkedTask, Process, SignalFrame, Zombie, ROOT_PID};
 
 /// `syscall` encodes as `0f 05`; rewinding NEXT_PC by its length makes the
 /// guest re-execute the instruction, giving blocking syscalls restart
@@ -3964,12 +3964,35 @@ fn sys_sigaltstack(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> Sys
     Ok(0)
 }
 
-/// handler, saving the interrupted state so `rt_sigreturn` can resume it. The
+const RT_UCONTEXT_SIZE: usize = 304;
+const RT_SIGINFO_SIZE: usize = 128;
+const RT_SIGFRAME_FIXED_SIZE: usize = 8 + RT_UCONTEXT_SIZE + RT_SIGINFO_SIZE;
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+const UC_FP_XSTATE: u64 = 1;
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed signal-frame field"),
+    )
+}
+
+fn user_canonical(address: u64) -> bool {
+    address < 0x0000_8000_0000_0000
+}
+
+/// Enter a handler with a Linux-compatible, guest-visible `rt_sigframe`. The
 /// interrupted syscall was parked to resume (blocking waits pre-set their
 /// return value), so after the handler returns the wait is re-evaluated and,
 /// if still not satisfied, simply re-parks. Returns false without consuming
 /// anything when the lowest deliverable signal calls for the default fatal
-/// action instead of a handler; the syscall boundary carries that out.
+/// action instead of a handler, or when the frame cannot be built.
 fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     // Only unblocked signals are deliverable; a signal raised while its
     // handler runs (the handler's own mask blocks it) stays pending until
@@ -4008,23 +4031,6 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         signal: sig,
     });
 
-    // Save the interrupted state and current mask for rt_sigreturn, which
-    // restores from this snapshot rather than parsing the stack frame.
-    env.proc.signal_saved.push(cpu.snapshot());
-    env.proc.signal_saved_mask.push(env.proc.sigmask);
-    // Block the delivered signal (unless SA_NODEFER) plus the handler's mask
-    // while it runs.
-    const SA_NODEFER: u64 = 0x4000_0000;
-    if flags & SA_NODEFER == 0 {
-        env.proc.sigmask |= bit;
-    }
-    env.proc.sigmask |= sa_mask;
-
-    // Build a minimal signal frame. A real handler gets (signo, &siginfo,
-    // &ucontext); tokio's SIGCHLD handler only writes a wakeup byte and
-    // ignores the latter two, so zeroed structures suffice. The handler
-    // returns into `restorer`, whose `rt_sigreturn` we service.
-    //
     // Which stack it goes on is the point of `SA_ONSTACK`: a handler asking
     // for it gets the alternate stack, from its top, because the stack it
     // interrupted may be the thing that faulted. Already running on the
@@ -4033,42 +4039,152 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     const SA_ONSTACK: u64 = 0x0800_0000;
     let interrupted_sp: u64 = cpu.read_var(env.regs.rsp);
     let on_alt = flags & SA_ONSTACK != 0 && env.proc.altstack.is_some();
-    let mut sp = match (on_alt, env.proc.altstack_depth, env.proc.altstack) {
+    let mut stack_top = match (on_alt, env.proc.altstack_depth, env.proc.altstack) {
         (true, 0, Some((base, size))) => base.saturating_add(size),
         _ => interrupted_sp,
     };
     // The red zone belongs to the interrupted frame; the alternate stack has
     // no frame below its top, so there is nothing to skip there.
     if !on_alt || env.proc.altstack_depth > 0 {
-        sp = sp.saturating_sub(128);
+        stack_top = stack_top.saturating_sub(128);
     }
-    sp = sp.saturating_sub(128);
-    let siginfo_ptr = sp;
-    let mut siginfo = [0_u8; 128];
-    siginfo[0..4].copy_from_slice(&(sig as u32).to_le_bytes()); // si_signo
-    let _ = write_mem(env, cpu, siginfo_ptr, &siginfo);
-    sp = sp.saturating_sub(256);
-    let ucontext_ptr = sp;
-    let _ = write_mem(env, cpu, ucontext_ptr, &[0_u8; 256]);
-    // The ABI wants (rsp + 8) % 16 == 0 at handler entry: align to 16 then push
-    // the 8-byte return address.
-    sp &= !15_u64;
-    sp = sp.saturating_sub(8);
-    if write_mem(env, cpu, sp, &restorer.to_le_bytes()).is_err() {
-        // Cannot set up the frame; abandon delivery and leave the saved state
-        // to be discarded on the next rt_sigreturn-less resume.
-        env.proc.signal_saved.pop();
-        env.proc.sigmask = env.proc.signal_saved_mask.pop().unwrap_or(env.proc.sigmask);
+
+    let Some(mut xstate) = icicle_cpu::exec::helpers::x86::standard_xstate_image(cpu, true) else {
+        env.proc.pending_signals |= bit;
+        return false;
+    };
+    let xstate_size = xstate.len();
+    let extended_size = xstate_size + 4;
+    xstate[464..468].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+    xstate[468..472].copy_from_slice(&(extended_size as u32).to_le_bytes());
+    xstate[472..480].copy_from_slice(&icicle_cpu::exec::helpers::x86::INITIAL_XCR0.to_le_bytes());
+    xstate[480..484].copy_from_slice(&(xstate_size as u32).to_le_bytes());
+
+    let Some(fpstate_ptr) = stack_top
+        .checked_sub(extended_size as u64)
+        .map(|value| value & !63)
+    else {
+        env.proc.pending_signals |= bit;
+        return false;
+    };
+    let Some(frame_limit) = fpstate_ptr.checked_sub(RT_SIGFRAME_FIXED_SIZE as u64) else {
+        env.proc.pending_signals |= bit;
+        return false;
+    };
+    // At handler entry `(rsp + 8) % 16 == 0`; the first word is the restorer
+    // return address and the fixed Linux rt_sigframe follows it.
+    let Some(frame_base) = frame_limit.checked_sub(8).map(|value| (value & !15) + 8) else {
+        env.proc.pending_signals |= bit;
+        return false;
+    };
+    let ucontext_ptr = frame_base + 8;
+    let siginfo_ptr = ucontext_ptr + RT_UCONTEXT_SIZE as u64;
+
+    let frame_end = match fpstate_ptr.checked_add(extended_size as u64) {
+        Some(value) => value,
+        None => {
+            env.proc.pending_signals |= bit;
+            return false;
+        }
+    };
+    let frame_len = (frame_end - frame_base) as usize;
+    if host_touch(
+        env,
+        cpu,
+        frame_base,
+        frame_len,
+        crate::pager::AccessKind::Write,
+    )
+    .is_err()
+    {
+        env.proc.pending_signals |= bit;
         return false;
     }
-    // Counted after the frame is written, so a delivery that failed to set up
-    // does not leave the process believing it is on the alternate stack.
+
+    let mut fixed = vec![0_u8; RT_SIGFRAME_FIXED_SIZE];
+    fixed[..8].copy_from_slice(&restorer.to_le_bytes());
+    let uc = &mut fixed[8..8 + RT_UCONTEXT_SIZE];
+    put_u64(uc, 0, UC_FP_XSTATE);
+    if let Some((base, size)) = env.proc.altstack {
+        put_u64(uc, 16, base);
+        uc[24..28].copy_from_slice(
+            &(if env.proc.altstack_depth > 0 {
+                SS_ONSTACK
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
+        put_u64(uc, 32, size);
+    }
+
+    let csgsfs = u64::from(cpu.read_var::<u16>(env.regs.cs))
+        | (u64::from(cpu.read_var::<u16>(env.regs.gs)) << 16)
+        | (u64::from(cpu.read_var::<u16>(env.regs.fs)) << 32)
+        | (u64::from(cpu.read_var::<u16>(env.regs.ss)) << 48);
+    let gregs = [
+        cpu.read_var::<u64>(env.regs.r8),
+        cpu.read_var::<u64>(env.regs.r9),
+        cpu.read_var::<u64>(env.regs.r10),
+        cpu.read_var::<u64>(env.regs.r11),
+        cpu.read_var::<u64>(env.regs.r12),
+        cpu.read_var::<u64>(env.regs.r13),
+        cpu.read_var::<u64>(env.regs.r14),
+        cpu.read_var::<u64>(env.regs.r15),
+        cpu.read_var::<u64>(env.regs.rdi),
+        cpu.read_var::<u64>(env.regs.rsi),
+        cpu.read_var::<u64>(env.regs.rbp),
+        cpu.read_var::<u64>(env.regs.rbx),
+        cpu.read_var::<u64>(env.regs.rdx),
+        cpu.read_var::<u64>(env.regs.rax),
+        cpu.read_var::<u64>(env.regs.rcx),
+        interrupted_sp,
+        cpu.read_pc(),
+        cpu.read_var::<u64>(env.regs.rflags),
+        csgsfs,
+        0,
+        0,
+        env.proc.sigmask,
+        0,
+    ];
+    for (index, value) in gregs.into_iter().enumerate() {
+        put_u64(uc, 40 + index * 8, value);
+    }
+    put_u64(uc, 224, fpstate_ptr);
+    put_u64(uc, 296, env.proc.sigmask);
+
+    let mut siginfo = [0_u8; RT_SIGINFO_SIZE];
+    siginfo[0..4].copy_from_slice(&(sig as u32).to_le_bytes()); // si_signo
+    fixed[8 + RT_UCONTEXT_SIZE..].copy_from_slice(&siginfo);
+
+    if write_mem_raw(cpu, frame_base, &fixed).is_err()
+        || write_mem_raw(cpu, fpstate_ptr, &xstate).is_err()
+        || write_mem_raw(
+            cpu,
+            fpstate_ptr + xstate_size as u64,
+            &FP_XSTATE_MAGIC2.to_le_bytes(),
+        )
+        .is_err()
+    {
+        env.proc.pending_signals |= bit;
+        return false;
+    }
+
+    env.proc.signal_frames.push(SignalFrame {
+        frame_base,
+        fpstate: fpstate_ptr,
+        on_alt,
+    });
     if on_alt {
         env.proc.altstack_depth += 1;
     }
-    env.proc.altstack_frames.push(on_alt);
+    const SA_NODEFER: u64 = 0x4000_0000;
+    if flags & SA_NODEFER == 0 {
+        env.proc.sigmask |= bit;
+    }
+    env.proc.sigmask |= sa_mask;
 
-    cpu.write_var(env.regs.rsp, sp);
+    cpu.write_var(env.regs.rsp, frame_base);
     cpu.write_var(env.regs.rdi, sig);
     cpu.write_var(env.regs.rsi, siginfo_ptr);
     cpu.write_var(env.regs.rdx, ucontext_ptr);
@@ -4080,38 +4196,138 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     true
 }
 
-/// `rt_sigreturn`: restore the state saved when the current handler was
-/// entered. The restored snapshot carries the interrupted syscall's resume
-/// point, so execution continues exactly where the signal interrupted it.
+fn bad_sigreturn(env: &mut LinuxEnv, cpu: &mut Cpu, why: &str) -> Outcome {
+    tracing::debug!("[{}] invalid rt_sigreturn frame: {why}", env.proc.pid);
+    task_exit(env, cpu, 11, true)
+}
+
+/// `rt_sigreturn`: validate and restore the guest-visible frame. GPR, signal
+/// mask and complete user xstate edits made by the handler are authoritative;
+/// malformed pointers, sizes, selectors, reserved xstate or MXCSR bits fail
+/// closed as a Linux bad frame rather than partially restoring state.
 fn sys_rt_sigreturn(env: &mut LinuxEnv, cpu: &mut Cpu) -> Outcome {
-    match (
-        env.proc.signal_saved.pop(),
-        env.proc.signal_saved_mask.pop(),
-    ) {
-        (Some(snapshot), Some(mask)) => {
-            // Leaving the handler leaves the stack it ran on.
-            if env.proc.altstack_frames.pop() == Some(true) {
-                env.proc.altstack_depth = env.proc.altstack_depth.saturating_sub(1);
-            }
-            // The instruction counter is global and must not rewind.
-            let icount = cpu.icount;
-            cpu.restore(&snapshot);
-            cpu.icount = icount;
-            env.proc.sigmask = mask;
-            // Restoring the mask may make a signal that arrived during the
-            // handler deliverable; enter its handler now (bounded nesting:
-            // each level blocks its own signal).
-            if env.proc.pending_signals & !env.proc.sigmask != 0 {
-                deliver_signal(env, cpu);
-            }
-            // The CPU now holds the fully restored pre-signal state (including
-            // its resume exception); do not touch RAX.
+    let Some(frame) = env.proc.signal_frames.last().copied() else {
+        return bad_sigreturn(env, cpu, "no active frame");
+    };
+    let rsp = cpu.read_var::<u64>(env.regs.rsp);
+    if rsp.checked_sub(8) != Some(frame.frame_base) {
+        return bad_sigreturn(
+            env,
+            cpu,
+            "stack pointer does not identify the innermost frame",
+        );
+    }
+    let fixed = match read_mem(env, cpu, frame.frame_base, RT_SIGFRAME_FIXED_SIZE) {
+        Ok(bytes) => bytes,
+        Err(_) => return bad_sigreturn(env, cpu, "fixed frame is unreadable"),
+    };
+    let uc = &fixed[8..8 + RT_UCONTEXT_SIZE];
+    if get_u64(uc, 224) != frame.fpstate || frame.fpstate & 63 != 0 {
+        return bad_sigreturn(env, cpu, "fpstate pointer changed or is misaligned");
+    }
+    let metadata = match read_mem(env, cpu, frame.fpstate + 464, 20) {
+        Ok(bytes) => bytes,
+        Err(_) => return bad_sigreturn(env, cpu, "xstate metadata is unreadable"),
+    };
+    let magic1 = u32::from_le_bytes(metadata[0..4].try_into().unwrap());
+    let extended_size = u32::from_le_bytes(metadata[4..8].try_into().unwrap()) as usize;
+    let layout_features = u64::from_le_bytes(metadata[8..16].try_into().unwrap());
+    let xstate_size = u32::from_le_bytes(metadata[16..20].try_into().unwrap()) as usize;
+    let expected_xstate_size = icicle_cpu::exec::helpers::x86::STANDARD_XSTATE_SIZE;
+    if magic1 != FP_XSTATE_MAGIC1
+        || xstate_size != expected_xstate_size
+        || extended_size != expected_xstate_size + 4
+        || layout_features != icicle_cpu::exec::helpers::x86::INITIAL_XCR0
+    {
+        return bad_sigreturn(env, cpu, "xstate metadata does not match the active layout");
+    }
+    let xstate = match read_mem(env, cpu, frame.fpstate, xstate_size) {
+        Ok(bytes) => bytes,
+        Err(_) => return bad_sigreturn(env, cpu, "xstate image is unreadable"),
+    };
+    let trailer = match read_mem(env, cpu, frame.fpstate + xstate_size as u64, 4) {
+        Ok(bytes) => bytes,
+        Err(_) => return bad_sigreturn(env, cpu, "xstate trailer is unreadable"),
+    };
+    if u32::from_le_bytes(trailer.try_into().unwrap()) != FP_XSTATE_MAGIC2 {
+        return bad_sigreturn(env, cpu, "xstate trailer is invalid");
+    }
+
+    let rip = get_u64(uc, 40 + 16 * 8);
+    let restored_rsp = get_u64(uc, 40 + 15 * 8);
+    if !user_canonical(rip) || !user_canonical(restored_rsp) {
+        return bad_sigreturn(env, cpu, "non-canonical user RIP or RSP");
+    }
+    let csgsfs = get_u64(uc, 40 + 18 * 8);
+    let current_csgsfs = u64::from(cpu.read_var::<u16>(env.regs.cs))
+        | (u64::from(cpu.read_var::<u16>(env.regs.gs)) << 16)
+        | (u64::from(cpu.read_var::<u16>(env.regs.fs)) << 32)
+        | (u64::from(cpu.read_var::<u16>(env.regs.ss)) << 48);
+    if csgsfs != current_csgsfs {
+        return bad_sigreturn(env, cpu, "segment selectors changed");
+    }
+
+    if icicle_cpu::exec::helpers::x86::restore_standard_xstate_image(cpu, &xstate, true).is_none() {
+        return bad_sigreturn(env, cpu, "xstate validation failed");
+    }
+
+    let restored = [
+        (env.regs.r8, 0),
+        (env.regs.r9, 1),
+        (env.regs.r10, 2),
+        (env.regs.r11, 3),
+        (env.regs.r12, 4),
+        (env.regs.r13, 5),
+        (env.regs.r14, 6),
+        (env.regs.r15, 7),
+        (env.regs.rdi, 8),
+        (env.regs.rsi, 9),
+        (env.regs.rbp, 10),
+        (env.regs.rbx, 11),
+        (env.regs.rdx, 12),
+        (env.regs.rax, 13),
+        (env.regs.rcx, 14),
+        (env.regs.rsp, 15),
+    ];
+    for (register, index) in restored {
+        cpu.write_var(register, get_u64(uc, 40 + index * 8));
+    }
+    const USER_RFLAGS: u64 = (1 << 0)
+        | (1 << 2)
+        | (1 << 4)
+        | (1 << 6)
+        | (1 << 7)
+        | (1 << 8)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 16)
+        | (1 << 18);
+    let current_flags = cpu.read_var::<u64>(env.regs.rflags);
+    let requested_flags = get_u64(uc, 40 + 17 * 8);
+    cpu.write_var(
+        env.regs.rflags,
+        (current_flags & !USER_RFLAGS) | (requested_flags & USER_RFLAGS) | 2,
+    );
+    cpu.write_pc(rip);
+    const UNBLOCKABLE: u64 = (1 << (9 - 1)) | (1 << (19 - 1));
+    env.proc.sigmask = get_u64(uc, 296) & !UNBLOCKABLE;
+    env.proc.signal_frames.pop();
+    if frame.on_alt {
+        env.proc.altstack_depth = env.proc.altstack_depth.saturating_sub(1);
+    }
+    cpu.exception = Exception::new(ExceptionCode::ExternalAddr, rip);
+    cpu.pending_exception = None;
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
+
+    match pending_signal_action(env) {
+        SignalExitAction::Terminate(sig) => task_exit(env, cpu, sig as i32, true),
+        SignalExitAction::Stop(sig) => stop_thread_group(env, cpu, sig, false),
+        SignalExitAction::Handler => {
+            deliver_signal(env, cpu);
             Outcome::Switched
         }
-        _ => {
-            // No handler frame outstanding: nothing to return from.
-            Outcome::Ret(Ok(0))
-        }
+        SignalExitAction::None => Outcome::Switched,
     }
 }
 
@@ -4320,6 +4536,9 @@ fn sys_execve(
     env.proc.argv = argv;
     env.proc.envp = envp;
     env.proc.sigactions.borrow_mut().clear();
+    env.proc.signal_frames.clear();
+    env.proc.altstack = None;
+    env.proc.altstack_depth = 0;
     // The new image releases a suspended vfork parent.
     if let Some(done) = env.proc.vfork_done.take() {
         done.set(true);

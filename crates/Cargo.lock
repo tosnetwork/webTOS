@@ -872,6 +872,7 @@ dependencies = [
  "icicle-cpu",
  "icicle-mem",
  "jit-wasmi",
+ "libc",
  "object 0.38.1",
  "pcode",
  "sleigh-compile",

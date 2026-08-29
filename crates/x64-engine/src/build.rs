@@ -167,6 +167,18 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         .sleigh
         .get_varnode("XCR0")
         .ok_or(BuildError::MissingVarnode("XCR0"))?;
+    let reg_fcw = spec
+        .sleigh
+        .get_varnode("FPUControlWord")
+        .ok_or(BuildError::MissingVarnode("FPUControlWord"))?;
+    let reg_ftw = spec
+        .sleigh
+        .get_varnode("FPUTagWord")
+        .ok_or(BuildError::MissingVarnode("FPUTagWord"))?;
+    let reg_mxcsr = spec
+        .sleigh
+        .get_varnode("MXCSR")
+        .ok_or(BuildError::MissingVarnode("MXCSR"))?;
 
     let temporaries = TEMPORARY_VARNODES
         .iter()
@@ -187,7 +199,12 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         reg_sp: spec.sp,
         reg_isa_mode,
         isa_mode_context: vec![spec.initial_ctx],
-        reg_init: vec![(reg_xcr0, helpers::x86::INITIAL_XCR0.into())],
+        reg_init: vec![
+            (reg_xcr0, helpers::x86::INITIAL_XCR0.into()),
+            (reg_fcw, 0x037f),
+            (reg_ftw, 0xffff),
+            (reg_mxcsr, 0x1f80),
+        ],
         temporaries,
         calling_cov: CallCov {
             integers: spec.int_args,

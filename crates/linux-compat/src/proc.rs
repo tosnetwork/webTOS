@@ -26,6 +26,17 @@ use crate::SigAction;
 
 pub const ROOT_PID: u64 = 1000;
 
+/// Host-side nesting metadata for one guest-visible `rt_sigframe`.
+/// Architectural state and the saved mask live only in guest memory; these
+/// addresses prevent an unrelated `rt_sigreturn` from consuming another
+/// frame and let alternate-stack nesting unwind deterministically.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalFrame {
+    pub frame_base: u64,
+    pub fpstate: u64,
+    pub on_alt: bool,
+}
+
 /// Per-process (or per-thread) state. This is everything a task owns
 /// besides its CPU registers and memory map.
 pub struct Process {
@@ -57,11 +68,10 @@ pub struct Process {
     /// holds signals that have a user handler and are unblocked for the
     /// thread, so a set bit means "deliverable now". Not inherited.
     pub pending_signals: u64,
-    /// Saved CPU state for each signal handler currently running on this
-    /// thread (innermost last), restored by `rt_sigreturn`. Paired with the
-    /// sigmask to reinstate when the handler returns.
-    pub signal_saved: Vec<Box<CpuSnapshot>>,
-    pub signal_saved_mask: Vec<u64>,
+    /// Guest-visible signal frames currently active on this thread,
+    /// innermost last. This stores nesting metadata, never hidden register or
+    /// xstate authority: `rt_sigreturn` restores those bytes from the frame.
+    pub signal_frames: Vec<SignalFrame>,
     /// The alternate signal stack, when one is registered: base and size.
     ///
     /// A runtime installs one so a handler has somewhere to run when the
@@ -73,10 +83,6 @@ pub struct Process {
     /// continues on the same stack rather than starting over at its top,
     /// which would overwrite the frame of the handler that was interrupted.
     pub altstack_depth: u32,
-    /// Whether each live handler frame is on the alternate stack, so leaving
-    /// one leaves the stack it actually ran on rather than the one the
-    /// innermost frame happened to use.
-    pub altstack_frames: Vec<bool>,
     pub exe_path: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
     pub envp: Vec<Vec<u8>>,
@@ -113,11 +119,9 @@ impl Process {
             sigactions: Rc::new(RefCell::new(HashMap::new())),
             sigmask: 0,
             pending_signals: 0,
-            signal_saved: Vec::new(),
-            signal_saved_mask: Vec::new(),
+            signal_frames: Vec::new(),
             altstack: None,
             altstack_depth: 0,
-            altstack_frames: Vec::new(),
             exe_path: Vec::new(),
             argv: Vec::new(),
             envp: Vec::new(),
@@ -145,14 +149,12 @@ impl Process {
             sigactions: Rc::new(RefCell::new(self.sigactions.borrow().clone())),
             sigmask: self.sigmask,
             pending_signals: 0,
-            signal_saved: Vec::new(),
-            signal_saved_mask: Vec::new(),
+            signal_frames: Vec::new(),
             // A fork inherits the registration; a new thread does not, since
             // the memory it names is the registering thread's stack and two
             // threads must not run handlers on one.
             altstack: self.altstack,
             altstack_depth: 0,
-            altstack_frames: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
@@ -181,14 +183,12 @@ impl Process {
             sigactions: Rc::clone(&self.sigactions),
             sigmask: self.sigmask,
             pending_signals: 0,
-            signal_saved: Vec::new(),
-            signal_saved_mask: Vec::new(),
+            signal_frames: Vec::new(),
             // A fork inherits the registration; a new thread does not, since
             // the memory it names is the registering thread's stack and two
             // threads must not run handlers on one.
             altstack: None,
             altstack_depth: 0,
-            altstack_frames: Vec::new(),
             exe_path: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),

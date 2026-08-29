@@ -451,6 +451,7 @@ pub mod x86 {
     }
 
     pub const INITIAL_XCR0: u64 = x86_profile::INITIAL_XCR0;
+    pub const STANDARD_XSTATE_SIZE: usize = x86_profile::XSAVE_AREA_SIZE as usize;
 
     fn xgetbv(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
         let selector: u32 = cpu.read(args[0]);
@@ -460,10 +461,7 @@ pub mod x86 {
             return;
         }
 
-        for (name, value) in [
-            ("RAX", INITIAL_XCR0 & 0xffff_ffff),
-            ("RDX", INITIAL_XCR0 >> 32),
-        ] {
+        for (name, value) in [("RAX", INITIAL_XCR0 & 0xffff_ffff), ("RDX", INITIAL_XCR0 >> 32)] {
             if let Some(var) = cpu.arch.sleigh.get_varnode(name) {
                 cpu.write_var(var, value);
             }
@@ -610,19 +608,41 @@ pub mod x86 {
     }
 
     fn write_guest(cpu: &mut Cpu, address: u64, bytes: &[u8]) -> Option<()> {
-        if let Err(error) = cpu.mem.write_bytes(address, bytes, icicle_mem::perm::WRITE) {
-            cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
-            cpu.exception.value = address;
-            return None;
+        // The MMU's bulk API reports only the error class after a potentially
+        // partial access. XSAVE-family faults must identify the first failing
+        // linear byte, so walk the small architectural image explicitly.
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            let Some(current) = address.checked_add(offset as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return None;
+            };
+            if let Err(error) = cpu.mem.write::<1>(current, [byte], icicle_mem::perm::WRITE) {
+                cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                cpu.exception.value = current;
+                return None;
+            }
         }
         Some(())
     }
 
     fn read_guest(cpu: &mut Cpu, address: u64, bytes: &mut [u8]) -> Option<()> {
-        if let Err(error) = cpu.mem.read_bytes(address, bytes, icicle_mem::perm::READ) {
-            cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
-            cpu.exception.value = address;
-            return None;
+        for (offset, byte) in bytes.iter_mut().enumerate() {
+            let Some(current) = address.checked_add(offset as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return None;
+            };
+            match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                Ok(value) => *byte = value[0],
+                Err(error) => {
+                    cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                    cpu.exception.value = current;
+                    return None;
+                }
+            }
         }
         Some(())
     }
@@ -663,19 +683,18 @@ pub mod x86 {
         full
     }
 
-    fn fxsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
-        let Some(address) = fx_address(cpu, address) else { return };
+    fn build_fx_image(cpu: &mut Cpu, mode64: bool) -> Option<[u8; 512]> {
         let mut image = [0_u8; 512];
 
-        let Some(fcw) = read_named::<u16>(cpu, "FPUControlWord") else { return };
-        let Some(fsw) = read_named::<u16>(cpu, "FPUStatusWord") else { return };
-        let Some(ftw) = read_named::<u16>(cpu, "FPUTagWord") else { return };
-        let Some(fop) = read_named::<u16>(cpu, "FPULastInstructionOpcode") else { return };
-        let Some(fip) = read_named::<u64>(cpu, "FPUInstructionPointer") else { return };
-        let Some(fdp) = read_named::<u64>(cpu, "FPUDataPointer") else { return };
-        let Some(fcs) = read_named::<u16>(cpu, "FPUPointerSelector") else { return };
-        let Some(fds) = read_named::<u16>(cpu, "FPUDataSelector") else { return };
-        let Some(mxcsr) = read_named::<u32>(cpu, "MXCSR") else { return };
+        let fcw = read_named::<u16>(cpu, "FPUControlWord")?;
+        let fsw = read_named::<u16>(cpu, "FPUStatusWord")?;
+        let ftw = read_named::<u16>(cpu, "FPUTagWord")?;
+        let fop = read_named::<u16>(cpu, "FPULastInstructionOpcode")?;
+        let fip = read_named::<u64>(cpu, "FPUInstructionPointer")?;
+        let fdp = read_named::<u64>(cpu, "FPUDataPointer")?;
+        let fcs = read_named::<u16>(cpu, "FPUPointerSelector")?;
+        let fds = read_named::<u16>(cpu, "FPUDataSelector")?;
+        let mxcsr = read_named::<u32>(cpu, "MXCSR")?;
 
         image[0..2].copy_from_slice(&fcw.to_le_bytes());
         image[2..4].copy_from_slice(&fsw.to_le_bytes());
@@ -695,38 +714,41 @@ pub mod x86 {
         image[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
 
         for index in 0..8 {
-            let Some(value) = read_named::<[u8; 10]>(cpu, &format!("ST{index}")) else { return };
+            let value = read_named::<[u8; 10]>(cpu, &format!("ST{index}"))?;
             let offset = 32 + index * 16;
             image[offset..offset + 10].copy_from_slice(&value);
         }
         for index in 0..16 {
-            let Some(value) = read_named::<[u8; 16]>(cpu, &format!("XMM{index}")) else { return };
+            let value = read_named::<[u8; 16]>(cpu, &format!("XMM{index}"))?;
             let offset = 160 + index * 16;
             image[offset..offset + 16].copy_from_slice(&value);
         }
-
-        if let Err(error) = cpu.mem.write_bytes(address, &image, icicle_mem::perm::WRITE) {
-            cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
-            cpu.exception.value = address;
-        }
+        Some(image)
     }
 
-    fn fxrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
-        let Some(address) = fx_address(cpu, address) else { return };
-        let mut image = [0_u8; 512];
-        if let Err(error) = cpu.mem.read_bytes(address, &mut image, icicle_mem::perm::READ) {
-            cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
-            cpu.exception.value = address;
+    fn fxsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = fx_address(cpu, address)
+        else {
             return;
-        }
+        };
+        let Some(image) = build_fx_image(cpu, mode64)
+        else {
+            return;
+        };
+        write_guest(cpu, address, &image);
+    }
 
+    fn validate_mxcsr(cpu: &mut Cpu, image: &[u8; 512]) -> Option<u32> {
         let mxcsr = u32::from_le_bytes(image[24..28].try_into().unwrap());
         if mxcsr & !MXCSR_MASK != 0 {
             cpu.exception.code = ExceptionCode::GeneralProtection as u32;
             cpu.exception.value = 0;
-            return;
+            return None;
         }
+        Some(mxcsr)
+    }
 
+    fn restore_x87(cpu: &mut Cpu, image: &[u8; 512], mode64: bool) -> Option<()> {
         let fcw = u16::from_le_bytes(image[0..2].try_into().unwrap());
         let fsw = u16::from_le_bytes(image[2..4].try_into().unwrap());
         let ftw = expanded_tag_word(image[4], &image);
@@ -748,63 +770,245 @@ pub mod x86 {
             )
         };
 
-        if write_named(cpu, "FPUControlWord", fcw).is_none()
-            || write_named(cpu, "FPUStatusWord", fsw).is_none()
-            || write_named(cpu, "FPUTagWord", ftw).is_none()
-            || write_named(cpu, "FPULastInstructionOpcode", fop).is_none()
-            || write_named(cpu, "FPUInstructionPointer", fip).is_none()
-            || write_named(cpu, "FPUDataPointer", fdp).is_none()
-            || write_named(cpu, "FPUPointerSelector", fcs).is_none()
-            || write_named(cpu, "FPUDataSelector", fds).is_none()
-            || write_named(cpu, "MXCSR", mxcsr).is_none()
-        {
-            return;
-        }
+        write_named(cpu, "FPUControlWord", fcw)?;
+        write_named(cpu, "FPUStatusWord", fsw)?;
+        write_named(cpu, "FPUTagWord", ftw)?;
+        write_named(cpu, "FPULastInstructionOpcode", fop)?;
+        write_named(cpu, "FPUInstructionPointer", fip)?;
+        write_named(cpu, "FPUDataPointer", fdp)?;
+        write_named(cpu, "FPUPointerSelector", fcs)?;
+        write_named(cpu, "FPUDataSelector", fds)?;
 
         for index in 0..8 {
             let offset = 32 + index * 16;
             let value: [u8; 10] = image[offset..offset + 10].try_into().unwrap();
-            if write_named(cpu, &format!("ST{index}"), value).is_none() { return }
+            write_named(cpu, &format!("ST{index}"), value)?;
         }
+        Some(())
+    }
+
+    fn initialize_x87(cpu: &mut Cpu) -> Option<()> {
+        write_named(cpu, "FPUControlWord", 0x037f_u16)?;
+        write_named(cpu, "FPUStatusWord", 0_u16)?;
+        write_named(cpu, "FPUTagWord", 0xffff_u16)?;
+        write_named(cpu, "FPULastInstructionOpcode", 0_u16)?;
+        write_named(cpu, "FPUInstructionPointer", 0_u64)?;
+        write_named(cpu, "FPUDataPointer", 0_u64)?;
+        write_named(cpu, "FPUPointerSelector", 0_u16)?;
+        write_named(cpu, "FPUDataSelector", 0_u16)?;
+        for index in 0..8 {
+            write_named(cpu, &format!("ST{index}"), [0_u8; 10])?;
+        }
+        Some(())
+    }
+
+    fn restore_sse(cpu: &mut Cpu, image: &[u8; 512]) -> Option<()> {
         for index in 0..16 {
             let offset = 160 + index * 16;
             let value: [u8; 16] = image[offset..offset + 16].try_into().unwrap();
-            if write_named(cpu, &format!("XMM{index}"), value).is_none() { return }
+            write_named(cpu, &format!("XMM{index}"), value)?;
         }
+        Some(())
     }
 
-    fn xsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
-        let Some(address) = xsave_address(cpu, address) else { return };
-        let Some(requested) = xstate_request(cpu) else { return };
+    fn initialize_sse(cpu: &mut Cpu) -> Option<()> {
+        for index in 0..16 {
+            write_named(cpu, &format!("XMM{index}"), [0_u8; 16])?;
+        }
+        Some(())
+    }
 
-        // The standard area's legacy region is byte-for-byte the FXSAVE
-        // image. Extended components below are emitted from the same table
-        // CPUID.0d reports.
-        fxsave_impl(cpu, Value::Const(address, 8), mode64);
-        if cpu.exception.code != ExceptionCode::None as u32 { return }
-
-        let mut header = [0_u8; x86_profile::XSAVE_HEADER_SIZE as usize];
-        header[0..8].copy_from_slice(&requested.to_le_bytes());
-        if write_guest(
-            cpu,
-            address + u64::from(x86_profile::XSAVE_LEGACY_SIZE),
-            &header,
-        )
-        .is_none()
+    fn fxrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = fx_address(cpu, address)
+        else {
+            return;
+        };
+        let mut image = [0_u8; 512];
+        if read_guest(cpu, address, &mut image).is_none() {
+            return;
+        }
+        let Some(mxcsr) = validate_mxcsr(cpu, &image)
+        else {
+            return;
+        };
+        if restore_x87(cpu, &image, mode64).is_none()
+            || write_named(cpu, "MXCSR", mxcsr).is_none()
+            || restore_sse(cpu, &image).is_none()
         {
             return;
         }
+    }
 
+    fn xstate_in_use(cpu: &mut Cpu) -> Option<u64> {
+        // Host-driven state transfer (notably Linux signal delivery) can run
+        // while the CPU still carries the syscall exception that entered the
+        // host. Only a new helper failure is relevant here.
+        let exception_before = cpu.exception.code;
+        let mut in_use = 0_u64;
+        if read_named::<u16>(cpu, "FPUControlWord")? != 0x037f
+            || read_named::<u16>(cpu, "FPUStatusWord")? != 0
+            || read_named::<u16>(cpu, "FPUTagWord")? != 0xffff
+            || read_named::<u16>(cpu, "FPULastInstructionOpcode")? != 0
+            || read_named::<u64>(cpu, "FPUInstructionPointer")? != 0
+            || read_named::<u64>(cpu, "FPUDataPointer")? != 0
+            || read_named::<u16>(cpu, "FPUPointerSelector")? != 0
+            || read_named::<u16>(cpu, "FPUDataSelector")? != 0
+            || (0..8).any(|index| {
+                read_named::<[u8; 10]>(cpu, &format!("ST{index}"))
+                    .is_some_and(|value| value != [0; 10])
+            })
+        {
+            in_use |= 1 << 0;
+        }
+        if (0..16).any(|index| {
+            read_named::<[u8; 16]>(cpu, &format!("XMM{index}"))
+                .is_some_and(|value| value != [0; 16])
+        }) {
+            in_use |= 1 << 1;
+        }
+        if (0..16).any(|index| {
+            named_slice(cpu, &format!("ZMM{index}"), 16, 16)
+                .is_some_and(|var| cpu.read_var::<[u8; 16]>(var) != [0; 16])
+        }) {
+            in_use |= 1 << 2;
+        }
+        if (0..8).any(|index| {
+            read_named::<u64>(cpu, &format!("K{index}")).is_some_and(|value| value != 0)
+        }) {
+            in_use |= 1 << 5;
+        }
+        if (0..16).any(|index| {
+            (0..2).any(|lane| {
+                named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
+                    .is_some_and(|var| cpu.read_var::<[u8; 16]>(var) != [0; 16])
+            })
+        }) {
+            in_use |= 1 << 6;
+        }
+        if (16..32).any(|index| {
+            (0..4).any(|lane| {
+                named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16)
+                    .is_some_and(|var| cpu.read_var::<[u8; 16]>(var) != [0; 16])
+            })
+        }) {
+            in_use |= 1 << 7;
+        }
+        if cpu.exception.code == exception_before { Some(in_use) } else { None }
+    }
+
+    /// Serialize the complete standard-format user xstate image used by the
+    /// Linux x86-64 signal ABI. The layout is the same table exposed through
+    /// CPUID leaf 0x0d and consumed by XSAVE/XRSTOR.
+    pub fn standard_xstate_image(cpu: &mut Cpu, mode64: bool) -> Option<Vec<u8>> {
+        let legacy = build_fx_image(cpu, mode64)?;
+        let present = xstate_in_use(cpu)? & INITIAL_XCR0;
+        let mut image = vec![0_u8; STANDARD_XSTATE_SIZE];
+        image[..legacy.len()].copy_from_slice(&legacy);
+        image[512..520].copy_from_slice(&present.to_le_bytes());
+
+        for index in 0..16 {
+            let ymm = named_slice(cpu, &format!("ZMM{index}"), 16, 16)?;
+            image[576 + index * 16..576 + (index + 1) * 16]
+                .copy_from_slice(&cpu.read_var::<[u8; 16]>(ymm));
+            for lane in 0..2 {
+                let zmm = named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)?;
+                let start = 1152 + index * 32 + usize::from(lane) * 16;
+                image[start..start + 16].copy_from_slice(&cpu.read_var::<[u8; 16]>(zmm));
+            }
+        }
+        for index in 0..8 {
+            let value = read_named::<u64>(cpu, &format!("K{index}"))?;
+            let start = 1088 + index * 8;
+            image[start..start + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for index in 16..32 {
+            for lane in 0..4 {
+                let zmm = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16)?;
+                let start = 1664 + (index - 16) * 64 + usize::from(lane) * 16;
+                image[start..start + 16].copy_from_slice(&cpu.read_var::<[u8; 16]>(zmm));
+            }
+        }
+        Some(image)
+    }
+
+    fn save_x87_component(cpu: &mut Cpu, address: u64, image: &[u8; 512]) -> Option<()> {
+        write_guest(cpu, address, &image[..24])?;
+        for index in 0..8 {
+            let offset = 32 + index * 16;
+            write_guest(cpu, address + offset as u64, &image[offset..offset + 10])?;
+        }
+        Some(())
+    }
+
+    fn save_sse_component(cpu: &mut Cpu, address: u64, image: &[u8; 512]) -> Option<()> {
+        for index in 0..16 {
+            let offset = 160 + index * 16;
+            write_guest(cpu, address + offset as u64, &image[offset..offset + 16])?;
+        }
+        Some(())
+    }
+
+    fn xsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = xsave_address(cpu, address)
+        else {
+            return;
+        };
+        let Some(requested) = xstate_request(cpu)
+        else {
+            return;
+        };
+        let Some(legacy) = build_fx_image(cpu, mode64)
+        else {
+            return;
+        };
+        let Some(in_use) = xstate_in_use(cpu)
+        else {
+            return;
+        };
+
+        // XSAVE updates only XSTATE_BV in the header. Bits for components not
+        // selected by RFBM and every reserved header byte remain untouched.
+        let header_address = address + u64::from(x86_profile::XSAVE_LEGACY_SIZE);
+        let mut old_bv = [0_u8; 8];
+        if read_guest(cpu, header_address, &mut old_bv).is_none() {
+            return;
+        }
+        let old_bv = u64::from_le_bytes(old_bv);
+        let updated_bv = (old_bv & !requested) | (in_use & requested);
+        if write_guest(cpu, header_address, &updated_bv.to_le_bytes()).is_none() {
+            return;
+        }
+
+        if requested & (1 << 0) != 0 && save_x87_component(cpu, address, &legacy).is_none() {
+            return;
+        }
+        // MXCSR and MXCSR_MASK are saved when either SSE or AVX is requested.
+        if requested & ((1 << 1) | (1 << 2)) != 0
+            && write_guest(cpu, address + 24, &legacy[24..32]).is_none()
+        {
+            return;
+        }
+        if requested & (1 << 1) != 0 && save_sse_component(cpu, address, &legacy).is_none() {
+            return;
+        }
         if requested & (1 << 2) != 0 {
             for index in 0..16 {
-                let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 16, 16) else { return };
+                let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 16, 16)
+                else {
+                    return;
+                };
                 let value = cpu.read_var::<[u8; 16]>(var);
-                if write_guest(cpu, address + 576 + index * 16, &value).is_none() { return }
+                if write_guest(cpu, address + 576 + index * 16, &value).is_none() {
+                    return;
+                }
             }
         }
         if requested & (1 << 5) != 0 {
             for index in 0..8 {
-                let Some(value) = read_named::<u64>(cpu, &format!("K{index}")) else { return };
+                let Some(value) = read_named::<u64>(cpu, &format!("K{index}"))
+                else {
+                    return;
+                };
                 if write_guest(cpu, address + 1088 + index * 8, &value.to_le_bytes()).is_none() {
                     return;
                 }
@@ -813,8 +1017,7 @@ pub mod x86 {
         if requested & (1 << 6) != 0 {
             for index in 0..16 {
                 for lane in 0..2 {
-                    let Some(var) =
-                        named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
+                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
                     else {
                         return;
                     };
@@ -830,7 +1033,8 @@ pub mod x86 {
         if requested & (1 << 7) != 0 {
             for index in 16..32 {
                 for lane in 0..4 {
-                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16) else {
+                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16)
+                    else {
                         return;
                     };
                     let value = cpu.read_var::<[u8; 16]>(var);
@@ -848,104 +1052,199 @@ pub mod x86 {
         }
     }
 
-    fn xrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
-        let Some(address) = xsave_address(cpu, address) else { return };
-        let Some(requested) = xstate_request(cpu) else { return };
-        let mut header = [0_u8; x86_profile::XSAVE_HEADER_SIZE as usize];
-        if read_guest(
-            cpu,
-            address + u64::from(x86_profile::XSAVE_LEGACY_SIZE),
-            &mut header,
-        )
-        .is_none()
-        {
-            return;
+    fn read_x87_component(cpu: &mut Cpu, address: u64, image: &mut [u8; 512]) -> Option<()> {
+        read_guest(cpu, address, &mut image[..24])?;
+        for index in 0..8 {
+            let offset = 32 + index * 16;
+            read_guest(cpu, address + offset as u64, &mut image[offset..offset + 10])?;
         }
+        Some(())
+    }
+
+    fn read_sse_component(cpu: &mut Cpu, address: u64, image: &mut [u8; 512]) -> Option<()> {
+        for index in 0..16 {
+            let offset = 160 + index * 16;
+            read_guest(cpu, address + offset as u64, &mut image[offset..offset + 16])?;
+        }
+        Some(())
+    }
+
+    fn validate_xstate_header(cpu: &mut Cpu, header: &[u8]) -> Option<u64> {
         let present = u64::from_le_bytes(header[0..8].try_into().unwrap());
-        let compacted = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        if present & !INITIAL_XCR0 != 0 || compacted != 0 {
+        if present & !INITIAL_XCR0 != 0 || header[8..].iter().any(|byte| *byte != 0) {
             cpu.exception.code = ExceptionCode::GeneralProtection as u32;
             cpu.exception.value = 0;
-            return;
+            return None;
         }
+        Some(present)
+    }
 
-        if requested & 0b11 != 0 {
-            fxrstor_impl(cpu, Value::Const(address, 8), mode64);
-            if cpu.exception.code != ExceptionCode::None as u32 { return }
+    fn apply_xstate_components(
+        cpu: &mut Cpu,
+        requested: u64,
+        present: u64,
+        legacy: &[u8; 512],
+        extended: &[u8],
+        mode64: bool,
+    ) -> Option<()> {
+        if requested & (1 << 0) != 0 {
+            if present & (1 << 0) != 0 {
+                restore_x87(cpu, legacy, mode64)?;
+            }
+            else {
+                initialize_x87(cpu)?;
+            }
         }
-
+        if requested & ((1 << 1) | (1 << 2)) != 0 {
+            let mxcsr = u32::from_le_bytes(legacy[24..28].try_into().unwrap());
+            write_named(cpu, "MXCSR", mxcsr)?;
+        }
+        if requested & (1 << 1) != 0 {
+            if present & (1 << 1) != 0 {
+                restore_sse(cpu, legacy)?;
+            }
+            else {
+                initialize_sse(cpu)?;
+            }
+        }
         for index in 0..16 {
             if requested & (1 << 2) != 0 {
-                let mut value = [0_u8; 16];
-                if present & (1 << 2) != 0
-                    && read_guest(cpu, address + 576 + index * 16, &mut value).is_none()
-                {
-                    return;
+                let start = 576 + index * 16;
+                let value: [u8; 16] = if present & (1 << 2) != 0 {
+                    extended[start..start + 16].try_into().unwrap()
                 }
-                let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 16, 16) else { return };
+                else {
+                    [0; 16]
+                };
+                let var = named_slice(cpu, &format!("ZMM{index}"), 16, 16)?;
                 cpu.write_var(var, value);
             }
             if requested & (1 << 6) != 0 {
                 for lane in 0..2 {
-                    let mut value = [0_u8; 16];
-                    if present & (1 << 6) != 0
-                        && read_guest(
-                            cpu,
-                            address + 1152 + index * 32 + u64::from(lane) * 16,
-                            &mut value,
-                        )
-                        .is_none()
-                    {
-                        return;
+                    let start = 1152 + index * 32 + lane as usize * 16;
+                    let value: [u8; 16] = if present & (1 << 6) != 0 {
+                        extended[start..start + 16].try_into().unwrap()
                     }
-                    let Some(var) =
-                        named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
                     else {
-                        return;
+                        [0; 16]
                     };
+                    let var = named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)?;
                     cpu.write_var(var, value);
                 }
             }
         }
         if requested & (1 << 5) != 0 {
             for index in 0..8 {
-                let mut bytes = [0_u8; 8];
-                if present & (1 << 5) != 0
-                    && read_guest(cpu, address + 1088 + index * 8, &mut bytes).is_none()
-                {
-                    return;
+                let start = 1088 + index * 8;
+                let value = if present & (1 << 5) != 0 {
+                    u64::from_le_bytes(extended[start..start + 8].try_into().unwrap())
                 }
-                if write_named(cpu, &format!("K{index}"), u64::from_le_bytes(bytes)).is_none() {
-                    return;
-                }
+                else {
+                    0
+                };
+                write_named(cpu, &format!("K{index}"), value)?;
             }
         }
         if requested & (1 << 7) != 0 {
             for index in 16..32 {
                 for lane in 0..4 {
-                    let mut value = [0_u8; 16];
-                    if present & (1 << 7) != 0
-                        && read_guest(
-                            cpu,
-                            address + 1664 + (index - 16) * 64 + u64::from(lane) * 16,
-                            &mut value,
-                        )
-                        .is_none()
-                    {
-                        return;
+                    let start = 1664 + (index - 16) as usize * 64 + lane as usize * 16;
+                    let value: [u8; 16] = if present & (1 << 7) != 0 {
+                        extended[start..start + 16].try_into().unwrap()
                     }
-                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16) else {
-                        return;
+                    else {
+                        [0; 16]
                     };
+                    let var = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16)?;
                     cpu.write_var(var, value);
                 }
             }
         }
+        Some(())
+    }
+
+    /// Validate and restore a complete standard-format user xstate image.
+    /// The caller must stage the bytes before calling so malformed input or a
+    /// guest-memory fault cannot partially update architectural state.
+    pub fn restore_standard_xstate_image(cpu: &mut Cpu, image: &[u8], mode64: bool) -> Option<()> {
+        if image.len() != STANDARD_XSTATE_SIZE {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = image.len() as u64;
+            return None;
+        }
+        let present = validate_xstate_header(cpu, &image[512..576])?;
+        let legacy: &[u8; 512] = image[..512].try_into().unwrap();
+        validate_mxcsr(cpu, legacy)?;
+        apply_xstate_components(cpu, INITIAL_XCR0, present, legacy, image, mode64)
+    }
+
+    fn xrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = xsave_address(cpu, address)
+        else {
+            return;
+        };
+        let Some(requested) = xstate_request(cpu)
+        else {
+            return;
+        };
+        let mut header = [0_u8; x86_profile::XSAVE_HEADER_SIZE as usize];
+        if read_guest(cpu, address + u64::from(x86_profile::XSAVE_LEGACY_SIZE), &mut header)
+            .is_none()
+        {
+            return;
+        }
+        let Some(present) = validate_xstate_header(cpu, &header)
+        else {
+            return;
+        };
+
+        // Stage every requested, present component before mutating registers.
+        // A memory fault therefore leaves the architectural register file at
+        // the restart RIP unchanged.
+        let mut legacy = [0_u8; 512];
+        if requested & ((1 << 1) | (1 << 2)) != 0 {
+            if read_guest(cpu, address + 24, &mut legacy[24..28]).is_none() {
+                return;
+            }
+            if validate_mxcsr(cpu, &legacy).is_none() {
+                return;
+            }
+        }
+        if requested & (1 << 0) != 0
+            && present & (1 << 0) != 0
+            && read_x87_component(cpu, address, &mut legacy).is_none()
+        {
+            return;
+        }
+        if requested & (1 << 1) != 0
+            && present & (1 << 1) != 0
+            && read_sse_component(cpu, address, &mut legacy).is_none()
+        {
+            return;
+        }
+
+        let mut extended = vec![0_u8; x86_profile::XSAVE_AREA_SIZE as usize];
+        for component in x86_profile::XSTATE_COMPONENTS {
+            let bit = 1_u64 << component.bit;
+            if requested & bit == 0 || present & bit == 0 {
+                continue;
+            }
+            let start = component.offset as usize;
+            let end = start + component.size as usize;
+            if read_guest(cpu, address + u64::from(component.offset), &mut extended[start..end])
+                .is_none()
+            {
+                return;
+            }
+        }
+
+        apply_xstate_components(cpu, requested, present, &legacy, &extended, mode64);
     }
 
     /// Extract Packed Double-Precision Floating-Point Sign Mask
     fn movmskpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(src) = xmm_bytes(cpu, args[1]) else {
+        let Some(src) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let src = u128::from_le_bytes(src);
@@ -958,7 +1257,8 @@ pub mod x86 {
     /// Extract the sign bit of each of the four packed single-precision floats
     /// into the low four bits of the destination register.
     fn movmskps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(src) = xmm_bytes(cpu, args[1]) else {
+        let Some(src) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let src = u128::from_le_bytes(src);
@@ -1050,7 +1350,8 @@ pub mod x86 {
         // `ceil`, and `trunc` all compile to this instruction, so rounding
         // every mode to nearest silently corrupts any program that indexes
         // with a floored value.
-        let Some(upper) = xmm_bytes(cpu, args[0]) else {
+        let Some(upper) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         // The scalar operand is a lane of a vector register, so a
@@ -1075,7 +1376,8 @@ pub mod x86 {
 
     fn roundss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // The f32 sibling of `roundsd`; same imm8-via-`cpu.args` contract.
-        let Some(upper) = xmm_bytes(cpu, args[0]) else {
+        let Some(upper) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         // The scalar operand is a lane of a vector register, so a
@@ -1102,7 +1404,8 @@ pub mod x86 {
         // Byte shuffle: for each byte, a control byte with the high bit set
         // yields zero, otherwise it selects a source byte by its low nibble
         // (within the same 128-bit lane; only 16-byte operands are used here).
-        let (Some(src), Some(ctrl)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(src), Some(ctrl)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1132,9 +1435,9 @@ pub mod x86 {
         Some(cpu.read::<u128>(v).to_le_bytes())
     }
 
-
     fn pmulhuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1147,7 +1450,8 @@ pub mod x86 {
     }
 
     fn pmulhw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1160,7 +1464,8 @@ pub mod x86 {
     }
 
     fn pmulld(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1173,18 +1478,16 @@ pub mod x86 {
     }
 
     fn pack_words(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
         for (half, src) in [a, b].into_iter().enumerate() {
             for i in 0..8 {
                 let w = i16::from_le_bytes([src[2 * i], src[2 * i + 1]]) as i32;
-                out[half * 8 + i] = if signed {
-                    w.clamp(-128, 127) as i8 as u8
-                } else {
-                    w.clamp(0, 255) as u8
-                };
+                out[half * 8 + i] =
+                    if signed { w.clamp(-128, 127) as i8 as u8 } else { w.clamp(0, 255) as u8 };
             }
         }
         write_xmm(cpu, dst, out);
@@ -1198,7 +1501,8 @@ pub mod x86 {
     }
 
     fn pack_dwords(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], signed: bool) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1207,7 +1511,8 @@ pub mod x86 {
                 let d = i32::from_le_bytes(src[4 * i..4 * i + 4].try_into().unwrap());
                 let w = if signed {
                     d.clamp(-32768, 32767) as i16 as u16
-                } else {
+                }
+                else {
                     d.clamp(0, 65535) as u16
                 };
                 out[half * 8 + 2 * i..half * 8 + 2 * i + 2].copy_from_slice(&w.to_le_bytes());
@@ -1250,11 +1555,7 @@ pub mod x86 {
         let count = simd_shift_count(cpu, args[1]);
         for i in (0..dst.size).step_by(2) {
             let w = cpu.read::<u16>(args[0].slice(i, 2)) as i16;
-            let r = if count >= 16 {
-                (w >> 15) as u16
-            } else {
-                (w >> count) as u16
-            };
+            let r = if count >= 16 { (w >> 15) as u16 } else { (w >> count) as u16 };
             cpu.write_var(dst.slice(i, 2), r);
         }
     }
@@ -1273,7 +1574,8 @@ pub mod x86 {
     }
 
     fn punpcklqdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1285,14 +1587,16 @@ pub mod x86 {
     /// pabs* take the source in the second operand; the first is the (unused)
     /// destination register the pcodeop is written with.
     fn pabsb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(s) = xmm_bytes(cpu, args[1]) else {
+        let Some(s) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let out: [u8; 16] = std::array::from_fn(|i| (s[i] as i8).unsigned_abs());
         write_xmm(cpu, dst, out);
     }
     fn pabsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(s) = xmm_bytes(cpu, args[1]) else {
+        let Some(s) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1303,7 +1607,8 @@ pub mod x86 {
         write_xmm(cpu, dst, out);
     }
     fn pabsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(s) = xmm_bytes(cpu, args[1]) else {
+        let Some(s) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1319,10 +1624,12 @@ pub mod x86 {
     // `(a OP b) ? a : b`.
 
     fn f64x2_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f64, f64) -> f64) {
-        let Some(a) = xmm_bytes(cpu, args[0]) else {
+        let Some(a) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(b) = xmm_bytes(cpu, args[1]) else {
+        let Some(b) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1335,10 +1642,12 @@ pub mod x86 {
     }
 
     fn f32x4_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f32, f32) -> f32) {
-        let Some(a) = xmm_bytes(cpu, args[0]) else {
+        let Some(a) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(b) = xmm_bytes(cpu, args[1]) else {
+        let Some(b) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1381,7 +1690,8 @@ pub mod x86 {
 
     fn pblendw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Third operand (imm8) arrives via the pcode arg slot.
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mask = cpu.args[0] as u8;
@@ -1395,7 +1705,8 @@ pub mod x86 {
 
     fn pblendvb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Third operand (the implicit XMM0 mask) arrives via the arg slot.
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mask = cpu.args[0].to_le_bytes();
@@ -1407,7 +1718,8 @@ pub mod x86 {
     }
 
     fn blendv_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane: usize) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mask = cpu.args[0].to_le_bytes();
@@ -1495,7 +1807,8 @@ pub mod x86 {
 
     fn pmuldq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Signed multiply of dwords 0 and 2 into two 64-bit products.
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1508,7 +1821,8 @@ pub mod x86 {
     }
 
     fn pmulhrsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1524,7 +1838,8 @@ pub mod x86 {
     fn pmaddubsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Unsigned bytes of a times signed bytes of b, adjacent pairs
         // summed with signed saturation.
-        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
             return;
         };
         let mut out = [0u8; 16];
@@ -1562,7 +1877,8 @@ pub mod x86 {
             let mut x = lane_i64(&a, i, lane);
             if b[i..i + lane].iter().all(|&v| v == 0) {
                 x = 0;
-            } else if b[i + lane - 1] & 0x80 != 0 {
+            }
+            else if b[i + lane - 1] & 0x80 != 0 {
                 x = x.wrapping_neg();
             }
             out[i..i + lane].copy_from_slice(&x.to_le_bytes()[..lane]);
@@ -1641,7 +1957,8 @@ pub mod x86 {
 
     fn phminposuw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Single-operand op: the source is the only input.
-        let Some(src) = xmm_bytes(cpu, args[0]) else {
+        let Some(src) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         let mut best = (u16::MAX, 0u16);
@@ -1655,19 +1972,22 @@ pub mod x86 {
     }
 
     fn insertps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(a) = xmm_bytes(cpu, args[0]) else {
+        let Some(a) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         let imm = cpu.args[0] as u8;
         // Register source: dword selected by bits 7:6; memory source: the
         // 32-bit value itself.
         let src = if args[1].size() >= 16 {
-            let Some(b) = xmm_bytes(cpu, args[1]) else {
-            return;
-        };
+            let Some(b) = xmm_bytes(cpu, args[1])
+            else {
+                return;
+            };
             let idx = (imm >> 6 & 3) as usize;
             u32::from_le_bytes(b[4 * idx..4 * idx + 4].try_into().unwrap())
-        } else {
+        }
+        else {
             cpu.read::<u32>(args[1].slice(0, 4))
         };
         let mut out = a;
@@ -1683,7 +2003,8 @@ pub mod x86 {
 
     fn extractps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // dst is a 4- or 8-byte GPR/memory location; zero-extended dword.
-        let Some(src) = xmm_bytes(cpu, args[0]) else {
+        let Some(src) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         let imm = cpu.read::<u64>(args[1]) as u8;
@@ -1696,7 +2017,8 @@ pub mod x86 {
     }
 
     fn roundp_lanes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
-        let Some(b) = xmm_bytes(cpu, args[1]) else {
+        let Some(b) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         // Bit 2 selects MXCSR rounding, which this machine keeps at the
@@ -1714,14 +2036,13 @@ pub mod x86 {
         let mut out = [0u8; 16];
         if double {
             for i in 0..2 {
-                let v =
-                    f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
+                let v = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
                 out[8 * i..8 * i + 8].copy_from_slice(&round64(v).to_bits().to_le_bytes());
             }
-        } else {
+        }
+        else {
             for i in 0..4 {
-                let v =
-                    f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
+                let v = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
                 let r = round64(v as f64) as f32;
                 out[4 * i..4 * i + 4].copy_from_slice(&r.to_bits().to_le_bytes());
             }
@@ -1761,7 +2082,8 @@ pub mod x86 {
         for i in (0..size).step_by(lane) {
             let (x, y) = if signed {
                 (lane_i64(&a, i, lane), lane_i64(&b, i, lane))
-            } else {
+            }
+            else {
                 let mut w = [0u8; 8];
                 w[..lane].copy_from_slice(&a[i..i + lane]);
                 let x = i64::from_le_bytes(w);
@@ -1921,10 +2243,12 @@ pub mod x86 {
     }
 
     fn aesenc(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(state) = xmm_bytes(cpu, args[0]) else {
+        let Some(state) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(key) = xmm_bytes(cpu, args[1]) else {
+        let Some(key) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut t = aes_shift_rows(&state, 1);
@@ -1937,10 +2261,12 @@ pub mod x86 {
     }
 
     fn aesenclast(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(state) = xmm_bytes(cpu, args[0]) else {
+        let Some(state) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(key) = xmm_bytes(cpu, args[1]) else {
+        let Some(key) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let mut t = aes_shift_rows(&state, 1);
@@ -1952,10 +2278,12 @@ pub mod x86 {
     }
 
     fn aesdec(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(state) = xmm_bytes(cpu, args[0]) else {
+        let Some(state) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(key) = xmm_bytes(cpu, args[1]) else {
+        let Some(key) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let inv = aes_inv_sbox();
@@ -1969,10 +2297,12 @@ pub mod x86 {
     }
 
     fn aesdeclast(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(state) = xmm_bytes(cpu, args[0]) else {
+        let Some(state) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
-        let Some(key) = xmm_bytes(cpu, args[1]) else {
+        let Some(key) = xmm_bytes(cpu, args[1])
+        else {
             return;
         };
         let inv = aes_inv_sbox();
@@ -1985,7 +2315,8 @@ pub mod x86 {
     }
 
     fn aesimc(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(x) = xmm_bytes(cpu, args[0]) else {
+        let Some(x) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         let t = aes_mix_columns(&x, [14, 11, 13, 9]);
@@ -1993,7 +2324,8 @@ pub mod x86 {
     }
 
     fn aeskeygenassist(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let Some(x) = xmm_bytes(cpu, args[0]) else {
+        let Some(x) = xmm_bytes(cpu, args[0])
+        else {
             return;
         };
         let rcon = cpu.read::<u8>(args[1]);
