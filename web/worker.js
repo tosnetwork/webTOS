@@ -256,10 +256,23 @@ async function loadFromCache(handle, path, mode) {
 
 /// Downloads an image, writing it into the guest and the cache as it arrives.
 async function loadFromNetwork(url, path, mode) {
+  // Ask for the declared size before opening a response body. Besides
+  // avoiding a pointless large transfer when the guest budget rejects the
+  // file, this keeps WebKit from retaining an unread body as an internal blob.
+  const head = await fetch(url, { method: "HEAD" }).catch(() => null);
+  // HEAD is an optimisation, not a new requirement on image hosts. If the
+  // server does not implement it, the GET response below remains authoritative.
+  const expected = head?.ok ? Number(head.headers.get("content-length")) || 0 : 0;
+  let write = expected > 0 ? guestWriter(path, expected, mode) : null;
+
   const response = await fetch(url);
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-  const total = Number(response.headers.get("content-length")) || 0;
-  const write = guestWriter(path, total, mode);
+  const total = Number(response.headers.get("content-length")) || expected;
+  if (expected > 0 && total !== expected) {
+    await response.body?.cancel();
+    throw new Error(`${url}: size changed from ${expected} to ${total}`);
+  }
+  write ??= guestWriter(path, total, mode);
 
   // The cache is written under a temporary name and renamed at the end, so an
   // interrupted download cannot be mistaken for a complete image later.
