@@ -128,6 +128,10 @@ The important word is not only *dynamic*. A model can already generate HTML.
 The harder problem is giving a generated interface a real, bounded execution
 environment behind it.
 
+<p align="center">
+  <img src="webTOS-intent.png" alt="One intent — plan a trip to Japan — composed in real time into a map, itinerary, hotels, flights, activities, budget, and booking, all running on the webTOS runtime" width="720">
+</p>
+
 A travel intent might compose a map, itinerary, comparison cards, a Python
 normalizer, and explicit approval points. A development intent might compose a
 file tree, terminal, code diff, `git`, a compiler, tests, and a coding agent.
