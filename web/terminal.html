@@ -96,6 +96,7 @@
   window.webtos = {
     term,
     state: "starting",
+    error: null,
     images: [],
     storage: false,
     // Where the tab's memory has gone: guest pages, lifted code, guest files.
@@ -183,7 +184,9 @@
 
   worker.onmessage = (event) => {
     const msg = event.data;
-    if (msg.type === "status") statusEl.textContent = msg.text;
+    if (msg.type === "status" && window.webtos.state !== "error") {
+      statusEl.textContent = msg.text;
+    }
     if (msg.type === "ready") {
       // A host that knows its ceiling sets one, and an image that will not
       // fit is refused at the request instead of part-way through.
@@ -224,7 +227,7 @@
           });
       }
     }
-    if (msg.type === "progress") {
+    if (msg.type === "progress" && window.webtos.state !== "error") {
       const mb = (n) => (n / (1 << 20)).toFixed(1);
       statusEl.textContent = msg.total
         ? `${msg.cached ? "restoring" : "downloading"} ${msg.path} — ${mb(msg.loaded)} / ${mb(msg.total)} MB`
@@ -266,6 +269,7 @@
     }
     if (msg.type === "error") {
       window.webtos.state = "error";
+      window.webtos.error = msg.text;
       statusEl.textContent = `error: ${msg.text}`;
       checkpointDone?.reject(new Error(msg.text));
       checkpointDone = null;
