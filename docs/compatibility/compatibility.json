@@ -39,7 +39,15 @@
           "ok": true
         },
         {
-          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "label": "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "network: proxy failure becomes a terminal Linux errno",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the next write always targets the non-current generation slot",
           "ok": true
         },
         {
@@ -155,7 +163,7 @@
           "ok": true
         },
         {
-          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "label": "memory: an image that will not fit the budget is refused before guest write",
           "ok": true
         },
         {
@@ -177,7 +185,8 @@
       ],
       "failed": 0,
       "name": "chromium",
-      "passed": 43,
+      "passed": 45,
+      "skipped": 0,
       "version": "151.0.7922.34"
     },
     {
@@ -219,7 +228,15 @@
           "ok": true
         },
         {
-          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "label": "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "network: proxy failure becomes a terminal Linux errno",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the next write always targets the non-current generation slot",
           "ok": true
         },
         {
@@ -335,7 +352,7 @@
           "ok": true
         },
         {
-          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "label": "memory: an image that will not fit the budget is refused before guest write",
           "ok": true
         },
         {
@@ -357,7 +374,8 @@
       ],
       "failed": 0,
       "name": "firefox",
-      "passed": 43,
+      "passed": 45,
+      "skipped": 0,
       "version": "153.0"
     },
     {
@@ -399,7 +417,15 @@
           "ok": true
         },
         {
-          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "label": "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "network: proxy failure becomes a terminal Linux errno",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the next write always targets the non-current generation slot",
           "ok": true
         },
         {
@@ -515,7 +541,7 @@
           "ok": true
         },
         {
-          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "label": "memory: an image that will not fit the budget is refused before guest write",
           "ok": true
         },
         {
@@ -537,15 +563,16 @@
       ],
       "failed": 0,
       "name": "webkit",
-      "passed": 43,
+      "passed": 45,
+      "skipped": 0,
       "version": "26.5"
     }
   ],
-  "generated_at": "2026-08-29T10:02:25.701Z",
+  "generated_at": "2026-08-29T14:23:28.741Z",
   "instruction_fingerprints": {
     "chromium": {
       "busybox ls /": 73280,
-      "claude --version": 186715528,
+      "claude --version": 185855298,
       "codex --help": 7084016,
       "codex --version": 5649059,
       "dynamic hello (musl loader)": 31937,
@@ -556,7 +583,7 @@
     },
     "firefox": {
       "busybox ls /": 73280,
-      "claude --version": 186715528,
+      "claude --version": 185855298,
       "codex --help": 7084016,
       "codex --version": 5649059,
       "dynamic hello (musl loader)": 31937,
@@ -567,7 +594,7 @@
     },
     "webkit": {
       "busybox ls /": 73280,
-      "claude --version": 186715528,
+      "claude --version": 185855298,
       "codex --help": 7084016,
       "codex --version": 5649059,
       "dynamic hello (musl loader)": 31937,
@@ -578,8 +605,8 @@
     }
   },
   "runtime": {
-    "sha256": "8a399de908746493fa64a6ecb77d9ee00fd16ee8e5fd1a514bb9980e1fc00b25",
-    "source_commit": "ff3e1b830890874ae35fe237fbd7ffa37d09c1d1"
+    "sha256": "ebb8b7c28bc346149014db43ef1d7a294af36596d8b3de234e5b3092a67e2f53",
+    "source_commit": "f4d5d59282b2bfe5f0258947e7e988ddb7f260ff"
   },
   "schema_version": 1,
   "status": "pass",
@@ -654,8 +681,8 @@
       "files": [
         {
           "path": "/bin/openfox",
-          "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb",
-          "size": 52971260
+          "sha256": "42c7b0a5b4eef884d8ad9470c261202d1c4f1f8693baff4ba42e26f7588d1f18",
+          "size": 54060924
         }
       ],
       "id": "openfox",

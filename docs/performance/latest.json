@@ -1,15 +1,15 @@
 {
   "browsers": [
     {
-      "before_grow_mib": 48.25,
+      "before_grow_mib": 52.3125,
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
         "seconds": 0.4491000001430511
       },
-      "linear_memory_ceiling_mib": 3888.25,
-      "machine_build_ms": 174.30000019073486,
-      "module_instantiate_ms": 34.200000047683716,
+      "linear_memory_ceiling_mib": 3892.3125,
+      "machine_build_ms": 171.69999980926514,
+      "module_instantiate_ms": 30.700000047683716,
       "name": "chromium",
       "runs": [
         {
@@ -19,29 +19,29 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 1.3129000000953674
+          "seconds": 1.3930999999046325
         },
         {
           "guestCapMiB": 1024,
           "guestUsedMiB": 1,
-          "heapMiB": 48.25,
+          "heapMiB": 52.3125,
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 4.96
+          "seconds": 5.271400000095367
         }
       ],
       "version": "151.0.7922.34"
     },
     {
-      "before_grow_mib": 48.25,
+      "before_grow_mib": 52.3125,
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
-        "seconds": 1.072
+        "seconds": 1.026
       },
-      "linear_memory_ceiling_mib": 3888.25,
-      "machine_build_ms": 1141,
+      "linear_memory_ceiling_mib": 3892.3125,
+      "machine_build_ms": 1131,
       "module_instantiate_ms": 66,
       "name": "firefox",
       "runs": [
@@ -52,30 +52,30 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 9.733
+          "seconds": 9.804
         },
         {
           "guestCapMiB": 1024,
           "guestUsedMiB": 1,
-          "heapMiB": 48.25,
+          "heapMiB": 52.3125,
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 37.825
+          "seconds": 38.19
         }
       ],
       "version": "153.0"
     },
     {
-      "before_grow_mib": 48.25,
+      "before_grow_mib": 52.3125,
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
         "seconds": 0.423
       },
-      "linear_memory_ceiling_mib": 3888.25,
-      "machine_build_ms": 165,
-      "module_instantiate_ms": 100,
+      "linear_memory_ceiling_mib": 3892.3125,
+      "machine_build_ms": 163,
+      "module_instantiate_ms": 90,
       "name": "webkit",
       "runs": [
         {
@@ -85,16 +85,16 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 1.395
+          "seconds": 1.364
         },
         {
           "guestCapMiB": 1024,
           "guestUsedMiB": 1,
-          "heapMiB": 48.25,
+          "heapMiB": 52.3125,
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 5.192
+          "seconds": 5.153
         }
       ],
       "version": "26.5"
@@ -118,12 +118,12 @@
       53448508
     ]
   },
-  "measured_at": "2026-08-29T12:50:31Z",
+  "measured_at": "2026-08-29T14:16:06Z",
   "native": {
-    "machine_build_ms": 261.395138,
+    "machine_build_ms": 274.4429,
     "marginal": {
       "instructions": 40078848,
-      "seconds": 2.455787989
+      "seconds": 2.478438536
     },
     "platform": {
       "arch": "x86_64",
@@ -134,19 +134,19 @@
       {
         "instructions": 13369660,
         "mib": 1,
-        "seconds": 0.972954145
+        "seconds": 0.961666511
       },
       {
         "instructions": 53448508,
         "mib": 4,
-        "seconds": 3.428742134
+        "seconds": 3.440105047
       }
     ],
     "schema_version": 1
   },
   "runtime": {
-    "sha256": "4fcedd62386cc4dde2b5fe1011df84a15bceed753ffe46c5b826b3f9e15288fc",
-    "source_commit": "170cc6cc08c0dcd6b10dbce71b789238f3c23d8f"
+    "sha256": "ebb8b7c28bc346149014db43ef1d7a294af36596d8b3de234e5b3092a67e2f53",
+    "source_commit": "f4d5d59282b2bfe5f0258947e7e988ddb7f260ff"
   },
   "schema_version": 1
 }
