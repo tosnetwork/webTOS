@@ -79,6 +79,10 @@ const generatedAssets = new Map();
 const BLANK = "<!doctype html><meta charset=utf-8><title>webTOS test</title>";
 /// Served at /__net_probe: the body a guest must fetch over a real socket.
 const NET_PROBE = "net-probe-ok";
+// Larger than the 32 MiB profile used by the terminal budget probe.  The
+// The endpoint is deterministic and avoids coupling this assertion to an
+// optional workload binary.
+const OVERSIZED_IMAGE_BYTES = 33 * 1024 * 1024;
 
 async function startServer() {
   const server = createServer(async (req, res) => {
@@ -91,6 +95,15 @@ async function startServer() {
     if (path === "/__net_probe") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(NET_PROBE);
+      return;
+    }
+    if (path === "/web/__budget_probe") {
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": OVERSIZED_IMAGE_BYTES,
+        "cache-control": "no-store",
+      });
+      res.end(Buffer.alloc(OVERSIZED_IMAGE_BYTES));
       return;
     }
     if (generatedAssets.has(path)) {
@@ -689,8 +702,8 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     }
   } else if (images.agent) {
     const detail = "OPFS unavailable; checkpoint and cache persistence not applicable";
-    record("secrets: the checkpoint carries the placeholder, not the value", true, detail);
-    record("checkpoint: the session is written to browser storage", true, detail);
+    record("secrets: the checkpoint carries the placeholder, not the value", null, detail);
+    record("checkpoint: the session is written to browser storage", null, detail);
   }
 
   // Downloaded once: a reload must serve every image from the cache.
@@ -708,7 +721,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   } else {
     record(
       "images: a reload serves them from the cache",
-      true,
+      null,
       "OPFS unavailable; image-cache persistence not applicable",
     );
   }
@@ -846,28 +859,27 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     `gateway refused 127.0.0.1:${gateway.port}`,
   );
 
-  // A budget too small for the agent image. The tab should say so and stay
-  // up, rather than dying on whichever allocation happens to be unlucky part
-  // way through a 52 MB delivery.
-  if (images.agent) {
-    await page.goto(`${origin}/web/terminal.html?budget=32&image=openfox`);
-    const refusal = await page
-      .waitForFunction(
-        () => {
-          const status = document.getElementById("status")?.textContent ?? "";
-          return status.includes("memory budget") ? status : false;
-        },
-        undefined,
-        { timeout: EXEC_TIMEOUT },
-      )
-      .then((handle) => handle.jsonValue())
-      .catch(() => null);
-    record(
-      "memory: an image that will not fit the budget is refused, not fatal",
-      typeof refusal === "string" && refusal.includes("over the memory budget"),
-      refusal ? refusal.replace(/^error: /, "") : "no refusal reported",
-    );
-  }
+  // A declared image larger than the remaining budget. The endpoint sends
+  // The worker calls guestWriter with Content-Length before reading the body,
+  // so a pass proves the guest image was rejected up front rather than being
+  // partially written until an unlucky allocation failed.
+  await page.goto(`${origin}/web/terminal.html?budget=32&image=__budget_probe`);
+  const refusal = await page
+    .waitForFunction(
+      () => {
+        const status = document.getElementById("status")?.textContent ?? "";
+        return status.includes("memory budget") ? status : false;
+      },
+      undefined,
+      { timeout: EXEC_TIMEOUT },
+    )
+    .then((handle) => handle.jsonValue())
+    .catch(() => null);
+  record(
+    "memory: an image that will not fit the budget is refused before guest write",
+    typeof refusal === "string" && refusal.includes("over the memory budget"),
+    refusal ? refusal.replace(/^error: /, "") : "no refusal reported",
+  );
 }
 
 // ------------------------------------------------------------- browser side
@@ -885,7 +897,8 @@ async function runEngine(name, origin, gateway, images) {
   const fingerprint = {};
   const record = (label, ok, detail = "") => {
     checks.push({ label, ok, detail });
-    console.log(`[${name}] ${ok ? "ok" : "FAILED"}: ${label}${detail ? ` -> ${detail}` : ""}`);
+    const state = ok === null ? "SKIP" : ok ? "ok" : "FAILED";
+    console.log(`[${name}] ${state}: ${label}${detail ? ` -> ${detail}` : ""}`);
   };
 
   const pageErrors = [];
@@ -963,12 +976,12 @@ async function runEngine(name, origin, gateway, images) {
     const opfsAvailable = !(await page.isDisabled("#save"));
     if (!opfsAvailable) {
       const detail = "OPFS unavailable; Save FS disabled and persistence probes not applicable";
-      record("persist filesystem to OPFS", true, detail);
-      record("reload restores the snapshot", true, detail);
-      record("state survives the browser reload", true, detail);
+      record("persist filesystem to OPFS", null, detail);
+      record("reload restores the snapshot", null, detail);
+      record("state survives the browser reload", null, detail);
       record(
         "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
-        true,
+        null,
         detail,
       );
     } else {
@@ -1070,6 +1083,24 @@ async function runEngine(name, origin, gateway, images) {
       "network: proxy failure becomes a terminal Linux errno",
       networkContract.every((item) => item.ok),
       networkContract.map((item) => `${item.name}=${item.got}`).join(", "),
+    );
+
+    const snapshotSlotContract = await page.evaluate(async (workerUrl) => {
+      const worker = new Worker(workerUrl);
+      const result = new Promise((resolve) => {
+        worker.onmessage = (event) => {
+          if (event.data.type === "snapshotSlotContract") resolve(event.data.cases);
+        };
+      });
+      worker.postMessage({ type: "snapshotSlotContractProbe" });
+      const cases = await result;
+      worker.terminate();
+      return cases;
+    }, `${origin}/web/worker.js`);
+    record(
+      "checkpoint: the next write always targets the non-current generation slot",
+      snapshotSlotContract.every((item) => item.ok),
+      snapshotSlotContract.map((item) => `${item.name}=${item.got}`).join(", "),
     );
 
     if (opfsAvailable) {
@@ -1300,7 +1331,7 @@ async function runEngine(name, origin, gateway, images) {
     if (!opfsAvailable) {
       record(
         "lazy snapshot restores descriptors and rebinds manifest authority",
-        true,
+        null,
         "OPFS unavailable; descriptor persistence not applicable",
       );
     } else {
@@ -1514,8 +1545,16 @@ try {
   for (const name of engines) {
     console.log(`\n=== ${name} ===`);
     const { browserVersion, checks, fingerprint } = await runEngine(name, origin, gateway, images);
-    const failed = checks.filter((c) => !c.ok);
-    summary.push({ browserVersion, checks, name, total: checks.length, failed: failed.length });
+    const failed = checks.filter((c) => c.ok === false);
+    const skipped = checks.filter((c) => c.ok === null);
+    summary.push({
+      browserVersion,
+      checks,
+      name,
+      total: checks.length,
+      failed: failed.length,
+      skipped: skipped.length,
+    });
     fingerprints[name] = fingerprint;
   }
 } finally {
@@ -1548,7 +1587,9 @@ if (ran.length > 1) {
 
 console.log("\n=== matrix ===");
 for (const row of summary) {
-  console.log(`${row.name.padEnd(9)} ${row.failed === 0 ? "PASS" : "FAIL"}  ${row.total - row.failed}/${row.total} checks`);
+  const passed = row.total - row.failed - row.skipped;
+  const skipped = row.skipped > 0 ? `, ${row.skipped} skipped` : "";
+  console.log(`${row.name.padEnd(9)} ${row.failed === 0 ? "PASS" : "FAIL"}  ${passed}/${passed + row.failed} checks${skipped}`);
 }
 const broken = summary.filter((r) => r.failed > 0);
 if (compatibilityReport) {
@@ -1557,7 +1598,8 @@ if (compatibilityReport) {
       checks: row.checks.map(({ label, ok }) => ({ label, ok })),
       failed: row.failed,
       name: row.name,
-      passed: row.total - row.failed,
+      passed: row.total - row.failed - row.skipped,
+      skipped: row.skipped,
       version: row.browserVersion,
     })),
     generated_at: new Date().toISOString(),
@@ -1567,7 +1609,11 @@ if (compatibilityReport) {
       source_commit: sourceCommit,
     },
     schema_version: 1,
-    status: broken.length === 0 && divergent === 0 ? "pass" : "fail",
+    status: broken.length === 0 && divergent === 0 && summary.every((row) => row.skipped === 0)
+      ? "pass"
+      : broken.length === 0 && divergent === 0
+        ? "incomplete"
+        : "fail",
     workloads: workloadEvidence,
   };
   const temporary = `${compatibilityReport}.tmp`;
@@ -1584,4 +1630,5 @@ if (broken.length > 0 || divergent > 0) {
   console.error(`\n[browsers] FAIL (${reasons.join(", ")})`);
   process.exit(1);
 }
-console.log("\n[browsers] PASS");
+const skippedTotal = summary.reduce((total, row) => total + row.skipped, 0);
+console.log(`\n[browsers] PASS${skippedTotal > 0 ? ` (${skippedTotal} capability checks skipped)` : ""}`);

@@ -94,6 +94,48 @@ class PerformanceDashboardTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown or missing"):
                 performance_dashboard.verify(report_path, runtime)
 
+    def test_boolean_nan_and_inconsistent_marginal_evidence_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            native, browsers, runtime = self.inputs(root)
+            native_doc = json.loads(native.read_text())
+            native_doc["runs"][0]["instructions"] = True
+            native.write_text(json.dumps(native_doc))
+            with self.assertRaisesRegex(ValueError, "instruction count"):
+                performance_dashboard.build(
+                    native, browsers, runtime, "a" * 40, "2026-08-29T00:00:00Z"
+                )
+
+            native, browsers, runtime = self.inputs(root)
+            browser_doc = json.loads(browsers.read_text())
+            browser_doc["engines"][0]["control"]["seconds"] = float("nan")
+            browsers.write_text(json.dumps(browser_doc))
+            with self.assertRaisesRegex(ValueError, "control"):
+                performance_dashboard.build(
+                    native, browsers, runtime, "a" * 40, "2026-08-29T00:00:00Z"
+                )
+
+            native, browsers, runtime = self.inputs(root)
+            native_doc = json.loads(native.read_text())
+            native_doc["marginal"]["instructions"] += 1
+            native.write_text(json.dumps(native_doc))
+            with self.assertRaisesRegex(ValueError, "marginal"):
+                performance_dashboard.build(
+                    native, browsers, runtime, "a" * 40, "2026-08-29T00:00:00Z"
+                )
+
+    def test_control_fingerprints_must_agree_across_browsers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            native, browsers, runtime = self.inputs(root)
+            browser_doc = json.loads(browsers.read_text())
+            browser_doc["engines"][2]["control"]["checksum"] += 1
+            browsers.write_text(json.dumps(browser_doc))
+            with self.assertRaisesRegex(ValueError, "control fingerprints diverge"):
+                performance_dashboard.build(
+                    native, browsers, runtime, "a" * 40, "2026-08-29T00:00:00Z"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -109,6 +109,45 @@ class ExecutionRecordTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "relative and contained"):
                 execution_record.build(descriptor_path)
 
+    def test_booleans_are_not_accepted_as_integer_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor_path = self.fixture(root)
+            descriptor = json.loads(descriptor_path.read_text())
+            descriptor["result"]["instruction_count"] = True
+            descriptor_path.write_text(json.dumps(descriptor))
+            with self.assertRaisesRegex(ValueError, "instruction count"):
+                execution_record.build(descriptor_path)
+
+            descriptor_path = self.fixture(root)
+            descriptor = json.loads(descriptor_path.read_text())
+            descriptor["network"]["receipts"][0]["bytes_sent"] = False
+            descriptor_path.write_text(json.dumps(descriptor))
+            with self.assertRaisesRegex(ValueError, "bytes_sent"):
+                execution_record.build(descriptor_path)
+
+    def test_exit_code_is_required_and_artifact_envelopes_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor_path = self.fixture(root)
+            descriptor = json.loads(descriptor_path.read_text())
+            del descriptor["result"]["exit_code"]
+            descriptor_path.write_text(json.dumps(descriptor))
+            with self.assertRaisesRegex(ValueError, "exit code"):
+                execution_record.build(descriptor_path)
+
+            record = execution_record.build(self.fixture(root))
+            record["build"]["runtime"]["unverified"] = True
+            unsigned = dict(record)
+            unsigned.pop("record_sha256")
+            record["record_sha256"] = execution_record.hashlib.sha256(
+                execution_record.canonical(unsigned)
+            ).hexdigest()
+            record_path = root / "execution.json"
+            record_path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(ValueError, "envelope"):
+                execution_record.verify(record_path)
+
 
 if __name__ == "__main__":
     unittest.main()

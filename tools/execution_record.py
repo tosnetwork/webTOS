@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 
 RECORD_TYPE = "webtos.execution.v1"
+ARTIFACT_FIELDS = {"path", "sha256", "size"}
 
 
 def canonical(document: dict) -> bytes:
@@ -60,9 +61,32 @@ def validate_receipts(receipts: object) -> list[dict]:
         if receipt.get("peer") is not None and not isinstance(receipt.get("peer"), str):
             raise ValueError("network receipt peer is invalid")
         for field in ("bytes_sent", "bytes_received"):
-            if not isinstance(receipt.get(field), int) or receipt[field] < 0:
+            if type(receipt.get(field)) is not int or receipt[field] < 0:
                 raise ValueError(f"network receipt has invalid {field}")
     return receipts
+
+
+def validate_result(result: object) -> dict:
+    if not isinstance(result, dict):
+        raise ValueError("execution result must be an object")
+    if result.get("status") not in {"halted", "failed", "budget_exhausted"}:
+        raise ValueError("execution record has invalid result status")
+    if type(result.get("exit_code")) is not int or not -(2**31) <= result["exit_code"] < 2**31:
+        raise ValueError("execution record has invalid exit code")
+    if type(result.get("instruction_count")) is not int or result["instruction_count"] < 0:
+        raise ValueError("execution record has invalid instruction count")
+    return result
+
+
+def validate_envelope(envelope: object) -> dict:
+    if not isinstance(envelope, dict) or set(envelope) != ARTIFACT_FIELDS:
+        raise ValueError("execution artifact envelope is incomplete or has unknown fields")
+    if type(envelope.get("size")) is not int or envelope["size"] < 0:
+        raise ValueError("execution artifact size is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", envelope.get("sha256", "")):
+        raise ValueError("execution artifact digest is malformed")
+    safe_path(envelope.get("path", ""))
+    return envelope
 
 
 def build(descriptor_path: Path) -> dict:
@@ -72,13 +96,9 @@ def build(descriptor_path: Path) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
         raise ValueError("descriptor needs a full lowercase source commit")
     workload = descriptor.get("workload", {})
-    result = descriptor.get("result", {})
+    result = validate_result(descriptor.get("result"))
     if not workload.get("id") or not workload.get("version"):
         raise ValueError("descriptor needs workload id and version")
-    if result.get("status") not in {"halted", "failed", "budget_exhausted"}:
-        raise ValueError("descriptor has invalid result status")
-    if not isinstance(result.get("instruction_count"), int) or result["instruction_count"] < 0:
-        raise ValueError("descriptor has invalid instruction count")
     inputs = descriptor.get("inputs")
     if not isinstance(inputs, list):
         raise ValueError("descriptor inputs must be an array")
@@ -136,13 +156,9 @@ def verify(record_path: Path) -> dict:
         raise ValueError("execution record has no source commit")
     validate_receipts(record.get("network", {}).get("receipts"))
     workload = record.get("workload", {})
-    result = record.get("result", {})
+    result = validate_result(record.get("result"))
     if not workload.get("id") or not workload.get("version"):
         raise ValueError("execution record has no workload identity")
-    if result.get("status") not in {"halted", "failed", "budget_exhausted"}:
-        raise ValueError("execution record has invalid result status")
-    if not isinstance(result.get("instruction_count"), int) or result["instruction_count"] < 0:
-        raise ValueError("execution record has invalid instruction count")
     if not isinstance(record.get("inputs"), list):
         raise ValueError("execution record inputs are invalid")
     if not re.fullmatch(r"[0-9a-f]{64}", record.get("trace", {}).get("root_sha256", "")):
@@ -160,10 +176,9 @@ def verify(record_path: Path) -> dict:
         record["snapshots"].get("after"),
     ]
     for envelope in (item for item in envelopes if item is not None):
+        validate_envelope(envelope)
         relative, resolved = contained_file(record_path.parent, envelope.get("path", ""))
         payload = resolved.read_bytes()
-        if not re.fullmatch(r"[0-9a-f]{64}", envelope.get("sha256", "")):
-            raise ValueError(f"execution artifact digest is malformed: {relative}")
         if envelope.get("size") != len(payload):
             raise ValueError(f"execution artifact size differs: {relative}")
         if envelope.get("sha256") != hashlib.sha256(payload).hexdigest():

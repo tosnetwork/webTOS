@@ -381,7 +381,19 @@ impl LinuxEnv {
         for task in &self.sched.parked {
             collect(&task.proc.fds.borrow());
         }
-        self.vfs.release_unreferenced(&referenced)
+        let released_secret_nodes = self
+            .host_secret_nodes
+            .keys()
+            .copied()
+            .filter(|node| self.vfs.node(*node).nlink == 0 && !referenced.contains(node))
+            .collect::<Vec<_>>();
+        let freed = self.vfs.release_unreferenced(&referenced);
+        for node in released_secret_nodes {
+            if let Some(handle) = self.host_secret_nodes.remove(&node) {
+                self.host_secret_handles.remove(&handle);
+            }
+        }
+        freed
     }
 
     /// Registers a secret readable by every guest file that names it.
@@ -428,7 +440,10 @@ impl LinuxEnv {
             return Err("secret handle needs a non-empty agent principal".to_string());
         }
         let handle = self.next_host_secret_handle;
-        self.next_host_secret_handle = self.next_host_secret_handle.saturating_add(1);
+        self.next_host_secret_handle = self
+            .next_host_secret_handle
+            .checked_add(1)
+            .ok_or_else(|| "secret handle id space exhausted".to_string())?;
         let node = self
             .vfs
             .add_node(path, vfs::NodeKind::File(Vec::new()), 0o400)
@@ -1321,7 +1336,7 @@ pub struct Machine {
     spec_fingerprint: [u8; 32],
 }
 
-/// What a machine occupies, split by what it is spent on. All three live in
+/// What a machine occupies, split by what it is spent on. All four live in
 /// one wasm linear memory and compete for its ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
@@ -1331,6 +1346,10 @@ pub struct Footprint {
     pub code_bytes: usize,
     /// File contents and symlink targets in the guest filesystem.
     pub files_bytes: usize,
+    /// Credential bytes retained behind opaque host handles. They are outside
+    /// the VFS but still occupy the same Wasm linear memory and therefore
+    /// count against the host's total budget.
+    pub host_bytes: usize,
     pub total_bytes: usize,
 }
 
@@ -1866,7 +1885,7 @@ impl Machine {
     }
 
     /// What the machine occupies, split by what it is spent on. One wasm
-    /// linear memory holds all three, and a browser tab's ceiling is roughly
+    /// linear memory holds all four, and a browser tab's ceiling is roughly
     /// 3.9 GiB (`docs/performance.md`), so they compete: an agent image, the
     /// guest's own pages, and the code the engine has lifted.
     /// Takes `&mut self` because the guest filesystem is reached through the
@@ -1874,12 +1893,19 @@ impl Machine {
     pub fn footprint(&mut self) -> Footprint {
         let guest_bytes = self.vm.cpu.mem.total_pages() * 4096;
         let code_bytes = self.vm.lifted_bytes();
-        let files_bytes = self.env().vfs.bytes();
+        let env = self.env();
+        let files_bytes = env.vfs.bytes();
+        let host_bytes = env
+            .host_secret_handles
+            .values()
+            .map(|secret| secret.value.capacity())
+            .sum::<usize>();
         Footprint {
             guest_bytes,
             code_bytes,
             files_bytes,
-            total_bytes: guest_bytes + code_bytes + files_bytes,
+            host_bytes,
+            total_bytes: guest_bytes + code_bytes + files_bytes + host_bytes,
         }
     }
 
@@ -2074,12 +2100,13 @@ impl Machine {
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         Err(format!(
             "over the memory budget: {:.1} MiB more against {:.1} MiB free \
-             (guest {:.1}, code {:.1}, files {:.1}, budget {:.1} MiB)",
+             (guest {:.1}, code {:.1}, files {:.1}, host {:.1}, budget {:.1} MiB)",
             mib(adding),
             mib(budget.saturating_sub(footprint.total_bytes)),
             mib(footprint.guest_bytes),
             mib(footprint.code_bytes),
             mib(footprint.files_bytes),
+            mib(footprint.host_bytes),
             mib(budget),
         ))
     }
@@ -2212,6 +2239,7 @@ impl Machine {
         path: &[u8],
         principal: &str,
     ) -> Result<u64, String> {
+        self.check_budget(value.len())?;
         self.env().mount_secret_handle(name, value, path, principal)
     }
 

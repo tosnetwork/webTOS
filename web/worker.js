@@ -145,6 +145,11 @@ async function snapshotCandidates() {
   return candidates.sort((a, b) => b.generation - a.generation);
 }
 
+function nextSnapshotSlot(newest) {
+  if (!newest) return SNAPSHOT_SLOTS[0];
+  return newest.name === SNAPSHOT_SLOTS[0] ? SNAPSHOT_SLOTS[1] : SNAPSHOT_SLOTS[0];
+}
+
 /// Reads only a complete, digest-valid generation. A pre-V2 single-file
 /// snapshot is accepted as generation zero for migration.
 async function readSnapshot() {
@@ -159,8 +164,15 @@ async function readSnapshot() {
 /// or digest and select the highest remaining valid generation.
 async function writeSnapshot(payload, pauseAfterHalf = false) {
   const [newest] = await snapshotCandidates();
+  if (newest && newest.generation >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("snapshot generation exhausted its exact integer range");
+  }
   const generation = (newest?.generation ?? 0) + 1;
-  const name = SNAPSHOT_SLOTS[generation % SNAPSHOT_SLOTS.length];
+  // Slot identity, not generation parity, decides the target. A valid slot
+  // can be moved or recovered under either name; the next write must still
+  // choose the other slot so an interrupted commit never destroys the only
+  // complete generation.
+  const name = nextSnapshotSlot(newest);
   const bytes = await encodeSnapshot(generation, payload);
   const root = await navigator.storage.getDirectory();
   const handle = await root.getFileHandle(name, { create: true });
@@ -172,6 +184,10 @@ async function writeSnapshot(payload, pauseAfterHalf = false) {
   }
   await writable.write(bytes);
   await writable.close();
+  // Once a digest-valid V2 generation is durable, the unverified legacy file
+  // is no longer a recovery candidate. If both V2 slots are later corrupt,
+  // fail closed instead of silently resurrecting an arbitrarily old session.
+  await opfsDelete(SNAPSHOT_FILE);
 }
 
 async function opfsDelete(name) {
@@ -582,9 +598,10 @@ async function boot(files, links = [], jitAfter = null, guestMemMb = null) {
 }
 
 /// Reports where the machine's memory has gone. One wasm linear memory holds
-/// the guest's pages, the images streamed into it, and the code the engine has
-/// lifted; a tab's ceiling is about 3.9 GiB, so a host that wants to refuse a
-/// workload rather than die needs to see all three.
+/// the guest's pages, the images streamed into it, the code the engine has
+/// lifted, and capability bytes held outside the VFS; a tab's ceiling is about
+/// 3.9 GiB, so a host that wants to refuse a workload rather than die needs to
+/// see all four.
 function reportFootprint() {
   const kib = (part) => exports.wtw_footprint_kib(part) * 1024;
   const headroom = exports.wtw_memory_headroom_kib();
@@ -595,11 +612,12 @@ function reportFootprint() {
     guest: kib(0),
     code: kib(1),
     files: kib(2),
+    host: kib(4),
     // The sum of the parts, not a separately rounded whole: each part is
-    // reported in KiB, and round(a)+round(b)+round(c) is not round(a+b+c), so
+    // reported in KiB, and summing rounded parts is not rounding their sum, so
     // a separately rounded total would disagree with its own parts by a few
     // KiB. The total is what the footprint is spent on, which is the parts.
-    total: kib(0) + kib(1) + kib(2),
+    total: kib(0) + kib(1) + kib(2) + kib(4),
     headroom: headroom < 0 ? null : headroom * 1024,
     // The filesystem's own ceiling. `files` is what it holds; this is what
     // the guest may still add before a write gets ENOSPC.
@@ -841,6 +859,19 @@ function networkErrorContractProbe() {
   ];
   return cases.map(({ name, entry, code, want }) => {
     const got = tcpCloseErrno(entry, code);
+    return { name, got, want, ok: got === want };
+  });
+}
+
+function snapshotSlotContractProbe() {
+  return [
+    { name: "empty", newest: null, want: SNAPSHOT_SLOTS[0] },
+    { name: "slot-zero-even", newest: { name: SNAPSHOT_SLOTS[0], generation: 2 }, want: SNAPSHOT_SLOTS[1] },
+    { name: "slot-zero-odd", newest: { name: SNAPSHOT_SLOTS[0], generation: 1 }, want: SNAPSHOT_SLOTS[1] },
+    { name: "slot-one-even", newest: { name: SNAPSHOT_SLOTS[1], generation: 2 }, want: SNAPSHOT_SLOTS[0] },
+    { name: "slot-one-odd", newest: { name: SNAPSHOT_SLOTS[1], generation: 1 }, want: SNAPSHOT_SLOTS[0] },
+  ].map(({ name, newest, want }) => {
+    const got = nextSnapshotSlot(newest);
     return { name, got, want, ok: got === want };
   });
 }
@@ -1112,6 +1143,9 @@ self.onmessage = async (event) => {
     if (msg.type === "network") enableNetwork(msg.gateway);
     if (msg.type === "networkErrorContractProbe") {
       postMessage({ type: "networkErrorContract", cases: networkErrorContractProbe() });
+    }
+    if (msg.type === "snapshotSlotContractProbe") {
+      postMessage({ type: "snapshotSlotContract", cases: snapshotSlotContractProbe() });
     }
     if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {

@@ -689,7 +689,9 @@ impl InterpVm {
         // the reach of the trace selector.
         let mut in_a_trace: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &(id, _) in by_addr.values() {
-            if let Some(order) = select_trace(&self.code.blocks, id as usize) {
+            if let Some(order) = select_trace(&self.code.blocks, id as usize, &|addr| {
+                by_addr.get(&addr).map(|(id, _)| *id as usize)
+            }) {
                 in_a_trace.extend(order);
             }
         }
@@ -1233,7 +1235,11 @@ impl InterpVm {
                     // instruction count and the block/address at which Rust
                     // must resume.
                     if hot {
-                        if let Some(order) = select_trace(&self.code.blocks, block_id as usize) {
+                        if let Some(order) =
+                            select_trace(&self.code.blocks, block_id as usize, &|addr| {
+                                resolve_trace_external(&self.code, self.get_block_key(addr))
+                            })
+                        {
                             let handle = match self.jit_region_cache.get(&key).copied() {
                                 Some(decided) => decided,
                                 None => match crate::jit::translate_trace(
@@ -1287,9 +1293,20 @@ impl InterpVm {
                                 (handle, self.jit_trace_meta.get(&key).cloned())
                             {
                                 let fuel_before = self.cpu.fuel.remaining;
-                                let outcome = match self.jit.as_mut() {
-                                    Some(j) => j.call_region(handle, &mut self.cpu, fuel_before),
-                                    None => crate::jit::RegionOutcome::Unavailable,
+                                let outcome = if fuel_before < block.num_instructions as u64 {
+                                    // The trace ABI cannot retire a fractional
+                                    // block. Fall through to the ordinary path,
+                                    // which stops at the exact instruction
+                                    // boundary instead of treating a zero-work
+                                    // trace return as corrupted metadata.
+                                    crate::jit::RegionOutcome::Unavailable
+                                } else {
+                                    match self.jit.as_mut() {
+                                        Some(j) => {
+                                            j.call_region(handle, &mut self.cpu, fuel_before)
+                                        }
+                                        None => crate::jit::RegionOutcome::Unavailable,
+                                    }
                                 };
                                 match outcome {
                                     crate::jit::RegionOutcome::Ran(packed) => {
@@ -1315,16 +1332,13 @@ impl InterpVm {
                                         self.cpu.fuel.remaining -= retired;
                                         self.jit_dispatches += 1;
                                         self.jit_region_dispatches += 1;
-                                        for &id in &meta.blocks {
-                                            if let Some(ran) = self.code.blocks.get(id) {
-                                                record_instruction_ranges(
-                                                    &mut self.executed_instructions,
-                                                    &ran.pcode,
-                                                    0,
-                                                    None,
-                                                );
-                                            }
-                                        }
+                                        record_trace_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &self.code.blocks,
+                                            &meta.blocks,
+                                            retired,
+                                            None,
+                                        );
                                         self.jit_budget.touch(handle);
                                         if jit_trace {
                                             eprintln!(
@@ -1407,11 +1421,12 @@ impl InterpVm {
                                             self.cpu.fuel.remaining.saturating_sub(guest_insns);
                                         self.jit_dispatches += 1;
                                         self.jit_region_dispatches += 1;
-                                        record_instruction_ranges(
+                                        record_trace_instruction_ranges(
                                             &mut self.executed_instructions,
-                                            &faulted.pcode,
-                                            0,
-                                            Some(local_index),
+                                            &self.code.blocks,
+                                            &meta.blocks,
+                                            retired,
+                                            Some((fault_block, local_index)),
                                         );
                                         self.jit_budget.touch(handle);
                                         self.cpu.block_id = fault_block as u64;
@@ -1978,7 +1993,11 @@ fn self_loop_kind(block: &lifter::Block, block_id: u64) -> Option<Option<pcode::
 /// address. Bounded in length, and never a single self-loop block (that is the
 /// region's job). Correctness never depends on which direction is followed — a
 /// wrong guess just fails to close, so no trace forms.
-fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
+fn select_trace(
+    blocks: &[lifter::Block],
+    header: usize,
+    resolve_external: &impl Fn(u64) -> Option<usize>,
+) -> Option<Vec<usize>> {
     const MAX_BLOCKS: usize = 8;
     // In-group block id of a target, and whether a target has a static resume
     // address (an in-group block's start, or an external constant) so a side
@@ -1986,13 +2005,11 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
     let in_group = |t: Target| -> Option<usize> {
         match t {
             Target::Internal(b) if b < blocks.len() => Some(b),
-            // A jump across lift groups is represented as an external constant
-            // even when its target is already in the arena. Prefer the newest
-            // lift at that address; the arena is append-only and invalidation
-            // flushes compiled handles before a replacement can run.
-            Target::External(pcode::Value::Const(addr, _)) => {
-                blocks.iter().rposition(|block| block.start == addr)
-            }
+            // A jump across lift groups is represented as an external constant.
+            // Resolve it through the caller's current BlockKey (address, ISA,
+            // and address-space id), never by scanning the global append-only
+            // arena where another process can own the newest block at that VA.
+            Target::External(pcode::Value::Const(addr, _)) => resolve_external(addr),
             _ => None,
         }
     };
@@ -2057,6 +2074,55 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
                 return None;
             }
             _ => return None, // Call / Return / indirect: not traceable
+        }
+    }
+}
+
+fn resolve_trace_external(code: &BlockTable, key: BlockKey) -> Option<usize> {
+    code.map.get(&key).map(|group| group.blocks.0)
+}
+
+/// Records exactly the unique guest instructions a linear trace reached.
+/// `retired` counts whole blocks before a normal side exit/budget return or
+/// before `fault`, and the trace always starts at `order[0]`. Once a complete
+/// cycle retired, every member was visited; otherwise only the retired prefix
+/// was. This avoids both over-counting untaken side blocks and under-counting
+/// blocks completed before a later block faulted.
+fn record_trace_instruction_ranges(
+    tracking: &mut Option<std::collections::HashSet<(u64, u64)>>,
+    blocks: &[lifter::Block],
+    order: &[usize],
+    retired: u64,
+    fault: Option<(usize, usize)>,
+) {
+    if tracking.is_none() {
+        return;
+    }
+    let cycle = order.iter().fold(0_u64, |total, &id| {
+        total.saturating_add(
+            blocks
+                .get(id)
+                .map_or(0, |block| block.num_instructions as u64),
+        )
+    });
+    let mut remaining = retired;
+    for &id in order {
+        let Some(block) = blocks.get(id) else {
+            continue;
+        };
+        let instructions = block.num_instructions as u64;
+        if retired >= cycle || remaining >= instructions {
+            record_instruction_ranges(tracking, &block.pcode, 0, None);
+            remaining = remaining.saturating_sub(instructions);
+        } else {
+            break;
+        }
+    }
+    if let Some((id, through)) =
+        fault.and_then(|(id, through)| order.contains(&id).then_some((id, through)))
+    {
+        if let Some(block) = blocks.get(id) {
+            record_instruction_ranges(tracking, &block.pcode, 0, Some(through));
         }
     }
 }
@@ -2139,5 +2205,71 @@ fn adjust_cpu_fuel_for_block_reentry(
         if !matches!(inst.op, pcode::Op::InstructionMarker) {
             cpu.fuel.remaining = cpu.fuel.remaining.saturating_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_external_targets_are_resolved_by_the_full_address_space_key() {
+        let mut code = BlockTable::default();
+        let group = |block, start| lifter::BlockGroup {
+            blocks: (block, block + 1),
+            start,
+            end: start + 1,
+        };
+        let at = 0x40_0000;
+        code.map.insert(
+            BlockKey {
+                vaddr: at,
+                isa_mode: 1,
+                asid: 7,
+            },
+            group(3, at),
+        );
+        code.map.insert(
+            BlockKey {
+                vaddr: at,
+                isa_mode: 1,
+                asid: 8,
+            },
+            group(9, at),
+        );
+
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 1,
+                    asid: 7,
+                }
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 1,
+                    asid: 8,
+                }
+            ),
+            Some(9)
+        );
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 2,
+                    asid: 8,
+                }
+            ),
+            None
+        );
     }
 }

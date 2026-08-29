@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use linux_compat::digest::{hex, sha256};
 use linux_compat::Machine;
 use x64_engine::{CpuExit, EngineConfig};
 
@@ -39,6 +40,22 @@ fn payload(len: usize) -> Vec<u8> {
             (state >> 24) as u8
         })
         .collect()
+}
+
+#[test]
+fn benchmark_payload_fingerprints_match_the_browser_generator() {
+    for (mib, want) in [
+        (
+            1,
+            "1bc78ba35cac54fe318a6bd7e2acdf69a1eaf7c47c9597b0f6cc10e026aec5a1",
+        ),
+        (
+            4,
+            "0bf23c3f806176c4a7e2e0169ac721515120732ec16cf2d9a7f4b44844b0d649",
+        ),
+    ] {
+        assert_eq!(hex(&sha256(&payload(mib * 1024 * 1024))), want);
+    }
 }
 
 struct Measured {

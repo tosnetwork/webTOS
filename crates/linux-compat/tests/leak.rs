@@ -247,6 +247,40 @@ fn a_host_secret_handle_reads_without_putting_bytes_in_the_filesystem() {
 }
 
 #[test]
+fn host_secret_handles_are_budgeted_and_released_when_their_marker_is_replaced() {
+    let mut machine = machine();
+    machine
+        .set_agent_principal("agent-a")
+        .expect("set agent principal");
+    let baseline = machine.footprint();
+    machine.set_memory_budget(Some(baseline.total_bytes + MARKER.len() - 1));
+    let refused = machine
+        .mount_secret_handle("AGENT_KEY", MARKER, b"/run/secrets/agent-key", "agent-a")
+        .expect_err("host secret bytes bypassed the memory budget");
+    assert!(
+        refused.contains("memory budget"),
+        "unhelpful refusal: {refused}"
+    );
+
+    machine.set_memory_budget(None);
+    machine
+        .mount_secret_handle("AGENT_KEY", MARKER, b"/run/secrets/agent-key", "agent-a")
+        .expect("mount host secret handle");
+    assert!(
+        machine.footprint().host_bytes >= MARKER.len(),
+        "host-backed bytes were absent from the footprint"
+    );
+    machine
+        .add_file(b"/run/secrets/agent-key", Vec::new(), 0o600)
+        .expect("replace marker");
+    assert_eq!(
+        machine.footprint().host_bytes,
+        baseline.host_bytes,
+        "replacing the last marker retained its host secret value"
+    );
+}
+
+#[test]
 fn the_guest_replacing_a_name_does_not_leave_the_old_bytes_behind() {
     let mut machine = machine();
     machine

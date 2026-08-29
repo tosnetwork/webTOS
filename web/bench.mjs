@@ -71,29 +71,11 @@ async function startServer() {
 // Runs entirely inside the page: Playwright serializes it, so it closes over
 // nothing but its argument.
 const benchmark = async (input) => {
-  const { wasmUrl, busyboxUrl, controlUrl, sizesMiB } = input;
+  const { wasmUrl, busyboxUrl, controlUrl, payloadUrl, sizesMiB } = input;
   const FUEL = 50_000_000;
 
   const busybox = new Uint8Array(await (await fetch(busyboxUrl)).arrayBuffer());
-
-  // Deterministic bytes; a compressible pattern would make the measurement
-  // depend on the data rather than the instruction stream.
-  const payload = (length) => {
-    const out = new Uint8Array(length);
-    let lo = 0x4f6cdd1d >>> 0;
-    let hi = 0x2545f491 >>> 0;
-    for (let i = 0; i < length; i += 1) {
-      // xorshift64 over a 32-bit pair, matching the native fixture's shape.
-      let t = lo ^ ((lo << 13) | (hi >>> 19));
-      hi = hi ^ ((hi << 13) | (lo >>> 19));
-      lo = t >>> 0;
-      t = lo ^ (lo >>> 7);
-      hi = hi ^ ((hi >>> 7) | (lo << 25));
-      lo = t >>> 0;
-      out[i] = (hi >>> 16) & 0xff;
-    }
-    return out;
-  };
+  const { benchmarkPayload } = await import(payloadUrl);
 
   // The JIT host imports (inlined; this function runs in the browser page).
   let e;
@@ -160,7 +142,7 @@ const benchmark = async (input) => {
     buildMs = performance.now() - buildStart;
 
     e.wtw_add_file(...put("/bin/busybox"), ...put(busybox));
-    const data = payload(mib * 1024 * 1024);
+    const data = benchmarkPayload(mib * 1024 * 1024);
     e.wtw_file_create(...put("/root/data.bin"), data.length, 0o644);
     for (let at = 0; at < data.length; at += 4 << 20) {
       e.wtw_file_append(...put("/root/data.bin"), ...put(data.subarray(at, at + (4 << 20))));
@@ -239,6 +221,7 @@ const { server, origin } = await startServer();
 const wasmUrl = `${origin}/web/webtos_web.wasm`;
 const busyboxUrl = `${origin}/web/busybox-musl`;
 const controlUrl = `${origin}/web/bench_control.wasm`;
+const payloadUrl = `${origin}/web/bench_payload.mjs`;
 const rows = [];
 
 try {
@@ -256,6 +239,7 @@ try {
         wasmUrl,
         busyboxUrl,
         controlUrl,
+        payloadUrl,
         sizesMiB: [1, 4],
       });
       rows.push({ name, version: context.browser()?.version() ?? "unknown", ...result });

@@ -1360,7 +1360,8 @@ fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
 /// Serializes the guest filesystem for persistence; read the image via
 /// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
 /// One part of the machine's footprint, in kibibytes: 0 guest pages, 1
-/// lifted code, 2 guest files, 3 the total. Kibibytes rather than bytes
+/// lifted code, 2 guest files, 3 the total, 4 host capability bytes.
+/// Kibibytes rather than bytes
 /// because the total passes 4 GiB before a `u32` would.
 #[no_mangle]
 pub extern "C" fn wtw_footprint_kib(part: u32) -> u32 {
@@ -1373,6 +1374,7 @@ pub extern "C" fn wtw_footprint_kib(part: u32) -> u32 {
             0 => f.guest_bytes,
             1 => f.code_bytes,
             2 => f.files_bytes,
+            4 => f.host_bytes,
             _ => f.total_bytes,
         };
         (bytes / 1024) as u32

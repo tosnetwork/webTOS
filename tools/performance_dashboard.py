@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -17,17 +18,80 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def finite_number(value: object, *, positive: bool = False, nonnegative: bool = False) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    if positive and value <= 0:
+        return False
+    if nonnegative and value < 0:
+        return False
+    return True
+
+
 def validate_runs(runs: object, owner: str) -> list[dict]:
-    if not isinstance(runs, list) or [run.get("mib") for run in runs] != [1, 4]:
+    if (
+        not isinstance(runs, list)
+        or not all(isinstance(run, dict) for run in runs)
+        or [run.get("mib") for run in runs] != [1, 4]
+    ):
         raise ValueError(f"{owner} does not contain the 1 MiB and 4 MiB runs")
     for run in runs:
-        if not isinstance(run.get("instructions"), int) or run["instructions"] <= 0:
+        if type(run.get("instructions")) is not int or run["instructions"] <= 0:
             raise ValueError(f"{owner} has invalid instruction count")
-        if not isinstance(run.get("seconds"), (int, float)) or run["seconds"] <= 0:
+        if not finite_number(run.get("seconds"), positive=True):
             raise ValueError(f"{owner} has invalid duration")
     if runs[1]["instructions"] <= runs[0]["instructions"] or runs[1]["seconds"] <= runs[0]["seconds"]:
         raise ValueError(f"{owner} has a non-positive marginal measurement")
     return runs
+
+
+def validate_native(native: object) -> dict:
+    if not isinstance(native, dict) or native.get("schema_version") != 1:
+        raise ValueError("native benchmark input is not schema v1")
+    platform = native.get("platform", {})
+    if platform != {"arch": "x86_64", "kind": "native", "os": "linux"}:
+        raise ValueError("native benchmark must be x86_64 Linux")
+    runs = validate_runs(native.get("runs"), "native")
+    if not finite_number(native.get("machine_build_ms"), nonnegative=True):
+        raise ValueError("native benchmark has invalid machine build duration")
+    marginal = native.get("marginal")
+    expected_seconds = runs[1]["seconds"] - runs[0]["seconds"]
+    if (
+        not isinstance(marginal, dict)
+        or type(marginal.get("instructions")) is not int
+        or marginal["instructions"] != runs[1]["instructions"] - runs[0]["instructions"]
+        or not finite_number(marginal.get("seconds"), positive=True)
+        or not math.isclose(marginal["seconds"], expected_seconds, rel_tol=1e-9, abs_tol=1e-9)
+    ):
+        raise ValueError("native benchmark marginal differs from its runs")
+    return native
+
+
+def validate_browser(engine: object, name: str) -> dict:
+    if not isinstance(engine, dict) or engine.get("name") != name:
+        raise ValueError(f"{name} browser evidence is malformed")
+    if not engine.get("version") or engine.get("version") == "unknown":
+        raise ValueError(f"{name} has no browser version")
+    validate_runs(engine.get("runs"), name)
+    for field in ("machine_build_ms", "module_instantiate_ms", "before_grow_mib"):
+        if not finite_number(engine.get(field), nonnegative=True):
+            raise ValueError(f"{name} has invalid {field}")
+    ceiling = engine.get("linear_memory_ceiling_mib")
+    if not finite_number(ceiling, positive=True) or ceiling < engine["before_grow_mib"]:
+        raise ValueError(f"{name} has invalid memory-ceiling evidence")
+    control = engine.get("control")
+    if (
+        not isinstance(control, dict)
+        or type(control.get("rounds")) is not int
+        or control["rounds"] <= 0
+        or type(control.get("checksum")) is not int
+        or control["checksum"] < 0
+        or not finite_number(control.get("seconds"), positive=True)
+    ):
+        raise ValueError(f"{name} lacks valid control evidence")
+    return engine
 
 
 def build(
@@ -43,19 +107,15 @@ def build(
         raise ValueError("measured-at must be UTC YYYY-MM-DDTHH:MM:SSZ")
     native = json.loads(native_path.read_text(encoding="utf-8"))
     browser = json.loads(browsers_path.read_text(encoding="utf-8"))
-    if native.get("schema_version") != 1 or native.get("platform", {}).get("kind") != "native":
-        raise ValueError("native benchmark input is not schema v1")
-    validate_runs(native.get("runs"), "native")
+    validate_native(native)
     engines = browser.get("engines", [])
     by_name = {engine.get("name"): engine for engine in engines}
     if browser.get("schema_version") != 1 or len(engines) != 3 or set(by_name) != ENGINES:
         raise ValueError("browser benchmark input must cover Chromium, Firefox, and WebKit")
     for name, engine in by_name.items():
-        if not engine.get("version") or engine.get("version") == "unknown":
-            raise ValueError(f"{name} has no browser version")
-        validate_runs(engine.get("runs"), name)
-        if not engine.get("control") or engine.get("linear_memory_ceiling_mib", 0) <= 0:
-            raise ValueError(f"{name} lacks control or memory-ceiling evidence")
+        validate_browser(engine, name)
+    if len({(engine["control"]["rounds"], engine["control"]["checksum"]) for engine in engines}) != 1:
+        raise ValueError("browser control fingerprints diverge")
 
     fingerprints = {
         "native": [run["instructions"] for run in native["runs"]],
@@ -151,21 +211,15 @@ def build_from_report_shape(report: dict, runtime_path: Path) -> dict:
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", report.get("measured_at", "")):
         raise ValueError("performance dashboard has invalid measurement time")
     native = report.get("native", {})
-    if native.get("schema_version") != 1 or native.get("platform", {}).get("kind") != "native":
-        raise ValueError("performance dashboard native evidence is invalid")
-    validate_runs(native.get("runs"), "native")
+    validate_native(native)
     engines = report.get("browsers", [])
     names = [engine.get("name") for engine in engines]
     if names != sorted(ENGINES):
         raise ValueError("performance dashboard does not have three sorted engines")
     for engine in engines:
-        validate_runs(engine.get("runs"), engine["name"])
-        if (
-            not engine.get("version")
-            or not engine.get("control")
-            or engine.get("linear_memory_ceiling_mib", 0) <= 0
-        ):
-            raise ValueError(f"{engine['name']} evidence is incomplete")
+        validate_browser(engine, engine.get("name", "unknown"))
+    if len({(engine["control"]["rounds"], engine["control"]["checksum"]) for engine in engines}) != 1:
+        raise ValueError("performance browser control fingerprints diverge")
     expected = {
         "native": [run["instructions"] for run in native["runs"]],
         **{engine["name"]: [run["instructions"] for run in engine["runs"]] for engine in engines},

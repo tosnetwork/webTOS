@@ -27,13 +27,14 @@ fn ldef_path() -> PathBuf {
 /// Assembles a flat code region, seeds registers, optionally maps a data
 /// buffer, and runs the loop. Returns (final RAX, retired instructions, JIT
 /// dispatches).
-fn run_program(
+fn run_program_details(
     jit: bool,
     code: &[u8],
     regs: &[(&str, u64)],
     data: Option<(u64, Vec<u8>)>,
     icount_limit: u64,
-) -> (u64, u64, u64) {
+    track_executed: bool,
+) -> (u64, u64, u64, u64, u64) {
     let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
     vm.cpu.mem.reset_virtual();
     vm.cpu.reset();
@@ -88,6 +89,7 @@ fn run_program(
         vm.set_jit(Box::new(WasmiJit::new()));
         vm.set_jit_tiering(Some(1));
     }
+    vm.track_executed_bytes(track_executed);
     let _ = vm.run();
 
     let rax = vm
@@ -97,7 +99,25 @@ fn run_program(
         .get_varnode("RAX")
         .map(|v| vm.cpu.read_reg(v))
         .expect("RAX");
-    (rax, vm.cpu.icount(), vm.jit_dispatch_count())
+    (
+        rax,
+        vm.cpu.icount(),
+        vm.jit_dispatch_count(),
+        vm.jit_region_dispatch_count(),
+        vm.executed_byte_count(),
+    )
+}
+
+fn run_program(
+    jit: bool,
+    code: &[u8],
+    regs: &[(&str, u64)],
+    data: Option<(u64, Vec<u8>)>,
+    icount_limit: u64,
+) -> (u64, u64, u64) {
+    let (rax, icount, dispatches, _, _) =
+        run_program_details(jit, code, regs, data, icount_limit, false);
+    (rax, icount, dispatches)
 }
 
 fn assert_matches(label: &str, count: u64, interp: (u64, u64, u64), jit: (u64, u64, u64)) {
@@ -177,6 +197,52 @@ fn a_self_loop_region_stops_at_the_fuel_budget() {
     assert_eq!(
         interp.1, limit,
         "self-loop budget: the interpreter should stop at the instruction limit"
+    );
+}
+
+#[test]
+fn a_multi_block_trace_with_less_than_one_block_of_fuel_falls_back_exactly() {
+    // A: add rax,1; test rcx,rcx; jz done
+    // B: dec rcx; jmp A
+    // With a one-instruction slice, the compiled trace cannot enter its first
+    // whole block. It must fall back to the interpreter, not return zero work
+    // and turn that valid budget boundary into CorruptedBlockMap.
+    let code = [
+        0x48, 0x83, 0xc0, 0x01, 0x48, 0x85, 0xc9, 0x74, 0x05, 0x48, 0xff, 0xc9, 0xeb, 0xf2, 0xf4,
+    ];
+    let regs = [("RAX", 0), ("RCX", 100)];
+    let interp = run_program(false, &code, &regs, None, 1);
+    let jit = run_program(true, &code, &regs, None, 1);
+    assert_eq!(
+        (jit.0, jit.1),
+        (interp.0, interp.1),
+        "a trace at a partial-block fuel boundary diverged from the interpreter"
+    );
+    assert_eq!(
+        jit.1, 1,
+        "the one-instruction slice retired the wrong amount"
+    );
+}
+
+#[test]
+fn a_multi_block_side_exit_tracks_only_instructions_that_ran() {
+    // The static CFG forms a two-block loop, but RCX=0 takes A's side exit on
+    // its first visit, so B never executes. Executed-byte accounting is used
+    // to size lazy delivery and must match the interpreter rather than mark
+    // every block merely because it belonged to the compiled trace.
+    let code = [
+        0x48, 0x83, 0xc0, 0x01, 0x48, 0x85, 0xc9, 0x74, 0x05, 0x48, 0xff, 0xc9, 0xeb, 0xf2, 0xf4,
+    ];
+    let regs = [("RAX", 0), ("RCX", 0)];
+    let interp = run_program_details(false, &code, &regs, None, 100, true);
+    let jit = run_program_details(true, &code, &regs, None, 100, true);
+    assert!(
+        jit.3 > 0,
+        "the multi-block region did not run, so the accounting test proves nothing"
+    );
+    assert_eq!(
+        jit.4, interp.4,
+        "the trace counted source bytes from its untaken block"
     );
 }
 
@@ -756,7 +822,7 @@ fn the_code_budget_evicts_and_recompiles() {
     (vm.cpu.arch.on_boot)(&mut vm.cpu, copy(1));
     let rax = vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX");
 
-    let mut run_under = |vm: &mut x64_engine::InterpVm, asid: u64, at: u64| {
+    let run_under = |vm: &mut x64_engine::InterpVm, asid: u64, at: u64| {
         x64_engine::vm::set_current_asid(asid);
         seed_loop(vm, n);
         vm.cpu.write_pc(at);
