@@ -5,11 +5,11 @@
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
-        "seconds": 0.431
+        "seconds": 0.4323000000119209
       },
       "linear_memory_ceiling_mib": 3892.3125,
-      "machine_build_ms": 134.09999999403954,
-      "module_instantiate_ms": 14.200000002980232,
+      "machine_build_ms": 135,
+      "module_instantiate_ms": 15.599999994039536,
       "name": "chromium",
       "runs": [
         {
@@ -19,7 +19,7 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 1.3094000000059605
+          "seconds": 1.3122000000029803
         },
         {
           "guestCapMiB": 1024,
@@ -28,7 +28,7 @@
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 5.045299999997019
+          "seconds": 5.05279999999702
         }
       ],
       "version": "151.0.7922.34"
@@ -38,11 +38,11 @@
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
-        "seconds": 2.332
+        "seconds": 2.333
       },
       "linear_memory_ceiling_mib": 3892.3125,
-      "machine_build_ms": 1114,
-      "module_instantiate_ms": 61,
+      "machine_build_ms": 1118,
+      "module_instantiate_ms": 66,
       "name": "firefox",
       "runs": [
         {
@@ -52,7 +52,7 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 8.564
+          "seconds": 8.733
         },
         {
           "guestCapMiB": 1024,
@@ -61,7 +61,7 @@
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 33.217
+          "seconds": 33.882
         }
       ],
       "version": "153.0"
@@ -71,10 +71,10 @@
       "control": {
         "checksum": 399047821,
         "rounds": 200000000,
-        "seconds": 0.435
+        "seconds": 0.434
       },
       "linear_memory_ceiling_mib": 3892.3125,
-      "machine_build_ms": 133,
+      "machine_build_ms": 135,
       "module_instantiate_ms": 12,
       "name": "webkit",
       "runs": [
@@ -85,7 +85,7 @@
           "instructions": 13369660,
           "label": "md5sum 1 MiB",
           "mib": 1,
-          "seconds": 1.144
+          "seconds": 1.178
         },
         {
           "guestCapMiB": 1024,
@@ -94,7 +94,7 @@
           "instructions": 53448508,
           "label": "md5sum 4 MiB",
           "mib": 4,
-          "seconds": 4.345
+          "seconds": 4.474
         }
       ],
       "version": "26.5"
@@ -118,7 +118,7 @@
       53448508
     ]
   },
-  "measured_at": "2026-08-29T15:21:36Z",
+  "measured_at": "2026-08-29T15:41:42Z",
   "native": {
     "machine_build_ms": 262.148138,
     "marginal": {
@@ -145,8 +145,8 @@
     "schema_version": 1
   },
   "runtime": {
-    "sha256": "2d06f1e272eed21432ebf051f646f36a49bb742813593060aaeb3beaf5f9ad10",
-    "source_commit": "bdeb88653720f84e7d0c4d9d28bd69c5eefdc6f1"
+    "sha256": "8491ee0580a8d8d4498fed9c714c0d43b167289e71f4e186baf625685ef76f08",
+    "source_commit": "1abe0130d2c805567cddd576b15fda04506ca93c"
   },
   "schema_version": 1
 }
