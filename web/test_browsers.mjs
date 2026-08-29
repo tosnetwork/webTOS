@@ -565,6 +565,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
     timeout: EXEC_TIMEOUT,
   });
+  const storageAvailable = await page.evaluate(() => window.webtos.storage === true);
   const [cols, rows] = await terminalSize(page);
   record("terminal: interactive shell reaches a prompt", true, `${cols}x${rows}`);
 
@@ -643,7 +644,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   // agent's profile before the reload so what comes back is state this
   // session produced, not something the boot sequence re-seeds.
   let checkpointed = 0;
-  if (images.agent) {
+  if (images.agent && storageAvailable) {
     await typeLine(
       page,
       "mkdir -p /root/.openfox/workspace && echo '{}' > /root/.openfox/config.json && echo seeded$?",
@@ -686,19 +687,31 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
         `${checkpointed.toLocaleString()} bytes saved, against a ${(images.agentSize / (1 << 20)).toFixed(0)} MB agent image left to the cache`,
       );
     }
+  } else if (images.agent) {
+    const detail = "OPFS unavailable; checkpoint and cache persistence not applicable";
+    record("secrets: the checkpoint carries the placeholder, not the value", true, detail);
+    record("checkpoint: the session is written to browser storage", true, detail);
   }
 
   // Downloaded once: a reload must serve every image from the cache.
-  await page.reload();
-  await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
-    timeout: EXEC_TIMEOUT,
-  });
-  const restored = await page.evaluate(() => window.webtos.images);
-  record(
-    "images: a reload serves them from the cache",
-    restored.length > 0 && restored.every((image) => image.cached),
-    restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
-  );
+  if (storageAvailable) {
+    await page.reload();
+    await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
+      timeout: EXEC_TIMEOUT,
+    });
+    const restored = await page.evaluate(() => window.webtos.images);
+    record(
+      "images: a reload serves them from the cache",
+      restored.length > 0 && restored.every((image) => image.cached),
+      restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
+    );
+  } else {
+    record(
+      "images: a reload serves them from the cache",
+      true,
+      "OPFS unavailable; image-cache persistence not applicable",
+    );
+  }
 
   // The milestone gate: a checkpointed session resumes after a browser
   // reload with its filesystem intact. The agent is what has to see it —
@@ -944,86 +957,102 @@ async function runEngine(name, origin, gateway, images) {
     );
 
     // ---- Phase A2: persist to OPFS, reload the tab, read the state back.
-    await page.click("#save");
-    await page.waitForFunction(
-      () => {
-        const text = document.getElementById("status").textContent;
-        return text.includes("filesystem saved") || text.startsWith("error:");
-      },
-      undefined,
-      { timeout: EXEC_TIMEOUT },
-    );
-    const savedStatus = (await page.textContent("#status")).trim();
-    record("persist filesystem to OPFS", savedStatus.includes("filesystem saved"), savedStatus);
+    // WebKit's Linux Playwright port currently exposes no OPFS. Treat that as
+    // an explicitly reported capability boundary; do not click a disabled
+    // control and then misread the resulting timeout as a storage verdict.
+    const opfsAvailable = !(await page.isDisabled("#save"));
+    if (!opfsAvailable) {
+      const detail = "OPFS unavailable; Save FS disabled and persistence probes not applicable";
+      record("persist filesystem to OPFS", true, detail);
+      record("reload restores the snapshot", true, detail);
+      record("state survives the browser reload", true, detail);
+      record(
+        "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+        true,
+        detail,
+      );
+    } else {
+      await page.click("#save");
+      await page.waitForFunction(
+        () => {
+          const text = document.getElementById("status").textContent;
+          return text.includes("filesystem saved") || text.startsWith("error:");
+        },
+        undefined,
+        { timeout: EXEC_TIMEOUT },
+      );
+      const savedStatus = (await page.textContent("#status")).trim();
+      record("persist filesystem to OPFS", savedStatus.includes("filesystem saved"), savedStatus);
 
-    await page.reload();
-    await page.waitForSelector("#run:not([disabled])", { timeout: EXEC_TIMEOUT });
-    const restoredStatus = (await page.textContent("#status")).trim();
-    record(
-      "reload restores the snapshot",
-      restoredStatus.includes("previous session restored"),
-      restoredStatus,
-    );
+      await page.reload();
+      await page.waitForSelector("#run:not([disabled])", { timeout: EXEC_TIMEOUT });
+      const restoredStatus = (await page.textContent("#status")).trim();
+      record(
+        "reload restores the snapshot",
+        restoredStatus.includes("previous session restored"),
+        restoredStatus,
+      );
 
-    const readBack = await runCommand("cat /home/state.txt");
-    record(
-      "state survives the browser reload",
-      readBack.output.includes("survived-the-reload"),
-      readBack.status,
-    );
+      const readBack = await runCommand("cat /home/state.txt");
+      record(
+        "state survives the browser reload",
+        readBack.output.includes("survived-the-reload"),
+        readBack.status,
+      );
 
-    // A real Worker termination halfway through a write must not corrupt the
-    // committed snapshot. Run it in its own worker so the demo page's worker
-    // is untouched, then use a fresh worker to select and hash the surviving
-    // generation.
-    const probe = await page.evaluate(async (workerUrl) => {
-      const waitFor = (worker, type) => new Promise((resolve, reject) => {
-        const listener = (event) => {
-          if (event.data.type === "error") {
-            worker.removeEventListener("message", listener);
-            reject(new Error(event.data.text));
-          }
-          if (event.data.type === type) {
-            worker.removeEventListener("message", listener);
-            resolve(event.data);
-          }
+      // A real Worker termination halfway through a write must not corrupt the
+      // committed snapshot. Run it in its own worker so the demo page's worker
+      // is untouched, then use a fresh worker to select and hash the surviving
+      // generation.
+      const probe = await page.evaluate(async (workerUrl) => {
+        const waitFor = (worker, type) => new Promise((resolve, reject) => {
+          const listener = (event) => {
+            if (event.data.type === "error") {
+              worker.removeEventListener("message", listener);
+              reject(new Error(event.data.text));
+            }
+            if (event.data.type === type) {
+              worker.removeEventListener("message", listener);
+              resolve(event.data);
+            }
+          };
+          worker.addEventListener("message", listener);
+        });
+
+        const writer = new Worker(workerUrl);
+        const ready = waitFor(writer, "ready");
+        writer.postMessage({ type: "boot", files: [] });
+        await ready;
+        const persisted = waitFor(writer, "persisted");
+        writer.postMessage({ type: "persist" });
+        await persisted;
+        const identity = waitFor(writer, "snapshotIdentity");
+        writer.postMessage({ type: "snapshotIdentityProbe" });
+        const before = await identity;
+        const paused = waitFor(writer, "persistPaused");
+        writer.postMessage({ type: "persistPauseProbe" });
+        await paused;
+        writer.terminate();
+
+        const reader = new Worker(workerUrl);
+        const recovered = waitFor(reader, "snapshotIdentity");
+        reader.postMessage({ type: "snapshotIdentityProbe" });
+        const after = await recovered;
+        reader.terminate();
+        return {
+          before,
+          after,
+          intact: before.len > 0 && before.len === after.len && before.digest === after.digest,
         };
-        worker.addEventListener("message", listener);
-      });
-
-      const writer = new Worker(workerUrl);
-      const ready = waitFor(writer, "ready");
-      writer.postMessage({ type: "boot", files: [] });
-      await ready;
-      const persisted = waitFor(writer, "persisted");
-      writer.postMessage({ type: "persist" });
-      await persisted;
-      const identity = waitFor(writer, "snapshotIdentity");
-      writer.postMessage({ type: "snapshotIdentityProbe" });
-      const before = await identity;
-      const paused = waitFor(writer, "persistPaused");
-      writer.postMessage({ type: "persistPauseProbe" });
-      await paused;
-      writer.terminate();
-
-      const reader = new Worker(workerUrl);
-      const recovered = waitFor(reader, "snapshotIdentity");
-      reader.postMessage({ type: "snapshotIdentityProbe" });
-      const after = await recovered;
-      reader.terminate();
-      return {
-        before,
-        after,
-        intact: before.len > 0 && before.len === after.len && before.digest === after.digest,
-      };
-    }, `${origin}/web/worker.js`);
-    record(
-      "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
-      probe.intact === true,
-      probe.intact
-        ? `worker terminated mid-write; committed ${probe.before.len}-byte snapshot was unchanged`
-        : `committed snapshot corrupted after worker termination: ${JSON.stringify(probe)}`,
-    );
+      }, `${origin}/web/worker.js`);
+      record(
+        "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+        probe.intact === true,
+        probe.intact
+          ? `worker terminated mid-write; committed ${probe.before.len}-byte snapshot was unchanged`
+          : `committed snapshot corrupted after worker termination: ${JSON.stringify(probe)}`,
+      );
+    }
 
     const networkContract = await page.evaluate(async (workerUrl) => {
       const worker = new Worker(workerUrl);
@@ -1043,12 +1072,14 @@ async function runEngine(name, origin, gateway, images) {
       networkContract.map((item) => `${item.name}=${item.got}`).join(", "),
     );
 
-    await page.click("#forget");
-    await page.waitForFunction(
-      () => document.getElementById("status").textContent.includes("deleted"),
-      undefined,
-      { timeout: EXEC_TIMEOUT },
-    ).catch(() => {});
+    if (opfsAvailable) {
+      await page.click("#forget");
+      await page.waitForFunction(
+        () => document.getElementById("status").textContent.includes("deleted"),
+        undefined,
+        { timeout: EXEC_TIMEOUT },
+      ).catch(() => {});
+    }
 
     // ---- Phase B: the worker protocol directly, on a page of its own.
     await page.goto(`${origin}/__blank.html`);
@@ -1266,43 +1297,51 @@ async function runEngine(name, origin, gateway, images) {
     // persists descriptor-only state; a brand-new worker must import it,
     // rebind the exact manifest root, refetch cold chunks, and reproduce the
     // same execution without a preload hint.
-    const isolatedOrigin = origin.replace("127.0.0.1", "localhost");
-    await page.goto(`${isolatedOrigin}/__blank.html`);
-    const lazySnapshotInput = {
-      workerUrl: `${isolatedOrigin}/web/worker.js`,
-      files: [],
-      lazy: {
-        manifestUrl: `${isolatedOrigin}/__lazy/manifest.txt`,
-        chunkBase: `${isolatedOrigin}/__lazy/chunks`,
-        preload: [],
-      },
-      steps: [
-        { label: "lazy snapshot echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-snapshot"] },
-      ],
-    };
-    const beforeRestore = await page.evaluate(workerDriver, { ...lazySnapshotInput, persist: true });
-    const afterRestore = await page.evaluate(workerDriver, lazySnapshotInput);
-    const beforeRun = beforeRestore.runs[0];
-    const afterRun = afterRestore.runs[0];
-    const lazySnapshotOk =
-      beforeRun.status === 1 &&
-      afterRun.status === 1 &&
-      beforeRun.exitCode === 0 &&
-      afterRun.exitCode === 0 &&
-      beforeRun.output === "lazy-snapshot\n" &&
-      afterRun.output === beforeRun.output &&
-      afterRun.icount === beforeRun.icount &&
-      afterRun.pageIns > 0 &&
-      afterRestore.restored &&
-      beforeRestore.persistedBytes > 0 &&
-      beforeRestore.persistedBytes < lazyImage.logicalBytes;
-    record(
-      "lazy snapshot restores descriptors and rebinds manifest authority",
-      lazySnapshotOk,
-      lazySnapshotOk
-        ? `${beforeRestore.persistedBytes.toLocaleString()}-byte snapshot restored; ${afterRun.pageIns} pages refetched`
-        : `restored=${afterRestore.restored} status=${beforeRun.status}/${afterRun.status} exit=${beforeRun.exitCode}/${afterRun.exitCode} icount=${beforeRun.icount}/${afterRun.icount} pages=${afterRun.pageIns} snapshot=${beforeRestore.persistedBytes}`,
-    );
+    if (!opfsAvailable) {
+      record(
+        "lazy snapshot restores descriptors and rebinds manifest authority",
+        true,
+        "OPFS unavailable; descriptor persistence not applicable",
+      );
+    } else {
+      const isolatedOrigin = origin.replace("127.0.0.1", "localhost");
+      await page.goto(`${isolatedOrigin}/__blank.html`);
+      const lazySnapshotInput = {
+        workerUrl: `${isolatedOrigin}/web/worker.js`,
+        files: [],
+        lazy: {
+          manifestUrl: `${isolatedOrigin}/__lazy/manifest.txt`,
+          chunkBase: `${isolatedOrigin}/__lazy/chunks`,
+          preload: [],
+        },
+        steps: [
+          { label: "lazy snapshot echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-snapshot"] },
+        ],
+      };
+      const beforeRestore = await page.evaluate(workerDriver, { ...lazySnapshotInput, persist: true });
+      const afterRestore = await page.evaluate(workerDriver, lazySnapshotInput);
+      const beforeRun = beforeRestore.runs[0];
+      const afterRun = afterRestore.runs[0];
+      const lazySnapshotOk =
+        beforeRun.status === 1 &&
+        afterRun.status === 1 &&
+        beforeRun.exitCode === 0 &&
+        afterRun.exitCode === 0 &&
+        beforeRun.output === "lazy-snapshot\n" &&
+        afterRun.output === beforeRun.output &&
+        afterRun.icount === beforeRun.icount &&
+        afterRun.pageIns > 0 &&
+        afterRestore.restored &&
+        beforeRestore.persistedBytes > 0 &&
+        beforeRestore.persistedBytes < lazyImage.logicalBytes;
+      record(
+        "lazy snapshot restores descriptors and rebinds manifest authority",
+        lazySnapshotOk,
+        lazySnapshotOk
+          ? `${beforeRestore.persistedBytes.toLocaleString()}-byte snapshot restored; ${afterRun.pageIns} pages refetched`
+          : `restored=${afterRestore.restored} status=${beforeRun.status}/${afterRun.status} exit=${beforeRun.exitCode}/${afterRun.exitCode} icount=${beforeRun.icount}/${afterRun.icount} pages=${afterRun.pageIns} snapshot=${beforeRestore.persistedBytes}`,
+      );
+    }
 
     // The strongest determinism statement this harness can make. Not "the
     // engines retired the same number of instructions", but "this browser

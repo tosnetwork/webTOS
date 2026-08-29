@@ -33,15 +33,15 @@ terminal behavior, and recovery after a browser reload.
 
 | Milestone | State | Completion | Evidence |
 |-----------|-------|------------|----------|
-| M0 Lock the baseline | 🔶 | ~93% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. The executable fixtures and reference traces are now a pinned set (`test_data/FIXTURES.sha256`); the pre-pivot native QEMU kernel harnesses have been removed with the kernel they validated; measurement harnesses exist but no dashboard |
+| M0 Lock the baseline | ✅ | ~100% | reference traces reproduce natively and in all three browser engines; skips are visible and forbidden by `WEBTOS_REQUIRE_FIXTURES=1`; executable fixtures and traces are pinned by `test_data/FIXTURES.sha256`; and `docs/performance/` publishes a versioned native/Chromium/Firefox/WebKit dashboard whose CI verifier rejects runtime, fingerprint, schema, or rendered-report drift |
 | M1 Static `hello` | ✅ | ~98% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
-| M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
-| M3 Dynamic userland | ✅ | ~95% | musl and glibc loaders green, native + wasm; file-backed mappings, the initial ELF, and the dynamic loader demand-page from a content-addressed manifest, fetching only what execution touches; no per-package rootfs license manifest |
+| M2 Static BusyBox | ✅ | ~97% | applet gates green; reload persistence is verified where OPFS exists (Chromium and Firefox in the current matrix), while WebKit reports the capability unavailable and disables persistence controls instead of pretending to save |
+| M3 Dynamic userland | ✅ | ~100% | musl and glibc loaders green, native + wasm; file-backed mappings, the initial ELF, and the dynamic loader demand-page from a content-addressed manifest; the pinned Alpine rootfs now has a generated 14-package license/source/redistribution inventory and fails closed on an undecided license |
 | M4 Threads & processes | ✅ | ~97% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
-| M5 Event loop & networking | ✅ | ~99% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, and suspension now gated; a session records and replays offline, a dropped connection leaves an error not a wait, and a suspended tab is told how much real time passed |
+| M5 Event loop & networking | ✅ | ~100% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. Socket interruption obeys `EINTR`/`SA_RESTART`; bytes are metered and capped; recording/replay, reconnect, and suspension are gated. The last proxy-failure ambiguity is closed: policy/upgrade rejection, upstream refusal, abnormal relay failure before/after connect, and clean EOF map to distinct documented Linux outcomes, with native delivery-once and browser boundary gates |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
 | M7 Codex & Claude Code | 🔶 | ~95% | **Both Codex modes run end to end.** Non-interactive: a real `exec` edits a file, runs a shell command, and prints the model's summary, exiting 0. Interactive: the real Codex TUI renders full-screen on a host-driven pty (capability probes, a bordered composer, `Ask Codex to do anything`), takes keystrokes, and quits cleanly on Ctrl-C. Getting here took real process groups, true 80-bit x87 software floating point, `mremap`, an argv/envp size fix, three network-ABI write-back fixes, keying the translated-block cache by address space, pseudoterminals with SIGWINCH-on-resize, and a host-driven stdio pty. The host `git` binary runs real repo ops (status/diff/add/commit/log) in the guest. The browser now has the terminal half of this: an interactive shell and a full-screen editor run on a pty in a tab in all three engines, and `/dev/tty` resolves to the controlling terminal so a shell's job control reaches the program it started. The terminal is now a terminal in the sense that matters for an agent: the input line discipline turns `^C` and `^Z` into signals on the foreground group, a stopped process group is a real scheduler state reported through `wait4(WUNTRACED)`, `fg` resumes it, and a background group that reads the terminal is stopped with SIGTTIN rather than competing for the user's keystrokes. A session checkpointed to browser storage resumes after a real reload, with the agent reading back its own profile. Image delivery to the browser is closed for both real agents: the 256 MB Codex standalone and the dynamically linked Claude Code — Bun runtime, loader, and glibc all manifest-delivered, every file lazy — answer version and help in a clean profile in all three engines, demand-paging 8% and 12% of their images, with retired instruction counts identical on every engine (Claude's 186-million-instruction run included). **A session that does work now finishes**: asked to change a value in a file and check it, Codex read the file, applied its own patch, ran `cat` on a pty it allocated, reported what that subprocess printed, and exited 0. Two engine defects of one shape were in the way, each an unimplemented case reported as an unrecoverable error — a vaddr-keyed disassembly map disagreeing with the asid-keyed block cache on every `execve`, and `TCSETSF` missing from the ioctl table |
-| M8 Performance & release | 🔶 | ~97% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. Two more surfaces are now swept. Every argument position of every syscall number against a corpus of the ways a number breaks code that trusts it, singly and paired, against four page contents, 7,128,576 cases — which found five more defects, four of them wrapped arithmetic that only the `relcheck` profile can see, including an `align_up` that turned an address at the top of the space into page zero and an `mprotect` of length zero that took the host down. And the decoder, which the guest reaches without a syscall at all by mapping a page executable and jumping into it: every opcode in all four maps under seventeen prefix combinations, then again truncated against a mapping boundary, 365,568 sequences, clean. The host side of the boundary is swept too, from Node against the real module: thirty-two distinct traps, all from a `slice_arg` whose documented safety contract — that the pointer came from `wtw_alloc` — a caller breaks by passing a different number. Executing guest bytes found three defects the decoder pass could not: a family of SIMD helpers written for the 128-bit form of their instruction and handed the 64-bit MMX form, which reads a register at a size it does not have; the address after an instruction at the top of the address space, computed with an addition that overflowed; and a zero-length executable range whose last address underflowed. CPU and the event log now have ceilings of their own: a workload that computes without ever entering the kernel used to be outside every mechanism for stopping a task, and the trace could grow until the tab died. Hot-block translation to WebAssembly has landed: a p-code→wasm translator covers every op whose semantics wasm can reproduce, held bit-for-bit to the interpreter by a block-level gate, and is wired into the run loop both natively and in the browser — where a hot block compiles to native code the WebAssembly engine produces and runs against the engine's own memory with no copy, guest memory reached through a softmmu callback. Region compilation then landed — a hot self-loop's back-edge folded into one wasm function, so millions of iterations are one `jit_call`, not one each — taking a register compute loop to ~30x over the interpreter in V8 (up from 2.76x per block) and, once host self-loops were covered with fault-in-region accounting, a memory-scan loop to ~4.6x. A bail-cause histogram weighted by executed work then scoped the coverage work — ~100% JIT-able for scalar static-musl hot paths (sha/gzip), lower for glibc/Node — and the 128-bit move/widen/logic quartet took Node from 89.9 to 94.3% and codex to 97.6%. Then the inline softmmu fast path landed: a compiled load/store resolves entirely in wasm against icicle's live TLB and the resolved guest page in the shared linear memory, calling the host only on a miss, fault, or cross-page access, which took the memory-scan loop from 4.6x to ~30x — matching the compute loop — as host crossings fell from one-per-byte to one-per-page, and a native fastmem gate proves a warm hit makes zero host calls while stale, aliased, and no-permission entries defer. The whole JIT line is now verified on the x86-64 Linux host with the real fixtures under `WEBTOS_REQUIRE_FIXTURES=1` (no skips): 188 tests green across 37 binaries, the six softmmu correctness gates among them. The exit gate that optimized and interpreter modes reproduce the same architectural traces is now closed too — a JIT-mode trace suite holds each recorded workload byte-for-byte to the interpreter's reference, and building it found and fixed a real defect (a zero-instruction block was being JIT-dispatched, desyncing icount from state). The 128-bit arithmetic ops then landed — a full u128 multiply (the schoolbook mulhi plus cross terms, since wasm has no widening multiply) and the u128 shifts (two lanes with the boundary-crossing carry, selected on the count at run time) — gated against the interpreter over generative inputs, so the only wide op left to bail is the odd 16-byte rotate. The release tail now has deterministic locked workload images, detached signatures and OIDC attestation definitions, and a generated, verifier-gated 43/43-per-engine compatibility report. What remains is true multi-block regions and external release/key operations |
+| M8 Performance & release | 🔶 | ~99% | wasm opt pin, deterministic scheduling, a measured baseline with a control module (`docs/performance.md`) plus the versioned four-host dashboard (`docs/performance/`), and the first optimization landed: a content-addressed lift cache took `execve` from 48.8 ms to about 2 ms and fixed a block-sharing bug in the process, block profiling established that a real agent's startup has no hot path to translate, and tiered lifting cut a cold agent start from 5.3 s to 1.4 s at no cost to compute. Memory is now accounted by what it is spent on and can be capped, so a workload that will not fit a tab is refused at the request instead of dying part-way through. Storage and network now have ceilings of their own, and a guest over either sees an errno it already knows how to handle rather than a dead tab. Two surfaces are swept for corruption and fail closed — snapshot restore, where the sweep found a memory amplification and a 32-bit narrowing that only a browser could exhibit, and ELF loading, where it found five panics. Two more surfaces are now swept. Every argument position of every syscall number against a corpus of the ways a number breaks code that trusts it, singly and paired, against four page contents, 7,128,576 cases — which found five more defects, four of them wrapped arithmetic that only the `relcheck` profile can see, including an `align_up` that turned an address at the top of the space into page zero and an `mprotect` of length zero that took the host down. And the decoder, which the guest reaches without a syscall at all by mapping a page executable and jumping into it: every opcode in all four maps under seventeen prefix combinations, then again truncated against a mapping boundary, 365,568 sequences, clean. The host side of the boundary is swept too, from Node against the real module: thirty-two distinct traps, all from a `slice_arg` whose documented safety contract — that the pointer came from `wtw_alloc` — a caller breaks by passing a different number. Executing guest bytes found three defects the decoder pass could not: a family of SIMD helpers written for the 128-bit form of their instruction and handed the 64-bit MMX form, which reads a register at a size it does not have; the address after an instruction at the top of the address space, computed with an addition that overflowed; and a zero-length executable range whose last address underflowed. CPU and the event log now have ceilings of their own: a workload that computes without ever entering the kernel used to be outside every mechanism for stopping a task, and the trace could grow until the tab died. Hot-block translation to WebAssembly has landed: a p-code→wasm translator covers every op whose semantics wasm can reproduce, held bit-for-bit to the interpreter by a block-level gate, and is wired into the run loop both natively and in the browser — where a hot block compiles to native code the WebAssembly engine produces and runs against the engine's own memory with no copy, guest memory reached through a softmmu callback. Region compilation then landed — a hot self-loop's back-edge folded into one wasm function, so millions of iterations are one `jit_call`, not one each — taking a register compute loop to ~30x over the interpreter in V8 (up from 2.76x per block) and, once host self-loops were covered with fault-in-region accounting, a memory-scan loop to ~4.6x. A bail-cause histogram weighted by executed work then scoped the coverage work — ~100% JIT-able for scalar static-musl hot paths (sha/gzip), lower for glibc/Node — and the 128-bit move/widen/logic quartet took Node from 89.9 to 94.3% and codex to 97.6%. Then the inline softmmu fast path landed: a compiled load/store resolves entirely in wasm against icicle's live TLB and the resolved guest page in the shared linear memory, calling the host only on a miss, fault, or cross-page access, which took the memory-scan loop from 4.6x to ~30x — matching the compute loop — as host crossings fell from one-per-byte to one-per-page, and a native fastmem gate proves a warm hit makes zero host calls while stale, aliased, and no-permission entries defer. The whole JIT line is now verified on the x86-64 Linux host with the real fixtures under `WEBTOS_REQUIRE_FIXTURES=1` (no skips): the current strict test matrix is green across every test binary, the six softmmu correctness gates among them. The exit gate that optimized and interpreter modes reproduce the same architectural traces is now closed too — a JIT-mode trace suite holds each recorded workload byte-for-byte to the interpreter's reference, and building it found and fixed a real defect (a zero-instruction block was being JIT-dispatched, desyncing icount from state). The 128-bit arithmetic ops then landed — a full u128 multiply (the schoolbook mulhi plus cross terms, since wasm has no widening multiply) and the u128 shifts (two lanes with the boundary-crossing carry, selected on the count at run time) — gated against the interpreter over generative inputs, so the only wide op left to bail is the odd 16-byte rotate. The release tail now has deterministic locked workload images, detached signatures and OIDC attestation definitions, and a generated, verifier-gated 43/43-per-engine compatibility report. True multi-block regions are now closed; what remains is external release/key operations |
 
 The M8 release slice now has a dated Rust toolchain, a committed Cargo lockfile,
 a frozen and path-remapped build with a fixed compile-time random seed, an SPDX
@@ -58,28 +58,36 @@ and changed mtimes produce identical results, while OpenFox additionally
 reproduces from pinned source with Go 1.25.13. Detached workload signing is
 implemented without creating a production key. The compatibility dashboard
 records 43/43 checks in Chromium, Firefox, and WebKit against all four locked
-workloads.
+workloads. The separate performance authority in `docs/performance/` binds the
+Linux native run, all three browser versions, control-module rates, memory
+ceilings, exact cross-host instruction fingerprints, runtime SHA-256, source
+commit, and measurement time; its workflow rebuilds the Linux Wasm and rejects
+digest or Markdown drift. `docs/EXECUTION_RECORD_V1.md` and
+`tools/execution_record.py` add the smallest portable run-evidence envelope:
+runtime/workload/input identities, before/after checkpoints, policy, network
+recording and receipts, terminal output/result, instruction count, trace
+artifact/root, and the record itself are all digest-bound and reverified.
 
 ### Overall completion
 
-Weighted by engineering effort, **roughly 97%**. The weights are a judgement
+Weighted by engineering effort, **roughly 98%**. The weights are a judgement
 call, so here is the arithmetic rather than the assertion:
 
 | Milestone | Weight | Done | Contribution |
 |---|---|---|---|
-| M0 Lock the baseline | 5% | 93% | 4.7 |
+| M0 Lock the baseline | 5% | 100% | 5.0 |
 | M1 Static `hello` | 5% | 98% | 4.9 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
-| M3 Dynamic userland | 10% | 95% | 9.5 |
+| M3 Dynamic userland | 10% | 100% | 10.0 |
 | M4 Threads & processes | 13% | 97% | 12.6 |
-| M5 Event loop & networking | 13% | 99% | 12.9 |
+| M5 Event loop & networking | 13% | 100% | 13.0 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 95% | 19.0 |
-| M8 Performance & release | 14% | 97% | 13.6 |
-| **Total** | **100%** | | **96.5** |
+| M8 Performance & release | 14% | 99% | 13.9 |
+| **Total** | **100%** | | **97.7** |
 
-The heaviest remaining items are the last M7 product gates and M8 true
-multi-block JIT regions. Release publication, the first OIDC workflow run, and
+The heaviest remaining items are the last M7 Claude Code product gates.
+Release publication, the first OIDC workflow run, and
 production workload-key custody are external maintainer gates rather than code
 that can be truthfully marked complete in a local worktree.
 
@@ -96,23 +104,23 @@ The milestone sections below carry the detail. This is the same work grouped
 by what it unblocks, because the outstanding items do not line up with the
 milestone numbering any more.
 
-### Parallel queue outside the active Claude work
+### Completed parallel queue outside the active Claude work
 
 Coordination snapshot, 2026-08-29: Claude is working on the M7 Claude Code TUI
 and long-run diagnosis in `crates/linux-compat/examples/run_guest.rs` and
 `web/probe_claude_tui.mjs`. The queue below deliberately excludes those files
 and that acceptance path.
 
-| Priority | Work we can take independently | Concrete exit gate |
-|---|---|---|
-| P0 | Name and gate the remaining M5 proxy-failure case | A broker/proxy that accepts the request and then fails produces the documented guest errno, never a hang; native and browser boundary tests go red if the mapping is removed |
-| P0 | Make browser-worker cancellation storage-safe | Terminating a worker during snapshot/image persistence leaves the last committed state readable after reload; an interrupted write is never selected as current |
-| P1 | Publish the M0 performance dashboard | Versioned JSON plus rendered Markdown report native/Chromium/Firefox/WebKit results from the existing control and workload harnesses; CI rejects report/render drift |
-| P1 | Close the M3 minimal-root licensing gap | The pinned Alpine image emits a per-package inventory with package version, source, license, and redistribution decision; image construction fails on an undecided package |
-| P1 | Specify Execution Record V1, then implement the smallest verifier | A canonical record binds runtime/workload identities, inputs, storage checkpoint, network receipts, output, and trace root; tampering any binding makes verification fail |
-| P2 | Implement true multi-block JIT regions | A relooper compiles a bounded multi-block CFG, interpreter/JIT architectural traces remain identical, and browser benchmarks prove fewer dispatches without a new unbounded cache |
-| P2 | Replace file-delivered secrets with real host handles | A guest can use a scoped credential without the secret bytes entering its filesystem, snapshot, trace, or crash bundle; cross-agent access is refused |
-| P2 | Close the remaining background-terminal semantics | Background `tcsetattr`/`tcsetpgrp` receive `SIGTTOU` as Linux requires, with native Linux fixtures that go red if either control operation is allowed silently |
+| Status | Priority | Independent work | Closed by |
+|---|---|---|---|
+| ✅ | P0 | Name and gate the remaining M5 proxy-failure case | Native error-delivery-once test plus all-engine browser boundary mapping |
+| ✅ | P0 | Make browser-worker cancellation storage-safe | Digest-checked dual generations; real mid-write Worker termination in Chromium and Firefox; WebKit reports OPFS unavailable |
+| ✅ | P1 | Publish the M0 performance dashboard | Versioned JSON/Markdown for native and three engines; CI rejects runtime or render drift |
+| ✅ | P1 | Close the M3 minimal-root licensing gap | Generated 14-package inventory; unknown expressions fail closed |
+| ✅ | P1 | Specify Execution Record V1 and verifier | Runtime/workload/inputs/checkpoints/network/output/trace bindings all verified against tampering |
+| ✅ | P2 | Implement true multi-block JIT regions | Bounded state-machine regions, exact fuel/fault resume, trace parity, and browser dispatch canary |
+| ✅ | P2 | Replace file-delivered secrets with real host handles | Bytes stay outside VFS/snapshots; host principals reject cross-agent opens and inherited-fd reads |
+| ✅ | P2 | Close background-terminal semantics | Linux fixture proves background `tcsetattr` and `tcsetpgrp` both stop with `SIGTTOU` |
 
 External maintainer gates are not implementation work: run the OIDC release
 workflow from the committed branch, choose and publish the production workload
@@ -173,9 +181,11 @@ what is left is the agent itself.
   reply, ends with `EINTR` after its handler runs, and with `SA_RESTART`
   resumes and reads bytes the peer sent only afterwards. That gate needs a
   compiled C fixture, so it runs on the Linux host and skips on macOS.
-- **SIGTTOU on terminal writes** fires only when `TOSTOP` is set, which the
-  default termios leaves off, matching Linux — but `tcsetattr` and
-  `tcsetpgrp` from a background group should raise it regardless, and do not.
+- ~~**SIGTTOU on background terminal state changes.**~~ Closed: terminal
+  writes still obey `TOSTOP`, while background `tcsetattr` and `tcsetpgrp`
+  stop the calling process group with `SIGTTOU` regardless of `TOSTOP`.
+  `tests/pty.rs` proves both operations independently with a native Linux C
+  fixture.
 - **The long soaks**: OpenFox's three-hour 8,000-round run and bounded event-log
   growth are done; a multi-hour Codex or Claude Code session is not. The soak
   asserts four
@@ -186,7 +196,9 @@ what is left is the agent itself.
 
 ### Making it usable rather than possible (M8)
 
-Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
+Measured, not guessed — see the analysis in
+[`docs/performance.md`](docs/performance.md) and the current four-host evidence
+in [`docs/performance/`](docs/performance/).
 
 - ~~**Reuse lifted blocks across processes that share an image.**~~ Done: the
   engine indexes lifted groups by address and content as well as by address
@@ -206,8 +218,13 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   (matching the compute loop) as host crossings dropped from one-per-byte to
   one-per-page. The 128-bit *arithmetic* ops then landed too — the full u128
   multiply and the u128 shifts, the cross-lane residue the quartet could not
-  decompose, gated against the interpreter over generative inputs. What remains:
-  true multi-block regions (a relooper).
+  decompose, gated against the interpreter over generative inputs. Bounded
+  multi-block regions now close the remaining dispatch gap: a hot CFG becomes
+  one Wasm state-machine loop with static side exits and exact retired-count/
+  fault-resume metadata. The two-block browser canary makes 100,000 iterations
+  in one region dispatch (about 200,000 without it), while interpreter/JIT
+  architectural traces remain identical and the existing code budget bounds
+  compiled regions.
 - **Persist the lift cache across sessions.** Worth about half a second on a
   cold agent start now that tiered lifting has taken the other four, so it
   ranks below the risk of serialising lifted code.
@@ -377,25 +394,21 @@ records are not, and no milestone from M0 to M8 fully covers them:
 - **Execution records.** Principle 6 says CPU execution, scheduling, external
   input, storage commits, and receipts are one system. Network recording,
   offline replay, and per-connection receipt classification are implemented
-  and gated, but nothing binds those receipts to the runtime/workload identity,
-  starting checkpoint, trace root, and final output in one canonical record a
-  third party can verify.
-
-An execution record a third party could check — binding an output to the code,
-the input, and the state that produced it — is the largest unscoped piece of
-work. The bare-metal kernel that once carried that model has been removed from
-this repository, so it is not a matter of wiring up code that is already here;
-it needs a design and a milestone of its own before it can be estimated
-honestly, which is why it is absent from the total above rather than dragging
-it down.
+  and gated. Execution Record V1 now binds those receipts to the runtime and
+  workload identities, explicit inputs, policy, before/after checkpoints,
+  output/result, instruction count, and trace artifact/root in one canonical
+  digest-checked record. See `docs/EXECUTION_RECORD_V1.md`; changing any record
+  field or bound artifact makes `tools/execution_record.py verify` fail. V1 is
+  deliberately integrity/replay evidence, not an attestation of who ran it.
 
 ### Deferred on purpose
 
 - **Multi-worker execution.** The single-worker deterministic model is the
   baseline, and multi-worker may not be attempted until it is provably
   correct.
-- **Worker cancellation leaving storage consistent** is browser-host work that
-  has not started.
+- ~~**Worker cancellation leaving storage consistent.**~~ Closed by the
+  digest-checked dual-generation protocol and real Worker termination gate
+  described in M4.
 
 ## Product Principles
 
@@ -595,12 +608,11 @@ Work:
   as proof of semantic completeness. ✅ (four traces in `test_data/traces/`,
   regenerated deliberately and diffed on every run; the count is not the
   claim, the contents are)
-- Define browser support and performance dashboards. 🔶 (browser support is
-  published and verifier-gated in `docs/compatibility/`; performance remains:
-  `web/bench.mjs` and `crates/linux-compat/tests/bench.rs` measure the same
-  workloads in a browser and natively, against a control module that separates
-  a slow engine from a slow runtime, but no versioned performance report is
-  published yet)
+- Define browser support and performance dashboards. ✅ (browser support is
+  published and verifier-gated in `docs/compatibility/`; `docs/performance/`
+  now binds the same 1/4 MiB workload on x86-64 Linux and all three engines to
+  the exact runtime digest, source commit, browser versions, control module,
+  memory ceilings, and cross-host instruction fingerprints)
 - Classify the existing `TODO-*` files as native-substrate supporting plans. ✅ (docs/plans/)
 
 Exit gate:
@@ -709,7 +721,11 @@ Work:
   which asks the only question that distinguishes a handler that got the
   stack it asked for from one that was told it did: where its own locals
   live)
-- Build versioned minimal root images with explicit licenses and manifests. 🔶 (Alpine minirootfs pinned by sha256; no per-package license manifest yet)
+- Build versioned minimal root images with explicit licenses and manifests. ✅
+  (the Alpine minirootfs is pinned by SHA-256 and its installed package DB
+  generates `docs/workloads/alpine-minirootfs-LICENSES.json`; every package
+  carries version, upstream/source, license expression, redistribution
+  decision, and obligations, and an undecided expression fails the build)
 
 Exit gate:
 
@@ -745,18 +761,13 @@ Exit gate:
 - Repeated runs from the same checkpoint produce the same scheduled event
   sequence in deterministic mode. ✅ (identical output and instruction counts across runs)
 - Worker cancellation cannot leave committed storage in a partial state. ✅
-  (a persist interrupted partway must leave the committed snapshot equal to
-  the last good one. Gated by a probe in `web/test_browsers.mjs`: it persists
-  a snapshot, then persists again with the next OPFS write made to reject — a
-  worker killed mid-write — and reads the committed file back. The probe
-  discriminates rather than passing for free: an in-place write
-  (`createSyncAccessHandle` + truncate) corrupts the committed file and the
-  probe catches it on all three engines. What passes is `createWritable`,
-  whose swap-on-close semantics write to a scratch file and only replace the
-  committed one atomically — so an interrupted write leaves the original
-  intact, which the direct-write canary confirmed empirically. `persist` now
-  makes that explicit with a temp-file-then-`move` commit, robust even where
-  an engine might write in place. Green in Chromium, Firefox, and WebKit)
+  (snapshots use two digest-checked generation slots; a reader validates both
+  and chooses the newest complete generation, never a half-write. The browser
+  gate persists a good snapshot, pauses after writing half the alternate
+  slot, calls `worker.terminate()`, and proves a fresh worker selects the
+  unchanged committed digest. It runs in Chromium and Firefox; the current
+  Playwright WebKit port exposes no OPFS, which the UI and matrix report as an
+  unavailable capability with persistence controls disabled)
 
 ## Milestone 5: Event Loop and Networking ✅
 
@@ -789,12 +800,12 @@ Work:
   into one receipt per connection — the peer reached, bytes each way, and how
   it ended — with a refused connection its own receipt keyed by its outcome,
   which is the case most worth seeing. Gated by `tests/netrecord.rs`)
-- Define offline, denied, timeout, reconnect, and proxy-failure behavior. 🔶
-  (denied and timeout defined, including a browser guest with no relay and a
-  destination the relay refuses; reconnect gated by `tests/net_event.rs` — a
-  dropped connection leaves an error not a wait, and a retry afterwards
-  succeeds — leaving only an explicit proxy-failure case, which the deny path
-  already covers in effect but does not name)
+- Define offline, denied, timeout, reconnect, and proxy-failure behavior. ✅
+  (reconnect is gated by `tests/net_event.rs`; the accepted-then-failed proxy
+  case now delivers `ECONNRESET` exactly once after buffered data instead of
+  becoming EOF or a hang. The browser boundary separately gates policy and
+  upgrade rejection as `ENETUNREACH`, upstream dial refusal as `ECONNREFUSED`,
+  abnormal relay failure as `ECONNRESET`, and clean EOF as EOF)
 
 Exit gate:
 
@@ -976,13 +987,12 @@ Work:
   history newest-first, which is the smallest proof that a mounted repo's
   object database and refs — delivered as host files — are intact and
   traversable, not merely that the working tree is readable. `tests/git.rs`)
-- Provide controlled environment variables and secret handles. 🔶 (env and
-  secret injection exist, now scoped per agent — a credential reaches only the
-  files the host names, and an out-of-scope program sees the placeholder
-  rather than an empty value that would read as "no key configured". A browser
-  host injects credentials the same way, gated in all three engines including
-  a read of the stored snapshot itself. The value still lands in the guest
-  filesystem, so this is scoping rather than a handle)
+- Provide controlled environment variables and secret handles. ✅ (legacy
+  placeholder injection remains for configuration templates; real handle
+  mounts keep the value in a host-owned table and put only an empty read-only
+  marker in the VFS. Snapshots and traces never receive the bytes, crash
+  bundles redact defensively, and a host-assigned agent principal makes both a
+  new open and an inherited descriptor return `EACCES` after crossing agents)
 - Test tool execution, cancellation, interrupted network calls, context
   persistence, browser reload, and checkpoint resume. 🔶 (cancellation,
   browser reload, and checkpoint resume are gated, and an interrupted network
@@ -1079,7 +1089,8 @@ The milestone is complete only when both agent profiles pass independently.
 runtime.
 
 A measured baseline exists before any of this work starts — see
-[`docs/performance.md`](docs/performance.md). Three findings shape the order
+[`docs/performance.md`](docs/performance.md); the current versioned evidence is
+in [`docs/performance/`](docs/performance/). Three findings shape the order
 below: Chromium and WebKit run the interpreter within a small factor of native
 speed, and the engine that does not is explained by its own wasm compiler
 rather than by anything in webTOS (a few-hundred-byte control module shows the
@@ -1146,14 +1157,17 @@ Work:
   only on a miss, fault, or cross-page access; that took the memory-scan loop
   from 4.6x to ~30x — matching the compute loop — as host crossings fell from
   one-per-byte to one-per-page. Verified on the x86-64 Linux host with the real
-  fixtures under `WEBTOS_REQUIRE_FIXTURES=1` (no skips): 188 tests green across
-  37 binaries, the six `fastmem` correctness gates among them — coherence after
+  fixtures under `WEBTOS_REQUIRE_FIXTURES=1` (no skips): the current strict
+  matrix is green across every test binary, the six `fastmem` correctness
+  gates among them — coherence after
   unmap, permission fault after mprotect, cross-page defer, and TLB-index
   aliasing all matched the interpreter. The 128-bit arithmetic ops then landed —
   the full u128 multiply (schoolbook mulhi over 32-bit halves, since wasm has no
   widening multiply) and the u128 shifts (two lanes with the boundary-crossing
   carry, selected on the count) — gated against the interpreter over generative
-  inputs. What is left: true multi-block regions, which need a relooper)
+  inputs. Bounded multi-block CFGs now compile as one state-machine region too,
+  with exact fuel and fault resume metadata, static side exits, trace parity,
+  and the existing compiled-code budget preventing an unbounded cache)
 - Add block caching, invalidation, tiering, SIMD fast paths, and syscall fast
   paths without changing architectural results. 🔶 (block caching, tiering,
   and self-modifying-code invalidation all landed — the content-addressed lift
@@ -1376,9 +1390,10 @@ Performance work follows three tiers:
 3. **Hot-block translator:** selected x86-64 blocks translated to WebAssembly,
    guarded by page versions and deoptimized on invalidation or uncommon exits.
 
-Release performance budgets will be set after the BusyBox and dynamic ELF
-baselines produce representative measurements. Until then, correctness,
-bounded memory, and actionable diagnostics are the gates.
+`docs/performance/` now publishes the BusyBox native and three-engine baseline.
+Wall times remain evidence rather than flaky pass/fail thresholds; deterministic
+instruction budgets, correctness, bounded memory, and actionable diagnostics
+remain the release gates.
 
 ## Major Risks
 
