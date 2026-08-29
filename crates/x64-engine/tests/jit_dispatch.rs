@@ -685,6 +685,42 @@ fn a_new_address_space_does_not_reuse_the_jit_handle() {
     );
 }
 
+// ── REP-prefixed string instructions under the JIT ───────────────────────────
+//
+// A REP-prefixed string instruction lifts to several blocks at ONE guest
+// address (a prologue testing the count, chained to the loop body). Those
+// blocks must never share a compiled handle — which address-keyed caches
+// allowed, and is why handles are keyed by block id (the agent-scale
+// reproducer is linux-compat/tests/jit_lazy_agent.rs). This exercises both
+// rep shapes the JIT sees: the double-exit scan loop below (whose blocks all
+// take the per-block path) and, in other tests, self-loop regions.
+
+#[test]
+fn rep_string_blocks_at_one_address_stay_distinct() {
+    let buf = 0x20_0000u64;
+    // outer: mov rdi, buf ; mov rcx, 0x40 ; mov al, 0x5A ; repne scasb ;
+    //        dec rdx ; jnz outer ; mov rax, rcx ; hlt
+    let mut code = vec![0x48, 0xBF];
+    code.extend_from_slice(&buf.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xC7, 0xC1, 0x40, 0x00, 0x00, 0x00]); // mov rcx, 0x40
+    code.extend_from_slice(&[0xB0, 0x5A]); // mov al, 0x5A
+    code.extend_from_slice(&[0xF2, 0xAE]); // repne scasb
+    code.extend_from_slice(&[0x48, 0xFF, 0xCA]); // dec rdx
+    code.extend_from_slice(&[0x75, 0xE6]); // jnz outer (-26)
+    code.extend_from_slice(&[0x48, 0x89, 0xC8]); // mov rax, rcx
+    code.push(0xF4); // hlt
+
+    let count = 50u64;
+    let regs = [("RAX", 0u64), ("RDX", count)];
+    let mut haystack = vec![0u8; 0x40];
+    haystack[8] = 0x5A; // found at offset 8: nine bytes scanned, 0x37 left
+    let data = Some((buf, haystack));
+    let interp = run_program(false, &code, &regs, data.clone(), 100_000);
+    let jit = run_program(true, &code, &regs, data, 100_000);
+    assert_eq!(interp.0, 0x37, "the scan itself must work: {interp:?}");
+    assert_matches("repne-scasb", count, interp, jit);
+}
+
 // ── Compiled-code budget: over the cap, the least-recently-used compiled block
 //    is evicted and recompiled on demand, and results stay correct ────────────
 
@@ -702,39 +738,49 @@ fn the_code_budget_evicts_and_recompiles() {
     )
     .0;
 
+    // Eleven copies of the loop at eleven addresses in one page. Absolute
+    // addresses are part of a block's p-code, so each copy is a distinct block
+    // identity with its own compiled handle — identical bytes at ONE address
+    // are one block (and one handle) no matter how many address spaces run
+    // them, since blocks are content-indexed and handles are keyed by block.
+    // All copies are written before anything is lifted, so no write lands on
+    // bytes a lifted block was built from.
     let mut vm = jit_vm_with_writable_code(base);
-    vm.cpu
-        .mem
-        .write_bytes(base, &LOOP_ADD, perm::NONE)
-        .expect("code");
-    (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+    let copy = |k: u64| base + 0x100 * k;
+    for k in 1..12u64 {
+        vm.cpu
+            .mem
+            .write_bytes(copy(k), &LOOP_ADD, perm::NONE)
+            .expect("code");
+    }
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, copy(1));
     let rax = vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX");
 
-    let mut run_under = |vm: &mut x64_engine::InterpVm, asid: u64| {
+    let mut run_under = |vm: &mut x64_engine::InterpVm, asid: u64, at: u64| {
         x64_engine::vm::set_current_asid(asid);
         seed_loop(vm, n);
-        vm.cpu.write_pc(base);
+        vm.cpu.write_pc(at);
         vm.cpu.block_id = u64::MAX;
         vm.cpu.block_offset = 0;
         vm.icount_limit = vm.cpu.icount() + 100_000;
         let _ = vm.run();
     };
 
-    // Learn one address space's total compiled size with no budget in force.
-    run_under(&mut vm, 1);
+    // Learn one copy's total compiled size with no budget in force.
+    run_under(&mut vm, 1, copy(1));
     let one = vm.jit_code_stats();
     assert!(
         one.live >= 1 && one.total_bytes > 0,
         "something compiled: {one:?}"
     );
 
-    // Cap the budget at one address space's worth, then run the same program
-    // under many address spaces — each a distinct block identity and set of
-    // handles — so the cap is exceeded and older handles are evicted.
+    // Cap the budget at one copy's worth, then run the other ten copies —
+    // each a distinct block identity and set of handles — so the cap is
+    // exceeded and older handles are evicted.
     let baseline = one.total_bytes;
     vm.set_jit_code_budget(baseline);
     for asid in 2..12u64 {
-        run_under(&mut vm, asid);
+        run_under(&mut vm, asid, copy(asid));
         assert_eq!(
             vm.cpu.read_reg(rax),
             want,
@@ -748,11 +794,11 @@ fn the_code_budget_evicts_and_recompiles() {
     }
     let s = vm.jit_code_stats();
     assert!(s.evictions > 0, "the budget should have evicted: {s:?}");
-    assert!(s.compiles >= 11, "each new address space recompiles: {s:?}");
+    assert!(s.compiles >= 11, "each copy compiles: {s:?}");
 
-    // Asid 1 was evicted long ago; running it again must recompile and be correct.
+    // Copy 1 was evicted long ago; running it again must recompile and be correct.
     let before = vm.jit_code_stats().compiles;
-    run_under(&mut vm, 1);
+    run_under(&mut vm, 1, copy(1));
     x64_engine::vm::set_current_asid(0);
     assert_eq!(
         vm.cpu.read_reg(rax),

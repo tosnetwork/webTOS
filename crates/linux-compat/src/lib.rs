@@ -1107,6 +1107,11 @@ impl Environment for LinuxEnv {
             {
                 FaultResolution::Ready { page, bytes, perm } => {
                     let fault_address = cpu.exception.value;
+                    if x64_engine::vm::jit_trace_enabled() {
+                        eprintln!(
+                            "[pager] ready page={page:#x} fault={fault_address:#x} {access:?} perm={perm:#x}"
+                        );
+                    }
                     if cpu.mem.write_bytes(page, &bytes, perm::NONE).is_ok()
                         && cpu.mem.update_perm(page, PAGE_SIZE, perm).is_ok()
                     {

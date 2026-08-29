@@ -35,6 +35,21 @@ thread_local! {
     static PAGE_IN_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether `WEBTOS_JIT_TRACE` diagnostics are on: every JIT dispatch, fault
+/// resume, and suspicious branch target prints to stderr. Native-only — env
+/// vars read as absent on wasm32, so there the code compiles out entirely.
+pub fn jit_trace_enabled() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("WEBTOS_JIT_TRACE").is_some())
+    }
+}
+
 /// Guest address of the basic block currently executing in the interpreter.
 /// A diagnostic mirror for memory-write hooks, which cannot see the CPU.
 pub fn current_block_start() -> u64 {
@@ -157,20 +172,27 @@ pub struct InterpVm {
     /// Compiled handles keyed by [`BlockKey`] — the same (vaddr, isa_mode,
     /// asid) identity the block cache uses, not the bare address: a handle
     /// compiled for one image must never be served for a different image that
-    /// reuses the address in a new address space. `Some(handle)` once compiled,
-    /// `None` once the block is known not to JIT (so it is never retried).
-    /// Cleared by [`InterpVm::flush_code`] when bytes change under a live key
-    /// (self-modifying code).
-    jit_cache: std::collections::HashMap<BlockKey, Option<u32>>,
-    /// Compiled *region* (self-loop) handles, keyed by [`BlockKey`] the same
+    /// Compiled per-block handles, keyed by block id — the one identity that
+    /// names exactly one p-code body. An address key is not enough: several
+    /// blocks can share a start address (a REP-style instruction lifts to a
+    /// prologue block chained to a loop block at the same address), and a
+    /// re-lift after a code page-in can replace the block behind an address,
+    /// either of which would serve one block's compiled code to another.
+    /// Block ids are append-only between flushes, so a stale id is simply
+    /// never dispatched again. `Some(handle)` once compiled, `None` once the
+    /// block is known not to JIT (so it is never retried). Cleared by
+    /// [`InterpVm::flush_code`] when bytes change (self-modifying code),
+    /// which also empties the arena those ids named.
+    jit_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Compiled *region* (self-loop) handles, keyed by block id the same
     /// way: `Some(handle)` once the block compiled as a region, `None` once it
     /// is known not to (not a self-loop, or not region-translatable), so it is
     /// never retried. Separate from `jit_cache` because a region is a different
     /// wasm module (an internal loop) than the per-block function.
-    jit_region_cache: std::collections::HashMap<BlockKey, Option<u32>>,
-    /// Per-[`BlockKey`] entry counts, to decide when a block is hot enough to
+    jit_region_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Per-block-id entry counts, to decide when a block is hot enough to
     /// compile. Separate from `entries`, which counts only external re-entries.
-    jit_entries: std::collections::HashMap<BlockKey, u64>,
+    jit_entries: std::collections::HashMap<u64, u64>,
     /// How many times a compiled block ran in place of the interpreter.
     jit_dispatches: u64,
     /// Dispatch split used by cross-platform gates: single-shot blocks versus
@@ -224,7 +246,7 @@ pub struct PhaseTimes {
 /// One live compiled handle's place in the budget: which block cache holds it,
 /// how big its wasm is, and when it last ran (for least-recently-used eviction).
 struct JitEntry {
-    key: BlockKey,
+    key: u64,
     is_region: bool,
     bytes: u32,
     last_epoch: u64,
@@ -285,8 +307,8 @@ impl JitBudget {
         &mut self,
         incoming: usize,
         jit: &mut dyn crate::jit::JitBackend,
-        block_cache: &mut std::collections::HashMap<BlockKey, Option<u32>>,
-        region_cache: &mut std::collections::HashMap<BlockKey, Option<u32>>,
+        block_cache: &mut std::collections::HashMap<u64, Option<u32>>,
+        region_cache: &mut std::collections::HashMap<u64, Option<u32>>,
     ) {
         if self.budget == 0 {
             return;
@@ -313,7 +335,7 @@ impl JitBudget {
     }
 
     /// Records a freshly compiled handle.
-    fn record(&mut self, handle: u32, key: BlockKey, is_region: bool, bytes: usize) {
+    fn record(&mut self, handle: u32, key: u64, is_region: bool, bytes: usize) {
         let last_epoch = self.next_epoch();
         self.meta.insert(
             handle,
@@ -994,6 +1016,18 @@ impl InterpVm {
     }
 
     fn handle_external_address(&mut self, addr: u64) -> VmExit {
+        if addr < 0x10000 && jit_trace_enabled() {
+            let start = self
+                .code
+                .blocks
+                .get(self.cpu.block_id as usize)
+                .map(|b| b.start)
+                .unwrap_or(u64::MAX);
+            eprintln!(
+                "[jit] LOW TARGET {addr:#x} from block_id={} start={start:#x} offset={}",
+                self.cpu.block_id, self.cpu.block_offset
+            );
+        }
         self.cpu.write_pc(addr);
 
         let key = self.get_block_key(addr);
@@ -1156,6 +1190,7 @@ impl InterpVm {
             // cross the fuel limit — falls through to the interpreter, which
             // stays the floor.
             let mut jit_ran = false;
+            let jit_trace = jit_trace_enabled();
             // A zero-instruction block retires nothing: dispatching it would advance
             // register state under an icount that never moves, and its handle would
             // be reused by a real block that shares the address. Keep it out of the
@@ -1163,11 +1198,12 @@ impl InterpVm {
             // interpreter runs it.
             if offset == 0 && !block.has_breakpoint() && block.num_instructions > 0 {
                 if let Some(after) = self.jit_after {
-                    // Key the JIT caches by the block's full identity (vaddr,
-                    // isa_mode, asid), the same key the block cache uses, so a
-                    // handle compiled for one image is never served for a different
-                    // image at the same address after `execve`.
-                    let key = self.get_block_key(block.start);
+                    // Key the JIT caches by block id — the only identity that
+                    // names exactly one p-code body. Blocks can share a start
+                    // address (REP-style lifts, re-lifts after a code page-in),
+                    // and `execve` lifts fresh blocks with fresh ids, so an id
+                    // never serves one block's compiled code to another.
+                    let key = block_id;
                     let count = self.jit_entries.entry(key).or_insert(0);
                     *count += 1;
                     let hot = *count >= after;
@@ -1219,6 +1255,12 @@ impl InterpVm {
                                 };
                                 match outcome {
                                     crate::jit::RegionOutcome::Ran(iters) => {
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] region {:#x} n={num} iters={iters} fuel={}",
+                                                block.start, self.cpu.fuel.remaining
+                                            );
+                                        }
                                         // Each iteration retired the whole block and
                                         // ticks no per-instruction fuel; charge it here
                                         // so icount stays exact. The register file now
@@ -1242,6 +1284,12 @@ impl InterpVm {
                                         jit_ran = true;
                                     }
                                     crate::jit::RegionOutcome::Faulted(iters, index) => {
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] region-fault {:#x} iters={iters} index={index} fuel={}",
+                                                block.start, self.cpu.fuel.remaining
+                                            );
+                                        }
                                         // A host op faulted mid-loop. Charge the fully
                                         // completed iterations first (each retired the
                                         // whole block), then reproduce the interpreter's
@@ -1322,6 +1370,14 @@ impl InterpVm {
                                 };
                                 match outcome {
                                     crate::jit::JitOutcome::Completed => {
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] block {:#x} n={} fuel={}",
+                                                block.start,
+                                                block.num_instructions,
+                                                self.cpu.fuel.remaining
+                                            );
+                                        }
                                         // The compiled block ticks no per-instruction
                                         // fuel the way InstructionMarker does; charge
                                         // the whole block here so icount stays exact.
@@ -1338,6 +1394,20 @@ impl InterpVm {
                                         jit_ran = true;
                                     }
                                     crate::jit::JitOutcome::Faulted(i) => {
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] block-fault {:#x} index={i} fuel={} exc={:#x}@{:#x}",
+                                                block.start,
+                                                self.cpu.fuel.remaining,
+                                                self.cpu.exception.code,
+                                                self.cpu.exception.value
+                                            );
+                                            for (n, inst) in
+                                                block.pcode.instructions.iter().enumerate()
+                                            {
+                                                eprintln!("[jit]   pcode[{n}] {inst:?}");
+                                            }
+                                        }
                                         // The block stopped mid-way, at pcode index i.
                                         // The interpreter, running to there, would have
                                         // ticked PC and fuel at each guest instruction's
@@ -1394,7 +1464,11 @@ impl InterpVm {
                 }
             }
 
-            match self.cpu.block_exit(block.exit) {
+            let exit_target = self.cpu.block_exit(block.exit);
+            if jit_trace && jit_ran {
+                eprintln!("[jit]   -> {exit_target:?} pc={:#x}", self.cpu.read_pc());
+            }
+            match exit_target {
                 Target::Internal(id) => {
                     block_id = id as u64;
                     offset = 0;

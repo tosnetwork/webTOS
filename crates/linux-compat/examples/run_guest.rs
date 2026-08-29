@@ -193,6 +193,12 @@ fn main() {
             machine.vm_mut().code.breakpoints.insert(addr);
         }
     }
+    // GUEST_PROFILE=1: count block entries and dump the hottest blocks at
+    // exit — the cheapest way to see where a silent guest actually spins.
+    let profile = std::env::var_os("GUEST_PROFILE").is_some();
+    if profile {
+        machine.vm_mut().profile_blocks(true);
+    }
     let exit = loop {
         let exit = machine.run();
         let x64_engine::CpuExit::Breakpoint { rip } = exit else {
@@ -341,4 +347,23 @@ fn main() {
         }
     }
     eprintln!("[runner] exit={exit:?} icount={}", machine.icount());
+    if profile {
+        if let Some(blocks) = machine.vm_mut().block_profile() {
+            let mut hot: Vec<_> = blocks
+                .iter()
+                .map(|(addr, p)| {
+                    (
+                        p.entries.saturating_mul(p.instructions.max(1)),
+                        *addr,
+                        p.entries,
+                    )
+                })
+                .collect();
+            hot.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            eprintln!("[profile] hottest blocks (weight = entries x instructions):");
+            for (weight, addr, entries) in hot.iter().take(30) {
+                eprintln!("[profile]   {addr:#x} weight={weight} entries={entries}");
+            }
+        }
+    }
 }
