@@ -167,13 +167,14 @@
     // The guest's terminal is created at the size the tab actually has.
     worker.postMessage({
       type: "spawn",
-      path: "/bin/busybox",
-      argv: ["sh", "-i"],
+      path: execPath,
+      argv: execArgv,
       envp: [
         "PATH=/bin:/usr/bin",
         "HOME=/root",
         "TERM=xterm-256color",
         "PS1=webtos:\\w$ ",
+        ...execEnv,
       ],
       rows: term.rows,
       cols: term.cols,
@@ -333,6 +334,14 @@
   const guestMib = params.get("guestmem");
   const storageMib = params.get("storage");
   const networkMib = params.get("network");
+  // What the tab runs interactively. Defaults to BusyBox's `sh -i`; a
+  // manifest-backed session can point it at any program the manifest carries
+  // — `?exec=/usr/bin/python3.10&argv=python3` starts a Python REPL. `argv` is
+  // comma-separated (its first element is argv[0]), and each `env=K=V` is
+  // appended to the base environment.
+  const execPath = params.get("exec") ?? "/bin/busybox";
+  const execArgv = params.get("argv") ? params.get("argv").split(",") : ["sh", "-i"];
+  const execEnv = params.getAll("env");
   const agentConfig = new TextEncoder().encode(`{"api_key":"\${${secretName}}"}\n`).buffer;
   // A file whose entire contents are the placeholder: for a credential that
   // is itself a whole file, like an agent's auth profile.
