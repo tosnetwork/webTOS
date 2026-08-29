@@ -22,6 +22,13 @@ rather than left to be mistaken for present behaviour; `git log` has them.
 - [Use cases](USE-CASES.md) - what the runtime supports today, what it has
   actually been pointed at, and what it deliberately does not do
 
+## Agentic application research
+
+- [AI-Fi development methods](AI_FI_DEVELOPMENT_METHODS.md) - research and
+  architecture proposal for composing webTOS local Agent execution with TOS
+  identity, capabilities, policy-gated custody, receipts, and settlement; all
+  proposed browser SDK and bridge surfaces are labelled as roadmap work
+
 ## Measurement and workloads
 
 - [Performance and memory](performance.md) - interpreter and hot-block JIT
