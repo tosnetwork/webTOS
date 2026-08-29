@@ -29,9 +29,9 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, normalize, extname } from "node:path";
+import { dirname, join, normalize, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -40,7 +40,15 @@ const ALL_ENGINES = ["chromium", "firefox", "webkit"];
 const args = process.argv.slice(2);
 const headed = args.includes("--headed");
 const engineArg = args.find((a) => a.startsWith("--engines="));
+const reportArg = args.find((a) => a.startsWith("--compat-report="));
+const sourceArg = args.find((a) => a.startsWith("--source-commit="));
 const engines = engineArg ? engineArg.slice("--engines=".length).split(",") : ALL_ENGINES;
+const compatibilityReport = reportArg ? reportArg.slice("--compat-report=".length) : null;
+const sourceCommit = sourceArg ? sourceArg.slice("--source-commit=".length) : null;
+if (compatibilityReport && !/^[0-9a-f]{40}$/.test(sourceCommit ?? "")) {
+  console.error("--compat-report requires --source-commit=<40 lowercase hex characters>");
+  process.exit(2);
+}
 for (const name of engines) {
   if (!ALL_ENGINES.includes(name)) {
     console.error(`unknown engine ${name}; expected one of ${ALL_ENGINES.join(", ")}`);
@@ -152,6 +160,43 @@ function md5OfFile(path) {
   });
 }
 
+function sha256OfFile(path) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    createReadStream(path)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
+}
+
+const sha256OfBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+const workloadLock = JSON.parse(
+  await readFile(new URL("../workloads/LOCK.json", import.meta.url), "utf8"),
+);
+function lockedWorkload(id, actualFiles) {
+  const locked = workloadLock.workloads.find((item) => item.id === id);
+  if (!locked) throw new Error(`workload ${id} is not in workloads/LOCK.json`);
+  if (actualFiles === null) return { id, present: false, version: locked.version };
+  const actual = new Map(actualFiles.map((item) => [item.path, item]));
+  for (const expected of locked.files) {
+    const file = actual.get(expected.path);
+    if (!file || file.sha256 !== expected.sha256 || file.size !== expected.size) {
+      throw new Error(`staged ${id} bytes do not match workloads/LOCK.json: ${expected.path}`);
+    }
+  }
+  if (actual.size !== locked.files.length) {
+    throw new Error(`staged ${id} file set does not match workloads/LOCK.json`);
+  }
+  return {
+    files: [...actual.values()].sort((a, b) => a.path.localeCompare(b.path)),
+    id,
+    present: true,
+    version: locked.version,
+  };
+}
+
 // Publishes several files (with their parent directories) as one manifest;
 // records must be strictly sorted by path. Legacy FNV is zero: it feeds trace
 // headers only, and the agent checks record no trace.
@@ -183,11 +228,11 @@ function publishLazyFiles(files, manifestName) {
   }
   for (const d of dirs) records.push({ path: d, line: `d 755 0 ${Buffer.from(d).toString("hex")}` });
   records.sort((a, b) => (a.path < b.path ? -1 : 1));
-  generatedAssets.set(
-    `/__lazy/${manifestName}`,
-    Buffer.from(`webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`),
+  const manifest = Buffer.from(
+    `webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`,
   );
-  return { logicalBytes };
+  generatedAssets.set(`/__lazy/${manifestName}`, manifest);
+  return { logicalBytes, manifestSha256: sha256OfBytes(manifest) };
 }
 
 function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFnv = true } = {}) {
@@ -215,7 +260,11 @@ function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFn
     `webtos-chunk-manifest 1\nd 755 0 2f62696e\nf 755 0 ${pathHex} ${bytes.length} ${chunkSize} ${fnv} ${hashes.join(",")}\n`,
   );
   generatedAssets.set(`/__lazy/${manifestName}`, manifest);
-  return { preload: hashes.slice(0, 1), logicalBytes: bytes.length };
+  return {
+    preload: hashes.slice(0, 1),
+    logicalBytes: bytes.length,
+    manifestSha256: sha256OfBytes(manifest),
+  };
 }
 
 /// Starts the relay with a single rule: the harness's own static server. It
@@ -1235,6 +1284,7 @@ async function runEngine(name, origin, gateway, images) {
   // ---- Phase D: a profile with no persistent storage (a private window).
   // The runtime must still boot and run; only the snapshot buttons stand down.
   const browser = await playwright[name].launch({ headless: !headed });
+  const browserVersion = browser.version();
   try {
     const ephemeralContext = await browser.newContext();
     ephemeralContext.setDefaultTimeout(EXEC_TIMEOUT);
@@ -1266,13 +1316,14 @@ async function runEngine(name, origin, gateway, images) {
   }
 
   record("no uncaught page errors", pageErrors.length === 0, pageErrors.join(" | "));
-  return { checks, fingerprint };
+  return { browserVersion, checks, fingerprint };
 }
 
 // -------------------------------------------------------------------- main
 
 const busyboxPath = fileURLToPath(new URL("./busybox-musl", import.meta.url));
-const lazyImage = publishLazyImage("/bin/busybox", await readFile(busyboxPath));
+const busyboxBytes = await readFile(busyboxPath);
+const lazyImage = publishLazyImage("/bin/busybox", busyboxBytes);
 const { server, origin } = await startServer();
 const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 
@@ -1298,14 +1349,14 @@ if (codexImage === null) {
 // travel in the same manifest. Stage web/claude and web/claude-libs/.
 const claudeBytes = await readFile(fileURLToPath(new URL("./claude", import.meta.url))).catch(() => null);
 let claudeImage = null;
+let claudeFiles = null;
 if (claudeBytes !== null) {
   const libDir = new URL("./claude-libs/", import.meta.url);
   const lib = async (name) => ({
     path: name === "ld-linux-x86-64.so.2" ? "/lib64/ld-linux-x86-64.so.2" : `/lib/x86_64-linux-gnu/${name}`,
     bytes: await readFile(fileURLToPath(new URL(name, libDir))),
   });
-  claudeImage = publishLazyFiles(
-    [
+  claudeFiles = [
       { path: "/bin/claude", bytes: claudeBytes },
       await lib("ld-linux-x86-64.so.2"),
       await lib("libc.so.6"),
@@ -1313,9 +1364,8 @@ if (claudeBytes !== null) {
       await lib("libdl.so.2"),
       await lib("libpthread.so.0"),
       await lib("librt.so.1"),
-    ],
-    "claude-manifest.txt",
-  );
+  ];
+  claudeImage = publishLazyFiles(claudeFiles, "claude-manifest.txt");
 } else {
   console.log("note: web/claude missing — Claude Code lazy checks skipped");
 }
@@ -1335,6 +1385,33 @@ const images = {
   codex: codexImage,
   claude: claudeImage,
 };
+const workloadEvidence = {
+  busybox: lockedWorkload("busybox", [
+    { path: "/bin/busybox", sha256: sha256OfBytes(busyboxBytes), size: busyboxBytes.length },
+  ]),
+  openfox: lockedWorkload(
+    "openfox",
+    agentInfo === null
+      ? null
+      : [{ path: "/bin/openfox", sha256: await sha256OfFile(agentPath), size: agentInfo.size }],
+  ),
+  codex: lockedWorkload(
+    "codex",
+    codexBytes === null
+      ? null
+      : [{ path: "/bin/codex", sha256: sha256OfBytes(codexBytes), size: codexBytes.length }],
+  ),
+  "claude-code": lockedWorkload(
+    "claude-code",
+    claudeFiles === null
+      ? null
+      : claudeFiles.map((file) => ({
+          path: file.path,
+          sha256: sha256OfBytes(file.bytes),
+          size: file.bytes.length,
+        })),
+  ),
+};
 if (!images.agent) {
   console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");
 }
@@ -1350,9 +1427,9 @@ const fingerprints = {};
 try {
   for (const name of engines) {
     console.log(`\n=== ${name} ===`);
-    const { checks, fingerprint } = await runEngine(name, origin, gateway, images);
+    const { browserVersion, checks, fingerprint } = await runEngine(name, origin, gateway, images);
     const failed = checks.filter((c) => !c.ok);
-    summary.push({ name, total: checks.length, failed: failed.length });
+    summary.push({ browserVersion, checks, name, total: checks.length, failed: failed.length });
     fingerprints[name] = fingerprint;
   }
 } finally {
@@ -1388,6 +1465,31 @@ for (const row of summary) {
   console.log(`${row.name.padEnd(9)} ${row.failed === 0 ? "PASS" : "FAIL"}  ${row.total - row.failed}/${row.total} checks`);
 }
 const broken = summary.filter((r) => r.failed > 0);
+if (compatibilityReport) {
+  const report = {
+    engines: summary.map((row) => ({
+      checks: row.checks.map(({ label, ok }) => ({ label, ok })),
+      failed: row.failed,
+      name: row.name,
+      passed: row.total - row.failed,
+      version: row.browserVersion,
+    })),
+    generated_at: new Date().toISOString(),
+    instruction_fingerprints: fingerprints,
+    runtime: {
+      sha256: await sha256OfFile(new URL("./webtos_web.wasm", import.meta.url)),
+      source_commit: sourceCommit,
+    },
+    schema_version: 1,
+    status: broken.length === 0 && divergent === 0 ? "pass" : "fail",
+    workloads: workloadEvidence,
+  };
+  const temporary = `${compatibilityReport}.tmp`;
+  await mkdir(dirname(compatibilityReport), { recursive: true });
+  await writeFile(temporary, `${JSON.stringify(report, null, 2)}\n`);
+  await rename(temporary, compatibilityReport);
+  console.log(`[browsers] compatibility report: ${compatibilityReport}`);
+}
 if (broken.length > 0 || divergent > 0) {
   const reasons = [
     ...broken.map((r) => r.name),

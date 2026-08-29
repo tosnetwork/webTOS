@@ -106,8 +106,15 @@ execution outside the module, or a way to make the module abort rather than
 refuse — say so in the title and leave the exploit out of the description;
 a maintainer will ask for it privately.
 
-There is no release yet and so no supported-version table. When there is, this
-section gets one.
+There is no published release yet and so no supported-version table. The
+repository has a reproducible release-candidate builder and gate documented in
+`docs/RELEASE.md`; its workflow creates GitHub OIDC provenance and SBOM
+attestations, but a workflow artifact is evidence for review, not a supported
+release. Workload statements can carry detached Ed25519 signatures as described
+in `workloads/README.md`. Production private keys and trust-root changes are
+maintainer-controlled and never generated implicitly by a build. When a
+maintainer publishes a release, this section gets its version and support
+window.
 
 ## What would change this document
 

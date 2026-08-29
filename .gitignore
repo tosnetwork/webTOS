@@ -1,6 +1,7 @@
 /target/
 **/target/
-Cargo.lock
+# Workspace lockfiles are release inputs and are committed. A dependency
+# change must move the lockfile in review.
 base_image.runtime.manifest
 .codex
 .codex/
@@ -13,9 +14,6 @@ base_image.runtime.manifest
 /web/codex
 /web/claude
 /web/claude-libs/
-/web/codex
-/web/claude
-/web/claude-libs/
 /test_data/alpine-minirootfs/
 /test_data/openfox
 /test_data/openfox.commit
@@ -25,6 +23,7 @@ base_image.runtime.manifest
 /node_modules/
 /package-lock.json
 /web/vendor/
+/dist/
 
 # Agent worktrees (git worktrees, not content)
 /.claude/

@@ -1,0 +1,62 @@
+name: reproducible release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build:
+    name: build twice and compare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show pinned toolchain
+        run: rustc --version --verbose && cargo --version --verbose
+
+      - name: Fetch the locked dependency graph
+        working-directory: crates
+        run: cargo fetch --locked
+
+      - name: Validate dependency-license metadata
+        working-directory: crates
+        run: cargo test --frozen --release -p linux-compat --test licenses
+
+      - name: Build twice and require byte-identical artifacts
+        run: tools/check_release_reproducible.sh
+
+      - name: Extract the artifact-specific SBOM
+        run: |
+          set -euo pipefail
+          set -- dist/webtos-runtime-*.tar
+          test "$#" -eq 1
+          tar -xOf "$1" --wildcards '*/SBOM.spdx.json' > dist/SBOM.spdx.json
+
+      - name: Attest release provenance with GitHub OIDC
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/webtos-runtime-*.tar
+
+      - name: Attest the release SBOM with GitHub OIDC
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/webtos-runtime-*.tar
+          sbom-path: dist/SBOM.spdx.json
+
+      - name: Upload the verified candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: webtos-runtime
+          path: |
+            dist/webtos-runtime-*.tar
+            dist/webtos-runtime-*.tar.sha256
+            ${{ steps.provenance.outputs.bundle-path }}
+            ${{ steps.sbom.outputs.bundle-path }}
+          if-no-files-found: error

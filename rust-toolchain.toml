@@ -1,4 +1,5 @@
 [toolchain]
-channel = "nightly"
+# Release output must not move when the nightly alias advances.
+channel = "nightly-2026-08-25"
 components = ["rust-src", "llvm-tools-preview"]
 targets = ["wasm32-unknown-unknown"]

@@ -19,6 +19,12 @@ rather than left to be mistaken for present behaviour; `git log` has them.
   competitive position, moat, risks, and anticipated questions
 - [Product roadmap](../ROADMAP.md) - the plan from static `hello` and BusyBox
   through OpenFox, Codex, and Claude Code, with milestone exit gates
+- [Release process](RELEASE.md) - pinned build inputs, the artifact contract,
+  SPDX metadata, OIDC attestations, and the byte-for-byte reproducibility gate
+- [Workload release contract](../workloads/README.md) - locked workload bytes,
+  deterministic image construction, licenses, and detached signatures
+- [Compatibility dashboard](compatibility/README.md) - verified browser
+  versions, runtime identity, and pinned workload results
 - [Use cases](USE-CASES.md) - what the runtime supports today, what it has
   actually been pointed at, and what it deliberately does not do
 

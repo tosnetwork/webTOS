@@ -298,11 +298,14 @@ Built offline at image-build time; not guest-visible; never changes during a run
 The canonical builder is:
 
 ```bash
-python3 tools/build_chunk_manifest.py <rootfs> <output-dir> --guest-prefix /
+SOURCE_DATE_EPOCH=0 python3 tools/build_chunk_manifest.py \
+  <rootfs> <output-dir> --guest-prefix /
 ```
 
 It writes `manifest.txt` plus `chunks/<sha256>`, prints the manifest root, and
-sorts byte paths before serialization. The manifest encodes paths and symlink
+sorts byte paths before serialization. The explicit source epoch fixes every
+manifest mtime rather than inheriting host filesystem metadata. The manifest
+encodes paths and symlink
 targets as lowercase hex, so whitespace and non-UTF-8 Unix names cannot create
 an ambiguous signed form. The VM rejects noncanonical paths, unsorted or
 duplicate entries, malformed layouts, and any chunk whose delivered SHA-256
@@ -480,9 +483,13 @@ immutable chunks are never serialized per session.
 - **OPFS API differences** — `createSyncAccessHandle` is used where available;
   the asynchronous verified barrier is the portable fallback and is included
   in the three-engine matrix.
-- **Manifest build reproducibility** — `tools/build_chunk_manifest.py` emits
-  canonical sorted bytes and the root, but production image builds still need
-  their own reproducibility gate and signature publication process.
+- **Manifest build reproducibility** — closed for the locked M8 workload
+  images. `tools/build_workload_image.py` fixes manifest and archive metadata,
+  verifies every input against `workloads/LOCK.json`, and emits a bound
+  in-toto statement; two-root/different-mtime tests and real BusyBox, OpenFox,
+  Codex, and Claude Code builds compare byte for byte. Detached signing is
+  implemented, while production key custody and publication remain explicit
+  maintainer operations.
 
 ## What this is not
 
