@@ -7042,16 +7042,16 @@ CMPSS_OPERAND: ", "^imm8 is imm8   { }
 :CVTPD2DQ     XmmReg, m128      is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0xE6; m128 & XmmReg ...
 {
     local m:16 = m128;
-    XmmReg[0,32] = trunc( m[0,64] );
-    XmmReg[32,32] = trunc( m[64,64] );
+    XmmReg[0,32] = trunc( round( m[0,64] ) );
+    XmmReg[32,32] = trunc( round( m[64,64] ) );
     XmmReg[64,32] = 0;
     XmmReg[96,32] = 0;
 }
 
 :CVTPD2DQ     XmmReg1, XmmReg2  is vexMode=0 &  $(PRE_F2) & byte=0x0F; byte=0xE6; xmmmod=3 & XmmReg1 & XmmReg2
 {
-    XmmReg1[0,32] = trunc( XmmReg2[0,64] );
-    XmmReg1[32,32] = trunc( XmmReg2[64,64] );
+    XmmReg1[0,32] = trunc( round( XmmReg2[0,64] ) );
+    XmmReg1[32,32] = trunc( round( XmmReg2[64,64] ) );
     XmmReg1[64,32] = 0;
     XmmReg1[96,32] = 0;
 }
@@ -7115,18 +7115,18 @@ CMPSS_OPERAND: ", "^imm8 is imm8   { }
 :CVTPS2DQ      XmmReg, m128        is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5B; m128 & XmmReg ...
 {
     local m:16 = m128;
-    XmmReg[0,32] = trunc( m[0,32] );
-    XmmReg[32,32] = trunc( m[32,32] );
-    XmmReg[64,32] = trunc( m[64,32] );
-    XmmReg[96,32] = trunc( m[96,32] );
+    XmmReg[0,32] = trunc( round( m[0,32] ) );
+    XmmReg[32,32] = trunc( round( m[32,32] ) );
+    XmmReg[64,32] = trunc( round( m[64,32] ) );
+    XmmReg[96,32] = trunc( round( m[96,32] ) );
 }
 
 :CVTPS2DQ      XmmReg1, XmmReg2    is vexMode=0 &  $(PRE_66) & byte=0x0F; byte=0x5B; xmmmod=3 & XmmReg1 & XmmReg2
 {
-    XmmReg1[0,32] = trunc( XmmReg2[0,32] );
-    XmmReg1[32,32] = trunc( XmmReg2[32,32] );
-    XmmReg1[64,32] = trunc( XmmReg2[64,32] );
-    XmmReg1[96,32] = trunc( XmmReg2[96,32] );
+    XmmReg1[0,32] = trunc( round( XmmReg2[0,32] ) );
+    XmmReg1[32,32] = trunc( round( XmmReg2[32,32] ) );
+    XmmReg1[64,32] = trunc( round( XmmReg2[64,32] ) );
+    XmmReg1[96,32] = trunc( round( XmmReg2[96,32] ) );
 }
 
 :CVTPS2PD     XmmReg, m64       is vexMode=0 &  mandover=0 & byte=0x0F; byte=0x5A; m64 & XmmReg ...

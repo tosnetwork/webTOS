@@ -2191,10 +2191,14 @@ pub fn translate_instruction(
             }
         }
 
-        // float -> signed integer, truncating toward zero and saturating (NaN
-        // -> 0, out-of-range -> the clamped extreme). wasm's saturating
-        // truncation matches the interpreter's saturating `as iN` exactly.
-        // Output 2 (i16) has no wasm saturating form and bails.
+        // float -> signed integer with x86 semantics: truncate toward zero;
+        // NaN or out-of-range produces the integer indefinite (the minimum
+        // signed value), matching the interpreter and hardware. wasm's
+        // trunc_sat gets the in-range and negative-overflow cases right, so
+        // only NaN (which it maps to 0) and positive overflow (which it
+        // clamps to MAX) are corrected, via a select on `f != f || f >=
+        // upper`. The f32 input is promoted first (exact), so one f64 path
+        // serves both widths. Output 2 (i16) stays interpreted.
         Op::FloatToInt => {
             let in_size = a.size();
             if !matches!(in_size, 4 | 8) || !matches!(out.size, 4 | 8) {
@@ -2202,12 +2206,42 @@ pub fn translate_instruction(
             }
             emit_store_addr(f);
             emit_float_operand(f, a, in_size)?;
-            f.instruction(&match (in_size, out.size) {
-                (4, 4) => Instruction::I32TruncSatF32S,
-                (8, 4) => Instruction::I32TruncSatF64S,
-                (4, _) => Instruction::I64TruncSatF32S,
-                (_, _) => Instruction::I64TruncSatF64S,
-            });
+            if in_size == 4 {
+                f.instruction(&Instruction::F64PromoteF32);
+            }
+            f.instruction(&Instruction::I64ReinterpretF64);
+            f.instruction(&Instruction::LocalSet(fast.wide));
+            let reload = |f: &mut Function| {
+                f.instruction(&Instruction::LocalGet(fast.wide));
+                f.instruction(&Instruction::F64ReinterpretI64);
+            };
+            // val1: the indefinite. val2: the saturating truncation.
+            if out.size == 4 {
+                f.instruction(&Instruction::I32Const(i32::MIN));
+                reload(f);
+                f.instruction(&Instruction::I32TruncSatF64S);
+            } else {
+                f.instruction(&Instruction::I64Const(i64::MIN));
+                reload(f);
+                f.instruction(&Instruction::I64TruncSatF64S);
+            }
+            // cond: NaN or >= the first unrepresentable positive value
+            // (2^31 / 2^63, both exact in f64).
+            reload(f);
+            reload(f);
+            f.instruction(&Instruction::F64Ne);
+            reload(f);
+            f.instruction(&Instruction::F64Const(
+                if out.size == 4 {
+                    2147483648.0f64
+                } else {
+                    9223372036854775808.0f64
+                }
+                .into(),
+            ));
+            f.instruction(&Instruction::F64Ge);
+            f.instruction(&Instruction::I32Or);
+            f.instruction(&Instruction::Select);
             emit_store(f, out)
         }
 

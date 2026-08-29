@@ -71,11 +71,42 @@ where
     }
     macro_rules! float_to_int {
         ($val:expr) => {{
-            let val = $val;
+            // x86 conversion semantics: a NaN, infinity, or out-of-range
+            // value produces the integer indefinite (the minimum signed
+            // value), not Rust's saturating `as`. JIT-compiled runtimes
+            // depend on it: JSC converts doubles with cvttsd2si and tests
+            // for 0x80000000 to detect "not representable" and take the
+            // slow path — a saturated value silently passes as converted.
+            let f = f64::from($val.to_float());
+            let t = f.trunc();
             match output.size {
-                2 => exec.write_var(output, val.to_float() as i16),
-                4 => exec.write_var(output, val.to_float() as i32),
-                8 => exec.write_var(output, val.to_float() as i64),
+                2 => exec.write_var(
+                    output,
+                    if t.is_nan() || t < f64::from(i16::MIN) || t > f64::from(i16::MAX) {
+                        i16::MIN
+                    } else {
+                        t as i16
+                    },
+                ),
+                4 => exec.write_var(
+                    output,
+                    if t.is_nan() || t < f64::from(i32::MIN) || t > f64::from(i32::MAX) {
+                        i32::MIN
+                    } else {
+                        t as i32
+                    },
+                ),
+                8 => exec.write_var(
+                    output,
+                    // 2^63 is exactly representable and out of range; the
+                    // lower bound -2^63 is exactly representable and in
+                    // range, so the comparisons are exact at both edges.
+                    if t.is_nan() || t < i64::MIN as f64 || t >= -(i64::MIN as f64) {
+                        i64::MIN
+                    } else {
+                        t as i64
+                    },
+                ),
                 size => return exec.exception(ExceptionCode::InvalidFloatSize, size as u64),
             }
         }};

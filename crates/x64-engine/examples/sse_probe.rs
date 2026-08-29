@@ -976,9 +976,485 @@ fn main() {
         );
     }
 
+    // The SSE4.2-baseline frontier: a Bun/JSC binary compiles rounds, shuffles,
+    // shifts, packed min/max/compare, and the double<->int conversions in
+    // unconditionally (no CPUID dispatch), so every one of these executes on
+    // any modern guest. Same harness, same native-CPU reference.
+    macro_rules! xc {
+        ($name:expr, $code:expr, $body:expr) => {
+            Case {
+                name: $name,
+                code: $code,
+                xmm_out: true,
+                reference: $body,
+            }
+        };
+    }
+    macro_rules! ec {
+        ($name:expr, $code:expr, $body:expr) => {
+            Case {
+                name: $name,
+                code: $code,
+                xmm_out: false,
+                reference: $body,
+            }
+        };
+    }
+    let extra: &[Case] = &[
+        xc!(
+            "palignr xmm0,xmm1,8",
+            &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x08],
+            |a, b| unsafe { store(_mm_alignr_epi8::<8>(load(a), load(b))) }
+        ),
+        xc!(
+            "palignr xmm0,xmm1,3",
+            &[0x66, 0x0f, 0x3a, 0x0f, 0xc1, 0x03],
+            |a, b| unsafe { store(_mm_alignr_epi8::<3>(load(a), load(b))) }
+        ),
+        xc!(
+            "psrldq xmm0,7",
+            &[0x66, 0x0f, 0x73, 0xd8, 0x07],
+            |a, _b| unsafe { store(_mm_srli_si128::<7>(load(a))) }
+        ),
+        xc!(
+            "pslldq xmm0,3",
+            &[0x66, 0x0f, 0x73, 0xf8, 0x03],
+            |a, _b| unsafe { store(_mm_slli_si128::<3>(load(a))) }
+        ),
+        xc!(
+            "psrlw xmm0,xmm1",
+            &[0x66, 0x0f, 0xd1, 0xc1],
+            |a, b| unsafe { store(_mm_srl_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "psrld xmm0,xmm1",
+            &[0x66, 0x0f, 0xd2, 0xc1],
+            |a, b| unsafe { store(_mm_srl_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "psrlq xmm0,xmm1",
+            &[0x66, 0x0f, 0xd3, 0xc1],
+            |a, b| unsafe { store(_mm_srl_epi64(load(a), load(b))) }
+        ),
+        xc!(
+            "psllw xmm0,xmm1",
+            &[0x66, 0x0f, 0xf1, 0xc1],
+            |a, b| unsafe { store(_mm_sll_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pslld xmm0,xmm1",
+            &[0x66, 0x0f, 0xf2, 0xc1],
+            |a, b| unsafe { store(_mm_sll_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "psllq xmm0,xmm1",
+            &[0x66, 0x0f, 0xf3, 0xc1],
+            |a, b| unsafe { store(_mm_sll_epi64(load(a), load(b))) }
+        ),
+        xc!(
+            "psrad xmm0,xmm1",
+            &[0x66, 0x0f, 0xe2, 0xc1],
+            |a, b| unsafe { store(_mm_sra_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "punpckhbw xmm0,xmm1",
+            &[0x66, 0x0f, 0x68, 0xc1],
+            |a, b| unsafe { store(_mm_unpackhi_epi8(load(a), load(b))) }
+        ),
+        xc!(
+            "punpckhwd xmm0,xmm1",
+            &[0x66, 0x0f, 0x69, 0xc1],
+            |a, b| unsafe { store(_mm_unpackhi_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "punpckhdq xmm0,xmm1",
+            &[0x66, 0x0f, 0x6a, 0xc1],
+            |a, b| unsafe { store(_mm_unpackhi_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "punpckhqdq xmm0,xmm1",
+            &[0x66, 0x0f, 0x6d, 0xc1],
+            |a, b| unsafe { store(_mm_unpackhi_epi64(load(a), load(b))) }
+        ),
+        xc!(
+            "punpcklwd xmm0,xmm1",
+            &[0x66, 0x0f, 0x61, 0xc1],
+            |a, b| unsafe { store(_mm_unpacklo_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "punpckldq xmm0,xmm1",
+            &[0x66, 0x0f, 0x62, 0xc1],
+            |a, b| unsafe { store(_mm_unpacklo_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxub xmm0,xmm1",
+            &[0x66, 0x0f, 0xde, 0xc1],
+            |a, b| unsafe { store(_mm_max_epu8(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxsw xmm0,xmm1",
+            &[0x66, 0x0f, 0xee, 0xc1],
+            |a, b| unsafe { store(_mm_max_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pminsw xmm0,xmm1",
+            &[0x66, 0x0f, 0xea, 0xc1],
+            |a, b| unsafe { store(_mm_min_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxsb xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3c, 0xc1],
+            |a, b| unsafe { store(_mm_max_epi8(load(a), load(b))) }
+        ),
+        xc!(
+            "pminsb xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x38, 0xc1],
+            |a, b| unsafe { store(_mm_min_epi8(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxuw xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3e, 0xc1],
+            |a, b| unsafe { store(_mm_max_epu16(load(a), load(b))) }
+        ),
+        xc!(
+            "pminuw xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3a, 0xc1],
+            |a, b| unsafe { store(_mm_min_epu16(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxud xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3f, 0xc1],
+            |a, b| unsafe { store(_mm_max_epu32(load(a), load(b))) }
+        ),
+        xc!(
+            "pminud xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3b, 0xc1],
+            |a, b| unsafe { store(_mm_min_epu32(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaxsd xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x3d, 0xc1],
+            |a, b| unsafe { store(_mm_max_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "pminsd xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x39, 0xc1],
+            |a, b| unsafe { store(_mm_min_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "pcmpeqw xmm0,xmm1",
+            &[0x66, 0x0f, 0x75, 0xc1],
+            |a, b| unsafe { store(_mm_cmpeq_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pcmpeqq xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x29, 0xc1],
+            |a, b| unsafe { store(_mm_cmpeq_epi64(load(a), load(b))) }
+        ),
+        xc!(
+            "pcmpgtw xmm0,xmm1",
+            &[0x66, 0x0f, 0x65, 0xc1],
+            |a, b| unsafe { store(_mm_cmpgt_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pcmpgtd xmm0,xmm1",
+            &[0x66, 0x0f, 0x66, 0xc1],
+            |a, b| unsafe { store(_mm_cmpgt_epi32(load(a), load(b))) }
+        ),
+        xc!(
+            "pcmpgtq xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x37, 0xc1],
+            |a, b| unsafe { store(_mm_cmpgt_epi64(load(a), load(b))) }
+        ),
+        xc!(
+            "pmullw xmm0,xmm1",
+            &[0x66, 0x0f, 0xd5, 0xc1],
+            |a, b| unsafe { store(_mm_mullo_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pmuludq xmm0,xmm1",
+            &[0x66, 0x0f, 0xf4, 0xc1],
+            |a, b| unsafe { store(_mm_mul_epu32(load(a), load(b))) }
+        ),
+        xc!(
+            "pmaddwd xmm0,xmm1",
+            &[0x66, 0x0f, 0xf5, 0xc1],
+            |a, b| unsafe { store(_mm_madd_epi16(load(a), load(b))) }
+        ),
+        xc!(
+            "pshufd xmm0,xmm1,0x1b",
+            &[0x66, 0x0f, 0x70, 0xc1, 0x1b],
+            |_a, b| unsafe { store(_mm_shuffle_epi32::<0x1b>(load(b))) }
+        ),
+        xc!(
+            "pshuflw xmm0,xmm1,0x1b",
+            &[0xf2, 0x0f, 0x70, 0xc1, 0x1b],
+            |_a, b| unsafe { store(_mm_shufflelo_epi16::<0x1b>(load(b))) }
+        ),
+        xc!(
+            "pshufhw xmm0,xmm1,0x1b",
+            &[0xf3, 0x0f, 0x70, 0xc1, 0x1b],
+            |_a, b| unsafe { store(_mm_shufflehi_epi16::<0x1b>(load(b))) }
+        ),
+        xc!(
+            "movddup xmm0,xmm1",
+            &[0xf2, 0x0f, 0x12, 0xc1],
+            |_a, b| unsafe { store(_mm_castpd_si128(_mm_movedup_pd(_mm_castsi128_pd(load(b))))) }
+        ),
+        xc!(
+            "movshdup xmm0,xmm1",
+            &[0xf3, 0x0f, 0x16, 0xc1],
+            |_a, b| unsafe { store(_mm_castps_si128(_mm_movehdup_ps(_mm_castsi128_ps(load(b))))) }
+        ),
+        xc!(
+            "movsldup xmm0,xmm1",
+            &[0xf3, 0x0f, 0x12, 0xc1],
+            |_a, b| unsafe { store(_mm_castps_si128(_mm_moveldup_ps(_mm_castsi128_ps(load(b))))) }
+        ),
+        xc!(
+            "unpcklpd xmm0,xmm1",
+            &[0x66, 0x0f, 0x14, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_unpacklo_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "unpckhpd xmm0,xmm1",
+            &[0x66, 0x0f, 0x15, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_unpackhi_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!("unpcklps xmm0,xmm1", &[0x0f, 0x14, 0xc1], |a, b| unsafe {
+            store(_mm_castps_si128(_mm_unpacklo_ps(
+                _mm_castsi128_ps(load(a)),
+                _mm_castsi128_ps(load(b)),
+            )))
+        }),
+        xc!("unpckhps xmm0,xmm1", &[0x0f, 0x15, 0xc1], |a, b| unsafe {
+            store(_mm_castps_si128(_mm_unpackhi_ps(
+                _mm_castsi128_ps(load(a)),
+                _mm_castsi128_ps(load(b)),
+            )))
+        }),
+        xc!(
+            "shufps xmm0,xmm1,0x4e",
+            &[0x0f, 0xc6, 0xc1, 0x4e],
+            |a, b| unsafe {
+                store(_mm_castps_si128(_mm_shuffle_ps::<0x4e>(
+                    _mm_castsi128_ps(load(a)),
+                    _mm_castsi128_ps(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "addpd xmm0,xmm1",
+            &[0x66, 0x0f, 0x58, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_add_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "subpd xmm0,xmm1",
+            &[0x66, 0x0f, 0x5c, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_sub_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "mulpd xmm0,xmm1",
+            &[0x66, 0x0f, 0x59, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_mul_pd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!("addps xmm0,xmm1", &[0x0f, 0x58, 0xc1], |a, b| unsafe {
+            store(_mm_castps_si128(_mm_add_ps(
+                _mm_castsi128_ps(load(a)),
+                _mm_castsi128_ps(load(b)),
+            )))
+        }),
+        xc!(
+            "addsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x58, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_add_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "subsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x5c, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_sub_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "mulsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x59, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_mul_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "divsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x5e, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_div_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "minsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x5d, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_min_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "maxsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x5f, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_max_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "sqrtsd xmm0,xmm1",
+            &[0xf2, 0x0f, 0x51, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_sqrt_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "addss xmm0,xmm1",
+            &[0xf3, 0x0f, 0x58, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castps_si128(_mm_add_ss(
+                    _mm_castsi128_ps(load(a)),
+                    _mm_castsi128_ps(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "cvtdq2pd xmm0,xmm1",
+            &[0xf3, 0x0f, 0xe6, 0xc1],
+            |_a, b| unsafe { store(_mm_castpd_si128(_mm_cvtepi32_pd(load(b)))) }
+        ),
+        xc!(
+            "cvtpd2dq xmm0,xmm1",
+            &[0xf2, 0x0f, 0xe6, 0xc1],
+            |_a, b| unsafe { store(_mm_cvtpd_epi32(_mm_castsi128_pd(load(b)))) }
+        ),
+        xc!(
+            "cvttpd2dq xmm0,xmm1",
+            &[0x66, 0x0f, 0xe6, 0xc1],
+            |_a, b| unsafe { store(_mm_cvttpd_epi32(_mm_castsi128_pd(load(b)))) }
+        ),
+        xc!("cvtdq2ps xmm0,xmm1", &[0x0f, 0x5b, 0xc1], |_a, b| unsafe {
+            store(_mm_castps_si128(_mm_cvtepi32_ps(load(b))))
+        }),
+        xc!(
+            "cvtps2dq xmm0,xmm1",
+            &[0x66, 0x0f, 0x5b, 0xc1],
+            |_a, b| unsafe { store(_mm_cvtps_epi32(_mm_castsi128_ps(load(b)))) }
+        ),
+        xc!(
+            "cvttps2dq xmm0,xmm1",
+            &[0xf3, 0x0f, 0x5b, 0xc1],
+            |_a, b| unsafe { store(_mm_cvttps_epi32(_mm_castsi128_ps(load(b)))) }
+        ),
+        xc!(
+            "cvtsd2ss xmm0,xmm1",
+            &[0xf2, 0x0f, 0x5a, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castps_si128(_mm_cvtsd_ss(
+                    _mm_castsi128_ps(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            }
+        ),
+        xc!(
+            "cvtss2sd xmm0,xmm1",
+            &[0xf3, 0x0f, 0x5a, 0xc1],
+            |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_cvtss_sd(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_ps(load(b)),
+                )))
+            }
+        ),
+        xc!("cvtps2pd xmm0,xmm1", &[0x0f, 0x5a, 0xc1], |_a, b| unsafe {
+            store(_mm_castpd_si128(_mm_cvtps_pd(_mm_castsi128_ps(load(b)))))
+        }),
+        xc!(
+            "cvtpd2ps xmm0,xmm1",
+            &[0x66, 0x0f, 0x5a, 0xc1],
+            |_a, b| unsafe { store(_mm_castps_si128(_mm_cvtpd_ps(_mm_castsi128_pd(load(b))))) }
+        ),
+        ec!(
+            "cvttsd2si eax,xmm1",
+            &[0xf2, 0x0f, 0x2c, 0xc1],
+            |_a, b| unsafe { _mm_cvttsd_si32(_mm_castsi128_pd(load(b))) as u32 as u128 }
+        ),
+        ec!(
+            "cvtsd2si eax,xmm1",
+            &[0xf2, 0x0f, 0x2d, 0xc1],
+            |_a, b| unsafe { _mm_cvtsd_si32(_mm_castsi128_pd(load(b))) as u32 as u128 }
+        ),
+        ec!(
+            "cvttss2si eax,xmm1",
+            &[0xf3, 0x0f, 0x2c, 0xc1],
+            |_a, b| unsafe { _mm_cvttss_si32(_mm_castsi128_ps(load(b))) as u32 as u128 }
+        ),
+        ec!(
+            "movmskpd eax,xmm1",
+            &[0x66, 0x0f, 0x50, 0xc1],
+            |_a, b| unsafe { _mm_movemask_pd(_mm_castsi128_pd(load(b))) as u32 as u128 }
+        ),
+        ec!(
+            "pextrw eax,xmm1,3",
+            &[0x66, 0x0f, 0xc5, 0xc1, 0x03],
+            |_a, b| unsafe { _mm_extract_epi16::<3>(load(b)) as u32 as u128 }
+        ),
+    ];
+
     let iterations = 200;
     let mut failures = 0;
-    for case in cases {
+    for case in cases.iter().chain(extra.iter()) {
         let mut mismatches = 0;
         let mut first: Option<String> = None;
         for _ in 0..iterations {
@@ -1007,6 +1483,204 @@ fn main() {
         } else {
             failures += 1;
             println!("FAIL {} ({mismatches}/{iterations})", case.name);
+            if let Some(f) = first {
+                println!("    {f}");
+            }
+        }
+    }
+    // Rounding-mode conformance for the round* family. Random 128-bit inputs
+    // are almost always NaN or |x| >= 2^52 (already integral), where every
+    // mode agrees — so mode bugs hide behind them. These feed crafted
+    // fractional values in the low lane, the only inputs that separate
+    // floor/ceil/trunc/nearest. `roundsd`/`roundss` take the mode as an imm8
+    // the pcodeop delivers as a third input; a helper that ignores it rounds
+    // every mode to nearest and passes the random sweep while corrupting real
+    // `Math.floor`/`ceil`/`trunc`. imm8 low bits: 0 nearest, 1 floor, 2 ceil,
+    // 3 truncate.
+    let round_inputs: &[f64] = &[2.5, -2.5, 2.4, -2.4, 0.5, -0.5, 3.5, 100.25, -100.25];
+    let round_cases: &[(&str, &[u8], bool, fn(f64, u8) -> f64)] = &[
+        (
+            "roundsd imm=0 nearest",
+            &[0x66, 0x0f, 0x3a, 0x0b, 0xc1, 0x00],
+            true,
+            |v, _| v.round_ties_even(),
+        ),
+        (
+            "roundsd imm=1 floor",
+            &[0x66, 0x0f, 0x3a, 0x0b, 0xc1, 0x01],
+            true,
+            |v, _| v.floor(),
+        ),
+        (
+            "roundsd imm=2 ceil",
+            &[0x66, 0x0f, 0x3a, 0x0b, 0xc1, 0x02],
+            true,
+            |v, _| v.ceil(),
+        ),
+        (
+            "roundsd imm=3 trunc",
+            &[0x66, 0x0f, 0x3a, 0x0b, 0xc1, 0x03],
+            true,
+            |v, _| v.trunc(),
+        ),
+        (
+            "roundss imm=1 floor",
+            &[0x66, 0x0f, 0x3a, 0x0a, 0xc1, 0x01],
+            false,
+            |v, _| (v as f32).floor() as f64,
+        ),
+        (
+            "roundss imm=2 ceil",
+            &[0x66, 0x0f, 0x3a, 0x0a, 0xc1, 0x02],
+            false,
+            |v, _| (v as f32).ceil() as f64,
+        ),
+        (
+            "roundss imm=3 trunc",
+            &[0x66, 0x0f, 0x3a, 0x0a, 0xc1, 0x03],
+            false,
+            |v, _| (v as f32).trunc() as f64,
+        ),
+    ];
+    for (name, code, is_double, reference) in round_cases {
+        let mut mismatches = 0;
+        let mut first: Option<String> = None;
+        for &v in round_inputs {
+            let (lane_in, want_lane): (u128, u64) = if *is_double {
+                (f64::to_bits(v) as u128, reference(v, 0).to_bits())
+            } else {
+                (
+                    (v as f32).to_bits() as u128,
+                    (reference(v, 0) as f32).to_bits() as u64,
+                )
+            };
+            let (got_xmm, _) = probe.run(code, 0, lane_in);
+            let got_lane = if *is_double {
+                got_xmm as u64
+            } else {
+                got_xmm as u32 as u64
+            };
+            if got_lane != want_lane {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some(format!("v={v} want={want_lane:#018x} got={got_lane:#018x}"));
+                }
+            }
+        }
+        if mismatches == 0 {
+            println!("OK   {name}");
+        } else {
+            failures += 1;
+            println!("FAIL {name} ({mismatches}/{})", round_inputs.len());
+            if let Some(f) = first {
+                println!("    {f}");
+            }
+        }
+    }
+
+    // Flag-writing compares: ucomisd/comisd drive every JS NaN check and
+    // double comparison, ptest the vectorized all-zero fast paths. A wrong
+    // ZF/PF/CF silently takes the wrong branch — no crash, just corruption.
+    type FlagRef = fn([u8; 16], [u8; 16]) -> (u8, u8, u8); // (ZF, PF, CF)
+    let flag_cases: &[(&str, &[u8], FlagRef)] = &[
+        ("ucomisd xmm0,xmm1", &[0x66, 0x0f, 0x2e, 0xc1], |a, b| {
+            let x = f64::from_le_bytes(a[..8].try_into().expect("8 bytes"));
+            let y = f64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            if x.is_nan() || y.is_nan() {
+                (1, 1, 1)
+            } else if x < y {
+                (0, 0, 1)
+            } else if x > y {
+                (0, 0, 0)
+            } else {
+                (1, 0, 0)
+            }
+        }),
+        ("comisd xmm0,xmm1", &[0x66, 0x0f, 0x2f, 0xc1], |a, b| {
+            let x = f64::from_le_bytes(a[..8].try_into().expect("8 bytes"));
+            let y = f64::from_le_bytes(b[..8].try_into().expect("8 bytes"));
+            if x.is_nan() || y.is_nan() {
+                (1, 1, 1)
+            } else if x < y {
+                (0, 0, 1)
+            } else if x > y {
+                (0, 0, 0)
+            } else {
+                (1, 0, 0)
+            }
+        }),
+        ("ucomiss xmm0,xmm1", &[0x0f, 0x2e, 0xc1], |a, b| {
+            let x = f32::from_le_bytes(a[..4].try_into().expect("4 bytes"));
+            let y = f32::from_le_bytes(b[..4].try_into().expect("4 bytes"));
+            if x.is_nan() || y.is_nan() {
+                (1, 1, 1)
+            } else if x < y {
+                (0, 0, 1)
+            } else if x > y {
+                (0, 0, 0)
+            } else {
+                (1, 0, 0)
+            }
+        }),
+        (
+            "ptest xmm0,xmm1",
+            &[0x66, 0x0f, 0x38, 0x17, 0xc1],
+            |a, b| {
+                let x = u128::from_le_bytes(a);
+                let y = u128::from_le_bytes(b);
+                (u8::from(x & y == 0), 0, u8::from(!x & y == 0))
+            },
+        ),
+    ];
+    for (name, code, reference) in flag_cases {
+        let mut mismatches = 0;
+        let mut first: Option<String> = None;
+        for i in 0..iterations {
+            let a_bytes: [u8; 16] = std::array::from_fn(|_| next() as u8);
+            // Every fourth case compares equal halves; sprinkle NaN and zero
+            // patterns, which random exponents almost never produce.
+            let b_bytes: [u8; 16] = match i % 4 {
+                0 => a_bytes,
+                1 => {
+                    let mut n = a_bytes;
+                    n[6] = 0xf8;
+                    n[7] = 0x7f; // quiet NaN in the low f64 lane
+                    n
+                }
+                2 => [0u8; 16],
+                _ => std::array::from_fn(|_| next() as u8),
+            };
+            let _ = probe.run(
+                code,
+                u128::from_le_bytes(a_bytes),
+                u128::from_le_bytes(b_bytes),
+            );
+            let read_flag = |vm: &mut InterpVm, name: &str| -> u8 {
+                let var = vm.cpu.arch.sleigh.get_varnode(name).expect("flag varnode");
+                (vm.cpu.read_reg(var) & 1) as u8
+            };
+            let got = (
+                read_flag(&mut probe.vm, "ZF"),
+                read_flag(&mut probe.vm, "PF"),
+                read_flag(&mut probe.vm, "CF"),
+            );
+            let want = reference(a_bytes, b_bytes);
+            if got != want {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some(format!(
+                        "a={:032x} b={:032x}\n    want ZF/PF/CF={want:?} got={got:?}",
+                        u128::from_le_bytes(a_bytes),
+                        u128::from_le_bytes(b_bytes)
+                    ));
+                }
+            }
+        }
+        if mismatches == 0 {
+            println!("OK   {name}");
+        } else {
+            failures += 1;
+            println!("FAIL {name} ({mismatches}/{iterations})");
             if let Some(f) = first {
                 println!("    {f}");
             }

@@ -679,10 +679,13 @@ pub mod x86 {
 
     fn roundsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Scalar round of the low f64 of args[1], with the upper 64 bits taken
-        // from args[0]. The SLEIGH pcodeop drops the imm8 rounding mode (only
-        // two operands survive icicle's p-code), so round to nearest, ties to
-        // even — the IEEE default and the MXCSR default that `imm8` bit 2
-        // selects.
+        // from args[0]. The imm8 rounding mode is the pcodeop's third input,
+        // delivered via `cpu.args` (as the packed forms already read it): bit
+        // 2 selects MXCSR rounding, which this machine keeps at the default
+        // (nearest-even); bits 1:0 give the explicit mode. `Math.floor`,
+        // `ceil`, and `trunc` all compile to this instruction, so rounding
+        // every mode to nearest silently corrupts any program that indexes
+        // with a floored value.
         let Some(upper) = xmm_bytes(cpu, args[0]) else {
             return;
         };
@@ -692,13 +695,22 @@ pub mod x86 {
             cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
             return;
         }
+        let imm = cpu.args[0] as u8;
+        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
         let upper = u128::from_le_bytes(upper);
         let value = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
-        let rounded = value.round_ties_even().to_bits();
+        let rounded = match mode {
+            0 => value.round_ties_even(),
+            1 => value.floor(),
+            2 => value.ceil(),
+            _ => value.trunc(),
+        }
+        .to_bits();
         write_xmm(cpu, dst, ((upper & !0xffff_ffff_ffff_ffffu128) | rounded as u128).to_le_bytes());
     }
 
     fn roundss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        // The f32 sibling of `roundsd`; same imm8-via-`cpu.args` contract.
         let Some(upper) = xmm_bytes(cpu, args[0]) else {
             return;
         };
@@ -708,9 +720,17 @@ pub mod x86 {
             cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
             return;
         }
+        let imm = cpu.args[0] as u8;
+        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
         let upper = u128::from_le_bytes(upper);
         let value = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
-        let rounded = value.round_ties_even().to_bits();
+        let rounded = match mode {
+            0 => value.round_ties_even(),
+            1 => value.floor(),
+            2 => value.ceil(),
+            _ => value.trunc(),
+        }
+        .to_bits();
         write_xmm(cpu, dst, ((upper & !0xffff_ffffu128) | rounded as u128).to_le_bytes());
     }
 
