@@ -79,10 +79,12 @@ const generatedAssets = new Map();
 const BLANK = "<!doctype html><meta charset=utf-8><title>webTOS test</title>";
 /// Served at /__net_probe: the body a guest must fetch over a real socket.
 const NET_PROBE = "net-probe-ok";
-// Larger than the 32 MiB profile used by the terminal budget probe.  The
-// The endpoint is deterministic and avoids coupling this assertion to an
-// optional workload binary.
-const OVERSIZED_IMAGE_BYTES = 33 * 1024 * 1024;
+// Larger than the 128 MiB profile used by the terminal budget probe. The
+// budget must itself be above the runtime's baseline footprint; otherwise
+// setting the budget is rejected before this image can exercise the intended
+// pre-write admission check. The endpoint is deterministic and avoids
+// coupling this assertion to an optional workload binary.
+const OVERSIZED_IMAGE_BYTES = 129 * 1024 * 1024;
 
 async function startServer() {
   const server = createServer(async (req, res) => {
@@ -863,7 +865,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   // The worker calls guestWriter with Content-Length before reading the body,
   // so a pass proves the guest image was rejected up front rather than being
   // partially written until an unlucky allocation failed.
-  await page.goto(`${origin}/web/terminal.html?budget=32&image=__budget_probe`);
+  await page.goto(`${origin}/web/terminal.html?budget=128&image=__budget_probe`);
   const refusal = await page
     .waitForFunction(
       () => {
