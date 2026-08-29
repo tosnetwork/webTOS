@@ -1175,8 +1175,16 @@ Work:
   they were keyed by bare address and were not cleared on a code-cache flush, so
   a re-lifted block could run a stale compiled handle after self-modifying code
   or reuse another image's handle at the same address after `execve`. They are
-  now keyed by the block's full identity (vaddr, isa_mode, asid) and cleared on
-  flush, gated by two tests that fail without the fix. A compiled-code budget
+  now keyed by block id — the one identity that names exactly one p-code body,
+  which an address does not: several blocks share a start address (a REP-style
+  instruction lifts to a prologue chained to a loop block at the same address),
+  and a re-lift after a lazy code page-in replaces the block behind an address,
+  either of which served one block's compiled code to another and, under JIT +
+  demand paging, hung a real dynamically-linked agent at the loader's memcpy.
+  Block ids are append-only between flushes, so a stale id is never dispatched
+  again and `execve` safety falls out. Gated by a same-address rep-string
+  regression test and the eviction test, both red without the fix. A
+  compiled-code budget
   then bounded the last unbounded JIT resource: the backend held every compiled
   module for the life of the session, and its native code memory was outside
   every ledger. The budget caps the wasm bytes held, evicts the least recently
@@ -1207,7 +1215,18 @@ Work:
   those bytes is a surface of its own — the interpreter, and every address
   translation the MMU does for an operand the guest computed — so the same
   corpus runs under nine register patterns, 940,032 executions, which found
-  three more defects. The host's own half of the boundary — every exported
+  three more defects. A differential SSE/conversion probe (`examples/sse_probe`,
+  run on the x86-64 host against the native CPU as reference) then found five
+  more, driving a real Bun/JSC agent binary through the engine: `rdtsc` returned
+  a constant so a spin-wait never ended; `roundsd`/`roundss` dropped the imm8
+  rounding mode so `Math.floor`/`ceil`/`trunc` all rounded to nearest;
+  float→int used a saturating cast where x86 yields the integer indefinite, so
+  JSC's not-representable check passed garbage; and `cvtpd2dq`/`cvtps2dq`
+  truncated where they should round. Random 128-bit inputs hid the mode bugs
+  (almost always NaN or already-integral, where every mode agrees), so the
+  probe grew crafted round-mode, flag-writing, and conversion families — 164
+  cases, each confirmed to go red when its fix is reverted. The host's own half
+  of the boundary — every exported
   `wtw_*` function, called with pointers, lengths, handles, and budgets it
   did not earn — is swept from Node against the real module, 6,013 calls
   across 56 functions, which found thirty-two ways for a page to trap the
