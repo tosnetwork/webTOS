@@ -22,6 +22,14 @@ rather than left to be mistaken for present behaviour; `git log` has them.
 - [Use cases](USE-CASES.md) - what the runtime supports today, what it has
   actually been pointed at, and what it deliberately does not do
 
+## Application architecture research
+
+- [Intent-native applications](INTENT_NATIVE_APPLICATIONS.md) - product and
+  architecture direction for dynamically composing interfaces, local Linux
+  processes, agents, tools, state, capabilities, approvals, and services from
+  user intent; proposed graph and SDK surfaces are explicitly separated from
+  current runtime capabilities
+
 ## Measurement and workloads
 
 - [Performance and memory](performance.md) - interpreter and hot-block JIT
