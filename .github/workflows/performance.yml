@@ -40,6 +40,10 @@ jobs:
           python3 -B tools/test_performance_dashboard.py
           node web/test_bench_payload.mjs
 
+      - name: Warm the crate cache for the frozen builds
+        working-directory: crates
+        run: cargo fetch --locked
+
       - name: Prove native and browser benchmark inputs are identical
         working-directory: crates
         run: cargo test --frozen --release -p linux-compat --test bench benchmark_payload_fingerprints
