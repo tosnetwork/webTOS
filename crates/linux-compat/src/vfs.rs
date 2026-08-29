@@ -304,6 +304,13 @@ impl Vfs {
     /// absolute). Follows symlinks in intermediate components, and in the
     /// final component when `follow_last` is set.
     pub fn resolve(&self, start: usize, path: &[u8], follow_last: bool) -> Result<Resolved, u64> {
+        // Linux: an empty pathname yields ENOENT (path resolution never treats
+        // it as the base directory; AT_EMPTY_PATH callers branch before this).
+        // Without the check, a corrupted or unfilled path string silently
+        // resolves to the working directory and masks the corruption.
+        if path.is_empty() {
+            return Err(crate::abi::ENOENT);
+        }
         self.resolve_depth(start, path, follow_last, 0)
     }
 
