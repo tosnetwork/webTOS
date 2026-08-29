@@ -58,12 +58,21 @@ jobs:
 
       - name: Rebuild the canonical measured runtime
         run: |
+          rustc --version --verbose
           tools/build_release.sh \
             --out-dir "$RUNNER_TEMP/webtos-release" \
             --target-dir "$RUNNER_TEMP/webtos-target"
           cp \
             "$RUNNER_TEMP/webtos-target/wasm32-unknown-unknown/release/webtos_web.wasm" \
             web/webtos_web.wasm
+          sha256sum web/webtos_web.wasm
+
+      - name: Upload rebuilt canonical runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: webtos-canonical-runtime
+          path: web/webtos_web.wasm
+          if-no-files-found: error
 
       - name: Reject runtime or rendered-dashboard drift
         run: |
