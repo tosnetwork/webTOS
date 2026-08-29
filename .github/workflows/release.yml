@@ -21,7 +21,14 @@ jobs:
 
       - name: Fetch the locked dependency graph
         working-directory: crates
-        run: cargo fetch --locked
+        # `.cargo/config.toml` sets `build-std`, so the reproducible-build check
+        # (which compiles the wasm runtime with `--frozen`) needs the wasm
+        # allocator dlmalloc in the registry cache. It is a build-std dependency,
+        # not a workspace one, so `cargo fetch` does not download it; a one-shot
+        # non-frozen wasm build does.
+        run: |
+          cargo fetch --locked
+          cargo build --locked --release --target wasm32-unknown-unknown -p webtos-web
 
       - name: Validate dependency-license metadata
         working-directory: crates

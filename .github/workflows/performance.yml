@@ -42,7 +42,15 @@ jobs:
 
       - name: Warm the crate cache for the frozen builds
         working-directory: crates
-        run: cargo fetch --locked
+        # `.cargo/config.toml` sets `build-std`, so every build compiles std
+        # from source. The wasm allocator (dlmalloc) is a build-std dependency,
+        # not a workspace one, so `cargo fetch` does not download it and the
+        # later `--frozen` wasm build cannot. A one-shot non-frozen wasm build
+        # pulls it into the shared registry cache; the frozen release build then
+        # recompiles from that cache under its own controls.
+        run: |
+          cargo fetch --locked
+          cargo build --locked --release --target wasm32-unknown-unknown -p webtos-web
 
       - name: Prove native and browser benchmark inputs are identical
         working-directory: crates
