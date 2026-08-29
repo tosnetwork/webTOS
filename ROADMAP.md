@@ -96,6 +96,32 @@ The milestone sections below carry the detail. This is the same work grouped
 by what it unblocks, because the outstanding items do not line up with the
 milestone numbering any more.
 
+### Parallel queue outside the active Claude work
+
+Coordination snapshot, 2026-08-29: Claude is working on the M7 Claude Code TUI
+and long-run diagnosis in `crates/linux-compat/examples/run_guest.rs` and
+`web/probe_claude_tui.mjs`. The queue below deliberately excludes those files
+and that acceptance path.
+
+| Priority | Work we can take independently | Concrete exit gate |
+|---|---|---|
+| P0 | Name and gate the remaining M5 proxy-failure case | A broker/proxy that accepts the request and then fails produces the documented guest errno, never a hang; native and browser boundary tests go red if the mapping is removed |
+| P0 | Make browser-worker cancellation storage-safe | Terminating a worker during snapshot/image persistence leaves the last committed state readable after reload; an interrupted write is never selected as current |
+| P1 | Publish the M0 performance dashboard | Versioned JSON plus rendered Markdown report native/Chromium/Firefox/WebKit results from the existing control and workload harnesses; CI rejects report/render drift |
+| P1 | Close the M3 minimal-root licensing gap | The pinned Alpine image emits a per-package inventory with package version, source, license, and redistribution decision; image construction fails on an undecided package |
+| P1 | Specify Execution Record V1, then implement the smallest verifier | A canonical record binds runtime/workload identities, inputs, storage checkpoint, network receipts, output, and trace root; tampering any binding makes verification fail |
+| P2 | Implement true multi-block JIT regions | A relooper compiles a bounded multi-block CFG, interpreter/JIT architectural traces remain identical, and browser benchmarks prove fewer dispatches without a new unbounded cache |
+| P2 | Replace file-delivered secrets with real host handles | A guest can use a scoped credential without the secret bytes entering its filesystem, snapshot, trace, or crash bundle; cross-agent access is refused |
+| P2 | Close the remaining background-terminal semantics | Background `tcsetattr`/`tcsetpgrp` receive `SIGTTOU` as Linux requires, with native Linux fixtures that go red if either control operation is allowed silently |
+
+External maintainer gates are not implementation work: run the OIDC release
+workflow from the committed branch, choose and publish the production workload
+trust root, and create the first supported release. Multi-worker execution,
+energy accounting, and lift-cache body serialization remain deliberately
+deferred and are not part of this queue. The real Claude Code browser task and
+the multi-hour agent soak stay with the active Claude acceptance path rather
+than being duplicated here.
+
 ### The agent goal (M7, and the M6 tail)
 
 The product goal is a coding agent in a tab. Everything below it now works;
@@ -131,8 +157,10 @@ what is left is the agent itself.
   `/proc/self/maps` did not exist — that last one alone is what Bun aborts
   without. What remains is a session that does work rather than a version
   string. See `docs/workloads/node.md`.
-- **Repository access with real history**, beyond the host `git` binary
-  running against a mounted tree.
+- ~~**Repository access with real history.**~~ Done: `tests/git.rs` mounts a
+  repository with a three-commit object database and proves the guest walks it
+  newest-first, so this is real refs/history rather than a readable working
+  tree alone.
 - ~~**Cancellation and checkpoint resume.**~~ Done. `^C` and `^Z` are
   signals, a stopped group is a scheduler state, `fg` resumes it, a background
   reader is stopped with SIGTTIN rather than competing for keystrokes, and an
@@ -148,8 +176,9 @@ what is left is the agent itself.
 - **SIGTTOU on terminal writes** fires only when `TOSTOP` is set, which the
   default termios leaves off, matching Linux — but `tcsetattr` and
   `tcsetpgrp` from a background group should raise it regardless, and do not.
-- **The long soaks**: OpenFox's hour is done; a multi-hour agent soak is not,
-  and neither is bounded event-log growth. The soak asserts four
+- **The long soaks**: OpenFox's three-hour 8,000-round run and bounded event-log
+  growth are done; a multi-hour Codex or Claude Code session is not. The soak
+  asserts four
   invariants rather than one; the block-table invariant is a structural
   ceiling, because tiered lifting leaves a retired block group behind on
   promotion and a long run reaches the ceiling rather than converging short
@@ -201,8 +230,10 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   sooner than the number suggests. The network meter counts guest payload
   only; connection setup, host-side DNS, and TCP and TLS framing never cross
   the broker interface, so the figure is a floor on what the tab moves rather
-  than a wire total. CPU and the event log have no quota. The browser wiring
-  for both new ceilings is gated natively but not yet in the engine matrix.
+  than a wire total. CPU and the event log have ceilings too: CPU stops a turn
+  with `OutOfCpu` and can resume under a raised allowance, while the event log
+  records how much it dropped after reaching its cap. All five quotas are
+  exposed through the browser host and covered by their native/browser gates.
 - **32-bit narrowing.** Three found so far, all the same shape: 64-bit
   address or size arithmetic done at `usize` width, which is correct on the
   64-bit host the tests run on and wrong on the 32-bit target that ships. A
@@ -261,7 +292,9 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   traces in `test_data/traces/`, and the browser matrix reproduces one of them
   register for register. Determinism is now gated against a recorded baseline
   rather than only against another run.
-- **Versioned fixtures.** They exist; they are not a formal, pinned set.
+- ~~**Versioned fixtures.**~~ Done: `test_data/FIXTURES.sha256` is the formal
+  pinned set and `tests/fixtures.rs` recomputes it, so corruption or accidental
+  regeneration fails rather than silently changing the baseline.
 - ~~**Native QEMU validation.**~~ Removed: it validated the Stage-1 kernel, which has been deleted from the repository; the trace suite is the native reference now, reproduced register for register in every browser engine.
 - ~~**A Linux host in the loop.**~~ Partly done: a skip is no longer silent.
   Every fixture goes through one helper that prints `SKIP:` with the fixture
@@ -276,8 +309,11 @@ Measured, not guessed — see [`docs/performance.md`](docs/performance.md).
   pinned OpenFox commit so a failure means this repository changed rather than
   that one did. It is manual (`workflow_dispatch`) until it has run on a real
   runner, so the Linux host is still in the loop only when someone starts it.
-- **A compatibility dashboard** across engines and pinned workload versions.
-  The measurement harnesses exist; nothing publishes them.
+- ~~**A compatibility dashboard** across engines and pinned workload
+  versions.~~ Done: `docs/compatibility/compatibility.json` binds the runtime,
+  exact workload bytes, browser versions, checks, and instruction
+  fingerprints; its workflow rejects lock or rendered-dashboard drift. The
+  separate performance dashboard remains in the parallel queue above.
 - ~~**A suite that is only sound single-threaded.**~~ Fixed. The engine kept
   the current address space, block address, and instruction count in
   process-wide atomics, and the OS layer the current pid, so two tests running
@@ -330,19 +366,20 @@ kernel entry.
 ### Not scoped by any milestone
 
 The mission promises "webTOS-owned isolation, scheduling, storage, networking
-policy, resource accounting, and execution records". The first four are
-delivered on the browser line. The last two are not, and no milestone from M0
-to M8 fully covers them:
+policy, resource accounting, and execution records". The first five are
+delivered on the browser line. End-to-end, third-party-verifiable execution
+records are not, and no milestone from M0 to M8 fully covers them:
 
 - **Resource accounting.** M8's quotas cap memory, CPU, storage, network, and
   the event log per agent. Energy accounting per agent — the TOS agent
   kernel's model, no longer in this repository — has no browser counterpart
   and no gate.
 - **Execution records.** Principle 6 says CPU execution, scheduling, external
-  input, storage commits, and receipts are one system. Determinism is gated by
-  comparing runs to each other; nothing produces a receipt a third party could
-  replay against. M5's "record network inputs for replay and receipt
-  classification" is the only line item, and it is not started.
+  input, storage commits, and receipts are one system. Network recording,
+  offline replay, and per-connection receipt classification are implemented
+  and gated, but nothing binds those receipts to the runtime/workload identity,
+  starting checkpoint, trace root, and final output in one canonical record a
+  third party can verify.
 
 An execution record a third party could check — binding an output to the code,
 the input, and the state that produced it — is the largest unscoped piece of
@@ -558,10 +595,12 @@ Work:
   as proof of semantic completeness. ✅ (four traces in `test_data/traces/`,
   regenerated deliberately and diffed on every run; the count is not the
   claim, the contents are)
-- Define browser support and performance dashboards. 🔶 (`web/bench.mjs` and
-  `crates/linux-compat/tests/bench.rs` measure the same workloads in a browser
-  and natively, against a control module that separates a slow engine from a
-  slow runtime; no dashboard yet)
+- Define browser support and performance dashboards. 🔶 (browser support is
+  published and verifier-gated in `docs/compatibility/`; performance remains:
+  `web/bench.mjs` and `crates/linux-compat/tests/bench.rs` measure the same
+  workloads in a browser and natively, against a control module that separates
+  a slow engine from a slow runtime, but no versioned performance report is
+  published yet)
 - Classify the existing `TODO-*` files as native-substrate supporting plans. ✅ (docs/plans/)
 
 Exit gate:
