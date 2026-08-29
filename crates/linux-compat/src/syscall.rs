@@ -2522,6 +2522,22 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         cpu.mem.unmap_memory_len(target, len);
         env.pager.unmap(env.proc.asid, target, len);
         target
+    } else if addr != 0
+        && addr & (PAGE_SIZE - 1) == 0
+        && cpu
+            .mem
+            .find_free_memory(icicle_cpu::mem::AllocLayout {
+                addr: Some(addr),
+                size: len,
+                align: PAGE_SIZE,
+            })
+            .is_ok_and(|found| found == addr)
+    {
+        // A page-aligned hint whose range is free is honored, exactly as
+        // Linux does. Software may legitimately depend on that: JSC hints
+        // the addresses of its caged heaps and later derives pointers from
+        // where it asked, not only from where it looked.
+        addr
     } else {
         // Find an actual free hole at or above the allocation hint; a plain
         // bump allocator collides with existing mappings once the guest

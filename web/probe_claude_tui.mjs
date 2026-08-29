@@ -1,8 +1,10 @@
 // Probe: does the Claude Code TUI paint under the engine when the JIT is on?
 // Drives the wasm module directly (Node's V8 compiles the engine ~30x faster
 // than the native interpreter), delivers claude + loader + glibc by manifest,
-// installs a pty, and pumps until the alternate screen appears or a budget
-// runs out. Usage: node web/probe_claude_tui.mjs [minutes]
+// installs a pty, and pumps until the TUI paints or a budget runs out. Claude
+// renders with Ink on the MAIN screen (no alternate-screen switch), so the
+// paint detector is its first interactive text, not \x1b[?1049h.
+// Usage: node web/probe_claude_tui.mjs [minutes]
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { makeJitHost } from "./jit_host.mjs";
@@ -74,6 +76,11 @@ if (e.wtw_set_guest_memory_mb(2048) !== 0) throw new Error(`guestmem: ${err()}`)
 if (useJit && e.wtw_jit_enable(10) !== 0) throw new Error(`jit: ${err()}`);
 if (e.wtw_install_chunk_manifest(...put(manifest)) !== 0) throw new Error(`manifest: ${err()}`);
 e.wtw_arg(...put("claude"));
+// Minimal-startup flags: --bare skips hooks/LSP/plugin sync/keychain reads,
+// --ax-screen-reader renders flat text and prints an early, stable marker
+// ("[Screen Reader Mode: on via flag]") the paint detector keys on.
+e.wtw_arg(...put("--bare"));
+e.wtw_arg(...put("--ax-screen-reader"));
 e.wtw_env(...put("PATH=/bin"));
 e.wtw_env(...put("HOME=/root"));
 e.wtw_env(...put("TERM=xterm-256color"));
@@ -103,6 +110,9 @@ const deadline = Date.now() + minutes * 60_000;
 let rendered = "";
 let status = 0;
 let slices = 0;
+const painted = () =>
+  /Screen Reader Mode|trust this folder|Welcome to Claude|Choose the text style/.test(rendered) ||
+  (rendered.length > 500 && rendered.includes("\x1b[38;5;"));
 const drain = () => {
   const n = e.wtw_output_len();
   if (n > 0) rendered += new TextDecoder().decode(mem().slice(e.wtw_output_ptr(), e.wtw_output_ptr() + n));
@@ -118,7 +128,7 @@ while (Date.now() < deadline) {
     );
   }
   drain();
-  if (rendered.includes("\x1b[?1049h")) break;
+  if (painted()) break;
   if (status === 10) { deliver("run"); continue; }
   if (status === 7) continue; // awaiting input: the TUI may idle-wait; keep pumping
   if (status !== 0) break;
@@ -126,10 +136,10 @@ while (Date.now() < deadline) {
 drain();
 
 const icount = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
-const alt = rendered.includes("\x1b[?1049h");
+const alt = painted();
 console.log(`jit=${useJit} pty=${usePty} status=${status} slices=${slices} icount=${icount.toLocaleString()}`);
 if (status !== 0 && status !== 1 && status !== 7) console.log(`engine error: ${err()}`);
-console.log(`alt_screen=${alt} rendered_bytes=${rendered.length}`);
+console.log(`painted=${alt} rendered_bytes=${rendered.length}`);
 const printable = rendered.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]/g, "").trim();
 console.log(`visible text (first 400): ${JSON.stringify(printable.slice(0, 400))}`);
 process.exit(alt ? 0 : 2);

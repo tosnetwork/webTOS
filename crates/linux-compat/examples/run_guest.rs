@@ -347,6 +347,75 @@ fn main() {
         }
     }
     eprintln!("[runner] exit={exit:?} icount={}", machine.icount());
+    // GUEST_GPRS=1: dump the register file at exit. Two runs stopped at
+    // different icounts show whether a silent loop's pointers progress
+    // (bounded work) or cycle (a real spin).
+    if std::env::var_os("GUEST_GPRS").is_some() {
+        let vm = machine.vm_mut();
+        let mut regs = String::new();
+        for name in [
+            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11",
+            "R12", "R13", "R14", "R15",
+        ] {
+            if let Some(var) = vm.cpu.arch.sleigh.get_varnode(name) {
+                regs.push_str(&format!("{name}={:#x} ", vm.cpu.read_reg(var)));
+            }
+        }
+        eprintln!("[runner] gprs {regs}");
+        // Walk the stack conservatively: every qword above RSP that lands in
+        // a mapped page is a potential return address for symbolization.
+        if let Some(var) = vm.cpu.arch.sleigh.get_varnode("RSP") {
+            let rsp: u64 = vm.cpu.read_reg(var);
+            let mut addrs = String::new();
+            for slot in 0..1024u64 {
+                let mut buf = [0u8; 8];
+                if vm
+                    .cpu
+                    .mem
+                    .read_bytes(rsp + slot * 8, &mut buf, icicle_mem::perm::NONE)
+                    .is_err()
+                {
+                    break;
+                }
+                let val = u64::from_le_bytes(buf);
+                if (0x40_0000..0x6000_0000).contains(&val) {
+                    addrs.push_str(&format!("{val:#x} "));
+                }
+            }
+            eprintln!("[runner] stack-code-ptrs {addrs}");
+        }
+        // The registers commonly hold a {capacity, data, len} buffer during
+        // string building; dump what the data pointers point at, as text.
+        for name in ["R15", "RDI", "RSI", "R12"] {
+            let Some(var) = vm.cpu.arch.sleigh.get_varnode(name) else {
+                continue;
+            };
+            let base: u64 = vm.cpu.read_reg(var);
+            let mut hdr = [0u8; 24];
+            if vm
+                .cpu
+                .mem
+                .read_bytes(base, &mut hdr, icicle_mem::perm::NONE)
+                .is_err()
+            {
+                continue;
+            }
+            let data = u64::from_le_bytes(hdr[8..16].try_into().expect("8 bytes"));
+            let mut text = [0u8; 256];
+            if data > 0x1000
+                && vm
+                    .cpu
+                    .mem
+                    .read_bytes(data, &mut text, icicle_mem::perm::NONE)
+                    .is_ok()
+            {
+                eprintln!(
+                    "[runner] [{name}]+8 -> {data:#x}: {:?}",
+                    String::from_utf8_lossy(&text)
+                );
+            }
+        }
+    }
     if profile {
         if let Some(blocks) = machine.vm_mut().block_profile() {
             let mut hot: Vec<_> = blocks
