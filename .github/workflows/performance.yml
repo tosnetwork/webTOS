@@ -11,6 +11,9 @@ on:
       - web/bench_payload.mjs
       - web/test_bench_payload.mjs
       - web/build.sh
+      - tools/build_release.sh
+      - tools/build_sbom.py
+      - tools/package_release.py
       - crates/**
       - .github/workflows/performance.yml
   push:
@@ -41,8 +44,14 @@ jobs:
         working-directory: crates
         run: cargo test --frozen --release -p linux-compat --test bench benchmark_payload_fingerprints
 
-      - name: Rebuild the measured runtime
-        run: bash web/build.sh
+      - name: Rebuild the canonical measured runtime
+        run: |
+          tools/build_release.sh \
+            --out-dir "$RUNNER_TEMP/webtos-release" \
+            --target-dir "$RUNNER_TEMP/webtos-target"
+          cp \
+            "$RUNNER_TEMP/webtos-target/wasm32-unknown-unknown/release/webtos_web.wasm" \
+            web/webtos_web.wasm
 
       - name: Reject runtime or rendered-dashboard drift
         run: |
