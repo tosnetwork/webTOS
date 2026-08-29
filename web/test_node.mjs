@@ -278,6 +278,115 @@ const bb = (...argv) => runProcess("/bin/busybox", ["busybox", ...argv]);
   console.log(`[node] ok: lazy image -> ${f.wtw_page_in_count()} pages, ${f.wtw_footprint_kib(2)} KiB resident of ${Math.ceil(busybox.length / 1024)} KiB`);
 }
 
+// Builds a chunk manifest over several files (with their parent directories)
+// and the content-addressed chunk store to serve it. The legacy-FNV field
+// feeds trace headers only; these gates record no trace.
+function buildManifest(files) {
+  const chunkSize = 64 * 1024;
+  const chunks = new Map();
+  const dirs = new Set();
+  const lines = [];
+  for (const { path, bytes, mode = "755" } of files) {
+    let at = 1;
+    while (true) {
+      const next = path.indexOf("/", at);
+      if (next < 0) break;
+      dirs.add(path.slice(0, next));
+      at = next + 1;
+    }
+    const hashes = [];
+    for (let off = 0; off < bytes.length; off += chunkSize) {
+      const chunk = bytes.subarray(off, Math.min(off + chunkSize, bytes.length));
+      const hash = createHash("sha256").update(chunk).digest("hex");
+      hashes.push(hash);
+      chunks.set(hash, chunk);
+    }
+    lines.push({
+      path,
+      line: `f ${mode} 0 ${Buffer.from(path).toString("hex")} ${bytes.length} ${chunkSize} ${"0".repeat(16)} ${hashes.join(",")}`,
+    });
+  }
+  // The parser requires every record (directories and files together) in
+  // strictly sorted path order.
+  const records = [
+    ...[...dirs].map((d) => ({ path: d, line: `d 755 0 ${Buffer.from(d).toString("hex")}` })),
+    ...lines,
+  ].sort((a, b) => (a.path < b.path ? -1 : 1));
+  return {
+    manifest: `webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`,
+    chunks,
+  };
+}
+
+// Runs one lazy-agent command against a fresh engine: install the manifest,
+// deliver requested chunks, and assert clean exit, expected output, and
+// partial materialization. Returns totals for the log line.
+async function lazyAgentRun({ label, manifest, chunks, loadPath, argv, envp, expectPattern, quarterOf, memMb }) {
+  const fresh = await instantiateEngine(await readFile(wasmPath));
+  const f = fresh.instance.exports;
+  const fmem = () => new Uint8Array(f.memory.buffer);
+  const fput = (value) => {
+    const data = typeof value === "string" ? new TextEncoder().encode(value) : value;
+    const ptr = f.wtw_alloc(data.length);
+    fmem().set(data, ptr);
+    return [ptr, data.length];
+  };
+  if (f.wtw_init() !== 0) throw new Error(`${label}: init`);
+  if (memMb && f.wtw_set_guest_memory_mb(memMb) !== 0) throw new Error(`${label}: guestmem`);
+  if (f.wtw_install_chunk_manifest(...fput(manifest)) !== 0) throw new Error(`${label}: manifest`);
+  for (const arg of argv) f.wtw_arg(...fput(arg));
+  for (const env of envp) f.wtw_env(...fput(env));
+  let delivered = 0;
+  const deliverRequest = (context) => {
+    const len = f.wtw_page_request_take();
+    if (len !== 65) throw new Error(`${label}: ${context} request length ${len}`);
+    const request = fmem().slice(f.wtw_page_request_ptr(), f.wtw_page_request_ptr() + len);
+    const hash = Buffer.from(request.slice(32, 64)).toString("hex");
+    const view = new DataView(request.buffer, request.byteOffset, request.byteLength);
+    const bytes = chunks.get(hash);
+    if (!bytes) throw new Error(`${label}: unknown chunk ${hash}`);
+    delivered += bytes.length;
+    if (f.wtw_page_deliver(view.getUint32(0, true), view.getUint32(4, true), ...fput(bytes)) !== 0) {
+      throw new Error(`${label}: ${context} deliver ${hash}`);
+    }
+  };
+  for (;;) {
+    const loadStatus = f.wtw_load(...fput(loadPath));
+    if (loadStatus === 0) break;
+    if (loadStatus !== 10) throw new Error(`${label}: load status ${loadStatus}`);
+    deliverRequest("metadata");
+  }
+  let status = 0;
+  let output = "";
+  while (status === 0 || status === 10) {
+    status = f.wtw_run(50_000_000);
+    output += new TextDecoder().decode(
+      fmem().slice(f.wtw_output_ptr(), f.wtw_output_ptr() + f.wtw_output_len()),
+    );
+    if (status === 10) deliverRequest("run");
+  }
+  const residentKiB = f.wtw_footprint_kib(2);
+  const ok =
+    status === 1 &&
+    f.wtw_exit_code() === 0 &&
+    expectPattern.test(output) &&
+    f.wtw_page_in_count() > 0 &&
+    delivered < quarterOf / 4 &&
+    residentKiB * 1024 < quarterOf / 4;
+  if (!ok) {
+    console.error(
+      `[node] FAILED ${label}: status=${status} exit=${f.wtw_exit_code()} ` +
+        `pages=${f.wtw_page_in_count()} delivered=${delivered} resident=${residentKiB} KiB ` +
+        `output=${JSON.stringify(output.slice(0, 160))}`,
+    );
+    process.exit(1);
+  }
+  console.log(
+    `[node] ok: ${label} -> ${JSON.stringify(output.trim().slice(0, 40))}, ` +
+      `${f.wtw_page_in_count()} pages, ${Math.round(delivered / 1024)} KiB fetched of ${Math.round(quarterOf / 1024)} KiB`,
+  );
+}
+
 // The real Codex agent through the same manifest boundary: a 256 MB
 // static-pie image installs by manifest and answers --version and --help while
 // materializing only the pages execution touches. Self-skipping: the binary is
@@ -370,6 +479,45 @@ const bb = (...argv) => runProcess("/bin/busybox", ["busybox", ...argv]);
     };
     await agentRun("codex --version (lazy 256MB agent)", ["codex", "--version"], /codex-cli \d+\.\d+\.\d+/);
     await agentRun("codex --help (lazy 256MB agent)", ["codex", "--help"], /[Uu]sage/);
+  }
+}
+
+// The real Claude Code agent: a dynamically linked Bun runtime whose loader
+// and glibc libraries are delivered by the same manifest, every file lazy.
+// Self-skipping: stage the x86-64 binary at web/claude and its libraries at
+// web/claude-libs/ (ld-linux-x86-64.so.2, libc.so.6, libm.so.6, libdl.so.2,
+// libpthread.so.0, librt.so.1).
+{
+  const claude = await readFile(new URL("./claude", import.meta.url)).catch(() => null);
+  if (claude === null) {
+    console.log("note: web/claude missing — Claude Code lazy checks skipped");
+  } else {
+    const lib = async (name) => ({
+      path: name === "ld-linux-x86-64.so.2" ? "/lib64/ld-linux-x86-64.so.2" : `/lib/x86_64-linux-gnu/${name}`,
+      bytes: await readFile(new URL(`./claude-libs/${name}`, import.meta.url)),
+    });
+    const files = [
+      { path: "/bin/claude", bytes: claude },
+      await lib("ld-linux-x86-64.so.2"),
+      await lib("libc.so.6"),
+      await lib("libm.so.6"),
+      await lib("libdl.so.2"),
+      await lib("libpthread.so.0"),
+      await lib("librt.so.1"),
+    ];
+    const { manifest, chunks } = buildManifest(files);
+    const logical = files.reduce((sum, f) => sum + f.bytes.length, 0);
+    await lazyAgentRun({
+      label: "claude --version (lazy dynamic agent)",
+      manifest,
+      chunks,
+      loadPath: "/bin/claude",
+      argv: ["claude", "--version"],
+      envp: ["PATH=/bin", "HOME=/root"],
+      expectPattern: /\(Claude Code\)/,
+      quarterOf: logical,
+      memMb: 2048,
+    });
   }
 }
 

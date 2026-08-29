@@ -152,6 +152,44 @@ function md5OfFile(path) {
   });
 }
 
+// Publishes several files (with their parent directories) as one manifest;
+// records must be strictly sorted by path. Legacy FNV is zero: it feeds trace
+// headers only, and the agent checks record no trace.
+function publishLazyFiles(files, manifestName) {
+  const chunkSize = 64 * 1024;
+  const dirs = new Set();
+  const records = [];
+  let logicalBytes = 0;
+  for (const { path, bytes, mode = "755" } of files) {
+    logicalBytes += bytes.length;
+    let at = 1;
+    for (;;) {
+      const next = path.indexOf("/", at);
+      if (next < 0) break;
+      dirs.add(path.slice(0, next));
+      at = next + 1;
+    }
+    const hashes = [];
+    for (let off = 0; off < bytes.length; off += chunkSize) {
+      const chunk = bytes.subarray(off, Math.min(off + chunkSize, bytes.length));
+      const hash = createHash("sha256").update(chunk).digest("hex");
+      hashes.push(hash);
+      generatedAssets.set(`/__lazy/chunks/${hash}`, chunk);
+    }
+    records.push({
+      path,
+      line: `f ${mode} 0 ${Buffer.from(path).toString("hex")} ${bytes.length} ${chunkSize} ${"0".repeat(16)} ${hashes.join(",")}`,
+    });
+  }
+  for (const d of dirs) records.push({ path: d, line: `d 755 0 ${Buffer.from(d).toString("hex")}` });
+  records.sort((a, b) => (a.path < b.path ? -1 : 1));
+  generatedAssets.set(
+    `/__lazy/${manifestName}`,
+    Buffer.from(`webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`),
+  );
+  return { logicalBytes };
+}
+
 function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFnv = true } = {}) {
   const chunkSize = 64 * 1024;
   const hashes = [];
@@ -243,7 +281,7 @@ const workerDriver = async (input) => {
   }
   const t0 = performance.now();
   worker.postMessage(
-    { type: "boot", files, jitAfter: input.jitAfter ?? null },
+    { type: "boot", files, jitAfter: input.jitAfter ?? null, guestMemMb: input.guestMemMb ?? null },
     files.map((f) => f.bytes),
   );
   const readyMsg = await ready;
@@ -941,6 +979,39 @@ async function runEngine(name, origin, gateway, images) {
       );
     }
 
+    // Claude Code, the dynamically linked half of the agent exit gate: the Bun
+    // runtime, its loader, and glibc all arrive by manifest, every file lazy.
+    if (images.claude) {
+      const claudeRun = await page.evaluate(workerDriver, {
+        workerUrl: `${origin}/web/worker.js`,
+        files: [],
+        guestMemMb: 2048,
+        lazy: {
+          manifestUrl: `${origin}/__lazy/claude-manifest.txt`,
+          chunkBase: `${origin}/__lazy/chunks`,
+          preload: [],
+        },
+        steps: [
+          { label: "claude --version", path: "/bin/claude", argv: ["claude", "--version"] },
+        ],
+      });
+      const claude = claudeRun.runs[0];
+      const claudeOk =
+        claude.status === 1 &&
+        claude.exitCode === 0 &&
+        /\(Claude Code\)/.test(claude.output) &&
+        claude.pageIns > 0 &&
+        claude.filesKiB * 1024 < images.claude.logicalBytes / 4;
+      fingerprint["claude --version"] = claude.icount;
+      record(
+        "real agent: claude --version, dynamic runtime fully manifest-delivered",
+        claudeOk,
+        claudeOk
+          ? `${JSON.stringify(claude.output.trim())}, ${claude.pageIns} pages, ${claude.filesKiB} KiB resident of ${Math.ceil(images.claude.logicalBytes / 1024)} KiB`
+          : `status=${claude.status} exit=${claude.exitCode} pages=${claude.pageIns} files=${claude.filesKiB} KiB ${claude.error} ${JSON.stringify(claude.output.slice(0, 100))}`,
+      );
+    }
+
     // The DoD names the browser JIT paths and the architectural trace, not
     // merely interpreter output. Run the same lazy/eager command with tiering
     // on from its first entry, and require both single-block and self-loop
@@ -1122,11 +1193,37 @@ const codexImage =
 if (codexImage === null) {
   console.log("note: web/codex missing (scp a standalone x86-64 codex there) — real-agent lazy checks skipped");
 }
+// Claude Code: a dynamically linked Bun runtime; the loader and glibc libraries
+// travel in the same manifest. Stage web/claude and web/claude-libs/.
+const claudeBytes = await readFile(fileURLToPath(new URL("./claude", import.meta.url))).catch(() => null);
+let claudeImage = null;
+if (claudeBytes !== null) {
+  const libDir = new URL("./claude-libs/", import.meta.url);
+  const lib = async (name) => ({
+    path: name === "ld-linux-x86-64.so.2" ? "/lib64/ld-linux-x86-64.so.2" : `/lib/x86_64-linux-gnu/${name}`,
+    bytes: await readFile(fileURLToPath(new URL(name, libDir))),
+  });
+  claudeImage = publishLazyFiles(
+    [
+      { path: "/bin/claude", bytes: claudeBytes },
+      await lib("ld-linux-x86-64.so.2"),
+      await lib("libc.so.6"),
+      await lib("libm.so.6"),
+      await lib("libdl.so.2"),
+      await lib("libpthread.so.0"),
+      await lib("librt.so.1"),
+    ],
+    "claude-manifest.txt",
+  );
+} else {
+  console.log("note: web/claude missing — Claude Code lazy checks skipped");
+}
 const images = {
   busyboxMd5: await md5OfFile(busyboxPath),
   agent: agentInfo !== null,
   agentSize: agentInfo?.size ?? 0,
   codex: codexImage,
+  claude: claudeImage,
 };
 if (!images.agent) {
   console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");

@@ -11,7 +11,11 @@ base_image.runtime.manifest
 /web/busybox-musl
 /web/openfox
 /web/codex
+/web/claude
+/web/claude-libs/
 /web/codex
+/web/claude
+/web/claude-libs/
 /test_data/alpine-minirootfs/
 /test_data/openfox
 /test_data/openfox.commit

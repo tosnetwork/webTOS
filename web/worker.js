@@ -502,7 +502,7 @@ const jitImports = {
   },
 };
 
-async function boot(files, links = [], jitAfter = null) {
+async function boot(files, links = [], jitAfter = null, guestMemMb = null) {
   postMessage({ type: "status", text: "loading wasm module…" });
   const url = new URL("./webtos_web.wasm", self.location.href);
   jitBlockInstances.length = 0;
@@ -512,6 +512,9 @@ async function boot(files, links = [], jitAfter = null) {
   postMessage({ type: "status", text: "compiling SLEIGH specification…" });
   const t0 = performance.now();
   if (exports.wtw_init() !== 0) throw new Error(`machine init failed: ${lastError()}`);
+  if (guestMemMb !== null && exports.wtw_set_guest_memory_mb(Math.round(guestMemMb)) !== 0) {
+    throw new Error(lastError());
+  }
   if (jitAfter !== null && exports.wtw_jit_enable(Math.max(1, Math.round(jitAfter))) !== 0) {
     throw new Error(`JIT enable failed: ${lastError()}`);
   }
@@ -1033,7 +1036,7 @@ function resize(rows, cols) {
 self.onmessage = async (event) => {
   const msg = event.data;
   try {
-    if (msg.type === "boot") await boot(msg.files, msg.links, msg.jitAfter ?? null);
+    if (msg.type === "boot") await boot(msg.files, msg.links, msg.jitAfter ?? null, msg.guestMemMb ?? null);
     if (msg.type === "image") await loadImage(msg);
     if (msg.type === "lazyImage") await installLazyImage(msg);
     if (msg.type === "trace") await recordTrace(msg);
