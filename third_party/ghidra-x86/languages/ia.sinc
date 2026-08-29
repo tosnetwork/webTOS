@@ -5219,8 +5219,10 @@ define pcodeop xend;
 @endif
 
 define pcodeop xinuse;
-:XGETBV         is vexMode=0 & byte=0x0F; byte=0x01; byte=0xD0  { local tmp = XCR0 >> 32; EDX = tmp:4;  EAX = XCR0:4; }
-:XSETBV         is vexMode=0 & byte=0x0F; byte=0x01; byte=0xD1  { local sel = ECX; XCR0 = (zext(EDX) << 32) | zext(EAX); }
+define pcodeop xgetbv;
+define pcodeop xsetbv;
+:XGETBV         is vexMode=0 & byte=0x0F; byte=0x01; byte=0xD0  { xgetbv(ECX); }
+:XSETBV         is vexMode=0 & byte=0x0F; byte=0x01; byte=0xD1  { local value:8 = (zext(EDX) << 32) | zext(EAX); xsetbv(ECX, value); }
 
 define pcodeop xsave;
 define pcodeop xsave64;
@@ -6457,6 +6459,10 @@ define pcodeop _fxrstor;
 @ifdef IA64
 define pcodeop _fxsave64;
 define pcodeop _fxrstor64;
+define pcodeop webtos_fxsave;
+define pcodeop webtos_fxsave64;
+define pcodeop webtos_fxrstor;
+define pcodeop webtos_fxrstor64;
 
 @endif
 
@@ -6475,22 +6481,22 @@ define pcodeop _fxrstor64;
 # this saves the FPU state into 512 bytes of memory similar to the 32-bit mode
 :FXSAVE Mem    is $(LONGMODE_ON) & vexMode=0 & byte=0x0F; byte=0xAE; ( mod != 0b11 & reg_opcode=0 ) ... & Mem
 {
-  _fxsave(Mem);
+  webtos_fxsave(Mem);
 }
 
 :FXSAVE64 Mem    is $(LONGMODE_ON) & vexMode=0 & $(REX_W) & byte=0x0F; byte=0xAE; ( mod != 0b11 & reg_opcode=0 ) ... & Mem
 {
-  _fxsave64(Mem);
+  webtos_fxsave64(Mem);
 }
 
 :FXRSTOR Mem   is $(LONGMODE_ON) & vexMode=0 & byte=0x0F; byte=0xAE; ( mod != 0b11 & reg_opcode=1 ) ... & Mem
 {
-  _fxrstor(Mem);
+  webtos_fxrstor(Mem);
 }
 
 :FXRSTOR64 Mem   is $(LONGMODE_ON) & vexMode=0 & $(REX_W) & byte=0x0F; byte=0xAE; ( mod != 0b11 & reg_opcode=1 ) ... & Mem
 {
-  _fxrstor64(Mem);
+  webtos_fxrstor64(Mem);
 }
 @endif
 

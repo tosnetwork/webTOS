@@ -141,3 +141,74 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
         "extended feature bits belong in EDX"
     );
 }
+
+#[test]
+fn conservative_profile_has_finite_leaf_boundaries() {
+    let mut probe = CpuidProbe::new();
+
+    assert_eq!(
+        probe.run(7, 0),
+        CpuidRegisters {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        },
+        "CPUID.7.0 EAX is the maximum supported subleaf, never a sentinel"
+    );
+
+    for subleaf in [1, 2, 7, u32::MAX] {
+        assert_eq!(
+            probe.run(7, subleaf),
+            CpuidRegisters {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            },
+            "unsupported CPUID.7 subleaf {subleaf:#x} must be a total zero result"
+        );
+    }
+}
+
+#[test]
+fn xstate_enumeration_comes_from_the_standard_layout() {
+    let mut probe = CpuidProbe::new();
+
+    assert_eq!(
+        probe.run(0x0d, 0),
+        CpuidRegisters {
+            eax: 0x00e7,
+            ebx: 2688,
+            ecx: 2688,
+            edx: 0,
+        }
+    );
+    for (subleaf, size, offset) in [
+        (2, 256, 576),
+        (5, 64, 1088),
+        (6, 512, 1152),
+        (7, 1024, 1664),
+    ] {
+        assert_eq!(
+            probe.run(0x0d, subleaf),
+            CpuidRegisters {
+                eax: size,
+                ebx: offset,
+                ecx: 0,
+                edx: 0,
+            },
+            "xstate component {subleaf}"
+        );
+    }
+    assert_eq!(
+        probe.run(0x0d, 1),
+        CpuidRegisters {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        },
+        "compacted, optimized and supervisor save forms stay unadvertised"
+    );
+}

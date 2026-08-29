@@ -163,6 +163,10 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         .add_custom_reg("NEXT_PC", 8)
         .ok_or(BuildError::MissingVarnode("NEXT_PC"))?;
     let reg_isa_mode = spec.sleigh.get_varnode("ISAModeSwitch");
+    let reg_xcr0 = spec
+        .sleigh
+        .get_varnode("XCR0")
+        .ok_or(BuildError::MissingVarnode("XCR0"))?;
 
     let temporaries = TEMPORARY_VARNODES
         .iter()
@@ -183,7 +187,7 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         reg_sp: spec.sp,
         reg_isa_mode,
         isa_mode_context: vec![spec.initial_ctx],
-        reg_init: vec![],
+        reg_init: vec![(reg_xcr0, helpers::x86::INITIAL_XCR0.into())],
         temporaries,
         calling_cov: CallCov {
             integers: spec.int_args,

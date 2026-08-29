@@ -167,6 +167,7 @@ pub enum ExceptionCode {
     Syscall = 0x0101,
     CpuStateChanged = 0x0102,
     DivisionException = 0x0103,
+    GeneralProtection = 0x0104,
 
     ReadUnmapped = 0x0201,
     ReadPerm = 0x0202,
@@ -220,6 +221,7 @@ impl ExceptionCode {
             0x0101 => Self::Syscall,
             0x0102 => Self::CpuStateChanged,
             0x0103 => Self::DivisionException,
+            0x0104 => Self::GeneralProtection,
 
             0x0201 => Self::ReadUnmapped,
             0x0202 => Self::ReadPerm,

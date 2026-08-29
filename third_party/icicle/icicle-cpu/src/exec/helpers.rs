@@ -2,6 +2,9 @@ use pcode::{Value, VarNode};
 
 use crate::{Cpu, ExceptionCode, ValueSource};
 
+#[path = "x86_profile.rs"]
+mod x86_profile;
+
 pub type PcodeOpHelper = fn(&mut Cpu, VarNode, [Value; 2]);
 
 pub fn unknown_operation(cpu: &mut Cpu, _: VarNode, _: [Value; 2]) {
@@ -261,7 +264,18 @@ pub mod x86 {
         ("cpuid_basic_info", cpuid_basic_info),
         ("cpuid_Version_info", cpuid_version_info),
         ("cpuid_Extended_Feature_Enumeration_info", cpuid_extended_feature_enumeration_info),
+        ("cpuid_Processor_Extended_States_info", cpuid_xstate_info),
         ("cpuid", cpuid),
+        ("xgetbv", xgetbv),
+        ("xsetbv", xsetbv),
+        ("webtos_fxsave", fxsave),
+        ("webtos_fxsave64", fxsave64),
+        ("webtos_fxrstor", fxrstor),
+        ("webtos_fxrstor64", fxrstor64),
+        ("xsave", xsave),
+        ("xsave64", xsave64),
+        ("xrstor", xrstor),
+        ("xrstor64", xrstor64),
         ("movmskpd", movmskpd),
         ("movmskps", movmskps),
         ("pinsrw", pinsrw), // Note: implemented in SLEIGH in Ghidra 10.3.
@@ -384,21 +398,7 @@ pub mod x86 {
         }
     }
 
-    /// Architectural CPUID output registers.
-    ///
-    /// The SLEIGH CPUID constructors export their 16-byte result tuple in the
-    /// physical order EAX, EBX, EDX, ECX. Keeping that storage detail here
-    /// prevents individual leaf helpers from crossing the architectural ECX
-    /// and EDX fields when they write tuple slices directly.
-    #[derive(Clone, Copy, Debug, Default)]
-    struct CpuidResult {
-        eax: u32,
-        ebx: u32,
-        ecx: u32,
-        edx: u32,
-    }
-
-    impl CpuidResult {
+    impl x86_profile::CpuidResult {
         fn write(self, cpu: &mut Cpu, dst: VarNode) {
             if dst.size != 16 {
                 tracing::warn!(
@@ -415,145 +415,487 @@ pub mod x86 {
     }
 
     // Basic processor information
-    fn cpuid_basic_info(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
-        tracing::debug!("cpuid(BASIC_INFO)");
-        // Maximum basic leaf. Must be at least 1 so software (e.g. V8) reads
-        // leaf 1 and sees the SSE2 feature bit; kept at 1 so the unimplemented
-        // cache/topology leaves (2..6) are never queried.
-        const MAX_BASIC_LEAF: u32 = 1;
-        // Pretend to be an Intel CPU.
-        CpuidResult {
-            eax: MAX_BASIC_LEAF,
-            ebx: u32::from_le_bytes(*b"Genu"),
-            edx: u32::from_le_bytes(*b"ineI"),
-            ecx: u32::from_le_bytes(*b"ntel"),
-        }
-        .write(cpu, dst);
+    fn cpuid_basic_info(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpuid_leaf(cpu, dst, 0, args[1]);
     }
 
     // Processor info and feature bits
-    fn cpuid_version_info(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
-        tracing::debug!("cpuid(VERSION_INFO)");
-        // Copied from `Coffee Lake` microarchitecture
-        let extended_family = 0x0;
-        let family = 0x6;
-        let extended_model = 0x9;
-        let model = 0xe;
-
-        let eax: u32 =
-            (extended_family << 20) | (extended_model << 16) | (family << 8) | (model << 4);
-
-        use cpuid::FeatureInformationEcx as Feature;
-
-        // Advertise SSE/SSE2/SSE3, AES-NI, and PCLMULQDQ, but deliberately not
-        // AVX or AVX-512: those encodings decode but their p-code semantics are
-        // not all validated, so userspace stays on the SSE paths. `xsave`,
-        // `osxsave`, `avx`, and `f16c` are left clear: CPUID leaf 0x0d and the
-        // XSAVE/XRSTOR state image are not implemented, so advertising XSAVE
-        // would be a false capability claim. AES-NI and PCLMULQDQ *are*
-        // advertised: their primitives are supported here (the AES round ops
-        // as helpers, PCLMULQDQ as an inlined SLEIGH macro, both verified
-        // against the native intrinsics), so a TLS client can use the hardware
-        // AES-GCM SSE path instead of a software fallback. AVX-only fused GCM
-        // stays off.
-        //
-        // SSE4 is left clear as a conservative choice, not a proven blocker
-        // (advertising it currently passes every test, Node included). SSE4.1/
-        // 4.2 add ~50 instructions — most notably the SSE4.2 string ops
-        // (`pcmpistri`/`pcmpestri`, used by glibc strlen/strchr) and packed
-        // rounds — that have no helpers here; keeping the bit clear avoids
-        // opting feature-detecting code onto those unvalidated paths, and onto
-        // more uses of `roundsd`/`roundss`, whose imm8 rounding mode icicle's
-        // two-operand p-code drops (so those helpers can only round to
-        // nearest — a silent approximation for floor/ceil/trunc).
-        let ecx: u32 = (Feature::sse3
-            | Feature::pclmulqdq
-            | Feature::tm2
-            | Feature::pdcm
-            | Feature::popcnt
-            | Feature::tsc_deadline
-            | Feature::aesni)
-            .bits();
-
-        // EDX baseline for an SSE2-capable CPU. V8 aborts at startup unless
-        // SSE2 is present (`Check failed: cpu.has_sse2()`).
-        use cpuid::FeatureInformationEdx as FeatureEdx;
-        let edx: u32 = (FeatureEdx::fpu
-            | FeatureEdx::vme
-            | FeatureEdx::de
-            | FeatureEdx::tsc
-            | FeatureEdx::msr
-            | FeatureEdx::pae
-            | FeatureEdx::cx8
-            | FeatureEdx::sep
-            | FeatureEdx::cmov
-            | FeatureEdx::clfsh
-            | FeatureEdx::mmx
-            | FeatureEdx::fxsr
-            | FeatureEdx::sse
-            | FeatureEdx::sse2)
-            .bits();
-
-        CpuidResult { eax, ebx: 0, ecx, edx }.write(cpu, dst);
+    fn cpuid_version_info(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpuid_leaf(cpu, dst, 1, args[1]);
     }
 
     // Return structured extended feature enumeration info leaf
     fn cpuid_extended_feature_enumeration_info(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let count: u32 = cpu.read(args[1]);
-        tracing::debug!("cpuid(EXTENDED_FEATURE_ENUMERATION_INFO, {:#0x})", count);
+        cpuid_leaf(cpu, dst, 7, args[1]);
+    }
 
-        let result = match count {
-            // Returns extended feature flags in EBX, ECX, and EDX
-            0x0 => CpuidResult {
-                eax: u32::MAX,
-                ebx: cpuid::EXTENDED_FEATURES_EBX,
-                ecx: cpuid::EXTENDED_FEATURES_ECX,
-                edx: cpuid::EXTENDED_FEATURES_EDX,
-            },
-
-            // Returns extended feature flags in EAX
-            0x1 => {
-                // We don't support AVX-512 BFLOAT16 operations
-                CpuidResult::default()
-            }
-            _ => CpuidResult::default(),
-        };
-        result.write(cpu, dst);
+    fn cpuid_xstate_info(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpuid_leaf(cpu, dst, 0x0d, args[1]);
     }
 
     fn cpuid(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        let index: u32 = cpu.read(args[0]);
-        let count: u32 = cpu.read(args[1]);
-        tracing::debug!("cpuid({:#0x}, {:#0x})", index, count);
-        let result = match index {
-            // Hypervisor
-            0x4000_0000 => CpuidResult::default(),
+        let leaf = cpu.read(args[0]);
+        cpuid_leaf(cpu, dst, leaf, args[1]);
+    }
 
-            // Highest extended function implemented. Reporting none is not a
-            // position a 64-bit processor can hold: every x86-64 part answers
-            // leaf 0x8000_0001, and programs read it without asking first.
-            0x8000_0000 => CpuidResult { eax: 0x8000_0001, ..CpuidResult::default() },
+    fn cpuid_leaf(cpu: &mut Cpu, dst: VarNode, leaf: u32, subleaf: Value) {
+        let subleaf = cpu.read(subleaf);
+        tracing::debug!("cpuid({leaf:#x}, {subleaf:#x}) profile={}", x86_profile::PROFILE_NAME);
+        x86_profile::cpuid(leaf, subleaf).write(cpu, dst);
+    }
 
-            // Extended processor info. Only what this engine actually
-            // implements is advertised: long mode and `syscall`. Claiming a
-            // feature that is not there is how a guest takes a path that then
-            // executes something unimplemented.
-            0x8000_0001 => {
-                const SYSCALL: u32 = 1 << 11;
-                const LONG_MODE: u32 = 1 << 29;
-                CpuidResult { edx: SYSCALL | LONG_MODE, ..CpuidResult::default() }
+    pub const INITIAL_XCR0: u64 = x86_profile::INITIAL_XCR0;
+
+    fn xgetbv(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        let selector: u32 = cpu.read(args[0]);
+        if selector != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return;
+        }
+
+        for (name, value) in [
+            ("RAX", INITIAL_XCR0 & 0xffff_ffff),
+            ("RDX", INITIAL_XCR0 >> 32),
+        ] {
+            if let Some(var) = cpu.arch.sleigh.get_varnode(name) {
+                cpu.write_var(var, value);
             }
+        }
+    }
 
-            // Anything else reads as zero. `CPUID` does not fault on real
-            // hardware — an unimplemented leaf returns zeros — so raising an
-            // exception turns a feature probe the guest is entitled to make
-            // into a crash.
-            unknown => {
-                tracing::debug!("CPUID leaf {unknown:#x} answered with zeros");
-                CpuidResult::default()
+    fn xsetbv(cpu: &mut Cpu, _: VarNode, _: [Value; 2]) {
+        // XSETBV is privileged.  The virtual userspace profile is immutable;
+        // a guest cannot turn unimplemented state components into features.
+        cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+        cpu.exception.value = 0;
+    }
+
+    const MXCSR_MASK: u32 = 0x0000_ffff;
+
+    fn fxsave(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        fxsave_impl(cpu, args[0], false);
+    }
+
+    fn fxsave64(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        fxsave_impl(cpu, args[0], true);
+    }
+
+    fn fxrstor(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        fxrstor_impl(cpu, args[0], false);
+    }
+
+    fn fxrstor64(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        fxrstor_impl(cpu, args[0], true);
+    }
+
+    fn xsave(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        xsave_impl(cpu, args[0], false);
+    }
+
+    fn xsave64(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        xsave_impl(cpu, args[0], true);
+    }
+
+    fn xrstor(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        xrstor_impl(cpu, args[0], false);
+    }
+
+    fn xrstor64(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        xrstor_impl(cpu, args[0], true);
+    }
+
+    fn named_reg(cpu: &mut Cpu, name: &str) -> Option<VarNode> {
+        match cpu.arch.sleigh.get_varnode(name) {
+            Some(var) => Some(var),
+            None => {
+                cpu.exception.code = ExceptionCode::InternalError as u32;
+                cpu.exception.value = 0;
+                None
             }
+        }
+    }
+
+    fn read_named<R: crate::RegValue>(cpu: &mut Cpu, name: &str) -> Option<R> {
+        let var = named_reg(cpu, name)?;
+        Some(cpu.read_var(var))
+    }
+
+    fn write_named<R: crate::RegValue>(cpu: &mut Cpu, name: &str, value: R) -> Option<()> {
+        let var = named_reg(cpu, name)?;
+        cpu.write_var(var, value);
+        Some(())
+    }
+
+    fn named_slice(cpu: &mut Cpu, name: &str, offset: u8, size: u8) -> Option<VarNode> {
+        match cpu.arch.sleigh.get_reg(name).and_then(|reg| reg.slice_var(offset, size)) {
+            Some(var) => Some(var),
+            None => {
+                cpu.exception.code = ExceptionCode::InternalError as u32;
+                cpu.exception.value = 0;
+                None
+            }
+        }
+    }
+
+    fn fx_address(cpu: &mut Cpu, value: Value) -> Option<u64> {
+        let address = cpu.read(value);
+        if address & 0xf != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return None;
+        }
+        Some(address)
+    }
+
+    fn xsave_address(cpu: &mut Cpu, value: Value) -> Option<u64> {
+        let address: u64 = cpu.read(value);
+        if address & 0x3f != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return None;
+        }
+        Some(address)
+    }
+
+    fn xstate_request(cpu: &mut Cpu) -> Option<u64> {
+        let eax = read_named::<u64>(cpu, "RAX")? & 0xffff_ffff;
+        let edx = read_named::<u64>(cpu, "RDX")? & 0xffff_ffff;
+        Some(((edx << 32) | eax) & INITIAL_XCR0)
+    }
+
+    fn write_guest(cpu: &mut Cpu, address: u64, bytes: &[u8]) -> Option<()> {
+        if let Err(error) = cpu.mem.write_bytes(address, bytes, icicle_mem::perm::WRITE) {
+            cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+            cpu.exception.value = address;
+            return None;
+        }
+        Some(())
+    }
+
+    fn read_guest(cpu: &mut Cpu, address: u64, bytes: &mut [u8]) -> Option<()> {
+        if let Err(error) = cpu.mem.read_bytes(address, bytes, icicle_mem::perm::READ) {
+            cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+            cpu.exception.value = address;
+            return None;
+        }
+        Some(())
+    }
+
+    fn abridged_tag_word(full: u16) -> u8 {
+        let mut abridged = 0_u8;
+        for index in 0..8 {
+            if (full >> (index * 2)) & 0b11 != 0b11 {
+                abridged |= 1 << index;
+            }
+        }
+        abridged
+    }
+
+    fn expanded_tag_word(abridged: u8, image: &[u8; 512]) -> u16 {
+        let mut full = 0_u16;
+        for index in 0..8 {
+            let tag = if abridged & (1 << index) == 0 {
+                0b11
+            }
+            else {
+                let slot = 32 + index * 16;
+                let significand = u64::from_le_bytes(image[slot..slot + 8].try_into().unwrap());
+                let exponent =
+                    u16::from_le_bytes(image[slot + 8..slot + 10].try_into().unwrap()) & 0x7fff;
+                if exponent == 0 && significand == 0 {
+                    0b01
+                }
+                else if exponent == 0 || exponent == 0x7fff || significand >> 63 == 0 {
+                    0b10
+                }
+                else {
+                    0b00
+                }
+            };
+            full |= tag << (index * 2);
+        }
+        full
+    }
+
+    fn fxsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = fx_address(cpu, address) else { return };
+        let mut image = [0_u8; 512];
+
+        let Some(fcw) = read_named::<u16>(cpu, "FPUControlWord") else { return };
+        let Some(fsw) = read_named::<u16>(cpu, "FPUStatusWord") else { return };
+        let Some(ftw) = read_named::<u16>(cpu, "FPUTagWord") else { return };
+        let Some(fop) = read_named::<u16>(cpu, "FPULastInstructionOpcode") else { return };
+        let Some(fip) = read_named::<u64>(cpu, "FPUInstructionPointer") else { return };
+        let Some(fdp) = read_named::<u64>(cpu, "FPUDataPointer") else { return };
+        let Some(fcs) = read_named::<u16>(cpu, "FPUPointerSelector") else { return };
+        let Some(fds) = read_named::<u16>(cpu, "FPUDataSelector") else { return };
+        let Some(mxcsr) = read_named::<u32>(cpu, "MXCSR") else { return };
+
+        image[0..2].copy_from_slice(&fcw.to_le_bytes());
+        image[2..4].copy_from_slice(&fsw.to_le_bytes());
+        image[4] = abridged_tag_word(ftw);
+        image[6..8].copy_from_slice(&(fop & 0x07ff).to_le_bytes());
+        if mode64 {
+            image[8..16].copy_from_slice(&fip.to_le_bytes());
+            image[16..24].copy_from_slice(&fdp.to_le_bytes());
+        }
+        else {
+            image[8..12].copy_from_slice(&(fip as u32).to_le_bytes());
+            image[12..14].copy_from_slice(&fcs.to_le_bytes());
+            image[16..20].copy_from_slice(&(fdp as u32).to_le_bytes());
+            image[20..22].copy_from_slice(&fds.to_le_bytes());
+        }
+        image[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        image[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+
+        for index in 0..8 {
+            let Some(value) = read_named::<[u8; 10]>(cpu, &format!("ST{index}")) else { return };
+            let offset = 32 + index * 16;
+            image[offset..offset + 10].copy_from_slice(&value);
+        }
+        for index in 0..16 {
+            let Some(value) = read_named::<[u8; 16]>(cpu, &format!("XMM{index}")) else { return };
+            let offset = 160 + index * 16;
+            image[offset..offset + 16].copy_from_slice(&value);
+        }
+
+        if let Err(error) = cpu.mem.write_bytes(address, &image, icicle_mem::perm::WRITE) {
+            cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+            cpu.exception.value = address;
+        }
+    }
+
+    fn fxrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = fx_address(cpu, address) else { return };
+        let mut image = [0_u8; 512];
+        if let Err(error) = cpu.mem.read_bytes(address, &mut image, icicle_mem::perm::READ) {
+            cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+            cpu.exception.value = address;
+            return;
+        }
+
+        let mxcsr = u32::from_le_bytes(image[24..28].try_into().unwrap());
+        if mxcsr & !MXCSR_MASK != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return;
+        }
+
+        let fcw = u16::from_le_bytes(image[0..2].try_into().unwrap());
+        let fsw = u16::from_le_bytes(image[2..4].try_into().unwrap());
+        let ftw = expanded_tag_word(image[4], &image);
+        let fop = u16::from_le_bytes(image[6..8].try_into().unwrap()) & 0x07ff;
+        let (fip, fdp, fcs, fds) = if mode64 {
+            (
+                u64::from_le_bytes(image[8..16].try_into().unwrap()),
+                u64::from_le_bytes(image[16..24].try_into().unwrap()),
+                0,
+                0,
+            )
+        }
+        else {
+            (
+                u32::from_le_bytes(image[8..12].try_into().unwrap()) as u64,
+                u32::from_le_bytes(image[16..20].try_into().unwrap()) as u64,
+                u16::from_le_bytes(image[12..14].try_into().unwrap()),
+                u16::from_le_bytes(image[20..22].try_into().unwrap()),
+            )
         };
-        result.write(cpu, dst);
+
+        if write_named(cpu, "FPUControlWord", fcw).is_none()
+            || write_named(cpu, "FPUStatusWord", fsw).is_none()
+            || write_named(cpu, "FPUTagWord", ftw).is_none()
+            || write_named(cpu, "FPULastInstructionOpcode", fop).is_none()
+            || write_named(cpu, "FPUInstructionPointer", fip).is_none()
+            || write_named(cpu, "FPUDataPointer", fdp).is_none()
+            || write_named(cpu, "FPUPointerSelector", fcs).is_none()
+            || write_named(cpu, "FPUDataSelector", fds).is_none()
+            || write_named(cpu, "MXCSR", mxcsr).is_none()
+        {
+            return;
+        }
+
+        for index in 0..8 {
+            let offset = 32 + index * 16;
+            let value: [u8; 10] = image[offset..offset + 10].try_into().unwrap();
+            if write_named(cpu, &format!("ST{index}"), value).is_none() { return }
+        }
+        for index in 0..16 {
+            let offset = 160 + index * 16;
+            let value: [u8; 16] = image[offset..offset + 16].try_into().unwrap();
+            if write_named(cpu, &format!("XMM{index}"), value).is_none() { return }
+        }
+    }
+
+    fn xsave_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = xsave_address(cpu, address) else { return };
+        let Some(requested) = xstate_request(cpu) else { return };
+
+        // The standard area's legacy region is byte-for-byte the FXSAVE
+        // image. Extended components below are emitted from the same table
+        // CPUID.0d reports.
+        fxsave_impl(cpu, Value::Const(address, 8), mode64);
+        if cpu.exception.code != ExceptionCode::None as u32 { return }
+
+        let mut header = [0_u8; x86_profile::XSAVE_HEADER_SIZE as usize];
+        header[0..8].copy_from_slice(&requested.to_le_bytes());
+        if write_guest(
+            cpu,
+            address + u64::from(x86_profile::XSAVE_LEGACY_SIZE),
+            &header,
+        )
+        .is_none()
+        {
+            return;
+        }
+
+        if requested & (1 << 2) != 0 {
+            for index in 0..16 {
+                let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 16, 16) else { return };
+                let value = cpu.read_var::<[u8; 16]>(var);
+                if write_guest(cpu, address + 576 + index * 16, &value).is_none() { return }
+            }
+        }
+        if requested & (1 << 5) != 0 {
+            for index in 0..8 {
+                let Some(value) = read_named::<u64>(cpu, &format!("K{index}")) else { return };
+                if write_guest(cpu, address + 1088 + index * 8, &value.to_le_bytes()).is_none() {
+                    return;
+                }
+            }
+        }
+        if requested & (1 << 6) != 0 {
+            for index in 0..16 {
+                for lane in 0..2 {
+                    let Some(var) =
+                        named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
+                    else {
+                        return;
+                    };
+                    let value = cpu.read_var::<[u8; 16]>(var);
+                    if write_guest(cpu, address + 1152 + index * 32 + u64::from(lane) * 16, &value)
+                        .is_none()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        if requested & (1 << 7) != 0 {
+            for index in 16..32 {
+                for lane in 0..4 {
+                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16) else {
+                        return;
+                    };
+                    let value = cpu.read_var::<[u8; 16]>(var);
+                    if write_guest(
+                        cpu,
+                        address + 1664 + (index - 16) * 64 + u64::from(lane) * 16,
+                        &value,
+                    )
+                    .is_none()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn xrstor_impl(cpu: &mut Cpu, address: Value, mode64: bool) {
+        let Some(address) = xsave_address(cpu, address) else { return };
+        let Some(requested) = xstate_request(cpu) else { return };
+        let mut header = [0_u8; x86_profile::XSAVE_HEADER_SIZE as usize];
+        if read_guest(
+            cpu,
+            address + u64::from(x86_profile::XSAVE_LEGACY_SIZE),
+            &mut header,
+        )
+        .is_none()
+        {
+            return;
+        }
+        let present = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let compacted = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if present & !INITIAL_XCR0 != 0 || compacted != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return;
+        }
+
+        if requested & 0b11 != 0 {
+            fxrstor_impl(cpu, Value::Const(address, 8), mode64);
+            if cpu.exception.code != ExceptionCode::None as u32 { return }
+        }
+
+        for index in 0..16 {
+            if requested & (1 << 2) != 0 {
+                let mut value = [0_u8; 16];
+                if present & (1 << 2) != 0
+                    && read_guest(cpu, address + 576 + index * 16, &mut value).is_none()
+                {
+                    return;
+                }
+                let Some(var) = named_slice(cpu, &format!("ZMM{index}"), 16, 16) else { return };
+                cpu.write_var(var, value);
+            }
+            if requested & (1 << 6) != 0 {
+                for lane in 0..2 {
+                    let mut value = [0_u8; 16];
+                    if present & (1 << 6) != 0
+                        && read_guest(
+                            cpu,
+                            address + 1152 + index * 32 + u64::from(lane) * 16,
+                            &mut value,
+                        )
+                        .is_none()
+                    {
+                        return;
+                    }
+                    let Some(var) =
+                        named_slice(cpu, &format!("ZMM{index}"), 32 + lane * 16, 16)
+                    else {
+                        return;
+                    };
+                    cpu.write_var(var, value);
+                }
+            }
+        }
+        if requested & (1 << 5) != 0 {
+            for index in 0..8 {
+                let mut bytes = [0_u8; 8];
+                if present & (1 << 5) != 0
+                    && read_guest(cpu, address + 1088 + index * 8, &mut bytes).is_none()
+                {
+                    return;
+                }
+                if write_named(cpu, &format!("K{index}"), u64::from_le_bytes(bytes)).is_none() {
+                    return;
+                }
+            }
+        }
+        if requested & (1 << 7) != 0 {
+            for index in 16..32 {
+                for lane in 0..4 {
+                    let mut value = [0_u8; 16];
+                    if present & (1 << 7) != 0
+                        && read_guest(
+                            cpu,
+                            address + 1664 + (index - 16) * 64 + u64::from(lane) * 16,
+                            &mut value,
+                        )
+                        .is_none()
+                    {
+                        return;
+                    }
+                    let Some(var) = named_slice(cpu, &format!("ZMM{index}"), lane * 16, 16) else {
+                        return;
+                    };
+                    cpu.write_var(var, value);
+                }
+            }
+        }
     }
 
     /// Extract Packed Double-Precision Floating-Point Sign Mask

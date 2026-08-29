@@ -557,7 +557,16 @@ where
         }
 
         (Op::Arg(id), ..) => {
-            let value = exec.read_dynamic(stmt.inputs.get()[0]).zxt();
+            let input = stmt.inputs.get()[0];
+            if !matches!(input.size(), 1..=10 | 16) {
+                // Additional p-codeop arguments are carried through one u128
+                // slot. Reject wider values instead of silently retaining the
+                // low 128 bits and turning the remaining vector lanes into
+                // zero. Wide helpers must be lowered into explicit slices.
+                exec.exception(ExceptionCode::InvalidOpSize, input.size() as u64);
+                return;
+            }
+            let value = exec.read_dynamic(input).zxt();
             exec.set_arg(id, value);
         }
         (Op::PcodeOp(id), ..) => exec.call_helper(id, output, stmt.inputs.get()),
