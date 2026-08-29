@@ -56,6 +56,9 @@ pub const STATUS_AWAITING_NETWORK: i32 = 8;
 /// turn is over and the host should call again — a host that confuses the two
 /// spins forever on a workload with no allowance left.
 pub const STATUS_OUT_OF_CPU: i32 = 9;
+/// The CPU or a file syscall is stopped on a missing manifest chunk. The host
+/// dequeues the ticket, supplies verified bytes, and calls `wtw_run` again.
+pub const STATUS_AWAITING_PAGEIN: i32 = 10;
 /// `wtw_net_budget_ms` when the guest armed no timer: the host may wait as
 /// long as it wants.
 pub const NET_BUDGET_UNBOUNDED: u32 = u32::MAX;
@@ -82,6 +85,8 @@ struct HostState {
     net: Option<std::rc::Rc<std::cell::RefCell<HostBroker>>>,
     /// Last drained broker command stream; kept alive for the reader.
     net_commands: Vec<u8>,
+    /// Last encoded content-chunk request; kept alive for the JS reader.
+    page_request: Vec<u8>,
     error: String,
     allocations: Vec<Box<[u8]>>,
     /// Staging buffer for bytes the host hands in repeatedly. See
@@ -108,6 +113,7 @@ thread_local! {
             pty: false,
             trace_text: String::new(),
             net: None,
+            page_request: Vec::new(),
             net_commands: Vec::new(),
             error: String::new(),
             allocations: Vec::new(),
@@ -594,6 +600,28 @@ pub extern "C" fn wtw_jit_dispatch_count() -> u64 {
     with_state(|state| state.machine.as_ref().map_or(0, |m| m.jit_dispatch_count()))
 }
 
+/// Single-shot compiled-block dispatches, separated from self-loop regions so
+/// browser correctness gates can prove that both JIT paths actually ran.
+#[no_mangle]
+pub extern "C" fn wtw_jit_block_dispatch_count() -> u64 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |m| m.jit_block_dispatch_count())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_jit_region_dispatch_count() -> u64 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |m| m.jit_region_dispatch_count())
+    })
+}
+
 /// Caps the wasm code the JIT may hold, in bytes (`0` = unlimited). Over the cap
 /// the least recently used compiled blocks are evicted and fall back to the
 /// interpreter, bounding this module's native code memory over a long session.
@@ -665,6 +693,85 @@ pub extern "C" fn wtw_add_file(path_ptr: u32, path_len: u32, data_ptr: u32, data
         match machine.add_file(&path, data, 0o755) {
             Ok(()) => 0,
             Err(e) => fail(state, e),
+        }
+    })
+}
+
+/// Installs one immutable file descriptor. `hashes` is `hash_count`
+/// consecutive SHA-256 digests; no payload bytes are copied by this call.
+#[no_mangle]
+pub extern "C" fn wtw_add_chunked_file(
+    path_ptr: u32,
+    path_len: u32,
+    size_lo: u32,
+    size_hi: u32,
+    chunk_size: u32,
+    hashes_ptr: u32,
+    hash_count: u32,
+    mode: u32,
+) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_add_chunked_file called before wtw_init");
+        };
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(hash_bytes) = hash_count.checked_mul(32) else {
+            return fail(state, "chunk hash table length overflows");
+        };
+        let Some(raw) = slice_arg(hashes_ptr, hash_bytes) else {
+            return fail(state, "chunk hashes are not inside the module's memory");
+        };
+        let hashes = raw.as_chunks::<32>().0.to_vec();
+        let size = u64::from(size_lo) | (u64::from(size_hi) << 32);
+        let file = match linux_compat::chunk::ChunkedFile::new(size, chunk_size, hashes) {
+            Ok(file) => file,
+            Err(why) => return fail(state, why),
+        };
+        match machine.add_chunked_file(&path, file, mode) {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// Installs the exact canonical chunk-manifest bytes the host authenticated.
+/// Parsing and path/layout enforcement happen inside the VM boundary; the
+/// browser cannot accidentally authenticate one object and install another.
+#[no_mangle]
+pub extern "C" fn wtw_install_chunk_manifest(data_ptr: u32, data_len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_install_chunk_manifest called before wtw_init");
+        };
+        let Some(bytes) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "chunk manifest is not inside the module's memory");
+        };
+        match machine.install_chunk_manifest(&bytes) {
+            Ok(_) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// Adds one warm content chunk (for example bounded ELF metadata read from
+/// OPFS). The module verifies the digest before retaining the bytes.
+#[no_mangle]
+pub extern "C" fn wtw_put_chunk(hash_ptr: u32, data_ptr: u32, data_len: u32) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_put_chunk called before wtw_init");
+        };
+        let Some(hash) = slice_arg(hash_ptr, 32) else {
+            return fail(state, "chunk hash is not inside the module's memory");
+        };
+        let Some(bytes) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "chunk bytes are not inside the module's memory");
+        };
+        match machine.put_chunk(hash.try_into().expect("32-byte hash"), bytes) {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
         }
     })
 }
@@ -772,18 +879,29 @@ pub extern "C" fn wtw_env(ptr: u32, len: u32) -> i32 {
 #[no_mangle]
 pub extern "C" fn wtw_load(path_ptr: u32, path_len: u32) -> i32 {
     with_state(|state| {
-        let argv = std::mem::take(&mut state.argv);
-        let envp = std::mem::take(&mut state.envp);
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_load called before wtw_init");
         };
         let Some(path) = path_arg(path_ptr, path_len) else {
             return fail(state, "path is not inside the module's memory");
         };
-        machine.set_args(argv, envp);
+        // A lazy ELF may need one or more metadata chunks before loading can
+        // finish. Keep the staged vectors until success so retrying this call
+        // after STATUS_AWAITING_PAGEIN constructs the identical initial
+        // stack rather than silently losing argv/envp on the first miss.
+        machine.set_args(state.argv.clone(), state.envp.clone());
         match machine.load(&path) {
-            Ok(()) => 0,
-            Err(e) => fail(state, format!("ELF load failed: {e}")),
+            Ok(()) => {
+                state.argv.clear();
+                state.envp.clear();
+                0
+            }
+            Err(_) if machine.page_request().is_some() => STATUS_AWAITING_PAGEIN,
+            Err(e) => {
+                state.argv.clear();
+                state.envp.clear();
+                fail(state, format!("ELF load failed: {e}"))
+            }
         }
     })
 }
@@ -821,7 +939,9 @@ fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
         CpuExit::Halt { .. } => STATUS_HALT,
         CpuExit::Breakpoint { .. } => STATUS_RUNNING,
         CpuExit::Interrupted => {
-            if machine.awaiting_network() {
+            if machine.env().awaiting_page_in() {
+                STATUS_AWAITING_PAGEIN
+            } else if machine.awaiting_network() {
                 STATUS_AWAITING_NETWORK
             } else if machine.awaiting_terminal_input() {
                 STATUS_AWAITING_INPUT
@@ -844,6 +964,65 @@ fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
             STATUS_UNHANDLED
         }
     }
+}
+
+/// Encodes the pending request as ticket/asid/generation/page (four LE u64s),
+/// 32 hash bytes, then access (0=file, 1=read, 2=write, 3=execute).
+#[no_mangle]
+pub extern "C" fn wtw_page_request_take() -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_page_request_take called before wtw_init");
+        };
+        let Some(request) = machine.page_request() else {
+            state.page_request.clear();
+            return 0;
+        };
+        state.page_request.clear();
+        for value in [
+            request.ticket,
+            request.asid,
+            request.generation,
+            request.page,
+        ] {
+            state.page_request.extend_from_slice(&value.to_le_bytes());
+        }
+        state.page_request.extend_from_slice(&request.hash);
+        state.page_request.push(match request.access {
+            None => 0,
+            Some(linux_compat::pager::AccessKind::Read) => 1,
+            Some(linux_compat::pager::AccessKind::Write) => 2,
+            Some(linux_compat::pager::AccessKind::Execute) => 3,
+        });
+        state.page_request.len() as i32
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_page_request_ptr() -> u32 {
+    with_state(|state| state.page_request.as_ptr() as u32)
+}
+
+#[no_mangle]
+pub extern "C" fn wtw_page_deliver(
+    ticket_lo: u32,
+    ticket_hi: u32,
+    data_ptr: u32,
+    data_len: u32,
+) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_page_deliver called before wtw_init");
+        };
+        let Some(bytes) = slice_arg(data_ptr, data_len) else {
+            return fail(state, "page-in bytes are not inside the module's memory");
+        };
+        let ticket = u64::from(ticket_lo) | (u64::from(ticket_hi) << 32);
+        match machine.deliver_page(ticket, bytes) {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
 }
 
 /// Puts the loaded process's stdin/stdout/stderr on a host-driven pty of
@@ -1514,8 +1693,10 @@ pub extern "C" fn wtw_secrets_apply() -> i32 {
                 machine.set_scoped_secret(name, value, &refs);
             }
         }
-        machine.expand_secrets();
-        0
+        match machine.expand_secrets() {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
     })
 }
 
@@ -1625,6 +1806,17 @@ pub extern "C" fn wtw_icount_hi() -> u32 {
             .machine
             .as_ref()
             .map_or(0, |m| (m.icount() >> 32) as u32)
+    })
+}
+
+/// Number of demand-filled guest pages in the current machine.
+#[no_mangle]
+pub extern "C" fn wtw_page_in_count() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_mut()
+            .map_or(0, |machine| machine.page_in_count() as u32)
     })
 }
 

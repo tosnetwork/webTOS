@@ -27,6 +27,12 @@ thread_local! {
     static BLOCK_START: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ASID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ICOUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // A demand fault happens after the faulting instruction's marker has
+    // already consumed its unit of fuel. Re-entering at that p-code offset
+    // must therefore not apply the generic mid-block compensation a second
+    // time. This is thread-local for the same reason as the mirrors above: a
+    // test process may run independent machines concurrently.
+    static PAGE_IN_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Guest address of the basic block currently executing in the interpreter.
@@ -58,6 +64,20 @@ pub fn current_icount() -> u64 {
 
 pub fn set_current_icount(icount: u64) {
     ICOUNT.with(|c| c.set(icount));
+}
+
+/// Marks the next mid-block interpreter entry as a retry of a restartable
+/// demand fault whose instruction marker has already consumed fuel.
+pub fn mark_page_in_retry() {
+    PAGE_IN_RETRY.with(|c| c.set(true));
+}
+
+fn take_page_in_retry() -> bool {
+    PAGE_IN_RETRY.with(|c| c.replace(false))
+}
+
+fn clear_page_in_retry() {
+    PAGE_IN_RETRY.with(|c| c.set(false));
 }
 
 /// A block group already lifted at some virtual address, kept so a different
@@ -153,6 +173,15 @@ pub struct InterpVm {
     jit_entries: std::collections::HashMap<BlockKey, u64>,
     /// How many times a compiled block ran in place of the interpreter.
     jit_dispatches: u64,
+    /// Dispatch split used by cross-platform gates: single-shot blocks versus
+    /// self-loop regions. The aggregate above remains the public compatibility
+    /// counter.
+    jit_block_dispatches: u64,
+    jit_region_dispatches: u64,
+    /// Unique guest instruction ranges observed while execution accounting is
+    /// enabled. Off by default; large-image gates use it to distinguish bytes
+    /// actually executed from whole pages first fetched for execution.
+    executed_instructions: Option<std::collections::HashSet<(u64, u64)>>,
     /// Bookkeeping for the compiled-code budget: how much wasm code the backend
     /// is holding, and which block each live handle belongs to, so the least
     /// recently used can be evicted when the budget is exceeded.
@@ -169,6 +198,11 @@ pub struct InterpVm {
     lazy_pages: std::collections::HashMap<u64, (Vec<u8>, u8)>,
     /// How many synthetic page-ins have been served.
     page_ins: u64,
+    /// A host-backed page miss may return from `run` mid-block. The next call
+    /// must continue the same interpreter turn rather than performing the
+    /// normal fresh-run block/timer setup; synchronous prototype page-in never
+    /// crossed this boundary, so it did not need this bit.
+    resume_page_in: bool,
     /// Lift-churn counters: groups decoded, groups served from reuse, and code
     /// flushes — to size how much lifting a persistent cache could avoid.
     lift_decoded: u64,
@@ -414,10 +448,14 @@ impl InterpVm {
             jit_region_cache: std::collections::HashMap::new(),
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
+            jit_block_dispatches: 0,
+            jit_region_dispatches: 0,
+            executed_instructions: None,
             jit_budget: JitBudget::default(),
             phase_times: None,
             lazy_pages: std::collections::HashMap::new(),
             page_ins: 0,
+            resume_page_in: false,
             lift_decoded: 0,
             lift_reused: 0,
             flush_count: 0,
@@ -446,6 +484,19 @@ impl InterpVm {
     /// How many synthetic page-ins have been served.
     pub fn page_in_count(&self) -> u64 {
         self.page_ins
+    }
+
+    pub fn suspend_for_page_in(&mut self) {
+        self.resume_page_in = true;
+    }
+
+    /// A host image replacement discards the faulting process rather than
+    /// resuming it. Clear both halves of the retry bookkeeping so the new
+    /// image cannot inherit a skipped timer update or fuel compensation from
+    /// the process it replaced.
+    pub fn cancel_page_in_resume(&mut self) {
+        self.resume_page_in = false;
+        clear_page_in_retry();
     }
 
     /// If the exception is an access fault on a registered non-resident page,
@@ -493,6 +544,7 @@ impl InterpVm {
         }
         self.cpu.exception.clear();
         self.page_ins += 1;
+        mark_page_in_retry();
         true
     }
 
@@ -534,6 +586,49 @@ impl InterpVm {
     /// How many times a compiled block ran in place of the interpreter.
     pub fn jit_dispatch_count(&self) -> u64 {
         self.jit_dispatches
+    }
+
+    pub fn jit_block_dispatch_count(&self) -> u64 {
+        self.jit_block_dispatches
+    }
+
+    pub fn jit_region_dispatch_count(&self) -> u64 {
+        self.jit_region_dispatches
+    }
+
+    pub fn track_executed_bytes(&mut self, enabled: bool) {
+        self.executed_instructions = enabled.then(std::collections::HashSet::new);
+    }
+
+    /// Unique guest source bytes belonging to instructions that reached an
+    /// instruction marker. Overlapping ranges are merged before counting.
+    pub fn executed_byte_count(&self) -> u64 {
+        let Some(instructions) = &self.executed_instructions else {
+            return 0;
+        };
+        let mut ranges = instructions
+            .iter()
+            .filter_map(|&(start, len)| start.checked_add(len).map(|end| (start, end)))
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        let mut total = 0_u64;
+        let mut current: Option<(u64, u64)> = None;
+        for (start, end) in ranges {
+            match current {
+                Some((before, through)) if start <= through => {
+                    current = Some((before, through.max(end)));
+                }
+                Some((before, through)) => {
+                    total = total.saturating_add(through - before);
+                    current = Some((start, end));
+                }
+                None => current = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = current {
+            total = total.saturating_add(end - start);
+        }
+        total
     }
 
     /// How well the JIT covers the blocks a profiled run actually executed.
@@ -694,14 +789,16 @@ impl InterpVm {
 
     /// Runs the VM until it encounters an exit condition.
     pub fn run(&mut self) -> VmExit {
-        if self.cpu.block_id == u64::MAX {
-            if let Some((block, _)) = self.get_current_block() {
-                self.cpu.block_id = block;
-                self.cpu.block_offset = 0;
+        let resume_page_in = std::mem::take(&mut self.resume_page_in);
+        if !resume_page_in {
+            if self.cpu.block_id == u64::MAX {
+                if let Some((block, _)) = self.get_current_block() {
+                    self.cpu.block_id = block;
+                    self.cpu.block_offset = 0;
+                }
             }
+            self.update_timer();
         }
-
-        self.update_timer();
         loop {
             if let Some(exception) = self.cpu.pending_exception.take() {
                 self.cpu.exception = exception;
@@ -939,7 +1036,11 @@ impl InterpVm {
             }
             Err(e) => {
                 tracing::trace!("DecodeError at {pc:#x}: {e:?}");
-                self.cpu.exception = Exception::new(ExceptionCode::from(e), pc);
+                let fault_address = match e {
+                    lifter::DecodeError::NonExecutableMemory(address) => address,
+                    _ => pc,
+                };
+                self.cpu.exception = Exception::new(ExceptionCode::from(e), fault_address);
                 self.cpu.block_id = u64::MAX;
                 if self.cpu.icount >= self.icount_limit {
                     return VmExit::InstructionLimit;
@@ -1017,7 +1118,7 @@ impl InterpVm {
 
         // Adjust the CPU fuel if we are entering the interpreter in the
         // middle of a block.
-        adjust_cpu_fuel_for_block_reentry(&mut self.cpu, block, offset);
+        adjust_cpu_fuel_for_block_reentry(&mut self.cpu, block, offset, take_page_in_retry());
 
         loop {
             if let Some(profile) = self.profile.as_mut() {
@@ -1128,6 +1229,15 @@ impl InterpVm {
                                         // the interpreter would.
                                         self.cpu.fuel.remaining -= iters.saturating_mul(num);
                                         self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        if iters > 0 {
+                                            record_instruction_ranges(
+                                                &mut self.executed_instructions,
+                                                &block.pcode,
+                                                0,
+                                                None,
+                                            );
+                                        }
                                         self.jit_budget.touch(handle);
                                         jit_ran = true;
                                     }
@@ -1153,6 +1263,13 @@ impl InterpVm {
                                         self.cpu.fuel.remaining =
                                             self.cpu.fuel.remaining.saturating_sub(guest_insns);
                                         self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        record_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &block.pcode,
+                                            0,
+                                            (iters == 0).then_some(index as usize),
+                                        );
                                         self.jit_budget.touch(handle);
                                         self.cpu.block_id = block_id;
                                         self.cpu.block_offset = index as u64;
@@ -1210,6 +1327,13 @@ impl InterpVm {
                                         // the whole block here so icount stays exact.
                                         self.cpu.fuel.remaining -= block.num_instructions as u64;
                                         self.jit_dispatches += 1;
+                                        self.jit_block_dispatches += 1;
+                                        record_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &block.pcode,
+                                            0,
+                                            None,
+                                        );
                                         self.jit_budget.touch(handle);
                                         jit_ran = true;
                                     }
@@ -1227,6 +1351,13 @@ impl InterpVm {
                                         self.cpu.fuel.remaining =
                                             self.cpu.fuel.remaining.saturating_sub(guest_insns);
                                         self.jit_dispatches += 1;
+                                        self.jit_block_dispatches += 1;
+                                        record_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &block.pcode,
+                                            0,
+                                            Some(i as usize),
+                                        );
                                         self.jit_budget.touch(handle);
                                         self.cpu.block_id = block_id;
                                         self.cpu.block_offset = i as u64;
@@ -1242,11 +1373,18 @@ impl InterpVm {
 
             // Safety: every block is validated as part of `lift`.
             if !jit_ran {
+                let start_offset = offset as usize;
                 unsafe {
-                    if let Some(offset) = self
+                    let stopped = self
                         .cpu
-                        .interpret_block_unchecked(&block.pcode, offset as usize)
-                    {
+                        .interpret_block_unchecked(&block.pcode, start_offset);
+                    record_instruction_ranges(
+                        &mut self.executed_instructions,
+                        &block.pcode,
+                        start_offset,
+                        stopped,
+                    );
+                    if let Some(offset) = stopped {
                         // We exited early due to an exception, so keep track of
                         // the offset where the CPU exited from.
                         self.cpu.block_id = block_id;
@@ -1645,6 +1783,37 @@ fn fault_pc_and_fuel(block: &pcode::Block, fault_index: usize) -> (Option<u64>, 
     (pc, guest_insns)
 }
 
+/// Records guest instruction source ranges whose markers ran in one p-code
+/// slice. `through` is the inclusive p-code offset where execution stopped;
+/// `None` means the slice completed. Keeping `(address, length)` pairs makes
+/// the hot path one hash insertion per distinct instruction, while
+/// [`InterpVm::executed_byte_count`] performs the rarer interval union.
+fn record_instruction_ranges(
+    tracking: &mut Option<std::collections::HashSet<(u64, u64)>>,
+    block: &pcode::Block,
+    start: usize,
+    through: Option<usize>,
+) {
+    let Some(tracking) = tracking.as_mut() else {
+        return;
+    };
+    let end = through
+        .map(|offset| offset.saturating_add(1))
+        .unwrap_or(block.instructions.len())
+        .min(block.instructions.len());
+    if start >= end {
+        return;
+    }
+    for instruction in &block.instructions[start..end] {
+        if matches!(instruction.op, pcode::Op::InstructionMarker) {
+            tracking.insert((
+                instruction.inputs.first().as_u64(),
+                instruction.inputs.second().as_u64(),
+            ));
+        }
+    }
+}
+
 /// Adjusts the fuel counter when the interpreter is entered mid-block.
 ///
 /// - When we enter the interpreter at the start of a block that has pcode
@@ -1652,7 +1821,15 @@ fn fault_pc_and_fuel(block: &pcode::Block, fault_index: usize) -> (Option<u64>, 
 ///   counter must not be decremented before the first marker executes.
 /// - When we resume in the middle of a block (e.g. after a fault), the fuel
 ///   counter must be decremented to account for the missing marker.
-fn adjust_cpu_fuel_for_block_reentry(cpu: &mut Cpu, block: &lifter::Block, offset: u64) {
+fn adjust_cpu_fuel_for_block_reentry(
+    cpu: &mut Cpu,
+    block: &lifter::Block,
+    offset: u64,
+    page_in_retry: bool,
+) {
+    if page_in_retry {
+        return;
+    }
     if block.pcode.address_of(offset as usize).is_none() {
         // The offset is _before_ the first instruction in the block; the
         // executed pcode is not related to any instruction.

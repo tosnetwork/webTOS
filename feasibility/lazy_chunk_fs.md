@@ -1,18 +1,21 @@
 # Content-addressed chunk store + demand paging for the guest filesystem
 
-Status: design / feasibility. No code yet. The question this answers: can we
-stop materializing a whole agent image before it runs — fetch only the bytes a
-run actually touches, cache them in OPFS, and keep the execution bit-for-bit
-replayable against the trace gate?
+Status: **Phase 2 complete (2026-08-29).** Phase 0's prerequisite was proven at
+`29f3975`; the implementation now passes the x86-64 no-skip release suite, the
+overflow-checking syscall sweep, Node boundary gates, and Chromium, Firefox,
+and WebKit at 39/39 each. A real 268 MB Codex image also closes the large-image
+measurement gate. The result is that an agent image can be installed by
+manifest and fetched only where execution touches it, with OPFS caching and
+the same architectural trace boundary as eager execution.
 
 This revision incorporates an adversarial code review (Codex, gpt-5.6). The
-first draft overclaimed how much of the fault/wait machinery already exists; the
-review found ten concrete problems, all folded in below. The short version of
-what changed: the softmmu fault is shared only for *detection* — the resumable
-page-in (a mid-instruction parked state, a retry-same-instruction outcome, a VMA
-model, a new host ABI, and a deterministic multi-task fault scheduler) is **new
-work**, and the async-fault-in-a-JIT-region is a **prototype-first blocker**, not
-a "confirm it works" footnote.
+first draft overclaimed how much of the fault/wait machinery already existed;
+the review found ten concrete problems, all folded in below. It correctly made
+the async fault inside a JIT region a prototype-first blocker and required a
+VMA model, host ABI, and deterministic completion rule. The prototype then
+showed that the feared parked state and new VM outcome were unnecessary:
+`block_offset` already preserves the retry point and the retry runs through the
+interpreter after the page is filled.
 
 ## Why
 
@@ -28,7 +31,7 @@ never otherwise. The base image is immutable and content-addressed, so it is
 CDN-cacheable and shared across agents (Node, Claude, Codex share libc, the
 loader, and much of their runtime).
 
-## What exists today (the anchor)
+## Baseline at the scope decision (the anchor)
 
 - `vfs.rs`: `NodeKind::File(Vec<u8>)` — a file's **entire** contents are an
   owned `Vec<u8>` resident in host memory. `Vfs::bytes()` sums
@@ -145,16 +148,142 @@ with identical `icount` and trace. Today it cannot; three things are missing:
    each needs a test asserting identical `icount`/trace versus the eager run.
    (Codex finding 3.)
 
-**This is the highest-risk item and the first deliverable.** It is provable in
-isolation (a synthetic non-resident page, no chunk store yet) and everything
-below depends on it. If the region path cannot carry a mid-iteration retry
-cleanly, the whole mmap layer is blocked and only the read() layer is viable.
+**Historical go/no-go, now closed.** This isolated synthetic-page test was the
+first deliverable because every later layer depends on it. `29f3975` supplies
+the required region-JIT evidence; Phase 2's risks are now image authority,
+VMA lifecycle, deterministic completion, and loader coverage.
+
+## Phase 2 scope decision: immutable file-backed mmap demand paging
+
+The blocker is closed. The next implementation is deliberately **not** “make
+the VFS lazy everywhere,” nor “add a generic pager.” It is one vertical slice
+whose product question is falsifiable: *can a pinned agent image map its
+executable and shared-library files without eagerly materializing their cold
+bytes, while preserving Linux `MAP_PRIVATE` and webTOS trace semantics?*
+
+### In scope
+
+1. **A pinned immutable base image.** An offline manifest names file metadata,
+   fixed-size content-addressed chunks, a manifest root, and the legacy image
+   identity needed by existing traces. Every chunk is verified before it is
+   exposed. This is the authority for bytes; OPFS and the network are only
+   transports and caches.
+2. **A bounded chunk store.** It fetches an already-known chunk by hash from
+   warm OPFS or the existing host delivery path, accounts resident bytes and
+   overlay bytes to the storage budget, and never treats a logical file length
+   as resident memory. The initial implementation may retain fetched chunks
+   for the session; eviction and cross-image deduplication are later work.
+3. **Non-resident private file mappings.** `MAP_PRIVATE` mappings of immutable
+   base files create VMA metadata and page permissions, but do not copy file
+   bytes into guest memory. First read, write, or instruction fetch asks the
+   pager for the corresponding chunk/page; a successful fill restores the
+   VMA's final permissions, including `EXEC`.
+4. **Initial executable and loader coverage.** The host ELF loader must stop
+   cloning the full executable. It may parse only the bounded ELF metadata
+   eagerly, but its `PT_LOAD` ranges and the dynamic loader's later `mmap`s use
+   the same VMA/page-in mechanism. Guest `mmap` alone is not success: it leaves
+   the first 256 MB executable eager.
+5. **Correct invalidation and private identity.** A mapping binds an immutable
+   file/overlay version at `mmap` time. Page-in tickets carry address-space and
+   VMA generation; `munmap`, `MAP_FIXED`, `mremap`, `mprotect`, `execve`, and
+   fork must make a late completion harmless rather than filling a reused
+   address.
+6. **Deterministic completion.** A page miss is a whole-machine deterministic
+   barrier: no guest task runs until that exact ticket is verified and the
+   faulting instruction can retry. Fetch latency therefore changes host wall
+   time only; it cannot choose another guest task or alter trace order. This is
+   intentionally stricter than task-local parking and fits the existing
+   syscall-boundary scheduler without inventing a mid-instruction task state.
+
+### Explicitly out of scope
+
+- `MAP_SHARED`, writable shared files, and a general page cache;
+- eviction, prefetching, compression, background download, and cross-agent
+  chunk deduplication;
+- making arbitrary `read`/`pread`, mutation, snapshot, or sendfile callers
+  fully lazy beyond the adapters required by the vertical slice;
+- changing guest-visible ELF, mmap, fault, scheduler, trace, or errno
+  semantics to obtain a time-to-prompt result;
+- claiming browser delivery for Codex or Claude Code before their image profile
+  passes the gates below.
+
+### Non-negotiable invariants
+
+- A successful lazy execution has the same exit state, guest bytes, retired
+  instruction count, and architectural trace as the eager image.
+- A failed hash, unavailable chunk, malformed manifest, stale ticket, or quota
+  overage fails closed and cannot expose substituted bytes or silently run an
+  eager fallback.
+- The failed p-code operation commits no architectural state. The proven
+  `block_offset` retry rule remains the only retry mechanism; Phase 2 does not
+  add a second parked-state or JIT-outcome model.
+- `PROT_EXEC` remains executable after first fill, and `MAP_PRIVATE` observes
+  the version that existed when it was mapped, not later VFS mutations.
+
+### Definition of done and current evidence
+
+The vertical slice is complete only when all of the following are gated. Local
+unit checks and Linux fixture checks are implementation evidence, not a
+substitute for the final three-browser matrix:
+
+1. A manifest-backed executable and a dynamic shared library both map with no
+   eager payload copy; an access to each causes exactly the expected page-ins.
+2. The eager and lazy versions reproduce the same trace, result, and retired
+   `icount` for interpreter, per-block JIT, and region JIT, on the x86-64 Linux
+   fixture host and in Chromium, Firefox, and WebKit.
+3. Tests cover `EXEC` first fetch, a cross-page access, syscall
+   `copy_from_user`/`copy_to_user`, a hash mismatch,
+   storage-budget refusal, private-file mutation after `mmap`, and every stale
+   completion path (`munmap`, `MAP_FIXED`, `mprotect`, `mremap`, `execve`, fork).
+4. A measured Codex/Claude-sized image demonstrates that untouched payload is
+   not materialized. The report separates bytes delivered, bytes resident,
+   bytes executed, and latency; “the prompt appeared” is not sufficient.
+
+Only after that gate may Phase 3 add deduplication, eviction, or prefetch.
+
+All four gates are closed by the 2026-08-29 matrix:
+
+| Gate | Evidence |
+|---|---|
+| Loader and mmap coverage | `lazy_paging.rs` demand-maps the initial static ELF and a dynamic ELF plus its exact manifest-bound musl interpreter; guest `execve` prefetches bounded ELF metadata before its point of no return; `MAP_PRIVATE` pins the mmap-time version and syscall copies page in user buffers |
+| Interpreter/JIT determinism | The eager/lazy BusyBox gate compares output, exit, retired `icount`, and architectural events in interpreter and JIT modes; `a_page_in_retries_identically_to_an_eager_run` separately covers per-block and region JIT retry; the browser lazy gate asserts both block and region dispatch counters, and the three engines all report the same 4,821 instructions |
+| Adversarial lifecycle | Unit/integration gates cover bad hashes, quota refusal, cross-page execute/read/write, cold-lift invalidation, scoped-secret materialization, canonical parent directories, atomic manifest installation, snapshot re-binding without losing resident overlays, executable-authority preservation, trailing snapshot bytes, `munmap`, `MAP_FIXED`, `mprotect`, growing `mremap`, `execve`, and fork |
+| Platform matrix | `test_node.mjs`, 9,943 exported-boundary calls, manifest enforcement, and Chromium/Firefox/WebKit 39/39 all pass against a fresh wasm build |
+
+The explicit large-image command used the x86-64 host's stock
+`codex-cli 0.150.1` binary with `--version`:
+
+```text
+logical bytes                 268,330,432
+delivered bytes                21,849,536  (8.14%)
+resident filesystem bytes      21,849,576  (8.14%)
+demand-filled page bytes       14,340,096
+execute-first page bytes        1,347,584
+executed bytes                    471,227
+retired instructions            5,650,191
+instrumented run latency            2,317 ms
+exit/output                    0 / codex-cli 0.150.1
+```
+
+`execute-first page bytes` counts pages whose first materializing access was
+instruction fetch; it is deliberately reported separately from all
+demand-filled pages. `executed bytes` is the union of guest instruction-source
+ranges actually reached by interpreter or JIT instruction markers, counted
+once even when a loop executes them repeatedly. That is the exact code-byte
+metric; `execute-first page bytes` remains the page-granularity transport
+metric. Tracking those ranges adds instrumentation overhead, so the latency is
+labelled instrumented rather than presented as a clean performance baseline.
+The run left 91.86% of the logical image undelivered. The gate also found two
+scale-only defects before passing: a lift built against a cold cross-page
+target had to be invalidated after fill, and unaligned cross-page reads/writes
+report the resident starting page rather than the adjacent cold page. Both now
+have small regression gates in addition to this explicit large measurement.
 
 ## Core abstractions
 
 ### Chunk and manifest (the immutable, content-addressed base)
 
-- **Chunk**: a fixed-size slice of a file's bytes (proposed 64 KiB, a multiple
+- **Chunk**: a fixed-size 64 KiB slice of a file's bytes (a multiple
   of the 4 KiB guest page). Identified by `Hash` = SHA-256 of its bytes.
 - **ChunkedFile**: `{ size: u64, chunk_size: u32, chunks: Vec<Hash> }`. The last
   chunk is short.
@@ -165,6 +294,19 @@ cleanly, the whole mmap layer is blocked and only the read() layer is viable.
   determinism). A Merkle image: the root pins every byte without reading them.
 
 Built offline at image-build time; not guest-visible; never changes during a run.
+
+The canonical builder is:
+
+```bash
+python3 tools/build_chunk_manifest.py <rootfs> <output-dir> --guest-prefix /
+```
+
+It writes `manifest.txt` plus `chunks/<sha256>`, prints the manifest root, and
+sorts byte paths before serialization. The manifest encodes paths and symlink
+targets as lowercase hex, so whitespace and non-UTF-8 Unix names cannot create
+an ambiguous signed form. The VM rejects noncanonical paths, unsorted or
+duplicate entries, malformed layouts, and any chunk whose delivered SHA-256
+does not match its entry.
 
 ### ChunkStore and the new host ABI (this is new protocol, not reuse)
 
@@ -190,11 +332,10 @@ streaming:
   input/network.
 - Every returned chunk is **hash-verified before use**; wrong bytes are a hard
   error, never used.
-- **Warm sync path:** OPFS `createSyncAccessHandle` gives synchronous reads
-  inside a Worker, so a warm chunk pages in without parking. This is **proposed,
-  not present**, and its availability across Chromium/Firefox/WebKit must be
-  verified; where it is absent, the async park is the fallback and the warm path
-  simply degrades to it.
+- **Warm cache path:** the worker uses OPFS `createSyncAccessHandle` when the
+  engine supplies it and `File.arrayBuffer()` otherwise. Both occur behind the
+  same deterministic VM barrier; support and behavior are gated in Chromium,
+  Firefox, and WebKit rather than assumed.
 
 ### FileData: typed accessors, not one transparent `&[u8]`
 
@@ -204,12 +345,12 @@ The type carries the state; three distinct APIs carry the three needs:
 
 ```
 enum FileData {
-    Resident(Vec<u8>),                 // created/written/fully-resident; today
-    Chunked { file: ChunkedFile, resident: ChunkMap, overlay: Overlay },
+    Resident(Vec<u8>),                 // created/written/fully-resident
+    Chunked(ChunkedFile),              // immutable descriptor; shared store
 }
 // read path (may park):   read_range(off, len) -> Ready(Vec<u8>) | Pending(Ticket)
-// mutate path (forces residency): materialize_mut() -> &mut Vec<u8>
-// snapshot path:          snapshot_encoding() -> resident set + overlay, not bytes
+// mutate path (forces residency): materialize_file() -> &mut Vec<u8>
+// snapshot path:          descriptor + manifest root, not cached base bytes
 ```
 
 Every current `NodeKind::File(data)` site must be classified and migrated — the
@@ -220,7 +361,7 @@ draft's "~15 match sites" was an undercount. The real surface (Codex finding 8):
 (`vfs.rs:77`), budget `data_len` (`:39`), snapshot `serialize` (`:779`),
 `rewrite_file` (`:737`), `take_file_contents`/`put_file_contents` (`:695`/`:708`),
 and `append_file` (`:331`). Mutating and whole-file-owning sites route through
-`materialize_mut` (correctness first, laziness only where it pays); only
+`materialize_file` (correctness first, laziness only where it pays); only
 `read`/`pread`, the loader, mmap, and sendfile take the lazy path.
 
 ### VMA metadata (required for any async completion)
@@ -272,21 +413,14 @@ and never the **order** in which tasks run.
    sequence of page-in *requests* is a function of the run, not of network
    timing.
 
-3. **Arrival latency is nondeterministic but must not decide scheduling.** This
-   is the subtle hole the first draft missed (Codex finding 10): with more than
-   one task, *when* a cold fetch completes could otherwise decide which ready
-   task the scheduler picks, reordering instructions, random draws, signals,
-   syscalls, and trace events. Content hashing fixes bytes, **not scheduling**.
-   So the fault scheduler must be deterministic by construction:
-   - a page fault blocks **only** the faulting task;
-   - ready tasks are selected by a **stable queue order**, never by fetch
-     arrival;
-   - page-in completion is applied at a deterministic point (e.g. the faulting
-     task becomes runnable in stable order once its bytes are present), and the
-     completion order is **recorded in the trace and replayed**, so a replay
-     does not depend on live network timing at all.
-   Without this rule the single-task argument does not extend to the multi-task
-   case, and this is a first-class requirement, not a footnote.
+3. **Arrival latency is nondeterministic but cannot decide scheduling.** The
+   subtle hole remains real: content hashing fixes bytes, not task order. The
+   implemented rule is a global page-in barrier. The CPU keeps the original
+   exception and p-code offset, and no guest task runs while its ticket is
+   outstanding. Delivery first re-submits that exception to the pager, fills
+   the authoritative page, and only then retries execution. Because there is
+   no scheduling choice during the wait, completion needs no new architectural
+   trace event; network latency changes wall time only.
 
 4. **The trace header needs an identity a lazy image can supply.** The header is
    length + FNV over the whole byte array (`trace.rs:146`); a lazy image has not
@@ -295,9 +429,9 @@ and never the **order** in which tasks run.
    legacy FNV** emitted by the manifest builder. (Codex finding 10.)
 
 Corollary — **snapshots shrink and become shareable.** A snapshot records the
-manifest root plus resident/overlay state (what was written), and re-fetches
-base chunks by hash on restore. The immutable base is never serialized per
-session.
+manifest root, immutable descriptors, and any files promoted to resident by
+mutation, then re-fetches unchanged base chunks by hash on restore. Cached
+immutable chunks are never serialized per session.
 
 ### Where determinism could still break (guards)
 
@@ -308,44 +442,47 @@ session.
 - Storage budget must count resident chunk bytes + overlay, not the file's
   logical size, or a large image reads as free and blows the cap while paging in
   (`Vfs::bytes` accounting changes with residency).
-- Overlay-vs-base resolution is **per-byte**, overlay wins, not per-chunk.
+- A mutated file is promoted atomically to resident storage before the write;
+  an existing `MAP_PRIVATE` retains the immutable descriptor captured at mmap.
 
 ## Phasing
 
-0. **Resumable page-in fault (prerequisite blocker).** The page-in exception,
-   the no-`prepare_resume` parked state, and the retry-same-pcode outcome for
-   interpreter/JIT-block/JIT-region, each trace-gated against the eager run. No
-   chunk store yet — a synthetic non-resident page. Everything below depends on
-   this proving out.
-1. **Foundation + read-path.** Chunk store, manifest, `FileData::Chunked`,
+0. **Resumable page-in fault (prerequisite blocker).** ✅ Proven at `29f3975`.
+   The synthetic non-resident-page gate covers interpreter, per-block JIT, and
+   region JIT without a new parked state or VM outcome. Everything below
+   depends on this evidence.
+1. **Foundation + read-path.** Implemented: chunk store, canonical manifest,
+   `NodeKind::ChunkedFile`,
    `read_range`, the new host ABI + `STATUS_AWAITING_PAGEIN`, OPFS-sync warm
    path with async fallback. Convert `read`/`pread`/sendfile. Win: large data
    files. Trace gate untouched.
-2. **Demand-faulted code.** VMA table (with fork/unmap/MAP_FIXED/mprotect
+2. **Demand-faulted code.** Implemented and matrix-gated: VMA table (with fork/unmap/MAP_FIXED/mprotect
    lifecycle and EXEC-preserving perms), mmap-time private-version binding,
    demand-faulted guest mmap, **and** a ranged/file-backed rewrite of the host
    ELF loader so the first executable is lazy too. Win: the agent binaries.
-3. **Shared immutable base.** Dedupe the base across agents by chunk hash so
-   Node/Claude/Codex share libc/loader/runtime in one OPFS cache; snapshots stop
-   storing base bytes.
+3. **Shared immutable base.** Session-wide and OPFS hash dedupe plus
+   descriptor-only snapshots are implemented. Eviction and measured
+   cross-agent policy remain post-gate work.
 
-## Risks / open questions
+## Remaining risks / open questions
 
-- **Async fault inside a JIT region** is the top risk and Phase 0's crux; if a
-  mid-iteration retry cannot be made bit-exact, the mmap layer is blocked.
-- **VMA lifecycle correctness under fork/MAP_FIXED/mremap/mprotect** with fetches
-  in flight — the ticket-generation validation must be airtight.
+- **VMA lifecycle regressions** — generation checks now gate
+  unmap/MAP_FIXED/mremap/mprotect/exec and fork preserves address-space
+  identity, but the release suite and browser matrix remain the continuing
+  guard.
 - **64 KiB chunk vs 4 KiB page** — page in the whole chunk (fewer round-trips) or
   just the page (less waste); start chunk-granular, measure.
-- **Overlay growth / promote-to-`Resident` threshold** under a workload that
-  rewrites a large mapped region — needs a measured rule like the JIT block-table
-  ceiling.
+- **Mutation granularity** — the scoped implementation promotes a chunked file
+  to `Resident` before a legacy whole-file mutation. A measured per-byte COW
+  overlay is later work, not part of this correctness slice.
 - **`MAP_SHARED` file mappings** remain `ENOSYS`; demand paging does not change
   that.
-- **OPFS `createSyncAccessHandle` support** across the three engines — verify;
-  async park is the fallback.
-- **Manifest build tool** is new offline surface, trust-rooted by the manifest
-  hash, so a bad build is a detected mismatch, not silent.
+- **OPFS API differences** — `createSyncAccessHandle` is used where available;
+  the asynchronous verified barrier is the portable fallback and is included
+  in the three-engine matrix.
+- **Manifest build reproducibility** — `tools/build_chunk_manifest.py` emits
+  canonical sorted bytes and the root, but production image builds still need
+  their own reproducibility gate and signature publication process.
 
 ## What this is not
 

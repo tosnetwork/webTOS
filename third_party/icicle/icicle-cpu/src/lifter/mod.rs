@@ -56,7 +56,9 @@ pub struct InstructionLifter {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum DecodeError {
     InvalidInstruction,
-    NonExecutableMemory,
+    /// The instruction whose bytes were not executable. This may differ
+    /// from the entry address of the block group currently being lifted.
+    NonExecutableMemory(u64),
     BadAlignment,
     UnimplementedOp,
     LifterError(sleigh_runtime::LifterError),
@@ -159,7 +161,7 @@ impl InstructionLifter {
             let err = src
                 .ensure_exec(vaddr, 1)
                 .then_some(DecodeError::InvalidInstruction)
-                .unwrap_or(DecodeError::NonExecutableMemory);
+                .unwrap_or(DecodeError::NonExecutableMemory(vaddr));
             return Err(err);
         }
 
@@ -167,7 +169,7 @@ impl InstructionLifter {
         let len = self.decoded.num_bytes() as usize;
         let is_executable = len <= buf.len() && src.ensure_exec(vaddr, len);
         if !is_executable {
-            return Err(DecodeError::NonExecutableMemory);
+            return Err(DecodeError::NonExecutableMemory(vaddr));
         }
         tracing::trace!("decode: {vaddr:#x} {:02x?}", &buf[..len]);
 

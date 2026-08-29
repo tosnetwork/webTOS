@@ -8,7 +8,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::abi;
+use crate::{
+    abi,
+    chunk::{ChunkStore, ChunkedFile, Hash, ReadRange},
+};
 
 pub const ROOT: usize = 0;
 
@@ -26,6 +29,9 @@ pub enum Dev {
 pub enum NodeKind {
     Dir(BTreeMap<Vec<u8>, usize>),
     File(Vec<u8>),
+    /// Immutable base-image file. Its logical bytes are named by hashes; only
+    /// verified resident chunks occupy host memory.
+    ChunkedFile(ChunkedFile),
     Symlink(Vec<u8>),
     CharDev(Dev),
 }
@@ -37,6 +43,7 @@ impl NodeKind {
     fn data_len(&self) -> usize {
         match self {
             NodeKind::File(data) => data.capacity(),
+            NodeKind::ChunkedFile(_) => 0,
             NodeKind::Symlink(target) => target.capacity(),
             NodeKind::Dir(_) | NodeKind::CharDev(_) => 0,
         }
@@ -57,7 +64,7 @@ impl Node {
     pub fn file_type_bits(&self) -> u32 {
         match self.kind {
             NodeKind::Dir(_) => abi::S_IFDIR,
-            NodeKind::File(_) => abi::S_IFREG,
+            NodeKind::File(_) | NodeKind::ChunkedFile(_) => abi::S_IFREG,
             NodeKind::Symlink(_) => abi::S_IFLNK,
             NodeKind::CharDev(_) => abi::S_IFCHR,
         }
@@ -66,7 +73,7 @@ impl Node {
     pub fn d_type(&self) -> u8 {
         match self.kind {
             NodeKind::Dir(_) => abi::DT_DIR,
-            NodeKind::File(_) => abi::DT_REG,
+            NodeKind::File(_) | NodeKind::ChunkedFile(_) => abi::DT_REG,
             NodeKind::Symlink(_) => abi::DT_LNK,
             NodeKind::CharDev(_) => abi::DT_CHR,
         }
@@ -75,6 +82,7 @@ impl Node {
     pub fn size(&self) -> u64 {
         match &self.kind {
             NodeKind::File(data) => data.len() as u64,
+            NodeKind::ChunkedFile(file) => file.size,
             NodeKind::Symlink(target) => target.len() as u64,
             NodeKind::Dir(entries) => entries.len() as u64,
             NodeKind::CharDev(_) => 0,
@@ -92,6 +100,11 @@ pub struct Resolved {
 
 pub struct Vfs {
     pub(crate) nodes: Vec<Node>,
+    /// Verified immutable chunks shared by every chunk-backed inode.
+    chunks: ChunkStore,
+    /// Canonical immutable-image identity. Cached chunks are transport state
+    /// and need not be embedded in a snapshot for this root to remain valid.
+    manifest_root: Option<Hash>,
     /// Ceiling on [`Vfs::bytes`], or None for unbounded. See
     /// [`Vfs::set_storage_budget`].
     storage_budget: Option<usize>,
@@ -107,6 +120,8 @@ impl Vfs {
         let mut vfs = Self {
             storage_budget: None,
             unlinked: Vec::new(),
+            chunks: ChunkStore::default(),
+            manifest_root: None,
             nodes: vec![Node {
                 kind: NodeKind::Dir(BTreeMap::new()),
                 mode: 0o755,
@@ -139,6 +154,133 @@ impl Vfs {
 
     pub fn node_mut(&mut self, index: usize) -> &mut Node {
         &mut self.nodes[index]
+    }
+
+    /// Installs an immutable file layout without making any payload resident.
+    pub fn add_chunked_file(
+        &mut self,
+        path: &[u8],
+        file: ChunkedFile,
+        mode: u32,
+    ) -> Result<usize, u64> {
+        self.add_node(path, NodeKind::ChunkedFile(file), mode)
+    }
+
+    /// Adds one verified base-image chunk. Identical hashes are stored once.
+    pub fn put_chunk(&mut self, expected: Hash, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.chunks.contains(&expected) {
+            self.reserve(bytes.capacity())
+                .map_err(|_| "chunk exceeds the storage budget".to_string())?;
+        }
+        self.chunks.insert(expected, bytes)
+    }
+
+    pub fn has_chunk(&self, hash: &Hash) -> bool {
+        self.chunks.contains(hash)
+    }
+
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunks.bytes()
+    }
+
+    pub fn set_manifest_root(&mut self, root: Option<Hash>) {
+        self.manifest_root = root;
+    }
+
+    pub fn manifest_root(&self) -> Option<Hash> {
+        self.manifest_root
+    }
+
+    /// Clones namespace topology and immutable descriptors without cloning
+    /// resident file or chunk payloads. Manifest installation uses this as a
+    /// preflight transaction: every path conflict is discovered before the
+    /// live filesystem is changed, even when the live tree holds a very large
+    /// resident overlay.
+    pub(crate) fn topology_only(&self) -> Self {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| Node {
+                kind: match &node.kind {
+                    NodeKind::Dir(entries) => NodeKind::Dir(entries.clone()),
+                    NodeKind::File(_) => NodeKind::File(Vec::new()),
+                    NodeKind::ChunkedFile(file) => NodeKind::ChunkedFile(file.clone()),
+                    NodeKind::Symlink(target) => NodeKind::Symlink(target.clone()),
+                    NodeKind::CharDev(dev) => NodeKind::CharDev(*dev),
+                },
+                mode: node.mode,
+                nlink: node.nlink,
+                mtime_sec: node.mtime_sec,
+                parent: node.parent,
+            })
+            .collect();
+        Self {
+            nodes,
+            chunks: ChunkStore::default(),
+            manifest_root: self.manifest_root,
+            storage_budget: None,
+            unlinked: self.unlinked.clone(),
+        }
+    }
+
+    pub(crate) fn read_chunked_range(
+        &self,
+        file: &ChunkedFile,
+        offset: u64,
+        len: usize,
+    ) -> ReadRange {
+        self.chunks.read_range(file, offset, len)
+    }
+
+    /// First authority needed before a legacy whole-file mutation can be
+    /// applied. Callers request it and retry until materialization is ready.
+    pub fn first_missing_file_chunk(&self, node: usize) -> Result<Option<Hash>, u64> {
+        match &self.nodes.get(node).ok_or(abi::ENOENT)?.kind {
+            NodeKind::File(_) => Ok(None),
+            NodeKind::ChunkedFile(file) => Ok(self.chunks.first_missing(file)),
+            NodeKind::Dir(_) => Err(abi::EISDIR),
+            _ => Err(abi::EINVAL),
+        }
+    }
+
+    /// Reads a regular-file range without silently materializing a chunked
+    /// file. The first absent hash is returned to the page-in boundary.
+    pub fn read_node_range(&self, node: usize, offset: u64, len: usize) -> Result<ReadRange, u64> {
+        match &self.nodes.get(node).ok_or(abi::ENOENT)?.kind {
+            NodeKind::File(data) => {
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
+                let end = start.saturating_add(len).min(data.len());
+                Ok(ReadRange::Ready(data[start..end].to_vec()))
+            }
+            NodeKind::ChunkedFile(file) => Ok(self.chunks.read_range(file, offset, len)),
+            NodeKind::Dir(_) => Err(abi::EISDIR),
+            _ => Err(abi::EINVAL),
+        }
+    }
+
+    /// Materializes a chunked inode only for legacy mutation/whole-file APIs.
+    /// Missing authority is an error, never an eager transport fallback.
+    pub fn materialize_file(&mut self, node: usize) -> Result<&mut Vec<u8>, u64> {
+        let bytes = match &self.nodes.get(node).ok_or(abi::ENOENT)?.kind {
+            NodeKind::File(_) => None,
+            NodeKind::ChunkedFile(file) => match self.chunks.read_range(file, 0, usize::MAX) {
+                ReadRange::Ready(bytes) => Some(bytes),
+                ReadRange::Missing(_) => return Err(abi::EIO),
+                ReadRange::Invalid(_) => return Err(abi::EIO),
+            },
+            NodeKind::Dir(_) => return Err(abi::EISDIR),
+            _ => return Err(abi::EINVAL),
+        };
+        if let Some(bytes) = bytes {
+            self.reserve(bytes.capacity())?;
+            self.nodes[node].kind = NodeKind::File(bytes);
+        }
+        match &mut self.nodes[node].kind {
+            NodeKind::File(data) => Ok(data),
+            _ => unreachable!("regular file was materialized"),
+        }
     }
 
     pub fn is_dir(&self, index: usize) -> bool {
@@ -586,6 +728,26 @@ impl Vfs {
     }
 }
 
+fn rewrite_bytes(data: &mut Vec<u8>, subs: &[(String, String)]) {
+    let replacement = {
+        let Ok(text) = std::str::from_utf8(data) else {
+            return;
+        };
+        let mut out = text.to_string();
+        let mut changed = false;
+        for (from, to) in subs {
+            if out.contains(from.as_str()) {
+                out = out.replace(from.as_str(), to);
+                changed = true;
+            }
+        }
+        changed.then(|| out.into_bytes())
+    };
+    if let Some(replacement) = replacement {
+        *data = replacement;
+    }
+}
+
 impl Default for Vfs {
     fn default() -> Self {
         Self::new()
@@ -595,7 +757,7 @@ impl Default for Vfs {
 // ── Whole-filesystem snapshots (browser reload persistence) ─────────────────
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"WTFS";
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 3;
 
 impl Vfs {
     /// Applies literal substitutions to every regular file's contents.
@@ -605,7 +767,11 @@ impl Vfs {
     /// node records are not counted: a filesystem's size is its data, and
     /// that is the term an image moves.
     pub fn bytes(&self) -> usize {
-        self.nodes.iter().map(|node| node.kind.data_len()).sum()
+        self.nodes
+            .iter()
+            .map(|node| node.kind.data_len())
+            .sum::<usize>()
+            .saturating_add(self.chunks.bytes())
     }
 
     /// Sets a ceiling on [`Vfs::bytes`], or clears it with None.
@@ -712,43 +878,40 @@ impl Vfs {
 
     /// Applies substitutions to one file. Used to give a secret a scope:
     /// the value is written where the host says it belongs and nowhere else.
-    pub fn rewrite_file(&mut self, path: &[u8], subs: &[(String, String)]) {
-        let Some(data) = self.take_file_contents(path) else {
-            return;
-        };
-        let replaced = match std::str::from_utf8(&data) {
-            Ok(text) => {
-                let mut out = text.to_string();
-                for (from, to) in subs {
-                    out = out.replace(from.as_str(), to);
-                }
-                out.into_bytes()
-            }
-            Err(_) => data, // never touch binary files
-        };
-        self.put_file_contents(path, replaced);
+    pub fn rewrite_file(&mut self, path: &[u8], subs: &[(String, String)]) -> Result<(), u64> {
+        let resolved = self.resolve(ROOT, path, true)?;
+        let node = resolved.node.ok_or(abi::ENOENT)?;
+        let data = self.materialize_file(node)?;
+        rewrite_bytes(data, subs);
+        Ok(())
     }
 
-    pub fn rewrite_files(&mut self, subs: &[(String, String)]) {
+    pub fn rewrite_files(&mut self, subs: &[(String, String)]) -> Result<(), u64> {
         if subs.is_empty() {
-            return;
+            return Ok(());
         }
+        let files: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                matches!(node.kind, NodeKind::File(_) | NodeKind::ChunkedFile(_)).then_some(index)
+            })
+            .collect();
+        for node in files {
+            rewrite_bytes(self.materialize_file(node)?, subs);
+        }
+        Ok(())
+    }
+
+    /// Rewrites only files that are already mutable overlays. Immutable
+    /// chunk descriptors cannot contain an injected secret: expanding one
+    /// first promotes it to `File`, so snapshot redaction never needs to page
+    /// untouched base files in.
+    pub fn rewrite_resident_files(&mut self, subs: &[(String, String)]) {
         for node in &mut self.nodes {
             if let NodeKind::File(data) = &mut node.kind {
-                let Ok(text) = std::str::from_utf8(data) else {
-                    continue; // never touch binary files
-                };
-                let mut replaced = text.to_string();
-                let mut changed = false;
-                for (from, to) in subs {
-                    if replaced.contains(from.as_str()) {
-                        replaced = replaced.replace(from.as_str(), to);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    *data = replaced.into_bytes();
-                }
+                rewrite_bytes(data, subs);
             }
         }
     }
@@ -760,6 +923,13 @@ impl Vfs {
         let mut out = Vec::with_capacity(4096);
         out.extend_from_slice(SNAPSHOT_MAGIC);
         out.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        match self.manifest_root {
+            Some(root) => {
+                out.push(1);
+                out.extend_from_slice(&root);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
         for node in &self.nodes {
             out.extend_from_slice(&(node.parent as u64).to_le_bytes());
@@ -780,6 +950,18 @@ impl Vfs {
                     out.push(2);
                     out.extend_from_slice(&(data.len() as u64).to_le_bytes());
                     out.extend_from_slice(data);
+                }
+                NodeKind::ChunkedFile(file) => {
+                    // Base chunks are deliberately not serialized per session.
+                    // Their hashes are the authority and the host cache can
+                    // supply them again after restore.
+                    out.push(5);
+                    out.extend_from_slice(&file.size.to_le_bytes());
+                    out.extend_from_slice(&file.chunk_size.to_le_bytes());
+                    out.extend_from_slice(&(file.chunks.len() as u64).to_le_bytes());
+                    for hash in &file.chunks {
+                        out.extend_from_slice(hash);
+                    }
                 }
                 NodeKind::Symlink(target) => {
                     out.push(3);
@@ -831,9 +1013,19 @@ impl Vfs {
         if r.take(4)? != SNAPSHOT_MAGIC {
             return Err("not a filesystem image".into());
         }
-        if r.u32()? != SNAPSHOT_VERSION {
+        let version = r.u32()?;
+        if !(1..=SNAPSHOT_VERSION).contains(&version) {
             return Err("unsupported filesystem image version".into());
         }
+        let manifest_root = if version >= 3 {
+            match r.u8()? {
+                0 => None,
+                1 => Some(r.take(32)?.try_into().expect("manifest root width")),
+                _ => return Err("invalid snapshot manifest-root tag".into()),
+            }
+        } else {
+            None
+        };
         let count = r.u32()? as usize;
         if count == 0 || count > 4_000_000 {
             return Err("implausible filesystem image".into());
@@ -892,6 +1084,17 @@ impl Vfs {
                     5 => Dev::Ptmx,
                     other => return Err(format!("unknown device tag {other}")),
                 }),
+                5 if version >= 2 => {
+                    let size = r.u64()?;
+                    let chunk_size = r.u32()?;
+                    let count = index(r.u64()?)?;
+                    let hashes_len = count
+                        .checked_mul(32)
+                        .ok_or_else(|| "chunk hash table too large".to_string())?;
+                    let hashes = r.take(hashes_len)?;
+                    let chunks = hashes.as_chunks::<32>().0.to_vec();
+                    NodeKind::ChunkedFile(ChunkedFile::new(size, chunk_size, chunks)?)
+                }
                 other => return Err(format!("unknown node tag {other}")),
             };
             if parent >= count {
@@ -905,8 +1108,20 @@ impl Vfs {
                 parent,
             });
         }
+        if !r.0.is_empty() {
+            return Err("filesystem image has trailing bytes".into());
+        }
+        if manifest_root.is_none()
+            && nodes
+                .iter()
+                .any(|node| matches!(node.kind, NodeKind::ChunkedFile(_)))
+        {
+            return Err("chunked snapshot has no manifest root".into());
+        }
         Ok(Self {
             nodes,
+            chunks: ChunkStore::default(),
+            manifest_root,
             storage_budget: None,
             unlinked: Vec::new(),
         })

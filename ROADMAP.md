@@ -68,8 +68,8 @@ were the ones where a workload either ran or did not.
 
 The native test suites (98 cases, plus the soak, the nine measurement runs,
 and trace regeneration, all invoked explicitly) gate every ✅ above, alongside
-the 26-check wasm harness and the
-35-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+the wasm harness and the current
+39-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -619,7 +619,9 @@ dynamic loader.
 Work:
 
 - Complete file-backed mappings, demand paging, protection transitions, and
-  executable-page invalidation. ✅ (eager private file maps; demand paging deferred by design)
+  executable-page invalidation. ✅ (`MAP_PRIVATE`, the initial ELF, and the
+  dynamic loader now use immutable manifest-backed demand paging; interpreter,
+  JIT, stale-ticket, snapshot, and three-browser gates cover the path)
 - Support `PT_INTERP`, auxiliary vectors, TLS setup, `arch_prctl`, and FS/GS
   base behavior. ✅
 - Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)

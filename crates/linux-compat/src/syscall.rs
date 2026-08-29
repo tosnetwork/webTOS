@@ -197,7 +197,10 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_EXIT => task_exit(env, cpu, encode_exit_status(a[0]), false),
         abi::SYS_EXIT_GROUP => task_exit(env, cpu, encode_exit_status(a[0]), true),
         abi::SYS_READ => outcome_read(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_PREAD64 => sys_pread(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_WRITE => outcome_write(env, cpu, a[0], a[1], a[2]),
+        abi::SYS_PWRITE64 => sys_pwrite(env, cpu, a[0], a[1], a[2], a[3]),
+        abi::SYS_FTRUNCATE => sys_ftruncate(env, cpu, a[0], a[1]),
         abi::SYS_READV => outcome_vectored(env, cpu, a[0], a[1], a[2], false),
         abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
         abi::SYS_FORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
@@ -238,8 +241,6 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
 
 fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> SysResult {
     match nr {
-        abi::SYS_PREAD64 => sys_pread(env, cpu, a[0], a[1], a[2], a[3]),
-        abi::SYS_PWRITE64 => sys_pwrite(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_OPEN => sys_openat(env, cpu, abi::AT_FDCWD, a[0], a[1], a[2]),
         abi::SYS_CREAT => sys_openat(
             env,
@@ -310,7 +311,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         // Advisory locking. The guest is a single process with no competing
         // lock holders, so acquiring/releasing always succeeds as a no-op.
         abi::SYS_FLOCK => Ok(0),
-        abi::SYS_FTRUNCATE => sys_ftruncate(env, a[0], a[1]),
 
         abi::SYS_SOCKET => sys_socket(env, a[0], a[1], a[2]),
         abi::SYS_CONNECT => sys_connect(env, cpu, a[0], a[1], a[2]),
@@ -373,6 +373,10 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         }
         abi::SYS_MUNMAP => {
             let ok = cpu.mem.unmap_memory_len(a[0], a[1]);
+            if ok {
+                env.pager
+                    .unmap(env.proc.asid, a[0], align_up(a[1], PAGE_SIZE));
+            }
             if std::env::var_os("MMAP_TRACE").is_some() {
                 eprintln!(
                     "[munmap] pid={} addr={:#x} len={:#x} -> {ok}",
@@ -384,7 +388,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
                 false => Err(abi::EINVAL),
             }
         }
-        abi::SYS_MPROTECT => sys_mprotect(cpu, a[0], a[1], a[2]),
+        abi::SYS_MPROTECT => sys_mprotect(env, cpu, a[0], a[1], a[2]),
         abi::SYS_MREMAP => sys_mremap(env, cpu, a),
         // Advisory only; taking no action is a valid implementation.
         abi::SYS_MADVISE => Ok(0),
@@ -706,22 +710,31 @@ fn read_backing(
     env: &mut LinuxEnv,
     desc: &mut Description,
     buf_len: usize,
-) -> Result<Vec<u8>, u64> {
+) -> Result<Vec<u8>, ReadBackingError> {
     match &mut desc.backing {
         Backing::Std(StdStream::In) => Ok(Vec::new()),
-        Backing::Std(_) => Err(abi::EBADF),
-        Backing::Inotify(inner) => read_inotify(&mut inner.borrow_mut(), buf_len),
+        Backing::Std(_) => Err(ReadBackingError::Errno(abi::EBADF)),
+        Backing::Inotify(inner) => {
+            read_inotify(&mut inner.borrow_mut(), buf_len).map_err(ReadBackingError::Errno)
+        }
         Backing::File { node } => {
-            let NodeKind::File(data) = &env.vfs.node(*node).kind else {
-                return Err(abi::EIO);
+            let chunk = match env
+                .vfs
+                .read_node_range(*node, desc.offset, buf_len)
+                .map_err(ReadBackingError::Errno)?
+            {
+                crate::chunk::ReadRange::Ready(bytes) => bytes,
+                crate::chunk::ReadRange::Missing(hash) => {
+                    return Err(ReadBackingError::Missing(hash));
+                }
+                crate::chunk::ReadRange::Invalid(_) => {
+                    return Err(ReadBackingError::Errno(abi::EIO));
+                }
             };
-            let start = offset_into(desc.offset, data.len());
-            let end = (start + buf_len).min(data.len());
-            let chunk = data[start..end].to_vec();
             desc.offset += chunk.len() as u64;
             Ok(chunk)
         }
-        Backing::Dir { .. } => Err(abi::EISDIR),
+        Backing::Dir { .. } => Err(ReadBackingError::Errno(abi::EISDIR)),
         // Handled by `outcome_read` before reaching here.
         Backing::Pipe { .. }
         | Backing::SocketPair { .. }
@@ -730,7 +743,7 @@ fn read_backing(
         | Backing::Net(_)
         | Backing::PtyMaster(_)
         | Backing::PtySlave(_)
-        | Backing::Epoll(_) => Err(abi::EINVAL),
+        | Backing::Epoll(_) => Err(ReadBackingError::Errno(abi::EINVAL)),
         Backing::Dev(dev) => match dev {
             Dev::Null | Dev::Tty | Dev::Ptmx => Ok(Vec::new()),
             Dev::Zero => Ok(vec![0; buf_len]),
@@ -744,6 +757,108 @@ fn read_backing(
             }
         },
     }
+}
+
+enum ReadBackingError {
+    Errno(u64),
+    Missing(crate::chunk::Hash),
+}
+
+impl From<u64> for ReadBackingError {
+    fn from(errno: u64) -> Self {
+        Self::Errno(errno)
+    }
+}
+
+fn wait_for_file_chunk(env: &mut LinuxEnv, cpu: &mut Cpu, hash: crate::chunk::Hash) -> Outcome {
+    if let Err(why) = env.request_file_chunk(hash) {
+        tracing::error!("file page-in refused: {why}");
+        return Outcome::Ret(Err(abi::EIO));
+    }
+    // `Environment::handle_exception` has already consumed this syscall
+    // exception. Queue it again so completion re-enters the syscall without
+    // advancing RIP or mutating the open-file offset.
+    cpu.pending_exception = Some(cpu.exception);
+    Outcome::Exit(VmExit::Interrupted)
+}
+
+/// Whole-file mutation preserves the immutable base by materializing it once.
+/// Fetch one absent chunk per retry so the syscall remains idempotent and the
+/// ordinary page-delivery ticket protocol stays the only host boundary.
+fn wait_to_materialize(env: &mut LinuxEnv, cpu: &mut Cpu, node: usize) -> Option<Outcome> {
+    match env.vfs.first_missing_file_chunk(node) {
+        Ok(Some(hash)) => Some(wait_for_file_chunk(env, cpu, hash)),
+        Ok(None) => None,
+        Err(errno) => Some(Outcome::Ret(Err(errno))),
+    }
+}
+
+/// Linux `copy_from_user`/`copy_to_user` faults user pages just like a guest
+/// load/store. Host-side syscall copies bypass the CPU's softmmu permission
+/// checks, so explicitly fill any lazy pages first; otherwise an untouched
+/// mapping would silently contribute allocator zeros to `write(2)`.
+fn ensure_guest_range(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: usize,
+    access: crate::pager::AccessKind,
+) -> Option<Outcome> {
+    if len == 0 {
+        return None;
+    }
+    let end = match addr.checked_add(len as u64) {
+        Some(end) => end,
+        None => return Some(Outcome::Ret(Err(abi::EFAULT))),
+    };
+    let required = match access {
+        crate::pager::AccessKind::Read => perm::READ,
+        crate::pager::AccessKind::Write => perm::WRITE,
+        crate::pager::AccessKind::Execute => perm::EXEC,
+    };
+    let mut page = addr & !(PAGE_SIZE - 1);
+    while page < end {
+        let Some((resident, final_perm)) = env.pager.page_state(env.proc.asid, page) else {
+            page = page.saturating_add(PAGE_SIZE);
+            continue;
+        };
+        if final_perm & required == 0 {
+            return Some(Outcome::Ret(Err(abi::EFAULT)));
+        }
+        if !resident {
+            match env.pager.resolve(&env.vfs, env.proc.asid, page, access) {
+                crate::pager::FaultResolution::Ready {
+                    page: resolved,
+                    bytes,
+                    perm: final_perm,
+                } => {
+                    if cpu.mem.write_bytes(resolved, &bytes, perm::NONE).is_err()
+                        || cpu
+                            .mem
+                            .update_perm(resolved, PAGE_SIZE, final_perm)
+                            .is_err()
+                    {
+                        return Some(Outcome::Ret(Err(abi::EFAULT)));
+                    }
+                    env.pager.mark_resident(env.proc.asid, resolved, access);
+                }
+                crate::pager::FaultResolution::Missing(_) => {
+                    env.page_in_wait = true;
+                    cpu.pending_exception = Some(cpu.exception);
+                    return Some(Outcome::Exit(VmExit::Interrupted));
+                }
+                crate::pager::FaultResolution::Invalid(why) => {
+                    tracing::error!("syscall page-in refused: {why}");
+                    return Some(Outcome::Ret(Err(abi::EIO)));
+                }
+                crate::pager::FaultResolution::NotLazy => {
+                    return Some(Outcome::Ret(Err(abi::EFAULT)));
+                }
+            }
+        }
+        page = page.saturating_add(PAGE_SIZE);
+    }
+    None
 }
 
 fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Result<u64, u64> {
@@ -763,10 +878,7 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
         Backing::Dev(_) => Ok(bytes.len() as u64),
         Backing::File { node } => {
             let node = *node;
-            let NodeKind::File(data) = &env.vfs.node(node).kind else {
-                return Err(abi::EIO);
-            };
-            let len = data.len();
+            let len = env.vfs.materialize_file(node)?.len();
             if desc.flags & abi::O_APPEND != 0 {
                 desc.offset = len as u64;
             }
@@ -778,9 +890,7 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
             if end > len {
                 env.vfs.reserve(end - len)?;
             }
-            let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind else {
-                return Err(abi::EIO);
-            };
+            let data = env.vfs.materialize_file(node)?;
             if data.len() < end {
                 // A host that cannot find the memory is a full disk to the
                 // guest, not an abort of the whole tab.
@@ -807,50 +917,73 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
     }
 }
 
-fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
-    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
     let mut desc = desc.borrow_mut();
     if !desc.readable() {
-        return Err(abi::EBADF);
+        return Outcome::Ret(Err(abi::EBADF));
     }
     let count = count.min(0x40_0000) as usize;
-    let chunk = read_backing(env, &mut desc, count)?;
-    write_mem(cpu, buf, &chunk)?;
-    Ok(chunk.len() as u64)
+    let chunk = match read_backing(env, &mut desc, count) {
+        Ok(chunk) => chunk,
+        Err(ReadBackingError::Errno(errno)) => return Outcome::Ret(Err(errno)),
+        Err(ReadBackingError::Missing(hash)) => {
+            drop(desc);
+            return wait_for_file_chunk(env, cpu, hash);
+        }
+    };
+    match write_mem(cpu, buf, &chunk) {
+        Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
+        Err(errno) => Outcome::Ret(Err(errno)),
+    }
 }
 
 /// Resizes a regular file to `length`, zero-filling any extension. The fd
 /// must be open for writing. Used for memfd/tempfile-backed IPC buffers.
-fn sys_ftruncate(env: &mut LinuxEnv, fd: u64, length: u64) -> SysResult {
+fn sys_ftruncate(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, length: u64) -> Outcome {
     const MAX_LEN: u64 = 1 << 30; // 1 GiB guard against a runaway size
     if length > MAX_LEN {
-        return Err(abi::EFBIG);
+        return Outcome::Ret(Err(abi::EFBIG));
     }
-    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
     let desc = desc.borrow();
     if desc.flags & abi::O_ACCMODE == abi::O_RDONLY {
-        return Err(abi::EINVAL);
+        return Outcome::Ret(Err(abi::EINVAL));
     }
     let Backing::File { node } = desc.backing else {
-        return Err(abi::EINVAL);
+        return Outcome::Ret(Err(abi::EINVAL));
     };
-    let NodeKind::File(data) = &env.vfs.node(node).kind else {
-        return Err(abi::EIO);
-    };
-    let len = data.len();
-    let length = guest_size(length)?;
-    if length > len {
-        env.vfs.reserve(length - len)?;
+    if let Some(outcome) = wait_to_materialize(env, cpu, node) {
+        return outcome;
     }
-    let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind else {
-        return Err(abi::EIO);
+    let len = match env.vfs.materialize_file(node) {
+        Ok(data) => data.len(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    if length > data.len() {
-        data.try_reserve(length - data.len())
-            .map_err(|_| abi::ENOSPC)?;
+    let length = match guest_size(length) {
+        Ok(length) => length,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    if length > len {
+        if let Err(errno) = env.vfs.reserve(length - len) {
+            return Outcome::Ret(Err(errno));
+        }
+    }
+    let data = match env.vfs.materialize_file(node) {
+        Ok(data) => data,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    if length > data.len() && data.try_reserve(length - data.len()).is_err() {
+        return Outcome::Ret(Err(abi::ENOSPC));
     }
     data.resize(length, 0);
-    Ok(0)
+    Outcome::Ret(Ok(0))
 }
 
 /// `sysinfo`: what a runtime asks before deciding how much memory it may use.
@@ -1058,12 +1191,28 @@ fn offset_into(offset: u64, len: usize) -> usize {
     }
 }
 
-fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> SysResult {
-    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
-    let mut desc = desc.borrow_mut();
+fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
     let count = count.min(0x40_0000) as usize;
-    let bytes = read_mem(cpu, buf, count)?;
-    write_backing(env, &mut desc, &bytes)
+    if let Some(outcome) = ensure_guest_range(env, cpu, buf, count, crate::pager::AccessKind::Read)
+    {
+        return outcome;
+    }
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let mut desc = desc.borrow_mut();
+    if let Backing::File { node } = desc.backing {
+        if let Some(outcome) = wait_to_materialize(env, cpu, node) {
+            drop(desc);
+            return outcome;
+        }
+    }
+    let bytes = match read_mem(cpu, buf, count) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    Outcome::Ret(write_backing(env, &mut desc, &bytes))
 }
 
 fn iter_iov(cpu: &mut Cpu, iov: u64, iovcnt: u64) -> Result<Vec<(u64, u64)>, u64> {
@@ -1089,19 +1238,36 @@ fn sys_pread(
     buf: u64,
     count: u64,
     pos: u64,
-) -> SysResult {
-    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
+) -> Outcome {
+    let count = count.min(0x40_0000) as usize;
+    if let Some(outcome) = ensure_guest_range(env, cpu, buf, count, crate::pager::AccessKind::Write)
+    {
+        return outcome;
+    }
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
     let mut desc = desc.borrow_mut();
     let Backing::File { .. } = desc.backing else {
-        return Err(abi::ESPIPE);
+        return Outcome::Ret(Err(abi::ESPIPE));
     };
     let saved = desc.offset;
     desc.offset = pos;
-    let chunk = read_backing(env, &mut desc, count.min(0x40_0000) as usize);
+    let chunk = read_backing(env, &mut desc, count);
     desc.offset = saved;
-    let chunk = chunk?;
-    write_mem(cpu, buf, &chunk)?;
-    Ok(chunk.len() as u64)
+    let chunk = match chunk {
+        Ok(chunk) => chunk,
+        Err(ReadBackingError::Errno(errno)) => return Outcome::Ret(Err(errno)),
+        Err(ReadBackingError::Missing(hash)) => {
+            drop(desc);
+            return wait_for_file_chunk(env, cpu, hash);
+        }
+    };
+    match write_mem(cpu, buf, &chunk) {
+        Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
+        Err(errno) => Outcome::Ret(Err(errno)),
+    }
 }
 
 fn sys_pwrite(
@@ -1111,18 +1277,34 @@ fn sys_pwrite(
     buf: u64,
     count: u64,
     pos: u64,
-) -> SysResult {
-    let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
-    let mut desc = desc.borrow_mut();
-    let Backing::File { .. } = desc.backing else {
-        return Err(abi::ESPIPE);
+) -> Outcome {
+    let desc = match env.proc.fds.borrow().get(fd) {
+        Ok(entry) => entry.desc.clone(),
+        Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let bytes = read_mem(cpu, buf, count.min(0x40_0000) as usize)?;
+    let mut desc = desc.borrow_mut();
+    let Backing::File { node } = desc.backing else {
+        return Outcome::Ret(Err(abi::ESPIPE));
+    };
+    if let Some(outcome) = wait_to_materialize(env, cpu, node) {
+        drop(desc);
+        return outcome;
+    }
+    let count = count.min(0x40_0000) as usize;
+    if let Some(outcome) = ensure_guest_range(env, cpu, buf, count, crate::pager::AccessKind::Read)
+    {
+        drop(desc);
+        return outcome;
+    }
+    let bytes = match read_mem(cpu, buf, count) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
     let saved = desc.offset;
     desc.offset = pos;
     let result = write_backing(env, &mut desc, &bytes);
     desc.offset = saved;
-    result
+    Outcome::Ret(result)
 }
 
 fn sys_openat(
@@ -1146,7 +1328,10 @@ fn sys_openat(
     // Access tracking (profiling only): note that a delivered file was actually
     // reached, so the untouched-image fraction can be measured.
     if let (Some(opened), Some(node)) = (env.opened_files.as_mut(), resolved.node) {
-        if matches!(env.vfs.node(node).kind, crate::vfs::NodeKind::File(_)) {
+        if matches!(
+            env.vfs.node(node).kind,
+            crate::vfs::NodeKind::File(_) | crate::vfs::NodeKind::ChunkedFile(_)
+        ) {
             opened.insert(node);
         }
     }
@@ -1251,14 +1436,14 @@ fn sys_openat(
             }
             Backing::Dir { node, cookie: 0 }
         }
-        NodeKind::File(_) => {
+        NodeKind::File(_) | NodeKind::ChunkedFile(_) => {
             if flags & abi::O_DIRECTORY != 0 {
                 return Err(abi::ENOTDIR);
             }
             if flags & abi::O_TRUNC != 0 && flags & abi::O_ACCMODE != abi::O_RDONLY {
-                if let NodeKind::File(data) = &mut env.vfs.node_mut(node).kind {
-                    data.clear();
-                }
+                // Truncation discards the immutable base view. It does not
+                // need to fetch bytes that are being replaced with nothing.
+                env.vfs.node_mut(node).kind = NodeKind::File(Vec::new());
             }
             Backing::File { node }
         }
@@ -2147,11 +2332,15 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     if len == 0 {
         return Err(abi::EINVAL);
     }
+    if flags & abi::MAP_ANONYMOUS == 0 && offset & (PAGE_SIZE - 1) != 0 {
+        return Err(abi::EINVAL);
+    }
     let len = align_up(len, PAGE_SIZE);
     let target = if flags & abi::MAP_FIXED != 0 && addr != 0 {
         let target = addr & !(PAGE_SIZE - 1);
         // MAP_FIXED replaces any existing mapping.
         cpu.mem.unmap_memory_len(target, len);
+        env.pager.unmap(env.proc.asid, target, len);
         target
     } else {
         // Find an actual free hole at or above the allocation hint; a plain
@@ -2174,6 +2363,7 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         }
     };
 
+    let mut lazy_file = None;
     let file_bytes = if flags & abi::MAP_ANONYMOUS == 0 {
         if flags & abi::MAP_SHARED != 0 {
             tracing::warn!("mmap: MAP_SHARED file mappings are not supported");
@@ -2183,22 +2373,36 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             Backing::File { node } => node,
             _ => return Err(abi::EBADF),
         };
-        let NodeKind::File(data) = &env.vfs.node(node).kind else {
-            return Err(abi::EBADF);
-        };
-        let start = offset_into(offset, data.len());
-        let end = (start + guest_size(len)?).min(data.len());
-        Some(data[start..end].to_vec())
+        match &env.vfs.node(node).kind {
+            NodeKind::File(data) => {
+                let start = offset_into(offset, data.len());
+                let end = (start + guest_size(len)?).min(data.len());
+                Some(data[start..end].to_vec())
+            }
+            NodeKind::ChunkedFile(file) => {
+                let file_len = file.size.saturating_sub(offset).min(len);
+                lazy_file = Some((file.clone(), file_len));
+                None
+            }
+            _ => return Err(abi::EBADF),
+        }
     } else {
         None
     };
 
-    // Map writable first so file contents can be copied in, then tighten.
+    // A lazy mapping is initialized but has no access permission, so its first
+    // read, write, or instruction fetch reaches the pager. Resident mappings
+    // stay writable while their eager bytes are copied.
+    let initial_perm = if lazy_file.is_some() {
+        perm::INIT
+    } else {
+        perm::READ | perm::WRITE | perm::INIT
+    };
     let ok = cpu.mem.map_memory_len(
         target,
         len,
         icicle_cpu::mem::Mapping {
-            perm: perm::READ | perm::WRITE | perm::INIT,
+            perm: initial_perm,
             value: 0,
         },
     );
@@ -2210,6 +2414,23 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         write_mem(cpu, target, &bytes)?;
     }
     let final_perm = prot_to_perm(prot);
+    if let Some((file, file_len)) = lazy_file {
+        if file_len > 0 {
+            let mapping = crate::pager::FileMapping::new(
+                target,
+                target + len,
+                target,
+                offset,
+                file_len,
+                final_perm,
+                0,
+                file,
+            )
+            .map_err(|_| abi::EINVAL)?;
+            env.pager.map(env.proc.asid, mapping);
+            return Ok(target);
+        }
+    }
     if let Err(e) = cpu.mem.update_perm(target, len, final_perm) {
         tracing::warn!("mmap: update_perm failed for {len:#x} at {target:#x}: {e:?}");
         return Err(abi::ENOMEM);
@@ -2239,6 +2460,8 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         if new_size < old_size {
             cpu.mem
                 .unmap_memory_len(old_addr + new_size, old_size - new_size);
+            env.pager
+                .unmap(env.proc.asid, old_addr + new_size, old_size - new_size);
         }
         return Ok(old_addr);
     }
@@ -2272,14 +2495,36 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         .map_err(|_| abi::EFAULT)?;
     write_mem(cpu, target, &buf)?;
     cpu.mem.unmap_memory_len(old_addr, old_size);
+    env.pager
+        .remap(env.proc.asid, old_addr, old_size, target, new_size);
+    let mut page = target;
+    while page < target + new_size {
+        if let Some((resident, final_perm)) = env.pager.page_state(env.proc.asid, page) {
+            let _ = cpu.mem.update_perm(
+                page,
+                PAGE_SIZE,
+                if resident { final_perm } else { perm::INIT },
+            );
+        }
+        page += PAGE_SIZE;
+    }
     env.proc.mmap_next.set(target + new_size + PAGE_SIZE);
     Ok(target)
 }
 
-fn sys_mprotect(cpu: &mut Cpu, addr: u64, len: u64, prot: u64) -> SysResult {
+fn sys_mprotect(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, prot: u64) -> SysResult {
     let len = align_up(len, PAGE_SIZE);
-    match cpu.mem.update_perm(addr, len, prot_to_perm(prot)) {
-        Ok(()) => Ok(0),
+    let new_perm = prot_to_perm(prot);
+    match cpu.mem.update_perm(addr, len, new_perm) {
+        Ok(()) => {
+            env.pager.protect(env.proc.asid, addr, len, new_perm);
+            // `mprotect` must update the recorded final permission without
+            // accidentally making an unfetched page accessible.
+            for page in env.pager.nonresident_pages(env.proc.asid, addr, len) {
+                let _ = cpu.mem.update_perm(page, PAGE_SIZE, perm::INIT);
+            }
+            Ok(0)
+        }
         Err(_) => Err(abi::ENOMEM),
     }
 }
@@ -3608,6 +3853,9 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
     } else {
         env.proc.fork_child(child_pid)
     };
+    if !is_thread {
+        env.pager.fork_space(env.proc.asid, child_proc.asid);
+    }
     if spec.flags & CLONE_CHILD_CLEARTID != 0 {
         child_proc.clear_child_tid = spec.child_tid;
     }
@@ -3740,11 +3988,38 @@ fn sys_execve(
         },
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    match &env.vfs.node(node).kind {
-        NodeKind::File(data) if data.len() >= 4 && data[..4] == *b"\x7fELF" => {}
+    let chunked = match &env.vfs.node(node).kind {
+        NodeKind::File(data) if data.len() >= 4 && data[..4] == *b"\x7fELF" => false,
         NodeKind::File(_) => return Outcome::Ret(Err(abi::ENOEXEC)),
+        NodeKind::ChunkedFile(_) => match env.vfs.read_node_range(node, 0, 4) {
+            Ok(crate::chunk::ReadRange::Ready(bytes)) if bytes == b"\x7fELF" => true,
+            Ok(crate::chunk::ReadRange::Ready(_)) => return Outcome::Ret(Err(abi::ENOEXEC)),
+            Ok(crate::chunk::ReadRange::Missing(hash)) => {
+                return wait_for_file_chunk(env, cpu, hash);
+            }
+            Ok(crate::chunk::ReadRange::Invalid(_)) => return Outcome::Ret(Err(abi::EIO)),
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        },
         NodeKind::Dir(_) => return Outcome::Ret(Err(abi::EISDIR)),
         _ => return Outcome::Ret(Err(abi::EACCES)),
+    };
+
+    if chunked {
+        if let Err(why) = crate::lazy_elf::prepare(env, &path, 0) {
+            if env.awaiting_page_in() {
+                // The old image is still intact. Re-present this syscall once
+                // the metadata chunk arrives; only a successful full
+                // preflight may pass the point of no return below.
+                cpu.pending_exception = Some(cpu.exception);
+                return Outcome::Exit(VmExit::Interrupted);
+            }
+            tracing::warn!("execve preflight refused {}: {why}", path.escape_ascii());
+            return Outcome::Ret(Err(if why.starts_with("refused:") {
+                abi::EACCES
+            } else {
+                abi::ENOEXEC
+            }));
+        }
     }
 
     // Point of no return: replace the process image.
@@ -3759,12 +4034,12 @@ fn sys_execve(
 
     // The instruction counter must survive the CPU reset inside the loader.
     let icount = cpu.icount;
-    let result = env.start_image(cpu, &path);
-    cpu.icount = icount;
-    // A new image occupies the same virtual addresses as the old one; give
-    // it a fresh address-space id so its blocks key distinctly in the cache.
+    let old_asid = env.proc.asid;
     env.proc.asid = crate::alloc_asid();
     x64_engine::vm::set_current_asid(env.proc.asid);
+    env.pager.drop_space(old_asid);
+    let result = env.start_image(cpu, &path);
+    cpu.icount = icount;
 
     match result {
         Ok(()) => {
@@ -3919,6 +4194,15 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
         };
         (kind, nonblock)
     };
+    if let Some(outcome) = ensure_guest_range(
+        env,
+        cpu,
+        buf,
+        count.min(0x40_0000) as usize,
+        crate::pager::AccessKind::Write,
+    ) {
+        return outcome;
+    }
 
     let would_block = |env: &mut LinuxEnv, cpu: &mut Cpu, watch: Watch| -> Outcome {
         if nonblock {
@@ -3936,7 +4220,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
     };
 
     match kind {
-        Kind::Plain => Outcome::Ret(sys_read(env, cpu, fd, buf, count)),
+        Kind::Plain => sys_read(env, cpu, fd, buf, count),
         Kind::Pipe(pipe) => {
             let chunk: Vec<u8> = {
                 let mut inner = pipe.borrow_mut();
@@ -4142,7 +4426,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
     };
 
     match kind {
-        Kind::Plain => Outcome::Ret(sys_write(env, cpu, fd, buf, count)),
+        Kind::Plain => sys_write(env, cpu, fd, buf, count),
         Kind::Pipe(pipe) => {
             let room = {
                 let inner = pipe.borrow();
@@ -5466,13 +5750,16 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         base_offset
     };
 
-    let chunk: Vec<u8> = {
-        let NodeKind::File(data) = &env.vfs.node(node).kind else {
-            return Outcome::Ret(Err(abi::EIO));
-        };
-        let start = offset_into(offset, data.len());
-        let end = (start + (count.min(0x4_0000) as usize)).min(data.len());
-        data[start..end].to_vec()
+    let chunk: Vec<u8> = match env
+        .vfs
+        .read_node_range(node, offset, count.min(0x4_0000) as usize)
+    {
+        Ok(crate::chunk::ReadRange::Ready(bytes)) => bytes,
+        Ok(crate::chunk::ReadRange::Missing(hash)) => {
+            return wait_for_file_chunk(env, cpu, hash);
+        }
+        Ok(crate::chunk::ReadRange::Invalid(_)) => return Outcome::Ret(Err(abi::EIO)),
+        Err(errno) => return Outcome::Ret(Err(errno)),
     };
     if chunk.is_empty() {
         return Outcome::Ret(Ok(0));

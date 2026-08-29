@@ -109,8 +109,17 @@ fn no_single_byte_corruption_panics() {
 #[test]
 fn a_header_claiming_more_nodes_than_bytes_is_refused_before_reserving() {
     let snapshot = sample_snapshot();
-    let mut lying = snapshot[..12].to_vec();
-    lying[8..12].copy_from_slice(&3_999_999_u32.to_le_bytes());
+    let version = u32::from_le_bytes(snapshot[4..8].try_into().expect("snapshot version"));
+    let mut count_at = 8;
+    if version >= 3 {
+        count_at += 1;
+        if snapshot[8] == 1 {
+            count_at += 32;
+        }
+    }
+    let header_end = count_at + 4;
+    let mut lying = snapshot[..header_end].to_vec();
+    lying[count_at..header_end].copy_from_slice(&3_999_999_u32.to_le_bytes());
     let error = match Vfs::deserialize(&lying) {
         Ok(_) => panic!("a header claiming 4M nodes was accepted"),
         Err(error) => error,
@@ -125,8 +134,8 @@ fn a_header_claiming_more_nodes_than_bytes_is_refused_before_reserving() {
     // truncation rather than an implausible header — so the check is a real
     // bound and not a blanket refusal.
     let mut plausible = snapshot.clone();
-    let backed = (snapshot.len() - 12) / (8 + 4 + 8 + 8 + 1);
-    plausible[8..12].copy_from_slice(&(backed as u32).to_le_bytes());
+    let backed = (snapshot.len() - header_end) / (8 + 4 + 8 + 8 + 1);
+    plausible[count_at..header_end].copy_from_slice(&(backed as u32).to_le_bytes());
     let error = match Vfs::deserialize(&plausible) {
         Ok(_) => panic!("a node count that cannot be filled"),
         Err(error) => error,

@@ -240,7 +240,7 @@ Named so that nothing here gets read as a feature.
 | An agent kernel — capabilities, energy accounting, mailboxes, receipts, attestation | Removed from the repository. It was a separate bare-metal kernel and was never wired into the browser runtime |
 | Multi-worker execution | Deferred. One worker today |
 | General multi-block JIT regions | Hot p-code blocks already translate to WebAssembly, including self-loop regions and inline softmmu fast paths. Cross-lane 128-bit arithmetic and general multi-block regions remain |
-| Block-level on-demand image loading | An image streams whole into the guest filesystem, which bounds how large a delivered userland can be |
+| General writable/shared demand paging | Immutable manifest-backed files now page in by content hash for the initial ELF, dynamic loader, `MAP_PRIVATE`, and reads. `MAP_SHARED`, eviction, and a general writable page cache remain out of scope |
 | A graphics path | None. Terminals and TUIs, not framebuffers |
 
 ---

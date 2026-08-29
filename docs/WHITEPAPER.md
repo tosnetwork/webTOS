@@ -166,7 +166,7 @@ does not pass a gate.
 
 - **The engine runs in three browsers, and they agree.** A pure-Rust software
   CPU — an interpreter over a production-grade instruction decoder — compiles
-  to WebAssembly and executes unmodified Linux binaries. A 35-check matrix
+  to WebAssembly and executes unmodified Linux binaries. A 39-check matrix
   runs in Chromium, Firefox, and WebKit on every change and compares
   instruction counts across them: identical input retires an identical
   instruction stream in all three, and one recorded architectural trace is
@@ -385,7 +385,7 @@ instruction quirks, syscall semantics, loader behaviour, PTY edge cases —
 fought binary by binary, and largely serial: failures are discovered by
 running real workloads, not enumerated up front. Wine and Proton demonstrate
 both the size of that moat and its durability. The corpus compounds: 98 native
-cases, a pinned fixture-and-trace set, a 35-check matrix per browser engine,
+cases, a pinned fixture-and-trace set, a 39-check matrix per browser engine,
 and workload gates that include a compiler toolchain and an hour-long soak. A
 well-funded fast-follower still has to walk the same tail.
 
@@ -452,7 +452,7 @@ above the free runtime, never by closing the runtime.
 |---|---|---|
 | **Performance ceiling** | An interpreter in Wasm runs orders of magnitude below native. Some workloads will never fit | Agent workloads are I/O- and network-bound at interactive timescales, and gates are latency-budget based rather than throughput based. Compute-bound work genuinely needs the translation tier, which is roadmap milestone 8, attempted only after correctness gates and required to pass the same traces. If interactive budgets cannot be met for the pinned workloads, that gate fails visibly — by design |
 | **Long-tail incompatibility** | A pinned release may fail deep in startup on one missing instruction or syscall | The entire methodology exists for this: trace pinned workloads, fail explicitly, grow fixtures. Never fake success — a wrong result is worse than a loud failure |
-| **Browser platform drift** | Memory limits, storage quotas, worker semantics, and store policies differ and change | Sparse paging and quotas from day one; a per-browser compatibility matrix is part of the release definition; no dependency on any single vendor's non-standard API |
+| **Browser platform drift** | Memory limits, storage quotas, worker semantics, and store policies differ and change | Content-addressed demand paging and quotas are regression-gated in Chromium, Firefox, and WebKit; asynchronous OPFS/network fallback avoids depending on one vendor's synchronous API |
 | **Workload release drift** | New agent versions change runtime requirements | Version pinning with published per-version compatibility reports; drift becomes a documented delta, not a silent break |
 | **A platform vendor ships it natively** | A browser or model vendor could ship a first-party agent sandbox | Likely partial overlap — their own agent, their own browser. A neutral substrate that runs all of them, locally, under one authority model, is a different product. Being MIT makes adoption cheaper than replication |
 | **Security of the broker boundary** | The credential and network broker is the highest-value target | Deny-by-default network, scoped secret injection, snapshot exclusion of credentials, adversarial sweeps of every parser and boundary, fail-closed on corrupt input |
@@ -478,7 +478,7 @@ Full details with exit criteria live in [ROADMAP](../ROADMAP.md).
 
 Verification is the point: the repository builds, the native suite runs 98
 cases with skipping forbidden on a host that can run everything, and a
-35-check matrix runs per browser engine. Every completed claim above
+39-check matrix runs per browser engine. Every completed claim above
 corresponds to tests and fixtures in-tree, and the performance claims to
 harnesses that print their numbers rather than assert them. Claims and code
 travel together.

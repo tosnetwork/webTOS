@@ -359,7 +359,7 @@ fn openfox_completes_a_scripted_network_agent_task() {
         snap_text.contains("${OPENAI_API_KEY}"),
         "snapshot should keep the secret placeholder"
     );
-    machine.expand_secrets();
+    machine.expand_secrets().expect("expand secret");
 
     let mut broker = NativeBroker::new();
     broker.redirect(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 7), 80), llm);
@@ -638,7 +638,7 @@ fn a_scoped_secret_stays_out_of_another_agents_configuration() {
     }
     machine.set_scoped_secret("AGENT_A_KEY", MINE, &[b"/root/.openfox/config.json"]);
     machine.set_scoped_secret("AGENT_B_KEY", YOURS, &[b"/root/.other/config.json"]);
-    machine.expand_secrets();
+    machine.expand_secrets().expect("expand scoped secrets");
 
     let read = |machine: &mut Machine, path: &[u8]| -> String {
         String::from_utf8_lossy(&machine.env().vfs.read_file(path).expect("read config"))

@@ -345,7 +345,7 @@ impl From<DecodeError> for ExceptionCode {
             DecodeError::InvalidInstruction | DecodeError::LifterError(_) => {
                 ExceptionCode::InvalidInstruction
             }
-            DecodeError::NonExecutableMemory => ExceptionCode::ExecViolation,
+            DecodeError::NonExecutableMemory(_) => ExceptionCode::ExecViolation,
             DecodeError::BadAlignment => ExceptionCode::ExecUnaligned,
             DecodeError::UnimplementedOp => ExceptionCode::UnimplementedOp,
         }

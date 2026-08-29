@@ -104,6 +104,7 @@ pub enum SyscallResult {
 pub struct Trace {
     version: u32,
     image: Option<(String, usize, u64)>,
+    manifest_image: Option<(String, u64, [u8; 32], u64)>,
     argv: Vec<String>,
     envp: Vec<String>,
     registers: Vec<(String, pcode::VarNode)>,
@@ -132,6 +133,7 @@ impl Trace {
         Self {
             version: FORMAT_VERSION,
             image: None,
+            manifest_image: None,
             argv: Vec::new(),
             envp: Vec::new(),
             registers,
@@ -145,10 +147,25 @@ impl Trace {
 
     /// Records what was run, so a trace identifies its own subject.
     pub fn set_image(&mut self, path: &[u8], bytes: &[u8]) {
+        self.manifest_image = None;
         self.image = Some((
             String::from_utf8_lossy(path).into_owned(),
             bytes.len(),
             fnv1a(bytes),
+        ));
+    }
+
+    /// Identifies a lazy image without reading its entire payload. Version 2
+    /// readers use the cryptographic manifest root; `legacy_fnv` lets tooling
+    /// correlate the same file with a version-1 eager trace.
+    pub fn set_manifest_image(&mut self, path: &[u8], len: u64, root: [u8; 32], legacy_fnv: u64) {
+        self.version = 2;
+        self.image = None;
+        self.manifest_image = Some((
+            String::from_utf8_lossy(path).into_owned(),
+            len,
+            root,
+            legacy_fnv,
         ));
     }
 
@@ -239,6 +256,13 @@ impl Trace {
         let _ = writeln!(out, "# webtos-trace {}", self.version);
         if let Some((path, len, hash)) = &self.image {
             let _ = writeln!(out, "# image path={path} len={len} hash={hash:016x}");
+        }
+        if let Some((path, len, root, legacy_fnv)) = &self.manifest_image {
+            let _ = writeln!(
+                out,
+                "# image path={path} len={len} root={} legacy-fnv={legacy_fnv:016x}",
+                crate::digest::hex(root)
+            );
         }
         if !self.argv.is_empty() {
             let _ = writeln!(out, "# argv {}", self.argv.join(" "));

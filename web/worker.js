@@ -49,6 +49,8 @@
 const SNAPSHOT_FILE = "webtos-fs.bin";
 /// Directory inside OPFS holding downloaded guest images.
 const IMAGE_CACHE = "webtos-images";
+/// Content-addressed chunks are independent of guest paths and image runs.
+const CHUNK_CACHE = "webtos-chunks";
 /// Bytes moved per step while streaming an image. Small enough that the
 /// module's staging buffer stays modest, large enough that a 100 MB image
 /// does not cost a hundred thousand calls.
@@ -65,6 +67,7 @@ const STATUS_AWAITING_NETWORK = 8;
 // on it like any non-running status; it is named here so a reader of a
 // stopped session can tell "out of allowance" from "crashed".
 const STATUS_OUT_OF_CPU = 9;
+const STATUS_AWAITING_PAGEIN = 10;
 /// wtw_net_budget_ms when the guest armed no timer.
 const NET_BUDGET_UNBOUNDED = 0xffff_ffff;
 /// Longest the worker waits on the network in one go, so a silent peer
@@ -164,6 +167,11 @@ async function opfsDelete(name) {
 async function imageCacheDir(create) {
   const root = await navigator.storage.getDirectory();
   return root.getDirectoryHandle(IMAGE_CACHE, { create });
+}
+
+async function chunkCacheDir(create) {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle(CHUNK_CACHE, { create });
 }
 
 /// The cache name for an image: its guest path, flattened. Two images at the
@@ -275,6 +283,104 @@ function concat(parts, total) {
   return out;
 }
 
+const hexBytes = (hex) => {
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) throw new Error(`invalid chunk hash ${hex}`);
+  return Uint8Array.from(hex.match(/../g), (pair) => Number.parseInt(pair, 16));
+};
+
+async function readCachedChunk(hash) {
+  if (!storageReady) return null;
+  try {
+    const handle = await (await chunkCacheDir(false)).getFileHandle(hash);
+    // Dedicated workers may expose synchronous OPFS reads. Where they do not,
+    // the File fallback is the same verified async completion path.
+    if (typeof handle.createSyncAccessHandle === "function") {
+      const access = await handle.createSyncAccessHandle();
+      try {
+        const bytes = new Uint8Array(access.getSize());
+        access.read(bytes, { at: 0 });
+        return bytes;
+      } finally {
+        access.close();
+      }
+    }
+    return new Uint8Array(await (await handle.getFile()).arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+async function cacheChunk(hash, bytes) {
+  if (!storageReady) return;
+  try {
+    const handle = await (await chunkCacheDir(true)).getFileHandle(hash, { create: true });
+    const sink = await handle.createWritable();
+    await sink.write(bytes);
+    await sink.close();
+  } catch {
+    // Caching is optional; the module still verifies and consumes this chunk.
+  }
+}
+
+async function fetchChunk(hash) {
+  const cached = await readCachedChunk(hash);
+  if (cached) return cached;
+  if (!chunkBaseUrl) throw new Error(`no chunk source configured for ${hash}`);
+  const response = await fetch(`${chunkBaseUrl}/${hash}`);
+  if (!response.ok) throw new Error(`chunk ${hash}: HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/// Completes the one deterministic chunk request currently exported by the
+/// module. ELF metadata loading, file reads, and mapped-page faults all use
+/// this ticket/hash authority. Bytes enter OPFS only after the module accepts
+/// their digest and storage charge.
+async function satisfyChunkRequest(context) {
+  const len = exports.wtw_page_request_take();
+  if (len !== 65) {
+    throw new Error(`${context}: invalid page request length ${len}: ${lastError()}`);
+  }
+  const request = mem().slice(
+    exports.wtw_page_request_ptr(),
+    exports.wtw_page_request_ptr() + len,
+  );
+  const view = new DataView(request.buffer, request.byteOffset, request.byteLength);
+  const ticketLo = view.getUint32(0, true);
+  const ticketHi = view.getUint32(4, true);
+  const hash = [...request.slice(32, 64)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  const bytes = await fetchChunk(hash);
+  if (exports.wtw_page_deliver(ticketLo, ticketHi, ...stage(bytes)) !== 0) {
+    throw new Error(`${context}: ${hash}: ${lastError()}`);
+  }
+  await cacheChunk(hash, bytes);
+}
+
+/// Installs the exact canonical manifest bytes only after the page has
+/// authenticated them. `preload` names the bounded ELF-metadata chunks needed
+/// by the synchronous load call and any scoped-secret target that must be
+/// promoted before execution; those hints cannot redefine manifest paths.
+async function installLazyImage({ manifest, chunkBase, preload = [] }) {
+  chunkBaseUrl = chunkBase.replace(/\/$/, "");
+  const bytes = typeof manifest === "string" ? new TextEncoder().encode(manifest) : manifest;
+  if (exports.wtw_install_chunk_manifest(...stage(bytes)) !== 0) {
+    throw new Error(`chunk manifest: ${lastError()}`);
+  }
+  for (const hash of preload) {
+    const bytes = await fetchChunk(hash);
+    const [hashPtr] = put(hexBytes(hash));
+    if (exports.wtw_put_chunk(hashPtr, ...stage(bytes)) !== 0) {
+      throw new Error(`preload chunk ${hash}: ${lastError()}`);
+    }
+    // The module has now verified SHA-256 and quota. Persist only bytes that
+    // crossed that authority boundary successfully; a corrupt response must
+    // not poison the warm cache under the hash it failed to match.
+    await cacheChunk(hash, bytes);
+  }
+  postMessage({ type: "lazyImage", preloaded: preload.length });
+}
+
 /// The cached copy of an image, or null when there is none to trust. A
 /// rebuilt image keeps its name, so the cache is only used when the server
 /// still reports the size that was stored.
@@ -317,15 +423,18 @@ async function loadImage({ path, url, mode = 0o755 }) {
 /// Deletes every cached image.
 async function forgetImages() {
   if (!storageReady) return;
-  try {
-    const root = await navigator.storage.getDirectory();
-    await root.removeEntry(IMAGE_CACHE, { recursive: true });
-  } catch {
-    // Nothing cached.
+  const root = await navigator.storage.getDirectory();
+  for (const name of [IMAGE_CACHE, CHUNK_CACHE]) {
+    try {
+      await root.removeEntry(name, { recursive: true });
+    } catch {
+      // That cache has not been created.
+    }
   }
 }
 
 let exports = null;
+let chunkBaseUrl = "";
 
 const mem = () => new Uint8Array(exports.memory.buffer);
 const text = (ptr, len) => new TextDecoder().decode(mem().slice(ptr, ptr + len));
@@ -393,7 +502,7 @@ const jitImports = {
   },
 };
 
-async function boot(files, links = []) {
+async function boot(files, links = [], jitAfter = null) {
   postMessage({ type: "status", text: "loading wasm module…" });
   const url = new URL("./webtos_web.wasm", self.location.href);
   jitBlockInstances.length = 0;
@@ -403,6 +512,9 @@ async function boot(files, links = []) {
   postMessage({ type: "status", text: "compiling SLEIGH specification…" });
   const t0 = performance.now();
   if (exports.wtw_init() !== 0) throw new Error(`machine init failed: ${lastError()}`);
+  if (jitAfter !== null && exports.wtw_jit_enable(Math.max(1, Math.round(jitAfter))) !== 0) {
+    throw new Error(`JIT enable failed: ${lastError()}`);
+  }
 
   // Restore the filesystem persisted before the last reload, if any.
   storageReady = await opfsProbe();
@@ -503,10 +615,16 @@ async function persist() {
   postMessage({ type: "persisted", bytes: bytes.length });
 }
 
-function load(path, argv, envp) {
+async function load(path, argv, envp) {
   for (const arg of argv) exports.wtw_arg(...put(arg));
   for (const env of envp) exports.wtw_env(...put(env));
-  if (exports.wtw_load(...put(path)) !== 0) {
+  for (;;) {
+    const status = exports.wtw_load(...put(path));
+    if (status === 0) return;
+    if (status === STATUS_AWAITING_PAGEIN) {
+      await satisfyChunkRequest("ELF metadata page-in");
+      continue;
+    }
     throw new Error(`load failed: ${lastError()}`);
   }
 }
@@ -523,13 +641,17 @@ function finish(status) {
     error: status === STATUS_HALT ? "" : lastError(),
     exitCode: exports.wtw_exit_code(),
     icount: exports.wtw_icount_hi() * 2 ** 32 + exports.wtw_icount_lo(),
+    pageIns: exports.wtw_page_in_count(),
+    filesKiB: exports.wtw_footprint_kib(2),
+    jitBlocks: Number(exports.wtw_jit_block_dispatch_count()),
+    jitRegions: Number(exports.wtw_jit_region_dispatch_count()),
   });
 }
 
 /// A non-interactive process, run through the same pump so a workload that
 /// uses the network still gets its host turns.
-function exec(path, argv, envp) {
-  load(path, argv, envp);
+async function exec(path, argv, envp) {
+  await load(path, argv, envp);
   waiting = false;
   return pump();
 }
@@ -797,6 +919,10 @@ async function pump() {
         await pumpNetwork();
         continue;
       }
+      if (status === STATUS_AWAITING_PAGEIN) {
+        await satisfyChunkRequest("page-in");
+        continue;
+      }
       if (status === STATUS_OUT_OF_CPU) {
         postMessage({
           type: "status",
@@ -828,30 +954,51 @@ function enableNetwork(url) {
 /// is the same format the native recorder writes, so a browser recording can
 /// be diffed against the reference in the repository.
 async function recordTrace({ path, url, argv, envp, sampleEvery }) {
-  const image = new Uint8Array(await (await fetch(url)).arrayBuffer());
-  if (exports.wtw_add_file(...put(path), ...put(image)) !== 0) {
-    throw new Error(`add_file ${path}: ${lastError()}`);
+  let image = null;
+  if (url) {
+    image = new Uint8Array(await (await fetch(url)).arrayBuffer());
+    if (exports.wtw_add_file(...put(path), ...put(image)) !== 0) {
+      throw new Error(`add_file ${path}: ${lastError()}`);
+    }
   }
-  load(path, argv, envp);
+  await load(path, argv, envp);
   if (exports.wtw_trace_start(sampleEvery) !== 0) {
     throw new Error(`trace start: ${lastError()}`);
   }
-  if (exports.wtw_trace_image(...put(path), ...put(image)) !== 0) {
+  // Manifest-backed traces identify themselves from the manifest root and
+  // precomputed legacy FNV. Only eager traces need their bytes named here.
+  if (image && exports.wtw_trace_image(...put(path), ...put(image)) !== 0) {
     throw new Error(`trace image: ${lastError()}`);
   }
   let status;
-  do {
+  for (;;) {
     status = exports.wtw_run_traced(FUEL);
     drain();
-  } while (status === STATUS_RUNNING);
+    if (status === STATUS_RUNNING) continue;
+    if (status === STATUS_AWAITING_PAGEIN) {
+      await satisfyChunkRequest("traced page-in");
+      continue;
+    }
+    break;
+  }
   const len = exports.wtw_trace_take();
   if (len < 0) throw new Error(`trace take: ${lastError()}`);
   const trace = text(exports.wtw_trace_ptr(), len);
-  postMessage({ type: "trace", status, trace });
+  postMessage({
+    type: "trace",
+    status,
+    trace,
+    exitCode: exports.wtw_exit_code(),
+    icount: exports.wtw_icount_hi() * 2 ** 32 + exports.wtw_icount_lo(),
+    pageIns: exports.wtw_page_in_count(),
+    filesKiB: exports.wtw_footprint_kib(2),
+    jitBlocks: Number(exports.wtw_jit_block_dispatch_count()),
+    jitRegions: Number(exports.wtw_jit_region_dispatch_count()),
+  });
 }
 
-function spawn(path, argv, envp, rows, cols) {
-  load(path, argv, envp);
+async function spawn(path, argv, envp, rows, cols) {
+  await load(path, argv, envp);
   if (exports.wtw_pty_install(rows, cols) !== 0) {
     throw new Error(`terminal setup failed: ${lastError()}`);
   }
@@ -886,13 +1033,14 @@ function resize(rows, cols) {
 self.onmessage = async (event) => {
   const msg = event.data;
   try {
-    if (msg.type === "boot") await boot(msg.files, msg.links);
+    if (msg.type === "boot") await boot(msg.files, msg.links, msg.jitAfter ?? null);
     if (msg.type === "image") await loadImage(msg);
+    if (msg.type === "lazyImage") await installLazyImage(msg);
     if (msg.type === "trace") await recordTrace(msg);
     if (msg.type === "network") enableNetwork(msg.gateway);
     if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {
-      spawn(msg.path, msg.argv, msg.envp, msg.rows, msg.cols);
+      await spawn(msg.path, msg.argv, msg.envp, msg.rows, msg.cols);
     }
     if (msg.type === "input") input(msg.data);
     if (msg.type === "resize") resize(msg.rows, msg.cols);

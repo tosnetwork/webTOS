@@ -31,6 +31,9 @@ rather than left to be mistaken for present behaviour; `git log` has them.
   its gates and what each one covers
 - [Node.js and agent runtime notes](workloads/node.md) - Node, Codex, and
   Claude Code compatibility evidence and the remaining milestone-7 boundaries
+- [Lazy image demand paging](../feasibility/lazy_chunk_fs.md) - the
+  first-principles scope, invariants, implementation shape, and exit gates for
+  canonical chunk manifests and immutable file-backed paging
 
 ## Status conventions
 

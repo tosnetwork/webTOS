@@ -64,6 +64,7 @@ const MIME = {
   ".wasm": "application/wasm",
   ".json": "application/json",
 };
+const generatedAssets = new Map();
 
 // A blank same-origin document: phase B needs a page whose only worker is the
 // one the test creates, so the demo page's own worker cannot race it on OPFS.
@@ -82,6 +83,16 @@ async function startServer() {
     if (path === "/__net_probe") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(NET_PROBE);
+      return;
+    }
+    if (generatedAssets.has(path)) {
+      const body = generatedAssets.get(path);
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": body.length,
+        "cache-control": "no-store",
+      });
+      res.end(body);
       return;
     }
     // normalize() collapses ".." before the join, so the served tree is the
@@ -119,6 +130,16 @@ function firstTraceDifference(expected, actual) {
   return `agree for ${Math.min(want.length, got.length)} lines, then lengths differ (${want.length} vs ${got.length})`;
 }
 
+/// Trace headers intentionally differ for eager (length + FNV) and lazy
+/// (manifest root + legacy FNV) images. Architectural event lines must still
+/// be byte-for-byte identical.
+function architecturalTrace(trace) {
+  return trace
+    .split("\n")
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .join("\n");
+}
+
 /// The md5 of a staged image, computed without holding it in memory, so the
 /// guest's own md5sum can be compared against it.
 function md5OfFile(path) {
@@ -129,6 +150,28 @@ function md5OfFile(path) {
       .on("end", () => resolve(hash.digest("hex")))
       .on("error", reject);
   });
+}
+
+function publishLazyImage(path, bytes) {
+  const chunkSize = 64 * 1024;
+  const hashes = [];
+  let legacy = 0xcbf29ce484222325n;
+  for (let at = 0; at < bytes.length; at += chunkSize) {
+    const chunk = bytes.subarray(at, Math.min(at + chunkSize, bytes.length));
+    for (const byte of chunk) {
+      legacy ^= BigInt(byte);
+      legacy = BigInt.asUintN(64, legacy * 0x100000001b3n);
+    }
+    const hash = createHash("sha256").update(chunk).digest("hex");
+    hashes.push(hash);
+    generatedAssets.set(`/__lazy/chunks/${hash}`, chunk);
+  }
+  const pathHex = Buffer.from(path).toString("hex");
+  const manifest = Buffer.from(
+    `webtos-chunk-manifest 1\nd 755 0 2f62696e\nf 755 0 ${pathHex} ${bytes.length} ${chunkSize} ${legacy.toString(16).padStart(16, "0")} ${hashes.join(",")}\n`,
+  );
+  generatedAssets.set("/__lazy/manifest.txt", manifest);
+  return { preload: hashes.slice(0, 1), logicalBytes: bytes.length };
 }
 
 /// Starts the relay with a single rule: the harness's own static server. It
@@ -167,11 +210,13 @@ async function startGateway(allow) {
 const workerDriver = async (input) => {
   const worker = new Worker(input.workerUrl);
   const pending = { output: "", status: null };
-  let resolveReady, resolveDone;
+  let resolveReady, resolveDone, resolveLazy, resolvePersisted;
   const ready = new Promise((r) => { resolveReady = r; });
   worker.onmessage = (event) => {
     const msg = event.data;
     if (msg.type === "ready") resolveReady(msg);
+    if (msg.type === "lazyImage") resolveLazy?.(msg);
+    if (msg.type === "persisted") resolvePersisted?.(msg);
     if (msg.type === "output") pending.output += msg.text;
     if (msg.type === "done") { pending.status = msg; resolveDone?.(msg); }
     if (msg.type === "trace") resolveDone?.(msg);
@@ -180,6 +225,7 @@ const workerDriver = async (input) => {
       pending.status = failure;
       resolveReady(failure);
       resolveDone?.(failure);
+      resolvePersisted?.(failure);
     }
   };
 
@@ -190,19 +236,37 @@ const workerDriver = async (input) => {
     files.push({ path: spec.path, bytes: await response.arrayBuffer() });
   }
   const t0 = performance.now();
-  worker.postMessage({ type: "boot", files }, files.map((f) => f.bytes));
+  worker.postMessage(
+    { type: "boot", files, jitAfter: input.jitAfter ?? null },
+    files.map((f) => f.bytes),
+  );
   const readyMsg = await ready;
   if (readyMsg.status === -1) throw new Error(`boot failed: ${readyMsg.error}`);
   const bootMs = performance.now() - t0;
 
+  if (input.lazy) {
+    const response = await fetch(input.lazy.manifestUrl);
+    if (!response.ok) throw new Error(`lazy manifest: HTTP ${response.status}`);
+    const installed = new Promise((r) => { resolveLazy = r; });
+    worker.postMessage({
+      type: "lazyImage",
+      manifest: await response.arrayBuffer(),
+      chunkBase: input.lazy.chunkBase,
+      preload: input.lazy.preload,
+    });
+    await installed;
+  }
+
   // An architectural trace of one fixture, recorded the same way the native
   // recorder does it, so the two can be compared line for line.
   let trace = null;
+  let traceStats = null;
   if (input.trace) {
     const done = new Promise((r) => { resolveDone = r; });
     worker.postMessage({ type: "trace", ...input.trace });
     const result = await done;
     trace = result.trace ?? null;
+    traceStats = result;
   }
 
   const runs = [];
@@ -218,11 +282,21 @@ const workerDriver = async (input) => {
       status: result.status,
       exitCode: result.exitCode,
       icount: result.icount,
+      pageIns: result.pageIns ?? 0,
+      filesKiB: result.filesKiB ?? 0,
+      jitBlocks: result.jitBlocks ?? 0,
+      jitRegions: result.jitRegions ?? 0,
       error: result.error ?? "",
     });
   }
+  let persistedBytes = 0;
+  if (input.persist) {
+    const persisted = new Promise((r) => { resolvePersisted = r; });
+    worker.postMessage({ type: "persist" });
+    persistedBytes = (await persisted).bytes ?? 0;
+  }
   worker.terminate();
-  return { bootMs, restored: readyMsg.restored === true, runs, trace };
+  return { bootMs, restored: readyMsg.restored === true, runs, trace, traceStats, persistedBytes };
 };
 
 // --------------------------------------------------------------- terminal
@@ -766,6 +840,139 @@ async function runEngine(name, origin, gateway, images) {
       record(run.label, ok, ok ? `${run.icount.toLocaleString()} instructions` : `status=${run.status} exit=${run.exitCode} ${run.error} ${JSON.stringify(run.output.slice(0, 80))}`);
     }
 
+    const eagerComparison = await page.evaluate(workerDriver, {
+      workerUrl: `${origin}/web/worker.js`,
+      files: [{ path: "/bin/busybox", url: `${origin}/web/busybox-musl` }],
+      steps: [
+        { label: "eager busybox echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-browser"] },
+      ],
+    });
+    const eagerBusybox = eagerComparison.runs[0];
+    const lazy = await page.evaluate(workerDriver, {
+      workerUrl: `${origin}/web/worker.js`,
+      files: [],
+      lazy: {
+        manifestUrl: `${origin}/__lazy/manifest.txt`,
+        chunkBase: `${origin}/__lazy/chunks`,
+        preload: [],
+      },
+      steps: [
+        { label: "lazy busybox echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-browser"] },
+      ],
+    });
+    const lazyBusybox = lazy.runs[0];
+    const lazyOk =
+      lazyBusybox.status === 1 &&
+      lazyBusybox.exitCode === 0 &&
+      lazyBusybox.output.includes("lazy-browser") &&
+      lazyBusybox.icount === eagerBusybox.icount &&
+      lazyBusybox.pageIns > 0 &&
+      lazyBusybox.filesKiB * 1024 < lazyImage.logicalBytes;
+    fingerprint["lazy busybox echo"] = lazyBusybox.icount;
+    record(
+      "manifest-backed demand paging matches eager execution",
+      lazyOk,
+      lazyOk
+        ? `${lazyBusybox.icount.toLocaleString()} instructions, ${lazyBusybox.pageIns} pages, ${lazyBusybox.filesKiB} KiB resident of ${Math.ceil(lazyImage.logicalBytes / 1024)} KiB`
+        : `status=${lazyBusybox.status} exit=${lazyBusybox.exitCode} icount=${lazyBusybox.icount}/${eagerBusybox?.icount} pages=${lazyBusybox.pageIns} files=${lazyBusybox.filesKiB} KiB ${lazyBusybox.error}`,
+    );
+
+    // The DoD names the browser JIT paths and the architectural trace, not
+    // merely interpreter output. Run the same lazy/eager command with tiering
+    // on from its first entry, and require both single-block and self-loop
+    // region dispatches to have actually occurred.
+    const jitTrace = {
+      path: "/bin/busybox",
+      argv: ["busybox", "echo", "lazy-browser-jit"],
+      envp: ["PATH=/bin:/usr/bin", "HOME=/home"],
+      sampleEvery: 512,
+    };
+    const eagerJit = await page.evaluate(workerDriver, {
+      workerUrl: `${origin}/web/worker.js`,
+      files: [{ path: "/bin/busybox", url: `${origin}/web/busybox-musl` }],
+      jitAfter: 1,
+      trace: { ...jitTrace, url: `${origin}/web/busybox-musl` },
+      steps: [],
+    });
+    const lazyJit = await page.evaluate(workerDriver, {
+      workerUrl: `${origin}/web/worker.js`,
+      files: [],
+      jitAfter: 1,
+      lazy: {
+        manifestUrl: `${origin}/__lazy/manifest.txt`,
+        chunkBase: `${origin}/__lazy/chunks`,
+        preload: [],
+      },
+      trace: jitTrace,
+      steps: [],
+    });
+    const eagerJitStats = eagerJit.traceStats ?? {};
+    const lazyJitStats = lazyJit.traceStats ?? {};
+    const jitTraceMatches =
+      eagerJitStats.status === 1 &&
+      lazyJitStats.status === 1 &&
+      eagerJitStats.exitCode === 0 &&
+      lazyJitStats.exitCode === 0 &&
+      eagerJitStats.icount === lazyJitStats.icount &&
+      architecturalTrace(eagerJit.trace ?? "") === architecturalTrace(lazyJit.trace ?? "") &&
+      (eagerJit.trace ?? "").startsWith("# webtos-trace 1\n") &&
+      (lazyJit.trace ?? "").startsWith("# webtos-trace 2\n") &&
+      (lazyJit.trace ?? "").includes(" root=") &&
+      lazyJitStats.pageIns > 0 &&
+      lazyJitStats.jitBlocks > 0 &&
+      lazyJitStats.jitRegions > 0;
+    fingerprint["lazy busybox JIT"] = lazyJitStats.icount;
+    record(
+      "lazy browser JIT matches eager architectural trace",
+      jitTraceMatches,
+      jitTraceMatches
+        ? `${lazyJitStats.icount.toLocaleString()} instructions, ${lazyJitStats.jitBlocks} block and ${lazyJitStats.jitRegions} region dispatches`
+        : `status=${lazyJitStats.status}/${eagerJitStats.status} exit=${lazyJitStats.exitCode}/${eagerJitStats.exitCode} icount=${lazyJitStats.icount}/${eagerJitStats.icount} blocks=${lazyJitStats.jitBlocks} regions=${lazyJitStats.jitRegions} pages=${lazyJitStats.pageIns}`,
+    );
+
+    // Use a second same-server origin so this check owns its OPFS snapshot
+    // and cannot disturb the eager reload/terminal phases. The first worker
+    // persists descriptor-only state; a brand-new worker must import it,
+    // rebind the exact manifest root, refetch cold chunks, and reproduce the
+    // same execution without a preload hint.
+    const isolatedOrigin = origin.replace("127.0.0.1", "localhost");
+    await page.goto(`${isolatedOrigin}/__blank.html`);
+    const lazySnapshotInput = {
+      workerUrl: `${isolatedOrigin}/web/worker.js`,
+      files: [],
+      lazy: {
+        manifestUrl: `${isolatedOrigin}/__lazy/manifest.txt`,
+        chunkBase: `${isolatedOrigin}/__lazy/chunks`,
+        preload: [],
+      },
+      steps: [
+        { label: "lazy snapshot echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-snapshot"] },
+      ],
+    };
+    const beforeRestore = await page.evaluate(workerDriver, { ...lazySnapshotInput, persist: true });
+    const afterRestore = await page.evaluate(workerDriver, lazySnapshotInput);
+    const beforeRun = beforeRestore.runs[0];
+    const afterRun = afterRestore.runs[0];
+    const lazySnapshotOk =
+      beforeRun.status === 1 &&
+      afterRun.status === 1 &&
+      beforeRun.exitCode === 0 &&
+      afterRun.exitCode === 0 &&
+      beforeRun.output === "lazy-snapshot\n" &&
+      afterRun.output === beforeRun.output &&
+      afterRun.icount === beforeRun.icount &&
+      afterRun.pageIns > 0 &&
+      afterRestore.restored &&
+      beforeRestore.persistedBytes > 0 &&
+      beforeRestore.persistedBytes < lazyImage.logicalBytes;
+    record(
+      "lazy snapshot restores descriptors and rebinds manifest authority",
+      lazySnapshotOk,
+      lazySnapshotOk
+        ? `${beforeRestore.persistedBytes.toLocaleString()}-byte snapshot restored; ${afterRun.pageIns} pages refetched`
+        : `restored=${afterRestore.restored} status=${beforeRun.status}/${afterRun.status} exit=${beforeRun.exitCode}/${afterRun.exitCode} icount=${beforeRun.icount}/${afterRun.icount} pages=${afterRun.pageIns} snapshot=${beforeRestore.persistedBytes}`,
+    );
+
     // The strongest determinism statement this harness can make. Not "the
     // engines retired the same number of instructions", but "this browser
     // reproduced, register for register, a trace recorded natively and kept
@@ -828,6 +1035,8 @@ async function runEngine(name, origin, gateway, images) {
 
 // -------------------------------------------------------------------- main
 
+const busyboxPath = fileURLToPath(new URL("./busybox-musl", import.meta.url));
+const lazyImage = publishLazyImage("/bin/busybox", await readFile(busyboxPath));
 const { server, origin } = await startServer();
 const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 
@@ -836,7 +1045,7 @@ const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 const agentPath = fileURLToPath(new URL("./openfox", import.meta.url));
 const agentInfo = await stat(agentPath).catch(() => null);
 const images = {
-  busyboxMd5: await md5OfFile(fileURLToPath(new URL("./busybox-musl", import.meta.url))),
+  busyboxMd5: await md5OfFile(busyboxPath),
   agent: agentInfo !== null,
   agentSize: agentInfo?.size ?? 0,
 };

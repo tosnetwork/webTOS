@@ -163,9 +163,12 @@ Available in the repository today:
 - Deterministic time, randomness, scheduling, and event ordering
 - Checkpoints, filesystem snapshots, structured trace events, and configurable
   per-agent budgets on memory, CPU, storage, network, and the event log
-- A manifest-enforcement path: a host can verify a signature with platform
-  cryptography, then the module enforces the manifest's image hashes and paths;
-  the stock demo worker does not yet install a signed manifest
+- Manifest enforcement for both resident images and canonical chunked images:
+  a host verifies the exact manifest bytes with platform cryptography, then
+  the module enforces paths, metadata, chunk hashes, and the manifest root
+- Immutable file-backed demand paging for the initial ELF, dynamic loader,
+  `MAP_PRIVATE`, file reads, and syscall user-buffer copies, with verified OPFS
+  chunks and an async browser fallback
 - A dependency-license manifest and a security policy (`SECURITY.md`)
 - The browser host: a Web Worker, terminal, OPFS persistence, and a network
   relay, gated in Chromium, Firefox, and WebKit
@@ -187,13 +190,15 @@ bash web/build.sh                   # build the wasm module and stage the images
 python3 -m http.server -d web 8080
 ```
 
-Guest images are streamed rather than loaded: the worker fetches an image
-itself, writing it into the guest filesystem and an OPFS cache as the bytes
-arrive, so nothing ever holds a whole one. A 52 MB agent binary reaches a
-shell prompt in about three seconds on the first load and one on the next,
-where buffering it in the page, transferring it, and copying it into the
-module would need three copies at once — which wasm32 does not have room for.
-`?image=NAME` on the terminal page streams `./NAME` into `/bin/NAME`:
+The browser host supports two delivery modes. The demo's `?image=NAME` path
+still streams a whole image into the guest and OPFS without creating an extra
+page-side copy. The manifest path installs only metadata and content hashes;
+the initial ELF, dynamic loader, `MAP_PRIVATE`, and file reads then fetch
+verified 64 KiB chunks on first access from an OPFS hash cache or the network.
+Snapshots retain the manifest root and immutable descriptors, not cached base
+chunks. A 52 MB streamed agent binary reaches a shell prompt in about three
+seconds on the first load and one on the next; the lazy path is the one meant
+for the 200+ MB agent images. To use the legacy demo stream:
 
 ```bash
 tools/build_openfox_fixture.sh      # needs the OpenFox source (OPENFOX_SRC)

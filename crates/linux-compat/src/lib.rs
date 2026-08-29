@@ -14,12 +14,16 @@
 //! portable rebuild of the native kernel's `src/linux_compat` substrate.
 
 pub mod abi;
+pub mod chunk;
+pub mod chunk_manifest;
 pub mod digest;
 pub mod fd;
+mod lazy_elf;
 pub mod liftcache;
 pub mod manifest;
 pub mod net;
 pub mod netrecord;
+pub mod pager;
 pub mod proc;
 pub mod syscall;
 pub mod testing;
@@ -39,6 +43,7 @@ use x64_engine::{
     classify_exit, CpuExit, EngineConfig, InterpVm,
 };
 
+use pager::{AccessKind, FaultResolution, Pager};
 use proc::{Process, Scheduler};
 use vfs::{NodeKind, Vfs};
 
@@ -134,6 +139,25 @@ pub(crate) struct Secret {
     pub(crate) paths: Vec<Vec<u8>>,
 }
 
+/// One content-addressed chunk the host must supply. Page requests carry VMA
+/// coordinates; file-range requests use zero coordinates and still retry the
+/// same syscall only after the verified chunk is resident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkRequest {
+    pub ticket: u64,
+    pub hash: chunk::Hash,
+    pub asid: u64,
+    pub generation: u64,
+    pub page: u64,
+    pub access: Option<AccessKind>,
+}
+
+#[derive(Debug, Clone)]
+struct FileChunkRequest {
+    ticket: u64,
+    hash: chunk::Hash,
+}
+
 pub struct LinuxEnv {
     pub(crate) regs: Regs,
     pub vfs: Vfs,
@@ -174,6 +198,8 @@ pub struct LinuxEnv {
     /// behaviour and stays the default: a host that has nothing to verify
     /// against should not be stopped from running.
     pub(crate) manifest: Option<crate::manifest::Manifest>,
+    /// Canonical authority for immutable lazy-image paths and chunk layouts.
+    pub(crate) chunk_manifest: Option<crate::chunk_manifest::ChunkManifest>,
     /// Running digests for images still arriving in pieces, by guest path.
     pub(crate) in_flight: std::collections::BTreeMap<Vec<u8>, (crate::digest::Sha256, usize)>,
     /// Live inotify instances. A change to the filesystem has to reach every
@@ -200,6 +226,17 @@ pub struct LinuxEnv {
     /// pause, not a deadlock: the host runs its event loop, delivers what
     /// arrived, and calls `run` again.
     pub(crate) network_wait: bool,
+    /// Set when a manifest-backed page fault has emitted a chunk request. The
+    /// CPU remains at the faulting p-code until the host completes its ticket.
+    pub(crate) page_in_wait: bool,
+    /// An executable page became resident after a lift had already observed
+    /// cold bytes. The partially lifted group must be discarded before the
+    /// VM can retry; this is an internal turn, never a host-visible wait.
+    page_in_recompile: bool,
+    /// Immutable file mappings, keyed by the process address-space id.
+    pub(crate) pager: Pager,
+    file_chunk_wait: Option<FileChunkRequest>,
+    next_file_ticket: u64,
     /// Set by the host to say its network wait expired with nothing to
     /// deliver, which lets the next stall advance the guest's clock so timers
     /// and socket timeouts fire.
@@ -208,6 +245,16 @@ pub struct LinuxEnv {
     pub(crate) trace: Option<trace::Trace>,
     /// Exit code of the root process (the machine's exit code).
     exit_code: Option<i32>,
+}
+
+fn resident_matches_chunk_layout(data: &[u8], layout: &crate::chunk::ChunkedFile) -> bool {
+    let chunk_size = layout.chunk_size as usize;
+    data.len() as u64 == layout.size
+        && data.len().div_ceil(chunk_size) == layout.chunks.len()
+        && data
+            .chunks(chunk_size)
+            .zip(&layout.chunks)
+            .all(|(chunk, expected)| crate::digest::sha256(chunk) == *expected)
 }
 
 /// Terminal-generated signal for a window-size change.
@@ -231,6 +278,7 @@ impl LinuxEnv {
             warp_nanos: 0,
             epoch_base_sec: EPOCH_BASE_SEC,
             manifest: None,
+            chunk_manifest: None,
             in_flight: std::collections::BTreeMap::new(),
             inotify: Vec::new(),
             inotify_cookie: 0,
@@ -240,6 +288,11 @@ impl LinuxEnv {
             stdio_input: std::collections::VecDeque::new(),
             terminal_input_wait: false,
             network_wait: false,
+            page_in_wait: false,
+            page_in_recompile: false,
+            pager: Pager::default(),
+            file_chunk_wait: None,
+            next_file_ticket: 0,
             network_expired: false,
             trace: None,
             exit_code: None,
@@ -333,9 +386,9 @@ impl LinuxEnv {
     /// Expands `${name}` placeholders using the registered secrets: in every
     /// regular file for an unscoped secret, and only in its own files for a
     /// scoped one. Call after seeding files and before `load`.
-    pub fn expand_secrets(&mut self) {
+    pub fn expand_secrets(&mut self) -> Result<(), String> {
         if self.secrets.is_empty() {
-            return;
+            return Ok(());
         }
         let mut everywhere: Vec<(String, String)> = Vec::new();
         let mut scoped: Vec<(Vec<u8>, (String, String))> = Vec::new();
@@ -350,11 +403,21 @@ impl LinuxEnv {
             }
         }
         if !everywhere.is_empty() {
-            self.vfs.rewrite_files(&everywhere);
+            self.vfs
+                .rewrite_files(&everywhere)
+                .map_err(|errno| format!("cannot expand unscoped secrets: errno {errno}"))?;
         }
         for (path, sub) in scoped {
-            self.vfs.rewrite_file(&path, std::slice::from_ref(&sub));
+            self.vfs
+                .rewrite_file(&path, std::slice::from_ref(&sub))
+                .map_err(|errno| {
+                    format!(
+                        "cannot expand secret in {}: errno {errno}",
+                        path.escape_ascii()
+                    )
+                })?;
         }
+        Ok(())
     }
 
     /// The reverse map (`value -> ${name}`) used to redact snapshots. Scope
@@ -365,6 +428,26 @@ impl LinuxEnv {
             .iter()
             .map(|(name, secret)| (secret.value.clone(), format!("${{{name}}}")))
             .collect()
+    }
+
+    /// Restores values after snapshot redaction without touching a new cold
+    /// base file that may have been installed since secrets were expanded.
+    /// Only resident overlays could have contained a value to redact.
+    fn restore_resident_secrets(&mut self) {
+        for (name, secret) in &self.secrets {
+            let sub = (format!("${{{name}}}"), secret.value.clone());
+            if secret.paths.is_empty() {
+                self.vfs.rewrite_resident_files(std::slice::from_ref(&sub));
+                continue;
+            }
+            for path in &secret.paths {
+                if self.vfs.read_file(path).is_some() {
+                    // `read_file` only returns resident regular files, so no
+                    // materialization, quota, or missing-chunk error remains.
+                    let _ = self.vfs.rewrite_file(path, std::slice::from_ref(&sub));
+                }
+            }
+        }
     }
 
     pub fn set_args(&mut self, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) {
@@ -450,6 +533,28 @@ impl LinuxEnv {
         self.network_wait
     }
 
+    /// True when the CPU is stopped at a manifest-backed access fault and the
+    /// host still owes the chunk named by [`Pager::pending`].
+    pub fn awaiting_page_in(&self) -> bool {
+        self.page_in_wait
+    }
+
+    pub(crate) fn request_file_chunk(&mut self, hash: chunk::Hash) -> Result<(), String> {
+        if let Some(pending) = &self.file_chunk_wait {
+            return (pending.hash == hash)
+                .then_some(())
+                .ok_or_else(|| "a second file chunk was requested while one is pending".into());
+        }
+        self.next_file_ticket = self.next_file_ticket.wrapping_add(1).max(1);
+        self.file_chunk_wait = Some(FileChunkRequest {
+            // Keep the namespace distinct from page tickets for diagnostics.
+            ticket: self.next_file_ticket | (1_u64 << 63),
+            hash,
+        });
+        self.page_in_wait = true;
+        Ok(())
+    }
+
     /// Tells the machine the host waited for network activity and none came,
     /// so the next stall may advance guest time instead of pausing again.
     pub fn expire_network_wait(&mut self) {
@@ -516,6 +621,65 @@ impl LinuxEnv {
     /// the large ones; anything else is hashed here. With no manifest
     /// installed nothing is checked, which is the default.
     pub(crate) fn verify_image(&mut self, path: &[u8]) -> Result<(), String> {
+        let resolved = self
+            .vfs
+            .resolve(self.proc.cwd, path, true)
+            .map_err(|errno| format!("cannot load {}: errno {errno}", path.escape_ascii()))?;
+        let node = resolved
+            .node
+            .ok_or_else(|| format!("cannot load {}: no such file", path.escape_ascii()))?;
+
+        // Once a chunk manifest is installed it is the executable allowlist,
+        // including after a snapshot restore. A mutable resident overlay is
+        // guest state, not authenticated base-image authority: allow it to run
+        // only when its complete bytes still reproduce the manifest layout.
+        // This keeps configuration overlays writable without letting one
+        // shadow a signed executable path and bypass verification.
+        if let Some(manifest) = self.chunk_manifest.as_ref() {
+            if self.vfs.manifest_root() != Some(manifest.root()) {
+                return Err(
+                    "refused: snapshot manifest root is not the installed authority".into(),
+                );
+            }
+            let resolved_path = self.vfs.abs_path_of(node);
+            let (expected, _) = manifest.file(&resolved_path).ok_or_else(|| {
+                format!(
+                    "refused: {} is not in the chunk manifest",
+                    resolved_path.escape_ascii()
+                )
+            })?;
+            match &self.vfs.node(node).kind {
+                NodeKind::ChunkedFile(actual) if actual == expected => return Ok(()),
+                NodeKind::ChunkedFile(_) => {
+                    return Err(format!(
+                        "refused: {} chunk layout differs from the manifest",
+                        path.escape_ascii()
+                    ));
+                }
+                NodeKind::File(data) if resident_matches_chunk_layout(data, expected) => {
+                    return Ok(());
+                }
+                NodeKind::File(_) => {
+                    return Err(format!(
+                        "refused: {} resident bytes differ from the chunk manifest",
+                        path.escape_ascii()
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "refused: {} is not a regular manifest file",
+                        path.escape_ascii()
+                    ));
+                }
+            }
+        }
+
+        if matches!(self.vfs.node(node).kind, NodeKind::ChunkedFile(_)) {
+            return Err(format!(
+                "refused: {} is chunked but no authenticated chunk manifest is installed",
+                path.escape_ascii()
+            ));
+        }
         if self.manifest.is_none() {
             return Ok(());
         }
@@ -668,6 +832,11 @@ impl LinuxEnv {
             cpu.mem.clear();
         }
         cpu.reset();
+        // `Cpu::reset` resets architectural registers and the active
+        // exception, but a host-wait retry may also have queued the old
+        // syscall/access exception separately. It belongs to the discarded
+        // process and must never be presented to the new entry point.
+        cpu.pending_exception = None;
 
         // Null page: faults with a permission error instead of unmapped.
         cpu.mem.map_memory_len(
@@ -679,7 +848,17 @@ impl LinuxEnv {
             },
         );
 
-        let metadata = self.load_elf(cpu, path)?;
+        let chunked = self
+            .vfs
+            .resolve(self.proc.cwd, path, true)
+            .ok()
+            .and_then(|resolved| resolved.node)
+            .is_some_and(|node| matches!(self.vfs.node(node).kind, NodeKind::ChunkedFile(_)));
+        let metadata = if chunked {
+            lazy_elf::load(self, cpu, path, 0)?
+        } else {
+            self.load_elf(cpu, path)?
+        };
 
         self.proc.exe_path = if path.first() == Some(&b'/') {
             path.to_vec()
@@ -840,6 +1019,10 @@ impl LinuxEnv {
 
 impl ElfLoader for LinuxEnv {
     fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, String> {
+        // The generic loader calls this again for PT_INTERP. Manifest policy
+        // applies to every executable image, not only the path the host named
+        // in Machine::load.
+        self.verify_image(path)?;
         let resolved = self
             .vfs
             .resolve(self.proc.cwd, path, true)
@@ -856,6 +1039,15 @@ impl ElfLoader for LinuxEnv {
 
 impl Environment for LinuxEnv {
     fn load(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<(), String> {
+        // A host `load` replaces the current root process just as guest
+        // `execve` replaces an address space. A previous turn may still be
+        // stopped on a page or file-chunk ticket; neither authority may
+        // survive into the replacement image. In particular, a late browser
+        // response must fail as stale instead of filling a mapping owned by
+        // the process that was just discarded.
+        let old_asid = self.proc.asid;
+        self.pager.drop_space(old_asid);
+        self.file_chunk_wait = None;
         // A fresh root process; the filesystem persists across loads, any
         // tasks from a previous run do not.
         let (argv, envp) = (
@@ -874,6 +1066,8 @@ impl Environment for LinuxEnv {
         self.stdio_pty = None;
         self.stdio_input.clear();
         self.terminal_input_wait = false;
+        self.page_in_wait = false;
+        self.page_in_recompile = false;
         // And a fresh address space, exactly as `execve` does. `Process::initial`
         // hands out id 0 every time, so without this a second image loaded into
         // the same machine keys its blocks identically to the first — and two
@@ -885,7 +1079,66 @@ impl Environment for LinuxEnv {
     }
 
     fn handle_exception(&mut self, cpu: &mut Cpu) -> Option<VmExit> {
-        match ExceptionCode::from_u32(cpu.exception.code) {
+        let code = ExceptionCode::from_u32(cpu.exception.code);
+        let access = match code {
+            ExceptionCode::ReadUnmapped
+            | ExceptionCode::ReadPerm
+            | ExceptionCode::ReadUninitialized => Some(AccessKind::Read),
+            ExceptionCode::WriteUnmapped | ExceptionCode::WritePerm => Some(AccessKind::Write),
+            ExceptionCode::ExecViolation => Some(AccessKind::Execute),
+            _ => None,
+        };
+        if let Some(access) = access {
+            match self
+                .pager
+                .resolve(&self.vfs, self.proc.asid, cpu.exception.value, access)
+            {
+                FaultResolution::Ready { page, bytes, perm } => {
+                    let fault_address = cpu.exception.value;
+                    if cpu.mem.write_bytes(page, &bytes, perm::NONE).is_ok()
+                        && cpu.mem.update_perm(page, PAGE_SIZE, perm).is_ok()
+                    {
+                        cpu.exception.clear();
+                        self.pager.mark_resident(self.proc.asid, page, access);
+                        self.page_in_wait = false;
+                        if access == AccessKind::Execute {
+                            // A code-page miss usually happened while the
+                            // lifter was reading source bytes, before a block
+                            // existed. Leave `block_id = MAX`: the next VM
+                            // pass raises CodeNotTranslated and lifts again
+                            // from the now-resident bytes. Queuing a second
+                            // ExternalAddr exception here is incorrect for a
+                            // cross-page lift: it can replay the original
+                            // ExecViolation after both pages are resident.
+                            // Data faults keep their proven block-offset retry
+                            // path unchanged.
+                            let rip = fault_address;
+                            cpu.write_pc(rip);
+                            cpu.block_id = u64::MAX;
+                            cpu.block_offset = 0;
+                            self.page_in_recompile = true;
+                            return Some(VmExit::Interrupted);
+                        } else {
+                            // The instruction marker already retired before
+                            // this restartable data fault. Tell the engine not
+                            // to apply its ordinary mid-block missing-marker
+                            // compensation when the same p-code is retried.
+                            x64_engine::vm::mark_page_in_retry();
+                        }
+                        return Some(VmExit::Running);
+                    }
+                }
+                FaultResolution::Missing(_) => {
+                    self.page_in_wait = true;
+                    return Some(VmExit::Interrupted);
+                }
+                FaultResolution::Invalid(why) => {
+                    tracing::error!("page-in refused: {why}");
+                }
+                FaultResolution::NotLazy => {}
+            }
+        }
+        match code {
             ExceptionCode::Syscall => syscall::handle(self, cpu),
             _ => None,
         }
@@ -1052,6 +1305,123 @@ impl Machine {
         self.env().add_file(path, bytes, mode)
     }
 
+    /// Installs a manifest-pinned file without making its payload resident.
+    pub fn add_chunked_file(
+        &mut self,
+        path: &[u8],
+        file: chunk::ChunkedFile,
+        mode: u32,
+    ) -> Result<(), String> {
+        if let Some(manifest) = &self.env().chunk_manifest {
+            let Some((expected, _)) = manifest.file(path) else {
+                return Err(format!(
+                    "refused: {} is not in the chunk manifest",
+                    path.escape_ascii()
+                ));
+            };
+            if expected != &file {
+                return Err(format!(
+                    "refused: {} chunk layout differs from the manifest",
+                    path.escape_ascii()
+                ));
+            }
+        }
+        self.env()
+            .vfs
+            .add_chunked_file(path, file, mode)
+            .map(|_| ())
+            .map_err(|errno| format!("cannot add {}: errno {errno}", path.escape_ascii()))
+    }
+
+    /// Adds a verified warm chunk before execution (for bounded ELF metadata
+    /// or a host cache hit).
+    pub fn put_chunk(&mut self, hash: chunk::Hash, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.env().vfs.has_chunk(&hash) {
+            self.check_budget(bytes.capacity())?;
+        }
+        self.env().vfs.put_chunk(hash, bytes)
+    }
+
+    /// The cold page request currently stopping execution, if any.
+    pub fn page_request(&mut self) -> Option<ChunkRequest> {
+        let env = self.env();
+        if let Some(request) = env.pager.pending() {
+            return Some(ChunkRequest {
+                ticket: request.ticket,
+                hash: request.hash,
+                asid: request.asid,
+                generation: request.generation,
+                page: request.page,
+                access: Some(request.access),
+            });
+        }
+        env.file_chunk_wait.as_ref().map(|request| ChunkRequest {
+            ticket: request.ticket,
+            hash: request.hash,
+            asid: 0,
+            generation: 0,
+            page: 0,
+            access: None,
+        })
+    }
+
+    /// Completes exactly one page-in ticket. Hash, quota, address-space id,
+    /// and mapping generation are checked before the bytes become usable.
+    pub fn deliver_page(&mut self, ticket: u64, bytes: Vec<u8>) -> Result<(), String> {
+        let expected_hash = self
+            .page_request()
+            .filter(|request| request.ticket == ticket)
+            .map(|request| request.hash);
+        if expected_hash.is_none_or(|hash| !self.env().vfs.has_chunk(&hash)) {
+            self.check_budget(bytes.capacity())?;
+        }
+        let completed_page_fault = {
+            let env = self.env();
+            if env
+                .pager
+                .pending()
+                .is_some_and(|request| request.ticket == ticket)
+            {
+                env.pager.complete(&mut env.vfs, ticket, bytes)?;
+                true
+            } else {
+                let request = env
+                    .file_chunk_wait
+                    .as_ref()
+                    .ok_or("no chunk request is pending")?;
+                if request.ticket != ticket {
+                    return Err("chunk ticket does not match the pending request".into());
+                }
+                env.vfs.put_chunk(request.hash, bytes)?;
+                env.file_chunk_wait = None;
+                false
+            }
+        };
+        if completed_page_fault {
+            // The CPU is still stopped on the original access exception. Make
+            // the VM present it to the environment before it executes any
+            // more p-code, so the newly available chunk is mapped first. If
+            // we merely resume, the same p-code faults once more before the
+            // normal post-block exception path and that failed retry consumes
+            // fuel despite retiring no instruction.
+            let exception = self.vm.cpu.exception;
+            self.vm.cpu.pending_exception = Some(exception);
+        }
+        self.env().page_in_wait = false;
+        Ok(())
+    }
+
+    pub fn page_in_count(&mut self) -> u64 {
+        self.env().pager.page_ins()
+    }
+
+    /// Pages first made resident by read, write, and instruction-fetch
+    /// accesses, in that order. This is diagnostic accounting only; it does
+    /// not affect scheduling or architectural traces.
+    pub fn page_in_access_counts(&mut self) -> [u64; 3] {
+        self.env().pager.page_ins_by_access()
+    }
+
     /// Adds a symlink to the guest filesystem.
     pub fn add_symlink(&mut self, path: &[u8], target: &[u8]) -> Result<(), String> {
         self.env().add_symlink(path, target)
@@ -1183,6 +1553,16 @@ impl Machine {
         collected.set_budget(self.event_log_budget);
         let env = self.env();
         collected.set_args(&env.proc.argv, &env.proc.envp);
+        if let Some(manifest) = &env.chunk_manifest {
+            if let Some((file, legacy_fnv)) = manifest.file(&env.proc.exe_path) {
+                collected.set_manifest_image(
+                    &env.proc.exe_path,
+                    file.size,
+                    manifest.root(),
+                    legacy_fnv,
+                );
+            }
+        }
         env.trace = Some(collected);
     }
 
@@ -1235,6 +1615,12 @@ impl Machine {
                     trace.sample(cpu);
                     continue;
                 }
+            }
+            // A page-in is a host transport pause, not an architectural stop.
+            // Do not add a Stop event or a duplicate sample; after delivery,
+            // the same run continues at the same p-code and sample schedule.
+            if exit == CpuExit::Interrupted && self.env().awaiting_page_in() {
+                return exit;
             }
             // A final sample makes the end state part of the record.
             let icount = self.icount();
@@ -1294,6 +1680,25 @@ impl Machine {
         self.vm.jit_dispatch_count()
     }
 
+    pub fn jit_block_dispatch_count(&self) -> u64 {
+        self.vm.jit_block_dispatch_count()
+    }
+
+    pub fn jit_region_dispatch_count(&self) -> u64 {
+        self.vm.jit_region_dispatch_count()
+    }
+
+    /// Enables or disables exact unique executed-source-byte accounting.
+    /// Intended for explicit image materialization measurements, not ordinary
+    /// production runs where even a disabled branch is unnecessary overhead.
+    pub fn track_executed_bytes(&mut self, enabled: bool) {
+        self.vm.track_executed_bytes(enabled);
+    }
+
+    pub fn executed_byte_count(&self) -> u64 {
+        self.vm.executed_byte_count()
+    }
+
     /// Caps the wasm code the JIT may hold, in bytes (`0` = unlimited). See
     /// [`InterpVm::set_jit_code_budget`].
     pub fn set_jit_code_budget(&mut self, bytes: usize) {
@@ -1328,13 +1733,16 @@ impl Machine {
         let opened = env.opened_files.as_ref();
         let mut s = FileAccessStats::default();
         for (idx, node) in env.vfs.nodes.iter().enumerate() {
-            if let crate::vfs::NodeKind::File(data) = &node.kind {
-                s.delivered_files += 1;
-                s.delivered_bytes += data.len();
-                if opened.is_some_and(|o| o.contains(&idx)) {
-                    s.opened_files += 1;
-                    s.opened_bytes += data.len();
-                }
+            let bytes = match &node.kind {
+                crate::vfs::NodeKind::File(data) => data.len() as u64,
+                crate::vfs::NodeKind::ChunkedFile(file) => file.size,
+                _ => continue,
+            };
+            s.delivered_files += 1;
+            s.delivered_bytes += bytes as usize;
+            if opened.is_some_and(|o| o.contains(&idx)) {
+                s.opened_files += 1;
+                s.opened_bytes += bytes as usize;
             }
         }
         s
@@ -1400,6 +1808,92 @@ impl Machine {
         };
         self.env().manifest = parsed;
         Ok(())
+    }
+
+    /// Parses and installs one authenticated immutable image description.
+    /// Payload chunks remain absent; only directory metadata, symlinks and
+    /// file hash tables enter the VFS. The SHA-256 of the exact canonical
+    /// bytes is retained as the image and snapshot identity.
+    pub fn install_chunk_manifest(&mut self, text: &[u8]) -> Result<[u8; 32], String> {
+        use crate::chunk_manifest::EntryKind;
+
+        let manifest = crate::chunk_manifest::ChunkManifest::parse(text)?;
+        let root = manifest.root();
+        let env = self.env();
+
+        // A v3 snapshot already contains the namespace, immutable
+        // descriptors, and resident mutation overlays. Re-installing the
+        // authenticated bytes is a rebind, not an image extraction: replacing
+        // nodes here would lose guest mutations and append dead descriptors on
+        // every reload. The root must match, and every descriptor carried by
+        // the snapshot must occur in that authority; renamed/hard-linked base
+        // files are allowed because those are guest namespace changes.
+        if let Some(snapshot_root) = env.vfs.manifest_root() {
+            if snapshot_root != root {
+                return Err("snapshot manifest root differs from the installed authority".into());
+            }
+            let authorized = manifest
+                .entries()
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::File { file, .. } => Some(file),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for node in &env.vfs.nodes {
+                if let crate::vfs::NodeKind::ChunkedFile(file) = &node.kind {
+                    if !authorized.contains(&file) {
+                        return Err(
+                            "snapshot contains a chunk descriptor outside its manifest authority"
+                                .into(),
+                        );
+                    }
+                }
+            }
+            env.chunk_manifest = Some(manifest);
+            return Ok(root);
+        }
+
+        fn apply(
+            vfs: &mut crate::vfs::Vfs,
+            manifest: &crate::chunk_manifest::ChunkManifest,
+        ) -> Result<(), String> {
+            for entry in manifest.entries() {
+                let node = match &entry.kind {
+                    EntryKind::Dir => vfs.mkdir_p(&entry.path).map_err(|errno| {
+                        format!("cannot mkdir {}: errno {errno}", entry.path.escape_ascii())
+                    })?,
+                    EntryKind::Symlink(target) => vfs
+                        .add_node(
+                            &entry.path,
+                            crate::vfs::NodeKind::Symlink(target.clone()),
+                            entry.mode,
+                        )
+                        .map_err(|errno| {
+                            format!("cannot link {}: errno {errno}", entry.path.escape_ascii())
+                        })?,
+                    EntryKind::File { file, .. } => vfs
+                        .add_chunked_file(&entry.path, file.clone(), entry.mode)
+                        .map_err(|errno| {
+                            format!("cannot add {}: errno {errno}", entry.path.escape_ascii())
+                        })?,
+                };
+                let node = vfs.node_mut(node);
+                node.mode = entry.mode;
+                node.mtime_sec = entry.mtime_sec;
+            }
+            Ok(())
+        }
+
+        // Validate the complete topology against a payload-free shadow before
+        // mutating the live VFS. A malformed but correctly signed manifest
+        // therefore cannot leave a half-installed namespace behind.
+        let mut shadow = env.vfs.topology_only();
+        apply(&mut shadow, &manifest)?;
+        apply(&mut env.vfs, &manifest)?;
+        env.vfs.set_manifest_root(Some(root));
+        env.chunk_manifest = Some(manifest);
+        Ok(root)
     }
 
     /// The paths the installed manifest names, for a host that wants to
@@ -1606,8 +2100,8 @@ impl Machine {
 
     /// Expands `${name}` secret placeholders in guest files. Call after
     /// seeding files and before `load`.
-    pub fn expand_secrets(&mut self) {
-        self.env().expand_secrets();
+    pub fn expand_secrets(&mut self) -> Result<(), String> {
+        self.env().expand_secrets()
     }
 
     /// Serializes the guest filesystem (for reload persistence). Secret
@@ -1631,7 +2125,7 @@ impl Machine {
     pub fn export_fs_excluding(&mut self, paths: &[Vec<u8>]) -> Vec<u8> {
         let redactions = self.env().secret_redactions();
         if !redactions.is_empty() {
-            self.env().vfs.rewrite_files(&redactions);
+            self.env().vfs.rewrite_resident_files(&redactions);
         }
         let mut held: Vec<(&Vec<u8>, Vec<u8>)> = Vec::new();
         for path in paths {
@@ -1644,7 +2138,7 @@ impl Machine {
             self.env().vfs.put_file_contents(path, data);
         }
         // Restore the in-memory values so the running machine keeps working.
-        self.env().expand_secrets();
+        self.env().restore_resident_secrets();
         image
     }
 
@@ -1665,6 +2159,7 @@ impl Machine {
         // announce that a stream finished cannot skip it that way, and the
         // moment that matters is the one before the guest runs the bytes.
         self.env().verify_image(path)?;
+        self.vm.cancel_page_in_resume();
         let InterpVm { cpu, env, .. } = &mut self.vm;
         env.load(cpu, path)
     }
@@ -1687,6 +2182,14 @@ impl Machine {
         // network activity. Put a task back on the CPU now that the host has
         // had its turn; with still nothing to deliver, stay paused rather
         // than spinning.
+        if self.env().page_in_wait {
+            // No host completion yet: preserve the exact CPU fault and do not
+            // spin or let wall-clock arrival reorder guest tasks.
+            if self.env().pager.pending().is_some() || self.env().file_chunk_wait.is_some() {
+                return CpuExit::Interrupted;
+            }
+            self.env().page_in_wait = false;
+        }
         if self.env().terminal_input_wait || self.env().network_wait {
             self.env().terminal_input_wait = false;
             self.env().network_wait = false;
@@ -1707,7 +2210,28 @@ impl Machine {
                 return CpuExit::Interrupted;
             }
         }
-        let exit = self.vm.run();
+        let exit = loop {
+            let exit = self.vm.run();
+            let recompile = {
+                let env = self.env();
+                std::mem::take(&mut env.page_in_recompile)
+            };
+            if exit == VmExit::Interrupted && recompile {
+                // `lift_block` can retain a Target::Invalid after it decoded
+                // into a cold executable page. Filling that page makes the
+                // bytes valid but does not repair the already-built target;
+                // drop all derived code and lift again from authority.
+                self.vm.cpu.mem.clear_code_cache();
+                self.vm.flush_code();
+                self.vm.cpu.block_id = u64::MAX;
+                self.vm.cpu.block_offset = 0;
+                continue;
+            }
+            break exit;
+        };
+        if exit == VmExit::Interrupted && self.env().page_in_wait {
+            self.vm.suspend_for_page_in();
+        }
         let code = self.env().exit_code();
         classify_exit(&self.vm, exit, code)
     }
