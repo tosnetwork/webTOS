@@ -34,6 +34,17 @@ rather than left to be mistaken for present behaviour; `git log` has them.
 - [Lazy image demand paging](../feasibility/lazy_chunk_fs.md) - the
   first-principles scope, invariants, implementation shape, and exit gates for
   canonical chunk manifests and immutable file-backed paging
+- [Dynamic-runtime JIT coverage](JIT_COVERAGE_DYNAMIC_RUNTIMES.md) - preserved
+  measurements for static-pie Codex and dynamically linked Node workloads
+
+## Architecture studies
+
+- [AI-Fi development methods](AI_FI_DEVELOPMENT_METHODS.md) - a research and
+  architecture proposal preserved from its documentation branch
+- [Intent-native applications](INTENT_NATIVE_APPLICATIONS.md) - an incomplete
+  product and developer-direction draft preserved from its documentation branch
+- [Retired branch archive](branch-archive/README.md) - tip commits, disposition,
+  and preserved content for the eight branches retired on 2026-08-29
 
 ## Status conventions
 
