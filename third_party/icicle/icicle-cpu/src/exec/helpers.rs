@@ -257,6 +257,7 @@ pub mod x86 {
 
     pub const HELPERS: &[(&str, PcodeOpHelper)] = &[
         ("rdtsc", rdtsc),
+        ("rdtscp", rdtscp),
         ("cpuid_basic_info", cpuid_basic_info),
         ("cpuid_Version_info", cpuid_version_info),
         ("cpuid_Extended_Feature_Enumeration_info", cpuid_extended_feature_enumeration_info),
@@ -363,7 +364,24 @@ pub mod x86 {
     ];
 
     fn rdtsc(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
-        cpu.write_var(dst, 0_u64);
+        // One retired instruction is one cycle, matching the guest clock's
+        // one-instruction-one-nanosecond model (an invariant 1 GHz TSC). The
+        // counter must advance: code that spin-waits on `rdtsc` deltas (timer
+        // calibration, backoff loops) never terminates on a constant TSC.
+        cpu.write_var(dst, cpu.icount());
+    }
+
+    // The SLEIGH spec calls `rdtscp()` with no output, so the helper writes
+    // the architectural results itself: EDX:EAX = TSC, ECX = IA32_TSC_AUX
+    // (0: single processor), each as a full 64-bit register write, which
+    // zeroes the upper halves exactly as 32-bit destinations do on x86-64.
+    fn rdtscp(cpu: &mut Cpu, _: VarNode, _: [Value; 2]) {
+        let tsc = cpu.icount();
+        for (name, value) in [("RAX", tsc & 0xffff_ffff), ("RDX", tsc >> 32), ("RCX", 0)] {
+            if let Some(var) = cpu.arch.sleigh.get_varnode(name) {
+                cpu.write_var(var, value);
+            }
+        }
     }
 
     // Basic processor information
