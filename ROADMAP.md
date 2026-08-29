@@ -36,7 +36,7 @@ terminal behavior, and recovery after a browser reload.
 | M0 Lock the baseline | 🔶 | ~93% | an architectural trace format with four versioned reference traces, reproduced natively and in all three browser engines. A skipped test now says so, and `WEBTOS_REQUIRE_FIXTURES=1` makes a skip a failure — run that way the x86-64 Linux host passes all 98 cases with no skips, while macOS fails 26 of them, which is how much of the suite is silently doing nothing where the browser work happens. The executable fixtures and reference traces are now a pinned set (`test_data/FIXTURES.sha256`); the pre-pivot native QEMU kernel harnesses have been removed with the kernel they validated; measurement harnesses exist but no dashboard |
 | M1 Static `hello` | ✅ | ~98% | native + wasm gates green; the three-browser matrix (Chromium/Firefox/WebKit) passes and the engines agree instruction for instruction |
 | M2 Static BusyBox | ✅ | ~97% | applet gates green incl. reload persistence (FS snapshots + OPFS), verified in all three browser engines |
-| M3 Dynamic userland | ✅ | ~93% | musl and glibc loaders green, native + wasm; no per-package rootfs license manifest |
+| M3 Dynamic userland | ✅ | ~95% | musl and glibc loaders green, native + wasm; file-backed mappings, the initial ELF, and the dynamic loader demand-page from a content-addressed manifest, fetching only what execution touches; no per-package rootfs license manifest |
 | M4 Threads & processes | ✅ | ~97% | green on x86-64 Linux and macOS, including determinism, adversarial COW/fd-sharing/backpressure, and a signal blocked-then-unblocked gate added after the bug below. Signal dispositions are now consulted rather than assumed: default actions run, a process can signal itself (`tkill` was missing, so `raise` was `ENOSYS`), and `rt_sigprocmask` delivers what it just unblocked before the next guest instruction. A blocking syscall interrupted by a handler returns `EINTR` unless the handler asked for a restart — nothing returned `EINTR` before, so every wait restarted whether or not the handler wanted it, and the rule is now gated through a socket as well as a terminal. Multi-worker deferred |
 | M5 Event loop & networking | ✅ | ~99% | HTTP/HTTPS (verified guest TLS)/DNS/epoll/sendmsg/denied-by-default green natively, and the browser reaches the network through a deny-by-default relay — gated in all three engines. A socket wait is interruptible on the same path as any other blocking wait, and that is now gated through a socket rather than inferred from a terminal read: a guest blocked in `recv` on a real connection takes a signal mid-flight, ends with `EINTR` after its handler runs, and with `SA_RESTART` resumes and reads bytes the peer only sent afterwards. Bytes across the broker boundary are now metered and can be capped. Credentials are injected at runtime and scoped per agent — one reaches only the files the host named, and an out-of-scope program reads the placeholder rather than an empty value that would read as "no key configured" — gated natively and in all three engines. Recording, reconnect, and suspension now gated; a session records and replays offline, a dropped connection leaves an error not a wait, and a suspended tab is told how much real time passed |
 | M6 OpenFox | ✅ | ~96% | all workload gates green natively (version/help/status, scripted network task, secret injection, crash bundles, bounded soak), **and the image now runs in a browser**: a 52 MB agent binary streams into the guest filesystem and an OPFS cache, reaches a shell prompt in about three seconds, and executes — gated in all three engines. The soak now bounds the filesystem, guest physical memory, and the lifted-block table, the last by a structural ceiling derived from the engine's own counters after an 80-round reading of the curve proved wrong at 1,000 rounds; the 60-minute run is green: 1,000 rounds in 3,673 s |
@@ -53,13 +53,13 @@ call, so here is the arithmetic rather than the assertion:
 | M0 Lock the baseline | 5% | 93% | 4.7 |
 | M1 Static `hello` | 5% | 98% | 4.9 |
 | M2 Static BusyBox | 8% | 97% | 7.8 |
-| M3 Dynamic userland | 10% | 93% | 9.3 |
+| M3 Dynamic userland | 10% | 95% | 9.5 |
 | M4 Threads & processes | 13% | 97% | 12.6 |
 | M5 Event loop & networking | 13% | 99% | 12.9 |
 | M6 OpenFox | 12% | 96% | 11.5 |
 | M7 Codex & Claude Code | 20% | 90% | 18.0 |
 | M8 Performance & release | 14% | 89% | 12.5 |
-| **Total** | **100%** | | **94.2** |
+| **Total** | **100%** | | **94.4** |
 
 The two heaviest remaining items are the back half of M7 and the tail of M8,
 which together account for about 4 of the ~6 points outstanding. Progress from
@@ -468,9 +468,12 @@ Responsibilities:
 - network mediation through browser-available transports ✅
   (`tools/webtos_gateway.mjs`: a deny-by-default WebSocket relay; the wasm
   module owns no transport and the guest has no network until the page asks)
-- application images, dependency manifests, and version pinning 🔶 (images
+- application images, dependency manifests, and version pinning ✅ (images
   stream in chunk by chunk and are cached in OPFS, so a reload does not
-  download again; manifests and pinning are not started)
+  download again; and an image can now install by a content-addressed chunk
+  manifest — the manifest is the execution authority and every chunk is
+  hash-verified before it enters the store, which is version pinning — with
+  execution fetching only the pages it touches)
 - capability prompts and credential injection
 - snapshot, reload, resume, diagnostics, and performance metrics
 
@@ -621,7 +624,13 @@ Work:
 - Complete file-backed mappings, demand paging, protection transitions, and
   executable-page invalidation. ✅ (`MAP_PRIVATE`, the initial ELF, and the
   dynamic loader now use immutable manifest-backed demand paging; interpreter,
-  JIT, stale-ticket, snapshot, and three-browser gates cover the path)
+  JIT, stale-ticket, snapshot, and three-browser gates cover the path. Review
+  then closed a soundness hole the gates missed: host-side syscall copies
+  bypassed the pager, so a path string inside an untouched mapping silently
+  read as empty — and a second bug, empty paths resolving to the base
+  directory instead of ENOENT, masked it. Host copies now fill or fault-in
+  lazy pages copy_from_user-style, and an adversarial gate writev()s out of an
+  untouched mapping and access()es a path living inside one)
 - Support `PT_INTERP`, auxiliary vectors, TLS setup, `arch_prctl`, and FS/GS
   base behavior. ✅
 - Complete instruction coverage exercised by the dynamic loader and libc. ✅ (musl and glibc loaders both run)
