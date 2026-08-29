@@ -193,6 +193,60 @@ fn a_secret_removed_from_a_config_does_not_survive_in_the_snapshot() {
 }
 
 #[test]
+fn a_host_secret_handle_reads_without_putting_bytes_in_the_filesystem() {
+    const SYS_OPENAT: u64 = 257;
+    const SYS_READ: u64 = 0;
+    const SYS_WRITE: u64 = 1;
+    const AT_FDCWD: u64 = (-100_i64) as u64;
+    const O_RDONLY: u64 = 0;
+    const O_WRONLY: u64 = 1;
+
+    let mut machine = machine();
+    machine
+        .set_agent_principal("agent-a")
+        .expect("set agent principal");
+    machine
+        .mount_secret_handle("AGENT_KEY", MARKER, b"/run/secrets/agent-key", "agent-a")
+        .expect("mount host secret handle");
+    let snapshot = machine.export_fs();
+    assert!(
+        find(&snapshot, MARKER).is_none(),
+        "a handle-backed secret entered the filesystem snapshot"
+    );
+
+    let scratch = map(&mut machine, 4096);
+    poke(&mut machine, scratch, b"/run/secrets/agent-key\0");
+    let (fd, _) = machine.issue_syscall(SYS_OPENAT, [AT_FDCWD, scratch, O_RDONLY, 0, 0, 0]);
+    assert!(fd >= 0, "opening the secret handle returned {fd}");
+    let (write_fd, _) = machine.issue_syscall(SYS_OPENAT, [AT_FDCWD, scratch, O_WRONLY, 0, 0, 0]);
+    assert!(write_fd < 0, "a secret handle could be opened for writing");
+    let (read, _) = machine.issue_syscall(
+        SYS_READ,
+        [fd as u64, scratch + 128, MARKER.len() as u64, 0, 0, 0],
+    );
+    assert_eq!(read as usize, MARKER.len(), "secret handle read was short");
+    assert_eq!(peek(&mut machine, scratch + 128, MARKER.len()), MARKER);
+
+    poke(&mut machine, scratch + 128, b"x");
+    let (written, _) = machine.issue_syscall(SYS_WRITE, [fd as u64, scratch + 128, 1, 0, 0, 0]);
+    assert!(written < 0, "a read-only secret handle accepted a write");
+
+    machine
+        .set_agent_principal("agent-b")
+        .expect("switch agent principal");
+    let (foreign_fd, _) = machine.issue_syscall(SYS_OPENAT, [AT_FDCWD, scratch, O_RDONLY, 0, 0, 0]);
+    assert_eq!(foreign_fd, -13, "another agent opened the secret handle");
+    let (foreign_read, _) = machine.issue_syscall(
+        SYS_READ,
+        [fd as u64, scratch + 128, MARKER.len() as u64, 0, 0, 0],
+    );
+    assert_eq!(
+        foreign_read, -13,
+        "an inherited descriptor crossed the agent principal boundary"
+    );
+}
+
+#[test]
 fn the_guest_replacing_a_name_does_not_leave_the_old_bytes_behind() {
     let mut machine = machine();
     machine

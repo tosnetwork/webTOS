@@ -27,6 +27,15 @@ jobs:
         working-directory: crates
         run: cargo test --frozen --release -p linux-compat --test licenses
 
+      - name: Validate workload licenses and execution-record contract
+        run: |
+          tools/fetch_alpine_rootfs.sh
+          python3 -B tools/build_alpine_license_inventory.py \
+            test_data/alpine-minirootfs/lib/apk/db/installed \
+            docs/workloads/alpine-minirootfs-LICENSES.json --check
+          python3 -B tools/test_alpine_license_inventory.py
+          python3 -B tools/test_execution_record.py
+
       - name: Build twice and require byte-identical artifacts
         run: tools/check_release_reproducible.sh
 

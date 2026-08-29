@@ -190,6 +190,10 @@ pub struct InterpVm {
     /// never retried. Separate from `jit_cache` because a region is a different
     /// wasm module (an internal loop) than the per-block function.
     jit_region_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Resume/fault tables for region-cache entries that are multi-block
+    /// state-machine traces. Entries are removed with their LRU handle, so
+    /// this metadata is bounded by the same code budget as compiled wasm.
+    jit_trace_meta: std::collections::HashMap<u64, TraceMeta>,
     /// Per-block-id entry counts, to decide when a block is hot enough to
     /// compile. Separate from `entries`, which counts only external re-entries.
     jit_entries: std::collections::HashMap<u64, u64>,
@@ -252,6 +256,13 @@ struct JitEntry {
     last_epoch: u64,
 }
 
+#[derive(Clone)]
+struct TraceMeta {
+    resumes: Vec<crate::jit::TraceResume>,
+    fault_sites: Vec<(usize, usize)>,
+    blocks: Vec<usize>,
+}
+
 /// The compiled-code budget and its metrics. `budget == 0` means unlimited (the
 /// default, so nothing changes until a host sets a cap). Native runs leave it
 /// unlimited; the browser sets a cap so a long session cannot grow the engine's
@@ -309,6 +320,7 @@ impl JitBudget {
         jit: &mut dyn crate::jit::JitBackend,
         block_cache: &mut std::collections::HashMap<u64, Option<u32>>,
         region_cache: &mut std::collections::HashMap<u64, Option<u32>>,
+        trace_meta: &mut std::collections::HashMap<u64, TraceMeta>,
     ) {
         if self.budget == 0 {
             return;
@@ -328,6 +340,9 @@ impl JitBudget {
             // have replaced it already.
             if cache.get(&entry.key).copied().flatten() == Some(handle) {
                 cache.remove(&entry.key);
+            }
+            if entry.is_region {
+                trace_meta.remove(&entry.key);
             }
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes as usize);
             self.evictions += 1;
@@ -468,6 +483,7 @@ impl InterpVm {
             jit_after: None,
             jit_cache: std::collections::HashMap::new(),
             jit_region_cache: std::collections::HashMap::new(),
+            jit_trace_meta: std::collections::HashMap::new(),
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
             jit_block_dispatches: 0,
@@ -587,6 +603,7 @@ impl InterpVm {
         self.jit_entries.clear();
         self.jit_cache.clear();
         self.jit_region_cache.clear();
+        self.jit_trace_meta.clear();
         if let Some(jit) = self.jit.as_deref_mut() {
             self.jit_budget.clear(jit);
         }
@@ -914,6 +931,7 @@ impl InterpVm {
         // JIT again from their new bytes.
         self.jit_cache.clear();
         self.jit_region_cache.clear();
+        self.jit_trace_meta.clear();
         self.jit_entries.clear();
         if let Some(jit) = self.jit.as_deref_mut() {
             self.jit_budget.clear(jit);
@@ -1154,7 +1172,7 @@ impl InterpVm {
         // middle of a block.
         adjust_cpu_fuel_for_block_reentry(&mut self.cpu, block, offset, take_page_in_retry());
 
-        loop {
+        'blocks: loop {
             if let Some(profile) = self.profile.as_mut() {
                 let entry = profile.entry(block.start).or_default();
                 entry.entries += 1;
@@ -1208,6 +1226,204 @@ impl InterpVm {
                     *count += 1;
                     let hot = *count >= after;
 
+                    // Multi-block region path. The selector only admits a
+                    // bounded, closed trace with static side exits; all edges
+                    // inside that trace stay in one wasm invocation. The
+                    // packed return value contains both the exact retired
+                    // instruction count and the block/address at which Rust
+                    // must resume.
+                    if hot {
+                        if let Some(order) = select_trace(&self.code.blocks, block_id as usize) {
+                            let handle = match self.jit_region_cache.get(&key).copied() {
+                                Some(decided) => decided,
+                                None => match crate::jit::translate_trace(
+                                    &self.code.blocks,
+                                    &order,
+                                    self.cpu.arch.reg_pc,
+                                ) {
+                                    None => {
+                                        self.jit_region_cache.insert(key, None);
+                                        None
+                                    }
+                                    Some(translation) => {
+                                        self.jit_budget.make_room(
+                                            translation.bytes.len(),
+                                            self.jit
+                                                .as_deref_mut()
+                                                .expect("jit installed when hot"),
+                                            &mut self.jit_cache,
+                                            &mut self.jit_region_cache,
+                                            &mut self.jit_trace_meta,
+                                        );
+                                        match self
+                                            .jit
+                                            .as_deref_mut()
+                                            .and_then(|j| j.compile(&translation.bytes))
+                                        {
+                                            Some(h) => {
+                                                self.jit_region_cache.insert(key, Some(h));
+                                                self.jit_trace_meta.insert(
+                                                    key,
+                                                    TraceMeta {
+                                                        resumes: translation.resumes,
+                                                        fault_sites: translation.fault_sites,
+                                                        blocks: order,
+                                                    },
+                                                );
+                                                self.jit_budget.record(
+                                                    h,
+                                                    key,
+                                                    true,
+                                                    translation.bytes.len(),
+                                                );
+                                                Some(h)
+                                            }
+                                            None => None,
+                                        }
+                                    }
+                                },
+                            };
+                            if let (Some(handle), Some(meta)) =
+                                (handle, self.jit_trace_meta.get(&key).cloned())
+                            {
+                                let fuel_before = self.cpu.fuel.remaining;
+                                let outcome = match self.jit.as_mut() {
+                                    Some(j) => j.call_region(handle, &mut self.cpu, fuel_before),
+                                    None => crate::jit::RegionOutcome::Unavailable,
+                                };
+                                match outcome {
+                                    crate::jit::RegionOutcome::Ran(packed) => {
+                                        let retired = packed >> crate::jit::TRACE_RESUME_BITS;
+                                        let resume_index = (packed
+                                            & ((1 << crate::jit::TRACE_RESUME_BITS) - 1))
+                                            as usize;
+                                        let Some(resume) = meta.resumes.get(resume_index).copied()
+                                        else {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        };
+                                        if retired == 0 || retired > fuel_before {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        }
+                                        self.cpu.fuel.remaining -= retired;
+                                        self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        for &id in &meta.blocks {
+                                            if let Some(ran) = self.code.blocks.get(id) {
+                                                record_instruction_ranges(
+                                                    &mut self.executed_instructions,
+                                                    &ran.pcode,
+                                                    0,
+                                                    None,
+                                                );
+                                            }
+                                        }
+                                        self.jit_budget.touch(handle);
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] trace {:#x} blocks={} retired={retired} resume={:#x}",
+                                                block.start,
+                                                meta.blocks.len(),
+                                                resume.addr
+                                            );
+                                        }
+                                        if resume.block_id != usize::MAX {
+                                            block_id = resume.block_id as u64;
+                                            offset = 0;
+                                            self.cpu.block_id = block_id;
+                                            self.cpu.block_offset = 0;
+                                            block = match self.code.blocks.get(resume.block_id) {
+                                                Some(block) => block,
+                                                None => {
+                                                    self.corrupted_block_map(block_id);
+                                                    break 'blocks;
+                                                }
+                                            };
+                                            set_current_block_start(block.start);
+                                            set_current_icount(self.cpu.icount());
+                                            continue 'blocks;
+                                        }
+
+                                        self.cpu.write_pc(resume.addr);
+                                        match self.code.map.get(&self.get_block_key(resume.addr)) {
+                                            Some(group) => {
+                                                block_id = group.blocks.0 as u64;
+                                                offset = 0;
+                                                self.cpu.block_id = block_id;
+                                                self.cpu.block_offset = 0;
+                                                block =
+                                                    match self.code.blocks.get(block_id as usize) {
+                                                        Some(block) => block,
+                                                        None => {
+                                                            self.corrupted_block_map(block_id);
+                                                            break 'blocks;
+                                                        }
+                                                    };
+                                                set_current_block_start(block.start);
+                                                set_current_icount(self.cpu.icount());
+                                                continue 'blocks;
+                                            }
+                                            None => {
+                                                self.cpu.block_id = block_id;
+                                                self.cpu.exception.code =
+                                                    ExceptionCode::CodeNotTranslated as u32;
+                                                self.cpu.exception.value = resume.addr;
+                                                break 'blocks;
+                                            }
+                                        }
+                                    }
+                                    crate::jit::RegionOutcome::Faulted(retired, index) => {
+                                        let Some(&(fault_block, local_index)) =
+                                            meta.fault_sites.get(index as usize)
+                                        else {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        };
+                                        if retired > fuel_before {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        }
+                                        self.cpu.fuel.remaining -= retired;
+                                        let faulted = &self.code.blocks[fault_block];
+                                        let (pc, guest_insns) =
+                                            fault_pc_and_fuel(&faulted.pcode, local_index);
+                                        if let Some(pc) = pc {
+                                            self.cpu.write_pc(pc);
+                                        }
+                                        self.cpu.fuel.remaining =
+                                            self.cpu.fuel.remaining.saturating_sub(guest_insns);
+                                        self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        record_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &faulted.pcode,
+                                            0,
+                                            Some(local_index),
+                                        );
+                                        self.jit_budget.touch(handle);
+                                        self.cpu.block_id = fault_block as u64;
+                                        self.cpu.block_offset = local_index as u64;
+                                        break 'blocks;
+                                    }
+                                    crate::jit::RegionOutcome::Unavailable => {}
+                                }
+                            }
+                        }
+                    }
+
                     // Region (self-loop) path. A register-only self-loop runs its
                     // whole loop in one call; a self-loop that needs the host
                     // caches a bail here and takes the per-block path below.
@@ -1226,6 +1442,7 @@ impl InterpVm {
                                         self.jit.as_deref_mut().expect("jit installed when hot"),
                                         &mut self.jit_cache,
                                         &mut self.jit_region_cache,
+                                        &mut self.jit_trace_meta,
                                     );
                                     match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
                                         Some(h) => {
@@ -1347,6 +1564,7 @@ impl InterpVm {
                                         self.jit.as_deref_mut().expect("jit installed when hot"),
                                         &mut self.jit_cache,
                                         &mut self.jit_region_cache,
+                                        &mut self.jit_trace_meta,
                                     );
                                     match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
                                         Some(h) => {
@@ -1768,6 +1986,13 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
     let in_group = |t: Target| -> Option<usize> {
         match t {
             Target::Internal(b) if b < blocks.len() => Some(b),
+            // A jump across lift groups is represented as an external constant
+            // even when its target is already in the arena. Prefer the newest
+            // lift at that address; the arena is append-only and invalidation
+            // flushes compiled handles before a replacement can run.
+            Target::External(pcode::Value::Const(addr, _)) => {
+                blocks.iter().rposition(|block| block.start == addr)
+            }
             _ => None,
         }
     };

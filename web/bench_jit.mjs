@@ -26,7 +26,35 @@ function loopElf(count) {
     0x31, 0xc0, 0xbb, 3, 0, 0, 0, 0xb9, 5, 0, 0, 0,
     0xba, count & 0xff, (count >> 8) & 0xff, (count >> 16) & 0xff, (count >>> 24) & 0xff,
     0x48, 0x01, 0xd8, 0x48, 0x01, 0xc8, 0x48, 0xff, 0xca, 0x75, 0xf5,
-    0x89, 0xc7, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
+    0x31, 0xff, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
+  ];
+  const codeOff = 120, vaddr = 0x400000n, total = codeOff + code.length;
+  const buf = new Uint8Array(total), dv = new DataView(buf.buffer);
+  buf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1, 0], 0);
+  dv.setUint16(16, 2, true); dv.setUint16(18, 0x3e, true); dv.setUint32(20, 1, true);
+  dv.setBigUint64(24, vaddr + BigInt(codeOff), true); dv.setBigUint64(32, 64n, true);
+  dv.setUint16(52, 64, true); dv.setUint16(54, 56, true); dv.setUint16(56, 1, true);
+  dv.setUint32(64, 1, true); dv.setUint32(68, 5, true);
+  dv.setBigUint64(80, vaddr, true); dv.setBigUint64(88, vaddr, true);
+  dv.setBigUint64(96, BigInt(total), true); dv.setBigUint64(104, BigInt(total), true);
+  dv.setBigUint64(112, 0x1000n, true);
+  buf.set(code, codeOff);
+  return buf;
+}
+
+// A two-block loop. A condition in block A side-exits to `done`; block B
+// decrements the counter and jumps back to A. Neither block is a self-loop, so
+// a low dispatch count proves the multi-block state-machine region is active.
+function multiBlockElf(count) {
+  const code = [
+    0x31, 0xc0, // xor eax,eax
+    0xb9, count & 0xff, (count >> 8) & 0xff, (count >> 16) & 0xff, (count >>> 24) & 0xff,
+    0x48, 0x83, 0xc0, 0x01, // A: add rax,1
+    0x48, 0x85, 0xc9, // test rcx,rcx
+    0x74, 0x05, // jz done
+    0x48, 0xff, 0xc9, // B: dec rcx
+    0xeb, 0xf2, // jmp A
+    0x31, 0xff, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05,
   ];
   const codeOff = 120, vaddr = 0x400000n, total = codeOff + code.length;
   const buf = new Uint8Array(total), dv = new DataView(buf.buffer);
@@ -105,7 +133,13 @@ async function timeRun(elf, enableJit) {
     status = e.wtw_run(50_000_000);
   } while (status === 0);
   const ns = Number(process.hrtime.bigint() - start);
-  return { ns, exit: e.wtw_exit_code(), dispatches: Number(e.wtw_jit_dispatch_count()) };
+  return {
+    ns,
+    exit: e.wtw_exit_code(),
+    dispatches: Number(e.wtw_jit_dispatch_count()),
+    blocks: Number(e.wtw_jit_block_dispatch_count()),
+    regions: Number(e.wtw_jit_region_dispatch_count()),
+  };
 }
 
 const elf = loopElf(iters);
@@ -123,6 +157,20 @@ console.log(`  interpreter: ${(interp.ns / 1e6).toFixed(0)} ms  (${rate(interp)}
 console.log(`  browser JIT: ${(jit.ns / 1e6).toFixed(0)} ms  (${rate(jit)} M-insn/s)  exit ${jit.exit}  ${jit.dispatches.toLocaleString()} dispatches (region)`);
 console.log(`  speedup:     ${(interp.ns / jit.ns).toFixed(2)}x  vs interpreter  (was ~2.76x per-block, one jit_call per iteration)  ${jit.exit === interp.exit ? "" : "*** EXIT MISMATCH ***"}`);
 console.log(`  per-iter dispatches: ${(jit.dispatches / iters).toExponential(1)}  (per-block would be ~1.0)`);
+
+await timeRun(multiBlockElf(100000), true); // warm up
+const multiInterp = await timeRun(multiBlockElf(iters), false);
+const multiJit = await timeRun(multiBlockElf(iters), true);
+if (multiJit.regions === 0 || multiJit.dispatches / iters >= 0.001) {
+  throw new Error(
+    `multi-block region did not amortize dispatch: ${multiJit.regions} regions, ${multiJit.dispatches} total for ${iters} iterations`,
+  );
+}
+console.log(`\ntwo-block loop, ${(iters * 5).toLocaleString()} approximate guest instructions`);
+console.log(`  interpreter: ${(multiInterp.ns / 1e6).toFixed(0)} ms  exit ${multiInterp.exit}`);
+console.log(`  browser JIT: ${(multiJit.ns / 1e6).toFixed(0)} ms  exit ${multiJit.exit}  ${multiJit.dispatches.toLocaleString()} dispatches (${multiJit.regions} region, ${multiJit.blocks} block)`);
+console.log(`  speedup:     ${(multiInterp.ns / multiJit.ns).toFixed(2)}x  vs interpreter`);
+console.log(`  per-iter dispatches: ${(multiJit.dispatches / iters).toExponential(1)}  (two per iteration without trace regions)`);
 
 // A HOST self-loop: the byte-scan loop now region-compiles as well, so the
 // softmmu load rides inside one region call instead of forcing a per-block

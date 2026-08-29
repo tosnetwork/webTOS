@@ -41,6 +41,7 @@
 //! So a binary op is: store-addr(out), load(a), load(b), the wasm op,
 //! store(out). `IntAdd` below is the worked reference; the rest follow it.
 
+use icicle_cpu::lifter::{Block as LiftedBlock, BlockExit, Target};
 use pcode::{Op, Value, VarNode};
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
@@ -123,6 +124,15 @@ const REGION_FAST: FastLocals = FastLocals {
     data: 6,
     wide: 7,
 };
+
+const TRACE_STATE_LOCAL: u32 = 4;
+const TRACE_FAST: FastLocals = FastLocals {
+    addr: 5,
+    entry: 6,
+    data: 7,
+    wide: 8,
+};
+pub(crate) const TRACE_RESUME_BITS: u32 = 8;
 
 /// The mask of permission bits the fast path requires per byte: `READ | INIT`
 /// for a load, `WRITE | INIT` for a store (`READ=0b10`, `WRITE=0b100`,
@@ -2512,6 +2522,265 @@ pub fn translate_region(block: &pcode::Block, cond: Option<Value>) -> Option<Vec
     module.section(&code);
 
     Some(module.finish())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TraceResume {
+    pub block_id: usize,
+    pub addr: u64,
+}
+
+pub struct TraceTranslation {
+    pub bytes: Vec<u8>,
+    pub resumes: Vec<TraceResume>,
+    /// Global fault index -> (arena block id, p-code index in that block).
+    pub fault_sites: Vec<(usize, usize)>,
+}
+
+/// Compiles a bounded multi-block CFG as a wasm state-machine loop. Internal
+/// edges select the next state without returning to Rust/JS; static side exits
+/// return a compact resume code. The high bits of a successful return are the
+/// exact guest instructions retired, so unlike a single-block region, blocks
+/// of different sizes preserve fuel and icount exactly.
+pub fn translate_trace(
+    blocks: &[LiftedBlock],
+    order: &[usize],
+    pc: VarNode,
+) -> Option<TraceTranslation> {
+    if order.len() < 2 || order.len() > 8 || pc.size != 8 {
+        return None;
+    }
+    let states: std::collections::HashMap<usize, u32> = order
+        .iter()
+        .enumerate()
+        .map(|(state, &block)| (block, state as u32))
+        .collect();
+    if states.len() != order.len() {
+        return None;
+    }
+    if order.iter().any(|&id| id >= blocks.len()) {
+        return None;
+    }
+    let has_host = order.iter().any(|&id| block_needs_host(&blocks[id].pcode));
+    let mut resumes = Vec::<TraceResume>::new();
+    let mut fault_sites = Vec::new();
+    for &id in order {
+        let block = blocks.get(id)?;
+        if block.has_breakpoint() || block.num_instructions == 0 {
+            return None;
+        }
+        fault_sites.extend((0..block.pcode.instructions.len()).map(|index| (id, index)));
+    }
+
+    let mut body = Function::new([
+        (1, ValType::I64),
+        (1, ValType::I32),
+        (1, ValType::I64),
+        (2, ValType::I32),
+        (WIDE_SCRATCH, ValType::I64),
+    ]);
+    body.instruction(&Instruction::Loop(BlockType::Empty));
+    let mut global_index = 0_u32;
+
+    for (state, &id) in order.iter().enumerate() {
+        let block = blocks.get(id)?;
+        body.instruction(&Instruction::LocalGet(TRACE_STATE_LOCAL));
+        body.instruction(&Instruction::I32Const(state as i32));
+        body.instruction(&Instruction::I32Eq);
+        body.instruction(&Instruction::If(BlockType::Empty));
+
+        // Keep the architectural PC on the state about to run, including a
+        // budget return before its first instruction.
+        emit_store_addr(&mut body);
+        body.instruction(&Instruction::I64Const(block.start as i64));
+        emit_store(&mut body, pc)?;
+
+        // Do not enter a block that does not fit the remaining fuel.
+        body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+        body.instruction(&Instruction::I64Const(block.num_instructions as i64));
+        body.instruction(&Instruction::I64Add);
+        body.instruction(&Instruction::LocalGet(REGION_MAX_ITERS_PARAM));
+        body.instruction(&Instruction::I64GtU);
+        body.instruction(&Instruction::If(BlockType::Empty));
+        let resume = trace_resume(&mut resumes, id, block.start)?;
+        emit_trace_return(&mut body, resume);
+        body.instruction(&Instruction::End);
+
+        for inst in &block.pcode.instructions {
+            translate_instruction(
+                &mut body,
+                inst,
+                global_index,
+                has_host,
+                Some(REGION_ITER_LOCAL),
+                TRACE_FAST,
+            )?;
+            global_index += 1;
+        }
+        body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+        body.instruction(&Instruction::I64Const(block.num_instructions as i64));
+        body.instruction(&Instruction::I64Add);
+        body.instruction(&Instruction::LocalSet(REGION_ITER_LOCAL));
+
+        match block.exit {
+            BlockExit::Jump { target } => {
+                emit_trace_target(&mut body, target, blocks, &states, &mut resumes, pc, 1)?
+            }
+            BlockExit::Branch {
+                cond,
+                target,
+                fallthrough,
+            } => {
+                emit_load(&mut body, cond, cond.size())?;
+                match wasm_ty(cond.size())? {
+                    ValType::I32 => {
+                        body.instruction(&Instruction::I32Const(0));
+                        body.instruction(&Instruction::I32Ne);
+                    }
+                    ValType::I64 => {
+                        body.instruction(&Instruction::I64Const(0));
+                        body.instruction(&Instruction::I64Ne);
+                    }
+                    _ => return None,
+                }
+                body.instruction(&Instruction::If(BlockType::Empty));
+                emit_trace_target(&mut body, target, blocks, &states, &mut resumes, pc, 2)?;
+                body.instruction(&Instruction::Else);
+                emit_trace_target(&mut body, fallthrough, blocks, &states, &mut resumes, pc, 2)?;
+                body.instruction(&Instruction::End);
+            }
+            _ => return None,
+        }
+        body.instruction(&Instruction::End);
+    }
+    // An invalid state cannot execute guest code. Return the retired count;
+    // the selector/compiler pair never emits such a state.
+    body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+    body.instruction(&Instruction::I64Const(TRACE_RESUME_BITS as i64));
+    body.instruction(&Instruction::I64Shl);
+    body.instruction(&Instruction::Return);
+    body.instruction(&Instruction::End); // loop
+    body.instruction(&Instruction::I64Const(0));
+    body.instruction(&Instruction::End); // function
+
+    let bytes = finish_region_module(body, has_host);
+    Some(TraceTranslation {
+        bytes,
+        resumes,
+        fault_sites,
+    })
+}
+
+fn trace_resume(resumes: &mut Vec<TraceResume>, block_id: usize, addr: u64) -> Option<u32> {
+    if let Some(index) = resumes
+        .iter()
+        .position(|resume| resume.block_id == block_id && resume.addr == addr)
+    {
+        return Some(index as u32);
+    }
+    if resumes.len() >= (1 << TRACE_RESUME_BITS) {
+        return None;
+    }
+    resumes.push(TraceResume { block_id, addr });
+    Some((resumes.len() - 1) as u32)
+}
+
+fn target_resume(target: Target, blocks: &[LiftedBlock]) -> Option<(usize, u64)> {
+    match target {
+        Target::Internal(id) => Some((id, blocks.get(id)?.start)),
+        Target::External(Value::Const(addr, _)) => Some((usize::MAX, addr)),
+        _ => None,
+    }
+}
+
+fn emit_trace_return(body: &mut Function, resume: u32) {
+    body.instruction(&Instruction::LocalGet(REGION_ITER_LOCAL));
+    body.instruction(&Instruction::I64Const(TRACE_RESUME_BITS as i64));
+    body.instruction(&Instruction::I64Shl);
+    body.instruction(&Instruction::I64Const(resume as i64));
+    body.instruction(&Instruction::I64Or);
+    body.instruction(&Instruction::Return);
+}
+
+fn emit_trace_target(
+    body: &mut Function,
+    target: Target,
+    blocks: &[LiftedBlock],
+    states: &std::collections::HashMap<usize, u32>,
+    resumes: &mut Vec<TraceResume>,
+    pc: VarNode,
+    loop_depth: u32,
+) -> Option<()> {
+    let internal_state = match target {
+        Target::Internal(id) => states.get(&id).copied(),
+        Target::External(Value::Const(addr, _)) => states.iter().find_map(|(&id, &state)| {
+            (blocks.get(id).map(|block| block.start) == Some(addr)).then_some(state)
+        }),
+        _ => None,
+    };
+    if let Some(state) = internal_state {
+        body.instruction(&Instruction::I32Const(state as i32));
+        body.instruction(&Instruction::LocalSet(TRACE_STATE_LOCAL));
+        body.instruction(&Instruction::Br(loop_depth));
+        return Some(());
+    }
+    let (block_id, addr) = target_resume(target, blocks)?;
+    emit_store_addr(body);
+    body.instruction(&Instruction::I64Const(addr as i64));
+    emit_store(body, pc)?;
+    let resume = trace_resume(resumes, block_id, addr)?;
+    emit_trace_return(body, resume);
+    Some(())
+}
+
+fn finish_region_module(body: Function, has_host: bool) -> Vec<u8> {
+    let mut module = Module::new();
+    let mut types = TypeSection::new();
+    types
+        .ty()
+        .function([ValType::I32, ValType::I32, ValType::I64], [ValType::I64]);
+    if has_host {
+        types
+            .ty()
+            .function([ValType::I64, ValType::I32, ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I64, ValType::I64, ValType::I32], [ValType::I32]);
+        types.ty().function([ValType::I32], []);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I64, ValType::I32], []);
+    }
+    module.section(&types);
+    let mut imports = wasm_encoder::ImportSection::new();
+    imports.import(
+        "env",
+        "regs",
+        EntityType::Memory(MemoryType {
+            minimum: REG_PAGES,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        }),
+    );
+    if has_host {
+        imports.import("env", "load", EntityType::Function(1));
+        imports.import("env", "store", EntityType::Function(2));
+        imports.import("env", "fault", EntityType::Function(3));
+        imports.import("env", "raise", EntityType::Function(4));
+    }
+    module.section(&imports);
+    let mut funcs = FunctionSection::new();
+    funcs.function(0);
+    module.section(&funcs);
+    let mut exports = ExportSection::new();
+    exports.export("run", ExportKind::Func, if has_host { 4 } else { 0 });
+    module.section(&exports);
+    let mut code = CodeSection::new();
+    code.function(&body);
+    module.section(&code);
+    module.finish()
 }
 
 /// The outcome of running a compiled block through a [`JitBackend`].

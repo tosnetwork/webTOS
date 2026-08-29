@@ -1700,6 +1700,57 @@ pub extern "C" fn wtw_secrets_apply() -> i32 {
     })
 }
 
+/// Mounts one credential as a read-only, host-handle-backed guest file. The
+/// value never becomes VFS contents and therefore cannot enter a snapshot.
+#[no_mangle]
+pub extern "C" fn wtw_secret_handle(
+    name_ptr: u32,
+    name_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+    path_ptr: u32,
+    path_len: u32,
+    principal_ptr: u32,
+    principal_len: u32,
+) -> i32 {
+    with_state(|state| {
+        let (Some(name), Some(value), Some(path), Some(principal)) = (
+            slice_arg(name_ptr, name_len),
+            slice_arg(value_ptr, value_len),
+            path_arg(path_ptr, path_len),
+            slice_arg(principal_ptr, principal_len),
+        ) else {
+            return fail(state, "secret handle argument is not inside module memory");
+        };
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_secret_handle called before wtw_init");
+        };
+        let name = String::from_utf8_lossy(&name);
+        let principal = String::from_utf8_lossy(&principal);
+        match machine.mount_secret_handle(&name, &value, &path, &principal) {
+            Ok(_) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// Selects the host-only agent principal that may dereference scoped handles.
+#[no_mangle]
+pub extern "C" fn wtw_agent_principal(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let Some(principal) = slice_arg(ptr, len) else {
+            return fail(state, "agent principal is not inside module memory");
+        };
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_agent_principal called before wtw_init");
+        };
+        match machine.set_agent_principal(&String::from_utf8_lossy(&principal)) {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
 /// Names a file the next `wtw_fs_export` writes as empty. A host that streams
 /// large images into the guest and caches them itself would otherwise carry
 /// them in every snapshot too; it excludes them here and re-injects them after

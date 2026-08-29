@@ -11,7 +11,7 @@
 // Usage:  node web/bench.mjs [--engines=chromium,firefox,webkit] [--headed]
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,7 +22,9 @@ const ALL_ENGINES = ["chromium", "firefox", "webkit"];
 const args = process.argv.slice(2);
 const headed = args.includes("--headed");
 const engineArg = args.find((a) => a.startsWith("--engines="));
+const reportArg = args.find((a) => a.startsWith("--report="));
 const engines = engineArg ? engineArg.slice("--engines=".length).split(",") : ALL_ENGINES;
+const reportPath = reportArg ? reportArg.slice("--report=".length) : null;
 
 let playwright;
 try {
@@ -256,7 +258,7 @@ try {
         controlUrl,
         sizesMiB: [1, 4],
       });
-      rows.push({ name, ...result });
+      rows.push({ name, version: context.browser()?.version() ?? "unknown", ...result });
       console.log(`\n=== ${name} ===`);
       console.log(
         `[bench] ${"module instantiate".padEnd(28)} ${result.instantiateMs.toFixed(0).padStart(7)} ms`,
@@ -301,6 +303,24 @@ try {
   }
 } finally {
   server.close();
+}
+
+if (reportPath) {
+  const report = {
+    engines: rows.map((row) => ({
+      before_grow_mib: row.beforeGrowMiB,
+      control: row.control,
+      linear_memory_ceiling_mib: row.ceilingMiB,
+      machine_build_ms: row.buildMs,
+      module_instantiate_ms: row.instantiateMs,
+      name: row.name,
+      runs: row.runs,
+      version: row.version,
+    })),
+    schema_version: 1,
+  };
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(`\n[bench] browser dashboard report ${reportPath}`);
 }
 
 if (rows.length > 1) {

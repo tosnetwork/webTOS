@@ -1,0 +1,50 @@
+name: verify published performance evidence
+
+on:
+  pull_request:
+    paths:
+      - docs/performance/**
+      - tools/performance_dashboard.py
+      - tools/test_performance_dashboard.py
+      - crates/linux-compat/tests/bench.rs
+      - web/bench.mjs
+      - web/build.sh
+      - crates/**
+      - .github/workflows/performance.yml
+  push:
+    branches: [main]
+    paths:
+      - docs/performance/**
+      - tools/performance_dashboard.py
+      - crates/**
+      - web/**
+      - .github/workflows/performance.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Test the report contract
+        run: python3 -B tools/test_performance_dashboard.py
+
+      - name: Rebuild the measured runtime
+        run: bash web/build.sh
+
+      - name: Reject runtime or rendered-dashboard drift
+        run: |
+          python3 -B tools/performance_dashboard.py verify \
+            docs/performance/latest.json web/webtos_web.wasm \
+            --markdown docs/performance/README.md
+
+      - name: Upload verified evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: webtos-performance
+          path: docs/performance/
+          if-no-files-found: error

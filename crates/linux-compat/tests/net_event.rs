@@ -14,7 +14,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use linux_compat::net::{HostBroker, NativeBroker};
+use linux_compat::net::{HostBroker, NativeBroker, NetworkBroker, RecvOutcome};
 use linux_compat::Machine;
 use x64_engine::{CpuExit, EngineConfig};
 
@@ -1238,6 +1238,28 @@ fn a_signal_interrupts_a_socket_read_unless_the_handler_asked_for_a_restart() {
 }
 
 // ── Transient failure and reconnect ──────────────────────────────────────────
+
+#[test]
+fn host_proxy_error_is_delivered_once_as_econnreset() {
+    let mut broker = HostBroker::new();
+    let destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+    let handle = broker.tcp_connect(destination).expect("connect handle");
+    broker.deliver_connected(handle, None);
+    broker.deliver_data(handle, b"buffered");
+    broker.deliver_error(handle, linux_compat::abi::ECONNRESET);
+
+    match broker.tcp_recv(handle, 64) {
+        Ok(RecvOutcome::Data(bytes)) => assert_eq!(bytes, b"buffered"),
+        _ => panic!("bytes received before the proxy failure were discarded"),
+    }
+    assert!(
+        matches!(
+            broker.tcp_recv(handle, 64),
+            Err(linux_compat::abi::ECONNRESET)
+        ),
+        "a failed relay must terminate the wait with ECONNRESET, not EOF"
+    );
+}
 
 /// Accepts and drops the first `fail_first` connections without answering,
 /// then serves normally. A peer that goes away mid-exchange is the ordinary

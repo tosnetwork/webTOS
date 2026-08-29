@@ -822,7 +822,7 @@ fn the_code_budget_evicts_and_recompiles() {
 // eager run produces — for the interpreter and for the JIT (region) path, which
 // faults out and lets the interpreter retry at the faulting offset.
 
-fn run_page_in_scan(code: &[u8], count: u64, jit: bool, lazy: bool) -> (u64, u64, u64) {
+fn run_page_in_scan(code: &[u8], count: u64, jit: bool, lazy: bool) -> (u64, u64, u64, u64, u64) {
     let base = 0x40_0000u64;
     let buf = 0x20_0000u64;
     let data: Vec<u8> = (0..count).map(|i| (i & 0xff) as u8).collect();
@@ -896,20 +896,26 @@ fn run_page_in_scan(code: &[u8], count: u64, jit: bool, lazy: bool) -> (u64, u64
     let rax = vm
         .cpu
         .read_reg(vm.cpu.arch.sleigh.get_varnode("RAX").expect("RAX"));
-    (rax, vm.cpu.icount(), vm.page_in_count())
+    (
+        rax,
+        vm.cpu.icount(),
+        vm.page_in_count(),
+        vm.jit_dispatch_count(),
+        vm.jit_region_dispatch_count(),
+    )
 }
 
 #[test]
 fn a_page_in_retries_identically_to_an_eager_run() {
     // A single-block self-loop (the JIT compiles it as a region), and a two-block
-    // loop whose memory-reading header is not a self-loop (the JIT compiles it on
-    // the per-block path). Both, interpreted and JIT'd, must page in once and
+    // loop whose memory-reading header is not a self-loop (the JIT compiles both
+    // blocks as one state-machine region). Both, interpreted and JIT'd, must page in once and
     // match the eager run.
     // region form: movzx edx,[rsi]; add rax,rdx; inc rsi; dec rcx; jnz; hlt
     let region_loop = [
         0x0f, 0xb6, 0x16, 0x48, 0x01, 0xd0, 0x48, 0xff, 0xc6, 0x48, 0xff, 0xc9, 0x75, 0xf2, 0xf4,
     ];
-    // per-block form: header A reads memory and conditionally exits (a branch, so
+    // multi-block form: header A reads memory and conditionally exits (a branch, so
     // A is its own block, not a self-loop); block B advances and jumps back to A.
     //   A: movzx edx,[rsi]; add rax,rdx; test rcx,rcx; jz done
     //   B: inc rsi; dec rcx; jmp A
@@ -920,7 +926,7 @@ fn a_page_in_retries_identically_to_an_eager_run() {
     ];
     for (label, code) in [
         ("region", &region_loop[..]),
-        ("per-block", &per_block_loop[..]),
+        ("multi-block", &per_block_loop[..]),
     ] {
         for jit in [false, true] {
             let mode = if jit { "JIT" } else { "interp" };
@@ -942,6 +948,17 @@ fn a_page_in_retries_identically_to_an_eager_run() {
                 "{label}/{mode}: retired instruction count diverged (eager {}, lazy {})",
                 eager.1, lazy.1
             );
+            if jit {
+                assert!(eager.3 > 0, "{label}/{mode}: no compiled dispatch ran");
+                if label == "multi-block" {
+                    assert!(
+                        eager.4 > 0 && eager.4 <= 8,
+                        "{label}/{mode}: expected a few multi-block region dispatches, got {} region / {} total",
+                        eager.4,
+                        eager.3
+                    );
+                }
+            }
         }
     }
 }

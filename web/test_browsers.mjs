@@ -658,8 +658,18 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
       // The strongest thing to check about a credential is where it is not.
       const stored = await page.evaluate(async () => {
         const root = await navigator.storage.getDirectory();
-        const handle = await root.getFileHandle("webtos-fs.bin");
-        return new TextDecoder().decode(await (await handle.getFile()).arrayBuffer());
+        const snapshots = [];
+        for (const name of ["webtos-fs.bin.0", "webtos-fs.bin.1"]) {
+          try {
+            const handle = await root.getFileHandle(name);
+            const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+            // WTWFS02\0 + generation + payload length + SHA-256.
+            snapshots.push(new TextDecoder().decode(bytes.subarray(52)));
+          } catch (error) {
+            if (error?.name !== "NotFoundError") throw error;
+          }
+        }
+        return snapshots.join("\n");
       });
       record(
         "secrets: the checkpoint carries the placeholder, not the value",
@@ -962,38 +972,75 @@ async function runEngine(name, origin, gateway, images) {
       readBack.status,
     );
 
-    // A persist interrupted partway must not corrupt the committed snapshot.
-    // The probe persists a good snapshot, then persists again with the next
-    // write made to reject — a worker killed mid-write — and reads the
-    // committed file back. `intact` is true only if the good snapshot
-    // survived the failed second persist. Run in its own worker so the demo
-    // page's is untouched.
+    // A real Worker termination halfway through a write must not corrupt the
+    // committed snapshot. Run it in its own worker so the demo page's worker
+    // is untouched, then use a fresh worker to select and hash the surviving
+    // generation.
     const probe = await page.evaluate(async (workerUrl) => {
-      const worker = new Worker(workerUrl);
-      const boot = new Promise((r) => {
-        worker.onmessage = (e) => {
-          if (e.data.type === "ready") r(true);
+      const waitFor = (worker, type) => new Promise((resolve, reject) => {
+        const listener = (event) => {
+          if (event.data.type === "error") {
+            worker.removeEventListener("message", listener);
+            reject(new Error(event.data.text));
+          }
+          if (event.data.type === type) {
+            worker.removeEventListener("message", listener);
+            resolve(event.data);
+          }
         };
+        worker.addEventListener("message", listener);
       });
-      worker.postMessage({ type: "boot", files: [] });
-      await boot;
-      const result = new Promise((r) => {
-        worker.onmessage = (e) => {
-          if (e.data.type === "persistProbe") r(e.data);
-          if (e.data.type === "error") r({ intact: false, error: e.data.text });
-        };
-      });
-      worker.postMessage({ type: "persistFaultProbe" });
-      const out = await result;
-      worker.terminate();
-      return out;
+
+      const writer = new Worker(workerUrl);
+      const ready = waitFor(writer, "ready");
+      writer.postMessage({ type: "boot", files: [] });
+      await ready;
+      const persisted = waitFor(writer, "persisted");
+      writer.postMessage({ type: "persist" });
+      await persisted;
+      const identity = waitFor(writer, "snapshotIdentity");
+      writer.postMessage({ type: "snapshotIdentityProbe" });
+      const before = await identity;
+      const paused = waitFor(writer, "persistPaused");
+      writer.postMessage({ type: "persistPauseProbe" });
+      await paused;
+      writer.terminate();
+
+      const reader = new Worker(workerUrl);
+      const recovered = waitFor(reader, "snapshotIdentity");
+      reader.postMessage({ type: "snapshotIdentityProbe" });
+      const after = await recovered;
+      reader.terminate();
+      return {
+        before,
+        after,
+        intact: before.len > 0 && before.len === after.len && before.digest === after.digest,
+      };
     }, `${origin}/web/worker.js`);
     record(
-      "checkpoint: an interrupted persist leaves the committed snapshot intact",
-      probe.intact === true && probe.threw === true,
+      "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+      probe.intact === true,
       probe.intact
-        ? `a failed persist threw and the committed ${probe.len}-byte snapshot was unchanged`
-        : `committed snapshot corrupted by a failed persist: ${JSON.stringify(probe)}`,
+        ? `worker terminated mid-write; committed ${probe.before.len}-byte snapshot was unchanged`
+        : `committed snapshot corrupted after worker termination: ${JSON.stringify(probe)}`,
+    );
+
+    const networkContract = await page.evaluate(async (workerUrl) => {
+      const worker = new Worker(workerUrl);
+      const result = new Promise((resolve) => {
+        worker.onmessage = (event) => {
+          if (event.data.type === "networkErrorContract") resolve(event.data.cases);
+        };
+      });
+      worker.postMessage({ type: "networkErrorContractProbe" });
+      const cases = await result;
+      worker.terminate();
+      return cases;
+    }, `${origin}/web/worker.js`);
+    record(
+      "network: proxy failure becomes a terminal Linux errno",
+      networkContract.every((item) => item.ok),
+      networkContract.map((item) => `${item.name}=${item.got}`).join(", "),
     );
 
     await page.click("#forget");
