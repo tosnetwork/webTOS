@@ -315,8 +315,28 @@ impl From<SysResult> for Outcome {
 
 fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome {
     match nr {
-        abi::SYS_EXIT => task_exit(env, cpu, encode_exit_status(a[0]), false),
-        abi::SYS_EXIT_GROUP => task_exit(env, cpu, encode_exit_status(a[0]), true),
+        abi::SYS_EXIT => {
+            if std::env::var_os("THREAD_TRACE").is_some() {
+                eprintln!(
+                    "[thread] exit pid={} code={} @{}",
+                    env.proc.pid,
+                    a[0],
+                    cpu.icount()
+                );
+            }
+            task_exit(env, cpu, encode_exit_status(a[0]), false)
+        }
+        abi::SYS_EXIT_GROUP => {
+            if std::env::var_os("THREAD_TRACE").is_some() {
+                eprintln!(
+                    "[thread] exit_group pid={} code={} @{}",
+                    env.proc.pid,
+                    a[0],
+                    cpu.icount()
+                );
+            }
+            task_exit(env, cpu, encode_exit_status(a[0]), true)
+        }
         abi::SYS_READ => outcome_read(env, cpu, a[0], a[1], a[2]),
         abi::SYS_PREAD64 => sys_pread(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_WRITE => outcome_write(env, cpu, a[0], a[1], a[2]),
@@ -326,7 +346,20 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
         abi::SYS_FORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
         abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::vfork()),
-        abi::SYS_CLONE => sys_clone_impl(env, cpu, CloneSpec::from_clone_args(a)),
+        abi::SYS_CLONE => {
+            let r = sys_clone_impl(env, cpu, CloneSpec::from_clone_args(a));
+            if std::env::var_os("THREAD_TRACE").is_some() {
+                if let Outcome::Ret(Ok(child)) = &r {
+                    eprintln!(
+                        "[thread] clone parent={} child={child} flags={:#x} @{}",
+                        env.proc.pid,
+                        a[0],
+                        cpu.icount()
+                    );
+                }
+            }
+            r
+        }
         abi::SYS_EXECVE => sys_execve(env, cpu, a[0], a[1], a[2]),
         abi::SYS_WAIT4 => sys_wait4(env, cpu, a[0], a[1], a[2]),
         abi::SYS_PIPE => sys_pipe(env, cpu, a[0], 0).into(),
@@ -1281,6 +1314,17 @@ fn offset_into(offset: u64, len: usize) -> usize {
 
 fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -> Outcome {
     let count = count.min(0x40_0000) as usize;
+    if std::env::var_os("THREAD_TRACE").is_some() && count > 0 && count < 4096 {
+        if let Ok(bytes) = read_mem_raw(cpu, buf, count) {
+            if bytes.windows(8).any(|w| w == b"panicked") {
+                eprintln!(
+                    "[panic-write] pid={} fd={fd} len={count} @{}",
+                    env.proc.pid,
+                    cpu.icount()
+                );
+            }
+        }
+    }
     if let Some(outcome) = ensure_guest_range(env, cpu, buf, count, crate::pager::AccessKind::Read)
     {
         return outcome;

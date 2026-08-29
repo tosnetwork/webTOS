@@ -134,7 +134,10 @@ fn main() {
         }
     }
 
-    machine.vm_mut().icount_limit = 20_000_000_000;
+    machine.vm_mut().icount_limit = std::env::var("GUEST_ICOUNT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000_000_000);
     // WATCH_GUEST_WRITE=hexaddr: MMU-level write hook on the 8 bytes at
     // that guest address. Every write (guest instruction or host) reports
     // the value and the guest basic block executing at the time.

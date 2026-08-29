@@ -980,13 +980,20 @@ Exit gate for each agent:
   state needed — `fchown` was ENOSYS, the `fcntl` lock queries were EINVAL,
   and `MAP_SHARED` file mappings were unimplemented; all three now behave and
   are gated natively by a WAL-shaped probe, and a manifest-only terminal
-  session reaches a live prompt in all three engines. What remains: codex's
-  own TUI logging pipeline panics ("Span not found", tracing-subscriber
-  fmt_layer) under this engine's scheduling — reproducible natively with
-  `run_guest GUEST_PTY=1 web/codex`, no failing syscall at the point of death,
-  avoidable there with RUST_LOG=off but not yet under a shell in a browser.
-  The interactive steps are env-gated (WEBTOS_TUI_GATE=1) until that race is
-  root-caused)
+  session reaches a live prompt in all three engines. The remaining blocker is
+  now root-caused and is not this engine's: codex's TUI panic ("Span not
+  found", tracing-subscriber fmt_layer.rs:833) is an upstream
+  tracing-subscriber defect — a span field whose Debug impl emits a nested
+  span during formatting clobbers the per-layer filter's thread-local state,
+  so a filtered-out fmt layer is wrongly told about the span and misreads its
+  own filtered view as "span not found" (tokio-rs/tracing #2448/#2704, still
+  present in 0.3.23). A twenty-line program with two filtered fmt layers and a
+  reentrant Debug reproduces the identical panic on bare macOS with no webTOS
+  involved; codex's TUI installs exactly that shape (file/feedback/log-DB/OTEL
+  layers, each per-layer filtered), and this engine's deterministic schedule
+  makes codex hit the reentrant path reliably where real hardware sometimes
+  misses. No clone/futex/TLS change is warranted; the interactive TUI steps
+  stay env-gated (WEBTOS_TUI_GATE=1) pending a codex-side fix upstream)
 - A checkpointed session resumes after browser reload with filesystem state
   intact. ✅ (the terminal page checkpoints the guest filesystem to browser
   storage on demand; after a real reload `openfox status` reports finding the
