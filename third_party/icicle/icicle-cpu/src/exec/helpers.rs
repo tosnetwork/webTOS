@@ -276,6 +276,12 @@ pub mod x86 {
         ("xsave64", xsave64),
         ("xrstor", xrstor),
         ("xrstor64", xrstor64),
+        ("vpbroadcastd_avx512vl", vpbroadcastd_128),
+        ("vpbroadcastd_avx512f", vpbroadcastd_128),
+        ("vpternlogd_avx512vl", vpternlog_128),
+        ("vpternlogd_avx512f", vpternlog_128),
+        ("vpternlogq_avx512vl", vpternlog_128),
+        ("vpternlogq_avx512f", vpternlog_128),
         ("movmskpd", movmskpd),
         ("movmskps", movmskps),
         ("pinsrw", pinsrw), // Note: implemented in SLEIGH in Ghidra 10.3.
@@ -503,6 +509,45 @@ pub mod x86 {
 
     fn xrstor64(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
         xrstor_impl(cpu, args[0], true);
+    }
+
+    /// One 128-bit slice of EVEX VPBROADCASTD. Wide constructors invoke this
+    /// helper once per slice so no YMM/ZMM value crosses the u128 helper ABI.
+    fn vpbroadcastd_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lane = u128::from(cpu.read::<u32>(args[0].slice(0, 4)));
+        cpu.write_var(dst, lane | lane << 32 | lane << 64 | lane << 96);
+    }
+
+    /// One 128-bit slice of VPTERNLOGD/Q. The truth-table operation is bitwise,
+    /// so dword and qword forms share the same implementation. Source 2 and
+    /// imm8 are the third and fourth p-codeop arguments and are width-safe
+    /// because each vector operand has already been lowered to 128 bits.
+    fn vpternlog_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let destination = cpu.read::<u128>(args[0]);
+        let source1 = cpu.read::<u128>(args[1]);
+        let source2 = cpu.args[0];
+        let table = cpu.args[1] as u8;
+        let mut result = 0_u128;
+        for index in 0..8 {
+            if table & (1 << index) == 0 {
+                continue;
+            }
+            let d = if index & 4 != 0 { destination } else { !destination };
+            let a = if index & 2 != 0 { source1 } else { !source1 };
+            let b = if index & 1 != 0 { source2 } else { !source2 };
+            result |= d & a & b;
+        }
+        cpu.write_var(dst, result);
     }
 
     fn named_reg(cpu: &mut Cpu, name: &str) -> Option<VarNode> {
