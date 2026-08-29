@@ -21,8 +21,91 @@ const PID: u64 = 1000;
 type SysResult = Result<u64, u64>;
 
 // ── Guest memory access ─────────────────────────────────────────────────────
+//
+// Every host-side copy into or out of guest memory behaves like Linux's
+// copy_from_user/copy_to_user: an access that lands on a manifest-backed page
+// that is not yet resident fills the page first (warm), or suspends and
+// restarts the whole syscall once the chunk arrives (cold). Without this, a
+// kernel-side copy would silently read allocator zeros from — or be silently
+// clobbered under — a page the guest itself has never touched.
 
-fn read_mem(cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
+/// Internal sentinel returned through the errno channel when a host-side copy
+/// hit a cold manifest-backed page: [`handle`] intercepts it (before any rax
+/// write or trace event) and suspends for page delivery; the replayed syscall
+/// exception then restarts the handler from scratch. Never guest-visible.
+pub(crate) const PAGE_IN_RESTART: u64 = 0x5041_4745; // "PAGE"
+
+/// Makes `[addr, addr+len)` safe for a host-side copy, filling warm lazy pages
+/// and suspending (via [`PAGE_IN_RESTART`]) on a cold one. The suspend replays
+/// the syscall, so callers must run before the handler commits side effects —
+/// which pointer reads at handler entry and result write-backs both satisfy.
+fn host_touch(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: usize,
+    access: crate::pager::AccessKind,
+) -> Result<(), u64> {
+    if len == 0 || !env.has_lazy_mappings() {
+        return Ok(());
+    }
+    let end = addr.checked_add(len as u64).ok_or(abi::EFAULT)?;
+    let mut page = addr & !(PAGE_SIZE - 1);
+    while page < end {
+        let Some((resident, final_perm)) = env.pager.page_state(env.proc.asid, page) else {
+            page = page.saturating_add(PAGE_SIZE);
+            continue;
+        };
+        let required = match access {
+            crate::pager::AccessKind::Read => perm::READ,
+            crate::pager::AccessKind::Write => perm::WRITE,
+            crate::pager::AccessKind::Execute => perm::EXEC,
+        };
+        if final_perm & required == 0 {
+            return Err(abi::EFAULT);
+        }
+        if !resident {
+            match env.pager.resolve(&env.vfs, env.proc.asid, page, access) {
+                crate::pager::FaultResolution::Ready {
+                    page: resolved,
+                    bytes,
+                    perm: final_perm,
+                } => {
+                    if cpu.mem.write_bytes(resolved, &bytes, perm::NONE).is_err()
+                        || cpu
+                            .mem
+                            .update_perm(resolved, PAGE_SIZE, final_perm)
+                            .is_err()
+                    {
+                        return Err(abi::EFAULT);
+                    }
+                    env.pager.mark_resident(env.proc.asid, resolved, access);
+                }
+                crate::pager::FaultResolution::Missing(_) => {
+                    env.page_in_wait = true;
+                    cpu.pending_exception = Some(cpu.exception);
+                    return Err(PAGE_IN_RESTART);
+                }
+                crate::pager::FaultResolution::Invalid(why) => {
+                    tracing::error!("host copy page-in refused: {why}");
+                    return Err(abi::EIO);
+                }
+                crate::pager::FaultResolution::NotLazy => {}
+            }
+        }
+        page = page.saturating_add(PAGE_SIZE);
+    }
+    Ok(())
+}
+
+fn read_mem(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
+    host_touch(env, cpu, addr, len, crate::pager::AccessKind::Read)?;
+    read_mem_raw(cpu, addr, len)
+}
+
+/// [`read_mem`] without the lazy-page fill — for diagnostics that must never
+/// suspend, and for callers that have already touched the range.
+fn read_mem_raw(cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
     let mut buf = vec![0_u8; len];
     cpu.mem
         .read_bytes(addr, &mut buf, perm::NONE)
@@ -30,19 +113,51 @@ fn read_mem(cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
     Ok(buf)
 }
 
-fn write_mem(cpu: &mut Cpu, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+fn write_mem(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+    host_touch(env, cpu, addr, bytes.len(), crate::pager::AccessKind::Write)?;
+    write_mem_raw(cpu, addr, bytes)
+}
+
+/// [`write_mem`] without the lazy-page fill (see [`read_mem_raw`]).
+fn write_mem_raw(cpu: &mut Cpu, addr: u64, bytes: &[u8]) -> Result<(), u64> {
     cpu.mem
         .write_bytes(addr, bytes, perm::NONE)
         .map_err(|_| abi::EFAULT)
 }
 
-fn read_cstr(cpu: &mut Cpu, addr: u64) -> Result<Vec<u8>, u64> {
-    read_cstr_limit(cpu, addr, PATH_MAX)
+fn read_cstr(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> Result<Vec<u8>, u64> {
+    read_cstr_limit(env, cpu, addr, PATH_MAX)
+}
+
+/// [`read_cstr`] without the lazy-page fill — diagnostics only.
+fn read_cstr_raw(cpu: &mut Cpu, addr: u64) -> Result<Vec<u8>, u64> {
+    let mut out = Vec::new();
+    let mut chunk = [0_u8; 64];
+    let mut cursor = addr;
+    while out.len() < PATH_MAX {
+        let to_page_end = (PAGE_SIZE - (cursor & (PAGE_SIZE - 1))) as usize;
+        let take = 64.min(PATH_MAX - out.len()).min(to_page_end);
+        cpu.mem
+            .read_bytes(cursor, &mut chunk[..take], perm::NONE)
+            .map_err(|_| abi::EFAULT)?;
+        if let Some(nul) = chunk[..take].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..nul]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..take]);
+        cursor += take as u64;
+    }
+    Err(abi::EINVAL)
 }
 
 /// Like [`read_cstr`] with an explicit length cap: argv/envp strings may
 /// legally be far longer than a path (the kernel allows 128 KiB each).
-fn read_cstr_limit(cpu: &mut Cpu, addr: u64, max: usize) -> Result<Vec<u8>, u64> {
+fn read_cstr_limit(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    max: usize,
+) -> Result<Vec<u8>, u64> {
     let mut out = Vec::new();
     let mut chunk = [0_u8; 64];
     let mut cursor = addr;
@@ -51,6 +166,7 @@ fn read_cstr_limit(cpu: &mut Cpu, addr: u64, max: usize) -> Result<Vec<u8>, u64>
         // an unmapped page and a fixed-size chunk read would fault.
         let to_page_end = (PAGE_SIZE - (cursor & (PAGE_SIZE - 1))) as usize;
         let take = 64.min(max - out.len()).min(to_page_end);
+        host_touch(env, cpu, cursor, take, crate::pager::AccessKind::Read)?;
         cpu.mem
             .read_bytes(cursor, &mut chunk[..take], perm::NONE)
             .map_err(|_| abi::EFAULT)?;
@@ -104,14 +220,19 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     }
 
     match dispatch(env, cpu, nr, [a0, a1, a2, a3, a4, a5]) {
+        // A host-side copy hit a cold manifest-backed page: the handler bailed
+        // out through the errno channel before committing a result. Suspend for
+        // delivery; the replayed syscall exception restarts the handler. No rax
+        // write and no trace event — the retried attempt emits the real ones.
+        Outcome::Ret(Err(PAGE_IN_RESTART)) => Some(VmExit::Interrupted),
         Outcome::Ret(result) => {
             let value = match result {
                 Ok(v) => v,
                 Err(errno) => {
                     if std::env::var_os("SYSCALL_ERR_TRACE").is_some() {
                         let path = match nr {
-                            2 => read_cstr(cpu, a0).ok(),
-                            257 | 262 => read_cstr(cpu, a1).ok(),
+                            2 => read_cstr_raw(cpu, a0).ok(),
+                            257 | 262 => read_cstr_raw(cpu, a1).ok(),
                             _ => None,
                         }
                         .map(|p| format!(" path={}", p.escape_ascii()))
@@ -329,14 +450,14 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
                 std::net::Ipv4Addr::UNSPECIFIED,
                 0,
             ));
-            write_sockaddr_in(cpu, a[1], a[2], local)?;
+            write_sockaddr_in(env, cpu, a[1], a[2], local)?;
             Ok(0)
         }
         abi::SYS_SETSOCKOPT => net_of(env, a[0]).map(|_| 0),
         abi::SYS_GETSOCKOPT => sys_getsockopt(env, cpu, a),
         abi::SYS_SOCKETPAIR => sys_socketpair(env, cpu, a),
         abi::SYS_BIND => {
-            let target = parse_sockaddr_in(cpu, a[1], a[2])?;
+            let target = parse_sockaddr_in(env, cpu, a[1], a[2])?;
             if target.port() == 0 {
                 Ok(0) // ephemeral bind: the broker already does this
             } else {
@@ -404,7 +525,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             abi::ARCH_GET_FS => {
                 let fs: u64 = cpu.read_var(env.regs.fs_offset);
-                write_mem(cpu, a[1], &fs.to_le_bytes())?;
+                write_mem(env, cpu, a[1], &fs.to_le_bytes())?;
                 Ok(0)
             }
             op => {
@@ -413,13 +534,13 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
         },
 
-        abi::SYS_UNAME => sys_uname(cpu, a[0]),
+        abi::SYS_UNAME => sys_uname(env, cpu, a[0]),
         abi::SYS_GETRANDOM => sys_getrandom(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETRES => {
             if a[1] != 0 {
                 let res: [u8; 16] = encode_timespec(0, 1);
-                write_mem(cpu, a[1], &res)?;
+                write_mem(env, cpu, a[1], &res)?;
             }
             Ok(0)
         }
@@ -427,7 +548,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_TIME => {
             let (sec, _) = env.now(cpu);
             if a[0] != 0 {
-                write_mem(cpu, a[0], &sec.to_le_bytes())?;
+                write_mem(env, cpu, a[0], &sec.to_le_bytes())?;
             }
             Ok(sec as u64)
         }
@@ -450,7 +571,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             env.proc.clear_child_tid = a[0];
             Ok(env.proc.pid)
         }
-        abi::SYS_PRLIMIT64 => sys_prlimit64(cpu, a[2], a[3]),
+        abi::SYS_PRLIMIT64 => sys_prlimit64(env, cpu, a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
         abi::SYS_PRCTL => {
             const PR_SET_PDEATHSIG: u64 = 1;
@@ -464,7 +585,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
                 // spawn preambles (pre_exec) treat a failure here as fatal.
                 PR_SET_PDEATHSIG => Ok(0),
                 PR_GET_PDEATHSIG => {
-                    write_mem(cpu, a[1], &0u32.to_le_bytes())?;
+                    write_mem(env, cpu, a[1], &0u32.to_le_bytes())?;
                     Ok(0)
                 }
                 other => {
@@ -482,7 +603,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             let mut mask = vec![0_u8; size];
             mask[0] = 1;
-            write_mem(cpu, a[2], &mask)?;
+            write_mem(env, cpu, a[2], &mask)?;
             Ok(8)
         }
 
@@ -516,8 +637,8 @@ fn dir_of(env: &LinuxEnv, dirfd: u64) -> Result<usize, u64> {
     }
 }
 
-fn path_arg(cpu: &mut Cpu, ptr: u64) -> Result<Vec<u8>, u64> {
-    read_cstr(cpu, ptr)
+fn path_arg(env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64) -> Result<Vec<u8>, u64> {
+    read_cstr(env, cpu, ptr)
 }
 
 // ── File I/O ────────────────────────────────────────────────────────────────
@@ -551,7 +672,7 @@ fn sys_inotify_add_watch(
     path_ptr: u64,
     mask: u64,
 ) -> SysResult {
-    let path = read_cstr(cpu, path_ptr)?;
+    let path = read_cstr(env, cpu, path_ptr)?;
     let node = env
         .vfs
         .resolve(crate::vfs::ROOT, &path, true)?
@@ -804,61 +925,12 @@ fn ensure_guest_range(
     len: usize,
     access: crate::pager::AccessKind,
 ) -> Option<Outcome> {
-    if len == 0 {
-        return None;
+    match host_touch(env, cpu, addr, len, access) {
+        Ok(()) => None,
+        // host_touch already armed the suspend state for a cold page.
+        Err(PAGE_IN_RESTART) => Some(Outcome::Exit(VmExit::Interrupted)),
+        Err(errno) => Some(Outcome::Ret(Err(errno))),
     }
-    let end = match addr.checked_add(len as u64) {
-        Some(end) => end,
-        None => return Some(Outcome::Ret(Err(abi::EFAULT))),
-    };
-    let required = match access {
-        crate::pager::AccessKind::Read => perm::READ,
-        crate::pager::AccessKind::Write => perm::WRITE,
-        crate::pager::AccessKind::Execute => perm::EXEC,
-    };
-    let mut page = addr & !(PAGE_SIZE - 1);
-    while page < end {
-        let Some((resident, final_perm)) = env.pager.page_state(env.proc.asid, page) else {
-            page = page.saturating_add(PAGE_SIZE);
-            continue;
-        };
-        if final_perm & required == 0 {
-            return Some(Outcome::Ret(Err(abi::EFAULT)));
-        }
-        if !resident {
-            match env.pager.resolve(&env.vfs, env.proc.asid, page, access) {
-                crate::pager::FaultResolution::Ready {
-                    page: resolved,
-                    bytes,
-                    perm: final_perm,
-                } => {
-                    if cpu.mem.write_bytes(resolved, &bytes, perm::NONE).is_err()
-                        || cpu
-                            .mem
-                            .update_perm(resolved, PAGE_SIZE, final_perm)
-                            .is_err()
-                    {
-                        return Some(Outcome::Ret(Err(abi::EFAULT)));
-                    }
-                    env.pager.mark_resident(env.proc.asid, resolved, access);
-                }
-                crate::pager::FaultResolution::Missing(_) => {
-                    env.page_in_wait = true;
-                    cpu.pending_exception = Some(cpu.exception);
-                    return Some(Outcome::Exit(VmExit::Interrupted));
-                }
-                crate::pager::FaultResolution::Invalid(why) => {
-                    tracing::error!("syscall page-in refused: {why}");
-                    return Some(Outcome::Ret(Err(abi::EIO)));
-                }
-                crate::pager::FaultResolution::NotLazy => {
-                    return Some(Outcome::Ret(Err(abi::EFAULT)));
-                }
-            }
-        }
-        page = page.saturating_add(PAGE_SIZE);
-    }
-    None
 }
 
 fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Result<u64, u64> {
@@ -935,7 +1007,7 @@ fn sys_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) ->
             return wait_for_file_chunk(env, cpu, hash);
         }
     };
-    match write_mem(cpu, buf, &chunk) {
+    match write_mem(env, cpu, buf, &chunk) {
         Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
         Err(errno) => Outcome::Ret(Err(errno)),
     }
@@ -1008,7 +1080,7 @@ fn sys_sysinfo(env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64) -> SysResult {
     put(48, cap_pages.saturating_sub(used_pages)); // freeram
     put(72, 1); // procs
     buf[104..108].copy_from_slice(&(mem_unit as u32).to_le_bytes());
-    write_mem(cpu, ptr, &buf)?;
+    write_mem(env, cpu, ptr, &buf)?;
     Ok(0)
 }
 
@@ -1031,7 +1103,7 @@ fn sys_getrusage(env: &mut LinuxEnv, cpu: &mut Cpu, who: i64, ptr: u64) -> SysRe
     let nanos = env.now_nanos(cpu);
     buf[0..8].copy_from_slice(&(nanos / 1_000_000_000).to_le_bytes());
     buf[8..16].copy_from_slice(&((nanos % 1_000_000_000) / 1_000).to_le_bytes());
-    write_mem(cpu, ptr, &buf)?;
+    write_mem(env, cpu, ptr, &buf)?;
     Ok(0)
 }
 
@@ -1208,16 +1280,21 @@ fn sys_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64) -
             return outcome;
         }
     }
-    let bytes = match read_mem(cpu, buf, count) {
+    let bytes = match read_mem(env, cpu, buf, count) {
         Ok(bytes) => bytes,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
     Outcome::Ret(write_backing(env, &mut desc, &bytes))
 }
 
-fn iter_iov(cpu: &mut Cpu, iov: u64, iovcnt: u64) -> Result<Vec<(u64, u64)>, u64> {
+fn iter_iov(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    iov: u64,
+    iovcnt: u64,
+) -> Result<Vec<(u64, u64)>, u64> {
     let iovcnt = iovcnt.min(1024);
-    let raw = read_mem(cpu, iov, (iovcnt * 16) as usize)?;
+    let raw = read_mem(env, cpu, iov, (iovcnt * 16) as usize)?;
     Ok(raw
         .as_chunks::<16>()
         .0
@@ -1264,7 +1341,7 @@ fn sys_pread(
             return wait_for_file_chunk(env, cpu, hash);
         }
     };
-    match write_mem(cpu, buf, &chunk) {
+    match write_mem(env, cpu, buf, &chunk) {
         Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
         Err(errno) => Outcome::Ret(Err(errno)),
     }
@@ -1296,7 +1373,7 @@ fn sys_pwrite(
         drop(desc);
         return outcome;
     }
-    let bytes = match read_mem(cpu, buf, count) {
+    let bytes = match read_mem(env, cpu, buf, count) {
         Ok(bytes) => bytes,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -1315,7 +1392,7 @@ fn sys_openat(
     flags: u64,
     mode: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     // A few `/proc` files are answered from the machine's own state. They are
     // written into the filesystem at each open rather than being a live
     // backing: a reader gets the snapshot it opened, which is what procfs
@@ -1527,7 +1604,7 @@ fn sys_getdents64(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, dirp: u64, count: 
         position += 1;
     }
     *cookie = position as u64;
-    write_mem(cpu, dirp, &out)?;
+    write_mem(env, cpu, dirp, &out)?;
     Ok(out.len() as u64)
 }
 
@@ -1602,7 +1679,7 @@ fn stat_of_fd(env: &LinuxEnv, fd: u64) -> Result<abi::Stat, u64> {
 
 fn sys_fstat(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64) -> SysResult {
     let stat = stat_of_fd(env, fd)?;
-    write_mem(cpu, buf, &stat.encode())?;
+    write_mem(env, cpu, buf, &stat.encode())?;
     Ok(0)
 }
 
@@ -1614,12 +1691,12 @@ fn sys_statpath(
     buf: u64,
     follow: bool,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, follow)?;
     let node = resolved.node.ok_or(abi::ENOENT)?;
     let stat = stat_of_node(env, node);
-    write_mem(cpu, buf, &stat.encode())?;
+    write_mem(env, cpu, buf, &stat.encode())?;
     Ok(0)
 }
 
@@ -1631,7 +1708,7 @@ fn sys_newfstatat(
     buf: u64,
     flags: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     if path.is_empty() && flags & abi::AT_EMPTY_PATH != 0 {
         return sys_fstat(env, cpu, dirfd, buf);
     }
@@ -1647,7 +1724,7 @@ fn sys_statx(
     flags: u64,
     buf: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let stat = if path.is_empty() && flags & abi::AT_EMPTY_PATH != 0 {
         stat_of_fd(env, dirfd)?
     } else {
@@ -1678,12 +1755,12 @@ fn sys_statx(
         put(base + 8, &(nsec as u32).to_le_bytes());
     }
     put(136, &1_u32.to_le_bytes()); // dev_major
-    write_mem(cpu, buf, &out)?;
+    write_mem(env, cpu, buf, &out)?;
     Ok(0)
 }
 
 fn sys_faccessat(env: &mut LinuxEnv, cpu: &mut Cpu, dirfd: u64, path_ptr: u64) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, true)?;
     resolved.node.map(|_| 0).ok_or(abi::ENOENT)
@@ -1697,7 +1774,7 @@ fn sys_readlinkat(
     buf: u64,
     size: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let target = if path == b"/proc/self/exe" {
         env.proc.exe_path.clone()
     } else {
@@ -1710,7 +1787,7 @@ fn sys_readlinkat(
         }
     };
     let n = target.len().min(size as usize);
-    write_mem(cpu, buf, &target[..n])?;
+    write_mem(env, cpu, buf, &target[..n])?;
     Ok(n as u64)
 }
 
@@ -1723,7 +1800,7 @@ fn sys_mkdirat(
     path_ptr: u64,
     mode: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, true)?;
     if resolved.node.is_some() {
@@ -1747,7 +1824,7 @@ fn sys_unlinkat(
     path_ptr: u64,
     flags: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, false)?;
     let gone = resolved.node;
@@ -1784,8 +1861,8 @@ fn sys_renameat(
     new_dirfd: u64,
     new_ptr: u64,
 ) -> SysResult {
-    let old_path = path_arg(cpu, old_ptr)?;
-    let new_path = path_arg(cpu, new_ptr)?;
+    let old_path = path_arg(env, cpu, old_ptr)?;
+    let new_path = path_arg(env, cpu, new_ptr)?;
     let old_base = dir_of(env, old_dirfd)?;
     let new_base = dir_of(env, new_dirfd)?;
     let old = env.vfs.resolve(old_base, &old_path, false)?;
@@ -1829,8 +1906,8 @@ fn sys_linkat(
     new_dirfd: u64,
     new_ptr: u64,
 ) -> SysResult {
-    let old_path = path_arg(cpu, old_ptr)?;
-    let new_path = path_arg(cpu, new_ptr)?;
+    let old_path = path_arg(env, cpu, old_ptr)?;
+    let new_path = path_arg(env, cpu, new_ptr)?;
     let old_base = dir_of(env, old_dirfd)?;
     let new_base = dir_of(env, new_dirfd)?;
     let old = env.vfs.resolve(old_base, &old_path, true)?;
@@ -1853,8 +1930,8 @@ fn sys_symlinkat(
     dirfd: u64,
     path_ptr: u64,
 ) -> SysResult {
-    let target = path_arg(cpu, target_ptr)?;
-    let path = path_arg(cpu, path_ptr)?;
+    let target = path_arg(env, cpu, target_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, false)?;
     if resolved.node.is_some() {
@@ -1871,7 +1948,7 @@ fn sys_symlinkat(
 }
 
 fn sys_chdir(env: &mut LinuxEnv, cpu: &mut Cpu, path_ptr: u64) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let resolved = env.vfs.resolve(env.proc.cwd, &path, true)?;
     let node = resolved.node.ok_or(abi::ENOENT)?;
     if !env.vfs.is_dir(node) {
@@ -1897,7 +1974,7 @@ fn sys_getcwd(env: &mut LinuxEnv, cpu: &mut Cpu, buf: u64, size: u64) -> SysResu
     if (size as usize) < path.len() {
         return Err(abi::ERANGE);
     }
-    write_mem(cpu, buf, &path)?;
+    write_mem(env, cpu, buf, &path)?;
     Ok(path.len() as u64)
 }
 
@@ -1908,7 +1985,7 @@ fn sys_chmodat(
     path_ptr: u64,
     mode: u64,
 ) -> SysResult {
-    let path = path_arg(cpu, path_ptr)?;
+    let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, true)?;
     let node = resolved.node.ok_or(abi::ENOENT)?;
@@ -2009,7 +2086,7 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
     // socket or pipe non-blocking, and returning ENOTTY there breaks it.
     match request {
         abi::FIONBIO => {
-            let val = i32::from_le_bytes(read_mem(cpu, arg, 4)?.try_into().expect("4 bytes"));
+            let val = i32::from_le_bytes(read_mem(env, cpu, arg, 4)?.try_into().expect("4 bytes"));
             let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
             let mut desc = desc.borrow_mut();
             if val != 0 {
@@ -2040,7 +2117,7 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             };
             drop(desc);
             drop(fds);
-            write_mem(cpu, arg, &n.to_le_bytes())?;
+            write_mem(env, cpu, arg, &n.to_le_bytes())?;
             return Ok(0);
         }
         _ => {}
@@ -2056,17 +2133,17 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         match request {
             abi::TIOCGPTN => {
                 let id = pty.borrow().id as u32;
-                write_mem(cpu, arg, &id.to_le_bytes())?;
+                write_mem(env, cpu, arg, &id.to_le_bytes())?;
                 return Ok(0);
             }
             abi::TIOCSPTLCK => return Ok(0), // slave unlock: always unlocked
             abi::TCGETS => {
                 let termios = pty.borrow().termios;
-                write_mem(cpu, arg, &termios)?;
+                write_mem(env, cpu, arg, &termios)?;
                 return Ok(0);
             }
             abi::TCSETS | abi::TCSETSW | abi::TCSETSF => {
-                let bytes = read_mem(cpu, arg, 36)?;
+                let bytes = read_mem(env, cpu, arg, 36)?;
                 let mut pty = pty.borrow_mut();
                 pty.termios.copy_from_slice(&bytes);
                 // TCSETSF (tcsetattr's TCSAFLUSH) discards input the caller
@@ -2092,11 +2169,11 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             abi::TIOCGWINSZ => {
                 let ws = pty.borrow().winsize;
                 let bytes: Vec<u8> = ws.iter().flat_map(|v| v.to_le_bytes()).collect();
-                write_mem(cpu, arg, &bytes)?;
+                write_mem(env, cpu, arg, &bytes)?;
                 return Ok(0);
             }
             abi::TIOCSWINSZ => {
-                let bytes = read_mem(cpu, arg, 8)?;
+                let bytes = read_mem(env, cpu, arg, 8)?;
                 let pgrp = {
                     let mut pty = pty.borrow_mut();
                     for (i, w) in pty.winsize.iter_mut().enumerate() {
@@ -2117,14 +2194,14 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
                 return Ok(0);
             }
             abi::TIOCSPGRP => {
-                let bytes = read_mem(cpu, arg, 4)?;
+                let bytes = read_mem(env, cpu, arg, 4)?;
                 pty.borrow_mut().fg_pgrp =
                     u32::from_le_bytes(bytes.try_into().expect("size")) as u64;
                 return Ok(0);
             }
             abi::TIOCGPGRP => {
                 let pgrp = pty.borrow().fg_pgrp as u32;
-                write_mem(cpu, arg, &pgrp.to_le_bytes())?;
+                write_mem(env, cpu, arg, &pgrp.to_le_bytes())?;
                 return Ok(0);
             }
             abi::TIOCNOTTY => return Ok(0),
@@ -2146,7 +2223,7 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         abi::TIOCGWINSZ => {
             let winsize: [u16; 4] = [24, 80, 0, 0];
             let bytes: Vec<u8> = winsize.iter().flat_map(|v| v.to_le_bytes()).collect();
-            write_mem(cpu, arg, &bytes)?;
+            write_mem(env, cpu, arg, &bytes)?;
             Ok(0)
         }
         abi::TCGETS => {
@@ -2157,7 +2234,7 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             termios[4..8].copy_from_slice(&0x0005_u32.to_le_bytes());
             termios[8..12].copy_from_slice(&0x00bf_u32.to_le_bytes());
             termios[12..16].copy_from_slice(&0x8a3b_u32.to_le_bytes());
-            write_mem(cpu, arg, &termios)?;
+            write_mem(env, cpu, arg, &termios)?;
             Ok(0)
         }
         abi::TCSETS
@@ -2169,7 +2246,7 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         | abi::TIOCSCTTY
         | abi::TIOCNOTTY => Ok(0),
         abi::TIOCGPGRP => {
-            write_mem(cpu, arg, &(PID as u32).to_le_bytes())?;
+            write_mem(env, cpu, arg, &(PID as u32).to_le_bytes())?;
             Ok(0)
         }
         _ => {
@@ -2191,7 +2268,7 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
 
     let now = env.now_nanos(cpu);
     let nfds = nfds.min(1024) as usize;
-    let mut records = read_mem(cpu, fds_ptr, nfds * 8)?;
+    let mut records = read_mem(env, cpu, fds_ptr, nfds * 8)?;
     let mut ready = 0_u64;
     for record in records.as_chunks_mut::<8>().0 {
         let fd = i32::from_le_bytes(record[..4].try_into().expect("chunk size"));
@@ -2225,7 +2302,7 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
             ready += 1;
         }
     }
-    write_mem(cpu, fds_ptr, &records)?;
+    write_mem(env, cpu, fds_ptr, &records)?;
     Ok(ready)
 }
 
@@ -2411,7 +2488,7 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         return Err(abi::ENOMEM);
     }
     if let Some(bytes) = file_bytes {
-        write_mem(cpu, target, &bytes)?;
+        write_mem(env, cpu, target, &bytes)?;
     }
     let final_perm = prot_to_perm(prot);
     if let Some((file, file_len)) = lazy_file {
@@ -2493,7 +2570,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     cpu.mem
         .read_bytes(old_addr, &mut buf, perm::NONE)
         .map_err(|_| abi::EFAULT)?;
-    write_mem(cpu, target, &buf)?;
+    write_mem(env, cpu, target, &buf)?;
     cpu.mem.unmap_memory_len(old_addr, old_size);
     env.pager
         .remap(env.proc.asid, old_addr, old_size, target, new_size);
@@ -2575,10 +2652,10 @@ fn sys_rt_sigaction(
             .get(&signal)
             .copied()
             .unwrap_or_default();
-        write_mem(cpu, old, &previous.0)?;
+        write_mem(env, cpu, old, &previous.0)?;
     }
     if new != 0 {
-        let bytes = read_mem(cpu, new, 32)?;
+        let bytes = read_mem(env, cpu, new, 32)?;
         let mut action = SigAction::default();
         action.0.copy_from_slice(&bytes);
         env.proc.sigactions.borrow_mut().insert(signal, action);
@@ -2588,14 +2665,14 @@ fn sys_rt_sigaction(
 
 fn sys_rt_sigprocmask(env: &mut LinuxEnv, cpu: &mut Cpu, how: u64, new: u64, old: u64) -> Outcome {
     if old != 0 {
-        if let Err(errno) = write_mem(cpu, old, &env.proc.sigmask.to_le_bytes()) {
+        if let Err(errno) = write_mem(env, cpu, old, &env.proc.sigmask.to_le_bytes()) {
             return Outcome::Ret(Err(errno));
         }
     }
     if new == 0 {
         return Outcome::Ret(Ok(0));
     }
-    let bytes = match read_mem(cpu, new, 8) {
+    let bytes = match read_mem(env, cpu, new, 8) {
         Ok(bytes) => bytes,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -2649,7 +2726,7 @@ fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) 
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => env.now_monotonic(cpu),
         _ => env.now(cpu),
     };
-    write_mem(cpu, ts, &encode_timespec(sec, nsec))?;
+    write_mem(env, cpu, ts, &encode_timespec(sec, nsec))?;
     Ok(0)
 }
 
@@ -2659,12 +2736,12 @@ fn sys_gettimeofday(env: &mut LinuxEnv, cpu: &mut Cpu, tv: u64) -> SysResult {
         let mut out = [0_u8; 16];
         out[..8].copy_from_slice(&sec.to_le_bytes());
         out[8..].copy_from_slice(&(nsec / 1000).to_le_bytes());
-        write_mem(cpu, tv, &out)?;
+        write_mem(env, cpu, tv, &out)?;
     }
     Ok(0)
 }
 
-fn sys_uname(cpu: &mut Cpu, buf: u64) -> SysResult {
+fn sys_uname(env: &mut LinuxEnv, cpu: &mut Cpu, buf: u64) -> SysResult {
     let mut out = [0_u8; 65 * 6];
     for (i, field) in ["Linux", "webtos", "6.6.0-webtos", "#1 webTOS", "x86_64", ""]
         .iter()
@@ -2673,7 +2750,7 @@ fn sys_uname(cpu: &mut Cpu, buf: u64) -> SysResult {
         let bytes = field.as_bytes();
         out[i * 65..i * 65 + bytes.len()].copy_from_slice(bytes);
     }
-    write_mem(cpu, buf, &out)?;
+    write_mem(env, cpu, buf, &out)?;
     Ok(0)
 }
 
@@ -2684,14 +2761,14 @@ fn sys_getrandom(env: &mut LinuxEnv, cpu: &mut Cpu, buf: u64, len: u64) -> SysRe
         let bytes = env.next_random().to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
-    write_mem(cpu, buf, &out)?;
+    write_mem(env, cpu, buf, &out)?;
     Ok(len as u64)
 }
 
-fn sys_prlimit64(cpu: &mut Cpu, new: u64, old: u64) -> SysResult {
+fn sys_prlimit64(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> SysResult {
     if old != 0 {
         // RLIM_INFINITY for both current and max.
-        write_mem(cpu, old, &[0xff_u8; 16])?;
+        write_mem(env, cpu, old, &[0xff_u8; 16])?;
     }
     let _ = new; // limits are accepted but not enforced
     Ok(0)
@@ -3302,7 +3379,7 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
     // pthread_join waits on this address.
     if env.proc.clear_child_tid != 0 {
         let addr = env.proc.clear_child_tid;
-        let _ = write_mem(cpu, addr, &0_u32.to_le_bytes());
+        let _ = write_mem(env, cpu, addr, &0_u32.to_le_bytes());
         env.sched.futex_wake(addr, u64::MAX);
     }
 
@@ -3637,7 +3714,7 @@ fn sys_sigaltstack(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> Sys
         out[0..8].copy_from_slice(&base.to_le_bytes());
         out[8..12].copy_from_slice(&flags.to_le_bytes());
         out[16..24].copy_from_slice(&size.to_le_bytes());
-        write_mem(cpu, old, &out)?;
+        write_mem(env, cpu, old, &out)?;
     }
     if new == 0 {
         return Ok(0);
@@ -3647,7 +3724,7 @@ fn sys_sigaltstack(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> Sys
     if on_stack {
         return Err(abi::EPERM);
     }
-    let bytes = read_mem(cpu, new, STACK_T_LEN)?;
+    let bytes = read_mem(env, cpu, new, STACK_T_LEN)?;
     let base = u64::from_le_bytes(bytes[0..8].try_into().expect("size"));
     let flags = u32::from_le_bytes(bytes[8..12].try_into().expect("size"));
     let size = u64::from_le_bytes(bytes[16..24].try_into().expect("size"));
@@ -3752,15 +3829,15 @@ fn deliver_signal(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     let siginfo_ptr = sp;
     let mut siginfo = [0_u8; 128];
     siginfo[0..4].copy_from_slice(&(sig as u32).to_le_bytes()); // si_signo
-    let _ = write_mem(cpu, siginfo_ptr, &siginfo);
+    let _ = write_mem(env, cpu, siginfo_ptr, &siginfo);
     sp = sp.saturating_sub(256);
     let ucontext_ptr = sp;
-    let _ = write_mem(cpu, ucontext_ptr, &[0_u8; 256]);
+    let _ = write_mem(env, cpu, ucontext_ptr, &[0_u8; 256]);
     // The ABI wants (rsp + 8) % 16 == 0 at handler entry: align to 16 then push
     // the 8-byte return address.
     sp &= !15_u64;
     sp = sp.saturating_sub(8);
-    if write_mem(cpu, sp, &restorer.to_le_bytes()).is_err() {
+    if write_mem(env, cpu, sp, &restorer.to_le_bytes()).is_err() {
         // Cannot set up the frame; abandon delivery and leave the saved state
         // to be discarded on the next rt_sigreturn-less resume.
         env.proc.signal_saved.pop();
@@ -3843,7 +3920,7 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
 
     if spec.flags & CLONE_PARENT_SETTID != 0
         && spec.parent_tid != 0
-        && write_mem(cpu, spec.parent_tid, &(child_pid as u32).to_le_bytes()).is_err()
+        && write_mem(env, cpu, spec.parent_tid, &(child_pid as u32).to_le_bytes()).is_err()
     {
         return Outcome::Ret(Err(abi::EFAULT));
     }
@@ -3891,13 +3968,13 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
         match child_mem.take() {
             None => {
                 // Shared address space: write directly.
-                let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+                let _ = write_mem(env, cpu, spec.child_tid, &tid_bytes);
             }
             Some(map) => {
                 // Write into the child's copy-on-write map.
                 let parent_map = cpu.mem.take_virtual_mapping();
                 cpu.mem.restore_virtual_mapping(map);
-                let _ = write_mem(cpu, spec.child_tid, &tid_bytes);
+                let _ = write_mem(env, cpu, spec.child_tid, &tid_bytes);
                 child_mem = Some(cpu.mem.take_virtual_mapping());
                 cpu.mem.restore_virtual_mapping(parent_map);
             }
@@ -3943,19 +4020,19 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
 }
 
 /// Reads a NUL-terminated array of string pointers (argv/envp layout).
-fn read_string_vec(cpu: &mut Cpu, mut ptr: u64) -> Result<Vec<Vec<u8>>, u64> {
+fn read_string_vec(env: &mut LinuxEnv, cpu: &mut Cpu, mut ptr: u64) -> Result<Vec<Vec<u8>>, u64> {
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
     }
     while out.len() < 4096 {
-        let entry = read_mem(cpu, ptr, 8)?;
+        let entry = read_mem(env, cpu, ptr, 8)?;
         let addr = u64::from_le_bytes(entry.try_into().expect("read_mem length"));
         if addr == 0 {
             return Ok(out);
         }
         // The kernel's per-string argv/envp limit (MAX_ARG_STRLEN).
-        out.push(read_cstr_limit(cpu, addr, 128 * 1024)?);
+        out.push(read_cstr_limit(env, cpu, addr, 128 * 1024)?);
         ptr += 8;
     }
     Err(abi::E2BIG)
@@ -3970,9 +4047,9 @@ fn sys_execve(
 ) -> Outcome {
     let (path, argv, envp) = match (|| {
         Ok::<_, u64>((
-            path_arg(cpu, path_ptr)?,
-            read_string_vec(cpu, argv_ptr)?,
-            read_string_vec(cpu, envp_ptr)?,
+            path_arg(env, cpu, path_ptr)?,
+            read_string_vec(env, cpu, argv_ptr)?,
+            read_string_vec(env, cpu, envp_ptr)?,
         ))
     })() {
         Ok(v) => v,
@@ -4075,7 +4152,7 @@ fn sys_wait4(
 
     if let Some(zombie) = env.sched.take_zombie(env.proc.tgid, filter) {
         if status_ptr != 0 {
-            if let Err(errno) = write_mem(cpu, status_ptr, &zombie.status.to_le_bytes()) {
+            if let Err(errno) = write_mem(env, cpu, status_ptr, &zombie.status.to_le_bytes()) {
                 return Outcome::Ret(Err(errno));
             }
         }
@@ -4089,7 +4166,7 @@ fn sys_wait4(
         if let Some((pid, sig)) = env.sched.take_stop_report(env.proc.tgid, filter) {
             let status = ((sig as i32) << 8) | 0x7f;
             if status_ptr != 0 {
-                if let Err(errno) = write_mem(cpu, status_ptr, &status.to_le_bytes()) {
+                if let Err(errno) = write_mem(env, cpu, status_ptr, &status.to_le_bytes()) {
                     return Outcome::Ret(Err(errno));
                 }
             }
@@ -4144,7 +4221,7 @@ fn sys_pipe(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, flags: u64) -> SysR
     let mut buf = [0_u8; 8];
     buf[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
     buf[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
-    if let Err(errno) = write_mem(cpu, fds_ptr, &buf) {
+    if let Err(errno) = write_mem(env, cpu, fds_ptr, &buf) {
         let mut fds = env.proc.fds.borrow_mut();
         let _ = fds.close(read_fd);
         let _ = fds.close(write_fd);
@@ -4235,7 +4312,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                 inner.activity += 1;
                 inner.data.drain(..take).collect()
             };
-            match write_mem(cpu, buf, &chunk) {
+            match write_mem(env, cpu, buf, &chunk) {
                 Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
@@ -4258,7 +4335,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                     std::mem::take(&mut inner.count)
                 }
             };
-            match write_mem(cpu, buf, &value.to_le_bytes()) {
+            match write_mem(env, cpu, buf, &value.to_le_bytes()) {
                 Ok(()) => Outcome::Ret(Ok(8)),
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
@@ -4297,7 +4374,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                     }
                 }
             };
-            match write_mem(cpu, buf, &expirations.to_le_bytes()) {
+            match write_mem(env, cpu, buf, &expirations.to_le_bytes()) {
                 Ok(()) => Outcome::Ret(Ok(8)),
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
@@ -4328,7 +4405,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             match result {
                 Ok(crate::net::RecvOutcome::Data(bytes)) => {
                     socket.borrow_mut().activity += 1;
-                    match write_mem(cpu, buf, &bytes) {
+                    match write_mem(env, cpu, buf, &bytes) {
                         Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
                         Err(errno) => Outcome::Ret(Err(errno)),
                     }
@@ -4379,7 +4456,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                 let take = (count as usize).min(queue.len()).min(0x40_0000);
                 queue.drain(..take).collect()
             };
-            match write_mem(cpu, buf, &chunk) {
+            match write_mem(env, cpu, buf, &chunk) {
                 Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
@@ -4451,7 +4528,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 );
             }
             let take = (count as usize).min(room).min(0x40_0000);
-            let bytes = match read_mem(cpu, buf, take) {
+            let bytes = match read_mem(env, cpu, buf, take) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
@@ -4466,7 +4543,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
             if count < 8 {
                 return Outcome::Ret(Err(abi::EINVAL));
             }
-            let bytes = match read_mem(cpu, buf, 8) {
+            let bytes = match read_mem(env, cpu, buf, 8) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
@@ -4477,7 +4554,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
             Outcome::Ret(Ok(8))
         }
         Kind::Net(socket) => {
-            let bytes = match read_mem(cpu, buf, (count as usize).min(0x40_0000)) {
+            let bytes = match read_mem(env, cpu, buf, (count as usize).min(0x40_0000)) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
@@ -4501,7 +4578,7 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
             Outcome::Ret(result.map(|n| n as u64))
         }
         Kind::Pty(pty, master) => {
-            let bytes = match read_mem(cpu, buf, (count as usize).min(0x40_0000)) {
+            let bytes = match read_mem(env, cpu, buf, (count as usize).min(0x40_0000)) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
@@ -4555,7 +4632,7 @@ fn sys_futex(
     const FUTEX_CMD_MASK: u64 = 0x7f; // strips PRIVATE / CLOCK_REALTIME bits
     match op & FUTEX_CMD_MASK {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            let current = match read_mem(cpu, addr, 4) {
+            let current = match read_mem(env, cpu, addr, 4) {
                 Ok(bytes) => u32::from_le_bytes(bytes.try_into().expect("read_mem length")),
                 Err(errno) => return Outcome::Ret(Err(errno)),
             };
@@ -4580,7 +4657,7 @@ fn sys_futex(
                 // woken return value, and resume after the syscall; the
                 // scheduler patches -ETIMEDOUT when the deadline fires
                 // without a wake.
-                let duration = match read_timespec_at(cpu, timeout_ptr) {
+                let duration = match read_timespec_at(env, cpu, timeout_ptr) {
                     Ok(nanos) => nanos,
                     Err(errno) => return Outcome::Ret(Err(errno)),
                 };
@@ -4884,7 +4961,7 @@ fn outcome_vectored(
     iovcnt: u64,
     write: bool,
 ) -> Outcome {
-    let entries = match iter_iov(cpu, iov, iovcnt) {
+    let entries = match iter_iov(env, cpu, iov, iovcnt) {
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -5008,11 +5085,16 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
     env.sched.find_ready(now)
 }
 
-fn parse_sockaddr_in(cpu: &mut Cpu, addr: u64, len: u64) -> Result<std::net::SocketAddrV4, u64> {
+fn parse_sockaddr_in(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: u64,
+) -> Result<std::net::SocketAddrV4, u64> {
     if len < 8 {
         return Err(abi::EINVAL);
     }
-    let bytes = read_mem(cpu, addr, 8)?;
+    let bytes = read_mem(env, cpu, addr, 8)?;
     let family = u16::from_le_bytes(bytes[..2].try_into().expect("slice length"));
     if family as u64 != AF_INET {
         return Err(abi::EAFNOSUPPORT);
@@ -5023,6 +5105,7 @@ fn parse_sockaddr_in(cpu: &mut Cpu, addr: u64, len: u64) -> Result<std::net::Soc
 }
 
 fn write_sockaddr_in(
+    env: &mut LinuxEnv,
     cpu: &mut Cpu,
     addr_ptr: u64,
     len_ptr: u64,
@@ -5038,14 +5121,14 @@ fn write_sockaddr_in(
     // The caller's socklen bounds the write (the address is truncated when
     // the buffer is short); the full length is reported back regardless.
     let cap = if len_ptr != 0 {
-        let bytes = read_mem(cpu, len_ptr, 4)?;
+        let bytes = read_mem(env, cpu, len_ptr, 4)?;
         u32::from_le_bytes(bytes.try_into().expect("read_mem length")) as usize
     } else {
         out.len()
     };
-    write_mem(cpu, addr_ptr, &out[..out.len().min(cap)])?;
+    write_mem(env, cpu, addr_ptr, &out[..out.len().min(cap)])?;
     if len_ptr != 0 {
-        write_mem(cpu, len_ptr, &16_u32.to_le_bytes())?;
+        write_mem(env, cpu, len_ptr, &16_u32.to_le_bytes())?;
     }
     Ok(())
 }
@@ -5105,7 +5188,7 @@ fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -
 
 fn sys_connect(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
     let socket = net_of(env, fd)?;
-    let target = parse_sockaddr_in(cpu, addr, len)?;
+    let target = parse_sockaddr_in(env, cpu, addr, len)?;
     let mut inner = socket.borrow_mut();
     match inner.kind {
         SocketKind::Tcp => {
@@ -5132,11 +5215,11 @@ fn sys_sendto(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         Ok(socket) => socket,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let target = match parse_sockaddr_in(cpu, addr, addrlen) {
+    let target = match parse_sockaddr_in(env, cpu, addr, addrlen) {
         Ok(target) => target,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let bytes = match read_mem(cpu, buf, (len as usize).min(0x1_0000)) {
+    let bytes = match read_mem(env, cpu, buf, (len as usize).min(0x1_0000)) {
         Ok(bytes) => bytes,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -5184,10 +5267,10 @@ fn sys_recvfrom(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     match received {
         Ok(Some((bytes, from))) => {
             socket.borrow_mut().activity += 1;
-            if let Err(errno) = write_mem(cpu, buf, &bytes) {
+            if let Err(errno) = write_mem(env, cpu, buf, &bytes) {
                 return Outcome::Ret(Err(errno));
             }
-            if let Err(errno) = write_sockaddr_in(cpu, addr, addrlen, from) {
+            if let Err(errno) = write_sockaddr_in(env, cpu, addr, addrlen, from) {
                 return Outcome::Ret(Err(errno));
             }
             Outcome::Ret(Ok(bytes.len() as u64))
@@ -5234,7 +5317,7 @@ fn sys_shutdown(env: &mut LinuxEnv, fd: u64, how: u64) -> SysResult {
 fn sys_getpeername(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
     let socket = net_of(env, fd)?;
     let peer = socket.borrow().peer.ok_or(abi::ENOTCONN)?;
-    write_sockaddr_in(cpu, addr, len, peer)?;
+    write_sockaddr_in(env, cpu, addr, len, peer)?;
     Ok(0)
 }
 
@@ -5246,9 +5329,9 @@ fn sys_getsockopt(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // SO_ERROR reads back 0 (no pending error); every other option
         // also reads as a zeroed 32-bit value.
         let _ = optname == SO_ERROR;
-        write_mem(cpu, optval, &[0_u8; 4])?;
+        write_mem(env, cpu, optval, &[0_u8; 4])?;
         if optlen != 0 {
-            write_mem(cpu, optlen, &4_u32.to_le_bytes())?;
+            write_mem(env, cpu, optlen, &4_u32.to_le_bytes())?;
         }
     }
     Ok(0)
@@ -5304,7 +5387,7 @@ fn sys_socketpair(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     let mut buf = [0_u8; 8];
     buf[..4].copy_from_slice(&(fd_a as u32).to_le_bytes());
     buf[4..].copy_from_slice(&(fd_b as u32).to_le_bytes());
-    write_mem(cpu, sv, &buf)?;
+    write_mem(env, cpu, sv, &buf)?;
     Ok(0)
 }
 
@@ -5333,8 +5416,8 @@ fn sys_eventfd(env: &mut LinuxEnv, initval: u64, flags: u64) -> SysResult {
 /// kernel gives and hides the guest's mistake from it. And the arithmetic
 /// saturates: seconds near `i64::MAX` scaled to nanoseconds overflow, and a
 /// wrapped result is a short wait where the guest asked for a long one.
-fn read_timespec_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
-    let bytes = read_mem(cpu, addr, 16)?;
+fn read_timespec_at(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
+    let bytes = read_mem(env, cpu, addr, 16)?;
     let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
     let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
@@ -5348,8 +5431,8 @@ fn read_timespec_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
 /// `select`'s `timeval` read as a duration, on the same terms as
 /// [`read_timespec_at`]: refused if it cannot be interpreted, saturating
 /// rather than wrapping when it can.
-fn read_timeval_at(cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
-    let bytes = read_mem(cpu, addr, 16)?;
+fn read_timeval_at(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64) -> Result<u64, u64> {
+    let bytes = read_mem(env, cpu, addr, 16)?;
     let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
     let usec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
     if sec < 0 || !(0..1_000_000).contains(&usec) {
@@ -5397,11 +5480,11 @@ fn sys_timerfd_settime(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysRes
         out[8..16].copy_from_slice(&((inner.interval % 1_000_000_000) as i64).to_le_bytes());
         out[16..24].copy_from_slice(&((remaining / 1_000_000_000) as i64).to_le_bytes());
         out[24..32].copy_from_slice(&((remaining % 1_000_000_000) as i64).to_le_bytes());
-        write_mem(cpu, old_value, &out)?;
+        write_mem(env, cpu, old_value, &out)?;
     }
 
-    let interval = read_timespec_at(cpu, new_value)?;
-    let value = read_timespec_at(cpu, new_value + 16)?;
+    let interval = read_timespec_at(env, cpu, new_value)?;
+    let value = read_timespec_at(env, cpu, new_value + 16)?;
     // itimerspec = { it_interval, it_value }.
     let (interval, value) = (interval, value);
     let mut inner = timer.borrow_mut();
@@ -5431,7 +5514,7 @@ fn sys_timerfd_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, curr: u64) ->
     out[8..16].copy_from_slice(&((inner.interval % 1_000_000_000) as i64).to_le_bytes());
     out[16..24].copy_from_slice(&((remaining / 1_000_000_000) as i64).to_le_bytes());
     out[24..32].copy_from_slice(&((remaining % 1_000_000_000) as i64).to_le_bytes());
-    write_mem(cpu, curr, &out)?;
+    write_mem(env, cpu, curr, &out)?;
     Ok(0)
 }
 
@@ -5462,7 +5545,7 @@ fn sys_epoll_ctl(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     match op {
         EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
             env.proc.fds.borrow().get(fd)?;
-            let bytes = read_mem(cpu, event_ptr, 12)?;
+            let bytes = read_mem(env, cpu, event_ptr, 12)?;
             let events = u32::from_le_bytes(bytes[..4].try_into().expect("slice length"));
             let data = u64::from_le_bytes(bytes[4..12].try_into().expect("slice length"));
             let mut inner = epoll.borrow_mut();
@@ -5583,7 +5666,7 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
             out.extend_from_slice(&events.to_le_bytes());
             out.extend_from_slice(&data.to_le_bytes());
         }
-        if let Err(errno) = write_mem(cpu, events_ptr, &out) {
+        if let Err(errno) = write_mem(env, cpu, events_ptr, &out) {
             return Outcome::Ret(Err(errno));
         }
         return Outcome::Ret(Ok(ready.len() as u64));
@@ -5618,11 +5701,11 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
     let words = nfds.div_ceil(64);
     let now = env.now_nanos(cpu);
 
-    let read_set = |cpu: &mut Cpu, ptr: u64| -> Result<Vec<u64>, u64> {
+    let read_set = |env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64| -> Result<Vec<u64>, u64> {
         if ptr == 0 || words == 0 {
             return Ok(vec![0; words]);
         }
-        let bytes = read_mem(cpu, ptr, words * 8)?;
+        let bytes = read_mem(env, cpu, ptr, words * 8)?;
         Ok(bytes
             .as_chunks::<8>()
             .0
@@ -5630,7 +5713,7 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
             .map(|word| u64::from_le_bytes(*word))
             .collect())
     };
-    let (rset, wset) = match (read_set(cpu, readfds), read_set(cpu, writefds)) {
+    let (rset, wset) = match (read_set(env, cpu, readfds), read_set(env, cpu, writefds)) {
         (Ok(r), Ok(w)) => (r, w),
         _ => return Outcome::Ret(Err(abi::EFAULT)),
     };
@@ -5670,12 +5753,12 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
     let timeout = if timeout_ptr == 0 {
         None
     } else if timespec {
-        match read_timespec_at(cpu, timeout_ptr) {
+        match read_timespec_at(env, cpu, timeout_ptr) {
             Ok(nanos) => Some(nanos),
             Err(errno) => return Outcome::Ret(Err(errno)),
         }
     } else {
-        match read_timeval_at(cpu, timeout_ptr) {
+        match read_timeval_at(env, cpu, timeout_ptr) {
             Ok(nanos) => Some(nanos),
             Err(errno) => return Outcome::Ret(Err(errno)),
         }
@@ -5702,22 +5785,22 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
         }
     }
 
-    let write_set = |cpu: &mut Cpu, ptr: u64, set: &[u64]| -> Result<(), u64> {
+    let write_set = |env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64, set: &[u64]| -> Result<(), u64> {
         if ptr == 0 {
             return Ok(());
         }
         let bytes: Vec<u8> = set.iter().flat_map(|w| w.to_le_bytes()).collect();
-        write_mem(cpu, ptr, &bytes)
+        write_mem(env, cpu, ptr, &bytes)
     };
-    if let Err(errno) = write_set(cpu, readfds, &r_out) {
+    if let Err(errno) = write_set(env, cpu, readfds, &r_out) {
         return Outcome::Ret(Err(errno));
     }
-    if let Err(errno) = write_set(cpu, writefds, &w_out) {
+    if let Err(errno) = write_set(env, cpu, writefds, &w_out) {
         return Outcome::Ret(Err(errno));
     }
     if exceptfds != 0 {
         let zeros = vec![0_u8; words * 8];
-        if let Err(errno) = write_mem(cpu, exceptfds, &zeros) {
+        if let Err(errno) = write_mem(env, cpu, exceptfds, &zeros) {
             return Outcome::Ret(Err(errno));
         }
     }
@@ -5742,7 +5825,7 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         }
     };
     let offset = if offset_ptr != 0 {
-        match read_mem(cpu, offset_ptr, 8) {
+        match read_mem(env, cpu, offset_ptr, 8) {
             Ok(bytes) => u64::from_le_bytes(bytes.try_into().expect("read_mem length")),
             Err(errno) => return Outcome::Ret(Err(errno)),
         }
@@ -5821,7 +5904,7 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
 
     if offset_ptr != 0 {
         let next = offset + written as u64;
-        if let Err(errno) = write_mem(cpu, offset_ptr, &next.to_le_bytes()) {
+        if let Err(errno) = write_mem(env, cpu, offset_ptr, &next.to_le_bytes()) {
             return Outcome::Ret(Err(errno));
         }
     } else {
@@ -5851,7 +5934,7 @@ fn outcome_poll(
         if timeout_arg == 0 {
             None
         } else {
-            match read_timespec_at(cpu, timeout_arg) {
+            match read_timespec_at(env, cpu, timeout_arg) {
                 Ok(nanos) => Some(nanos),
                 Err(errno) => return Outcome::Ret(Err(errno)),
             }
@@ -5872,7 +5955,7 @@ fn outcome_poll(
     const POLLIN: u16 = 0x1;
     const POLLOUT: u16 = 0x4;
     let mut watches: Vec<Watch> = Vec::new();
-    let records = match read_mem(cpu, fds_ptr, nfds.min(1024) as usize * 8) {
+    let records = match read_mem(env, cpu, fds_ptr, nfds.min(1024) as usize * 8) {
         Ok(records) => records,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -5929,7 +6012,7 @@ fn sys_utimensat(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             _ => return Ok(0), // non-VFS objects have no timestamps
         }
     } else {
-        let path = path_arg(cpu, path_ptr)?;
+        let path = path_arg(env, cpu, path_ptr)?;
         let base = dir_of(env, dirfd)?;
         let follow = flags & abi::AT_SYMLINK_NOFOLLOW == 0;
         env.vfs
@@ -5943,7 +6026,7 @@ fn sys_utimensat(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     let mtime = if times_ptr == 0 {
         now_sec
     } else {
-        let bytes = read_mem(cpu, times_ptr + 16, 16)?;
+        let bytes = read_mem(env, cpu, times_ptr + 16, 16)?;
         let sec = i64::from_le_bytes(bytes[..8].try_into().expect("slice length"));
         let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("slice length"));
         match nsec {
@@ -5958,8 +6041,8 @@ fn sys_utimensat(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
 
 /// Reads a `struct msghdr`: (name ptr, name len, iov ptr, iov count).
 /// Control messages are not modeled and are reported as absent.
-fn read_msghdr(cpu: &mut Cpu, msg: u64) -> Result<(u64, u64, u64, u64), u64> {
-    let bytes = read_mem(cpu, msg, 56)?;
+fn read_msghdr(env: &mut LinuxEnv, cpu: &mut Cpu, msg: u64) -> Result<(u64, u64, u64, u64), u64> {
+    let bytes = read_mem(env, cpu, msg, 56)?;
     let field = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().expect("slice length"));
     Ok((field(0), field(8) & 0xffff_ffff, field(16), field(24)))
 }
@@ -5967,12 +6050,12 @@ fn read_msghdr(cpu: &mut Cpu, msg: u64) -> Result<(u64, u64, u64, u64), u64> {
 /// `sendmsg`: name + iovec gather (control data unsupported and refused).
 fn sys_sendmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     let [fd, msg, _flags, _, _, _] = a;
-    let (name, name_len, iov, iovcnt) = match read_msghdr(cpu, msg) {
+    let (name, name_len, iov, iovcnt) = match read_msghdr(env, cpu, msg) {
         Ok(parts) => parts,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
     // First non-empty segment only (short sends are valid; callers loop).
-    let entries = match iter_iov(cpu, iov, iovcnt) {
+    let entries = match iter_iov(env, cpu, iov, iovcnt) {
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -5992,14 +6075,14 @@ fn sys_sendmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
 /// msg_controllen is zeroed so callers do not read stale lengths).
 fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     let [fd, msg, _flags, _, _, _] = a;
-    let (name, name_len, iov, iovcnt) = match read_msghdr(cpu, msg) {
+    let (name, name_len, iov, iovcnt) = match read_msghdr(env, cpu, msg) {
         Ok(parts) => parts,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    if let Err(errno) = write_mem(cpu, msg + 40, &0_u64.to_le_bytes()) {
+    if let Err(errno) = write_mem(env, cpu, msg + 40, &0_u64.to_le_bytes()) {
         return Outcome::Ret(Err(errno)); // msg_controllen = 0
     }
-    let entries = match iter_iov(cpu, iov, iovcnt) {
+    let entries = match iter_iov(env, cpu, iov, iovcnt) {
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -6015,7 +6098,7 @@ fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         let out = sys_recvfrom(env, cpu, [fd, base, len, 0, cap_name, 0]);
         if let Outcome::Ret(Ok(_)) = out {
             if cap_name != 0 {
-                if let Err(errno) = write_mem(cpu, msg + 8, &16_u32.to_le_bytes()) {
+                if let Err(errno) = write_mem(env, cpu, msg + 8, &16_u32.to_le_bytes()) {
                     return Outcome::Ret(Err(errno));
                 }
             }
@@ -6032,7 +6115,7 @@ fn outcome_nanosleep(env: &mut LinuxEnv, cpu: &mut Cpu, req: u64, absolute: bool
     let duration = if req == 0 {
         0
     } else {
-        match read_timespec_at(cpu, req) {
+        match read_timespec_at(env, cpu, req) {
             Ok(nanos) => nanos,
             Err(errno) => return Outcome::Ret(Err(errno)),
         }

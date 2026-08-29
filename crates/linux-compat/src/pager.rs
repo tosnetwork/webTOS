@@ -146,6 +146,12 @@ impl Pager {
         space.mappings.push(mapping);
     }
 
+    /// Whether any address space has a lazy file mapping at all — the cheap
+    /// gate host-side copies consult before doing per-page work.
+    pub fn is_empty(&self) -> bool {
+        self.spaces.values().all(|space| space.mappings.is_empty())
+    }
+
     pub fn generation(&self, asid: u64) -> u64 {
         self.spaces.get(&asid).map_or(0, |space| space.generation)
     }

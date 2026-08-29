@@ -261,6 +261,11 @@ fn resident_matches_chunk_layout(data: &[u8], layout: &crate::chunk::ChunkedFile
 const SIGWINCH: u64 = 28;
 
 impl LinuxEnv {
+    /// Whether any lazy file mappings exist (see [`crate::pager::Pager::is_empty`]).
+    pub(crate) fn has_lazy_mappings(&self) -> bool {
+        !self.pager.is_empty()
+    }
+
     pub fn new(cpu: &Cpu) -> Result<Self, String> {
         Ok(Self {
             regs: Regs::resolve(cpu)?,
