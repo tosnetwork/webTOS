@@ -278,6 +278,101 @@ const bb = (...argv) => runProcess("/bin/busybox", ["busybox", ...argv]);
   console.log(`[node] ok: lazy image -> ${f.wtw_page_in_count()} pages, ${f.wtw_footprint_kib(2)} KiB resident of ${Math.ceil(busybox.length / 1024)} KiB`);
 }
 
+// The real Codex agent through the same manifest boundary: a 256 MB
+// static-pie image installs by manifest and answers --version and --help while
+// materializing only the pages execution touches. Self-skipping: the binary is
+// not in the repository (scp the x86-64 standalone from a host that has it to
+// web/codex).
+{
+  const codex = await readFile(new URL("./codex", import.meta.url)).catch(() => null);
+  if (codex === null) {
+    console.log("note: web/codex missing — real-agent lazy checks skipped");
+  } else {
+    const chunkSize = 64 * 1024;
+    const hashes = [];
+    const chunks = new Map();
+    for (let at = 0; at < codex.length; at += chunkSize) {
+      const chunk = codex.subarray(at, Math.min(at + chunkSize, codex.length));
+      const hash = createHash("sha256").update(chunk).digest("hex");
+      hashes.push(hash);
+      chunks.set(hash, chunk);
+    }
+    // The legacy-FNV field feeds trace headers only; no trace is recorded here.
+    const manifest =
+      `webtos-chunk-manifest 1\n` +
+      `d 755 0 ${Buffer.from("/bin").toString("hex")}\n` +
+      `f 755 0 ${Buffer.from("/bin/codex").toString("hex")} ${codex.length} ${chunkSize} ${"0".repeat(16)} ${hashes.join(",")}\n`;
+
+    const agentRun = async (label, argv, expectPattern) => {
+      const fresh = await instantiateEngine(await readFile(wasmPath));
+      const f = fresh.instance.exports;
+      const fmem = () => new Uint8Array(f.memory.buffer);
+      const fput = (value) => {
+        const data = typeof value === "string" ? new TextEncoder().encode(value) : value;
+        const ptr = f.wtw_alloc(data.length);
+        fmem().set(data, ptr);
+        return [ptr, data.length];
+      };
+      if (f.wtw_init() !== 0) throw new Error(`${label}: init`);
+      if (f.wtw_install_chunk_manifest(...fput(manifest)) !== 0) throw new Error(`${label}: manifest`);
+      for (const arg of argv) f.wtw_arg(...fput(arg));
+      f.wtw_env(...fput("PATH=/bin"));
+      f.wtw_env(...fput("HOME=/root"));
+      let delivered = 0;
+      const deliverRequest = (context) => {
+        const len = f.wtw_page_request_take();
+        if (len !== 65) throw new Error(`${label}: ${context} request length ${len}`);
+        const request = fmem().slice(f.wtw_page_request_ptr(), f.wtw_page_request_ptr() + len);
+        const hash = Buffer.from(request.slice(32, 64)).toString("hex");
+        const view = new DataView(request.buffer, request.byteOffset, request.byteLength);
+        const bytes = chunks.get(hash);
+        if (!bytes) throw new Error(`${label}: unknown chunk ${hash}`);
+        delivered += bytes.length;
+        if (f.wtw_page_deliver(view.getUint32(0, true), view.getUint32(4, true), ...fput(bytes)) !== 0) {
+          throw new Error(`${label}: ${context} deliver ${hash}`);
+        }
+      };
+      for (;;) {
+        const loadStatus = f.wtw_load(...fput("/bin/codex"));
+        if (loadStatus === 0) break;
+        if (loadStatus !== 10) throw new Error(`${label}: load status ${loadStatus}`);
+        deliverRequest("metadata");
+      }
+      let status = 0;
+      let output = "";
+      while (status === 0 || status === 10) {
+        status = f.wtw_run(50_000_000);
+        output += new TextDecoder().decode(
+          fmem().slice(f.wtw_output_ptr(), f.wtw_output_ptr() + f.wtw_output_len()),
+        );
+        if (status === 10) deliverRequest("run");
+      }
+      const residentKiB = f.wtw_footprint_kib(2);
+      const ok =
+        status === 1 &&
+        f.wtw_exit_code() === 0 &&
+        expectPattern.test(output) &&
+        f.wtw_page_in_count() > 0 &&
+        delivered < codex.length / 4 &&
+        residentKiB * 1024 < codex.length / 4;
+      if (!ok) {
+        console.error(
+          `[node] FAILED ${label}: status=${status} exit=${f.wtw_exit_code()} ` +
+            `pages=${f.wtw_page_in_count()} delivered=${delivered} resident=${residentKiB} KiB ` +
+            `output=${JSON.stringify(output.slice(0, 120))}`,
+        );
+        process.exit(1);
+      }
+      console.log(
+        `[node] ok: ${label} -> ${JSON.stringify(output.trim().slice(0, 40))}, ` +
+          `${f.wtw_page_in_count()} pages, ${Math.round(delivered / 1024)} KiB fetched of ${Math.round(codex.length / 1024)} KiB`,
+      );
+    };
+    await agentRun("codex --version (lazy 256MB agent)", ["codex", "--version"], /codex-cli \d+\.\d+\.\d+/);
+    await agentRun("codex --help (lazy 256MB agent)", ["codex", "--help"], /[Uu]sage/);
+  }
+}
+
 expect("echo", bb("echo", "hi-from-wasm"), "hi-from-wasm");
 expect("cat", bb("cat", "/etc/motd.txt"), "from-the-vfs");
 expect("ls /", bb("ls", "/"), "etc");

@@ -152,25 +152,31 @@ function md5OfFile(path) {
   });
 }
 
-function publishLazyImage(path, bytes) {
+function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFnv = true } = {}) {
   const chunkSize = 64 * 1024;
   const hashes = [];
   let legacy = 0xcbf29ce484222325n;
   for (let at = 0; at < bytes.length; at += chunkSize) {
     const chunk = bytes.subarray(at, Math.min(at + chunkSize, bytes.length));
-    for (const byte of chunk) {
-      legacy ^= BigInt(byte);
-      legacy = BigInt.asUintN(64, legacy * 0x100000001b3n);
+    if (legacyFnv) {
+      // Per-byte 64-bit FNV in BigInt is fine at busybox scale; a 256 MB agent
+      // image would take minutes, and the field only feeds trace headers,
+      // which the agent checks do not record.
+      for (const byte of chunk) {
+        legacy ^= BigInt(byte);
+        legacy = BigInt.asUintN(64, legacy * 0x100000001b3n);
+      }
     }
     const hash = createHash("sha256").update(chunk).digest("hex");
     hashes.push(hash);
     generatedAssets.set(`/__lazy/chunks/${hash}`, chunk);
   }
   const pathHex = Buffer.from(path).toString("hex");
+  const fnv = legacyFnv ? legacy.toString(16).padStart(16, "0") : "0".repeat(16);
   const manifest = Buffer.from(
-    `webtos-chunk-manifest 1\nd 755 0 2f62696e\nf 755 0 ${pathHex} ${bytes.length} ${chunkSize} ${legacy.toString(16).padStart(16, "0")} ${hashes.join(",")}\n`,
+    `webtos-chunk-manifest 1\nd 755 0 2f62696e\nf 755 0 ${pathHex} ${bytes.length} ${chunkSize} ${fnv} ${hashes.join(",")}\n`,
   );
-  generatedAssets.set("/__lazy/manifest.txt", manifest);
+  generatedAssets.set(`/__lazy/${manifestName}`, manifest);
   return { preload: hashes.slice(0, 1), logicalBytes: bytes.length };
 }
 
@@ -877,6 +883,64 @@ async function runEngine(name, origin, gateway, images) {
         : `status=${lazyBusybox.status} exit=${lazyBusybox.exitCode} icount=${lazyBusybox.icount}/${eagerBusybox?.icount} pages=${lazyBusybox.pageIns} files=${lazyBusybox.filesKiB} KiB ${lazyBusybox.error}`,
     );
 
+    // The real agent: a ~256 MB Codex standalone installs by manifest and
+    // answers --version fetching only the pages execution touches. This is the
+    // "version and help commands from a clean browser profile" exit gate for
+    // the Codex agent; it self-skips where web/codex is not staged.
+    if (images.codex) {
+      const codexRun = await page.evaluate(workerDriver, {
+        workerUrl: `${origin}/web/worker.js`,
+        files: [],
+        lazy: {
+          manifestUrl: `${origin}/__lazy/codex-manifest.txt`,
+          chunkBase: `${origin}/__lazy/chunks`,
+          preload: [],
+        },
+        steps: [
+          { label: "codex --version", path: "/bin/codex", argv: ["codex", "--version"] },
+        ],
+      });
+      const version = codexRun.runs[0];
+      const versionOk =
+        version.status === 1 &&
+        version.exitCode === 0 &&
+        /codex-cli \d+\.\d+\.\d+/.test(version.output) &&
+        version.pageIns > 0 &&
+        version.filesKiB * 1024 < images.codex.logicalBytes / 4;
+      fingerprint["codex --version"] = version.icount;
+      record(
+        "real agent: codex --version from a clean profile, demand paged",
+        versionOk,
+        versionOk
+          ? `${JSON.stringify(version.output.trim())}, ${version.pageIns} pages, ${version.filesKiB} KiB resident of ${Math.ceil(images.codex.logicalBytes / 1024)} KiB`
+          : `status=${version.status} exit=${version.exitCode} pages=${version.pageIns} files=${version.filesKiB} KiB ${version.error} ${JSON.stringify(version.output.slice(0, 100))}`,
+      );
+      const helpRun = await page.evaluate(workerDriver, {
+        workerUrl: `${origin}/web/worker.js`,
+        files: [],
+        lazy: {
+          manifestUrl: `${origin}/__lazy/codex-manifest.txt`,
+          chunkBase: `${origin}/__lazy/chunks`,
+          preload: [],
+        },
+        steps: [{ label: "codex --help", path: "/bin/codex", argv: ["codex", "--help"] }],
+      });
+      const help = helpRun.runs[0];
+      const helpOk =
+        help.status === 1 &&
+        help.exitCode === 0 &&
+        /[Uu]sage/.test(help.output) &&
+        help.filesKiB * 1024 < images.codex.logicalBytes / 4;
+      fingerprint["codex --help"] = help.icount;
+      record(
+        "real agent: codex --help, demand paged",
+        helpOk,
+        helpOk
+          ? `${help.pageIns} pages, ${help.filesKiB} KiB resident`
+          : `status=${help.status} exit=${help.exitCode} pages=${help.pageIns} files=${help.filesKiB} KiB ${help.error} ${JSON.stringify(help.output.slice(0, 100))}`,
+      );
+    }
+
     // The DoD names the browser JIT paths and the architectural trace, not
     // merely interpreter output. Run the same lazy/eager command with tiering
     // on from its first entry, and require both single-block and self-loop
@@ -1044,10 +1108,25 @@ const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 // builds it), so its checks run only where it has been staged.
 const agentPath = fileURLToPath(new URL("./openfox", import.meta.url));
 const agentInfo = await stat(agentPath).catch(() => null);
+// The real Codex standalone (x86-64 static-pie, ~256 MB) is not in the
+// repository; stage it at web/codex to enable the real-agent lazy checks.
+const codexPath = fileURLToPath(new URL("./codex", import.meta.url));
+const codexBytes = await readFile(codexPath).catch(() => null);
+const codexImage =
+  codexBytes === null
+    ? null
+    : publishLazyImage("/bin/codex", codexBytes, {
+        manifestName: "codex-manifest.txt",
+        legacyFnv: false,
+      });
+if (codexImage === null) {
+  console.log("note: web/codex missing (scp a standalone x86-64 codex there) — real-agent lazy checks skipped");
+}
 const images = {
   busyboxMd5: await md5OfFile(busyboxPath),
   agent: agentInfo !== null,
   agentSize: agentInfo?.size ?? 0,
+  codex: codexImage,
 };
 if (!images.agent) {
   console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");
