@@ -29,9 +29,9 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, normalize, extname } from "node:path";
+import { dirname, join, normalize, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -40,7 +40,15 @@ const ALL_ENGINES = ["chromium", "firefox", "webkit"];
 const args = process.argv.slice(2);
 const headed = args.includes("--headed");
 const engineArg = args.find((a) => a.startsWith("--engines="));
+const reportArg = args.find((a) => a.startsWith("--compat-report="));
+const sourceArg = args.find((a) => a.startsWith("--source-commit="));
 const engines = engineArg ? engineArg.slice("--engines=".length).split(",") : ALL_ENGINES;
+const compatibilityReport = reportArg ? reportArg.slice("--compat-report=".length) : null;
+const sourceCommit = sourceArg ? sourceArg.slice("--source-commit=".length) : null;
+if (compatibilityReport && !/^[0-9a-f]{40}$/.test(sourceCommit ?? "")) {
+  console.error("--compat-report requires --source-commit=<40 lowercase hex characters>");
+  process.exit(2);
+}
 for (const name of engines) {
   if (!ALL_ENGINES.includes(name)) {
     console.error(`unknown engine ${name}; expected one of ${ALL_ENGINES.join(", ")}`);
@@ -71,6 +79,10 @@ const generatedAssets = new Map();
 const BLANK = "<!doctype html><meta charset=utf-8><title>webTOS test</title>";
 /// Served at /__net_probe: the body a guest must fetch over a real socket.
 const NET_PROBE = "net-probe-ok";
+// Larger than the 32 MiB profile used by the terminal budget probe.  The
+// The endpoint is deterministic and avoids coupling this assertion to an
+// optional workload binary.
+const OVERSIZED_IMAGE_BYTES = 33 * 1024 * 1024;
 
 async function startServer() {
   const server = createServer(async (req, res) => {
@@ -83,6 +95,15 @@ async function startServer() {
     if (path === "/__net_probe") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(NET_PROBE);
+      return;
+    }
+    if (path === "/web/__budget_probe") {
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": OVERSIZED_IMAGE_BYTES,
+        "cache-control": "no-store",
+      });
+      res.end(Buffer.alloc(OVERSIZED_IMAGE_BYTES));
       return;
     }
     if (generatedAssets.has(path)) {
@@ -152,6 +173,43 @@ function md5OfFile(path) {
   });
 }
 
+function sha256OfFile(path) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    createReadStream(path)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
+}
+
+const sha256OfBytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+const workloadLock = JSON.parse(
+  await readFile(new URL("../workloads/LOCK.json", import.meta.url), "utf8"),
+);
+function lockedWorkload(id, actualFiles) {
+  const locked = workloadLock.workloads.find((item) => item.id === id);
+  if (!locked) throw new Error(`workload ${id} is not in workloads/LOCK.json`);
+  if (actualFiles === null) return { id, present: false, version: locked.version };
+  const actual = new Map(actualFiles.map((item) => [item.path, item]));
+  for (const expected of locked.files) {
+    const file = actual.get(expected.path);
+    if (!file || file.sha256 !== expected.sha256 || file.size !== expected.size) {
+      throw new Error(`staged ${id} bytes do not match workloads/LOCK.json: ${expected.path}`);
+    }
+  }
+  if (actual.size !== locked.files.length) {
+    throw new Error(`staged ${id} file set does not match workloads/LOCK.json`);
+  }
+  return {
+    files: [...actual.values()].sort((a, b) => a.path.localeCompare(b.path)),
+    id,
+    present: true,
+    version: locked.version,
+  };
+}
+
 // Publishes several files (with their parent directories) as one manifest;
 // records must be strictly sorted by path. Legacy FNV is zero: it feeds trace
 // headers only, and the agent checks record no trace.
@@ -183,11 +241,11 @@ function publishLazyFiles(files, manifestName) {
   }
   for (const d of dirs) records.push({ path: d, line: `d 755 0 ${Buffer.from(d).toString("hex")}` });
   records.sort((a, b) => (a.path < b.path ? -1 : 1));
-  generatedAssets.set(
-    `/__lazy/${manifestName}`,
-    Buffer.from(`webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`),
+  const manifest = Buffer.from(
+    `webtos-chunk-manifest 1\n${records.map((r) => r.line).join("\n")}\n`,
   );
-  return { logicalBytes };
+  generatedAssets.set(`/__lazy/${manifestName}`, manifest);
+  return { logicalBytes, manifestSha256: sha256OfBytes(manifest) };
 }
 
 function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFnv = true } = {}) {
@@ -215,7 +273,11 @@ function publishLazyImage(path, bytes, { manifestName = "manifest.txt", legacyFn
     `webtos-chunk-manifest 1\nd 755 0 2f62696e\nf 755 0 ${pathHex} ${bytes.length} ${chunkSize} ${fnv} ${hashes.join(",")}\n`,
   );
   generatedAssets.set(`/__lazy/${manifestName}`, manifest);
-  return { preload: hashes.slice(0, 1), logicalBytes: bytes.length };
+  return {
+    preload: hashes.slice(0, 1),
+    logicalBytes: bytes.length,
+    manifestSha256: sha256OfBytes(manifest),
+  };
 }
 
 /// Starts the relay with a single rule: the harness's own static server. It
@@ -516,6 +578,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
     timeout: EXEC_TIMEOUT,
   });
+  const storageAvailable = await page.evaluate(() => window.webtos.storage === true);
   const [cols, rows] = await terminalSize(page);
   record("terminal: interactive shell reaches a prompt", true, `${cols}x${rows}`);
 
@@ -594,7 +657,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
   // agent's profile before the reload so what comes back is state this
   // session produced, not something the boot sequence re-seeds.
   let checkpointed = 0;
-  if (images.agent) {
+  if (images.agent && storageAvailable) {
     await typeLine(
       page,
       "mkdir -p /root/.openfox/workspace && echo '{}' > /root/.openfox/config.json && echo seeded$?",
@@ -609,8 +672,18 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
       // The strongest thing to check about a credential is where it is not.
       const stored = await page.evaluate(async () => {
         const root = await navigator.storage.getDirectory();
-        const handle = await root.getFileHandle("webtos-fs.bin");
-        return new TextDecoder().decode(await (await handle.getFile()).arrayBuffer());
+        const snapshots = [];
+        for (const name of ["webtos-fs.bin.0", "webtos-fs.bin.1"]) {
+          try {
+            const handle = await root.getFileHandle(name);
+            const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+            // WTWFS02\0 + generation + payload length + SHA-256.
+            snapshots.push(new TextDecoder().decode(bytes.subarray(52)));
+          } catch (error) {
+            if (error?.name !== "NotFoundError") throw error;
+          }
+        }
+        return snapshots.join("\n");
       });
       record(
         "secrets: the checkpoint carries the placeholder, not the value",
@@ -627,19 +700,31 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
         `${checkpointed.toLocaleString()} bytes saved, against a ${(images.agentSize / (1 << 20)).toFixed(0)} MB agent image left to the cache`,
       );
     }
+  } else if (images.agent) {
+    const detail = "OPFS unavailable; checkpoint and cache persistence not applicable";
+    record("secrets: the checkpoint carries the placeholder, not the value", null, detail);
+    record("checkpoint: the session is written to browser storage", null, detail);
   }
 
   // Downloaded once: a reload must serve every image from the cache.
-  await page.reload();
-  await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
-    timeout: EXEC_TIMEOUT,
-  });
-  const restored = await page.evaluate(() => window.webtos.images);
-  record(
-    "images: a reload serves them from the cache",
-    restored.length > 0 && restored.every((image) => image.cached),
-    restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
-  );
+  if (storageAvailable) {
+    await page.reload();
+    await page.waitForFunction(() => window.webtos?.state === "waiting", undefined, {
+      timeout: EXEC_TIMEOUT,
+    });
+    const restored = await page.evaluate(() => window.webtos.images);
+    record(
+      "images: a reload serves them from the cache",
+      restored.length > 0 && restored.every((image) => image.cached),
+      restored.map((image) => `${image.path} ${(image.bytes / (1 << 20)).toFixed(1)} MB`).join(", "),
+    );
+  } else {
+    record(
+      "images: a reload serves them from the cache",
+      null,
+      "OPFS unavailable; image-cache persistence not applicable",
+    );
+  }
 
   // The milestone gate: a checkpointed session resumes after a browser
   // reload with its filesystem intact. The agent is what has to see it —
@@ -774,28 +859,27 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
     `gateway refused 127.0.0.1:${gateway.port}`,
   );
 
-  // A budget too small for the agent image. The tab should say so and stay
-  // up, rather than dying on whichever allocation happens to be unlucky part
-  // way through a 52 MB delivery.
-  if (images.agent) {
-    await page.goto(`${origin}/web/terminal.html?budget=32&image=openfox`);
-    const refusal = await page
-      .waitForFunction(
-        () => {
-          const status = document.getElementById("status")?.textContent ?? "";
-          return status.includes("memory budget") ? status : false;
-        },
-        undefined,
-        { timeout: EXEC_TIMEOUT },
-      )
-      .then((handle) => handle.jsonValue())
-      .catch(() => null);
-    record(
-      "memory: an image that will not fit the budget is refused, not fatal",
-      typeof refusal === "string" && refusal.includes("over the memory budget"),
-      refusal ? refusal.replace(/^error: /, "") : "no refusal reported",
-    );
-  }
+  // A declared image larger than the remaining budget. The endpoint sends
+  // The worker calls guestWriter with Content-Length before reading the body,
+  // so a pass proves the guest image was rejected up front rather than being
+  // partially written until an unlucky allocation failed.
+  await page.goto(`${origin}/web/terminal.html?budget=32&image=__budget_probe`);
+  const refusal = await page
+    .waitForFunction(
+      () => {
+        const status = document.getElementById("status")?.textContent ?? "";
+        return status.includes("memory budget") ? status : false;
+      },
+      undefined,
+      { timeout: EXEC_TIMEOUT },
+    )
+    .then((handle) => handle.jsonValue())
+    .catch(() => null);
+  record(
+    "memory: an image that will not fit the budget is refused before guest write",
+    typeof refusal === "string" && refusal.includes("over the memory budget"),
+    refusal ? refusal.replace(/^error: /, "") : "no refusal reported",
+  );
 }
 
 // ------------------------------------------------------------- browser side
@@ -813,7 +897,8 @@ async function runEngine(name, origin, gateway, images) {
   const fingerprint = {};
   const record = (label, ok, detail = "") => {
     checks.push({ label, ok, detail });
-    console.log(`[${name}] ${ok ? "ok" : "FAILED"}: ${label}${detail ? ` -> ${detail}` : ""}`);
+    const state = ok === null ? "SKIP" : ok ? "ok" : "FAILED";
+    console.log(`[${name}] ${state}: ${label}${detail ? ` -> ${detail}` : ""}`);
   };
 
   const pageErrors = [];
@@ -885,74 +970,147 @@ async function runEngine(name, origin, gateway, images) {
     );
 
     // ---- Phase A2: persist to OPFS, reload the tab, read the state back.
-    await page.click("#save");
-    await page.waitForFunction(
-      () => {
-        const text = document.getElementById("status").textContent;
-        return text.includes("filesystem saved") || text.startsWith("error:");
-      },
-      undefined,
-      { timeout: EXEC_TIMEOUT },
-    );
-    const savedStatus = (await page.textContent("#status")).trim();
-    record("persist filesystem to OPFS", savedStatus.includes("filesystem saved"), savedStatus);
+    // WebKit's Linux Playwright port currently exposes no OPFS. Treat that as
+    // an explicitly reported capability boundary; do not click a disabled
+    // control and then misread the resulting timeout as a storage verdict.
+    const opfsAvailable = !(await page.isDisabled("#save"));
+    if (!opfsAvailable) {
+      const detail = "OPFS unavailable; Save FS disabled and persistence probes not applicable";
+      record("persist filesystem to OPFS", null, detail);
+      record("reload restores the snapshot", null, detail);
+      record("state survives the browser reload", null, detail);
+      record(
+        "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+        null,
+        detail,
+      );
+    } else {
+      await page.click("#save");
+      await page.waitForFunction(
+        () => {
+          const text = document.getElementById("status").textContent;
+          return text.includes("filesystem saved") || text.startsWith("error:");
+        },
+        undefined,
+        { timeout: EXEC_TIMEOUT },
+      );
+      const savedStatus = (await page.textContent("#status")).trim();
+      record("persist filesystem to OPFS", savedStatus.includes("filesystem saved"), savedStatus);
 
-    await page.reload();
-    await page.waitForSelector("#run:not([disabled])", { timeout: EXEC_TIMEOUT });
-    const restoredStatus = (await page.textContent("#status")).trim();
-    record(
-      "reload restores the snapshot",
-      restoredStatus.includes("previous session restored"),
-      restoredStatus,
-    );
+      await page.reload();
+      await page.waitForSelector("#run:not([disabled])", { timeout: EXEC_TIMEOUT });
+      const restoredStatus = (await page.textContent("#status")).trim();
+      record(
+        "reload restores the snapshot",
+        restoredStatus.includes("previous session restored"),
+        restoredStatus,
+      );
 
-    const readBack = await runCommand("cat /home/state.txt");
-    record(
-      "state survives the browser reload",
-      readBack.output.includes("survived-the-reload"),
-      readBack.status,
-    );
+      const readBack = await runCommand("cat /home/state.txt");
+      record(
+        "state survives the browser reload",
+        readBack.output.includes("survived-the-reload"),
+        readBack.status,
+      );
 
-    // A persist interrupted partway must not corrupt the committed snapshot.
-    // The probe persists a good snapshot, then persists again with the next
-    // write made to reject — a worker killed mid-write — and reads the
-    // committed file back. `intact` is true only if the good snapshot
-    // survived the failed second persist. Run in its own worker so the demo
-    // page's is untouched.
-    const probe = await page.evaluate(async (workerUrl) => {
+      // A real Worker termination halfway through a write must not corrupt the
+      // committed snapshot. Run it in its own worker so the demo page's worker
+      // is untouched, then use a fresh worker to select and hash the surviving
+      // generation.
+      const probe = await page.evaluate(async (workerUrl) => {
+        const waitFor = (worker, type) => new Promise((resolve, reject) => {
+          const listener = (event) => {
+            if (event.data.type === "error") {
+              worker.removeEventListener("message", listener);
+              reject(new Error(event.data.text));
+            }
+            if (event.data.type === type) {
+              worker.removeEventListener("message", listener);
+              resolve(event.data);
+            }
+          };
+          worker.addEventListener("message", listener);
+        });
+
+        const writer = new Worker(workerUrl);
+        const ready = waitFor(writer, "ready");
+        writer.postMessage({ type: "boot", files: [] });
+        await ready;
+        const persisted = waitFor(writer, "persisted");
+        writer.postMessage({ type: "persist" });
+        await persisted;
+        const identity = waitFor(writer, "snapshotIdentity");
+        writer.postMessage({ type: "snapshotIdentityProbe" });
+        const before = await identity;
+        const paused = waitFor(writer, "persistPaused");
+        writer.postMessage({ type: "persistPauseProbe" });
+        await paused;
+        writer.terminate();
+
+        const reader = new Worker(workerUrl);
+        const recovered = waitFor(reader, "snapshotIdentity");
+        reader.postMessage({ type: "snapshotIdentityProbe" });
+        const after = await recovered;
+        reader.terminate();
+        return {
+          before,
+          after,
+          intact: before.len > 0 && before.len === after.len && before.digest === after.digest,
+        };
+      }, `${origin}/web/worker.js`);
+      record(
+        "checkpoint: terminating a worker mid-persist leaves the committed snapshot intact",
+        probe.intact === true,
+        probe.intact
+          ? `worker terminated mid-write; committed ${probe.before.len}-byte snapshot was unchanged`
+          : `committed snapshot corrupted after worker termination: ${JSON.stringify(probe)}`,
+      );
+    }
+
+    const networkContract = await page.evaluate(async (workerUrl) => {
       const worker = new Worker(workerUrl);
-      const boot = new Promise((r) => {
-        worker.onmessage = (e) => {
-          if (e.data.type === "ready") r(true);
+      const result = new Promise((resolve) => {
+        worker.onmessage = (event) => {
+          if (event.data.type === "networkErrorContract") resolve(event.data.cases);
         };
       });
-      worker.postMessage({ type: "boot", files: [] });
-      await boot;
-      const result = new Promise((r) => {
-        worker.onmessage = (e) => {
-          if (e.data.type === "persistProbe") r(e.data);
-          if (e.data.type === "error") r({ intact: false, error: e.data.text });
-        };
-      });
-      worker.postMessage({ type: "persistFaultProbe" });
-      const out = await result;
+      worker.postMessage({ type: "networkErrorContractProbe" });
+      const cases = await result;
       worker.terminate();
-      return out;
+      return cases;
     }, `${origin}/web/worker.js`);
     record(
-      "checkpoint: an interrupted persist leaves the committed snapshot intact",
-      probe.intact === true && probe.threw === true,
-      probe.intact
-        ? `a failed persist threw and the committed ${probe.len}-byte snapshot was unchanged`
-        : `committed snapshot corrupted by a failed persist: ${JSON.stringify(probe)}`,
+      "network: proxy failure becomes a terminal Linux errno",
+      networkContract.every((item) => item.ok),
+      networkContract.map((item) => `${item.name}=${item.got}`).join(", "),
     );
 
-    await page.click("#forget");
-    await page.waitForFunction(
-      () => document.getElementById("status").textContent.includes("deleted"),
-      undefined,
-      { timeout: EXEC_TIMEOUT },
-    ).catch(() => {});
+    const snapshotSlotContract = await page.evaluate(async (workerUrl) => {
+      const worker = new Worker(workerUrl);
+      const result = new Promise((resolve) => {
+        worker.onmessage = (event) => {
+          if (event.data.type === "snapshotSlotContract") resolve(event.data.cases);
+        };
+      });
+      worker.postMessage({ type: "snapshotSlotContractProbe" });
+      const cases = await result;
+      worker.terminate();
+      return cases;
+    }, `${origin}/web/worker.js`);
+    record(
+      "checkpoint: the next write always targets the non-current generation slot",
+      snapshotSlotContract.every((item) => item.ok),
+      snapshotSlotContract.map((item) => `${item.name}=${item.got}`).join(", "),
+    );
+
+    if (opfsAvailable) {
+      await page.click("#forget");
+      await page.waitForFunction(
+        () => document.getElementById("status").textContent.includes("deleted"),
+        undefined,
+        { timeout: EXEC_TIMEOUT },
+      ).catch(() => {});
+    }
 
     // ---- Phase B: the worker protocol directly, on a page of its own.
     await page.goto(`${origin}/__blank.html`);
@@ -1170,43 +1328,51 @@ async function runEngine(name, origin, gateway, images) {
     // persists descriptor-only state; a brand-new worker must import it,
     // rebind the exact manifest root, refetch cold chunks, and reproduce the
     // same execution without a preload hint.
-    const isolatedOrigin = origin.replace("127.0.0.1", "localhost");
-    await page.goto(`${isolatedOrigin}/__blank.html`);
-    const lazySnapshotInput = {
-      workerUrl: `${isolatedOrigin}/web/worker.js`,
-      files: [],
-      lazy: {
-        manifestUrl: `${isolatedOrigin}/__lazy/manifest.txt`,
-        chunkBase: `${isolatedOrigin}/__lazy/chunks`,
-        preload: [],
-      },
-      steps: [
-        { label: "lazy snapshot echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-snapshot"] },
-      ],
-    };
-    const beforeRestore = await page.evaluate(workerDriver, { ...lazySnapshotInput, persist: true });
-    const afterRestore = await page.evaluate(workerDriver, lazySnapshotInput);
-    const beforeRun = beforeRestore.runs[0];
-    const afterRun = afterRestore.runs[0];
-    const lazySnapshotOk =
-      beforeRun.status === 1 &&
-      afterRun.status === 1 &&
-      beforeRun.exitCode === 0 &&
-      afterRun.exitCode === 0 &&
-      beforeRun.output === "lazy-snapshot\n" &&
-      afterRun.output === beforeRun.output &&
-      afterRun.icount === beforeRun.icount &&
-      afterRun.pageIns > 0 &&
-      afterRestore.restored &&
-      beforeRestore.persistedBytes > 0 &&
-      beforeRestore.persistedBytes < lazyImage.logicalBytes;
-    record(
-      "lazy snapshot restores descriptors and rebinds manifest authority",
-      lazySnapshotOk,
-      lazySnapshotOk
-        ? `${beforeRestore.persistedBytes.toLocaleString()}-byte snapshot restored; ${afterRun.pageIns} pages refetched`
-        : `restored=${afterRestore.restored} status=${beforeRun.status}/${afterRun.status} exit=${beforeRun.exitCode}/${afterRun.exitCode} icount=${beforeRun.icount}/${afterRun.icount} pages=${afterRun.pageIns} snapshot=${beforeRestore.persistedBytes}`,
-    );
+    if (!opfsAvailable) {
+      record(
+        "lazy snapshot restores descriptors and rebinds manifest authority",
+        null,
+        "OPFS unavailable; descriptor persistence not applicable",
+      );
+    } else {
+      const isolatedOrigin = origin.replace("127.0.0.1", "localhost");
+      await page.goto(`${isolatedOrigin}/__blank.html`);
+      const lazySnapshotInput = {
+        workerUrl: `${isolatedOrigin}/web/worker.js`,
+        files: [],
+        lazy: {
+          manifestUrl: `${isolatedOrigin}/__lazy/manifest.txt`,
+          chunkBase: `${isolatedOrigin}/__lazy/chunks`,
+          preload: [],
+        },
+        steps: [
+          { label: "lazy snapshot echo", path: "/bin/busybox", argv: ["busybox", "echo", "lazy-snapshot"] },
+        ],
+      };
+      const beforeRestore = await page.evaluate(workerDriver, { ...lazySnapshotInput, persist: true });
+      const afterRestore = await page.evaluate(workerDriver, lazySnapshotInput);
+      const beforeRun = beforeRestore.runs[0];
+      const afterRun = afterRestore.runs[0];
+      const lazySnapshotOk =
+        beforeRun.status === 1 &&
+        afterRun.status === 1 &&
+        beforeRun.exitCode === 0 &&
+        afterRun.exitCode === 0 &&
+        beforeRun.output === "lazy-snapshot\n" &&
+        afterRun.output === beforeRun.output &&
+        afterRun.icount === beforeRun.icount &&
+        afterRun.pageIns > 0 &&
+        afterRestore.restored &&
+        beforeRestore.persistedBytes > 0 &&
+        beforeRestore.persistedBytes < lazyImage.logicalBytes;
+      record(
+        "lazy snapshot restores descriptors and rebinds manifest authority",
+        lazySnapshotOk,
+        lazySnapshotOk
+          ? `${beforeRestore.persistedBytes.toLocaleString()}-byte snapshot restored; ${afterRun.pageIns} pages refetched`
+          : `restored=${afterRestore.restored} status=${beforeRun.status}/${afterRun.status} exit=${beforeRun.exitCode}/${afterRun.exitCode} icount=${beforeRun.icount}/${afterRun.icount} pages=${afterRun.pageIns} snapshot=${beforeRestore.persistedBytes}`,
+      );
+    }
 
     // The strongest determinism statement this harness can make. Not "the
     // engines retired the same number of instructions", but "this browser
@@ -1235,6 +1401,7 @@ async function runEngine(name, origin, gateway, images) {
   // ---- Phase D: a profile with no persistent storage (a private window).
   // The runtime must still boot and run; only the snapshot buttons stand down.
   const browser = await playwright[name].launch({ headless: !headed });
+  const browserVersion = browser.version();
   try {
     const ephemeralContext = await browser.newContext();
     ephemeralContext.setDefaultTimeout(EXEC_TIMEOUT);
@@ -1266,13 +1433,14 @@ async function runEngine(name, origin, gateway, images) {
   }
 
   record("no uncaught page errors", pageErrors.length === 0, pageErrors.join(" | "));
-  return { checks, fingerprint };
+  return { browserVersion, checks, fingerprint };
 }
 
 // -------------------------------------------------------------------- main
 
 const busyboxPath = fileURLToPath(new URL("./busybox-musl", import.meta.url));
-const lazyImage = publishLazyImage("/bin/busybox", await readFile(busyboxPath));
+const busyboxBytes = await readFile(busyboxPath);
+const lazyImage = publishLazyImage("/bin/busybox", busyboxBytes);
 const { server, origin } = await startServer();
 const gateway = await startGateway(`127.0.0.1:${new URL(origin).port}`);
 
@@ -1298,14 +1466,14 @@ if (codexImage === null) {
 // travel in the same manifest. Stage web/claude and web/claude-libs/.
 const claudeBytes = await readFile(fileURLToPath(new URL("./claude", import.meta.url))).catch(() => null);
 let claudeImage = null;
+let claudeFiles = null;
 if (claudeBytes !== null) {
   const libDir = new URL("./claude-libs/", import.meta.url);
   const lib = async (name) => ({
     path: name === "ld-linux-x86-64.so.2" ? "/lib64/ld-linux-x86-64.so.2" : `/lib/x86_64-linux-gnu/${name}`,
     bytes: await readFile(fileURLToPath(new URL(name, libDir))),
   });
-  claudeImage = publishLazyFiles(
-    [
+  claudeFiles = [
       { path: "/bin/claude", bytes: claudeBytes },
       await lib("ld-linux-x86-64.so.2"),
       await lib("libc.so.6"),
@@ -1313,9 +1481,8 @@ if (claudeBytes !== null) {
       await lib("libdl.so.2"),
       await lib("libpthread.so.0"),
       await lib("librt.so.1"),
-    ],
-    "claude-manifest.txt",
-  );
+  ];
+  claudeImage = publishLazyFiles(claudeFiles, "claude-manifest.txt");
 } else {
   console.log("note: web/claude missing — Claude Code lazy checks skipped");
 }
@@ -1335,6 +1502,33 @@ const images = {
   codex: codexImage,
   claude: claudeImage,
 };
+const workloadEvidence = {
+  busybox: lockedWorkload("busybox", [
+    { path: "/bin/busybox", sha256: sha256OfBytes(busyboxBytes), size: busyboxBytes.length },
+  ]),
+  openfox: lockedWorkload(
+    "openfox",
+    agentInfo === null
+      ? null
+      : [{ path: "/bin/openfox", sha256: await sha256OfFile(agentPath), size: agentInfo.size }],
+  ),
+  codex: lockedWorkload(
+    "codex",
+    codexBytes === null
+      ? null
+      : [{ path: "/bin/codex", sha256: sha256OfBytes(codexBytes), size: codexBytes.length }],
+  ),
+  "claude-code": lockedWorkload(
+    "claude-code",
+    claudeFiles === null
+      ? null
+      : claudeFiles.map((file) => ({
+          path: file.path,
+          sha256: sha256OfBytes(file.bytes),
+          size: file.bytes.length,
+        })),
+  ),
+};
 if (!images.agent) {
   console.log("note: web/openfox missing (tools/build_openfox_fixture.sh) — agent image checks skipped");
 }
@@ -1350,9 +1544,17 @@ const fingerprints = {};
 try {
   for (const name of engines) {
     console.log(`\n=== ${name} ===`);
-    const { checks, fingerprint } = await runEngine(name, origin, gateway, images);
-    const failed = checks.filter((c) => !c.ok);
-    summary.push({ name, total: checks.length, failed: failed.length });
+    const { browserVersion, checks, fingerprint } = await runEngine(name, origin, gateway, images);
+    const failed = checks.filter((c) => c.ok === false);
+    const skipped = checks.filter((c) => c.ok === null);
+    summary.push({
+      browserVersion,
+      checks,
+      name,
+      total: checks.length,
+      failed: failed.length,
+      skipped: skipped.length,
+    });
     fingerprints[name] = fingerprint;
   }
 } finally {
@@ -1385,9 +1587,41 @@ if (ran.length > 1) {
 
 console.log("\n=== matrix ===");
 for (const row of summary) {
-  console.log(`${row.name.padEnd(9)} ${row.failed === 0 ? "PASS" : "FAIL"}  ${row.total - row.failed}/${row.total} checks`);
+  const passed = row.total - row.failed - row.skipped;
+  const skipped = row.skipped > 0 ? `, ${row.skipped} skipped` : "";
+  console.log(`${row.name.padEnd(9)} ${row.failed === 0 ? "PASS" : "FAIL"}  ${passed}/${passed + row.failed} checks${skipped}`);
 }
 const broken = summary.filter((r) => r.failed > 0);
+if (compatibilityReport) {
+  const report = {
+    engines: summary.map((row) => ({
+      checks: row.checks.map(({ label, ok }) => ({ label, ok })),
+      failed: row.failed,
+      name: row.name,
+      passed: row.total - row.failed - row.skipped,
+      skipped: row.skipped,
+      version: row.browserVersion,
+    })),
+    generated_at: new Date().toISOString(),
+    instruction_fingerprints: fingerprints,
+    runtime: {
+      sha256: await sha256OfFile(new URL("./webtos_web.wasm", import.meta.url)),
+      source_commit: sourceCommit,
+    },
+    schema_version: 1,
+    status: broken.length === 0 && divergent === 0 && summary.every((row) => row.skipped === 0)
+      ? "pass"
+      : broken.length === 0 && divergent === 0
+        ? "incomplete"
+        : "fail",
+    workloads: workloadEvidence,
+  };
+  const temporary = `${compatibilityReport}.tmp`;
+  await mkdir(dirname(compatibilityReport), { recursive: true });
+  await writeFile(temporary, `${JSON.stringify(report, null, 2)}\n`);
+  await rename(temporary, compatibilityReport);
+  console.log(`[browsers] compatibility report: ${compatibilityReport}`);
+}
 if (broken.length > 0 || divergent > 0) {
   const reasons = [
     ...broken.map((r) => r.name),
@@ -1396,4 +1630,5 @@ if (broken.length > 0 || divergent > 0) {
   console.error(`\n[browsers] FAIL (${reasons.join(", ")})`);
   process.exit(1);
 }
-console.log("\n[browsers] PASS");
+const skippedTotal = summary.reduce((total, row) => total + row.skipped, 0);
+console.log(`\n[browsers] PASS${skippedTotal > 0 ? ` (${skippedTotal} capability checks skipped)` : ""}`);

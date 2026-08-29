@@ -139,6 +139,12 @@ pub(crate) struct Secret {
     pub(crate) paths: Vec<Vec<u8>>,
 }
 
+struct HostSecretHandle {
+    name: String,
+    value: Vec<u8>,
+    principal: String,
+}
+
 /// One content-addressed chunk the host must supply. Page requests carry VMA
 /// coordinates; file-range requests use zero coordinates and still retry the
 /// same syscall only after the verified chunk is resident.
@@ -189,6 +195,15 @@ pub struct LinuxEnv {
     /// expanded to the value in memory, and redacted back to `${name}` when
     /// the filesystem is serialized, so secrets never enter a snapshot.
     pub(crate) secrets: std::collections::BTreeMap<String, Secret>,
+    /// Opaque host-owned secret handles. The VFS contains only an empty,
+    /// read-only mount node; reads resolve node -> handle -> bytes here, so a
+    /// filesystem snapshot never has secret bytes to redact.
+    host_secret_handles: std::collections::BTreeMap<u64, HostSecretHandle>,
+    pub(crate) host_secret_nodes: std::collections::BTreeMap<usize, u64>,
+    pub(crate) next_host_secret_handle: u64,
+    /// Host-assigned identity for capability-backed resources. Guest syscalls
+    /// cannot change this principal.
+    agent_principal: Option<String>,
     /// Recent syscalls, as `(pid, nr, icount)` (bounded ring), for crash
     /// and deadlock diagnostics.
     pub(crate) syscall_trail: std::collections::VecDeque<(u64, u64, u64)>,
@@ -286,6 +301,10 @@ impl LinuxEnv {
             net: None,
             net_meter: std::rc::Rc::new(std::cell::RefCell::new(net::NetMeter::new())),
             secrets: std::collections::BTreeMap::new(),
+            host_secret_handles: std::collections::BTreeMap::new(),
+            host_secret_nodes: std::collections::BTreeMap::new(),
+            next_host_secret_handle: 1,
+            agent_principal: None,
             syscall_trail: std::collections::VecDeque::with_capacity(128),
             warp_nanos: 0,
             epoch_base_sec: EPOCH_BASE_SEC,
@@ -362,7 +381,19 @@ impl LinuxEnv {
         for task in &self.sched.parked {
             collect(&task.proc.fds.borrow());
         }
-        self.vfs.release_unreferenced(&referenced)
+        let released_secret_nodes = self
+            .host_secret_nodes
+            .keys()
+            .copied()
+            .filter(|node| self.vfs.node(*node).nlink == 0 && !referenced.contains(node))
+            .collect::<Vec<_>>();
+        let freed = self.vfs.release_unreferenced(&referenced);
+        for node in released_secret_nodes {
+            if let Some(handle) = self.host_secret_nodes.remove(&node) {
+                self.host_secret_handles.remove(&handle);
+            }
+        }
+        freed
     }
 
     /// Registers a secret readable by every guest file that names it.
@@ -393,6 +424,68 @@ impl LinuxEnv {
                 paths: paths.iter().map(|p| p.to_vec()).collect(),
             },
         );
+    }
+
+    /// Mounts a read-only file whose bytes stay behind an opaque host handle.
+    /// The guest namespace stores an empty marker node; only `read(2)` crosses
+    /// the handle boundary, and snapshots serialize the marker, not `value`.
+    pub fn mount_secret_handle(
+        &mut self,
+        name: &str,
+        value: &[u8],
+        path: &[u8],
+        principal: &str,
+    ) -> Result<u64, String> {
+        if principal.is_empty() {
+            return Err("secret handle needs a non-empty agent principal".to_string());
+        }
+        let handle = self.next_host_secret_handle;
+        self.next_host_secret_handle = self
+            .next_host_secret_handle
+            .checked_add(1)
+            .ok_or_else(|| "secret handle id space exhausted".to_string())?;
+        let node = self
+            .vfs
+            .add_node(path, vfs::NodeKind::File(Vec::new()), 0o400)
+            .map_err(|errno| {
+                format!(
+                    "cannot mount secret at {}: errno {errno}",
+                    path.escape_ascii()
+                )
+            })?;
+        self.host_secret_handles.insert(
+            handle,
+            HostSecretHandle {
+                name: name.to_string(),
+                value: value.to_vec(),
+                principal: principal.to_string(),
+            },
+        );
+        self.host_secret_nodes.insert(node, handle);
+        self.reclaim_unlinked();
+        Ok(handle)
+    }
+
+    pub(crate) fn host_secret_for_node(&self, node: usize) -> Option<&[u8]> {
+        let handle = self.host_secret_nodes.get(&node)?;
+        self.host_secret_handles
+            .get(handle)
+            .filter(|secret| self.agent_principal.as_deref() == Some(&secret.principal))
+            .map(|secret| secret.value.as_slice())
+    }
+
+    pub(crate) fn is_host_secret_node(&self, node: usize) -> bool {
+        self.host_secret_nodes.contains_key(&node)
+    }
+
+    /// Selects the host-controlled agent principal for subsequent syscalls.
+    /// It is not part of the guest filesystem or its snapshots.
+    pub fn set_agent_principal(&mut self, principal: &str) -> Result<(), String> {
+        if principal.is_empty() {
+            return Err("agent principal cannot be empty".to_string());
+        }
+        self.agent_principal = Some(principal.to_string());
+        Ok(())
     }
 
     /// Expands `${name}` placeholders using the registered secrets: in every
@@ -1243,7 +1336,7 @@ pub struct Machine {
     spec_fingerprint: [u8; 32],
 }
 
-/// What a machine occupies, split by what it is spent on. All three live in
+/// What a machine occupies, split by what it is spent on. All four live in
 /// one wasm linear memory and compete for its ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footprint {
@@ -1253,6 +1346,10 @@ pub struct Footprint {
     pub code_bytes: usize,
     /// File contents and symlink targets in the guest filesystem.
     pub files_bytes: usize,
+    /// Credential bytes retained behind opaque host handles. They are outside
+    /// the VFS but still occupy the same Wasm linear memory and therefore
+    /// count against the host's total budget.
+    pub host_bytes: usize,
     pub total_bytes: usize,
 }
 
@@ -1788,7 +1885,7 @@ impl Machine {
     }
 
     /// What the machine occupies, split by what it is spent on. One wasm
-    /// linear memory holds all three, and a browser tab's ceiling is roughly
+    /// linear memory holds all four, and a browser tab's ceiling is roughly
     /// 3.9 GiB (`docs/performance.md`), so they compete: an agent image, the
     /// guest's own pages, and the code the engine has lifted.
     /// Takes `&mut self` because the guest filesystem is reached through the
@@ -1796,12 +1893,19 @@ impl Machine {
     pub fn footprint(&mut self) -> Footprint {
         let guest_bytes = self.vm.cpu.mem.total_pages() * 4096;
         let code_bytes = self.vm.lifted_bytes();
-        let files_bytes = self.env().vfs.bytes();
+        let env = self.env();
+        let files_bytes = env.vfs.bytes();
+        let host_bytes = env
+            .host_secret_handles
+            .values()
+            .map(|secret| secret.value.capacity())
+            .sum::<usize>();
         Footprint {
             guest_bytes,
             code_bytes,
             files_bytes,
-            total_bytes: guest_bytes + code_bytes + files_bytes,
+            host_bytes,
+            total_bytes: guest_bytes + code_bytes + files_bytes + host_bytes,
         }
     }
 
@@ -1996,12 +2100,13 @@ impl Machine {
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
         Err(format!(
             "over the memory budget: {:.1} MiB more against {:.1} MiB free \
-             (guest {:.1}, code {:.1}, files {:.1}, budget {:.1} MiB)",
+             (guest {:.1}, code {:.1}, files {:.1}, host {:.1}, budget {:.1} MiB)",
             mib(adding),
             mib(budget.saturating_sub(footprint.total_bytes)),
             mib(footprint.guest_bytes),
             mib(footprint.code_bytes),
             mib(footprint.files_bytes),
+            mib(footprint.host_bytes),
             mib(budget),
         ))
     }
@@ -2123,6 +2228,24 @@ impl Machine {
     /// See [`LinuxEnv::set_scoped_secret`].
     pub fn set_scoped_secret(&mut self, name: &str, value: &str, paths: &[&[u8]]) {
         self.env().set_scoped_secret(name, value, paths);
+    }
+
+    /// Mounts a read-only guest path backed by an opaque host secret handle.
+    /// Unlike placeholder injection, the value is never copied into the VFS.
+    pub fn mount_secret_handle(
+        &mut self,
+        name: &str,
+        value: &[u8],
+        path: &[u8],
+        principal: &str,
+    ) -> Result<u64, String> {
+        self.check_budget(value.len())?;
+        self.env().mount_secret_handle(name, value, path, principal)
+    }
+
+    /// Chooses the host principal allowed to consume scoped capabilities.
+    pub fn set_agent_principal(&mut self, principal: &str) -> Result<(), String> {
+        self.env().set_agent_principal(principal)
     }
 
     /// Expands `${name}` secret placeholders in guest files. Call after
@@ -2361,6 +2484,19 @@ impl Machine {
             .filter(|(_, secret)| !secret.value.is_empty())
             .map(|(name, secret)| (secret.value.clone(), format!("${{{name}}}")))
             .collect();
+        let mut names = names;
+        names.extend(
+            self.env()
+                .host_secret_handles
+                .values()
+                .filter(|secret| !secret.value.is_empty())
+                .map(|secret| {
+                    (
+                        String::from_utf8_lossy(&secret.value).into_owned(),
+                        format!("${{{}}}", secret.name),
+                    )
+                }),
+        );
         for (value, placeholder) in names {
             bundle = bundle.replace(&value, &placeholder);
         }

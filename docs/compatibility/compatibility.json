@@ -1,0 +1,666 @@
+{
+  "engines": [
+    {
+      "checks": [
+        {
+          "label": "demo page boots",
+          "ok": true
+        },
+        {
+          "label": "busybox echo",
+          "ok": true
+        },
+        {
+          "label": "busybox ls /",
+          "ok": true
+        },
+        {
+          "label": "sh pipeline (fork/pipe/execve)",
+          "ok": true
+        },
+        {
+          "label": "write state before reload",
+          "ok": true
+        },
+        {
+          "label": "no network unless the host grants one",
+          "ok": true
+        },
+        {
+          "label": "persist filesystem to OPFS",
+          "ok": true
+        },
+        {
+          "label": "reload restores the snapshot",
+          "ok": true
+        },
+        {
+          "label": "state survives the browser reload",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "worker boots the machine",
+          "ok": true
+        },
+        {
+          "label": "static hello",
+          "ok": true
+        },
+        {
+          "label": "dynamic hello (musl loader)",
+          "ok": true
+        },
+        {
+          "label": "manifest-backed demand paging matches eager execution",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --version from a clean profile, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --help, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: claude --version, dynamic runtime fully manifest-delivered",
+          "ok": true
+        },
+        {
+          "label": "lazy browser JIT matches eager architectural trace",
+          "ok": true
+        },
+        {
+          "label": "lazy snapshot restores descriptors and rebinds manifest authority",
+          "ok": true
+        },
+        {
+          "label": "architectural trace matches the native reference",
+          "ok": true
+        },
+        {
+          "label": "terminal: interactive shell reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "images: a streamed image arrives intact",
+          "ok": true
+        },
+        {
+          "label": "images: a whole agent image is delivered",
+          "ok": true
+        },
+        {
+          "label": "images: the agent image runs in the browser",
+          "ok": true
+        },
+        {
+          "label": "memory: the footprint is reported by what it is spent on",
+          "ok": true
+        },
+        {
+          "label": "secrets: the credential reaches the file the host scoped it to",
+          "ok": true
+        },
+        {
+          "label": "secrets: another agent's config keeps the placeholder",
+          "ok": true
+        },
+        {
+          "label": "secrets: the checkpoint carries the placeholder, not the value",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the session is written to browser storage",
+          "ok": true
+        },
+        {
+          "label": "images: a reload serves them from the cache",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the agent resumes from its session after a reload",
+          "ok": true
+        },
+        {
+          "label": "terminal: the shell echoes and runs a command",
+          "ok": true
+        },
+        {
+          "label": "terminal: pipeline across processes",
+          "ok": true
+        },
+        {
+          "label": "terminal: full-screen editor paints",
+          "ok": true
+        },
+        {
+          "label": "terminal: SIGWINCH repaints without a keystroke",
+          "ok": true
+        },
+        {
+          "label": "terminal: the editor quits back to the shell",
+          "ok": true
+        },
+        {
+          "label": "network: the guest fetches over a relayed socket",
+          "ok": true
+        },
+        {
+          "label": "network: a destination outside the allowlist is refused",
+          "ok": true
+        },
+        {
+          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "ok": true
+        },
+        {
+          "label": "terminal: manifest-only session reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: runtime still runs",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: snapshot capability reported honestly",
+          "ok": true
+        },
+        {
+          "label": "no uncaught page errors",
+          "ok": true
+        }
+      ],
+      "failed": 0,
+      "name": "chromium",
+      "passed": 43,
+      "version": "151.0.7922.34"
+    },
+    {
+      "checks": [
+        {
+          "label": "demo page boots",
+          "ok": true
+        },
+        {
+          "label": "busybox echo",
+          "ok": true
+        },
+        {
+          "label": "busybox ls /",
+          "ok": true
+        },
+        {
+          "label": "sh pipeline (fork/pipe/execve)",
+          "ok": true
+        },
+        {
+          "label": "write state before reload",
+          "ok": true
+        },
+        {
+          "label": "no network unless the host grants one",
+          "ok": true
+        },
+        {
+          "label": "persist filesystem to OPFS",
+          "ok": true
+        },
+        {
+          "label": "reload restores the snapshot",
+          "ok": true
+        },
+        {
+          "label": "state survives the browser reload",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "worker boots the machine",
+          "ok": true
+        },
+        {
+          "label": "static hello",
+          "ok": true
+        },
+        {
+          "label": "dynamic hello (musl loader)",
+          "ok": true
+        },
+        {
+          "label": "manifest-backed demand paging matches eager execution",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --version from a clean profile, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --help, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: claude --version, dynamic runtime fully manifest-delivered",
+          "ok": true
+        },
+        {
+          "label": "lazy browser JIT matches eager architectural trace",
+          "ok": true
+        },
+        {
+          "label": "lazy snapshot restores descriptors and rebinds manifest authority",
+          "ok": true
+        },
+        {
+          "label": "architectural trace matches the native reference",
+          "ok": true
+        },
+        {
+          "label": "terminal: interactive shell reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "images: a streamed image arrives intact",
+          "ok": true
+        },
+        {
+          "label": "images: a whole agent image is delivered",
+          "ok": true
+        },
+        {
+          "label": "images: the agent image runs in the browser",
+          "ok": true
+        },
+        {
+          "label": "memory: the footprint is reported by what it is spent on",
+          "ok": true
+        },
+        {
+          "label": "secrets: the credential reaches the file the host scoped it to",
+          "ok": true
+        },
+        {
+          "label": "secrets: another agent's config keeps the placeholder",
+          "ok": true
+        },
+        {
+          "label": "secrets: the checkpoint carries the placeholder, not the value",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the session is written to browser storage",
+          "ok": true
+        },
+        {
+          "label": "images: a reload serves them from the cache",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the agent resumes from its session after a reload",
+          "ok": true
+        },
+        {
+          "label": "terminal: the shell echoes and runs a command",
+          "ok": true
+        },
+        {
+          "label": "terminal: pipeline across processes",
+          "ok": true
+        },
+        {
+          "label": "terminal: full-screen editor paints",
+          "ok": true
+        },
+        {
+          "label": "terminal: SIGWINCH repaints without a keystroke",
+          "ok": true
+        },
+        {
+          "label": "terminal: the editor quits back to the shell",
+          "ok": true
+        },
+        {
+          "label": "network: the guest fetches over a relayed socket",
+          "ok": true
+        },
+        {
+          "label": "network: a destination outside the allowlist is refused",
+          "ok": true
+        },
+        {
+          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "ok": true
+        },
+        {
+          "label": "terminal: manifest-only session reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: runtime still runs",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: snapshot capability reported honestly",
+          "ok": true
+        },
+        {
+          "label": "no uncaught page errors",
+          "ok": true
+        }
+      ],
+      "failed": 0,
+      "name": "firefox",
+      "passed": 43,
+      "version": "153.0"
+    },
+    {
+      "checks": [
+        {
+          "label": "demo page boots",
+          "ok": true
+        },
+        {
+          "label": "busybox echo",
+          "ok": true
+        },
+        {
+          "label": "busybox ls /",
+          "ok": true
+        },
+        {
+          "label": "sh pipeline (fork/pipe/execve)",
+          "ok": true
+        },
+        {
+          "label": "write state before reload",
+          "ok": true
+        },
+        {
+          "label": "no network unless the host grants one",
+          "ok": true
+        },
+        {
+          "label": "persist filesystem to OPFS",
+          "ok": true
+        },
+        {
+          "label": "reload restores the snapshot",
+          "ok": true
+        },
+        {
+          "label": "state survives the browser reload",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: an interrupted persist leaves the committed snapshot intact",
+          "ok": true
+        },
+        {
+          "label": "worker boots the machine",
+          "ok": true
+        },
+        {
+          "label": "static hello",
+          "ok": true
+        },
+        {
+          "label": "dynamic hello (musl loader)",
+          "ok": true
+        },
+        {
+          "label": "manifest-backed demand paging matches eager execution",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --version from a clean profile, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: codex --help, demand paged",
+          "ok": true
+        },
+        {
+          "label": "real agent: claude --version, dynamic runtime fully manifest-delivered",
+          "ok": true
+        },
+        {
+          "label": "lazy browser JIT matches eager architectural trace",
+          "ok": true
+        },
+        {
+          "label": "lazy snapshot restores descriptors and rebinds manifest authority",
+          "ok": true
+        },
+        {
+          "label": "architectural trace matches the native reference",
+          "ok": true
+        },
+        {
+          "label": "terminal: interactive shell reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "images: a streamed image arrives intact",
+          "ok": true
+        },
+        {
+          "label": "images: a whole agent image is delivered",
+          "ok": true
+        },
+        {
+          "label": "images: the agent image runs in the browser",
+          "ok": true
+        },
+        {
+          "label": "memory: the footprint is reported by what it is spent on",
+          "ok": true
+        },
+        {
+          "label": "secrets: the credential reaches the file the host scoped it to",
+          "ok": true
+        },
+        {
+          "label": "secrets: another agent's config keeps the placeholder",
+          "ok": true
+        },
+        {
+          "label": "secrets: the checkpoint carries the placeholder, not the value",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the session is written to browser storage",
+          "ok": true
+        },
+        {
+          "label": "images: a reload serves them from the cache",
+          "ok": true
+        },
+        {
+          "label": "checkpoint: the agent resumes from its session after a reload",
+          "ok": true
+        },
+        {
+          "label": "terminal: the shell echoes and runs a command",
+          "ok": true
+        },
+        {
+          "label": "terminal: pipeline across processes",
+          "ok": true
+        },
+        {
+          "label": "terminal: full-screen editor paints",
+          "ok": true
+        },
+        {
+          "label": "terminal: SIGWINCH repaints without a keystroke",
+          "ok": true
+        },
+        {
+          "label": "terminal: the editor quits back to the shell",
+          "ok": true
+        },
+        {
+          "label": "network: the guest fetches over a relayed socket",
+          "ok": true
+        },
+        {
+          "label": "network: a destination outside the allowlist is refused",
+          "ok": true
+        },
+        {
+          "label": "memory: an image that will not fit the budget is refused, not fatal",
+          "ok": true
+        },
+        {
+          "label": "terminal: manifest-only session reaches a prompt",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: runtime still runs",
+          "ok": true
+        },
+        {
+          "label": "storage-less profile: snapshot capability reported honestly",
+          "ok": true
+        },
+        {
+          "label": "no uncaught page errors",
+          "ok": true
+        }
+      ],
+      "failed": 0,
+      "name": "webkit",
+      "passed": 43,
+      "version": "26.5"
+    }
+  ],
+  "generated_at": "2026-08-29T10:02:25.701Z",
+  "instruction_fingerprints": {
+    "chromium": {
+      "busybox ls /": 73280,
+      "claude --version": 186715528,
+      "codex --help": 7084016,
+      "codex --version": 5649059,
+      "dynamic hello (musl loader)": 31937,
+      "lazy busybox JIT": 4865,
+      "lazy busybox echo": 4821,
+      "sh pipeline": 45563,
+      "static hello": 23
+    },
+    "firefox": {
+      "busybox ls /": 73280,
+      "claude --version": 186715528,
+      "codex --help": 7084016,
+      "codex --version": 5649059,
+      "dynamic hello (musl loader)": 31937,
+      "lazy busybox JIT": 4865,
+      "lazy busybox echo": 4821,
+      "sh pipeline": 45563,
+      "static hello": 23
+    },
+    "webkit": {
+      "busybox ls /": 73280,
+      "claude --version": 186715528,
+      "codex --help": 7084016,
+      "codex --version": 5649059,
+      "dynamic hello (musl loader)": 31937,
+      "lazy busybox JIT": 4865,
+      "lazy busybox echo": 4821,
+      "sh pipeline": 45563,
+      "static hello": 23
+    }
+  },
+  "runtime": {
+    "sha256": "8a399de908746493fa64a6ecb77d9ee00fd16ee8e5fd1a514bb9980e1fc00b25",
+    "source_commit": "ff3e1b830890874ae35fe237fbd7ffa37d09c1d1"
+  },
+  "schema_version": 1,
+  "status": "pass",
+  "workloads": {
+    "busybox": {
+      "files": [
+        {
+          "path": "/bin/busybox",
+          "sha256": "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
+          "size": 1131168
+        }
+      ],
+      "id": "busybox",
+      "present": true,
+      "version": "1.35.0"
+    },
+    "claude-code": {
+      "files": [
+        {
+          "path": "/bin/claude",
+          "sha256": "5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15",
+          "size": 250162696
+        },
+        {
+          "path": "/lib/x86_64-linux-gnu/libc.so.6",
+          "sha256": "e01b1ce7be2987f3b8560e26d0df2623f9dd5cec17be923ae28a785bc0d32d50",
+          "size": 2220400
+        },
+        {
+          "path": "/lib/x86_64-linux-gnu/libdl.so.2",
+          "sha256": "d255ba9c9e3a7c35115e578c898147edaba1a2bcf742cc3a76995ceed9d5ac4f",
+          "size": 14432
+        },
+        {
+          "path": "/lib/x86_64-linux-gnu/libm.so.6",
+          "sha256": "df621c68dbfed7e843434ef2faedb9f4d4b0543ad161e9a55eaf4d4ce2443176",
+          "size": 940560
+        },
+        {
+          "path": "/lib/x86_64-linux-gnu/libpthread.so.0",
+          "sha256": "fbed9505adacada2abb37c6b43be2df6de81e742712c6025694ba48de62c7e78",
+          "size": 21448
+        },
+        {
+          "path": "/lib/x86_64-linux-gnu/librt.so.1",
+          "sha256": "83eda8758c8697323bedf48bc0186c006cca2205441a988cb0f5072b96262100",
+          "size": 14664
+        },
+        {
+          "path": "/lib64/ld-linux-x86-64.so.2",
+          "sha256": "8d06f393f4a93bcf9b81145a259524d66a95522a646bf8d7e05b6ffdf2e63dcc",
+          "size": 240936
+        }
+      ],
+      "id": "claude-code",
+      "present": true,
+      "version": "2.1.247"
+    },
+    "codex": {
+      "files": [
+        {
+          "path": "/bin/codex",
+          "sha256": "abf1bb1643a79f73aa78ee627e111e02d4f8c98f25813a0cf6ce277709664386",
+          "size": 268330432
+        }
+      ],
+      "id": "codex",
+      "present": true,
+      "version": "0.150.1"
+    },
+    "openfox": {
+      "files": [
+        {
+          "path": "/bin/openfox",
+          "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb",
+          "size": 52971260
+        }
+      ],
+      "id": "openfox",
+      "present": true,
+      "version": "6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
+    }
+  }
+}

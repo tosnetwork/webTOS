@@ -1360,7 +1360,8 @@ fn socket_addr(ip: u32, port: u32) -> Option<std::net::SocketAddrV4> {
 /// Serializes the guest filesystem for persistence; read the image via
 /// `wtw_fs_ptr`/`wtw_fs_len`. Snapshot between processes, not mid-run.
 /// One part of the machine's footprint, in kibibytes: 0 guest pages, 1
-/// lifted code, 2 guest files, 3 the total. Kibibytes rather than bytes
+/// lifted code, 2 guest files, 3 the total, 4 host capability bytes.
+/// Kibibytes rather than bytes
 /// because the total passes 4 GiB before a `u32` would.
 #[no_mangle]
 pub extern "C" fn wtw_footprint_kib(part: u32) -> u32 {
@@ -1373,6 +1374,7 @@ pub extern "C" fn wtw_footprint_kib(part: u32) -> u32 {
             0 => f.guest_bytes,
             1 => f.code_bytes,
             2 => f.files_bytes,
+            4 => f.host_bytes,
             _ => f.total_bytes,
         };
         (bytes / 1024) as u32
@@ -1694,6 +1696,57 @@ pub extern "C" fn wtw_secrets_apply() -> i32 {
             }
         }
         match machine.expand_secrets() {
+            Ok(()) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// Mounts one credential as a read-only, host-handle-backed guest file. The
+/// value never becomes VFS contents and therefore cannot enter a snapshot.
+#[no_mangle]
+pub extern "C" fn wtw_secret_handle(
+    name_ptr: u32,
+    name_len: u32,
+    value_ptr: u32,
+    value_len: u32,
+    path_ptr: u32,
+    path_len: u32,
+    principal_ptr: u32,
+    principal_len: u32,
+) -> i32 {
+    with_state(|state| {
+        let (Some(name), Some(value), Some(path), Some(principal)) = (
+            slice_arg(name_ptr, name_len),
+            slice_arg(value_ptr, value_len),
+            path_arg(path_ptr, path_len),
+            slice_arg(principal_ptr, principal_len),
+        ) else {
+            return fail(state, "secret handle argument is not inside module memory");
+        };
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_secret_handle called before wtw_init");
+        };
+        let name = String::from_utf8_lossy(&name);
+        let principal = String::from_utf8_lossy(&principal);
+        match machine.mount_secret_handle(&name, &value, &path, &principal) {
+            Ok(_) => 0,
+            Err(why) => fail(state, why),
+        }
+    })
+}
+
+/// Selects the host-only agent principal that may dereference scoped handles.
+#[no_mangle]
+pub extern "C" fn wtw_agent_principal(ptr: u32, len: u32) -> i32 {
+    with_state(|state| {
+        let Some(principal) = slice_arg(ptr, len) else {
+            return fail(state, "agent principal is not inside module memory");
+        };
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_agent_principal called before wtw_init");
+        };
+        match machine.set_agent_principal(&String::from_utf8_lossy(&principal)) {
             Ok(()) => 0,
             Err(why) => fail(state, why),
         }

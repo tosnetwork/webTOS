@@ -344,6 +344,9 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_FTRUNCATE => sys_ftruncate(env, cpu, a[0], a[1]),
         abi::SYS_READV => outcome_vectored(env, cpu, a[0], a[1], a[2], false),
         abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
+        // Terminal-changing ioctls may stop a background process group before
+        // they mutate the pty, so they need the scheduler-aware Outcome path.
+        abi::SYS_IOCTL => outcome_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
         abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::vfork()),
         abi::SYS_CLONE => {
@@ -464,7 +467,6 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
         }
         abi::SYS_FCNTL => sys_fcntl(env, cpu, a[0], a[1], a[2]),
-        abi::SYS_IOCTL => sys_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FSYNC | abi::SYS_SYNC => Ok(0),
         // Advisory locking. The guest is a single process with no competing
         // lock holders, so acquiring/releasing always succeeds as a no-op.
@@ -888,6 +890,16 @@ fn read_backing(
             read_inotify(&mut inner.borrow_mut(), buf_len).map_err(ReadBackingError::Errno)
         }
         Backing::File { node } => {
+            if env.is_host_secret_node(*node) {
+                let secret = env
+                    .host_secret_for_node(*node)
+                    .ok_or(ReadBackingError::Errno(abi::EACCES))?;
+                let start = offset_into(desc.offset, secret.len());
+                let end = start.saturating_add(buf_len).min(secret.len());
+                let chunk = secret[start..end].to_vec();
+                desc.offset += chunk.len() as u64;
+                return Ok(chunk);
+            }
             let chunk = match env
                 .vfs
                 .read_node_range(*node, desc.offset, buf_len)
@@ -999,6 +1011,9 @@ fn write_backing(env: &mut LinuxEnv, desc: &mut Description, bytes: &[u8]) -> Re
         Backing::Dev(_) => Ok(bytes.len() as u64),
         Backing::File { node } => {
             let node = *node;
+            if env.is_host_secret_node(node) {
+                return Err(abi::EPERM);
+            }
             let len = env.vfs.materialize_file(node)?.len();
             if desc.flags & abi::O_APPEND != 0 {
                 desc.offset = len as u64;
@@ -1080,6 +1095,9 @@ fn sys_ftruncate(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, length: u64) -> Out
     let Backing::File { node } = desc.backing else {
         return Outcome::Ret(Err(abi::EINVAL));
     };
+    if env.is_host_secret_node(node) {
+        return Outcome::Ret(Err(abi::EPERM));
+    }
     if let Some(outcome) = wait_to_materialize(env, cpu, node) {
         return outcome;
     }
@@ -1577,6 +1595,12 @@ fn sys_openat(
             if flags & abi::O_DIRECTORY != 0 {
                 return Err(abi::ENOTDIR);
             }
+            if env.is_host_secret_node(node)
+                && (env.host_secret_for_node(node).is_none()
+                    || flags & abi::O_ACCMODE != abi::O_RDONLY)
+            {
+                return Err(abi::EACCES);
+            }
             if flags & abi::O_TRUNC != 0 && flags & abi::O_ACCMODE != abi::O_RDONLY {
                 // Truncation discards the immutable base view. It does not
                 // need to fetch bytes that are being replaced with nothing.
@@ -1611,6 +1635,10 @@ fn sys_lseek(env: &mut LinuxEnv, fd: u64, offset: u64, whence: u64) -> SysResult
     let desc = env.proc.fds.borrow().get(fd)?.desc.clone();
     let mut desc = desc.borrow_mut();
     let size = match &mut desc.backing {
+        Backing::File { node } if env.is_host_secret_node(*node) => env
+            .host_secret_for_node(*node)
+            .map(|value| value.len() as u64)
+            .ok_or(abi::EACCES)?,
         Backing::File { node } => env.vfs.node(*node).size(),
         Backing::Dir { cookie, .. } => {
             // Directory seeks reset or set the getdents64 cookie.
@@ -1672,7 +1700,9 @@ fn sys_getdents64(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, dirp: u64, count: 
 
 fn stat_of_node(env: &LinuxEnv, node: usize) -> abi::Stat {
     let n = env.vfs.node(node);
-    let size = n.size() as i64;
+    let size = env
+        .host_secret_for_node(node)
+        .map_or_else(|| n.size(), |value| value.len() as u64) as i64;
     abi::Stat {
         dev: 1,
         ino: node as u64 + 1,
@@ -2152,6 +2182,26 @@ fn flush_pty(pty: &mut crate::fd::Pty, is_master: bool, input: bool, output: boo
     pty.activity += 1;
 }
 
+fn outcome_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64) -> Outcome {
+    if matches!(
+        request,
+        abi::TCSETS | abi::TCSETSW | abi::TCSETSF | abi::TIOCSPGRP
+    ) {
+        let pty = env.proc.fds.borrow().get(fd).ok().and_then(|entry| {
+            match &entry.desc.borrow().backing {
+                Backing::PtyMaster(pty) | Backing::PtySlave(pty) => Some(std::rc::Rc::clone(pty)),
+                _ => None,
+            }
+        });
+        if let Some(pty) = pty {
+            if let Some(outcome) = background_tty_ioctl(env, cpu, &pty) {
+                return outcome;
+            }
+        }
+    }
+    sys_ioctl(env, cpu, fd, request, arg).into()
+}
+
 fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64) -> SysResult {
     // General fd ioctls, valid on any descriptor. These must be handled
     // before the tty gate: FIONBIO in particular is how a runtime sets a
@@ -2566,6 +2616,9 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             Backing::File { node } => node,
             _ => return Err(abi::EBADF),
         };
+        if env.is_host_secret_node(node) {
+            return Err(abi::ENODEV);
+        }
         // A MAP_SHARED file mapping: the pages are filled eagerly and written
         // back to the file at msync/munmap. SQLite's WAL shared-memory file —
         // mapped read/write once per process — is the workload; a plain File
@@ -3193,6 +3246,35 @@ fn background_tty_access(
     deliver_signal_to_pgrp(env, env.proc.pgid, signal);
     env.proc.pending_signals &= !bit;
     Some(stop_thread_group(env, cpu, signal, true))
+}
+
+/// Terminal-state changes (`tcsetattr` and `tcsetpgrp`) are job-control
+/// writes even when `TOSTOP` is clear. POSIX permits the operation when the
+/// caller blocks or ignores SIGTTOU; otherwise the whole background process
+/// group stops before the ioctl changes anything.
+fn background_tty_ioctl(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    pty: &crate::fd::PtyRef,
+) -> Option<Outcome> {
+    let foreground = pty.borrow().fg_pgrp;
+    if foreground == 0 || foreground == env.proc.pgid {
+        return None;
+    }
+    let bit = 1_u64 << (SIGTTOU - 1);
+    let ignored = env
+        .proc
+        .sigactions
+        .borrow()
+        .get(&SIGTTOU)
+        .map(|action| u64::from_le_bytes(action.0[..8].try_into().expect("size")))
+        == Some(SIG_IGN);
+    if env.proc.sigmask & bit != 0 || ignored {
+        return None;
+    }
+    deliver_signal_to_pgrp(env, env.proc.pgid, SIGTTOU);
+    env.proc.pending_signals &= !bit;
+    Some(stop_thread_group(env, cpu, SIGTTOU, true))
 }
 
 /// Turns a wait that was parked to restart into one that returns `value`.
@@ -5968,16 +6050,27 @@ fn sys_sendfile(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         base_offset
     };
 
-    let chunk: Vec<u8> = match env
-        .vfs
-        .read_node_range(node, offset, count.min(0x4_0000) as usize)
-    {
-        Ok(crate::chunk::ReadRange::Ready(bytes)) => bytes,
-        Ok(crate::chunk::ReadRange::Missing(hash)) => {
-            return wait_for_file_chunk(env, cpu, hash);
+    let chunk: Vec<u8> = if env.is_host_secret_node(node) {
+        let Some(secret) = env.host_secret_for_node(node) else {
+            return Outcome::Ret(Err(abi::EACCES));
+        };
+        let start = offset_into(offset, secret.len());
+        let end = start
+            .saturating_add(count.min(0x4_0000) as usize)
+            .min(secret.len());
+        secret[start..end].to_vec()
+    } else {
+        match env
+            .vfs
+            .read_node_range(node, offset, count.min(0x4_0000) as usize)
+        {
+            Ok(crate::chunk::ReadRange::Ready(bytes)) => bytes,
+            Ok(crate::chunk::ReadRange::Missing(hash)) => {
+                return wait_for_file_chunk(env, cpu, hash);
+            }
+            Ok(crate::chunk::ReadRange::Invalid(_)) => return Outcome::Ret(Err(abi::EIO)),
+            Err(errno) => return Outcome::Ret(Err(errno)),
         }
-        Ok(crate::chunk::ReadRange::Invalid(_)) => return Outcome::Ret(Err(abi::EIO)),
-        Err(errno) => return Outcome::Ret(Err(errno)),
     };
     if chunk.is_empty() {
         return Outcome::Ret(Ok(0));

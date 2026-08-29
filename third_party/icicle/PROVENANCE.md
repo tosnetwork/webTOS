@@ -18,7 +18,10 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
 1. `Cargo.toml` (workspace): `ahash` switched to
    `default-features = false, features = ["std", "compile-time-rng"]`.
    Removes the `getrandom` dependency so the crates build for
-   `wasm32-unknown-unknown`, and makes hash seeding deterministic.
+   `wasm32-unknown-unknown`. The seed is fixed within one compiled binary, but
+   `const-random` chooses a new value on each rebuild unless
+   `CONST_RANDOM_SEED` is set; the release builder sets it explicitly so the
+   wasm itself is reproducible.
 2. `icicle-cpu/src/lifter/mod.rs`: sentinel `UNKNOWN_BLOCK` changed from
    `0xbadbadbadbad` to `usize::MAX - 0xbad` so it fits a 32-bit `usize`.
 3. `icicle-cpu/src/exec/const_eval.rs`: `shift_left`/`shift_right` calls use

@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use linux_compat::digest::{hex, sha256};
 use linux_compat::Machine;
 use x64_engine::{CpuExit, EngineConfig};
 
@@ -39,6 +40,22 @@ fn payload(len: usize) -> Vec<u8> {
             (state >> 24) as u8
         })
         .collect()
+}
+
+#[test]
+fn benchmark_payload_fingerprints_match_the_browser_generator() {
+    for (mib, want) in [
+        (
+            1,
+            "1bc78ba35cac54fe318a6bd7e2acdf69a1eaf7c47c9597b0f6cc10e026aec5a1",
+        ),
+        (
+            4,
+            "0bf23c3f806176c4a7e2e0169ac721515120732ec16cf2d9a7f4b44844b0d649",
+        ),
+    ] {
+        assert_eq!(hex(&sha256(&payload(mib * 1024 * 1024))), want);
+    }
 }
 
 struct Measured {
@@ -134,6 +151,58 @@ fn bench_compute_md5sum() {
         seconds,
         instructions as f64 / seconds / 1e6,
     );
+}
+
+/// One machine-readable native row for the versioned performance dashboard.
+/// It intentionally has no pass/fail threshold: the verifier binds inputs and
+/// checks cross-engine instruction identity, while wall time remains evidence.
+#[test]
+#[ignore = "measurement, not a gate; writes WEBTOS_PERF_NATIVE_REPORT when set"]
+fn bench_dashboard_native() {
+    if busybox().is_none() {
+        return;
+    }
+    let build_start = Instant::now();
+    let machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+    drop(machine);
+
+    let mut points = Vec::new();
+    for mb in [1, 4] {
+        let data = payload(mb * 1024 * 1024);
+        let run = measure(&["md5sum", "/root/data.bin"], &[(b"/root/data.bin", data)])
+            .expect("busybox was already present");
+        assert!(run.output.contains(' '), "md5sum printed nothing");
+        points.push((mb, run));
+    }
+    let (small, large) = (&points[0].1, &points[1].1);
+    let marginal_instructions = large.icount - small.icount;
+    let marginal_seconds = large.seconds - small.seconds;
+    let runs = points
+        .iter()
+        .map(|(mib, run)| {
+            format!(
+                "{{\"instructions\":{},\"mib\":{},\"seconds\":{:.9}}}",
+                run.icount, mib, run.seconds
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let document = format!(
+        "{{\"machine_build_ms\":{build_ms:.6},\"marginal\":{{\"instructions\":{marginal_instructions},\"seconds\":{marginal_seconds:.9}}},\"platform\":{{\"arch\":\"{}\",\"kind\":\"native\",\"os\":\"{}\"}},\"runs\":[{runs}],\"schema_version\":1}}\n",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    );
+    if let Some(path) = std::env::var_os("WEBTOS_PERF_NATIVE_REPORT") {
+        std::fs::write(&path, &document).expect("write native performance report");
+        println!(
+            "[bench] native dashboard report {}",
+            PathBuf::from(path).display()
+        );
+    } else {
+        print!("[bench-json] {document}");
+    }
 }
 
 /// Syscall- and process-bound: a shell pipeline forks, execs, and moves bytes

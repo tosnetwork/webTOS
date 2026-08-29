@@ -825,6 +825,80 @@ fn a_background_reader_is_stopped_instead_of_stealing_keystrokes() {
     );
 }
 
+#[test]
+fn background_terminal_state_changes_stop_with_sigttou_even_without_tostop() {
+    let Some(image) = compile_c(
+        "background_tty_ioctl",
+        r#"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+
+static int stopped_by_sigttou(int slave, int operation) {
+    pid_t child = fork();
+    if (child < 0) return 0;
+    if (child == 0) {
+        setpgid(0, 0);
+        if (operation == 0) {
+            struct termios term;
+            if (tcgetattr(slave, &term) < 0) _exit(10);
+            term.c_lflag ^= ECHO;
+            tcsetattr(slave, TCSANOW, &term);
+        } else {
+            tcsetpgrp(slave, getpgrp());
+        }
+        _exit(11);
+    }
+    int status = 0;
+    if (waitpid(child, &status, WUNTRACED) != child) return 0;
+    int ok = WIFSTOPPED(status) && WSTOPSIG(status) == SIGTTOU;
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    return ok;
+}
+
+int main(void) {
+    int master = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    int unlock = 0, number = 0;
+    if (master < 0 || ioctl(master, TIOCSPTLCK, &unlock) < 0 ||
+        ioctl(master, TIOCGPTN, &number) < 0) return 1;
+    char path[64];
+    snprintf(path, sizeof path, "/dev/pts/%d", number);
+    int slave = open(path, O_RDWR | O_NOCTTY);
+    if (slave < 0) return 2;
+    if (setsid() < 0 || ioctl(slave, TIOCSCTTY, 0) < 0) return 3;
+    if (tcsetpgrp(slave, getpgrp()) < 0) return 4;
+
+    int attr = stopped_by_sigttou(slave, 0);
+    int pgrp = stopped_by_sigttou(slave, 1);
+    printf("tcsetattr=%d tcsetpgrp=%d\n", attr, pgrp);
+    return attr && pgrp ? 0 : 5;
+}
+"#,
+        &["-std=gnu17", "-D_GNU_SOURCE"],
+    ) else {
+        return;
+    };
+
+    let (exit, output) = run(image);
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "background tty ioctl fixture failed: {output}"
+    );
+    assert!(
+        output.contains("tcsetattr=1 tcsetpgrp=1"),
+        "one background ioctl escaped SIGTTOU: {output}"
+    );
+}
+
 /// `tcsetattr(TCSAFLUSH)` is how a program changes terminal mode without
 /// letting keystrokes typed under the old mode be read back under the new
 /// one. Returning ENOTTY for it stops any program that switches modes —

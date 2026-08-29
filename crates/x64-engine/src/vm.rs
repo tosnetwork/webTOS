@@ -190,6 +190,10 @@ pub struct InterpVm {
     /// never retried. Separate from `jit_cache` because a region is a different
     /// wasm module (an internal loop) than the per-block function.
     jit_region_cache: std::collections::HashMap<u64, Option<u32>>,
+    /// Resume/fault tables for region-cache entries that are multi-block
+    /// state-machine traces. Entries are removed with their LRU handle, so
+    /// this metadata is bounded by the same code budget as compiled wasm.
+    jit_trace_meta: std::collections::HashMap<u64, TraceMeta>,
     /// Per-block-id entry counts, to decide when a block is hot enough to
     /// compile. Separate from `entries`, which counts only external re-entries.
     jit_entries: std::collections::HashMap<u64, u64>,
@@ -252,6 +256,13 @@ struct JitEntry {
     last_epoch: u64,
 }
 
+#[derive(Clone)]
+struct TraceMeta {
+    resumes: Vec<crate::jit::TraceResume>,
+    fault_sites: Vec<(usize, usize)>,
+    blocks: Vec<usize>,
+}
+
 /// The compiled-code budget and its metrics. `budget == 0` means unlimited (the
 /// default, so nothing changes until a host sets a cap). Native runs leave it
 /// unlimited; the browser sets a cap so a long session cannot grow the engine's
@@ -309,6 +320,7 @@ impl JitBudget {
         jit: &mut dyn crate::jit::JitBackend,
         block_cache: &mut std::collections::HashMap<u64, Option<u32>>,
         region_cache: &mut std::collections::HashMap<u64, Option<u32>>,
+        trace_meta: &mut std::collections::HashMap<u64, TraceMeta>,
     ) {
         if self.budget == 0 {
             return;
@@ -328,6 +340,9 @@ impl JitBudget {
             // have replaced it already.
             if cache.get(&entry.key).copied().flatten() == Some(handle) {
                 cache.remove(&entry.key);
+            }
+            if entry.is_region {
+                trace_meta.remove(&entry.key);
             }
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes as usize);
             self.evictions += 1;
@@ -468,6 +483,7 @@ impl InterpVm {
             jit_after: None,
             jit_cache: std::collections::HashMap::new(),
             jit_region_cache: std::collections::HashMap::new(),
+            jit_trace_meta: std::collections::HashMap::new(),
             jit_entries: std::collections::HashMap::new(),
             jit_dispatches: 0,
             jit_block_dispatches: 0,
@@ -587,6 +603,7 @@ impl InterpVm {
         self.jit_entries.clear();
         self.jit_cache.clear();
         self.jit_region_cache.clear();
+        self.jit_trace_meta.clear();
         if let Some(jit) = self.jit.as_deref_mut() {
             self.jit_budget.clear(jit);
         }
@@ -672,7 +689,9 @@ impl InterpVm {
         // the reach of the trace selector.
         let mut in_a_trace: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for &(id, _) in by_addr.values() {
-            if let Some(order) = select_trace(&self.code.blocks, id as usize) {
+            if let Some(order) = select_trace(&self.code.blocks, id as usize, &|addr| {
+                by_addr.get(&addr).map(|(id, _)| *id as usize)
+            }) {
                 in_a_trace.extend(order);
             }
         }
@@ -914,6 +933,7 @@ impl InterpVm {
         // JIT again from their new bytes.
         self.jit_cache.clear();
         self.jit_region_cache.clear();
+        self.jit_trace_meta.clear();
         self.jit_entries.clear();
         if let Some(jit) = self.jit.as_deref_mut() {
             self.jit_budget.clear(jit);
@@ -1154,7 +1174,7 @@ impl InterpVm {
         // middle of a block.
         adjust_cpu_fuel_for_block_reentry(&mut self.cpu, block, offset, take_page_in_retry());
 
-        loop {
+        'blocks: loop {
             if let Some(profile) = self.profile.as_mut() {
                 let entry = profile.entry(block.start).or_default();
                 entry.entries += 1;
@@ -1208,6 +1228,217 @@ impl InterpVm {
                     *count += 1;
                     let hot = *count >= after;
 
+                    // Multi-block region path. The selector only admits a
+                    // bounded, closed trace with static side exits; all edges
+                    // inside that trace stay in one wasm invocation. The
+                    // packed return value contains both the exact retired
+                    // instruction count and the block/address at which Rust
+                    // must resume.
+                    if hot {
+                        if let Some(order) =
+                            select_trace(&self.code.blocks, block_id as usize, &|addr| {
+                                resolve_trace_external(&self.code, self.get_block_key(addr))
+                            })
+                        {
+                            let handle = match self.jit_region_cache.get(&key).copied() {
+                                Some(decided) => decided,
+                                None => match crate::jit::translate_trace(
+                                    &self.code.blocks,
+                                    &order,
+                                    self.cpu.arch.reg_pc,
+                                ) {
+                                    None => {
+                                        self.jit_region_cache.insert(key, None);
+                                        None
+                                    }
+                                    Some(translation) => {
+                                        self.jit_budget.make_room(
+                                            translation.bytes.len(),
+                                            self.jit
+                                                .as_deref_mut()
+                                                .expect("jit installed when hot"),
+                                            &mut self.jit_cache,
+                                            &mut self.jit_region_cache,
+                                            &mut self.jit_trace_meta,
+                                        );
+                                        match self
+                                            .jit
+                                            .as_deref_mut()
+                                            .and_then(|j| j.compile(&translation.bytes))
+                                        {
+                                            Some(h) => {
+                                                self.jit_region_cache.insert(key, Some(h));
+                                                self.jit_trace_meta.insert(
+                                                    key,
+                                                    TraceMeta {
+                                                        resumes: translation.resumes,
+                                                        fault_sites: translation.fault_sites,
+                                                        blocks: order,
+                                                    },
+                                                );
+                                                self.jit_budget.record(
+                                                    h,
+                                                    key,
+                                                    true,
+                                                    translation.bytes.len(),
+                                                );
+                                                Some(h)
+                                            }
+                                            None => None,
+                                        }
+                                    }
+                                },
+                            };
+                            if let (Some(handle), Some(meta)) =
+                                (handle, self.jit_trace_meta.get(&key).cloned())
+                            {
+                                let fuel_before = self.cpu.fuel.remaining;
+                                let outcome = if fuel_before < block.num_instructions as u64 {
+                                    // The trace ABI cannot retire a fractional
+                                    // block. Fall through to the ordinary path,
+                                    // which stops at the exact instruction
+                                    // boundary instead of treating a zero-work
+                                    // trace return as corrupted metadata.
+                                    crate::jit::RegionOutcome::Unavailable
+                                } else {
+                                    match self.jit.as_mut() {
+                                        Some(j) => {
+                                            j.call_region(handle, &mut self.cpu, fuel_before)
+                                        }
+                                        None => crate::jit::RegionOutcome::Unavailable,
+                                    }
+                                };
+                                match outcome {
+                                    crate::jit::RegionOutcome::Ran(packed) => {
+                                        let retired = packed >> crate::jit::TRACE_RESUME_BITS;
+                                        let resume_index = (packed
+                                            & ((1 << crate::jit::TRACE_RESUME_BITS) - 1))
+                                            as usize;
+                                        let Some(resume) = meta.resumes.get(resume_index).copied()
+                                        else {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        };
+                                        if retired == 0 || retired > fuel_before {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        }
+                                        self.cpu.fuel.remaining -= retired;
+                                        self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        record_trace_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &self.code.blocks,
+                                            &meta.blocks,
+                                            retired,
+                                            None,
+                                        );
+                                        self.jit_budget.touch(handle);
+                                        if jit_trace {
+                                            eprintln!(
+                                                "[jit] trace {:#x} blocks={} retired={retired} resume={:#x}",
+                                                block.start,
+                                                meta.blocks.len(),
+                                                resume.addr
+                                            );
+                                        }
+                                        if resume.block_id != usize::MAX {
+                                            block_id = resume.block_id as u64;
+                                            offset = 0;
+                                            self.cpu.block_id = block_id;
+                                            self.cpu.block_offset = 0;
+                                            block = match self.code.blocks.get(resume.block_id) {
+                                                Some(block) => block,
+                                                None => {
+                                                    self.corrupted_block_map(block_id);
+                                                    break 'blocks;
+                                                }
+                                            };
+                                            set_current_block_start(block.start);
+                                            set_current_icount(self.cpu.icount());
+                                            continue 'blocks;
+                                        }
+
+                                        self.cpu.write_pc(resume.addr);
+                                        match self.code.map.get(&self.get_block_key(resume.addr)) {
+                                            Some(group) => {
+                                                block_id = group.blocks.0 as u64;
+                                                offset = 0;
+                                                self.cpu.block_id = block_id;
+                                                self.cpu.block_offset = 0;
+                                                block =
+                                                    match self.code.blocks.get(block_id as usize) {
+                                                        Some(block) => block,
+                                                        None => {
+                                                            self.corrupted_block_map(block_id);
+                                                            break 'blocks;
+                                                        }
+                                                    };
+                                                set_current_block_start(block.start);
+                                                set_current_icount(self.cpu.icount());
+                                                continue 'blocks;
+                                            }
+                                            None => {
+                                                self.cpu.block_id = block_id;
+                                                self.cpu.exception.code =
+                                                    ExceptionCode::CodeNotTranslated as u32;
+                                                self.cpu.exception.value = resume.addr;
+                                                break 'blocks;
+                                            }
+                                        }
+                                    }
+                                    crate::jit::RegionOutcome::Faulted(retired, index) => {
+                                        let Some(&(fault_block, local_index)) =
+                                            meta.fault_sites.get(index as usize)
+                                        else {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        };
+                                        if retired > fuel_before {
+                                            self.cpu.exception.code =
+                                                ExceptionCode::InternalError as u32;
+                                            self.cpu.exception.value =
+                                                InternalError::CorruptedBlockMap as u64;
+                                            break 'blocks;
+                                        }
+                                        self.cpu.fuel.remaining -= retired;
+                                        let faulted = &self.code.blocks[fault_block];
+                                        let (pc, guest_insns) =
+                                            fault_pc_and_fuel(&faulted.pcode, local_index);
+                                        if let Some(pc) = pc {
+                                            self.cpu.write_pc(pc);
+                                        }
+                                        self.cpu.fuel.remaining =
+                                            self.cpu.fuel.remaining.saturating_sub(guest_insns);
+                                        self.jit_dispatches += 1;
+                                        self.jit_region_dispatches += 1;
+                                        record_trace_instruction_ranges(
+                                            &mut self.executed_instructions,
+                                            &self.code.blocks,
+                                            &meta.blocks,
+                                            retired,
+                                            Some((fault_block, local_index)),
+                                        );
+                                        self.jit_budget.touch(handle);
+                                        self.cpu.block_id = fault_block as u64;
+                                        self.cpu.block_offset = local_index as u64;
+                                        break 'blocks;
+                                    }
+                                    crate::jit::RegionOutcome::Unavailable => {}
+                                }
+                            }
+                        }
+                    }
+
                     // Region (self-loop) path. A register-only self-loop runs its
                     // whole loop in one call; a self-loop that needs the host
                     // caches a bail here and takes the per-block path below.
@@ -1226,6 +1457,7 @@ impl InterpVm {
                                         self.jit.as_deref_mut().expect("jit installed when hot"),
                                         &mut self.jit_cache,
                                         &mut self.jit_region_cache,
+                                        &mut self.jit_trace_meta,
                                     );
                                     match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
                                         Some(h) => {
@@ -1347,6 +1579,7 @@ impl InterpVm {
                                         self.jit.as_deref_mut().expect("jit installed when hot"),
                                         &mut self.jit_cache,
                                         &mut self.jit_region_cache,
+                                        &mut self.jit_trace_meta,
                                     );
                                     match self.jit.as_deref_mut().and_then(|j| j.compile(&bytes)) {
                                         Some(h) => {
@@ -1760,7 +1993,11 @@ fn self_loop_kind(block: &lifter::Block, block_id: u64) -> Option<Option<pcode::
 /// address. Bounded in length, and never a single self-loop block (that is the
 /// region's job). Correctness never depends on which direction is followed — a
 /// wrong guess just fails to close, so no trace forms.
-fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
+fn select_trace(
+    blocks: &[lifter::Block],
+    header: usize,
+    resolve_external: &impl Fn(u64) -> Option<usize>,
+) -> Option<Vec<usize>> {
     const MAX_BLOCKS: usize = 8;
     // In-group block id of a target, and whether a target has a static resume
     // address (an in-group block's start, or an external constant) so a side
@@ -1768,6 +2005,11 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
     let in_group = |t: Target| -> Option<usize> {
         match t {
             Target::Internal(b) if b < blocks.len() => Some(b),
+            // A jump across lift groups is represented as an external constant.
+            // Resolve it through the caller's current BlockKey (address, ISA,
+            // and address-space id), never by scanning the global append-only
+            // arena where another process can own the newest block at that VA.
+            Target::External(pcode::Value::Const(addr, _)) => resolve_external(addr),
             _ => None,
         }
     };
@@ -1832,6 +2074,55 @@ fn select_trace(blocks: &[lifter::Block], header: usize) -> Option<Vec<usize>> {
                 return None;
             }
             _ => return None, // Call / Return / indirect: not traceable
+        }
+    }
+}
+
+fn resolve_trace_external(code: &BlockTable, key: BlockKey) -> Option<usize> {
+    code.map.get(&key).map(|group| group.blocks.0)
+}
+
+/// Records exactly the unique guest instructions a linear trace reached.
+/// `retired` counts whole blocks before a normal side exit/budget return or
+/// before `fault`, and the trace always starts at `order[0]`. Once a complete
+/// cycle retired, every member was visited; otherwise only the retired prefix
+/// was. This avoids both over-counting untaken side blocks and under-counting
+/// blocks completed before a later block faulted.
+fn record_trace_instruction_ranges(
+    tracking: &mut Option<std::collections::HashSet<(u64, u64)>>,
+    blocks: &[lifter::Block],
+    order: &[usize],
+    retired: u64,
+    fault: Option<(usize, usize)>,
+) {
+    if tracking.is_none() {
+        return;
+    }
+    let cycle = order.iter().fold(0_u64, |total, &id| {
+        total.saturating_add(
+            blocks
+                .get(id)
+                .map_or(0, |block| block.num_instructions as u64),
+        )
+    });
+    let mut remaining = retired;
+    for &id in order {
+        let Some(block) = blocks.get(id) else {
+            continue;
+        };
+        let instructions = block.num_instructions as u64;
+        if retired >= cycle || remaining >= instructions {
+            record_instruction_ranges(tracking, &block.pcode, 0, None);
+            remaining = remaining.saturating_sub(instructions);
+        } else {
+            break;
+        }
+    }
+    if let Some((id, through)) =
+        fault.and_then(|(id, through)| order.contains(&id).then_some((id, through)))
+    {
+        if let Some(block) = blocks.get(id) {
+            record_instruction_ranges(tracking, &block.pcode, 0, Some(through));
         }
     }
 }
@@ -1914,5 +2205,71 @@ fn adjust_cpu_fuel_for_block_reentry(
         if !matches!(inst.op, pcode::Op::InstructionMarker) {
             cpu.fuel.remaining = cpu.fuel.remaining.saturating_sub(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_external_targets_are_resolved_by_the_full_address_space_key() {
+        let mut code = BlockTable::default();
+        let group = |block, start| lifter::BlockGroup {
+            blocks: (block, block + 1),
+            start,
+            end: start + 1,
+        };
+        let at = 0x40_0000;
+        code.map.insert(
+            BlockKey {
+                vaddr: at,
+                isa_mode: 1,
+                asid: 7,
+            },
+            group(3, at),
+        );
+        code.map.insert(
+            BlockKey {
+                vaddr: at,
+                isa_mode: 1,
+                asid: 8,
+            },
+            group(9, at),
+        );
+
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 1,
+                    asid: 7,
+                }
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 1,
+                    asid: 8,
+                }
+            ),
+            Some(9)
+        );
+        assert_eq!(
+            resolve_trace_external(
+                &code,
+                BlockKey {
+                    vaddr: at,
+                    isa_mode: 2,
+                    asid: 8,
+                }
+            ),
+            None
+        );
     }
 }

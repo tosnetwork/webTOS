@@ -30,9 +30,11 @@
 //                                        relay through the broker; past it a
 //                                        guest send or receive gets EPERM
 //               { type: "footprint" }   -- ask for a fresh reading
-//               { type: "secrets", secrets: [{ name, value, paths? }] }
+//               { type: "secrets", principal, secrets:
+//                 [{ name, value, paths?, handles?: [{ path, principal }] }] }
 //                                     -- inject credentials by placeholder;
-//                                        values never reach storage or a log
+//                                        `handles` mounts read-only paths whose
+//                                        values never enter the guest filesystem
 //               { type: "forget" }    -- delete the OPFS snapshot
 // Messages out: { type: "status", text }, { type: "ready", restored, storage },
 //               { type: "output", text },
@@ -47,6 +49,9 @@
 //               { type: "persisted", bytes }, { type: "error", text }
 
 const SNAPSHOT_FILE = "webtos-fs.bin";
+const SNAPSHOT_SLOTS = [`${SNAPSHOT_FILE}.0`, `${SNAPSHOT_FILE}.1`];
+const SNAPSHOT_MAGIC = new TextEncoder().encode("WTWFS02\0");
+const SNAPSHOT_HEADER = SNAPSHOT_MAGIC.length + 8 + 4 + 32;
 /// Directory inside OPFS holding downloaded guest images.
 const IMAGE_CACHE = "webtos-images";
 /// Content-addressed chunks are independent of guest paths and image runs.
@@ -101,50 +106,88 @@ async function opfsRead(name) {
   }
 }
 
-/// Writes `bytes` to `name` so that a cancellation cannot leave the committed
-/// file partial.
-///
-/// `createWritable()` truncates the file it opens at once, so writing straight
-/// to `name` and being killed before `close()` destroys whatever was there —
-/// for a snapshot, that is the session. So the bytes go to a `.partial` first,
-/// which is fully written and closed before the committed name is touched at
-/// all, and the commit is a single `move()`, which replaces atomically. If the
-/// worker dies before the move, the old committed file is exactly as it was;
-/// if it dies during the partial write, only the partial is damaged, and a
-/// stale partial is overwritten by the next write or ignored on read.
-async function opfsWriteAtomic(name, bytes) {
+const equalBytes = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i]);
+
+async function sha256(bytes) {
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+}
+
+async function encodeSnapshot(generation, payload) {
+  const out = new Uint8Array(SNAPSHOT_HEADER + payload.length);
+  out.set(SNAPSHOT_MAGIC, 0);
+  const view = new DataView(out.buffer);
+  view.setBigUint64(SNAPSHOT_MAGIC.length, BigInt(generation), true);
+  view.setUint32(SNAPSHOT_MAGIC.length + 8, payload.length, true);
+  out.set(await sha256(payload), SNAPSHOT_MAGIC.length + 12);
+  out.set(payload, SNAPSHOT_HEADER);
+  return out;
+}
+
+async function decodeSnapshot(bytes) {
+  if (!bytes || bytes.length < SNAPSHOT_HEADER) return null;
+  if (!equalBytes(bytes.subarray(0, SNAPSHOT_MAGIC.length), SNAPSHOT_MAGIC)) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const generation = Number(view.getBigUint64(SNAPSHOT_MAGIC.length, true));
+  const length = view.getUint32(SNAPSHOT_MAGIC.length + 8, true);
+  if (!Number.isSafeInteger(generation) || bytes.length !== SNAPSHOT_HEADER + length) return null;
+  const payload = bytes.subarray(SNAPSHOT_HEADER);
+  const expected = bytes.subarray(SNAPSHOT_MAGIC.length + 12, SNAPSHOT_HEADER);
+  if (!equalBytes(await sha256(payload), expected)) return null;
+  return { generation, payload };
+}
+
+async function snapshotCandidates() {
+  const candidates = [];
+  for (const name of SNAPSHOT_SLOTS) {
+    const decoded = await decodeSnapshot(await opfsRead(name));
+    if (decoded) candidates.push({ ...decoded, name });
+  }
+  return candidates.sort((a, b) => b.generation - a.generation);
+}
+
+function nextSnapshotSlot(newest) {
+  if (!newest) return SNAPSHOT_SLOTS[0];
+  return newest.name === SNAPSHOT_SLOTS[0] ? SNAPSHOT_SLOTS[1] : SNAPSHOT_SLOTS[0];
+}
+
+/// Reads only a complete, digest-valid generation. A pre-V2 single-file
+/// snapshot is accepted as generation zero for migration.
+async function readSnapshot() {
+  const [newest] = await snapshotCandidates();
+  if (newest) return newest.payload;
+  return opfsRead(SNAPSHOT_FILE);
+}
+
+/// Commits into the older of two independently validated slots. Truncating or
+/// partially writing that slot can never damage the newer generation, and no
+/// rename primitive is required. Readers ignore an incomplete header, length,
+/// or digest and select the highest remaining valid generation.
+async function writeSnapshot(payload, pauseAfterHalf = false) {
+  const [newest] = await snapshotCandidates();
+  if (newest && newest.generation >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("snapshot generation exhausted its exact integer range");
+  }
+  const generation = (newest?.generation ?? 0) + 1;
+  // Slot identity, not generation parity, decides the target. A valid slot
+  // can be moved or recovered under either name; the next write must still
+  // choose the other slot so an interrupted commit never destroys the only
+  // complete generation.
+  const name = nextSnapshotSlot(newest);
+  const bytes = await encodeSnapshot(generation, payload);
   const root = await navigator.storage.getDirectory();
-  const partial = `${name}.partial`;
-  const scratch = await root.getFileHandle(partial, { create: true });
-  const writable = await scratch.createWritable();
-  try {
-    await writable.write(bytes);
-    await writable.close();
-  } catch (e) {
-    // A failed write must not leave a partial masquerading as committable.
-    try { await root.removeEntry(partial); } catch {}
-    throw e;
-  }
-  if (typeof scratch.move === "function") {
-    try {
-      // The atomic path: one rename over the target.
-      await scratch.move(name);
-      return;
-    } catch {
-      // Some engines expose move() with a different signature or refuse a
-      // rename over an existing file. Fall through to the copy commit.
-    }
-  }
-  // Fallback where move() is absent or refused: the target is written from the
-  // completed partial's bytes, which are already known to be whole. This
-  // reopens the window the partial was meant to close, so it is the lesser
-  // path, taken only when the atomic one is unavailable.
-  const whole = await (await scratch.getFile()).arrayBuffer();
   const handle = await root.getFileHandle(name, { create: true });
-  const commit = await handle.createWritable();
-  await commit.write(whole);
-  await commit.close();
-  try { await root.removeEntry(partial); } catch {}
+  const writable = await handle.createWritable();
+  if (pauseAfterHalf) {
+    await writable.write(bytes.subarray(0, Math.max(1, Math.floor(bytes.length / 2))));
+    postMessage({ type: "persistPaused", generation, name });
+    await new Promise(() => {});
+  }
+  await writable.write(bytes);
+  await writable.close();
+  // Once a digest-valid V2 generation is durable, the unverified legacy file
+  // is no longer a recovery candidate. If both V2 slots are later corrupt,
+  // fail closed instead of silently resurrecting an arbitrarily old session.
+  await opfsDelete(SNAPSHOT_FILE);
 }
 
 async function opfsDelete(name) {
@@ -154,6 +197,10 @@ async function opfsDelete(name) {
   } catch {
     // Nothing to delete.
   }
+}
+
+async function deleteSnapshots() {
+  await Promise.all([SNAPSHOT_FILE, ...SNAPSHOT_SLOTS].map(opfsDelete));
 }
 
 // ------------------------------------------------------------------ images
@@ -522,7 +569,7 @@ async function boot(files, links = [], jitAfter = null, guestMemMb = null) {
   // Restore the filesystem persisted before the last reload, if any.
   storageReady = await opfsProbe();
   let restored = false;
-  const snapshot = storageReady ? await opfsRead(SNAPSHOT_FILE) : null;
+  const snapshot = storageReady ? await readSnapshot() : null;
   if (snapshot && snapshot.length > 0) {
     if (exports.wtw_fs_import(...put(snapshot)) === 0) {
       restored = true;
@@ -551,9 +598,10 @@ async function boot(files, links = [], jitAfter = null, guestMemMb = null) {
 }
 
 /// Reports where the machine's memory has gone. One wasm linear memory holds
-/// the guest's pages, the images streamed into it, and the code the engine has
-/// lifted; a tab's ceiling is about 3.9 GiB, so a host that wants to refuse a
-/// workload rather than die needs to see all three.
+/// the guest's pages, the images streamed into it, the code the engine has
+/// lifted, and capability bytes held outside the VFS; a tab's ceiling is about
+/// 3.9 GiB, so a host that wants to refuse a workload rather than die needs to
+/// see all four.
 function reportFootprint() {
   const kib = (part) => exports.wtw_footprint_kib(part) * 1024;
   const headroom = exports.wtw_memory_headroom_kib();
@@ -564,11 +612,12 @@ function reportFootprint() {
     guest: kib(0),
     code: kib(1),
     files: kib(2),
+    host: kib(4),
     // The sum of the parts, not a separately rounded whole: each part is
-    // reported in KiB, and round(a)+round(b)+round(c) is not round(a+b+c), so
+    // reported in KiB, and summing rounded parts is not rounding their sum, so
     // a separately rounded total would disagree with its own parts by a few
     // KiB. The total is what the footprint is spent on, which is the parts.
-    total: kib(0) + kib(1) + kib(2),
+    total: kib(0) + kib(1) + kib(2) + kib(4),
     headroom: headroom < 0 ? null : headroom * 1024,
     // The filesystem's own ceiling. `files` is what it holds; this is what
     // the guest may still add before a write gets ENOSPC.
@@ -589,14 +638,36 @@ function reportFootprint() {
 /// The values are handed to the module and dropped here: nothing keeps a copy
 /// in the worker, and no message, status line, or error carries one. A
 /// snapshot redacts them back to `${name}`, so they never reach OPFS either.
-function applySecrets(secrets) {
-  for (const { name, value, paths = [] } of secrets ?? []) {
-    if (exports.wtw_secret(...put(name), ...put(value)) !== 0) {
-      throw new Error(`secret ${name}: ${lastError()}`);
+function applySecrets(secrets, activePrincipal) {
+  if (typeof activePrincipal !== "string" || activePrincipal.length === 0) {
+    throw new Error("secrets message needs a non-empty host agent principal");
+  }
+  if (exports.wtw_agent_principal(...put(activePrincipal)) !== 0) {
+    throw new Error(`agent principal: ${lastError()}`);
+  }
+  for (const { name, value, paths = [], handles = [] } of secrets ?? []) {
+    for (const handle of handles) {
+      const path = typeof handle === "string" ? handle : handle?.path;
+      const principal = typeof handle === "string" ? activePrincipal : handle?.principal;
+      if (typeof path !== "string" || typeof principal !== "string" || principal.length === 0) {
+        throw new Error(`secret handle ${name}: path and principal are required`);
+      }
+      if (exports.wtw_secret_handle(
+        ...put(name), ...put(value), ...put(path), ...put(principal),
+      ) !== 0) {
+        throw new Error(`secret handle ${name}: ${lastError()}`);
+      }
     }
-    for (const path of paths) {
-      if (exports.wtw_secret_scope(...put(path)) !== 0) {
-        throw new Error(`secret ${name} scope: ${lastError()}`);
+    // A handle-only credential must not also take the legacy unscoped
+    // placeholder path, which would copy it into every resident file.
+    if (handles.length === 0 || paths.length > 0) {
+      if (exports.wtw_secret(...put(name), ...put(value)) !== 0) {
+        throw new Error(`secret ${name}: ${lastError()}`);
+      }
+      for (const path of paths) {
+        if (exports.wtw_secret_scope(...put(path)) !== 0) {
+          throw new Error(`secret ${name} scope: ${lastError()}`);
+        }
       }
     }
   }
@@ -604,7 +675,7 @@ function applySecrets(secrets) {
   postMessage({ type: "status", text: `${(secrets ?? []).length} credential(s) injected` });
 }
 
-async function persist() {
+async function persist(pauseAfterHalf = false) {
   if (!storageReady) {
     throw new Error("browser storage is unavailable here (private window or blocked storage)");
   }
@@ -614,7 +685,7 @@ async function persist() {
     exports.wtw_fs_ptr(),
     exports.wtw_fs_ptr() + exports.wtw_fs_len(),
   );
-  await opfsWriteAtomic(SNAPSHOT_FILE, bytes);
+  await writeSnapshot(bytes, pauseAfterHalf);
   postMessage({ type: "persisted", bytes: bytes.length });
 }
 
@@ -683,6 +754,18 @@ const ECONNRESET = 104;
 const CLOSE_BAD_REQUEST = 4400;
 const CLOSE_REFUSED = 4403;
 const CLOSE_UNREACHABLE = 4502;
+
+/// Converts a WebSocket close into the Linux transport error the guest sees.
+/// `null` is reserved for a clean TCP EOF, which the gateway announces before
+/// closing. In particular, a relay/proxy that accepted the WebSocket and then
+/// failed is a reset -- it must not look like EOF or leave the guest waiting.
+function tcpCloseErrno(entry, code) {
+  if (code === CLOSE_REFUSED || code === CLOSE_BAD_REQUEST) return ENETUNREACH;
+  if (code === CLOSE_UNREACHABLE) return ECONNREFUSED;
+  if (!entry.open) return ENETUNREACH;
+  if (entry.eof) return null;
+  return ECONNRESET;
+}
 
 let gateway = null;
 const sockets = new Map();
@@ -760,20 +843,37 @@ function openTcp(handle, ip, port) {
   socket.onclose = (event) => {
     if (sockets.get(handle) !== entry) return; // the guest already closed it
     sockets.delete(handle);
-    if (event.code === CLOSE_REFUSED || event.code === CLOSE_BAD_REQUEST) {
-      // The relay refused the destination by policy, so nothing was dialled:
-      // unreachable, not refused by a peer.
-      deliverError(handle, ENETUNREACH);
-    } else if (event.code === CLOSE_UNREACHABLE) {
-      deliverError(handle, ECONNREFUSED);
-    } else if (!entry.connected) {
-      // Never opened: no gateway listening, or the upgrade was rejected.
-      deliverError(handle, ENETUNREACH);
-    } else if (!entry.eof) {
-      exports.wtw_net_closed(handle);
-      noteNetEvent();
-    }
+    const errno = tcpCloseErrno(entry, event.code);
+    if (errno !== null) deliverError(handle, errno);
   };
+}
+
+function networkErrorContractProbe() {
+  const cases = [
+    { name: "upgrade-rejected", entry: { open: false }, code: 1006, want: ENETUNREACH },
+    { name: "policy-refused", entry: { open: true }, code: CLOSE_REFUSED, want: ENETUNREACH },
+    { name: "upstream-refused", entry: { open: true }, code: CLOSE_UNREACHABLE, want: ECONNREFUSED },
+    { name: "proxy-failed-before-dial", entry: { open: true }, code: 1011, want: ECONNRESET },
+    { name: "proxy-failed-after-connect", entry: { open: true, connected: true }, code: 1011, want: ECONNRESET },
+    { name: "clean-eof", entry: { open: true, connected: true, eof: true }, code: 1000, want: null },
+  ];
+  return cases.map(({ name, entry, code, want }) => {
+    const got = tcpCloseErrno(entry, code);
+    return { name, got, want, ok: got === want };
+  });
+}
+
+function snapshotSlotContractProbe() {
+  return [
+    { name: "empty", newest: null, want: SNAPSHOT_SLOTS[0] },
+    { name: "slot-zero-even", newest: { name: SNAPSHOT_SLOTS[0], generation: 2 }, want: SNAPSHOT_SLOTS[1] },
+    { name: "slot-zero-odd", newest: { name: SNAPSHOT_SLOTS[0], generation: 1 }, want: SNAPSHOT_SLOTS[1] },
+    { name: "slot-one-even", newest: { name: SNAPSHOT_SLOTS[1], generation: 2 }, want: SNAPSHOT_SLOTS[0] },
+    { name: "slot-one-odd", newest: { name: SNAPSHOT_SLOTS[1], generation: 1 }, want: SNAPSHOT_SLOTS[0] },
+  ].map(({ name, newest, want }) => {
+    const got = nextSnapshotSlot(newest);
+    return { name, got, want, ok: got === want };
+  });
 }
 
 function openUdp(handle) {
@@ -1041,6 +1141,12 @@ self.onmessage = async (event) => {
     if (msg.type === "lazyImage") await installLazyImage(msg);
     if (msg.type === "trace") await recordTrace(msg);
     if (msg.type === "network") enableNetwork(msg.gateway);
+    if (msg.type === "networkErrorContractProbe") {
+      postMessage({ type: "networkErrorContract", cases: networkErrorContractProbe() });
+    }
+    if (msg.type === "snapshotSlotContractProbe") {
+      postMessage({ type: "snapshotSlotContract", cases: snapshotSlotContractProbe() });
+    }
     if (msg.type === "exec") await exec(msg.path, msg.argv, msg.envp);
     if (msg.type === "spawn") {
       await spawn(msg.path, msg.argv, msg.envp, msg.rows, msg.cols);
@@ -1056,50 +1162,20 @@ self.onmessage = async (event) => {
       postMessage({ type: "status", text: `guest memory cap ${msg.mib} MiB` });
     }
     if (msg.type === "footprint") reportFootprint();
-    if (msg.type === "persistFaultProbe") {
-      // Does an interrupted persist leave the committed snapshot partial?
-      // Persist a good snapshot, then persist again with the very next
-      // createWritable write made to reject — the shape of a worker killed
-      // mid-write — and read the committed file back. `intact` says whether
-      // the committed snapshot is still the good one.
-      await persist();
-      const root = await navigator.storage.getDirectory();
-      const read = async () =>
-        new Uint8Array(
-          await (await (await root.getFileHandle(SNAPSHOT_FILE)).getFile()).arrayBuffer(),
-        );
-      const before = await read();
-      const proto = self.FileSystemWritableFileStream.prototype;
-      const realWrite = proto.write;
-      let armed = true;
-      proto.write = function (...args) {
-        if (armed) {
-          armed = false;
-          return Promise.reject(new Error("injected write fault"));
-        }
-        return realWrite.apply(this, args);
-      };
-      let threw = false;
-      try {
-        exports.wtw_file_create(...put("/home/probe.txt"), 4, 0o644);
-        exports.wtw_file_append(...put("/home/probe.txt"), ...put("data"));
-        await persist();
-      } catch {
-        threw = true;
-      } finally {
-        proto.write = realWrite;
-      }
-      let after;
-      try {
-        after = await read();
-      } catch {
-        after = new Uint8Array(0); // the committed file is gone entirely
-      }
-      const intact =
-        before.length > 0 &&
-        before.length === after.length &&
-        before.every((b, i) => b === after[i]);
-      postMessage({ type: "persistProbe", intact, threw, len: before.length });
+    if (msg.type === "snapshotIdentityProbe") {
+      const bytes = await readSnapshot();
+      postMessage({
+        type: "snapshotIdentity",
+        len: bytes?.length ?? 0,
+        digest: bytes ? Array.from(await sha256(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("") : null,
+      });
+    }
+    if (msg.type === "persistPauseProbe") {
+      // The browser harness terminates this worker after it reports that half
+      // the next slot was written. The promise intentionally never settles.
+      exports.wtw_file_create(...put("/home/interrupted.txt"), 4, 0o644);
+      exports.wtw_file_append(...put("/home/interrupted.txt"), ...put("partial"));
+      await persist(true);
     }
     if (msg.type === "budget") {
       if (exports.wtw_set_memory_budget_kib(Math.round((msg.mib ?? 0) * 1024)) !== 0) {
@@ -1147,11 +1223,11 @@ self.onmessage = async (event) => {
         throw new Error(`event log budget: ${lastError()}`);
       }
     }
-    if (msg.type === "secrets") applySecrets(msg.secrets);
+    if (msg.type === "secrets") applySecrets(msg.secrets, msg.principal);
     if (msg.type === "persist") await persist();
     if (msg.type === "forget") {
       if (!storageReady) throw new Error("browser storage is unavailable here");
-      await opfsDelete(SNAPSHOT_FILE);
+      await deleteSnapshots();
       await forgetImages();
       postMessage({ type: "status", text: "saved filesystem deleted" });
     }

@@ -1,0 +1,46 @@
+name: verify published compatibility evidence
+
+on:
+  pull_request:
+    paths:
+      - docs/compatibility/**
+      - workloads/LOCK.json
+      - tools/publish_compatibility_report.py
+      - tools/verify_compatibility_report.py
+      - .github/workflows/compatibility.yml
+  push:
+    branches: [main]
+    paths:
+      - docs/compatibility/**
+      - workloads/LOCK.json
+      - tools/publish_compatibility_report.py
+      - tools/verify_compatibility_report.py
+      - .github/workflows/compatibility.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify locked workloads and browser evidence
+        run: |
+          python3 -B tools/verify_compatibility_report.py \
+            docs/compatibility/compatibility.json
+          python3 -B tools/publish_compatibility_report.py \
+            docs/compatibility/compatibility.json /tmp/compatibility
+          diff -u docs/compatibility/compatibility.json \
+            /tmp/compatibility/compatibility.json
+          diff -u docs/compatibility/README.md \
+            /tmp/compatibility/README.md
+
+      - name: Upload verified evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: webtos-compatibility
+          path: docs/compatibility/
+          if-no-files-found: error

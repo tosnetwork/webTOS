@@ -158,6 +158,7 @@
       // what stops one agent reading another's credential.
       worker.postMessage({
         type: "secrets",
+        principal: "terminal-agent",
         secrets: [{ name: secretName, value: secret, paths: [secretFile] }],
       });
     }

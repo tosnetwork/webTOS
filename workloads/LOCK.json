@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "files": [
+        {
+          "license": "GPL-2.0-only",
+          "mode": "755",
+          "path": "/bin/busybox",
+          "redistribution": "separate GPL-2.0 distribution obligations apply",
+          "sha256": "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
+          "size": 1131168,
+          "source": "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
+        }
+      ],
+      "expected_manifest_sha256": "f66af61fc9434842ad5e55488ee4df17cb89a34fc41906365c84739d753c035f",
+      "id": "busybox",
+      "source": [
+        {
+          "digest": {
+            "sha256": "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348"
+          },
+          "uri": "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
+        }
+      ],
+      "version": "1.35.0"
+    },
+    {
+      "files": [
+        {
+          "license": "MIT",
+          "mode": "755",
+          "path": "/bin/openfox",
+          "redistribution": "permitted with MIT notice",
+          "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb",
+          "size": 52971260,
+          "source": "git+https://github.com/tosnetwork/openfox@6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
+        }
+      ],
+      "build": {
+        "command": "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags goolm,stdjson ./cmd/openfox",
+        "toolchain": "go1.25.13"
+      },
+      "expected_manifest_sha256": "5d5ff5e552dfb94c312d9e13289d1f284ea709b50d99016d2d7175a667250edf",
+      "id": "openfox",
+      "source": [
+        {
+          "digest": {
+            "sha1": "6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
+          },
+          "uri": "git+https://github.com/tosnetwork/openfox"
+        },
+        {
+          "digest": {
+            "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb"
+          },
+          "uri": "pkg:generic/openfox@6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
+        }
+      ],
+      "version": "6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
+    },
+    {
+      "files": [
+        {
+          "license": "NOASSERTION",
+          "mode": "755",
+          "path": "/bin/codex",
+          "redistribution": "not authorized for webTOS publication",
+          "sha256": "abf1bb1643a79f73aa78ee627e111e02d4f8c98f25813a0cf6ce277709664386",
+          "size": 268330432,
+          "source": "local OpenAI Codex standalone installation"
+        }
+      ],
+      "expected_manifest_sha256": "a7e3ab41f43a9dfc370ca4d6c6a256bf0d9e75007e4c8ab3ad1e8cf0120a9834",
+      "id": "codex",
+      "source": [
+        {
+          "digest": {
+            "sha256": "abf1bb1643a79f73aa78ee627e111e02d4f8c98f25813a0cf6ce277709664386"
+          },
+          "uri": "pkg:generic/openai-codex-standalone@0.150.1"
+        }
+      ],
+      "version": "0.150.1"
+    },
+    {
+      "files": [
+        {
+          "license": "NOASSERTION",
+          "mode": "755",
+          "path": "/bin/claude",
+          "redistribution": "not authorized for webTOS publication",
+          "sha256": "5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15",
+          "size": 250162696,
+          "source": "local Anthropic Claude Code installation"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "755",
+          "path": "/lib64/ld-linux-x86-64.so.2",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "8d06f393f4a93bcf9b81145a259524d66a95522a646bf8d7e05b6ffdf2e63dcc",
+          "size": 240936,
+          "source": "Ubuntu libc6 binary"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "755",
+          "path": "/lib/x86_64-linux-gnu/libc.so.6",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "e01b1ce7be2987f3b8560e26d0df2623f9dd5cec17be923ae28a785bc0d32d50",
+          "size": 2220400,
+          "source": "Ubuntu libc6 binary"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "644",
+          "path": "/lib/x86_64-linux-gnu/libdl.so.2",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "d255ba9c9e3a7c35115e578c898147edaba1a2bcf742cc3a76995ceed9d5ac4f",
+          "size": 14432,
+          "source": "Ubuntu libc6 binary"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "644",
+          "path": "/lib/x86_64-linux-gnu/libm.so.6",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "df621c68dbfed7e843434ef2faedb9f4d4b0543ad161e9a55eaf4d4ce2443176",
+          "size": 940560,
+          "source": "Ubuntu libc6 binary"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "644",
+          "path": "/lib/x86_64-linux-gnu/libpthread.so.0",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "fbed9505adacada2abb37c6b43be2df6de81e742712c6025694ba48de62c7e78",
+          "size": 21448,
+          "source": "Ubuntu libc6 binary"
+        },
+        {
+          "license": "LGPL-2.1-or-later",
+          "mode": "644",
+          "path": "/lib/x86_64-linux-gnu/librt.so.1",
+          "redistribution": "separate LGPL distribution obligations apply",
+          "sha256": "83eda8758c8697323bedf48bc0186c006cca2205441a988cb0f5072b96262100",
+          "size": 14664,
+          "source": "Ubuntu libc6 binary"
+        }
+      ],
+      "expected_manifest_sha256": "0c36848958071d061dabc5d4611010efc5f5fda28d81430f7653e3906618d17d",
+      "id": "claude-code",
+      "source": [
+        {
+          "digest": {
+            "sha256": "5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15"
+          },
+          "uri": "pkg:generic/anthropic-claude-code@2.1.247"
+        }
+      ],
+      "version": "2.1.247"
+    }
+  ]
+}

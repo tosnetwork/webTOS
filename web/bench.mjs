@@ -11,7 +11,7 @@
 // Usage:  node web/bench.mjs [--engines=chromium,firefox,webkit] [--headed]
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, normalize, extname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,7 +22,9 @@ const ALL_ENGINES = ["chromium", "firefox", "webkit"];
 const args = process.argv.slice(2);
 const headed = args.includes("--headed");
 const engineArg = args.find((a) => a.startsWith("--engines="));
+const reportArg = args.find((a) => a.startsWith("--report="));
 const engines = engineArg ? engineArg.slice("--engines=".length).split(",") : ALL_ENGINES;
+const reportPath = reportArg ? reportArg.slice("--report=".length) : null;
 
 let playwright;
 try {
@@ -69,29 +71,11 @@ async function startServer() {
 // Runs entirely inside the page: Playwright serializes it, so it closes over
 // nothing but its argument.
 const benchmark = async (input) => {
-  const { wasmUrl, busyboxUrl, controlUrl, sizesMiB } = input;
+  const { wasmUrl, busyboxUrl, controlUrl, payloadUrl, sizesMiB } = input;
   const FUEL = 50_000_000;
 
   const busybox = new Uint8Array(await (await fetch(busyboxUrl)).arrayBuffer());
-
-  // Deterministic bytes; a compressible pattern would make the measurement
-  // depend on the data rather than the instruction stream.
-  const payload = (length) => {
-    const out = new Uint8Array(length);
-    let lo = 0x4f6cdd1d >>> 0;
-    let hi = 0x2545f491 >>> 0;
-    for (let i = 0; i < length; i += 1) {
-      // xorshift64 over a 32-bit pair, matching the native fixture's shape.
-      let t = lo ^ ((lo << 13) | (hi >>> 19));
-      hi = hi ^ ((hi << 13) | (lo >>> 19));
-      lo = t >>> 0;
-      t = lo ^ (lo >>> 7);
-      hi = hi ^ ((hi >>> 7) | (lo << 25));
-      lo = t >>> 0;
-      out[i] = (hi >>> 16) & 0xff;
-    }
-    return out;
-  };
+  const { benchmarkPayload } = await import(payloadUrl);
 
   // The JIT host imports (inlined; this function runs in the browser page).
   let e;
@@ -158,7 +142,7 @@ const benchmark = async (input) => {
     buildMs = performance.now() - buildStart;
 
     e.wtw_add_file(...put("/bin/busybox"), ...put(busybox));
-    const data = payload(mib * 1024 * 1024);
+    const data = benchmarkPayload(mib * 1024 * 1024);
     e.wtw_file_create(...put("/root/data.bin"), data.length, 0o644);
     for (let at = 0; at < data.length; at += 4 << 20) {
       e.wtw_file_append(...put("/root/data.bin"), ...put(data.subarray(at, at + (4 << 20))));
@@ -237,6 +221,7 @@ const { server, origin } = await startServer();
 const wasmUrl = `${origin}/web/webtos_web.wasm`;
 const busyboxUrl = `${origin}/web/busybox-musl`;
 const controlUrl = `${origin}/web/bench_control.wasm`;
+const payloadUrl = `${origin}/web/bench_payload.mjs`;
 const rows = [];
 
 try {
@@ -254,9 +239,10 @@ try {
         wasmUrl,
         busyboxUrl,
         controlUrl,
+        payloadUrl,
         sizesMiB: [1, 4],
       });
-      rows.push({ name, ...result });
+      rows.push({ name, version: context.browser()?.version() ?? "unknown", ...result });
       console.log(`\n=== ${name} ===`);
       console.log(
         `[bench] ${"module instantiate".padEnd(28)} ${result.instantiateMs.toFixed(0).padStart(7)} ms`,
@@ -301,6 +287,24 @@ try {
   }
 } finally {
   server.close();
+}
+
+if (reportPath) {
+  const report = {
+    engines: rows.map((row) => ({
+      before_grow_mib: row.beforeGrowMiB,
+      control: row.control,
+      linear_memory_ceiling_mib: row.ceilingMiB,
+      machine_build_ms: row.buildMs,
+      module_instantiate_ms: row.instantiateMs,
+      name: row.name,
+      runs: row.runs,
+      version: row.version,
+    })),
+    schema_version: 1,
+  };
+  await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(`\n[bench] browser dashboard report ${reportPath}`);
 }
 
 if (rows.length > 1) {

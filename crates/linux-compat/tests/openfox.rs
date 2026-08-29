@@ -696,7 +696,7 @@ fn a_workload_that_will_not_fit_is_refused_before_it_arrives() {
     );
     assert_eq!(
         before.total_bytes,
-        before.guest_bytes + before.code_bytes + before.files_bytes
+        before.guest_bytes + before.code_bytes + before.files_bytes + before.host_bytes
     );
 
     // Running lifts code, and the code shows up as its own line rather than
