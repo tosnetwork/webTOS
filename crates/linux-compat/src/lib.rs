@@ -161,6 +161,12 @@ struct FileChunkRequest {
 pub struct LinuxEnv {
     pub(crate) regs: Regs,
     pub vfs: Vfs,
+    /// Live `MAP_SHARED` file mappings: guest writes land in the mapped pages
+    /// and are written back to the backing file at `msync`/`munmap`. One guest
+    /// process is the honest scope — SQLite's WAL shared-memory file, mapped
+    /// once per process, is the workload this exists for; a fork does not see
+    /// the parent's later stores (documented divergence).
+    pub(crate) shared_maps: Vec<SharedMap>,
     /// VFS node ids the guest has opened, when access tracking is on (`Some`).
     /// A delivered file never in this set was materialized for nothing — the
     /// measure of how much a lazy image could avoid. Off by default so the set
@@ -270,6 +276,7 @@ impl LinuxEnv {
         Ok(Self {
             regs: Regs::resolve(cpu)?,
             vfs: Vfs::new(),
+            shared_maps: Vec::new(),
             opened_files: None,
             proc: Process::initial(),
             sched: Scheduler::new(),
@@ -1251,6 +1258,16 @@ pub struct FileAccessStats {
     pub delivered_bytes: usize,
     pub opened_files: usize,
     pub opened_bytes: usize,
+}
+
+/// One live `MAP_SHARED` file mapping (see `LinuxEnv::shared_maps`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedMap {
+    pub(crate) asid: u64,
+    pub(crate) addr: u64,
+    pub(crate) len: u64,
+    pub(crate) node: usize,
+    pub(crate) offset: u64,
 }
 
 impl Machine {

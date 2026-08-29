@@ -69,7 +69,7 @@ were the ones where a workload either ran or did not.
 The native test suites (98 cases, plus the soak, the nine measurement runs,
 and trace regeneration, all invoked explicitly) gate every ✅ above, alongside
 the wasm harness and the current
-42-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
+43-check-per-engine browser matrix; `crates/x64-engine` and `crates/linux-compat`
 are the delivered engine and OS layers, `crates/webtos-web` + `web/` the current
 browser host.
 
@@ -975,8 +975,18 @@ Exit gate for each agent:
 - Child processes, cancellation, and terminal resize behave correctly. 🔶
   (child processes and vfork spawns work; terminal resize delivers SIGWINCH,
   and a full-screen program repaints from a browser window resize with nothing
-  typed — gated in Chromium, Firefox, and WebKit; Codex's interactive TUI
-  quits cleanly on Ctrl-C natively, not yet in a browser profile)
+  typed — gated in Chromium, Firefox, and WebKit. Driving the real Codex TUI
+  into a browser profile found and fixed three engine gaps its SQLite WAL
+  state needed — `fchown` was ENOSYS, the `fcntl` lock queries were EINVAL,
+  and `MAP_SHARED` file mappings were unimplemented; all three now behave and
+  are gated natively by a WAL-shaped probe, and a manifest-only terminal
+  session reaches a live prompt in all three engines. What remains: codex's
+  own TUI logging pipeline panics ("Span not found", tracing-subscriber
+  fmt_layer) under this engine's scheduling — reproducible natively with
+  `run_guest GUEST_PTY=1 web/codex`, no failing syscall at the point of death,
+  avoidable there with RUST_LOG=off but not yet under a shell in a browser.
+  The interactive steps are env-gated (WEBTOS_TUI_GATE=1) until that race is
+  root-caused)
 - A checkpointed session resumes after browser reload with filesystem state
   intact. ✅ (the terminal page checkpoints the guest filesystem to browser
   storage on demand; after a real reload `openfox status` reports finding the

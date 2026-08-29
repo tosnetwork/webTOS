@@ -410,7 +410,11 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_CHMOD => sys_chmodat(env, cpu, abi::AT_FDCWD, a[0], a[1]),
         abi::SYS_FCHMODAT => sys_chmodat(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FCHMOD => sys_fchmod(env, a[0], a[1]),
-        abi::SYS_CHOWN | abi::SYS_FCHOWNAT => Ok(0), // single-user: uid/gid stay 0
+        abi::SYS_CHOWN | abi::SYS_LCHOWN | abi::SYS_FCHOWNAT => Ok(0), // single-user: uid/gid stay 0
+        abi::SYS_FCHOWN => {
+            env.proc.fds.borrow().get(a[0])?; // EBADF still reports honestly
+            Ok(0)
+        }
         abi::SYS_UTIMENSAT => sys_utimensat(env, cpu, a),
         abi::SYS_UMASK => {
             let old = env.proc.umask;
@@ -426,7 +430,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
                 sys_dup2(env, a[0], a[1], a[2] & abi::O_CLOEXEC != 0)
             }
         }
-        abi::SYS_FCNTL => sys_fcntl(env, a[0], a[1], a[2]),
+        abi::SYS_FCNTL => sys_fcntl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_IOCTL => sys_ioctl(env, cpu, a[0], a[1], a[2]),
         abi::SYS_FSYNC | abi::SYS_SYNC => Ok(0),
         // Advisory locking. The guest is a single process with no competing
@@ -492,7 +496,19 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             r
         }
+        abi::SYS_MSYNC => {
+            sync_shared_range(env, cpu, a[0], align_up(a[1], PAGE_SIZE));
+            Ok(0)
+        }
         abi::SYS_MUNMAP => {
+            // A MAP_SHARED region's contents live in guest pages until they are
+            // written back; unmapping is the last chance.
+            sync_shared_range(env, cpu, a[0], align_up(a[1], PAGE_SIZE));
+            env.shared_maps.retain(|map| {
+                map.asid != env.proc.asid
+                    || map.addr >= a[0].saturating_add(align_up(a[1], PAGE_SIZE))
+                    || map.addr.saturating_add(map.len) <= a[0]
+            });
             let ok = cpu.mem.unmap_memory_len(a[0], a[1]);
             if ok {
                 env.pager
@@ -2029,7 +2045,7 @@ fn sys_dup2(env: &mut LinuxEnv, fd: u64, new_fd: u64, cloexec: bool) -> SysResul
     )
 }
 
-fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
+fn sys_fcntl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, cmd: u64, arg: u64) -> SysResult {
     match cmd {
         abi::F_DUPFD => sys_dup(env, fd, arg, false),
         abi::F_DUPFD_CLOEXEC => sys_dup(env, fd, arg, true),
@@ -2052,8 +2068,20 @@ fn sys_fcntl(env: &mut LinuxEnv, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         // Advisory record locks: a single guest has no competing lock
         // holders, so setting always succeeds and querying reports unlocked
-        // (l_type = F_UNLCK in the caller's struct flock).
-        abi::F_SETLK | abi::F_SETLKW => Ok(0),
+        // (l_type = F_UNLCK in the caller's struct flock). The open-file-
+        // description variants get the same answer — SQLite tries those first.
+        abi::F_SETLK | abi::F_SETLKW | abi::F_OFD_SETLK | abi::F_OFD_SETLKW => {
+            env.proc.fds.borrow().get(fd)?;
+            Ok(0)
+        }
+        abi::F_GETLK | abi::F_OFD_GETLK => {
+            env.proc.fds.borrow().get(fd)?;
+            // struct flock: l_type i16 at 0, l_pid i32 at 24. Report the range
+            // unlocked, leaving whence/start/len as the caller wrote them.
+            write_mem(env, cpu, arg, &abi::F_UNLCK.to_le_bytes())?;
+            write_mem(env, cpu, arg + 24, &0u32.to_le_bytes())?;
+            Ok(0)
+        }
         _ => {
             tracing::debug!("fcntl: unsupported cmd {cmd}");
             Err(abi::EINVAL)
@@ -2404,6 +2432,37 @@ fn prot_to_perm(prot: u64) -> u8 {
     bits
 }
 
+/// Writes every `MAP_SHARED` mapping overlapping `[addr, addr+len)` back to
+/// its file, capped by the file's current length (an `ftruncate` may have
+/// shrunk it since the map was made).
+fn sync_shared_range(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64) {
+    let end = addr.saturating_add(len);
+    let maps: Vec<crate::SharedMap> = env
+        .shared_maps
+        .iter()
+        .copied()
+        .filter(|map| {
+            map.asid == env.proc.asid && map.addr < end && map.addr.saturating_add(map.len) > addr
+        })
+        .collect();
+    for map in maps {
+        let mut bytes = vec![0_u8; map.len as usize];
+        if cpu
+            .mem
+            .read_bytes(map.addr, &mut bytes, icicle_cpu::mem::perm::NONE)
+            .is_err()
+        {
+            continue;
+        }
+        let node = env.vfs.node_mut(map.node);
+        if let NodeKind::File(data) = &mut node.kind {
+            let start = (map.offset as usize).min(data.len());
+            let take = bytes.len().min(data.len() - start);
+            data[start..start + take].copy_from_slice(&bytes[..take]);
+        }
+    }
+}
+
 fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     let [addr, len, prot, flags, fd, offset] = a;
     if len == 0 {
@@ -2441,15 +2500,22 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     };
 
     let mut lazy_file = None;
+    let mut shared_node = None;
     let file_bytes = if flags & abi::MAP_ANONYMOUS == 0 {
-        if flags & abi::MAP_SHARED != 0 {
-            tracing::warn!("mmap: MAP_SHARED file mappings are not supported");
-            return Err(abi::ENOSYS);
-        }
         let node = match env.proc.fds.borrow().get(fd)?.desc.borrow().backing {
             Backing::File { node } => node,
             _ => return Err(abi::EBADF),
         };
+        // A MAP_SHARED file mapping: the pages are filled eagerly and written
+        // back to the file at msync/munmap. SQLite's WAL shared-memory file —
+        // mapped read/write once per process — is the workload; a plain File
+        // node is required (a manifest-backed image is never mapped shared).
+        if flags & abi::MAP_SHARED != 0 {
+            if !matches!(env.vfs.node(node).kind, NodeKind::File(_)) {
+                return Err(abi::ENODEV);
+            }
+            shared_node = Some(node);
+        }
         match &env.vfs.node(node).kind {
             NodeKind::File(data) => {
                 let start = offset_into(offset, data.len());
@@ -2491,6 +2557,15 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         write_mem(env, cpu, target, &bytes)?;
     }
     let final_perm = prot_to_perm(prot);
+    if let Some(node) = shared_node {
+        env.shared_maps.push(crate::SharedMap {
+            asid: env.proc.asid,
+            addr: target,
+            len,
+            node,
+            offset,
+        });
+    }
     if let Some((file, file_len)) = lazy_file {
         if file_len > 0 {
             let mapping = crate::pager::FileMapping::new(

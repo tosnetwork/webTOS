@@ -131,6 +131,10 @@
   // so it is never held in this page — the worker streams it into the guest
   // and into an OPFS cache as it arrives.
   const extraImages = params.getAll("image");
+  // A manifest-backed lazy image: the manifest is fetched and installed before
+  // the shell starts, and the agent's pages arrive as execution touches them.
+  const manifestUrl = params.get("manifest");
+  const chunkBase = params.get("chunkBase");
   if (gateway) {
     document.getElementById("netnote").textContent =
       `Network relayed through ${gateway}; resolver ${resolver}. The relay's` +
@@ -138,10 +142,15 @@
   }
 
   // BusyBox and any extra images arrive the same way; the shell starts once
-  // every one is in the guest filesystem.
-  const wanted = new Map([["/bin/busybox", "./busybox-musl"]]);
-  for (const name of extraImages) wanted.set(`/bin/${name}`, `./${name}`);
+  // every one is in the guest filesystem. With a chunk manifest, the manifest
+  // is the execution authority and carries every binary — including BusyBox —
+  // so nothing streams eagerly beside it.
+  const wanted = new Map(manifestUrl && chunkBase ? [] : [["/bin/busybox", "./busybox-musl"]]);
+  if (!(manifestUrl && chunkBase)) {
+    for (const name of extraImages) wanted.set(`/bin/${name}`, `./${name}`);
+  }
   const outstanding = new Set(wanted.keys());
+  if (manifestUrl && chunkBase) outstanding.add("__manifest__");
 
   const startShell = () => {
     if (secret) {
@@ -200,6 +209,19 @@
         statusEl.textContent += " — browser storage unavailable; checkpoints disabled";
       }
       for (const [path, url] of wanted) worker.postMessage({ type: "image", path, url });
+      if (manifestUrl && chunkBase) {
+        fetch(manifestUrl)
+          .then((r) => {
+            if (!r.ok) throw new Error(`manifest: HTTP ${r.status}`);
+            return r.arrayBuffer();
+          })
+          .then((manifest) =>
+            worker.postMessage({ type: "lazyImage", manifest, chunkBase, preload: [] }),
+          )
+          .catch((e) => {
+            statusEl.textContent = `lazy image failed: ${e.message}`;
+          });
+      }
     }
     if (msg.type === "progress") {
       const mb = (n) => (n / (1 << 20)).toFixed(1);
@@ -215,6 +237,10 @@
     if (msg.type === "image") {
       window.webtos.images.push(msg);
       outstanding.delete(msg.path);
+      if (outstanding.size === 0) startShell();
+    }
+    if (msg.type === "lazyImage") {
+      outstanding.delete("__manifest__");
       if (outstanding.size === 0) startShell();
     }
     if (msg.type === "output") term.write(msg.text);
