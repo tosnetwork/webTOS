@@ -26,10 +26,12 @@ compilation disabled, a fixed locale, timezone, source epoch, and
 Rust toolchain. Caller-supplied Cargo profile and Rust flags do not reach the
 compiler.
 
-The canonical builder host is `x86_64-unknown-linux-gnu`, the host used by the
-release workflow and the fixture machine. The same target toolchain does not
-promise identical wasm across host architectures, so the builder records this
-triple in `BUILDINFO.json` and refuses another host. A developer can set
+The canonical builder is Ubuntu 24.04 on `x86_64-unknown-linux-gnu`, the image
+used by the release workflow. The same target toolchain does not promise
+identical wasm across host operating systems or architectures, so the builder
+records both the OS and triple in `BUILDINFO.json` and refuses another host.
+It also isolates Cargo configuration from the caller while reusing only the
+frozen registry and Git caches. A developer can set
 `WEBTOS_RELEASE_ALLOW_NONCANONICAL_HOST=1` for local validation, but that output
 is not a release candidate.
 

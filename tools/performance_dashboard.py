@@ -204,8 +204,13 @@ def build_from_report_shape(report: dict, runtime_path: Path) -> dict:
         "schema_version",
     }:
         raise ValueError("performance dashboard has unknown or missing fields")
-    if report.get("runtime", {}).get("sha256") != digest(runtime_path):
-        raise ValueError("measured runtime digest differs")
+    expected_digest = report.get("runtime", {}).get("sha256")
+    actual_digest = digest(runtime_path)
+    if expected_digest != actual_digest:
+        raise ValueError(
+            "measured runtime digest differs: "
+            f"expected {expected_digest}, got {actual_digest}"
+        )
     if not re.fullmatch(r"[0-9a-f]{40}", report.get("runtime", {}).get("source_commit", "")):
         raise ValueError("performance dashboard has no source commit")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", report.get("measured_at", "")):

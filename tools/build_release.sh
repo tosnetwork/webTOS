@@ -89,20 +89,39 @@ if ! printf '%s' "$TOOLCHAIN" | grep -Eq '^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$';
     exit 1
 fi
 BUILDER_HOST="$(cd "$ROOT" && rustc --version --verbose | awk '/^host:/ { print $2 }')"
-if [ "$BUILDER_HOST" != "x86_64-unknown-linux-gnu" ] && \
+BUILDER_OS="unknown"
+if [ -r /etc/os-release ]; then
+    OS_ID="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
+    OS_VERSION_ID="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
+    BUILDER_OS="${OS_ID:-unknown}-${OS_VERSION_ID:-unknown}"
+fi
+if { [ "$BUILDER_HOST" != "x86_64-unknown-linux-gnu" ] || \
+     [ "$BUILDER_OS" != "ubuntu-24.04" ]; } && \
    [ "${WEBTOS_RELEASE_ALLOW_NONCANONICAL_HOST:-0}" != "1" ]; then
-    echo "canonical releases require x86_64-unknown-linux-gnu, found: $BUILDER_HOST" >&2
+    echo "canonical releases require Ubuntu 24.04 x86_64-unknown-linux-gnu" >&2
+    echo "found: $BUILDER_OS $BUILDER_HOST" >&2
     echo "WEBTOS_RELEASE_ALLOW_NONCANONICAL_HOST=1 is local validation only" >&2
     exit 1
 fi
 
 CARGO_HOME_REAL="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_REAL="${RUSTUP_HOME:-$HOME/.rustup}"
-REMAP_FLAGS="--remap-path-prefix=$ROOT=/usr/src/webtos --remap-path-prefix=$CARGO_HOME_REAL=/usr/local/cargo --remap-path-prefix=$RUSTUP_HOME_REAL=/usr/local/rustup"
 METADATA="$(mktemp)"
 STAGE="$(mktemp -d)"
-trap 'rm -f "$METADATA"; rm -rf "$STAGE"' EXIT
+CONTROLLED_CARGO_HOME="$(mktemp -d)"
+trap 'rm -f "$METADATA"; rm -rf "$STAGE" "$CONTROLLED_CARGO_HOME"' EXIT
 mkdir -p "$OUT_DIR" "$TARGET_DIR"
+
+# Cargo reads configuration from CARGO_HOME as well as the checkout. Reusing
+# the caller's whole Cargo home would let a personal rustc wrapper, linker, or
+# rustflags change a nominally controlled release. Keep only the immutable
+# dependency caches needed by the frozen build.
+for cache in registry git; do
+    if [ -e "$CARGO_HOME_REAL/$cache" ]; then
+        ln -s "$CARGO_HOME_REAL/$cache" "$CONTROLLED_CARGO_HOME/$cache"
+    fi
+done
+REMAP_FLAGS="--remap-path-prefix=$ROOT=/usr/src/webtos --remap-path-prefix=$CARGO_HOME_REAL=/usr/local/cargo --remap-path-prefix=$CONTROLLED_CARGO_HOME=/usr/local/cargo --remap-path-prefix=$RUSTUP_HOME_REAL=/usr/local/rustup"
 
 controlled_cargo() {
     (
@@ -110,7 +129,7 @@ controlled_cargo() {
         env -i \
             HOME="$HOME" \
             PATH="$PATH" \
-            CARGO_HOME="$CARGO_HOME_REAL" \
+            CARGO_HOME="$CONTROLLED_CARGO_HOME" \
             RUSTUP_HOME="$RUSTUP_HOME_REAL" \
             LC_ALL=C \
             TZ=UTC \
@@ -173,7 +192,7 @@ LOCK_SHA="$(sha256sum "$ROOT/crates/Cargo.lock" | awk '{print $1}')"
 LICENSE_SHA="$(sha256sum "$ROOT/LICENSES.tsv" | awk '{print $1}')"
 SBOM_SHA="$(sha256sum "$STAGE/SBOM.spdx.json" | awk '{print $1}')"
 python3 - "$STAGE/BUILDINFO.json" "$VERSION" "$SOURCE_COMMIT" "$TREE_STATE" \
-    "$SOURCE_EPOCH" "$TOOLCHAIN" "$BUILDER_HOST" "$WASM_SHA" "$LOCK_SHA" \
+    "$SOURCE_EPOCH" "$TOOLCHAIN" "$BUILDER_HOST" "$BUILDER_OS" "$WASM_SHA" "$LOCK_SHA" \
     "$LICENSE_SHA" "$SBOM_SHA" <<'PY'
 import json
 import pathlib
@@ -187,6 +206,7 @@ import sys
     epoch,
     toolchain,
     builder_host,
+    builder_os,
     wasm,
     lock,
     licenses,
@@ -194,6 +214,7 @@ import sys
 ) = sys.argv[1:]
 document = {
     "builder_host": builder_host,
+    "builder_os": builder_os,
     "cargo_lock_sha256": lock,
     "licenses_sha256": licenses,
     "profile": "release",
