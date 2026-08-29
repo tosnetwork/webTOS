@@ -3,11 +3,13 @@
 </p>
 
 <p align="center">
-  <strong>Unmodified Linux x86-64 programs, running in a browser tab.</strong>
+  <strong>The Runtime for Intent-Native Applications.</strong><br>
+  Turn user intent into dynamically composed applications, backed by real Linux software running locally in the browser.
 </p>
 
 <p align="center">
   <a href="#overview">Overview</a> &middot;
+  <a href="#intent-native-applications">Intent-Native Apps</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#project-status">Status</a> &middot;
   <a href="ROADMAP.md">Roadmap</a> &middot;
@@ -17,9 +19,21 @@
 
 ## Overview
 
-webTOS runs **unmodified Linux x86-64 binaries inside a browser tab**. Not a
-port, not a reimplementation in JavaScript, and not a container on someone
-else's machine: the same ELF that runs on a Linux host, executing in the page.
+The Web was built around applications whose interfaces and workflows are
+mostly decided before the user arrives. The agentic Web changes that model.
+A user can express an intent; an agent can understand the goal, choose tools,
+inspect data, run software, and adapt the workflow as results arrive. The
+application itself can become part of that plan.
+
+**webTOS is the runtime foundation for that world.** Its long-term direction is
+to support **intent-native applications**: applications whose interface,
+agents, tools, data, local processes, state, permissions, and approval points
+can be composed dynamically for the user's current objective.
+
+The foundation is concrete today: webTOS runs **unmodified Linux x86-64
+binaries inside a browser tab**. Not a port, not a reimplementation in
+JavaScript, and not a container on someone else's machine: the same ELF that
+runs on a Linux host executes in the page.
 
 It is a WebAssembly x86-64 execution engine with the operating-system half of
 the Linux ABI on top of it — processes, threads, signals, a virtual
@@ -32,11 +46,18 @@ than exposing ambient browser authority to what it runs: a guest reaches the
 network only through a relay the page configured, and a deployment can bound
 its memory, CPU, storage, and network use with runtime-enforced budgets.
 
-### Primary Goal
+The short version:
 
-The primary goal is to run unmodified Linux x86-64 AI agent software locally
-in the browser. Development is gated by real workloads rather than raw
-instruction or syscall counts:
+> **Intent in. Application out.**
+>
+> The interface may be generated for the task. The tools behind it are real.
+> The execution stays local and bounded in the browser.
+
+### Current goal and future direction
+
+The current engineering goal is to run unmodified Linux x86-64 AI agent
+software locally in the browser. Development is gated by real workloads rather
+than raw instruction or syscall counts:
 
 ```text
 static hello
@@ -47,30 +68,135 @@ static hello
     -> Codex and Claude Code
 ```
 
-See the [webTOS Roadmap](ROADMAP.md) for architecture boundaries, milestone
-exit criteria, risks, and the product definition of done.
+This is not separate from the intent-native vision; it is the execution
+foundation required to make it useful. Dynamic UI alone can generate a button
+labelled `Run tests`. A real intent-native application also needs the
+repository, `git`, the test runner, subprocesses, a terminal, persistence,
+network policy, and resource limits behind that button.
+
+The proposed application-composition layer is described in
+[`docs/INTENT_NATIVE_APPLICATIONS.md`](docs/INTENT_NATIVE_APPLICATIONS.md).
+Application Graphs, dynamic UI composition APIs, and public SDK surfaces in
+that document are product direction, not claims of shipped functionality.
+See the [webTOS Roadmap](ROADMAP.md) for current architecture boundaries,
+milestone exit criteria, risks, and the product definition of done.
+
+## Intent-Native Applications
+
+A traditional Web application is largely application-first:
+
+```text
+Developer
+   |
+   v
+Routes + UI + APIs + workflows
+   |
+   v
+Deployed application
+   |
+   v
+User chooses a predefined path
+```
+
+An intent-native application can invert that relationship:
+
+```text
+User Intent
+     |
+     v
+Agent understands and plans
+     |
+     v
+Application Graph
+     |
+     +-- UI
+     +-- Agents
+     +-- Linux processes
+     +-- Tools and services
+     +-- Data and workspace
+     +-- Capabilities
+     +-- Approvals and budgets
+     |
+     v
+Dynamic Application
+     |
+     v
+webTOS local execution
+```
+
+The important word is not only *dynamic*. A model can already generate HTML.
+The harder problem is giving a generated interface a real, bounded execution
+environment behind it.
+
+A travel intent might compose a map, itinerary, comparison cards, a Python
+normalizer, and explicit approval points. A development intent might compose a
+file tree, terminal, code diff, `git`, a compiler, tests, and a coding agent.
+A research intent might compose source views, local data, Python analysis, and
+charts. The visible application changes because the task changes; the runtime
+beneath it remains the same.
+
+This is why webTOS exists at a lower layer than React, Vue, Svelte, or Web
+Components. Those technologies can render the interface. webTOS supplies the
+local processes, filesystem, terminals, state, networking boundary, and Linux
+software that dynamically selected components can operate against.
+
+The proposed core abstraction is an **Application Graph** rather than a fixed
+page tree:
+
+```text
+Intent
+  |
+  +-- Interface components
+  +-- Agent processes
+  +-- Linux tools
+  +-- Local state
+  +-- Remote services
+  +-- Capabilities
+  +-- Approval points
+  `-- Resource budgets
+```
+
+One security rule follows immediately:
+
+> **Graph mutation may rearrange granted authority; it must never manufacture
+> new authority.**
+
+An agent may propose a chart, terminal, process, or service call. Expanding
+filesystem access, network destinations, credentials, or resource ceilings
+must still pass host policy and, where required, explicit user approval.
+
+webTOS is deliberately neutral at this layer. Intent-native applications do
+not require a particular frontend framework, model provider, agent protocol,
+remote service, blockchain, token, or settlement system. The runtime is MIT
+licensed and intended to be useful underneath any compatible application
+stack.
 
 ## Why webTOS?
 
-Running a real program in a browser usually means one of three things, and
-each gives something up. Reimplementing the tool in JavaScript means it is no
-longer the tool. Renting a container means the operator holds the compute and
-the data. Using a proprietary browser VM means the engine is somebody else's
-to license and to fix.
+### Dynamic interfaces need dynamic execution
 
-webTOS is the third option built differently: the real binary, in the user's
-own browser, on an engine that is MIT-licensed and in this repository.
+Generating an interface is the easy half. If an application is assembled in
+real time, its backend requirements may also change in real time: Python for
+analysis, `git` for a repository, `ffmpeg` for media, a shell for orchestration,
+or an unmodified agent binary for autonomous work.
 
-## What it gives you
+webTOS lets those tools run where the application already is: in the user's
+browser.
 
 ### The program, not a port
 
 An ELF built for Linux x86-64 runs as-is. BusyBox applets, the host `git`
-doing real repository work, and a 52 MB agent binary all run unmodified. So
-does a C toolchain: a shell forks `gcc`, which execs the compiler, the
-assembler, and the linker, and then runs what came out
-(`crates/linux-compat/tests/gcc.rs`). What the runtime is for is in
+doing real repository work, and large agent binaries run unmodified. So does
+a C toolchain: a shell forks `gcc`, which execs the compiler, assembler, and
+linker, and then runs what came out (`crates/linux-compat/tests/gcc.rs`).
+What the runtime supports is documented in
 [`docs/USE-CASES.md`](docs/USE-CASES.md).
+
+### Local by architecture
+
+The execution environment is in the tab, not a per-user container rented by
+the application operator. The user's own machine supplies the compute and the
+workspace can remain local.
 
 ### Authority the page grants explicitly
 
@@ -89,6 +215,12 @@ configured budget is refused at the request rather than dying part-way
 through, and a guest over a limit sees an error it already knows how to
 handle.
 
+### State that survives a reload
+
+The guest filesystem is snapshotted to OPFS and restored into a fresh machine,
+so a session can resume after a page reload. This matters when an application
+is ephemeral in interface but persistent in workspace and task state.
+
 ### Determinism that is gated, not claimed
 
 The same input retires the same instruction stream in Chromium, Firefox, and
@@ -98,19 +230,15 @@ instruction counts. The runtime's native network-recording layer can replay a
 recorded session without a network; browser-host recording and replay is not
 yet an exported user-facing flow.
 
-### State that survives a reload
-
-The guest filesystem is snapshotted to OPFS and restored into a fresh
-machine, so a session resumes where it stopped.
-
 ## Architecture
 
-The current architecture, in text:
+Today, the delivered runtime is intentionally narrower than the long-term
+application-composition vision:
 
 ```text
 Browser
   |
-  +-- Terminal and control interface
+  +-- Application / terminal / control interface
   +-- Persistent storage adapter
   +-- Network adapter
   +-- Worker-based execution host
@@ -121,6 +249,33 @@ Browser
           +-- Linux x86-64 compatibility layer
           +-- x86-64 execution engine
           +-- Scheduling, budgets, snapshots, and trace events
+```
+
+The proposed higher layer is:
+
+```text
+User Intent
+     |
+     v
+Agent / Planner
+     |
+     v
+Application Graph                 proposed
+     |
+     +-- UI renderer              proposed
+     +-- capability broker        proposed public surface
+     +-- typed state/events       proposed public surface
+     |
+     v
+webTOS Runtime                    current
+     |
+     +-- Linux processes          current
+     +-- VFS / PTY / sockets      current
+     +-- budgets / snapshots      current
+     `-- deterministic execution current
+     |
+     v
+Browser
 ```
 
 For Linux workloads, webTOS provides the operating-system side of the Linux
@@ -147,11 +302,10 @@ signals, sockets, polling, and epoll-style event handling.
 
 ## Project Status
 
-webTOS is the browser-hosted runtime: a WebAssembly x86-64 engine that runs
-real Linux binaries in a tab. The native TOS kernel it grew out of has been
-removed from this repository — it was a separate, bare-metal Stage-1 crate
-that the browser pivot left behind, and the current project under `crates/`
-does not depend on it. What remains is the runtime and its host.
+The intent-native application layer is a product and architecture direction;
+it is not presented as completed functionality. The delivered webTOS runtime
+is the browser-hosted foundation: a WebAssembly x86-64 engine that runs real
+Linux binaries in a tab.
 
 Available in the repository today:
 
@@ -172,8 +326,13 @@ Available in the repository today:
 - A dependency-license manifest and a security policy (`SECURITY.md`)
 - The browser host: a Web Worker, terminal, OPFS persistence, and a network
   relay, gated in Chromium, Firefox, and WebKit
-- A gated OpenFox workload profile, plus Node/Codex/Claude Code compatibility
-  evidence; complete Codex and Claude Code browser-image profiles remain M7 work
+- Browser delivery of real large agent binaries through content-addressed
+  manifests, with current workload status and remaining interactive gates
+  tracked in [`ROADMAP.md`](ROADMAP.md)
+
+The repository once contained a separate native bare-metal kernel. That kernel
+has been removed; the current browser runtime under `crates/` does not depend
+on it.
 
 ## Browser Host
 
@@ -190,15 +349,14 @@ bash web/build.sh                   # build the wasm module and stage the images
 python3 -m http.server -d web 8080
 ```
 
-The browser host supports two delivery modes. The demo's `?image=NAME` path
-still streams a whole image into the guest and OPFS without creating an extra
-page-side copy. The manifest path installs only metadata and content hashes;
-the initial ELF, dynamic loader, `MAP_PRIVATE`, and file reads then fetch
-verified 64 KiB chunks on first access from an OPFS hash cache or the network.
-Snapshots retain the manifest root and immutable descriptors, not cached base
-chunks. A 52 MB streamed agent binary reaches a shell prompt in about three
-seconds on the first load and one on the next; the lazy path is the one meant
-for the 200+ MB agent images. To use the legacy demo stream:
+The browser host supports streamed and manifest-backed delivery. The manifest
+path installs metadata and content hashes first; executable files, dynamic
+loaders, mappings, and reads can then fetch verified chunks on demand from an
+OPFS hash cache or the network. This is the direction intended for large Agent
+and future application images: the browser should materialize what execution
+needs rather than eagerly download a whole disk image.
+
+To use the legacy demo stream:
 
 ```bash
 tools/build_openfox_fixture.sh      # needs the OpenFox source (OPENFOX_SRC)
@@ -207,120 +365,66 @@ bash web/build.sh
 # and run:  openfox --help
 ```
 
-Two pages: `/` runs one-shot BusyBox commands against a filesystem that
-survives reload, and `/terminal.html` is an interactive BusyBox shell on a
-pseudoterminal — it echoes what you type, forks and execs commands through
-pipelines, runs the full-screen `vi` editor, and repaints when the window is
-resized (a host resize is a SIGWINCH to the guest's foreground group). A guest
-blocked on a terminal read pauses the run rather than deadlocking it; the next
-keystroke resumes the same process where it stopped.
+Two pages provide the current demonstration surface: `/` runs one-shot BusyBox
+commands against a filesystem that survives reload, and `/terminal.html` is an
+interactive shell on a pseudoterminal. It echoes input, forks and execs commands
+through pipelines, runs a full-screen editor, and repaints on resize through
+SIGWINCH. The terminal page also supports manifest-backed sessions; see the
+roadmap and browser harness for the current gated paths.
 
 ### Giving the guest a network
 
-A tab cannot open a socket, and the guest does its own TLS and its own DNS, so
-what it needs is a byte relay rather than an HTTP proxy. `tools/webtos_gateway.mjs`
-is that relay, and because it is the only component that can reach the network
-on the guest's behalf, it is where the policy lives:
+A tab cannot open a raw socket, and the guest does its own TLS and DNS, so it
+needs a byte relay rather than an HTTP proxy. `tools/webtos_gateway.mjs` is
+that relay, and because it is the component that can reach the network on the
+guest's behalf, it is where network policy lives:
 
 ```bash
-npm install                                   # the relay needs 'ws'
+npm install
 node tools/webtos_gateway.mjs --allow example.com:80 --allow 1.1.1.1:53
 python3 -m http.server -d web 8080
-# then open http://localhost:8080/terminal.html?gateway=ws://127.0.0.1:8081
 ```
 
 Nothing is reachable unless an `--allow` rule names it; with no rules the relay
-starts and refuses everything. A rule is `host:port`, where the host is an IPv4
-literal or a name the relay resolves — the guest does its own DNS and connects
-to an address, so name rules are matched by address. The relay also requires a
-page `Origin` it was told to accept (localhost by default), so a page on any
-site the user happens to visit cannot drive their relay as an open proxy; that
-check constrains browsers, not local programs, which is why the allowlist is
-the boundary that matters. It binds to loopback, and logs every decision,
-allowed and refused alike.
+starts and refuses everything. The guest itself never gains ambient browser
+network authority.
 
-The guest has no network at all until the page asks for one, and the machine
-itself never opens anything: guest socket operations become a command stream
-the host carries out, which is why the browser and the native host can enforce
-different policies over the same runtime.
-
-Two harnesses gate it:
+Two harnesses gate the browser host:
 
 ```bash
-node web/test_node.mjs              # the wasm module under Node/V8, no browser
+node web/test_node.mjs
 
-npm install                         # Playwright, for the browser matrix
-npx playwright install              # Chromium, Firefox, and WebKit engines
-node web/test_browsers.mjs          # all three engines; --engines= to narrow
+npm install
+npx playwright install
+node web/test_browsers.mjs
 ```
 
-`web/test_browsers.mjs` drives the demo page the way a user does — BusyBox
-applets, a snapshot, a real page reload, a read-back of the restored
-filesystem — runs the static and dynamically linked fixtures through the
-worker protocol directly, drives the interactive terminal (a streamed image the guest
-hashes to prove it arrived intact, a shell prompt, a pipeline, the full-screen
-editor, and a resize that repaints without a keystroke), starts its own
-gateway allowing exactly one destination and checks
-both that the guest can fetch over a real socket and that anything else is
-refused, and finally reruns the page in a profile without persistent storage
-to confirm the host reports the missing capability instead of failing at the
-first click. It ends by comparing per-command instruction counts across
-the three engines: identical input must retire an identical instruction stream
-everywhere.
+The browser matrix drives the runtime as a user would, including Linux
+workloads, terminal behavior, persistence, networking policy, manifest-backed
+delivery paths, and cross-engine determinism. See [`ROADMAP.md`](ROADMAP.md)
+and [`docs/performance.md`](docs/performance.md) for the exact current gates and
+measurements rather than treating this README as a test report.
 
-Determinism is gated against recorded baselines rather than only against
-another run: `test_data/traces/` holds architectural traces — the syscall
-stream with its arguments, delivered signals, and register and flag samples
-taken at exact instruction counts — and the browser matrix reproduces one of
-them register for register in each engine. The format is documented in
-`crates/linux-compat/src/trace.rs`; regenerate after an intended change with:
-
-```bash
-cd crates && cargo test -p linux-compat --release --test trace -- --ignored rewrite
-```
-
-Measurements, as opposed to gates, live in `web/bench.mjs` and
-`crates/linux-compat/tests/bench.rs`: the same guest workloads in a browser and
-natively, so the two can be read against each other, plus a few-hundred-byte
-control module that separates "this engine is slow" from "this engine dislikes
-our runtime". What they currently report, and what it implies, is in
-[`docs/performance.md`](docs/performance.md).
-
-**Run the suite on x86-64 Linux before trusting it.** Every test whose fixture
-is compiled by the host `gcc` — the pseudoterminal, signal, and glibc cases —
-cannot build a static Linux binary on macOS or ARM, so it returns early and
-reports success. A green suite on a Mac is not a green suite: a signal-loss
-bug lived behind that gap until the suite was run somewhere it could not skip.
-See *A bug that only appeared where the tests ran* in the roadmap.
-
-The native suite pins its target in `crates/.cargo/config.toml`, so on a macOS
-or ARM development machine run it against the host instead — tests whose
-fixtures need an x86-64 Linux toolchain skip themselves:
-
-```bash
-cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
-```
-
-A skip prints `SKIP:` naming the fixture and how to get it, but `cargo test`
-captures that for a passing test, so add `-- --nocapture` to see what a run
-actually covered. On macOS 23 cases skip: every C fixture, which is most of
-the threads, processes, epoll, pty, and signal surface.
-
-On a machine that can build and run everything, make a skip a failure so the
-run cannot quietly cover less than it claims:
+**Run the native suite on x86-64 Linux before trusting it.** Tests whose
+fixtures require an x86-64 Linux compiler can skip on macOS or ARM. On a host
+that can build everything, forbid skips:
 
 ```bash
 cd crates && WEBTOS_REQUIRE_FIXTURES=1 cargo test -p linux-compat --release
 ```
 
-The x86-64 Linux host passes that way with no skips.
+On macOS or ARM, run the suite against the host target and use `--nocapture`
+to see skipped fixtures:
+
+```bash
+cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin -- --nocapture
+```
 
 ## Running natively
 
 The same engine runs outside a browser, which is the faster way to iterate and
-the only way to run the parts of the suite a browser cannot host. Rust nightly
-is the only prerequisite; cargo runs from `crates/`, never the repository
-root.
+the only way to run parts of the suite a browser cannot host. Rust nightly is
+the only prerequisite; cargo runs from `crates/`, never the repository root.
 
 ```bash
 cd crates
@@ -329,34 +433,13 @@ cargo run --release -p linux-compat --example run_guest -- /usr/bin/git --versio
 ```
 
 `SYSCALL_ERR_TRACE=1` prints every syscall that returned an error, with the
-path for `openat`; `RUST_LOG=linux_compat=trace` prints all of them. On a
-fault the runner reports the faulting page's permissions, which separates
-"jumped into nothing" from "jumped into a page the loader left
-non-executable".
-
-On a macOS or ARM development machine, run the suite against the host — tests
-whose fixtures need an x86-64 Linux toolchain skip themselves:
-
-```bash
-cd crates && cargo test -p linux-compat --release --target aarch64-apple-darwin
-```
+path for `openat`; `RUST_LOG=linux_compat=trace` prints all of them.
 
 ## Documentation
 
+- [Intent-Native Applications](docs/INTENT_NATIVE_APPLICATIONS.md) - the
+  product and architecture direction for applications dynamically composed
+  from user intent
 - [Documentation Index](docs/README.md) - guides, specifications, runtime
   notes, and engineering roadmaps
-- [Roadmap](ROADMAP.md) - browser x86-64 architecture, workload milestones,
-  acceptance gates, and release definition
-- [Use cases](docs/USE-CASES.md) - what the runtime supports today, and what
-  it deliberately does not
-- [Performance and memory](docs/performance.md) - what the interpreter costs
-  per browser engine, and what a tab grants it
-
-Several documents under `docs/` describe the bare-metal kernel that has been
-removed — the yellow paper, the Wasm runtime and engine-integration notes, the
-policy specification, and the package manager. They are kept as history and
-are not linked here, because they no longer describe anything in this tree.
-
-## License
-
-[MIT](LICENSE)
+- [White Paper](docs/WHITEPAPER.md) -
