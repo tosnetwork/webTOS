@@ -384,42 +384,55 @@ pub mod x86 {
         }
     }
 
+    /// Architectural CPUID output registers.
+    ///
+    /// The SLEIGH CPUID constructors export their 16-byte result tuple in the
+    /// physical order EAX, EBX, EDX, ECX. Keeping that storage detail here
+    /// prevents individual leaf helpers from crossing the architectural ECX
+    /// and EDX fields when they write tuple slices directly.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct CpuidResult {
+        eax: u32,
+        ebx: u32,
+        ecx: u32,
+        edx: u32,
+    }
+
+    impl CpuidResult {
+        fn write(self, cpu: &mut Cpu, dst: VarNode) {
+            if dst.size != 16 {
+                tracing::warn!(
+                    "Using unpatched SLEIGH specification, CPUID instruction will behave incorrectly"
+                );
+                return;
+            }
+
+            cpu.write_var(dst.slice(0, 4), self.eax);
+            cpu.write_var(dst.slice(4, 4), self.ebx);
+            cpu.write_var(dst.slice(8, 4), self.edx);
+            cpu.write_var(dst.slice(12, 4), self.ecx);
+        }
+    }
+
     // Basic processor information
     fn cpuid_basic_info(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
-        if dst.size != 16 {
-            tracing::warn!(
-                "Using unpatched SLEIGH specification, CPUID instruction will behave incorrectly"
-            );
-            return;
-        }
         tracing::debug!("cpuid(BASIC_INFO)");
         // Maximum basic leaf. Must be at least 1 so software (e.g. V8) reads
         // leaf 1 and sees the SSE2 feature bit; kept at 1 so the unimplemented
         // cache/topology leaves (2..6) are never queried.
         const MAX_BASIC_LEAF: u32 = 1;
-        if true {
-            // Pretend to be an Intel CPU
-            cpu.write_var(dst.slice(0, 4), MAX_BASIC_LEAF);
-            cpu.write_var(dst.slice(4, 4), u32::from_le_bytes(*b"Genu"));
-            cpu.write_var(dst.slice(8, 4), u32::from_le_bytes(*b"ineI"));
-            cpu.write_var(dst.slice(12, 4), u32::from_le_bytes(*b"ntel"));
+        // Pretend to be an Intel CPU.
+        CpuidResult {
+            eax: MAX_BASIC_LEAF,
+            ebx: u32::from_le_bytes(*b"Genu"),
+            edx: u32::from_le_bytes(*b"ineI"),
+            ecx: u32::from_le_bytes(*b"ntel"),
         }
-        else {
-            cpu.write_var(dst.slice(0, 4), MAX_BASIC_LEAF);
-            cpu.write_var(dst.slice(4, 4), u32::from_le_bytes(*b"Icic"));
-            cpu.write_var(dst.slice(8, 4), u32::from_le_bytes(*b"leCo"));
-            cpu.write_var(dst.slice(12, 4), u32::from_le_bytes(*b"reVm"));
-        }
+        .write(cpu, dst);
     }
 
     // Processor info and feature bits
     fn cpuid_version_info(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
-        if dst.size != 16 {
-            tracing::warn!(
-                "Using unpatched SLEIGH specification, CPUID instruction will behave incorrectly"
-            );
-            return;
-        }
         tracing::debug!("cpuid(VERSION_INFO)");
         // Copied from `Coffee Lake` microarchitecture
         let extended_family = 0x0;
@@ -434,13 +447,15 @@ pub mod x86 {
 
         // Advertise SSE/SSE2/SSE3, AES-NI, and PCLMULQDQ, but deliberately not
         // AVX or AVX-512: those encodings decode but their p-code semantics are
-        // not all validated, so userspace stays on the SSE paths. `avx`,
-        // `osxsave`, and `f16c` are left clear. AES-NI and PCLMULQDQ *are*
+        // not all validated, so userspace stays on the SSE paths. `xsave`,
+        // `osxsave`, `avx`, and `f16c` are left clear: CPUID leaf 0x0d and the
+        // XSAVE/XRSTOR state image are not implemented, so advertising XSAVE
+        // would be a false capability claim. AES-NI and PCLMULQDQ *are*
         // advertised: their primitives are supported here (the AES round ops
         // as helpers, PCLMULQDQ as an inlined SLEIGH macro, both verified
-        // against the native intrinsics), so a TLS client can use the
-        // hardware AES-GCM (AES-NI + carryless-multiply GHASH) SSE path
-        // instead of a software fallback. AVX-only fused GCM stays off.
+        // against the native intrinsics), so a TLS client can use the hardware
+        // AES-GCM SSE path instead of a software fallback. AVX-only fused GCM
+        // stays off.
         //
         // SSE4 is left clear as a conservative choice, not a proven blocker
         // (advertising it currently passes every test, Node included). SSE4.1/
@@ -457,8 +472,7 @@ pub mod x86 {
             | Feature::pdcm
             | Feature::popcnt
             | Feature::tsc_deadline
-            | Feature::aesni
-            | Feature::xsave)
+            | Feature::aesni)
             .bits();
 
         // EDX baseline for an SSE2-capable CPU. V8 aborts at startup unless
@@ -480,77 +494,45 @@ pub mod x86 {
             | FeatureEdx::sse2)
             .bits();
 
-        cpu.write_var(dst.slice(0, 4), eax);
-        cpu.write_var(dst.slice(4, 4), 0_u32);
-        cpu.write_var(dst.slice(8, 4), ecx);
-        cpu.write_var(dst.slice(12, 4), edx);
+        CpuidResult { eax, ebx: 0, ecx, edx }.write(cpu, dst);
     }
 
     // Return structured extended feature enumeration info leaf
     fn cpuid_extended_feature_enumeration_info(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        if dst.size != 16 {
-            tracing::warn!(
-                "Using unpatched SLEIGH specification, CPUID instruction will behave incorrectly"
-            );
-            return;
-        }
         let count: u32 = cpu.read(args[1]);
         tracing::debug!("cpuid(EXTENDED_FEATURE_ENUMERATION_INFO, {:#0x})", count);
 
-        match count {
+        let result = match count {
             // Returns extended feature flags in EBX, ECX, and EDX
-            0x0 => {
-                cpu.write_var(dst.slice(0, 4), u32::MAX);
-                cpu.write_var(dst.slice(4, 4), cpuid::EXTENDED_FEATURES_EBX);
-                cpu.write_var(dst.slice(8, 4), cpuid::EXTENDED_FEATURES_EDX);
-                cpu.write_var(dst.slice(12, 4), cpuid::EXTENDED_FEATURES_ECX);
-            }
+            0x0 => CpuidResult {
+                eax: u32::MAX,
+                ebx: cpuid::EXTENDED_FEATURES_EBX,
+                ecx: cpuid::EXTENDED_FEATURES_ECX,
+                edx: cpuid::EXTENDED_FEATURES_EDX,
+            },
 
             // Returns extended feature flags in EAX
             0x1 => {
                 // We don't support AVX-512 BFLOAT16 operations
-                cpu.write_var(dst.slice(0, 4), 0_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), 0_u32);
+                CpuidResult::default()
             }
-            _ => {
-                cpu.write_var(dst.slice(0, 4), 0_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), 0_u32);
-            }
-        }
+            _ => CpuidResult::default(),
+        };
+        result.write(cpu, dst);
     }
 
     fn cpuid(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        if dst.size != 16 {
-            tracing::warn!(
-                "Using unpatched SLEIGH specification, CPUID instruction will behave incorrectly"
-            );
-            return;
-        }
         let index: u32 = cpu.read(args[0]);
         let count: u32 = cpu.read(args[1]);
         tracing::debug!("cpuid({:#0x}, {:#0x})", index, count);
-        match index {
+        let result = match index {
             // Hypervisor
-            0x4000_0000 => {
-                cpu.write_var(dst.slice(0, 4), 0_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), 0_u32);
-            }
+            0x4000_0000 => CpuidResult::default(),
 
             // Highest extended function implemented. Reporting none is not a
             // position a 64-bit processor can hold: every x86-64 part answers
             // leaf 0x8000_0001, and programs read it without asking first.
-            0x8000_0000 => {
-                cpu.write_var(dst.slice(0, 4), 0x8000_0001_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), 0_u32);
-            }
+            0x8000_0000 => CpuidResult { eax: 0x8000_0001, ..CpuidResult::default() },
 
             // Extended processor info. Only what this engine actually
             // implements is advertised: long mode and `syscall`. Claiming a
@@ -559,10 +541,7 @@ pub mod x86 {
             0x8000_0001 => {
                 const SYSCALL: u32 = 1 << 11;
                 const LONG_MODE: u32 = 1 << 29;
-                cpu.write_var(dst.slice(0, 4), 0_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), SYSCALL | LONG_MODE);
+                CpuidResult { edx: SYSCALL | LONG_MODE, ..CpuidResult::default() }
             }
 
             // Anything else reads as zero. `CPUID` does not fault on real
@@ -571,12 +550,10 @@ pub mod x86 {
             // into a crash.
             unknown => {
                 tracing::debug!("CPUID leaf {unknown:#x} answered with zeros");
-                cpu.write_var(dst.slice(0, 4), 0_u32);
-                cpu.write_var(dst.slice(4, 4), 0_u32);
-                cpu.write_var(dst.slice(8, 4), 0_u32);
-                cpu.write_var(dst.slice(12, 4), 0_u32);
+                CpuidResult::default()
             }
-        }
+        };
+        result.write(cpu, dst);
     }
 
     /// Extract Packed Double-Precision Floating-Point Sign Mask
