@@ -55,7 +55,7 @@ now adds OIDC provenance and SBOM attestations, but has not yet run and no
 supported release has been published. BusyBox, OpenFox, Codex, and Claude Code
 images are built from exact locked bytes into canonical archives; two roots
 and changed mtimes produce identical results, while OpenFox additionally
-reproduces from pinned source with Go 1.25.13. Detached workload signing is
+reproduces from pinned source with Go 1.26.6. Detached workload signing is
 implemented without creating a production key. The compatibility dashboard
 records 43/43 checks in Chromium, Firefox, and WebKit against all four locked
 workloads. The separate performance authority in `docs/performance/` binds the

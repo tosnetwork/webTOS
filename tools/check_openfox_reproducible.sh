@@ -6,7 +6,7 @@ umask 022
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 SRC="${OPENFOX_SRC:-$HOME/openfox}"
 EXPECTED_COMMIT="6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
-EXPECTED_GO="go1.25.13"
+EXPECTED_GO="go1.26.6"
 TEMP="$(mktemp -d)"
 trap 'rm -rf "$TEMP"' EXIT
 

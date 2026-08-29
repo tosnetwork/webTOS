@@ -24,7 +24,7 @@ not affect the result. The verifier recomputes the archive manifest, internal
 bindings, and every chunk hash.
 
 For OpenFox, first run `tools/check_openfox_reproducible.sh`. It builds the
-clean pinned source twice with Go 1.25.13, changes the timezone between builds,
+clean pinned source twice with Go 1.26.6, changes the timezone between builds,
 and requires both binaries to equal the locked SHA-256. BusyBox is a pinned
 upstream binary. Codex and Claude Code are opaque upstream installations:
 webTOS can reproduce an image from the same locked bytes, but does not claim

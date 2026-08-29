@@ -32,16 +32,16 @@
           "mode": "755",
           "path": "/bin/openfox",
           "redistribution": "permitted with MIT notice",
-          "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb",
-          "size": 52971260,
+          "sha256": "42c7b0a5b4eef884d8ad9470c261202d1c4f1f8693baff4ba42e26f7588d1f18",
+          "size": 54060924,
           "source": "git+https://github.com/tosnetwork/openfox@6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
         }
       ],
       "build": {
         "command": "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags goolm,stdjson ./cmd/openfox",
-        "toolchain": "go1.25.13"
+        "toolchain": "go1.26.6"
       },
-      "expected_manifest_sha256": "5d5ff5e552dfb94c312d9e13289d1f284ea709b50d99016d2d7175a667250edf",
+      "expected_manifest_sha256": "ce4633ee0b05d94b7e8a42ee45aa997dc43e7aadb058af52ba300049351f7812",
       "id": "openfox",
       "source": [
         {
@@ -52,7 +52,7 @@
         },
         {
           "digest": {
-            "sha256": "d4a73e1224800d54b2581d8503bb3408c6351bb44b5ae4029ecde336a02c7aeb"
+            "sha256": "42c7b0a5b4eef884d8ad9470c261202d1c4f1f8693baff4ba42e26f7588d1f18"
           },
           "uri": "pkg:generic/openfox@6b997b638b7a99dd95f56bf6f35e91557f1cf7cf"
         }

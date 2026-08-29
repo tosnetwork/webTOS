@@ -30,11 +30,11 @@ jobs:
           ref: 6b997b638b7a99dd95f56bf6f35e91557f1cf7cf
           path: .openfox-src
 
-      # The version OpenFox itself asks for, so the pin above decides it
-      # rather than a number written here going stale.
+      # Keep the fixture build on the exact toolchain recorded in
+      # workloads/LOCK.json and enforced by build_openfox_fixture.sh.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: .openfox-src/go.mod
+          go-version: '1.26.6'
           cache: false
 
       # rust-toolchain.toml pins the channel and components; rustup honours it.
