@@ -8,10 +8,6 @@
 > with explicit permissions, persistent state, and runtime-enforced resource
 > limits.
 
-This brief applies investment criteria found in a16z's public writing on AI
-infrastructure, developer tools, open source, and agent execution. It has not
-been reviewed or endorsed by a16z.
-
 ---
 
 ## 1. Investment Thesis
@@ -21,11 +17,10 @@ repositories, running code, using tools, changing files, and operating over
 long-lived workflows. The model is only the decision layer. Every useful agent
 also needs a computer.
 
-a16z describes code sandboxes as critical components of the AI development
-stack and places execution environments at the base of the computer-use stack.
-It also identifies reliability, latency, cost, security, credentials,
-permissioning, auditability, and data retention as unresolved production
-constraints.[^a16z-sandboxes][^a16z-computer-use]
+Code sandboxes and execution environments are becoming critical components of
+the AI development and computer-use stacks. Reliability, latency, cost,
+security, credentials, permissioning, auditability, and data retention remain
+unresolved production constraints across the category.
 
 Today, that computer normally has one of two shapes:
 
@@ -182,11 +177,68 @@ the entire cloud or developer-tools market.
 
 ## 6. Business Model and Go-to-Market
 
-### Open-source funnel
+### MIT core: adoption is free by design
 
-The MIT runtime can create developer trust and distribution. a16z's open-source
-framework separates project-community fit, product-market fit, and
-value-market fit; all three must eventually be measured.[^a16z-oss]
+The repository's MIT license permits anyone to use, copy, modify, merge,
+publish, distribute, sublicense, and sell the released software, including as
+part of a commercial product, subject to preserving the required copyright and
+license notice. Released MIT versions remain available on those terms.
+
+Therefore, webTOS cannot base its business on charging for permission to use
+the core runtime or on preventing a customer or competitor from forking it.
+The free core should instead maximize adoption and become the common local
+execution contract for agents.
+
+The free surface should include:
+
+- the x86-64 engine and Linux compatibility layer;
+- the browser runtime and a useful TypeScript SDK;
+- local development tools and a one-click demonstration;
+- the public workload format, compatibility protocol, and basic policy APIs.
+
+This makes open source the distribution funnel. Commercial success must then
+progress through three independently measured stages: active project community,
+real product usage, and a paid value proposition.
+
+### Paid product: trust, control, compatibility, and operations
+
+Customers do not pay for bytes they can copy. They can pay to avoid owning the
+operational, security, release, and compatibility burden around those bytes.
+
+🔸 **Supported Enterprise Distribution.** Certified LTS builds, browser and
+agent-version qualification, upgrade guarantees, incident response, and
+compatibility SLAs.
+
+🔸 **Enterprise Control Plane.** Organization policy, workload identity,
+approvals, resource ceilings, version management, administrator controls, and
+fleet-wide configuration.
+
+🔸 **Managed Connectivity.** Credential brokerage, enterprise proxy support,
+deny-by-default network relays, destination policy, regional deployment, and
+operational monitoring.
+
+🔸 **Private Workload Registry.** Private agent images, signatures, SBOMs,
+provenance, vulnerability notices, compatibility reports, and controlled
+promotion between environments.
+
+🔸 **Audit and Execution Records.** Organization-authorized evidence,
+policy decisions, security events, compliance exports, retention controls, and
+incident investigation workflows.
+
+🔸 **Hybrid Execution.** A single policy surface that keeps suitable work in
+the browser and moves workloads beyond endpoint limits to an approved cloud or
+on-premises sandbox.
+
+🔸 **OEM Integration and Support.** Supported embedding for agent vendors,
+IDEs, and AI SaaS products, including release engineering and response
+commitments.
+
+The TypeScript SDK should remain free enough that developers can adopt webTOS
+without a sales call. The commercial boundary begins when an organization
+needs guarantees, governance, shared operations, or someone accountable for a
+production integration.
+
+### Go-to-market
 
 The recommended sequence is:
 
@@ -195,24 +247,17 @@ The recommended sequence is:
 3. 5–10 design partners in coding agents, browser IDEs, and AI SaaS;
 4. paid production pilots with measurable cost, privacy, or onboarding wins;
 5. bottom-up developer adoption followed by enterprise security and platform
-   sales — the “growth + sales” motion a16z has documented for developer-led
-   enterprise companies.[^a16z-growth]
-
-### Paid product
-
-- **Enterprise Runtime SDK:** supported releases, browser certification,
-  integration support, and compatibility SLAs.
-- **Policy and Control Plane:** organization policy, workload identity,
-  approvals, audit records, version management, and administration.
-- **Managed Connectivity:** credential brokerage and deny-by-default network
-  relay for products that do not want to operate those services.
-- **Workload Supply Chain:** signed images, provenance, compatibility reports,
-  and private registries.
+   sales.
 
 Pricing should reflect a recognizable unit of customer value — a protected
 active workspace, supported integration, or completed agent job — rather than
 raw emulated instructions. This preserves the local-compute advantage instead
 of recreating cloud VM billing inside the browser.
+
+Future proprietary enterprise modules or a dual-license strategy may be
+possible only for code whose rights the company controls and should be
+evaluated with legal counsel. Neither approach can revoke rights already
+granted for MIT releases, and neither should make the free runtime unusable.
 
 ---
 
@@ -238,9 +283,14 @@ tab requires a different architecture and business model.
 registries, policy standards, and shared compatibility data can create
 switching costs and ecosystem effects.
 
-Open source is not itself a moat. The moat becomes investable only if technical
-leadership converts into developer adoption, a stable integration contract,
-and a paid control plane.
+Open source is not itself a moat. MIT also creates an explicit value-capture
+risk: a well-funded company can copy the released code and use it commercially
+without paying webTOS. The defensible business must therefore compound outside
+mere code access — official compatibility ownership, trusted releases,
+certification, operating history, enterprise policy, customer integrations,
+support accountability, and an ecosystem that treats webTOS as the canonical
+runtime. A fork can copy a release; it does not automatically inherit the next
+agent compatibility fix, the customer relationship, or the production SLA.
 
 ---
 
@@ -261,6 +311,10 @@ and a paid control plane.
   production signing, and multi-hour agent soak are not all closed.
 - **Commercial risk:** no customer, revenue, retention, or community metrics
   have been supplied for this brief.
+- **Open-source value-capture risk:** the MIT core can be used, modified,
+  forked, and sold without paying webTOS; monetization depends on making the
+  official enterprise, operations, and compatibility layers valuable enough
+  to buy rather than rebuild.
 
 ### Milestones for the next financing period
 
@@ -292,14 +346,3 @@ next value inflection is commercial proof, not another instruction family.
 > ownership, financing amount and use of funds, customer pipeline, community
 > metrics, and a bottom-up market model. None should be invented from repository
 > evidence.
-
----
-
-## Public a16z Lens Used in This Brief
-
-[^a16z-sandboxes]: a16z, [The Trillion Dollar AI Software Development Stack](https://a16z.com/the-trillion-dollar-ai-software-development-stack/) — identifies code sandboxes as critical tools for agents.
-[^a16z-computer-use]: a16z, [The Rise of Computer Use and Agentic Coworkers](https://a16z.com/the-rise-of-computer-use-and-agentic-coworkers/) and [Can Agents Use a Computer Yet? We've Got the Data](https://a16z.com/can-agents-use-a-computer-yet-weve-got-the-data/) — frame execution environments, orchestration, accuracy, latency, cost, security, and governance as core layers and constraints.
-[^a16z-oss]: a16z, [Open Source: From Community to Commercialization](https://a16z.com/open-source-from-community-to-commercialization/) — distinguishes project-community fit, product-market fit, and value-market fit.
-[^a16z-growth]: a16z, [Growth+Sales: The New Era of Enterprise Go-to-Market](https://a16z.com/growthsales-the-new-era-of-enterprise-go-to-market/) — describes bottom-up product adoption followed by top-down enterprise sales.
-
-Additional framing: a16z's [The New Business of AI](https://a16z.com/the-new-business-of-ai-and-how-its-different-from-traditional-software/) highlights cloud infrastructure as a material AI gross-margin cost, while [Investing in Temporal](https://a16z.com/announcement/investing-in-temporal/) argues that reliable execution becomes indispensable as agents take consequential, long-running actions.
