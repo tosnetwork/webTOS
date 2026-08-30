@@ -55,6 +55,9 @@ fn fill_xstate(image: &mut [u8]) {
         image[1088 + index * 8..1088 + (index + 1) * 8]
             .copy_from_slice(&(0x0102_0304_0506_0708_u64 ^ index as u64).to_le_bytes());
     }
+    // K7 intentionally selects only the first eight byte lanes. Boundary
+    // cases use it to prove VPMULTISHIFTQB's E4NF full-source read behavior.
+    image[1088 + 7 * 8..1088 + 8 * 8].copy_from_slice(&0xff_u64.to_le_bytes());
     for index in 0..16 {
         image[1664 + index * 64..1664 + (index + 1) * 64].fill(0xa0_u8.wrapping_add(index as u8));
     }
@@ -279,6 +282,29 @@ fn native_with_layout(case: Case, data_offset: usize, protect_tail: bool) -> Res
             NT_X86_XSTATE as *mut c_void,
             (&mut set_iov as *mut libc::iovec).cast(),
         );
+    }
+    let mut seeded_xstate = vec![0_u8; xstate.len()];
+    let mut seeded_iov = libc::iovec {
+        iov_base: seeded_xstate.as_mut_ptr().cast(),
+        iov_len: seeded_xstate.len(),
+    };
+    unsafe {
+        checked_ptrace(
+            libc::PTRACE_GETREGSET,
+            pid,
+            NT_X86_XSTATE as *mut c_void,
+            (&mut seeded_iov as *mut libc::iovec).cast(),
+        );
+    }
+    seeded_xstate.truncate(seeded_iov.iov_len);
+    for offset in defined_xstate_offsets() {
+        assert_eq!(
+            seeded_xstate[offset], xstate[offset],
+            "{}: kernel changed seeded xstate byte {offset:#x}",
+            case.name
+        );
+    }
+    unsafe {
         checked_ptrace(
             libc::PTRACE_SINGLESTEP,
             pid,
@@ -1025,6 +1051,62 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
         },
         Case {
+            name: "vpmultishiftqb xmm1,xmm2,xmm3",
+            bytes: &[0x62, 0xf2, 0xed, 0x08, 0x83, 0xcb],
+        },
+        Case {
+            name: "vpmultishiftqb xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf2, 0xcd, 0x0d, 0x83, 0xe7],
+        },
+        Case {
+            name: "vpmultishiftqb xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x52, 0xb5, 0x8d, 0x83, 0xc2],
+        },
+        Case {
+            name: "vpmultishiftqb ymm11,ymm12,ymm13",
+            bytes: &[0x62, 0x52, 0x9d, 0x28, 0x83, 0xdd],
+        },
+        Case {
+            name: "vpmultishiftqb ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x32, 0x85, 0x2d, 0x83, 0xf0],
+        },
+        Case {
+            name: "vpmultishiftqb ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa2, 0xed, 0xa5, 0x83, 0xcb],
+        },
+        Case {
+            name: "vpmultishiftqb zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa2, 0xd5, 0x40, 0x83, 0xe6],
+        },
+        Case {
+            name: "vpmultishiftqb zmm23{k5}{z},zmm24,zmm25",
+            bytes: &[0x62, 0x82, 0xbd, 0xc5, 0x83, 0xf9],
+        },
+        Case {
+            name: "vpmultishiftqb xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0xed, 0x8d, 0x83, 0x0e],
+        },
+        Case {
+            name: "vpmultishiftqb ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0xdd, 0xad, 0x83, 0x1e],
+        },
+        Case {
+            name: "vpmultishiftqb zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf2, 0xcd, 0xcd, 0x83, 0x2e],
+        },
+        Case {
+            name: "vpmultishiftqb xmm7{k5}{z},xmm8,[rsi]{1to2}",
+            bytes: &[0x62, 0xf2, 0xbd, 0x9d, 0x83, 0x3e],
+        },
+        Case {
+            name: "vpmultishiftqb ymm9{k5}{z},ymm10,[rsi]{1to4}",
+            bytes: &[0x62, 0x72, 0xad, 0xbd, 0x83, 0x0e],
+        },
+        Case {
+            name: "vpmultishiftqb zmm11{k5}{z},zmm12,[rsi]{1to8}",
+            bytes: &[0x62, 0x72, 0x9d, 0xdd, 0x83, 0x1e],
+        },
+        Case {
             name: "vpermd zmm15,zmm16,zmm17",
             bytes: &[0x62, 0x32, 0x7d, 0x40, 0x36, 0xf9],
         },
@@ -1696,6 +1778,66 @@ fn vpopcnt_memory_masks_and_broadcasts_have_precise_faults() {
             (PAGE - selected_span, false),
             (PAGE - selected_span + 1, true),
         ] {
+            let native = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
+            let native_repeat = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            let native_instability = differences(&native, &native_repeat);
+            assert!(
+                native_instability.is_empty(),
+                "{} at offset {data_offset:#x} native authority was not repeatable:\n{}",
+                case.name,
+                native_instability.join("\n")
+            );
+            let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
+            let mismatches = differences(&native, &emulated);
+            assert!(
+                mismatches.is_empty(),
+                "{} at offset {data_offset:#x}:\n{}",
+                case.name,
+                mismatches.join("\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn vpmultishift_memory_masks_and_broadcasts_have_precise_faults() {
+    let cases = [
+        (
+            Case {
+                name: "vpmultishiftqb zmm5{k7}{z},zmm6,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0xcd, 0xcf, 0x83, 0x2e],
+            },
+            64,
+        ),
+        (
+            Case {
+                name: "vpmultishiftqb zmm11{k7}{z},zmm12,[rsi]{1to8} boundary",
+                bytes: &[0x62, 0x72, 0x9d, 0xdf, 0x83, 0x1e],
+            },
+            8,
+        ),
+    ];
+
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+    for (case, source_span) in cases {
+        // VPMULTISHIFTQB has E4NF memory exceptions: its output writemask does
+        // not suppress ordinary source reads. The normal form consumes the
+        // complete vector even though K7 selects only lanes 0..7, while the
+        // broadcast form consumes exactly one qword.
+        for (data_offset, should_fault) in
+            [(PAGE - source_span, false), (PAGE - source_span + 1, true)]
+        {
             let native = normalize_native(
                 native_with_layout(case, data_offset, true),
                 case,

@@ -403,6 +403,8 @@ pub mod x86 {
         ("webtos_vptestm_mem_512", packed_test_mask_mem_512),
         ("webtos_vpopcnt_128", packed_popcount_128),
         ("webtos_vpopcnt_mem_128", packed_popcount_mem_128),
+        ("webtos_vpmultishift_masked_128", packed_multishift_masked_128),
+        ("webtos_vpmultishift_mem_128", packed_multishift_mem_128),
         // MMX/SSE2 saturating packed arithmetic (also opaque in the spec).
         ("paddsb", paddsb),
         ("paddsw", paddsw),
@@ -1618,6 +1620,87 @@ pub mod x86 {
             let output_offset = lane_in_chunk * element_size;
             output[output_offset..output_offset + element_size]
                 .copy_from_slice(&count.to_le_bytes()[..element_size]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_multishift_masked_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let control = cpu.read::<u128>(args[0]).to_le_bytes();
+        let data = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = cpu.args[0].to_le_bytes();
+        let mask = cpu.args[1] as u64;
+        let chunk = cpu.args[2] as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        for group in 0..2 {
+            let qword = u64::from_le_bytes(data[group * 8..group * 8 + 8].try_into().unwrap());
+            for byte in 0..8 {
+                let lane_in_chunk = group * 8 + byte;
+                let global_lane = chunk * 16 + lane_in_chunk;
+                if mask & (1_u64 << global_lane) != 0 {
+                    output[lane_in_chunk] =
+                        qword.rotate_right(u32::from(control[lane_in_chunk] & 63)) as u8;
+                }
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_multishift_mem_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let control = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = cpu.args[0].to_le_bytes();
+        let mask = cpu.args[1] as u64;
+        let chunk = cpu.args[2] as usize;
+        let broadcast = cpu.args[3] != 0;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        for group_in_chunk in 0..2 {
+            let global_group = chunk * 2 + group_in_chunk;
+            let source_offset = if broadcast { 0 } else { global_group * 8 };
+            let mut qword_bytes = [0_u8; 8];
+            for (byte, output_byte) in qword_bytes.iter_mut().enumerate() {
+                let Some(current) = address.checked_add((source_offset + byte) as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => *output_byte = value[0],
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+            let qword = u64::from_le_bytes(qword_bytes);
+            for byte in 0..8 {
+                let global_lane = global_group * 8 + byte;
+                if mask & (1_u64 << global_lane) == 0 {
+                    continue;
+                }
+                let lane_in_chunk = group_in_chunk * 8 + byte;
+                output[lane_in_chunk] =
+                    qword.rotate_right(u32::from(control[lane_in_chunk] & 63)) as u8;
+            }
         }
         cpu.write_var(dst, u128::from_le_bytes(output));
     }

@@ -17551,33 +17551,100 @@ define pcodeop vpmadd52luq_avx512_ifma ;
 }
 
 # VPMULTISHIFTQB 5-571 PAGE 2395 LINE 130845
-define pcodeop vpmultishiftqb_avx512_vbmi ;
-:VPMULTISHIFTQB XmmReg1^XmmOpMask8, evexV5_XmmReg, XmmReg2_m128_m64bcst is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & XmmOpMask8 & evexV5_XmmReg; byte=0x83; (XmmReg1 & ZmmReg1) ... & XmmReg2_m128_m64bcst
+define pcodeop webtos_vpmultishift_masked_128;
+define pcodeop webtos_vpmultishift_mem_128;
+:VPMULTISHIFTQB XmmReg1^AVXOpMask^XmmMaskMode, evexV5_XmmReg, m128Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode & evexV5_XmmReg & evexB=0; byte=0x83; (XmmReg1 & ZmmReg1) ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpmultishift_mem_128(m128Addr, evexV5_XmmReg, XmmMask, AVXOpMask, 0:1, 0:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPMULTISHIFTQB XmmReg1^AVXOpMask^XmmMaskMode, evexV5_XmmReg, m64Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode & evexV5_XmmReg & evexB=1; byte=0x83; (XmmReg1 & ZmmReg1) ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpmultishift_mem_128(m64Addr, evexV5_XmmReg, XmmMask, AVXOpMask, 0:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPMULTISHIFTQB YmmReg1^AVXOpMask^YmmMaskMode, evexV5_YmmReg, m256Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode & evexV5_YmmReg & evexB=0; byte=0x83; (YmmReg1 & ZmmReg1) ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpmultishift_mem_128(m256Addr, evexV5_YmmReg[0,128], YmmMask[0,128], AVXOpMask, 0:1, 0:1);
+	YmmResult[128,128] = webtos_vpmultishift_mem_128(m256Addr, evexV5_YmmReg[128,128], YmmMask[128,128], AVXOpMask, 1:1, 0:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPMULTISHIFTQB YmmReg1^AVXOpMask^YmmMaskMode, evexV5_YmmReg, m64Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode & evexV5_YmmReg & evexB=1; byte=0x83; (YmmReg1 & ZmmReg1) ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_YmmReg[0,128], YmmMask[0,128], AVXOpMask, 0:1, 1:1);
+	YmmResult[128,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_YmmReg[128,128], YmmMask[128,128], AVXOpMask, 1:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPMULTISHIFTQB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, m512Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg & evexB=0; byte=0x83; ZmmReg1 ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpmultishift_mem_128(m512Addr, evexV5_ZmmReg[0,128], ZmmMask[0,128], AVXOpMask, 0:1, 0:1);
+	ZmmResult[128,128] = webtos_vpmultishift_mem_128(m512Addr, evexV5_ZmmReg[128,128], ZmmMask[128,128], AVXOpMask, 1:1, 0:1);
+	ZmmResult[256,128] = webtos_vpmultishift_mem_128(m512Addr, evexV5_ZmmReg[256,128], ZmmMask[256,128], AVXOpMask, 2:1, 0:1);
+	ZmmResult[384,128] = webtos_vpmultishift_mem_128(m512Addr, evexV5_ZmmReg[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 0:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPMULTISHIFTQB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, m64Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg & evexB=1; byte=0x83; ZmmReg1 ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_ZmmReg[0,128], ZmmMask[0,128], AVXOpMask, 0:1, 1:1);
+	ZmmResult[128,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_ZmmReg[128,128], ZmmMask[128,128], AVXOpMask, 1:1, 1:1);
+	ZmmResult[256,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_ZmmReg[256,128], ZmmMask[256,128], AVXOpMask, 2:1, 1:1);
+	ZmmResult[384,128] = webtos_vpmultishift_mem_128(m64Addr, evexV5_ZmmReg[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPMULTISHIFTQB XmmReg1^AVXOpMask^XmmMaskMode, evexV5_XmmReg, XmmReg2 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode & evexV5_XmmReg; byte=0x83; XmmReg1 & ZmmReg1 & mod=3 & XmmReg2
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	XmmResult = vpmultishiftqb_avx512_vbmi( evexV5_XmmReg, XmmReg2_m128_m64bcst );
 	XmmMask = XmmReg1;
-	build XmmOpMask8;
+	build XmmMaskMode;
+	XmmResult = webtos_vpmultishift_masked_128(evexV5_XmmReg, XmmReg2, XmmMask, AVXOpMask, 0:1);
 	ZmmReg1 = zext(XmmResult);
 }
 
 # VPMULTISHIFTQB 5-571 PAGE 2395 LINE 130849
-:VPMULTISHIFTQB YmmReg1^YmmOpMask8, evexV5_YmmReg, YmmReg2_m256_m64bcst is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & YmmOpMask8 & evexV5_YmmReg; byte=0x83; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256_m64bcst
+:VPMULTISHIFTQB YmmReg1^AVXOpMask^YmmMaskMode, evexV5_YmmReg, YmmReg2 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode & evexV5_YmmReg; byte=0x83; YmmReg1 & ZmmReg1 & mod=3 & YmmReg2
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	YmmResult = vpmultishiftqb_avx512_vbmi( evexV5_YmmReg, YmmReg2_m256_m64bcst );
 	YmmMask = YmmReg1;
-	build YmmOpMask8;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpmultishift_masked_128(evexV5_YmmReg[0,128], YmmReg2[0,128], YmmMask[0,128], AVXOpMask, 0:1);
+	YmmResult[128,128] = webtos_vpmultishift_masked_128(evexV5_YmmReg[128,128], YmmReg2[128,128], YmmMask[128,128], AVXOpMask, 1:1);
 	ZmmReg1 = zext(YmmResult);
 }
 
 # VPMULTISHIFTQB 5-571 PAGE 2395 LINE 130853
-:VPMULTISHIFTQB ZmmReg1^ZmmOpMask8, evexV5_ZmmReg, ZmmReg2_m512_m64bcst is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & ZmmOpMask8 & evexV5_ZmmReg; byte=0x83; ZmmReg1 ... & ZmmReg2_m512_m64bcst
-[ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
+:VPMULTISHIFTQB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, ZmmReg2 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg; byte=0x83; ZmmReg1 & mod=3 & ZmmReg2
+[ evexD8Type = 0; evexTType = 0; ]
 {
-	ZmmResult = vpmultishiftqb_avx512_vbmi( evexV5_ZmmReg, ZmmReg2_m512_m64bcst );
 	ZmmMask = ZmmReg1;
-	build ZmmOpMask8;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpmultishift_masked_128(evexV5_ZmmReg[0,128], ZmmReg2[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_vpmultishift_masked_128(evexV5_ZmmReg[128,128], ZmmReg2[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_vpmultishift_masked_128(evexV5_ZmmReg[256,128], ZmmReg2[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_vpmultishift_masked_128(evexV5_ZmmReg[384,128], ZmmReg2[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 	ZmmReg1 = ZmmResult;
 }
 
