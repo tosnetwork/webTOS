@@ -1419,19 +1419,19 @@ define pcodeop vpmovusqd_avx512f ;
 define pcodeop vpmovwb_avx512vl ;
 :VPMOVWB XmmReg2^XmmOpMask8, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask8; byte=0x30; mod=3 & XmmReg1 & XmmReg2 & ZmmReg2
 {
-	XmmResult = vpmovwb_avx512vl( XmmReg1 );
+	XmmResult[0,64] = vpmovwb_avx512vl(XmmReg1);
+	XmmResult[64,64] = 0;
 	XmmMask = XmmReg2;
 	build XmmOpMask8;
 	ZmmReg2 = zext(XmmResult[0,64]);
 }
 
-:VPMOVWB m64^XmmOpMask8, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask8; byte=0x30; XmmReg1 ... & m64
+:VPMOVWB m64Addr^AVXOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x30; XmmReg1 ... & m64Addr
 [ evexD8Type = 1; evexTType = 9; ] # (TupleType HVM)
 {
-	XmmResult = vpmovwb_avx512vl( XmmReg1 );
-	XmmMask = zext(m64);
-	build XmmOpMask8;
-	m64 = XmmResult[0,64];
+	XmmResult[0,64] = vpmovwb_avx512vl(XmmReg1);
+	XmmResult[64,64] = 0;
+	webtos_masked_store_128(m64Addr, XmmResult, AVXOpMask, 1:1);
 }
 
 # VPMOVWB/VPMOVSWB/VPMOVUSWB 5-426 PAGE 2250 LINE 115751
@@ -1475,20 +1475,20 @@ define pcodeop vpmovuswb_avx512vl ;
 # VPMOVWB/VPMOVSWB/VPMOVUSWB 5-426 PAGE 2250 LINE 115757
 :VPMOVWB XmmReg2^XmmOpMask8, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask8; byte=0x30; mod=3 & YmmReg1 & XmmReg2 & ZmmReg2
 {
-	XmmResult = vpmovwb_avx512vl( YmmReg1 );
+	XmmResult[0,64] = vpmovwb_avx512vl(YmmReg1[0,128]);
+	XmmResult[64,64] = vpmovwb_avx512vl(YmmReg1[128,128]);
 	XmmMask = XmmReg2;
 	build XmmOpMask8;
 	ZmmReg2 = zext(XmmResult);
 
 }
 
-:VPMOVWB m128^XmmOpMask8, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask8; byte=0x30; YmmReg1 ... & m128
+:VPMOVWB m128Addr^AVXOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x30; YmmReg1 ... & m128Addr
 [ evexD8Type = 1; evexTType = 9; ] # (TupleType HVM)
 {
-	XmmResult = vpmovwb_avx512vl( YmmReg1 );
-	XmmMask = m128;
-	build XmmOpMask8;
-	m128 = XmmResult;
+	XmmResult[0,64] = vpmovwb_avx512vl(YmmReg1[0,128]);
+	XmmResult[64,64] = vpmovwb_avx512vl(YmmReg1[128,128]);
+	webtos_masked_store_128(m128Addr, XmmResult, AVXOpMask, 1:1);
 }
 
 # VPMOVWB/VPMOVSWB/VPMOVUSWB 5-426 PAGE 2250 LINE 115760
@@ -1531,19 +1531,23 @@ define pcodeop vpmovuswb_avx512vl ;
 define pcodeop vpmovwb_avx512bw ;
 :VPMOVWB YmmReg2^YmmOpMask8, ZmmReg1 is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & YmmOpMask8; byte=0x30; mod=3 & ZmmReg1 & YmmReg2 & ZmmReg2
 {
-	YmmResult = vpmovwb_avx512bw( ZmmReg1 );
+	YmmResult[0,64] = vpmovwb_avx512bw(ZmmReg1[0,128]);
+	YmmResult[64,64] = vpmovwb_avx512bw(ZmmReg1[128,128]);
+	YmmResult[128,64] = vpmovwb_avx512bw(ZmmReg1[256,128]);
+	YmmResult[192,64] = vpmovwb_avx512bw(ZmmReg1[384,128]);
 	YmmMask = YmmReg2;
 	build YmmOpMask8;
 	ZmmReg2 = zext(YmmResult);
 }
 
-:VPMOVWB m256^YmmOpMask8, ZmmReg1 is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & YmmOpMask8; byte=0x30; ZmmReg1 ... & m256
+:VPMOVWB m256Addr^AVXOpMask, ZmmReg1 is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x30; ZmmReg1 ... & m256Addr
 [ evexD8Type = 1; evexTType = 9; ] # (TupleType HVM)
 {
-	YmmResult = vpmovwb_avx512bw( ZmmReg1 );
-	YmmMask = m256;
-	build YmmOpMask8;
-	m256 = zext(YmmResult);
+	YmmResult[0,64] = vpmovwb_avx512bw(ZmmReg1[0,128]);
+	YmmResult[64,64] = vpmovwb_avx512bw(ZmmReg1[128,128]);
+	YmmResult[128,64] = vpmovwb_avx512bw(ZmmReg1[256,128]);
+	YmmResult[192,64] = vpmovwb_avx512bw(ZmmReg1[384,128]);
+	webtos_masked_store_256(m256Addr, YmmResult[0,128], YmmResult[128,128], AVXOpMask, 1:1);
 }
 
 # VPMOVWB/VPMOVSWB/VPMOVUSWB 5-426 PAGE 2250 LINE 115769
@@ -1598,7 +1602,8 @@ define pcodeop vpmovuswb_avx512bw ;
 :VPXORD YmmReg1^YmmOpMask32, evexV5_YmmReg, YmmReg2_m256_m32bcst  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_W0) & evexV5_YmmReg; byte=0xEF; (YmmReg1 & ZmmReg1 & YmmOpMask32) ... & YmmReg2_m256_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	YmmResult = evexV5_YmmReg ^ YmmReg2_m256_m32bcst;
+	YmmResult[0,128] = evexV5_YmmReg[0,128] ^ YmmReg2_m256_m32bcst[0,128];
+	YmmResult[128,128] = evexV5_YmmReg[128,128] ^ YmmReg2_m256_m32bcst[128,128];
 	YmmMask = YmmReg1;
 	build YmmOpMask32;
 	ZmmReg1 = zext(YmmResult);
@@ -1608,7 +1613,10 @@ define pcodeop vpmovuswb_avx512bw ;
 :VPXORD ZmmReg1^ZmmOpMask32, evexV5_ZmmReg, ZmmReg2_m512_m32bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_W0) & evexV5_ZmmReg; byte=0xEF; (ZmmReg1 & ZmmOpMask32) ... & ZmmReg2_m512_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	ZmmResult = evexV5_ZmmReg ^ ZmmReg2_m512_m32bcst;
+	ZmmResult[0,128] = evexV5_ZmmReg[0,128] ^ ZmmReg2_m512_m32bcst[0,128];
+	ZmmResult[128,128] = evexV5_ZmmReg[128,128] ^ ZmmReg2_m512_m32bcst[128,128];
+	ZmmResult[256,128] = evexV5_ZmmReg[256,128] ^ ZmmReg2_m512_m32bcst[256,128];
+	ZmmResult[384,128] = evexV5_ZmmReg[384,128] ^ ZmmReg2_m512_m32bcst[384,128];
 	ZmmMask = ZmmReg1;
 	build ZmmOpMask32;
 	ZmmReg1 = ZmmResult;
@@ -1628,7 +1636,8 @@ define pcodeop vpmovuswb_avx512bw ;
 :VPXORQ YmmReg1^YmmOpMask64, evexV5_YmmReg, YmmReg2_m256_m64bcst  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_W1)  & evexV5_YmmReg; byte=0xEF; (YmmReg1 & ZmmReg1 & YmmOpMask64) ... & YmmReg2_m256_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	YmmResult = evexV5_YmmReg ^ YmmReg2_m256_m64bcst;
+	YmmResult[0,128] = evexV5_YmmReg[0,128] ^ YmmReg2_m256_m64bcst[0,128];
+	YmmResult[128,128] = evexV5_YmmReg[128,128] ^ YmmReg2_m256_m64bcst[128,128];
 	YmmMask = YmmReg1;
 	build YmmOpMask64;
 	ZmmReg1 = zext(YmmResult);
@@ -1638,9 +1647,11 @@ define pcodeop vpmovuswb_avx512bw ;
 :VPXORQ ZmmReg1^ZmmOpMask64, evexV5_ZmmReg, ZmmReg2_m512_m64bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_W1)  & evexV5_ZmmReg; byte=0xEF; (ZmmReg1 & ZmmOpMask64) ... & ZmmReg2_m512_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	ZmmResult = evexV5_ZmmReg ^ ZmmReg2_m512_m64bcst;
+	ZmmResult[0,128] = evexV5_ZmmReg[0,128] ^ ZmmReg2_m512_m64bcst[0,128];
+	ZmmResult[128,128] = evexV5_ZmmReg[128,128] ^ ZmmReg2_m512_m64bcst[128,128];
+	ZmmResult[256,128] = evexV5_ZmmReg[256,128] ^ ZmmReg2_m512_m64bcst[256,128];
+	ZmmResult[384,128] = evexV5_ZmmReg[384,128] ^ ZmmReg2_m512_m64bcst[384,128];
 	ZmmMask = ZmmReg1;
 	build ZmmOpMask64;
 	ZmmReg1 = ZmmResult;
 }
-

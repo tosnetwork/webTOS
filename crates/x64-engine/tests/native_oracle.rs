@@ -684,6 +684,10 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0x71, 0xfe, 0x4c, 0x7f, 0x27],
         },
         Case {
+            name: "vmovdqu64 [rsi+0x40],zmm2 compressed disp8",
+            bytes: &[0x62, 0xf1, 0xfe, 0x48, 0x7f, 0x56, 0x01],
+        },
+        Case {
             name: "vpaddd zmm4,zmm5,zmm6",
             bytes: &[0x62, 0xf1, 0x55, 0x48, 0xfe, 0xe6],
         },
@@ -694,6 +698,34 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
         Case {
             name: "vpternlogd zmm10,zmm11,zmm12,0x96",
             bytes: &[0x62, 0x53, 0x25, 0x48, 0x25, 0xd4, 0x96],
+        },
+        Case {
+            name: "vpmovzxbw zmm2,ymm0",
+            bytes: &[0x62, 0xf2, 0x7d, 0x48, 0x30, 0xd0],
+        },
+        Case {
+            name: "vpmovwb [rsi]{k2},zmm2",
+            bytes: &[0x62, 0xf2, 0x7e, 0x4a, 0x30, 0x16],
+        },
+        Case {
+            name: "vextracti32x8 ymm2,zmm0,1",
+            bytes: &[0x62, 0xf3, 0x7d, 0x48, 0x3b, 0xc2, 0x01],
+        },
+        Case {
+            name: "vpcmpltub k3,zmm0,zmm1",
+            bytes: &[0x62, 0xf3, 0x7d, 0x48, 0x3e, 0xd9, 0x01],
+        },
+        Case {
+            name: "vpcmpnltuw k3{k2},zmm2,zmm3",
+            bytes: &[0x62, 0xf3, 0xed, 0x4a, 0x3e, 0xdb, 0x05],
+        },
+        Case {
+            name: "vpcmpeqw k1{k2},zmm0,zmm6",
+            bytes: &[0x62, 0xf1, 0x7d, 0x4a, 0x75, 0xce],
+        },
+        Case {
+            name: "vpslld zmm1{k3},zmm3,0x18",
+            bytes: &[0x62, 0xf1, 0x75, 0x4b, 0x72, 0xf3, 0x18],
         },
         Case {
             name: "vpcmpltd k2,zmm13,zmm14",

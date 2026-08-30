@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use sleigh_parse::ast;
 use sleigh_runtime::{
     ContextModValue, DisasmConstantValue, Field, GlobalSetAddr, PatternExprOp, semantics::Local,
@@ -39,6 +41,7 @@ pub(crate) fn resolve(
     disasm_actions: &[ast::DisasmAction],
 ) -> Result<DisasmActions, String> {
     let mut section = DisasmActions::default();
+    let mut assigned_fields = HashMap::new();
 
     for action in disasm_actions {
         match action {
@@ -49,7 +52,13 @@ pub(crate) fn resolve(
                         let field = scope.globals.context_fields[id as usize].field;
 
                         let mut out = vec![];
-                        resolve_pattern_expr::<ContextModValue>(scope, expr, &mut out)?;
+                        resolve_context_expr(
+                            scope,
+                            expr,
+                            &assigned_fields,
+                            &mut HashSet::new(),
+                            &mut out,
+                        )?;
                         section.context_actions.push(ContextAction::Modify(field, out));
                     }
 
@@ -63,6 +72,7 @@ pub(crate) fn resolve(
                         section.fields.push((field_id, out));
 
                         scope.mapping.insert(*ident, Local::Field(field_id));
+                        assigned_fields.insert(*ident, expr.clone());
                     }
 
                     Ok(Symbol { kind, .. }) => {
@@ -97,6 +107,57 @@ pub(crate) fn resolve(
     }
 
     Ok(section)
+}
+
+/// Resolve a decoder-context expression while preserving the ordering of the
+/// disassembly actions that precede it.
+///
+/// SLEIGH permits a local disassembly value to be assigned and then copied to
+/// a context field in the same action block, for example
+/// `[ scale = 6; address_scale = scale; ]`. These context writes must happen
+/// while the constructor is decoded, before its child tables are selected.
+/// Consequently the earlier local expression has to be inlined here; treating
+/// an unbacked `Local::Field` as a decoder-context field reads unrelated bits
+/// from the context register.
+fn resolve_context_expr(
+    scope: &Scope,
+    expr: &ast::PatternExpr,
+    assigned_fields: &HashMap<ast::Ident, ast::PatternExpr>,
+    visiting: &mut HashSet<ast::Ident>,
+    out: &mut Vec<PatternExprOp<ContextModValue>>,
+) -> Result<(), String> {
+    let op = match expr {
+        ast::PatternExpr::Ident(ident) => {
+            if let Some(assigned) = assigned_fields.get(ident) {
+                if !visiting.insert(*ident) {
+                    return Err(format!(
+                        "cyclic disassembly assignment used by context expression: {}",
+                        scope.debug(ident)
+                    ));
+                }
+                resolve_context_expr(scope, assigned, assigned_fields, visiting, out)?;
+                visiting.remove(ident);
+                return Ok(());
+            }
+            PatternExprOp::Value(ContextModValue::resolve_ident(scope, *ident)?)
+        }
+        ast::PatternExpr::Integer(value) => PatternExprOp::Constant(*value),
+        ast::PatternExpr::Op(lhs, op, rhs) => {
+            resolve_context_expr(scope, lhs, assigned_fields, visiting, out)?;
+            resolve_context_expr(scope, rhs, assigned_fields, visiting, out)?;
+            PatternExprOp::Op(*op)
+        }
+        ast::PatternExpr::Not(inner) => {
+            resolve_context_expr(scope, inner, assigned_fields, visiting, out)?;
+            PatternExprOp::Not
+        }
+        ast::PatternExpr::Negate(inner) => {
+            resolve_context_expr(scope, inner, assigned_fields, visiting, out)?;
+            PatternExprOp::Negate
+        }
+    };
+    out.push(op);
+    Ok(())
 }
 
 impl ResolveIdent for DisasmConstantValue {

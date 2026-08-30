@@ -319,6 +319,10 @@ pub mod x86 {
         ("vpsrld_avx2", packed_shift_right_d),
         ("vpsrld_avx512vl", packed_shift_right_d),
         ("vpsrld_avx512f", packed_shift_right_d),
+        ("vpslld_avx", packed_shift_left_d),
+        ("vpslld_avx2", packed_shift_left_d),
+        ("vpslld_avx512vl", packed_shift_left_d),
+        ("vpslld_avx512f", packed_shift_left_d),
         ("vpsrldq_avx", packed_shift_right_lane_bytes),
         ("vpsrldq_avx2", packed_shift_right_lane_bytes),
         ("vpsrldq_avx512vl", packed_shift_right_lane_bytes),
@@ -348,6 +352,16 @@ pub mod x86 {
         ("vpsubusb_avx2", psubusb),
         ("vpsubusb_avx512vl", psubusb),
         ("vpsubusb_avx512bw", psubusb),
+        ("vpmovzxbw_avx", pmovzxbw_single),
+        ("vpmovzxbw_avx2", pmovzxbw_single),
+        ("vpmovzxbw_avx512vl", pmovzxbw_single),
+        ("vpmovzxbw_avx512bw", pmovzxbw_single),
+        ("vpmovwb_avx512vl", packed_narrow_w_to_b_128),
+        ("vpmovwb_avx512bw", packed_narrow_w_to_b_128),
+        ("vpmovzxwd_avx", pmovzxwd_single),
+        ("vpmovzxwd_avx2", pmovzxwd_single),
+        ("vpmovzxwd_avx512vl", pmovzxwd_single),
+        ("vpmovzxwd_avx512f", pmovzxwd_single),
         ("psraw", psraw),
         ("divpd", divpd),
         ("divps", divps),
@@ -403,8 +417,30 @@ pub mod x86 {
         ("vpsubq_avx512f", packed_sub_q),
         ("vpaddd_avx512vl", packed_add_d),
         ("vpaddd_avx512f", packed_add_d),
+        ("vpcmpb_avx512vl", packed_compare_b_signed),
+        ("vpcmpb_avx512bw", packed_compare_b_signed),
+        ("vpcmpub_avx512vl", packed_compare_b_unsigned),
+        ("vpcmpub_avx512bw", packed_compare_b_unsigned),
+        ("vpcmpw_avx512vl", packed_compare_w_signed),
+        ("vpcmpw_avx512bw", packed_compare_w_signed),
+        ("vpcmpuw_avx512vl", packed_compare_w_unsigned),
+        ("vpcmpuw_avx512bw", packed_compare_w_unsigned),
         ("vpcmpd_avx512vl", packed_compare_d_signed),
         ("vpcmpd_avx512f", packed_compare_d_signed),
+        ("vpcmpud_avx512vl", packed_compare_d_unsigned),
+        ("vpcmpud_avx512f", packed_compare_d_unsigned),
+        ("vpcmpq_avx512vl", packed_compare_q_signed),
+        ("vpcmpq_avx512f", packed_compare_q_signed),
+        ("vpcmpuq_avx512vl", packed_compare_q_unsigned),
+        ("vpcmpuq_avx512f", packed_compare_q_unsigned),
+        ("vpcmpeqb_avx512vl", packed_compare_b_unsigned),
+        ("vpcmpeqb_avx512bw", packed_compare_b_unsigned),
+        ("vpcmpeqw_avx512vl", packed_compare_w_unsigned),
+        ("vpcmpeqw_avx512bw", packed_compare_w_unsigned),
+        ("vpcmpeqd_avx512vl", packed_compare_d_unsigned),
+        ("vpcmpeqd_avx512f", packed_compare_d_unsigned),
+        ("vpcmpeqq_avx512vl", packed_compare_q_unsigned),
+        ("vpcmpeqq_avx512f", packed_compare_q_unsigned),
         ("vpshufb_avx", pshufb),
         ("vpshufb_avx2", pshufb),
         ("vpshufb_avx512vl", pshufb),
@@ -458,6 +494,10 @@ pub mod x86 {
         ("webtos_masked_store_128", masked_store_128),
         ("webtos_masked_store_256", masked_store_256),
         ("webtos_masked_store_512", masked_store_512),
+        ("webtos_aligned_masked_load_128", aligned_masked_load_128),
+        ("webtos_aligned_masked_store_128", aligned_masked_store_128),
+        ("webtos_aligned_masked_store_256", aligned_masked_store_256),
+        ("webtos_aligned_masked_store_512", aligned_masked_store_512),
         ("webtos_vptestm_128", packed_test_mask_128),
         ("webtos_vptestm_512", packed_test_mask_512),
         ("webtos_vptestm_mem_128", packed_test_mask_mem_128),
@@ -534,31 +574,97 @@ pub mod x86 {
         }
     }
 
-    fn packed_compare_d_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        if dst.size != 1 || args[0].size() != 16 || args[1].size() != 16 {
+    fn packed_compare_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: usize,
+        signed: bool,
+    ) {
+        let lane_count = 16 / element_size;
+        let result_size = lane_count.div_ceil(8);
+        if usize::from(dst.size) != result_size
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+        {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
             cpu.exception.value = u64::from(dst.size);
             return;
         }
         let predicate = cpu.args[0] as u8 & 7;
-        let mut mask = 0_u8;
-        for lane in 0..4_u8 {
-            let left = cpu.read::<i32>(args[0].slice(lane * 4, 4));
-            let right = cpu.read::<i32>(args[1].slice(lane * 4, 4));
-            let matches = match predicate {
-                0 => left == right,
-                1 => left < right,
-                2 => left <= right,
-                3 => false,
-                4 => left != right,
-                5 => left >= right,
-                6 => left > right,
-                7 => true,
-                _ => unreachable!(),
+        let mut mask = 0_u16;
+        for lane in 0..lane_count {
+            let offset = (lane * element_size) as u8;
+            let left: u128 = cpu
+                .read_dynamic(args[0].slice(offset, element_size as u8))
+                .zxt();
+            let right: u128 = cpu
+                .read_dynamic(args[1].slice(offset, element_size as u8))
+                .zxt();
+            let matches = if signed {
+                let shift = 128 - element_size * 8;
+                let left = ((left << shift) as i128) >> shift;
+                let right = ((right << shift) as i128) >> shift;
+                match predicate {
+                    0 => left == right,
+                    1 => left < right,
+                    2 => left <= right,
+                    3 => false,
+                    4 => left != right,
+                    5 => left >= right,
+                    6 => left > right,
+                    7 => true,
+                    _ => unreachable!(),
+                }
+            } else {
+                match predicate {
+                    0 => left == right,
+                    1 => left < right,
+                    2 => left <= right,
+                    3 => false,
+                    4 => left != right,
+                    5 => left >= right,
+                    6 => left > right,
+                    7 => true,
+                    _ => unreachable!(),
+                }
             };
-            mask |= u8::from(matches) << lane;
+            mask |= u16::from(matches) << lane;
         }
-        cpu.write_var(dst, mask);
+        cpu.write_trunc(dst, mask);
+    }
+
+    fn packed_compare_b_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 1, true);
+    }
+
+    fn packed_compare_b_unsigned(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 1, false);
+    }
+
+    fn packed_compare_w_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 2, true);
+    }
+
+    fn packed_compare_w_unsigned(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 2, false);
+    }
+
+    fn packed_compare_d_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 4, true);
+    }
+
+    fn packed_compare_d_unsigned(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 4, false);
+    }
+
+    fn packed_compare_q_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 8, true);
+    }
+
+    fn packed_compare_q_unsigned(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_128(cpu, dst, args, 8, false);
     }
 
     fn packed_movemask_b(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -1667,6 +1773,37 @@ pub mod x86 {
         cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
+    fn aligned_vector_address(cpu: &mut Cpu, address: u64, mask: u64, width: usize) -> bool {
+        if !matches!(width, 16 | 32 | 64) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = width as u64;
+            return false;
+        }
+        // EVEX masking suppresses the memory reference entirely when no lane
+        // is selected. Otherwise VMOVDQA32/64 retains the architectural
+        // vector-width alignment requirement.
+        if mask != 0 && address & (width as u64 - 1) != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return false;
+        }
+        true
+    }
+
+    fn aligned_masked_load_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.args[0] as u64;
+        let width = cpu.args[3] as usize;
+        if aligned_vector_address(cpu, address, mask, width) {
+            masked_load_128(cpu, dst, args);
+        }
+    }
+
     fn masked_store(
         cpu: &mut Cpu,
         address: u64,
@@ -1769,6 +1906,45 @@ pub mod x86 {
             cpu.args[3] as u64,
             cpu.args[4] as usize,
         );
+    }
+
+    fn aligned_masked_store_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.args[0] as u64;
+        if aligned_vector_address(cpu, address, mask, 16) {
+            masked_store_128(cpu, dst, args);
+        }
+    }
+
+    fn aligned_masked_store_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.args[1] as u64;
+        if aligned_vector_address(cpu, address, mask, 32) {
+            masked_store_256(cpu, dst, args);
+        }
+    }
+
+    fn aligned_masked_store_512(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.args[3] as u64;
+        if aligned_vector_address(cpu, address, mask, 64) {
+            masked_store_512(cpu, dst, args);
+        }
     }
 
     fn packed_test_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3293,6 +3469,14 @@ pub mod x86 {
         }
     }
 
+    fn packed_shift_left_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]);
+        for i in (0..dst.size).step_by(4) {
+            let dword: u32 = cpu.read(args[0].slice(i, 4));
+            cpu.write_var(dst.slice(i, 4), if count >= 32 { 0 } else { dword << count });
+        }
+    }
+
     /// VPSRLDQ shifts each architectural 128-bit lane independently. Counts
     /// greater than 15 zero the complete lane rather than crossing a lane
     /// boundary.
@@ -3655,6 +3839,25 @@ pub mod x86 {
 
     fn pmovzxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 8, false);
+    }
+    fn pmovzxbw_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 1, 8, false);
+    }
+
+    fn pmovzxwd_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 2, 4, false);
+    }
+
+    fn packed_narrow_w_to_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 8 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..8_u8 {
+            let value = cpu.read::<u16>(args[0].slice(lane * 2, 2)) as u8;
+            cpu.write_var(dst.slice(lane, 1), value);
+        }
     }
     fn pmovzxbd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 4, false);
