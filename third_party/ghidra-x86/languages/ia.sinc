@@ -1160,6 +1160,12 @@ m80:  "tword ptr" Mem   is Mem      { export *:10 Mem; }
 m128: "xmmword ptr" Mem	is Mem      { export *:16 Mem; }
 m256: "ymmword ptr" Mem	is Mem      { export *:32 Mem; }
 m512: "zmmword ptr" Mem is Mem      { export *:64 Mem; }
+# Address-only vector operands are used by instructions whose mask controls
+# which individual elements are accessed. Exporting the whole memory varnode
+# would perform an eager full-width access and violate EVEX fault suppression.
+m128Addr: "xmmword ptr" Mem is Mem { export Mem; }
+m256Addr: "ymmword ptr" Mem is Mem { export Mem; }
+m512Addr: "zmmword ptr" Mem is Mem { export Mem; }
 
 m32fp: "float ptr" Mem              is Mem      { export *:4 Mem; }
 m64fp: "double ptr" Mem             is Mem      { export *:8 Mem; }
@@ -1704,6 +1710,8 @@ YmmOpMask8: AVXOpMask^YmmMaskMode is AVXOpMask & YmmMaskMode {
 	conditionalAssign(YmmResult[216,8], mask[27,1], YmmResult[216,8], YmmMask[216,8]);
 	conditionalAssign(YmmResult[224,8], mask[28,1], YmmResult[224,8], YmmMask[224,8]);
 	conditionalAssign(YmmResult[232,8], mask[29,1], YmmResult[232,8], YmmMask[232,8]);
+	conditionalAssign(YmmResult[240,8], mask[30,1], YmmResult[240,8], YmmMask[240,8]);
+	conditionalAssign(YmmResult[248,8], mask[31,1], YmmResult[248,8], YmmMask[248,8]);
 }
 
 YmmOpMask8: is evexOpmask=0 {
@@ -2363,8 +2371,13 @@ macro fucompe(val1, val2) {
 # Specification is "LIG", "LZ", "128", or "256".
 @define VEX_LIG		"vexL"
 @define VEX_LZ		"vexL=0"
-@define VEX_L128	"vexL=0"
-@define VEX_L256	"vexL=1"
+@define VEX_L128	"evexLp=0 & vexL=0"
+@define VEX_L256	"evexLp=0 & vexL=1"
+# The AVX-512 generator names this VEX_L512 even though it is an EVEX-only
+# vector length. Keep the spelling as a compatibility alias, but bind both
+# architectural length bits so a 512-bit encoding cannot also match a
+# 128-bit constructor.
+@define VEX_L512	"evexLp=1 & vexL=0"
 @define EVEX_L512	"evexLp=1 & vexL=0"
 @define EVEX_LLIG	"evexLp & vexL"
 

@@ -124,7 +124,8 @@ impl ResolvedValue {
         match self {
             Self::Const(value, _) => {
                 let mask = if size > 8 { u64::MAX } else { pcode::mask(size as u64 * 8) };
-                Self::Const((value >> offset) & mask, size)
+                let shifted = if offset >= 8 { 0 } else { value >> (offset * 8) };
+                Self::Const(shifted & mask, size)
             }
             Self::Var(var) => Self::Var(var.slice(offset, size)),
         }
@@ -733,7 +734,9 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
                 }
                 _ => Err(Error::UnsupportedVarNodeSize(output.size)),
             },
-            pcode::Op::IntOr => self.emit_or(output, inputs[0], inputs[1]),
+            op @ (pcode::Op::IntAnd | pcode::Op::IntOr | pcode::Op::IntXor) => {
+                self.emit_bitwise(op, output, inputs[0], inputs[1])
+            }
 
             pcode::Op::Load(_) => self.emit_load(inputs[0], 0, output),
 
@@ -772,12 +775,19 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         })
     }
 
-    fn emit_or(&mut self, dst: VarNode, a: ResolvedValue, b: ResolvedValue) -> Result<()> {
+    fn emit_bitwise(
+        &mut self,
+        op: pcode::Op,
+        dst: VarNode,
+        a: ResolvedValue,
+        b: ResolvedValue,
+    ) -> Result<()> {
+        debug_assert!(matches!(op, pcode::Op::IntAnd | pcode::Op::IntOr | pcode::Op::IntXor));
         self.split_large_op(dst, |this, i, dst| {
             let a = this.get_runtime_value(a.slice(i, dst.size))?;
             let b = this.get_runtime_value(b.slice(i, dst.size))?;
             let dst = this.get_runtime_var(dst)?;
-            this.push((dst, pcode::Op::IntOr, [a, b]));
+            this.push((dst, op, [a, b]));
             Ok(())
         })
     }

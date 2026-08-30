@@ -2521,10 +2521,15 @@ define pcodeop vptest_avx ;
 # PTEST 4-487 PAGE 1607 LINE 83730
 :VPTEST YmmReg1, YmmReg2_m256 is $(VEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG); byte=0x17; YmmReg1 ... & YmmReg2_m256
 {
-	local val1 = YmmReg2_m256;
-	local val2 = YmmReg1;
-	ZF = (val1 & val2) == 0;
-	CF = (val1 & ~val2) == 0;
+	# Keep the 256-bit operation out of the userop/dynamic-value ABI.  That
+	# boundary transports at most 128 bits, while PTEST is exactly reducible
+	# over two 128-bit slices.
+	local low_and:16 = YmmReg2_m256[0,128] & YmmReg1[0,128];
+	local high_and:16 = YmmReg2_m256[128,128] & YmmReg1[128,128];
+	local low_andn:16 = YmmReg2_m256[0,128] & ~YmmReg1[0,128];
+	local high_andn:16 = YmmReg2_m256[128,128] & ~YmmReg1[128,128];
+	ZF = (low_and == 0) & (high_and == 0);
+	CF = (low_andn == 0) & (high_andn == 0);
 	AF = 0;
 	OF = 0;
 	PF = 0;
@@ -3242,5 +3247,4 @@ define pcodeop vcvtps2ph_f16c ;
 	XmmReg2_m128 = vcvtps2ph_f16c( YmmReg1, imm8:1 );
 	build XmmReg2_m128_extend;
 }
-
 

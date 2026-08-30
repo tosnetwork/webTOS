@@ -210,7 +210,7 @@ define pcodeop vpalignr_avx2 ;
 define pcodeop vpand_avx2 ;
 :VPAND YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xDB; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpand_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = vexVVVV_YmmReg & YmmReg2_m256;
 	ZmmReg1 = zext(tmp);
 }
 
@@ -642,7 +642,9 @@ define pcodeop vpsadbw_avx2 ;
 define pcodeop vpshufb_avx2 ;
 :VPSHUFB YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x00; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpshufb_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpshufb_avx2( vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128] );
+	tmp[128,128] = vpshufb_avx2( vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 
@@ -848,7 +850,9 @@ define pcodeop vpsubd_avx2 ;
 define pcodeop vpsubq_avx2 ;
 :VPSUBQ YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xFB; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpsubq_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpsubq_avx2( vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128] );
+	tmp[128,128] = vpsubq_avx2( vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 
@@ -1150,15 +1154,109 @@ define pcodeop vpblendd_avx2 ;
 define pcodeop vperm2i128_avx2 ;
 :VPERM2I128 YmmReg1, vexVVVV_YmmReg, YmmReg2_m256, imm8 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F3A) & $(VEX_W0) & vexVVVV_YmmReg; byte=0x46; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256; imm8
 {
-	local tmp:32 = vperm2i128_avx2( vexVVVV_YmmReg, YmmReg2_m256, imm8:1 );
+	local tmp:32 = 0;
+	local low:1 = imm8:1 & 3;
+	if (low == 0) goto <low_a0>;
+	if (low == 1) goto <low_a1>;
+	if (low == 2) goto <low_b0>;
+	tmp[0,128] = YmmReg2_m256[128,128];
+	goto <low_done>;
+<low_a0>
+	tmp[0,128] = vexVVVV_YmmReg[0,128];
+	goto <low_done>;
+<low_a1>
+	tmp[0,128] = vexVVVV_YmmReg[128,128];
+	goto <low_done>;
+<low_b0>
+	tmp[0,128] = YmmReg2_m256[0,128];
+<low_done>
+	if ((imm8:1 & 8) == 0) goto <keep_low>;
+	tmp[0,128] = 0;
+<keep_low>
+
+	local high:1 = (imm8:1 >> 4) & 3;
+	if (high == 0) goto <high_a0>;
+	if (high == 1) goto <high_a1>;
+	if (high == 2) goto <high_b0>;
+	tmp[128,128] = YmmReg2_m256[128,128];
+	goto <high_done>;
+<high_a0>
+	tmp[128,128] = vexVVVV_YmmReg[0,128];
+	goto <high_done>;
+<high_a1>
+	tmp[128,128] = vexVVVV_YmmReg[128,128];
+	goto <high_done>;
+<high_b0>
+	tmp[128,128] = YmmReg2_m256[0,128];
+<high_done>
+	if ((imm8:1 & 128) == 0) goto <keep_high>;
+	tmp[128,128] = 0;
+<keep_high>
 	ZmmReg1 = zext(tmp);
 }
 
 # VPERMD/VPERMW 5-362 PAGE 2186 LINE 112405
 define pcodeop vpermd_avx2 ;
+define pcodeop webtos_vpermd_lane_128 ;
 :VPERMD YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & vexVVVV_YmmReg; byte=0x36; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpermd_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	local index0:4 = vexVVVV_YmmReg[0,32] & 7;
+	if ((index0 & 4) != 0) goto <lane0_high>;
+	tmp[0,32] = webtos_vpermd_lane_128(index0, YmmReg2_m256[0,128]);
+	goto <lane0_done>;
+<lane0_high>
+	tmp[0,32] = webtos_vpermd_lane_128(index0, YmmReg2_m256[128,128]);
+<lane0_done>
+	local index1:4 = vexVVVV_YmmReg[32,32] & 7;
+	if ((index1 & 4) != 0) goto <lane1_high>;
+	tmp[32,32] = webtos_vpermd_lane_128(index1, YmmReg2_m256[0,128]);
+	goto <lane1_done>;
+<lane1_high>
+	tmp[32,32] = webtos_vpermd_lane_128(index1, YmmReg2_m256[128,128]);
+<lane1_done>
+	local index2:4 = vexVVVV_YmmReg[64,32] & 7;
+	if ((index2 & 4) != 0) goto <lane2_high>;
+	tmp[64,32] = webtos_vpermd_lane_128(index2, YmmReg2_m256[0,128]);
+	goto <lane2_done>;
+<lane2_high>
+	tmp[64,32] = webtos_vpermd_lane_128(index2, YmmReg2_m256[128,128]);
+<lane2_done>
+	local index3:4 = vexVVVV_YmmReg[96,32] & 7;
+	if ((index3 & 4) != 0) goto <lane3_high>;
+	tmp[96,32] = webtos_vpermd_lane_128(index3, YmmReg2_m256[0,128]);
+	goto <lane3_done>;
+<lane3_high>
+	tmp[96,32] = webtos_vpermd_lane_128(index3, YmmReg2_m256[128,128]);
+<lane3_done>
+	local index4:4 = vexVVVV_YmmReg[128,32] & 7;
+	if ((index4 & 4) != 0) goto <lane4_high>;
+	tmp[128,32] = webtos_vpermd_lane_128(index4, YmmReg2_m256[0,128]);
+	goto <lane4_done>;
+<lane4_high>
+	tmp[128,32] = webtos_vpermd_lane_128(index4, YmmReg2_m256[128,128]);
+<lane4_done>
+	local index5:4 = vexVVVV_YmmReg[160,32] & 7;
+	if ((index5 & 4) != 0) goto <lane5_high>;
+	tmp[160,32] = webtos_vpermd_lane_128(index5, YmmReg2_m256[0,128]);
+	goto <lane5_done>;
+<lane5_high>
+	tmp[160,32] = webtos_vpermd_lane_128(index5, YmmReg2_m256[128,128]);
+<lane5_done>
+	local index6:4 = vexVVVV_YmmReg[192,32] & 7;
+	if ((index6 & 4) != 0) goto <lane6_high>;
+	tmp[192,32] = webtos_vpermd_lane_128(index6, YmmReg2_m256[0,128]);
+	goto <lane6_done>;
+<lane6_high>
+	tmp[192,32] = webtos_vpermd_lane_128(index6, YmmReg2_m256[128,128]);
+<lane6_done>
+	local index7:4 = vexVVVV_YmmReg[224,32] & 7;
+	if ((index7 & 4) != 0) goto <lane7_high>;
+	tmp[224,32] = webtos_vpermd_lane_128(index7, YmmReg2_m256[0,128]);
+	goto <lane7_done>;
+<lane7_high>
+	tmp[224,32] = webtos_vpermd_lane_128(index7, YmmReg2_m256[128,128]);
+<lane7_done>
 	ZmmReg1 = zext(tmp);
 }
 
@@ -1180,9 +1278,38 @@ define pcodeop vpermps_avx2 ;
 
 # VPERMQ 5-387 PAGE 2211 LINE 113768
 define pcodeop vpermq_avx2 ;
+define pcodeop webtos_vpermq_lane_128 ;
 :VPERMQ YmmReg1, YmmReg2_m256, imm8 is $(VEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F3A) & $(VEX_W1); byte=0x00; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256; imm8
 {
-	local tmp:32 = vpermq_avx2( YmmReg2_m256, imm8:1 );
+	local tmp:32 = 0;
+	local index0:1 = imm8:1 & 3;
+	if ((index0 & 2) != 0) goto <q0_high>;
+	tmp[0,64] = webtos_vpermq_lane_128(index0, YmmReg2_m256[0,128]);
+	goto <q0_done>;
+<q0_high>
+	tmp[0,64] = webtos_vpermq_lane_128(index0, YmmReg2_m256[128,128]);
+<q0_done>
+	local index1:1 = (imm8:1 >> 2) & 3;
+	if ((index1 & 2) != 0) goto <q1_high>;
+	tmp[64,64] = webtos_vpermq_lane_128(index1, YmmReg2_m256[0,128]);
+	goto <q1_done>;
+<q1_high>
+	tmp[64,64] = webtos_vpermq_lane_128(index1, YmmReg2_m256[128,128]);
+<q1_done>
+	local index2:1 = (imm8:1 >> 4) & 3;
+	if ((index2 & 2) != 0) goto <q2_high>;
+	tmp[128,64] = webtos_vpermq_lane_128(index2, YmmReg2_m256[0,128]);
+	goto <q2_done>;
+<q2_high>
+	tmp[128,64] = webtos_vpermq_lane_128(index2, YmmReg2_m256[128,128]);
+<q2_done>
+	local index3:1 = (imm8:1 >> 6) & 3;
+	if ((index3 & 2) != 0) goto <q3_high>;
+	tmp[192,64] = webtos_vpermq_lane_128(index3, YmmReg2_m256[0,128]);
+	goto <q3_done>;
+<q3_high>
+	tmp[192,64] = webtos_vpermq_lane_128(index3, YmmReg2_m256[128,128]);
+<q3_done>
 	ZmmReg1 = zext(tmp);
 }
 
@@ -1314,4 +1441,3 @@ define pcodeop vpsrlvq_avx2 ;
 	local tmp:32 = vpsrlvq_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
 	ZmmReg1 = zext(tmp);
 }
-

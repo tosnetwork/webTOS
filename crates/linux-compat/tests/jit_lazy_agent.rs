@@ -8,6 +8,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
+use icicle_cpu::mem::perm;
 use jit_wasmi::WasmiJit;
 use linux_compat::{
     chunk::ChunkedFile,
@@ -127,14 +128,15 @@ fn dynamic_agent_under_jit_and_lazy_paging() {
         .install_chunk_manifest(&manifest(&records))
         .expect("chunk manifest");
 
-    machine.set_args(
-        vec![b"claude".to_vec()],
-        vec![
-            b"PATH=/bin".to_vec(),
-            b"HOME=/root".to_vec(),
-            b"TERM=xterm-256color".to_vec(),
-        ],
-    );
+    let mut guest_env = vec![
+        b"PATH=/bin".to_vec(),
+        b"HOME=/root".to_vec(),
+        b"TERM=xterm-256color".to_vec(),
+    ];
+    if let Ok(implementation) = std::env::var("PROBE_SIMDUTF_FORCE_IMPLEMENTATION") {
+        guest_env.push(format!("SIMDUTF_FORCE_IMPLEMENTATION={implementation}").into_bytes());
+    }
+    machine.set_args(vec![b"claude".to_vec()], guest_env);
     // The initial ELF metadata pages in during load.
     let mut supplied = 0usize;
     loop {
@@ -154,13 +156,19 @@ fn dynamic_agent_under_jit_and_lazy_paging() {
             }
         }
     }
-    machine.set_jit(Box::new(WasmiJit::new()));
-    machine.set_jit_tiering(Some(10));
+    if std::env::var_os("PROBE_DISABLE_JIT").is_none() {
+        machine.set_jit(Box::new(WasmiJit::new()));
+        machine.set_jit_tiering(Some(10));
+    }
 
     let limit: u64 = std::env::var("PROBE_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(50_000_000);
+    let timeout_secs: u64 = std::env::var("PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
     machine.vm_mut().icount_limit = limit;
     let started = std::time::Instant::now();
     let exit = loop {
@@ -179,7 +187,7 @@ fn dynamic_agent_under_jit_and_lazy_paging() {
         machine
             .deliver_page(request.ticket, bytes.clone())
             .expect("verified page delivery");
-        if started.elapsed().as_secs() > 300 {
+        if started.elapsed().as_secs() > timeout_secs {
             break CpuExit::Interrupted;
         }
     };
@@ -196,6 +204,24 @@ fn dynamic_agent_under_jit_and_lazy_paging() {
         machine.vm_mut().jit_block_dispatch_count(),
         machine.vm_mut().jit_region_dispatch_count(),
     );
+    if !matches!(exit, CpuExit::InstructionLimit | CpuExit::Halt { .. }) {
+        let mut instruction = [0_u8; 15];
+        let (rip, readable) = {
+            let vm = machine.vm_mut();
+            let rip = vm.cpu.read_pc();
+            let readable = vm
+                .cpu
+                .mem
+                .read_bytes(rip, &mut instruction, perm::NONE)
+                .is_ok();
+            (rip, readable)
+        };
+        if readable {
+            eprintln!("abnormal rip={rip:#x} bytes={instruction:02x?}");
+        } else {
+            eprintln!("abnormal rip={rip:#x} bytes=<unmapped>");
+        }
+    }
     let output = machine.take_output();
     eprintln!(
         "output ({} bytes): {:?}",

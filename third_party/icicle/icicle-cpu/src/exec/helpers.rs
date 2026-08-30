@@ -352,6 +352,43 @@ pub mod x86 {
         ("extractps", extractps),
         ("roundps", roundps),
         ("roundpd", roundpd),
+        // Generated AVX-family specifications leave several packed integer
+        // operations opaque. These helpers are width-generic: they walk the
+        // p-code Value in architectural lanes, so YMM/ZMM operands never pass
+        // through a truncating whole-value u128 read.
+        ("vpsubq_avx", packed_sub_q),
+        ("vpsubq_avx2", packed_sub_q),
+        ("vpsubq_avx512vl", packed_sub_q),
+        ("vpsubq_avx512f", packed_sub_q),
+        ("vpaddd_avx512vl", packed_add_d),
+        ("vpaddd_avx512f", packed_add_d),
+        ("vpcmpd_avx512vl", packed_compare_d_signed),
+        ("vpcmpd_avx512f", packed_compare_d_signed),
+        ("vpshufb_avx", pshufb),
+        ("vpshufb_avx2", pshufb),
+        ("vpshufb_avx512vl", pshufb),
+        ("vpshufb_avx512bw", pshufb),
+        ("webtos_vpmovmskb_128", packed_movemask_b),
+        ("webtos_vpermd_lane_128", packed_permute_d_lane),
+        ("webtos_vpermq_lane_128", packed_permute_q_lane),
+        ("webtos_vpermd_256_chunk", packed_permute_d_256_chunk),
+        ("webtos_vpermd_512_chunk", packed_permute_d_512_chunk),
+        ("webtos_vpermq_256_chunk", packed_permute_q_256_chunk),
+        ("webtos_vpcompressd_128_chunk", packed_compress_d_128_chunk),
+        ("webtos_vpcompressd_256_chunk", packed_compress_d_256_chunk),
+        ("webtos_vpcompressd_512_chunk", packed_compress_d_512_chunk),
+        ("webtos_vpcompressd_mem_128", packed_compress_d_mem_128),
+        ("webtos_vpcompressd_mem_256", packed_compress_d_mem_256),
+        ("webtos_vpcompressd_mem_512", packed_compress_d_mem_512),
+        ("webtos_vpexpandd_128_chunk", packed_expand_d_128_chunk),
+        ("webtos_vpexpandd_256_chunk", packed_expand_d_256_chunk),
+        ("webtos_vpexpandd_512_chunk", packed_expand_d_512_chunk),
+        ("webtos_masked_load_128", masked_load_128),
+        ("webtos_masked_store_128", masked_store_128),
+        ("webtos_masked_store_256", masked_store_256),
+        ("webtos_masked_store_512", masked_store_512),
+        ("webtos_vptestm_128", packed_test_mask_128),
+        ("webtos_vptestm_512", packed_test_mask_512),
         // MMX/SSE2 saturating packed arithmetic (also opaque in the spec).
         ("paddsb", paddsb),
         ("paddsw", paddsw),
@@ -382,6 +419,648 @@ pub mod x86 {
         ("f2xm1", f2xm1),
         ("fscale", fscale),
     ];
+
+    fn packed_sub_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size == 0
+            || dst.size > 64
+            || dst.size % 8 != 0
+            || args[0].size() != dst.size
+            || args[1].size() != dst.size
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0..dst.size).step_by(8) {
+            let left = cpu.read::<u64>(args[0].slice(offset, 8));
+            let right = cpu.read::<u64>(args[1].slice(offset, 8));
+            cpu.write_var(dst.slice(offset, 8), left.wrapping_sub(right));
+        }
+    }
+
+    fn packed_add_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size == 0
+            || dst.size > 16
+            || dst.size % 4 != 0
+            || args[0].size() != dst.size
+            || args[1].size() != dst.size
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0..dst.size).step_by(4) {
+            let left = cpu.read::<u32>(args[0].slice(offset, 4));
+            let right = cpu.read::<u32>(args[1].slice(offset, 4));
+            cpu.write_var(dst.slice(offset, 4), left.wrapping_add(right));
+        }
+    }
+
+    fn packed_compare_d_signed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 1 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let predicate = cpu.args[0] as u8 & 7;
+        let mut mask = 0_u8;
+        for lane in 0..4_u8 {
+            let left = cpu.read::<i32>(args[0].slice(lane * 4, 4));
+            let right = cpu.read::<i32>(args[1].slice(lane * 4, 4));
+            let matches = match predicate {
+                0 => left == right,
+                1 => left < right,
+                2 => left <= right,
+                3 => false,
+                4 => left != right,
+                5 => left >= right,
+                6 => left > right,
+                7 => true,
+                _ => unreachable!(),
+            };
+            mask |= u8::from(matches) << lane;
+        }
+        cpu.write_var(dst, mask);
+    }
+
+    fn packed_movemask_b(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 2 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bytes = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut mask = 0_u16;
+        for (index, byte) in bytes.into_iter().enumerate() {
+            mask |= u16::from(byte >> 7) << index;
+        }
+        cpu.write_var(dst, mask);
+    }
+
+    fn packed_permute_d_lane(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 4 || args[0].size() != 4 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lane = (cpu.read::<u32>(args[0]) & 3) as u8;
+        let value = cpu.read::<u32>(args[1].slice(lane * 4, 4));
+        cpu.write_var(dst, value);
+    }
+
+    fn packed_permute_q_lane(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 8 || args[0].size() != 1 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lane = cpu.read::<u8>(args[0]) & 1;
+        let value = cpu.read::<u64>(args[1].slice(lane * 8, 8));
+        cpu.write_var(dst, value);
+    }
+
+    fn packed_permute_d_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        indexes: Value,
+        sources: [u128; 4],
+        lane_mask: u32,
+    ) {
+        if dst.size != 16 || indexes.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let sources = sources.map(u128::to_le_bytes);
+        for output_lane in 0..4_u8 {
+            let start = usize::from(output_lane) * 4;
+            let index =
+                u32::from_le_bytes(indexes[start..start + 4].try_into().unwrap()) & lane_mask;
+            let chunk = (index / 4) as usize;
+            let lane = (index % 4) as usize;
+            let value =
+                u32::from_le_bytes(sources[chunk][lane * 4..lane * 4 + 4].try_into().unwrap());
+            cpu.write_var(dst.slice(output_lane * 4, 4), value);
+        }
+    }
+
+    fn packed_permute_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_permute_d_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            7,
+        );
+    }
+
+    fn packed_permute_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_permute_d_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            15,
+        );
+    }
+
+    fn packed_permute_q_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let sources =
+            [cpu.read::<u128>(args[0]).to_le_bytes(), cpu.read::<u128>(args[1]).to_le_bytes()];
+        let immediate = cpu.args[0] as u8;
+        let output_pair = (cpu.args[1] as u8) & 1;
+        for lane_in_pair in 0..2_u8 {
+            let output_lane = output_pair * 2 + lane_in_pair;
+            let source_lane = (immediate >> (output_lane * 2)) & 3;
+            let source_chunk = usize::from(source_lane / 2);
+            let lane_in_chunk = usize::from(source_lane % 2);
+            let value = u64::from_le_bytes(
+                sources[source_chunk][lane_in_chunk * 8..lane_in_chunk * 8 + 8].try_into().unwrap(),
+            );
+            cpu.write_var(dst.slice(lane_in_pair * 8, 8), value);
+        }
+    }
+
+    fn packed_compact_d_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        sources: [u128; 4],
+        lane_count: usize,
+        old_destination: u128,
+        mask: u64,
+        output_chunk: usize,
+        expand: bool,
+    ) {
+        if dst.size != 16 || !matches!(lane_count, 4 | 8 | 16) || output_chunk * 4 >= lane_count {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+
+        let source_bytes = sources.map(u128::to_le_bytes);
+        let old_bytes = old_destination.to_le_bytes();
+        let read_source_lane = |lane: usize| {
+            let chunk = lane / 4;
+            let offset = (lane % 4) * 4;
+            u32::from_le_bytes(source_bytes[chunk][offset..offset + 4].try_into().unwrap())
+        };
+
+        let mut packed = [0_u32; 16];
+        let mut packed_len = 0;
+        if !expand {
+            for source_lane in 0..lane_count {
+                if mask & (1_u64 << source_lane) != 0 {
+                    packed[packed_len] = read_source_lane(source_lane);
+                    packed_len += 1;
+                }
+            }
+        }
+
+        for lane_in_chunk in 0..4 {
+            let destination_lane = output_chunk * 4 + lane_in_chunk;
+            let old_offset = lane_in_chunk * 4;
+            let old = u32::from_le_bytes(old_bytes[old_offset..old_offset + 4].try_into().unwrap());
+            let value = if expand {
+                if mask & (1_u64 << destination_lane) == 0 {
+                    old
+                }
+                else {
+                    let packed_index = (mask & ((1_u64 << destination_lane) - 1)).count_ones();
+                    read_source_lane(packed_index as usize)
+                }
+            }
+            else if destination_lane < packed_len {
+                packed[destination_lane]
+            }
+            else {
+                old
+            };
+            cpu.write_var(dst.slice((lane_in_chunk * 4) as u8, 4), value);
+        }
+    }
+
+    fn packed_compress_d_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), 0, 0, 0],
+            4,
+            cpu.read::<u128>(args[1]),
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            false,
+        );
+    }
+
+    fn packed_compress_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            8,
+            cpu.args[0],
+            cpu.args[1] as u64,
+            cpu.args[2] as usize,
+            false,
+        );
+    }
+
+    fn packed_compress_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            16,
+            cpu.args[2],
+            cpu.args[3] as u64,
+            cpu.args[4] as usize,
+            false,
+        );
+    }
+
+    fn packed_compress_d_memory(
+        cpu: &mut Cpu,
+        address: u64,
+        sources: [u128; 4],
+        lane_count: usize,
+        mask: u64,
+    ) {
+        let source_bytes = sources.map(u128::to_le_bytes);
+        let mut packed = [0_u32; 16];
+        let mut packed_len = 0;
+        for source_lane in 0..lane_count {
+            if mask & (1_u64 << source_lane) == 0 {
+                continue;
+            }
+            let chunk = source_lane / 4;
+            let offset = (source_lane % 4) * 4;
+            packed[packed_len] =
+                u32::from_le_bytes(source_bytes[chunk][offset..offset + 4].try_into().unwrap());
+            packed_len += 1;
+        }
+
+        // Native VPCOMPRESSD memory writes are fault-atomic. Preflight every
+        // selected dword before the first mutation, and report the end of the
+        // first failing element as Linux exposes it through si_addr.
+        for output_lane in 0..packed_len {
+            let Some(element_start) = address.checked_add((output_lane * 4) as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            for byte in 0..4_u64 {
+                let Some(current) = element_start.checked_add(byte)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                if let Err(error) =
+                    icicle_mem::perm::check(cpu.mem.get_perm(current), icicle_mem::perm::WRITE)
+                {
+                    cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                    cpu.exception.value = element_start.saturating_add(3);
+                    return;
+                }
+            }
+        }
+
+        for (output_lane, value) in packed[..packed_len].iter().copied().enumerate() {
+            let element_start = address + (output_lane * 4) as u64;
+            if let Err(error) =
+                cpu.mem.write::<4>(element_start, value.to_le_bytes(), icicle_mem::perm::WRITE)
+            {
+                cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                cpu.exception.value = element_start.saturating_add(3);
+                return;
+            }
+        }
+    }
+
+    fn packed_compress_d_mem_128(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_d_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            4,
+            cpu.args[0] as u64,
+        );
+    }
+
+    fn packed_compress_d_mem_256(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_d_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            8,
+            cpu.args[1] as u64,
+        );
+    }
+
+    fn packed_compress_d_mem_512(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_d_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            16,
+            cpu.args[3] as u64,
+        );
+    }
+
+    fn packed_expand_d_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), 0, 0, 0],
+            4,
+            cpu.read::<u128>(args[1]),
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            true,
+        );
+    }
+
+    fn packed_expand_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            8,
+            cpu.args[0],
+            cpu.args[1] as u64,
+            cpu.args[2] as usize,
+            true,
+        );
+    }
+
+    fn packed_expand_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compact_d_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            16,
+            cpu.args[2],
+            cpu.args[3] as u64,
+            cpu.args[4] as usize,
+            true,
+        );
+    }
+
+    fn masked_memory_shape(cpu: &mut Cpu, element_size: usize, chunks: usize) -> Option<usize> {
+        if !matches!(element_size, 1 | 2 | 4 | 8) || !(1..=4).contains(&chunks) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return None;
+        }
+        Some(chunks * 16 / element_size)
+    }
+
+    /// Reads one 128-bit chunk of an EVEX masked vector load.
+    ///
+    /// The address operand is deliberately not materialized by SLEIGH. Only
+    /// selected elements are touched, so an unmapped page containing solely
+    /// masked-off lanes cannot fault. The destination is committed only after
+    /// every selected byte in the chunk has been read successfully.
+    fn masked_load_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mut output = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mask = cpu.args[0] as u64;
+        let element_size = cpu.args[1] as usize;
+        let chunk = cpu.args[2] as usize;
+        let Some(_) = masked_memory_shape(cpu, element_size, chunk + 1)
+        else {
+            return;
+        };
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let lanes_per_chunk = 16 / element_size;
+        for lane in 0..lanes_per_chunk {
+            let global_lane = chunk * lanes_per_chunk + lane;
+            if mask & (1_u64 << global_lane) == 0 {
+                continue;
+            }
+            for byte in 0..element_size {
+                let offset = chunk * 16 + lane * element_size + byte;
+                let Some(current) = address.checked_add(offset as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => output[lane * element_size + byte] = value[0],
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn masked_store(
+        cpu: &mut Cpu,
+        address: u64,
+        chunks: [u128; 4],
+        chunk_count: usize,
+        mask: u64,
+        element_size: usize,
+    ) {
+        let Some(lane_count) = masked_memory_shape(cpu, element_size, chunk_count)
+        else {
+            return;
+        };
+        let source = chunks.map(u128::to_le_bytes);
+
+        // Ordinary masked vector stores are restartable as one instruction.
+        // Preflight every selected byte so a late page fault cannot expose a
+        // partially committed vector store in the guest memory image.
+        for lane in 0..lane_count {
+            if mask & (1_u64 << lane) == 0 {
+                continue;
+            }
+            for byte in 0..element_size {
+                let offset = lane * element_size + byte;
+                let Some(current) = address.checked_add(offset as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                if let Err(error) =
+                    icicle_mem::perm::check(cpu.mem.get_perm(current), icicle_mem::perm::WRITE)
+                {
+                    cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                    cpu.exception.value = current;
+                    return;
+                }
+            }
+        }
+
+        for lane in 0..lane_count {
+            if mask & (1_u64 << lane) == 0 {
+                continue;
+            }
+            for byte in 0..element_size {
+                let offset = lane * element_size + byte;
+                let current = address + offset as u64;
+                let value = source[offset / 16][offset % 16];
+                if let Err(error) = cpu.mem.write::<1>(current, [value], icicle_mem::perm::WRITE) {
+                    cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                    cpu.exception.value = current;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn masked_store_128(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        masked_store(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            1,
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+        );
+    }
+
+    fn masked_store_256(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        masked_store(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            2,
+            cpu.args[1] as u64,
+            cpu.args[2] as usize,
+        );
+    }
+
+    fn masked_store_512(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        masked_store(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            4,
+            cpu.args[3] as u64,
+            cpu.args[4] as usize,
+        );
+    }
+
+    fn packed_test_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 2 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let element_size = cpu.args[0] as usize;
+        if !matches!(element_size, 1 | 2 | 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        }
+        let invert_left = cpu.args[1] != 0;
+        let left = cpu.read::<u128>(args[0]).to_le_bytes();
+        let right = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut result = 0_u16;
+        for lane in 0..16 / element_size {
+            let start = lane * element_size;
+            let any = (0..element_size).any(|byte| {
+                let lhs = if invert_left { !left[start + byte] } else { left[start + byte] };
+                lhs & right[start + byte] != 0
+            });
+            result |= u16::from(any) << lane;
+        }
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_test_mask_512(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 2 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let element_size = cpu.args[6] as usize;
+        if !matches!(element_size, 1 | 2 | 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        }
+        let invert_left = cpu.args[7] != 0;
+        let left = [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]]
+            .map(u128::to_le_bytes);
+        let right = [cpu.args[2], cpu.args[3], cpu.args[4], cpu.args[5]].map(u128::to_le_bytes);
+        let lane_count = 64 / element_size;
+        let mut result = 0_u64;
+        for lane in 0..lane_count {
+            let start = lane * element_size;
+            let any = (0..element_size).any(|byte| {
+                let offset = start + byte;
+                let lhs = left[offset / 16][offset % 16];
+                let lhs = if invert_left { !lhs } else { lhs };
+                lhs & right[offset / 16][offset % 16] != 0
+            });
+            result |= u64::from(any) << lane;
+        }
+        cpu.write_trunc(dst, result);
+    }
 
     fn rdtsc(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
         // One retired instruction is one cycle, matching the guest clock's

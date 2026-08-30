@@ -166,7 +166,9 @@ impl Value {
         match self {
             Self::Var(v) => Value::Var(v.slice(offset, size)),
             Self::Const(x, _) => {
-                Value::Const((x >> (offset * 8)) & crate::mask(size as u64 * 8), size)
+                let shifted = if offset >= 8 { 0 } else { x >> (offset * 8) };
+                let mask = if size >= 8 { u64::MAX } else { crate::mask(size as u64 * 8) };
+                Value::Const(shifted & mask, size)
             }
         }
     }
@@ -780,4 +782,13 @@ fn inputs_display() {
 
     let two = Inputs::new(0x10_u64, 0x20_u64);
     assert_eq!(two.get().display(&()).to_string(), "0x10:8, 0x20:8");
+}
+
+#[test]
+fn slicing_a_wide_zero_extended_constant_uses_byte_offsets_without_panicking() {
+    let value = Value::Const(0x8877_6655_4433_2211, 32);
+    assert_eq!(value.slice(0, 8), Value::Const(0x8877_6655_4433_2211, 8));
+    assert_eq!(value.slice(4, 8), Value::Const(0x8877_6655, 8));
+    assert_eq!(value.slice(8, 8), Value::Const(0, 8));
+    assert_eq!(value.slice(16, 16), Value::Const(0, 16));
 }
