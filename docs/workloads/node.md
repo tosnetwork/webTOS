@@ -1,11 +1,13 @@
-# Workload profile: Node.js (milestone 7 groundwork)
+# Workload profile: Node.js and Bun (milestones 7 and 9)
 
 **Status: Node.js runs. A stock `node -e "console.log(...)"` executes the
 script and exits cleanly (~90M instructions); `node --version` prints
 `v24.13.0`. Scripts exercising arrays, string methods, `JSON`, and `Math`
-produce correct output. This was reached on the AVX-512-capable spec plus a
-set of p-code-op helpers and a CPUID SSE2 baseline (below). This file records
-how it works and what remains.**
+produce correct output. This was first reached on the AVX-512-capable language
+spec plus a set of p-code-op helpers and a conservative CPUID SSE2 baseline.
+M9 subsequently validated and published the versioned
+`webtos-x86_64-icelake-simdutf-v1` AVX-family execution profile. This file
+preserves the M7 investigation and records the current workload gates.**
 
 Milestone 7 targets the Codex and Claude Code CLIs, and this file was written
 believing both were Node.js applications, so that a stock `node` would be the
@@ -300,8 +302,8 @@ Three things, each found by running Node and fixing the next fault:
 1. **CPUID SSE2 baseline.** V8 aborts (`Check failed: cpu.has_sse2()`) unless
    it can read the SSE2 feature bit. Two changes in the CPUID helper: raise
    max-basic-leaf from 0 to 1 (so software reads leaf 1 at all), and set the
-   SSE2 baseline in leaf 1 EDX. AVX is still not advertised, so V8/glibc stay
-   on SSE paths. Max-leaf stays at 1 so the unimplemented cache/topology
+   SSE2 baseline in leaf 1 EDX. At this M7 checkpoint AVX was not advertised,
+   so V8/glibc stayed on SSE paths. Max-leaf stayed at 1 so the unimplemented cache/topology
    leaves are never queried. (Advertising SSE2 also makes glibc's ifunc
    resolver select SSE2 `memcmp`/`strcmp` — those are correct here; an earlier
    report of a wrong-result bug there was a harness artifact, since ruled out
@@ -318,24 +320,37 @@ Three things, each found by running Node and fixing the next fault:
    icicle's two-operand p-code drops the imm8 mode (see
    `third_party/icicle/PROVENANCE.md` patch 8).
 
-AES-NI **is** advertised in CPUID (the legacy, non-VEX encodings, which now
-have helpers). The guest TLS client takes its hardware-AES path — which also
-uses `pshufb` — and works. What stays unadvertised is AVX/AVX-512, so nothing
-selects the VEX-AES/PCLMULQDQ/XOP encodings that are still not lifted.
+AES-NI **was** advertised in CPUID (the legacy, non-VEX encodings, which had
+helpers). The guest TLS client took its hardware-AES path — which also used
+`pshufb` — and worked. At this checkpoint AVX/AVX-512 stayed unadvertised, so
+nothing selected the then-ungated VEX-AES/PCLMULQDQ/XOP encodings. The M9
+update below supersedes that feature boundary.
 
 All the added SIMD helpers are covered by `x64-engine/examples/sse_probe.rs`,
 which runs each instruction in the engine and compares it to the native
 intrinsic over many random inputs.
 
-## Remaining
+## M9 update
 
-- **AVX/AVX-512 execution.** The encodings decode (zero gaps on glibc) but
-  their p-code semantics are unvalidated, so CPUID keeps userspace on SSE.
-- **VEX-AES / PCLMULQDQ / XOP** are still unlifted (the ~0.0049% Node decode
-  residual); reached only if AES-NI is advertised, which it is not.
-- Browser delivery and sustained task gates for Codex and Claude Code. Codex
-  and Claude Code both run in the wasm module; the OpenFox image is the only
-  agent image currently carried through the browser delivery profile.
+The earlier AVX limitation is closed for the published profile. CPUID now
+advertises AVX, AVX2, BMI1/BMI2, AVX-512F/CD/BW/VL/VBMI2/VPOPCNTDQ with a
+coherent XCR0 and standard xstate transfer. AVX-512DQ remains deliberately
+absent because the pinned simdutf Ice Lake selector does not require it and
+webTOS does not publish extensions merely to approximate a marketing profile.
+
+The published-feature ledger covers 789 mnemonics and reports zero reachable
+opaque operations without helpers. A ptrace/`NT_X86_XSTATE` corpus compares
+VEX, AVX2, and EVEX execution and faults to native hardware; the portable M9
+ELF produces the same result in the interpreter, JIT, Chromium, Firefox, and
+WebKit. The pinned Node, Codex, OpenFox, and Claude Code images remain
+digest-locked compatibility workloads.
+
+Because AVX is published together with AES-NI and PCLMULQDQ, their VEX.128
+forms are part of the contract. The native oracle covers every VAES operation,
+register and memory VPCLMULQDQ, and full ZMM upper-lane zeroing; that final gate
+found and fixed stale high-ZMM state in the inherited language rules. XOP and
+AVX-512DQ remain absent and are therefore explicit feature boundaries, not
+unimplemented operations reachable behind an advertised bit.
 
 ## Tools
 

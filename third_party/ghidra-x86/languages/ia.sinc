@@ -1182,15 +1182,15 @@ vaddr32x: [Xmm_vsib*ss + simm32_32]				is mod=0 & r_m=4; Xmm_vsib & base=5 & ss;
 vaddr32x: [Base + Xmm_vsib*ss + simm8_32]		is mod=1 & r_m=4; Xmm_vsib & Base & ss;		simm8_32	{ local tmp=zext(Base)+zext(simm8_32)+Xmm_vsib*ss; export tmp; }
 vaddr32x: [Base + Xmm_vsib*ss + simm32_32]		is mod=2 & r_m=4; Xmm_vsib & Base & ss;		simm32_32	{ local tmp=zext(Base)+zext(simm32_32)+Xmm_vsib*ss; export tmp; }
 
-vaddr32y: [Base + Ymm_vsib*ss]					is mod=0 & r_m=4; Ymm_vsib & Base & ss					{ local tmp=zext(Base)+Ymm_vsib*ss; export tmp; }
-vaddr32y: [Ymm_vsib*ss + simm32_32]				is mod=0 & r_m=4; Ymm_vsib & base=5 & ss;	simm32_32	{ local tmp=zext(simm32_32)+Ymm_vsib*ss; export tmp; }
-vaddr32y: [Base + Ymm_vsib*ss + simm8_32]		is mod=1 & r_m=4; Ymm_vsib & Base & ss;		simm8_32	{ local tmp=zext(Base)+zext(simm8_32)+Ymm_vsib*ss; export tmp; }
-vaddr32y: [Base + Ymm_vsib*ss + simm32_32]		is mod=2 & r_m=4; Ymm_vsib & Base & ss;		simm32_32	{ local tmp=zext(Base)+zext(simm32_32)+Ymm_vsib*ss; export tmp; }
+vaddr32y: [Base + Ymm_vsib*ss]					is mod=0 & r_m=4; Ymm_vsib & Base & ss					{ local tmp=zext(Base)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr32y: [Ymm_vsib*ss + simm32_32]				is mod=0 & r_m=4; Ymm_vsib & base=5 & ss;	simm32_32	{ local tmp=zext(simm32_32)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr32y: [Base + Ymm_vsib*ss + simm8_32]		is mod=1 & r_m=4; Ymm_vsib & Base & ss;		simm8_32	{ local tmp=zext(Base)+zext(simm8_32)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr32y: [Base + Ymm_vsib*ss + simm32_32]		is mod=2 & r_m=4; Ymm_vsib & Base & ss;		simm32_32	{ local tmp=zext(Base)+zext(simm32_32)+Ymm_vsib[0,64]*ss; export tmp; }
 
-vaddr32z: [Base + Zmm_vsib*ss]					is mod=0 & r_m=4; Zmm_vsib & Base & ss					{ local tmp=zext(Base)+Zmm_vsib*ss; export tmp; }
-vaddr32z: [Zmm_vsib*ss + simm32_32]				is mod=0 & r_m=4; Zmm_vsib & base=5 & ss;	simm32_32	{ local tmp=zext(simm32_32)+Zmm_vsib*ss; export tmp; }
-vaddr32z: [Base + Zmm_vsib*ss + simm8_32]		is mod=1 & r_m=4; Zmm_vsib & Base & ss;		simm8_32	{ local tmp=zext(Base)+zext(simm8_32)+Zmm_vsib*ss; export tmp; }
-vaddr32z: [Base + Zmm_vsib*ss + simm32_32]		is mod=2 & r_m=4; Zmm_vsib & Base & ss;		simm32_32	{ local tmp=zext(Base)+zext(simm32_32)+Zmm_vsib*ss; export tmp; }
+vaddr32z: [Base + Zmm_vsib*ss]					is mod=0 & r_m=4; Zmm_vsib & Base & ss					{ local tmp=zext(Base)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr32z: [Zmm_vsib*ss + simm32_32]				is mod=0 & r_m=4; Zmm_vsib & base=5 & ss;	simm32_32	{ local tmp=zext(simm32_32)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr32z: [Base + Zmm_vsib*ss + simm8_32]		is mod=1 & r_m=4; Zmm_vsib & Base & ss;		simm8_32	{ local tmp=zext(Base)+zext(simm8_32)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr32z: [Base + Zmm_vsib*ss + simm32_32]		is mod=2 & r_m=4; Zmm_vsib & Base & ss;		simm32_32	{ local tmp=zext(Base)+zext(simm32_32)+Zmm_vsib[0,64]*ss; export tmp; }
 
 @ifdef IA64
 vaddr64x: [Base64 + Xmm_vsib*ss]				is mod=0 & r_m=4; Xmm_vsib & Base64 & ss				{ local tmp=zext(Base64)+Xmm_vsib*ss; export tmp; }
@@ -1198,15 +1198,15 @@ vaddr64x: [Xmm_vsib*ss + simm32_64]				is mod=0 & r_m=4; Xmm_vsib & base64=5 & s
 vaddr64x: [Base64 + Xmm_vsib*ss + simm8_64]		is mod=1 & r_m=4; Xmm_vsib & Base64 & ss;	simm8_64	{ local tmp=zext(Base64)+zext(simm8_64)+Xmm_vsib*ss; export tmp; }
 vaddr64x: [Base64 + Xmm_vsib*ss + simm32_64]	is mod=2 & r_m=4; Xmm_vsib & Base64 & ss;	simm32_64	{ local tmp=zext(Base64)+zext(simm32_64)+Xmm_vsib*ss; export tmp; }
 
-vaddr64y: [Base64 + Ymm_vsib*ss]				is mod=0 & r_m=4; Ymm_vsib & Base64 & ss				{ local tmp=zext(Base64)+Ymm_vsib*ss; export tmp; }
-vaddr64y: [Ymm_vsib*ss + simm32_64]				is mod=0 & r_m=4; Ymm_vsib & base64=5 & ss;	simm32_64	{ local tmp=zext(simm32_64)+Ymm_vsib*ss; export tmp; }
-vaddr64y: [Base64 + Ymm_vsib*ss + simm8_64]		is mod=1 & r_m=4; Ymm_vsib & Base64 & ss;	simm8_64	{ local tmp=zext(Base64)+zext(simm8_64)+Ymm_vsib*ss; export tmp; }
-vaddr64y: [Base64 + Ymm_vsib*ss + simm32_64]	is mod=2 & r_m=4; Ymm_vsib & Base64 & ss;	simm32_64	{ local tmp=zext(Base64)+zext(simm32_64)+Ymm_vsib*ss; export tmp; }
+vaddr64y: [Base64 + Ymm_vsib*ss]				is mod=0 & r_m=4; Ymm_vsib & Base64 & ss				{ local tmp=zext(Base64)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr64y: [Ymm_vsib*ss + simm32_64]				is mod=0 & r_m=4; Ymm_vsib & base64=5 & ss;	simm32_64	{ local tmp=zext(simm32_64)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr64y: [Base64 + Ymm_vsib*ss + simm8_64]		is mod=1 & r_m=4; Ymm_vsib & Base64 & ss;	simm8_64	{ local tmp=zext(Base64)+zext(simm8_64)+Ymm_vsib[0,64]*ss; export tmp; }
+vaddr64y: [Base64 + Ymm_vsib*ss + simm32_64]	is mod=2 & r_m=4; Ymm_vsib & Base64 & ss;	simm32_64	{ local tmp=zext(Base64)+zext(simm32_64)+Ymm_vsib[0,64]*ss; export tmp; }
 
-vaddr64z: [Base64 + Zmm_vsib*ss]				is mod=0 & r_m=4; Zmm_vsib & Base64 & ss				{ local tmp=zext(Base64)+Zmm_vsib*ss; export tmp; }
-vaddr64z: [Zmm_vsib*ss + simm32_64]				is mod=0 & r_m=4; Zmm_vsib & base64=5 & ss;	simm32_64	{ local tmp=zext(simm32_64)+Zmm_vsib*ss; export tmp; }
-vaddr64z: [Base64 + Zmm_vsib*ss + simm8_64]		is mod=1 & r_m=4; Zmm_vsib & Base64 & ss;	simm8_64	{ local tmp=zext(Base64)+zext(simm8_64)+Zmm_vsib*ss; export tmp; }
-vaddr64z: [Base64 + Zmm_vsib*ss + simm32_64]	is mod=2 & r_m=4; Zmm_vsib & Base64 & ss;	simm32_64	{ local tmp=zext(Base64)+zext(simm32_64)+Zmm_vsib*ss; export tmp; }
+vaddr64z: [Base64 + Zmm_vsib*ss]				is mod=0 & r_m=4; Zmm_vsib & Base64 & ss				{ local tmp=zext(Base64)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr64z: [Zmm_vsib*ss + simm32_64]				is mod=0 & r_m=4; Zmm_vsib & base64=5 & ss;	simm32_64	{ local tmp=zext(simm32_64)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr64z: [Base64 + Zmm_vsib*ss + simm8_64]		is mod=1 & r_m=4; Zmm_vsib & Base64 & ss;	simm8_64	{ local tmp=zext(Base64)+zext(simm8_64)+Zmm_vsib[0,64]*ss; export tmp; }
+vaddr64z: [Base64 + Zmm_vsib*ss + simm32_64]	is mod=2 & r_m=4; Zmm_vsib & Base64 & ss;	simm32_64	{ local tmp=zext(Base64)+zext(simm32_64)+Zmm_vsib[0,64]*ss; export tmp; }
 @endif
 
 
@@ -1611,6 +1611,7 @@ ZmmMaskMode: "{z}" is evexZ=1 { ZmmMask=0; }
 
 AVXOpMask: "{"^evexOpmask^"}" is evexOpmask { export evexOpmask; }
 AVXOpMask:  is evexOpmask=0 { local tmp:8 = 0xffffffffffffffff; export *[const]:8 tmp; }
+
 # Z=0: merge masking
 # Z=1: zero masking
 XmmOpMask: AVXOpMask^XmmMaskMode is AVXOpMask & XmmMaskMode {
@@ -1674,6 +1675,25 @@ XmmOpMask64: AVXOpMask^XmmMaskMode is AVXOpMask & XmmMaskMode {
 }
 
 XmmOpMask64: is evexOpmask=0 {
+}
+
+# Scalar EVEX instructions apply writemasking only to element zero. Upper
+# elements come from the instruction's first source, not from the old
+# destination and not from additional opmask bits.
+XmmScalarOpMask32: AVXOpMask^XmmMaskMode is AVXOpMask & XmmMaskMode {
+	local mask = AVXOpMask;
+	conditionalAssign(XmmResult[0,32], mask[0,1], XmmResult[0,32], XmmMask[0,32]);
+}
+
+XmmScalarOpMask32: is evexOpmask=0 {
+}
+
+XmmScalarOpMask64: AVXOpMask^XmmMaskMode is AVXOpMask & XmmMaskMode {
+	local mask = AVXOpMask;
+	conditionalAssign(XmmResult[0,64], mask[0,1], XmmResult[0,64], XmmMask[0,64]);
+}
+
+XmmScalarOpMask64: is evexOpmask=0 {
 }
 
 YmmOpMask: AVXOpMask^YmmMaskMode is AVXOpMask & YmmMaskMode {
@@ -1772,72 +1792,12 @@ ZmmOpMask: AVXOpMask^ZmmMaskMode is AVXOpMask & ZmmMaskMode {
 	export AVXOpMask;
 }
 
+define pcodeop webtos_apply_byte_mask_128;
 ZmmOpMask8: AVXOpMask^ZmmMaskMode is AVXOpMask & ZmmMaskMode {
-	local mask = AVXOpMask;
-	conditionalAssign(ZmmResult[0,8], mask[0,1], ZmmResult[0,8], ZmmMask[0,8]);
-	conditionalAssign(ZmmResult[8,8], mask[1,1], ZmmResult[8,8], ZmmMask[8,8]);
-	conditionalAssign(ZmmResult[16,8], mask[2,1], ZmmResult[16,8], ZmmMask[16,8]);
-	conditionalAssign(ZmmResult[24,8], mask[3,1], ZmmResult[24,8], ZmmMask[24,8]);
-	conditionalAssign(ZmmResult[32,8], mask[4,1], ZmmResult[32,8], ZmmMask[32,8]);
-	conditionalAssign(ZmmResult[40,8], mask[5,1], ZmmResult[40,8], ZmmMask[40,8]);
-	conditionalAssign(ZmmResult[48,8], mask[6,1], ZmmResult[48,8], ZmmMask[48,8]);
-	conditionalAssign(ZmmResult[56,8], mask[7,1], ZmmResult[56,8], ZmmMask[56,8]);
-	conditionalAssign(ZmmResult[64,8], mask[8,1], ZmmResult[64,8], ZmmMask[64,8]);
-	conditionalAssign(ZmmResult[72,8], mask[9,1], ZmmResult[72,8], ZmmMask[72,8]);
-	conditionalAssign(ZmmResult[80,8], mask[10,1], ZmmResult[80,8], ZmmMask[80,8]);
-	conditionalAssign(ZmmResult[88,8], mask[11,1], ZmmResult[88,8], ZmmMask[88,8]);
-	conditionalAssign(ZmmResult[96,8], mask[12,1], ZmmResult[96,8], ZmmMask[96,8]);
-	conditionalAssign(ZmmResult[104,8], mask[13,1], ZmmResult[104,8], ZmmMask[104,8]);
-	conditionalAssign(ZmmResult[112,8], mask[14,1], ZmmResult[112,8], ZmmMask[112,8]);
-	conditionalAssign(ZmmResult[120,8], mask[15,1], ZmmResult[120,8], ZmmMask[120,8]);
-	conditionalAssign(ZmmResult[128,8], mask[16,1], ZmmResult[128,8], ZmmMask[128,8]);
-	conditionalAssign(ZmmResult[136,8], mask[17,1], ZmmResult[136,8], ZmmMask[136,8]);
-	conditionalAssign(ZmmResult[144,8], mask[18,1], ZmmResult[144,8], ZmmMask[144,8]);
-	conditionalAssign(ZmmResult[152,8], mask[19,1], ZmmResult[152,8], ZmmMask[152,8]);
-	conditionalAssign(ZmmResult[160,8], mask[20,1], ZmmResult[160,8], ZmmMask[160,8]);
-	conditionalAssign(ZmmResult[168,8], mask[21,1], ZmmResult[168,8], ZmmMask[168,8]);
-	conditionalAssign(ZmmResult[176,8], mask[22,1], ZmmResult[176,8], ZmmMask[176,8]);
-	conditionalAssign(ZmmResult[184,8], mask[23,1], ZmmResult[184,8], ZmmMask[184,8]);
-	conditionalAssign(ZmmResult[192,8], mask[24,1], ZmmResult[192,8], ZmmMask[192,8]);
-	conditionalAssign(ZmmResult[200,8], mask[25,1], ZmmResult[200,8], ZmmMask[200,8]);
-	conditionalAssign(ZmmResult[208,8], mask[26,1], ZmmResult[208,8], ZmmMask[208,8]);
-	conditionalAssign(ZmmResult[216,8], mask[27,1], ZmmResult[216,8], ZmmMask[216,8]);
-	conditionalAssign(ZmmResult[224,8], mask[28,1], ZmmResult[224,8], ZmmMask[224,8]);
-	conditionalAssign(ZmmResult[232,8], mask[29,1], ZmmResult[232,8], ZmmMask[232,8]);
-	conditionalAssign(ZmmResult[240,8], mask[30,1], ZmmResult[240,8], ZmmMask[240,8]);
-	conditionalAssign(ZmmResult[248,8], mask[31,1], ZmmResult[248,8], ZmmMask[248,8]);
-	conditionalAssign(ZmmResult[256,8], mask[32,1], ZmmResult[256,8], ZmmMask[256,8]);
-	conditionalAssign(ZmmResult[264,8], mask[33,1], ZmmResult[264,8], ZmmMask[264,8]);
-	conditionalAssign(ZmmResult[272,8], mask[34,1], ZmmResult[272,8], ZmmMask[272,8]);
-	conditionalAssign(ZmmResult[280,8], mask[35,1], ZmmResult[280,8], ZmmMask[280,8]);
-	conditionalAssign(ZmmResult[288,8], mask[36,1], ZmmResult[288,8], ZmmMask[288,8]);
-	conditionalAssign(ZmmResult[296,8], mask[37,1], ZmmResult[296,8], ZmmMask[296,8]);
-	conditionalAssign(ZmmResult[304,8], mask[38,1], ZmmResult[304,8], ZmmMask[304,8]);
-	conditionalAssign(ZmmResult[312,8], mask[39,1], ZmmResult[312,8], ZmmMask[312,8]);
-	conditionalAssign(ZmmResult[320,8], mask[40,1], ZmmResult[320,8], ZmmMask[320,8]);
-	conditionalAssign(ZmmResult[328,8], mask[41,1], ZmmResult[328,8], ZmmMask[328,8]);
-	conditionalAssign(ZmmResult[336,8], mask[42,1], ZmmResult[336,8], ZmmMask[336,8]);
-	conditionalAssign(ZmmResult[344,8], mask[43,1], ZmmResult[344,8], ZmmMask[344,8]);
-	conditionalAssign(ZmmResult[352,8], mask[44,1], ZmmResult[352,8], ZmmMask[352,8]);
-	conditionalAssign(ZmmResult[360,8], mask[45,1], ZmmResult[360,8], ZmmMask[360,8]);
-	conditionalAssign(ZmmResult[368,8], mask[46,1], ZmmResult[368,8], ZmmMask[368,8]);
-	conditionalAssign(ZmmResult[376,8], mask[47,1], ZmmResult[376,8], ZmmMask[376,8]);
-	conditionalAssign(ZmmResult[384,8], mask[48,1], ZmmResult[384,8], ZmmMask[384,8]);
-	conditionalAssign(ZmmResult[392,8], mask[49,1], ZmmResult[392,8], ZmmMask[392,8]);
-	conditionalAssign(ZmmResult[400,8], mask[50,1], ZmmResult[400,8], ZmmMask[400,8]);
-	conditionalAssign(ZmmResult[408,8], mask[51,1], ZmmResult[408,8], ZmmMask[408,8]);
-	conditionalAssign(ZmmResult[416,8], mask[52,1], ZmmResult[416,8], ZmmMask[416,8]);
-	conditionalAssign(ZmmResult[424,8], mask[53,1], ZmmResult[424,8], ZmmMask[424,8]);
-	conditionalAssign(ZmmResult[432,8], mask[54,1], ZmmResult[432,8], ZmmMask[432,8]);
-	conditionalAssign(ZmmResult[440,8], mask[55,1], ZmmResult[440,8], ZmmMask[440,8]);
-	conditionalAssign(ZmmResult[448,8], mask[56,1], ZmmResult[448,8], ZmmMask[448,8]);
-	conditionalAssign(ZmmResult[456,8], mask[57,1], ZmmResult[456,8], ZmmMask[456,8]);
-	conditionalAssign(ZmmResult[464,8], mask[58,1], ZmmResult[464,8], ZmmMask[464,8]);
-	conditionalAssign(ZmmResult[472,8], mask[59,1], ZmmResult[472,8], ZmmMask[472,8]);
-	conditionalAssign(ZmmResult[480,8], mask[60,1], ZmmResult[480,8], ZmmMask[480,8]);
-	conditionalAssign(ZmmResult[488,8], mask[61,1], ZmmResult[488,8], ZmmMask[488,8]);
-	conditionalAssign(ZmmResult[496,8], mask[62,1], ZmmResult[496,8], ZmmMask[496,8]);
-	conditionalAssign(ZmmResult[504,8], mask[63,1], ZmmResult[504,8], ZmmMask[504,8]);
+	ZmmResult[0,128] = webtos_apply_byte_mask_128(ZmmResult[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_apply_byte_mask_128(ZmmResult[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_apply_byte_mask_128(ZmmResult[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_apply_byte_mask_128(ZmmResult[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 }
 
 ZmmOpMask8: is evexOpmask=0 {
@@ -10631,8 +10591,8 @@ define pcodeop pcmpestrm;
 @endif
 
 define pcodeop pcmpistri;
-:PCMPISTRI XmmReg, m128, imm8     is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0x63; XmmReg ... & m128; imm8 { ECX = pcmpistri(XmmReg, m128, imm8:8); }
-:PCMPISTRI XmmReg1, XmmReg2, imm8 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0x63; xmmmod=3 & XmmReg1 & XmmReg2; imm8 { ECX = pcmpistri(XmmReg1, XmmReg2, imm8:8); }
+:PCMPISTRI XmmReg, m128, imm8     is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0x63; XmmReg ... & m128; imm8 { local result:4 = pcmpistri(XmmReg, m128, imm8:8); RCX = zext(result); }
+:PCMPISTRI XmmReg1, XmmReg2, imm8 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0x63; xmmmod=3 & XmmReg1 & XmmReg2; imm8 { local result:4 = pcmpistri(XmmReg1, XmmReg2, imm8:8); RCX = zext(result); }
 
 define pcodeop pcmpistrm;
 :PCMPISTRM XmmReg, m128, imm8     is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0x62; XmmReg ... & m128; imm8 { XMM0 = pcmpistrm(XmmReg, m128, imm8:8); }
@@ -10666,54 +10626,54 @@ define pcodeop aesdec;
 :AESDEC XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xde; XmmReg1 ... & XmmReg2_m128 {
 	XmmReg1 = aesdec(XmmReg1, XmmReg2_m128);
 }
-:VAESDEC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xde; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
+:VAESDEC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xde; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesdec(vexVVVV_XmmReg, XmmReg2_m128);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 define pcodeop aesdeclast;
 :AESDECLAST  XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdf; XmmReg1 ... & XmmReg2_m128 {
 	XmmReg1 = aesdeclast(XmmReg1, XmmReg2_m128);
 }
-:VAESDECLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdf; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
+:VAESDECLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdf; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesdeclast(vexVVVV_XmmReg, XmmReg2_m128);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 define pcodeop aesenc;
 :AESENC XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdc; XmmReg1 ... & XmmReg2_m128 {
 	XmmReg1 = aesenc(XmmReg1, XmmReg2_m128);
 }
-:VAESENC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdc; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
+:VAESENC XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdc; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesenc(vexVVVV_XmmReg, XmmReg2_m128);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 define pcodeop aesenclast;
 :AESENCLAST  XmmReg1, XmmReg2_m128 is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdd; XmmReg1 ... & XmmReg2_m128 {
 	XmmReg1 = aesenclast(XmmReg1, XmmReg2_m128);
 }
-:VAESENCLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdd; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
+:VAESENCLAST XmmReg1, vexVVVV_XmmReg, XmmReg2_m128 is $(VEX_NDS) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_XmmReg; byte=0xdd; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesenclast(vexVVVV_XmmReg, XmmReg2_m128);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 define pcodeop aesimc;
 :AESIMC XmmReg1, XmmReg2_m128  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x38; byte=0xdb; XmmReg1 ... & XmmReg2_m128 {
 	XmmReg1 = aesimc(XmmReg2_m128);
 }
-:VAESIMC XmmReg1, XmmReg2_m128 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG); byte=0xdb; (XmmReg1 & YmmReg1) ... & XmmReg2_m128 {
+:VAESIMC XmmReg1, XmmReg2_m128 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG); byte=0xdb; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128 {
 	XmmReg1 = aesimc(XmmReg2_m128);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 define pcodeop aeskeygenassist;
 :AESKEYGENASSIST XmmReg1, XmmReg2_m128, imm8  is vexMode=0 & $(PRE_66) & byte=0x0F; byte=0x3A; byte=0xdf; XmmReg1 ... & XmmReg2_m128; imm8 {
 	XmmReg1 = aeskeygenassist(XmmReg2_m128, imm8:1);
 }
-:VAESKEYGENASSIST XmmReg1, XmmReg2_m128, imm8 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F3A) & $(VEX_WIG); byte=0xdf; (XmmReg1 & YmmReg1) ... & XmmReg2_m128; imm8 {
+:VAESKEYGENASSIST XmmReg1, XmmReg2_m128, imm8 is $(VEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F3A) & $(VEX_WIG); byte=0xdf; (XmmReg1 & YmmReg1 & ZmmReg1) ... & XmmReg2_m128; imm8 {
 	XmmReg1 = aeskeygenassist(XmmReg2_m128, imm8:1);
-	YmmReg1 = zext(XmmReg1);
+	ZmmReg1 = zext(XmmReg1);
 }
 
 

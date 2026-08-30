@@ -86,6 +86,32 @@ impl InstructionLifter {
         self.decoder.global_context = context;
     }
 
+    /// Allows one architecture-specific opaque operation to lower a wide
+    /// result into independent 128-bit helper calls. Callers must prove the
+    /// operation is lane-local; the generic runtime never infers this.
+    pub fn split_large_user_op(&mut self, id: pcode::HookId) {
+        self.lifter.split_large_user_op(id);
+    }
+
+    /// Like `split_large_user_op`, but passes the zero-based 128-bit chunk
+    /// index as the helper's final scalar argument, including chunk zero for
+    /// an XMM-sized result.
+    pub fn split_large_user_op_indexed(&mut self, id: pcode::HookId) {
+        self.lifter.split_large_user_op_indexed(id);
+    }
+
+    /// Split a lane-local narrowing user operation proportionally at the
+    /// runtime's 128-bit helper boundary.
+    pub fn split_narrow_user_op(&mut self, id: pcode::HookId, input_bytes_per_output: u8) {
+        self.lifter.split_narrow_user_op(id, input_bytes_per_output);
+    }
+
+    /// Split a lane-local widening user operation proportionally at the
+    /// runtime's 128-bit helper boundary.
+    pub fn split_widen_user_op(&mut self, id: pcode::HookId, output_bytes_per_input: u8) {
+        self.lifter.split_widen_user_op(id, output_bytes_per_input);
+    }
+
     /// Lift a single instruction starting at `vaddr` returning the address of the next instruction,
     /// or `None` if no instruction could be fetched from `vaddr`.
     pub fn lift<S>(&mut self, src: &mut S, vaddr: u64) -> Result<u64, DecodeError>

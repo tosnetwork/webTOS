@@ -19,6 +19,6 @@ wasm-encoder = "0.243"
 [dev-dependencies]
 wasmi = "0.51"
 jit-wasmi = { path = "../jit-wasmi" }
-iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "std"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "instr_info", "std"] }
 object = { version = "0.38", default-features = false, features = ["read", "std"] }
 libc = "0.2"

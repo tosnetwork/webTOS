@@ -642,7 +642,20 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
             pcode::RAM_SPACE => match self.cpu.mem.read::<N>(addr, perm::READ) {
                 Ok(val) => Some(val),
                 Err(err) => {
-                    self.exception(ExceptionCode::from_load_error(err), addr);
+                    // Report the first byte that cannot be read, matching the
+                    // faulting linear address placed in x86 CR2.  A wide p-code
+                    // load may straddle a page (or a byte-granular permission
+                    // boundary), so its starting address is not necessarily
+                    // the address that caused the access fault.
+                    let mut fault = (err, addr);
+                    for offset in 0..N {
+                        let byte_addr = addr.wrapping_add(offset as u64);
+                        if let Err(byte_err) = self.cpu.mem.read::<1>(byte_addr, perm::READ) {
+                            fault = (byte_err, byte_addr);
+                            break;
+                        }
+                    }
+                    self.exception(ExceptionCode::from_load_error(fault.0), fault.1);
                     return None;
                 }
             },

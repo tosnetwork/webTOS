@@ -4,8 +4,10 @@
 //! through instruction helpers.  Extended-state serialization and XCR0 use
 //! this same module as M9 grows, so they cannot silently disagree with CPUID.
 
-/// The conservative profile shipped before AVX-family execution is enabled.
-pub(crate) const PROFILE_NAME: &str = "webtos-x86_64-conservative-v1";
+/// The first Ice Lake-class userspace execution profile.  It publishes only
+/// the dependency-closed subset needed by the validated simdutf Ice Lake
+/// implementation; unrelated Ice Lake extensions remain absent.
+pub(crate) const PROFILE_NAME: &str = "webtos-x86_64-icelake-simdutf-v1";
 
 /// Immutable userspace xstate policy.  Bits 0, 1, 2, 5, 6 and 7 select x87,
 /// XMM, YMM, opmask, ZMM_Hi256 and Hi16_ZMM respectively.
@@ -31,7 +33,7 @@ pub(crate) const XSTATE_COMPONENTS: &[XstateComponent] = &[
     XstateComponent { bit: 7, size: 1024, offset: 1664 },
 ];
 
-const MAX_BASIC_LEAF: u32 = 1;
+const MAX_BASIC_LEAF: u32 = 0x0d;
 const MAX_EXTENDED_LEAF: u32 = 0x8000_0001;
 
 /// Architectural CPUID output registers.
@@ -55,6 +57,8 @@ enum Feature {
     Avx512Cd,
     Avx512Bw,
     Avx512Vl,
+    Avx512Vbmi2,
+    Avx512Vpopcntdq,
 }
 
 impl Feature {
@@ -83,9 +87,23 @@ const FEATURE_RULES: &[FeatureRule] = &[
     FeatureRule { feature: Feature::Avx512Cd, requires: Feature::Avx512F.bit() },
     FeatureRule { feature: Feature::Avx512Bw, requires: Feature::Avx512F.bit() },
     FeatureRule { feature: Feature::Avx512Vl, requires: Feature::Avx512F.bit() },
+    FeatureRule {
+        feature: Feature::Avx512Vbmi2,
+        requires: Feature::Avx512Bw.bit() | Feature::Avx512Vl.bit(),
+    },
+    FeatureRule { feature: Feature::Avx512Vpopcntdq, requires: Feature::Avx512F.bit() },
 ];
 
-const ENABLED_AVX_FAMILY: u16 = 0;
+const ENABLED_AVX_FAMILY: u16 = Feature::Xsave.bit()
+    | Feature::Osxsave.bit()
+    | Feature::Avx.bit()
+    | Feature::Avx2.bit()
+    | Feature::Avx512F.bit()
+    | Feature::Avx512Cd.bit()
+    | Feature::Avx512Bw.bit()
+    | Feature::Avx512Vl.bit()
+    | Feature::Avx512Vbmi2.bit()
+    | Feature::Avx512Vpopcntdq.bit();
 
 pub(crate) fn feature_dependencies_are_closed(enabled: u16) -> bool {
     FEATURE_RULES
@@ -113,10 +131,18 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
             // a claim about cache topology or physical model identity.
             eax: 0x0009_06e0,
             ebx: 0,
-            // SSE3, PCLMULQDQ, TM2, PDCM, POPCNT, TSC deadline, AES-NI.
-            // XSAVE/OSXSAVE/AVX/F16C stay clear until M9-L publishes the
-            // completed extended-state profile.
-            ecx: (1 << 0) | (1 << 1) | (1 << 8) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25),
+            // SSE3, PCLMULQDQ, TM2, PDCM, POPCNT, TSC deadline, AES-NI,
+            // XSAVE, OSXSAVE and AVX.
+            ecx: (1 << 0)
+                | (1 << 1)
+                | (1 << 8)
+                | (1 << 15)
+                | (1 << 23)
+                | (1 << 24)
+                | (1 << 25)
+                | (1 << 26)
+                | (1 << 27)
+                | (1 << 28),
             // FPU, VME, DE, TSC, MSR, PAE, CX8, SEP, CMOV, CLFSH, MMX,
             // FXSR, SSE, SSE2.
             edx: (1 << 0)
@@ -136,7 +162,15 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
         },
         // Structured extended features: subleaf zero is the only supported
         // subleaf, and EAX reports that finite maximum.
-        (7, 0) => CpuidResult { eax: 0, ..CpuidResult::default() },
+        (7, 0) => CpuidResult {
+            eax: 0,
+            // BMI1, AVX2, BMI2, AVX-512F, AVX-512CD, AVX-512BW and AVX-512VL.
+            ebx: (1 << 3) | (1 << 5) | (1 << 8) | (1 << 16) | (1 << 28) | (1 << 30) | (1 << 31),
+            // AVX-512VBMI2.
+            ecx: 1 << 6,
+            // AVX-512VPOPCNTDQ.
+            edx: 1 << 14,
+        },
         (7, _) => CpuidResult::default(),
         (0x0d, 0) => CpuidResult {
             eax: INITIAL_XCR0 as u32,

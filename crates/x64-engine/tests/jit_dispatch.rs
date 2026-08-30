@@ -138,6 +138,100 @@ fn assert_matches(label: &str, count: u64, interp: (u64, u64, u64), jit: (u64, u
     );
 }
 
+fn run_extended_ymm_copy(jit: bool) -> (Vec<u8>, u64, u64) {
+    // vmovdqu64 ymm17,[rsi+0x20]
+    // vmovntdq [rdi],ymm17
+    // add rsi,0x20 ; add rdi,0x20 ; dec rcx ; jnz loop ; hlt
+    //
+    // This is the load/store shape used by glibc's EVEX memcpy path. Keeping
+    // the register in the EVEX-only YMM16..31 bank catches a bad high-half or
+    // extended-register lowering that independent load and store tests miss.
+    const CODE: &[u8] = &[
+        0x62, 0xe1, 0xfe, 0x28, 0x6f, 0x4e, 0x01, 0x62, 0xe1, 0x7d, 0x28, 0xe7, 0x0f, 0x48, 0x83,
+        0xc6, 0x20, 0x48, 0x83, 0xc7, 0x20, 0x48, 0xff, 0xc9, 0x75, 0xe6, 0xf4,
+    ];
+    const COUNT: usize = 256;
+    const SOURCE: u64 = 0x60_0000;
+    const DESTINATION: u64 = 0x62_0000;
+
+    let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+    vm.cpu.mem.reset_virtual();
+    vm.cpu.reset();
+    vm.cpu.mem.map_memory_len(
+        0x40_0000,
+        0x1000,
+        Mapping {
+            perm: perm::READ | perm::EXEC,
+            value: 0,
+        },
+    );
+    vm.cpu
+        .mem
+        .write_bytes(0x40_0000, CODE, perm::NONE)
+        .expect("code");
+    vm.cpu.mem.map_memory_len(
+        SOURCE,
+        0x30_000,
+        Mapping {
+            perm: perm::READ | perm::WRITE,
+            value: 0,
+        },
+    );
+    let source: Vec<u8> = (0..COUNT * 32)
+        .map(|index| (index as u8).wrapping_mul(0x5d).wrapping_add(0x37))
+        .collect();
+    vm.cpu
+        .mem
+        .write_bytes(SOURCE, &source, perm::NONE)
+        .expect("source");
+    vm.cpu.mem.map_memory_len(
+        0x7fff_0000_0000,
+        0x10_0000,
+        Mapping {
+            perm: perm::READ | perm::WRITE | perm::INIT,
+            value: 0,
+        },
+    );
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, 0x40_0000);
+    for (name, value) in [
+        ("RSI", SOURCE - 0x20),
+        ("RDI", DESTINATION),
+        ("RCX", COUNT as u64),
+        ("RSP", 0x7fff_0010_0000),
+    ] {
+        let register = vm.cpu.arch.sleigh.get_varnode(name).expect("register");
+        vm.cpu.write_var(register, value);
+    }
+    vm.icount_limit = COUNT as u64 * 6 + 10;
+    if jit {
+        vm.set_jit(Box::new(WasmiJit::new()));
+        vm.set_jit_tiering(Some(1));
+    }
+    let _ = vm.run();
+    let mut copied = vec![0_u8; source.len()];
+    vm.cpu
+        .mem
+        .read_bytes(DESTINATION, &mut copied, perm::NONE)
+        .expect("destination");
+    (copied, vm.cpu.icount(), vm.jit_dispatch_count())
+}
+
+#[test]
+fn extended_ymm_load_store_loop_matches_the_interpreter() {
+    let interpreted = run_extended_ymm_copy(false);
+    let compiled = run_extended_ymm_copy(true);
+    assert_eq!(interpreted.0, compiled.0, "JIT changed the copied bytes");
+    assert_eq!(
+        interpreted.1, compiled.1,
+        "JIT changed retired instruction count"
+    );
+    assert_eq!(
+        interpreted.2, 0,
+        "interpreter unexpectedly dispatched JIT code"
+    );
+    assert!(compiled.2 > 0, "test never dispatched JIT code");
+}
+
 #[test]
 fn a_hot_register_block_matches_the_interpreter() {
     // add rax, rbx ; add rax, rcx ; dec rdx ; jnz loop ; hlt
@@ -197,6 +291,25 @@ fn a_self_loop_region_stops_at_the_fuel_budget() {
     assert_eq!(
         interp.1, limit,
         "self-loop budget: the interpreter should stop at the instruction limit"
+    );
+}
+
+#[test]
+fn a_long_self_loop_is_redispatched_without_changing_architectural_state() {
+    // The browser cannot preempt a synchronous compiled region. A loop longer
+    // than the per-dispatch liveness cap must therefore return to the VM and be
+    // dispatched again, while preserving the exact interpreter result/fuel.
+    let code = [
+        0x48, 0x01, 0xD8, 0x48, 0x01, 0xC8, 0x48, 0xFF, 0xCA, 0x75, 0xF5, 0xF4,
+    ];
+    let count = 100_000;
+    let regs = [("RAX", 1), ("RBX", 3), ("RCX", 5), ("RDX", count)];
+    let interp = run_program(false, &code, &regs, None, 8 * count + 100);
+    let jit = run_program(true, &code, &regs, None, 8 * count + 100);
+    assert_matches("bounded long self-loop", count, interp, jit);
+    assert!(
+        jit.2 >= 2,
+        "a loop beyond the host-liveness cap must require multiple region dispatches"
     );
 }
 
@@ -785,6 +898,85 @@ fn rep_string_blocks_at_one_address_stay_distinct() {
     let jit = run_program(true, &code, &regs, data, 100_000);
     assert_eq!(interp.0, 0x37, "the scan itself must work: {interp:?}");
     assert_matches("repne-scasb", count, interp, jit);
+}
+
+#[test]
+fn long_rep_stos_is_resumable_across_jit_dispatch_budgets() {
+    // mov rdi,buf ; mov rcx,len ; mov al,0x5a ; rep stosb ; hlt
+    //
+    // glibc's AVX-512 memset uses REP STOS for large tails.  That loop can be
+    // longer than the browser liveness budget, so returning from a compiled
+    // region must preserve its internal REP continuation exactly: RCX reaches
+    // zero, RDI advances by the full length, and every byte is stored once.
+    let base = 0x40_0000u64;
+    let buf = 0x20_0000u64;
+    let len = 100_000u64;
+    let mut code = vec![0x48, 0xbf];
+    code.extend_from_slice(&buf.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xb9]);
+    code.extend_from_slice(&len.to_le_bytes());
+    code.extend_from_slice(&[0xb0, 0x5a, 0xf3, 0xaa, 0xf4]);
+
+    let run = |jit: bool| {
+        let mut vm = build_x64_vm(&ldef_path(), &EngineConfig::default()).expect("build vm");
+        vm.cpu.mem.reset_virtual();
+        vm.cpu.reset();
+        vm.cpu.mem.map_memory_len(
+            base,
+            0x1000,
+            Mapping {
+                perm: perm::READ | perm::EXEC,
+                value: 0,
+            },
+        );
+        vm.cpu
+            .mem
+            .write_bytes(base, &code, perm::NONE)
+            .expect("code");
+        vm.cpu.mem.map_memory_len(
+            buf,
+            len.next_multiple_of(0x1000),
+            Mapping {
+                perm: perm::READ | perm::WRITE | perm::INIT,
+                value: 0,
+            },
+        );
+        (vm.cpu.arch.on_boot)(&mut vm.cpu, base);
+        vm.icount_limit = len * 3 + 100;
+        if jit {
+            vm.set_jit(Box::new(WasmiJit::new()));
+            vm.set_jit_tiering(Some(1));
+        }
+        let _ = vm.run();
+        let rcx = vm.cpu.arch.sleigh.get_varnode("RCX").expect("RCX");
+        let rdi = vm.cpu.arch.sleigh.get_varnode("RDI").expect("RDI");
+        let mut bytes = vec![0; len as usize];
+        vm.cpu
+            .mem
+            .read_bytes(buf, &mut bytes, perm::NONE)
+            .expect("data");
+        (
+            vm.cpu.read_reg(rcx),
+            vm.cpu.read_reg(rdi),
+            vm.cpu.icount(),
+            vm.jit_region_dispatch_count(),
+            bytes,
+        )
+    };
+
+    let interp = run(false);
+    let jit = run(true);
+    assert_eq!(interp.0, 0, "interpreter left REP count unfinished");
+    assert_eq!(interp.1, buf + len, "interpreter advanced RDI incorrectly");
+    assert!(interp.4.iter().all(|&byte| byte == 0x5a));
+    assert_eq!(jit.0, interp.0, "JIT left REP count unfinished");
+    assert_eq!(jit.1, interp.1, "JIT advanced RDI incorrectly");
+    assert_eq!(jit.2, interp.2, "JIT retired a different instruction count");
+    assert_eq!(jit.4, interp.4, "JIT wrote a different byte image");
+    assert!(
+        jit.3 >= 2,
+        "a REP loop beyond the liveness cap must return through multiple region dispatches"
+    );
 }
 
 // ── Compiled-code budget: over the cap, the least-recently-used compiled block

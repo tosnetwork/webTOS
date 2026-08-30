@@ -329,7 +329,7 @@
 {
 	local tmp:2 = KReg_reg[0,16] & KReg_rm[0,16];
 	ZF = (tmp == 0);
-	tmp = KReg_reg[0,16] & ~KReg_rm[0,16];
+	tmp = ~KReg_reg[0,16] & KReg_rm[0,16];
 	CF = (tmp == 0);
 	AF = 0;
 	OF = 0;
@@ -342,7 +342,7 @@
 {
 	local tmp:1 = KReg_reg[0,8] & KReg_rm[0,8];
 	ZF = (tmp == 0);
-	tmp = KReg_reg[0,8] & ~KReg_rm[0,8];
+	tmp = ~KReg_reg[0,8] & KReg_rm[0,8];
 	CF = (tmp == 0);
 	AF = 0;
 	OF = 0;
@@ -355,7 +355,7 @@
 {
 	local tmp:8 = KReg_reg[0,64] & KReg_rm[0,64];
 	ZF = (tmp == 0);
-	tmp = KReg_reg[0,64] & ~KReg_rm[0,64];
+	tmp = ~KReg_reg[0,64] & KReg_rm[0,64];
 	CF = (tmp == 0);
 	AF = 0;
 	OF = 0;
@@ -368,7 +368,7 @@
 {
 	local tmp:4 = KReg_reg[0,32] & KReg_rm[0,32];
 	ZF = (tmp == 0);
-	tmp = KReg_reg[0,32] & ~KReg_rm[0,32];
+	tmp = ~KReg_reg[0,32] & KReg_rm[0,32];
 	CF = (tmp == 0);
 	AF = 0;
 	OF = 0;

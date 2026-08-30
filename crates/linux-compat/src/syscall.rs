@@ -546,6 +546,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             });
             let ok = cpu.mem.unmap_memory_len(a[0], a[1]);
             if ok {
+                env.forget_file_backed_range(env.proc.asid, a[0], align_up(a[1], PAGE_SIZE));
                 env.pager
                     .unmap(env.proc.asid, a[0], align_up(a[1], PAGE_SIZE));
             }
@@ -562,8 +563,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         }
         abi::SYS_MPROTECT => sys_mprotect(env, cpu, a[0], a[1], a[2]),
         abi::SYS_MREMAP => sys_mremap(env, cpu, a),
-        // Advisory only; taking no action is a valid implementation.
-        abi::SYS_MADVISE => Ok(0),
+        abi::SYS_MADVISE => sys_madvise(env, cpu, a[0], a[1], a[2]),
         abi::SYS_BRK => sys_brk(env, cpu, a[0]),
 
         abi::SYS_RT_SIGACTION => sys_rt_sigaction(env, cpu, a[0], a[1], a[2]),
@@ -2571,6 +2571,7 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // MAP_FIXED replaces any existing mapping.
         cpu.mem.unmap_memory_len(target, len);
         env.pager.unmap(env.proc.asid, target, len);
+        env.forget_file_backed_range(env.proc.asid, target, len);
         target
     } else if addr != 0
         && addr & (PAGE_SIZE - 1) == 0
@@ -2679,6 +2680,10 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             offset,
         });
     }
+    let file_backed = flags & abi::MAP_ANONYMOUS == 0;
+    if file_backed {
+        env.record_file_backed_range(env.proc.asid, target, len);
+    }
     if let Some((file, file_len)) = lazy_file {
         if file_len > 0 {
             let mapping = crate::pager::FileMapping::new(
@@ -2701,6 +2706,94 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         return Err(abi::ENOMEM);
     }
     Ok(target)
+}
+
+/// Applies the observable part of `madvise(2)`.
+///
+/// Most advice values are performance hints and may legitimately be ignored.
+/// `MADV_DONTNEED` is different: on anonymous private memory Linux guarantees
+/// that subsequent reads observe zero-filled pages. Returning success while
+/// retaining old bytes leaks one allocation into the next and breaks real
+/// allocators (JSC/Bun uses this as its page-discard primitive).
+fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u64) -> SysResult {
+    const MADV_DONTNEED: u64 = 4;
+
+    if len == 0 {
+        return Ok(0);
+    }
+    if addr & (PAGE_SIZE - 1) != 0 {
+        return Err(abi::EINVAL);
+    }
+    let len = len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|value| value & !(PAGE_SIZE - 1))
+        .ok_or(abi::ENOMEM)?;
+    let end = addr.checked_add(len).ok_or(abi::ENOMEM)?;
+
+    if advice != MADV_DONTNEED {
+        return match advice {
+            // These are content-preserving performance/core-dump hints. The
+            // kernel is allowed to take no immediate action, so success with
+            // no state change is honest in this execution model.
+            0..=3 // NORMAL, RANDOM, SEQUENTIAL, WILLNEED
+            | 8 // FREE (the kernel may retain the pages indefinitely)
+            | 12..=17 // MERGEABLE..DODUMP
+            | 20..=23 // COLD, PAGEOUT, POPULATE_READ/WRITE
+            | 25 => Ok(0), // COLLAPSE
+
+            // REMOVE changes the backing store. DONTFORK/DOFORK and
+            // WIPEONFORK/KEEPONFORK change the address space inherited by a
+            // child. DONTNEED_LOCKED has locking preconditions. None is a
+            // mere hint, so fail closed until those policies are represented
+            // in Process/COW state. Unknown advice values are EINVAL too,
+            // which real runtimes use as a feature probe.
+            _ => Err(abi::EINVAL),
+        };
+    }
+
+    // A MAP_SHARED mapping must first be reconciled with its mutable backing
+    // file. Refuse that case instead of claiming success and substituting
+    // zeros for file data. Immutable manifest-backed pages can be discarded
+    // safely: make them inaccessible/nonresident and the existing pager will
+    // restore their digest-pinned bytes on the next access.
+    let touches_shared_file = env.shared_maps.iter().any(|mapping| {
+        mapping.asid == env.proc.asid
+            && mapping.addr < end
+            && mapping.addr.saturating_add(mapping.len) > addr
+    });
+    if touches_shared_file {
+        return Err(abi::EINVAL);
+    }
+
+    let touches_eager_file = env.file_backed_ranges.iter().any(|mapping| {
+        if mapping.asid != env.proc.asid || mapping.start >= end || mapping.end <= addr {
+            return false;
+        }
+        let first = mapping.start.max(addr) & !(PAGE_SIZE - 1);
+        let last = mapping.end.min(end);
+        (first..last)
+            .step_by(PAGE_SIZE as usize)
+            .any(|page| env.pager.page_state(env.proc.asid, page).is_none())
+    });
+    if touches_eager_file {
+        return Err(abi::EINVAL);
+    }
+
+    let mut page = addr;
+    while page < end {
+        if env.pager.page_state(env.proc.asid, page).is_some() {
+            cpu.mem
+                .update_perm(page, PAGE_SIZE, perm::INIT)
+                .map_err(|_| abi::ENOMEM)?;
+        } else {
+            cpu.mem
+                .fill_mem(page, PAGE_SIZE, 0)
+                .map_err(|_| abi::ENOMEM)?;
+        }
+        page += PAGE_SIZE;
+    }
+    env.pager.discard(env.proc.asid, addr, len);
+    Ok(0)
 }
 
 /// `mremap`: resizes a mapping. Shrinking truncates in place; growing
@@ -2734,6 +2827,11 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         // In-place growth is never attempted; the caller must allow a move.
         return Err(abi::ENOMEM);
     }
+    let old_was_file_backed = env.file_backed_ranges.iter().any(|mapping| {
+        mapping.asid == env.proc.asid
+            && mapping.start < old_addr.saturating_add(old_size)
+            && mapping.end > old_addr
+    });
     let hint = env.proc.mmap_next.get();
     let target = cpu
         .mem
@@ -2762,6 +2860,10 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
     cpu.mem.unmap_memory_len(old_addr, old_size);
     env.pager
         .remap(env.proc.asid, old_addr, old_size, target, new_size);
+    env.forget_file_backed_range(env.proc.asid, old_addr, old_size);
+    if old_was_file_backed {
+        env.record_file_backed_range(env.proc.asid, target, new_size);
+    }
     let mut page = target;
     while page < target + new_size {
         if let Some((resident, final_perm)) = env.pager.page_state(env.proc.asid, page) {
@@ -4365,6 +4467,7 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
     };
     if !is_thread {
         env.pager.fork_space(env.proc.asid, child_proc.asid);
+        env.fork_file_backed_ranges(env.proc.asid, child_proc.asid);
     }
     if spec.flags & CLONE_CHILD_CLEARTID != 0 {
         child_proc.clear_child_tid = spec.child_tid;
@@ -4551,6 +4654,7 @@ fn sys_execve(
     env.proc.asid = crate::alloc_asid();
     x64_engine::vm::set_current_asid(env.proc.asid);
     env.pager.drop_space(old_asid);
+    env.drop_file_backed_space(old_asid);
     let result = env.start_image(cpu, &path);
     cpu.icount = icount;
 

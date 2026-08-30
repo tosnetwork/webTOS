@@ -885,6 +885,7 @@ async function runTerminalPhase(page, origin, name, record, gateway, images) {
 // ------------------------------------------------------------- browser side
 
 const EXEC_TIMEOUT = 180_000;
+const M9_ORACLE_OUTPUT = "M9_ORACLE_FNV1A64=0a7c58fd00cdfc14\n";
 
 // "exit 0 · 73,280 instructions total" -> 73280
 const icountOf = (status) => {
@@ -1119,6 +1120,7 @@ async function runEngine(name, origin, gateway, images) {
       files: [
         { path: "/bin/hello", url: `${origin}/web/hello_linux.elf` },
         { path: "/bin/hello_dynamic", url: `${origin}/test_data/hello_dynamic.elf` },
+        { path: "/bin/m9-oracle", url: `${origin}/test_data/m9_icelake_oracle.elf` },
         { path: "/lib/ld-musl-x86_64.so.1", url: `${origin}/test_data/alpine-minirootfs/lib/ld-musl-x86_64.so.1` },
       ],
       // Matches the `hello-static` case in the native trace recorder exactly:
@@ -1133,14 +1135,43 @@ async function runEngine(name, origin, gateway, images) {
       steps: [
         { label: "static hello", path: "/bin/hello", argv: ["hello"] },
         { label: "dynamic hello (musl loader)", path: "/bin/hello_dynamic", argv: ["hello_dynamic"] },
+        { label: "M9 Ice Lake oracle replay", path: "/bin/m9-oracle", argv: ["m9-oracle"] },
       ],
     });
     record("worker boots the machine", true, `${direct.bootMs.toFixed(0)} ms`);
     for (const run of direct.runs) {
-      const ok = run.status === 1 && run.exitCode === 0 && /ello/.test(run.output);
+      const expectedOutput = run.label === "M9 Ice Lake oracle replay"
+        ? run.output === M9_ORACLE_OUTPUT
+        : /ello/.test(run.output);
+      const ok = run.status === 1 && run.exitCode === 0 && expectedOutput;
       fingerprint[run.label] = run.icount;
       record(run.label, ok, ok ? `${run.icount.toLocaleString()} instructions` : `status=${run.status} exit=${run.exitCode} ${run.error} ${JSON.stringify(run.output.slice(0, 80))}`);
     }
+
+    const m9JitReplay = await page.evaluate(workerDriver, {
+      workerUrl: `${origin}/web/worker.js`,
+      files: [
+        { path: "/bin/m9-oracle", url: `${origin}/test_data/m9_icelake_oracle.elf` },
+      ],
+      jitAfter: 1,
+      steps: [
+        { label: "M9 Ice Lake oracle JIT replay", path: "/bin/m9-oracle", argv: ["m9-oracle"] },
+      ],
+    });
+    const m9Jit = m9JitReplay.runs[0];
+    const m9JitOk =
+      m9Jit.status === 1 &&
+      m9Jit.exitCode === 0 &&
+      m9Jit.output === M9_ORACLE_OUTPUT &&
+      m9Jit.jitBlocks + m9Jit.jitRegions > 0;
+    fingerprint["M9 Ice Lake oracle JIT replay"] = m9Jit.icount;
+    record(
+      "M9 Ice Lake oracle JIT replay",
+      m9JitOk,
+      m9JitOk
+        ? `${m9Jit.icount.toLocaleString()} instructions, ${m9Jit.jitBlocks} block and ${m9Jit.jitRegions} region dispatches`
+        : `status=${m9Jit.status} exit=${m9Jit.exitCode} blocks=${m9Jit.jitBlocks} regions=${m9Jit.jitRegions} ${m9Jit.error} ${JSON.stringify(m9Jit.output.slice(0, 80))}`,
+    );
 
     const eagerComparison = await page.evaluate(workerDriver, {
       workerUrl: `${origin}/web/worker.js`,

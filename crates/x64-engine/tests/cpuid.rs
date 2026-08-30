@@ -90,7 +90,7 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
     assert_eq!(
         probe.run(0, 0),
         CpuidRegisters {
-            eax: 1,
+            eax: 0x0d,
             ebx: u32::from_le_bytes(*b"Genu"),
             ecx: u32::from_le_bytes(*b"ntel"),
             edx: u32::from_le_bytes(*b"ineI"),
@@ -104,7 +104,10 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
         | (1 << 15) // PDCM
         | (1 << 23) // POPCNT
         | (1 << 24) // TSC deadline
-        | (1 << 25); // AES-NI
+        | (1 << 25) // AES-NI
+        | (1 << 26) // XSAVE
+        | (1 << 27) // OSXSAVE
+        | (1 << 28); // AVX
     let expected_leaf_1_edx = (1 << 0) // FPU
         | (1 << 1) // VME
         | (1 << 2) // DE
@@ -127,7 +130,7 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
             ecx: expected_leaf_1_ecx,
             edx: expected_leaf_1_edx,
         },
-        "CPUID.1 feature masks must not be crossed, and XSAVE stays clear until leaf 0x0d exists"
+        "CPUID.1 feature masks and AVX/xstate prerequisites must not be crossed"
     );
 
     assert_eq!(
@@ -143,16 +146,22 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
 }
 
 #[test]
-fn conservative_profile_has_finite_leaf_boundaries() {
+fn icelake_profile_has_finite_leaf_boundaries() {
     let mut probe = CpuidProbe::new();
 
     assert_eq!(
         probe.run(7, 0),
         CpuidRegisters {
             eax: 0,
-            ebx: 0,
-            ecx: 0,
-            edx: 0,
+            ebx: (1 << 3) // BMI1
+                | (1 << 5) // AVX2
+                | (1 << 8) // BMI2
+                | (1 << 16) // AVX-512F
+                | (1 << 28) // AVX-512CD
+                | (1 << 30) // AVX-512BW
+                | (1 << 31), // AVX-512VL
+            ecx: 1 << 6,  // AVX-512VBMI2
+            edx: 1 << 14, // AVX-512VPOPCNTDQ
         },
         "CPUID.7.0 EAX is the maximum supported subleaf, never a sentinel"
     );
@@ -169,6 +178,37 @@ fn conservative_profile_has_finite_leaf_boundaries() {
             "unsupported CPUID.7 subleaf {subleaf:#x} must be a total zero result"
         );
     }
+}
+
+#[test]
+fn profile_satisfies_the_pinned_simdutf_icelake_selector_without_forcing() {
+    // The simdutf implementation embedded by the pinned Bun/Claude workload
+    // requires AVX2, BMI1/2, AVX-512BW/CD/VL/VBMI2/VPOPCNTDQ. AVX-512F and
+    // the AVX/OSXSAVE prerequisites are architectural dependencies. Keep this
+    // gate explicit so changing one CPUID bit cannot silently demote normal
+    // runtime detection to haswell/westmere while the instruction tests stay
+    // green. AVX-512DQ is intentionally not part of simdutf's selector.
+    let mut probe = CpuidProbe::new();
+    let leaf1 = probe.run(1, 0);
+    let leaf7 = probe.run(7, 0);
+
+    let required_leaf1_ecx = (1 << 26) | (1 << 27) | (1 << 28); // XSAVE, OSXSAVE, AVX
+    assert_eq!(
+        leaf1.ecx & required_leaf1_ecx,
+        required_leaf1_ecx,
+        "simdutf's AVX prerequisite is not guest-visible"
+    );
+
+    let required_leaf7_ebx = (1 << 3) // BMI1
+        | (1 << 5) // AVX2
+        | (1 << 8) // BMI2
+        | (1 << 16) // AVX-512F
+        | (1 << 28) // AVX-512CD
+        | (1 << 30) // AVX-512BW
+        | (1 << 31); // AVX-512VL
+    assert_eq!(leaf7.ebx & required_leaf7_ebx, required_leaf7_ebx);
+    assert_ne!(leaf7.ecx & (1 << 6), 0, "AVX-512VBMI2 is required");
+    assert_ne!(leaf7.edx & (1 << 14), 0, "AVX-512VPOPCNTDQ is required");
 }
 
 #[test]

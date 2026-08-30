@@ -263,8 +263,20 @@ pub mod x86 {
         ("rdtscp", rdtscp),
         ("cpuid_basic_info", cpuid_basic_info),
         ("cpuid_Version_info", cpuid_version_info),
+        ("cpuid_cache_tlb_info", cpuid),
+        ("cpuid_serial_info", cpuid),
+        ("cpuid_Deterministic_Cache_Parameters_info", cpuid),
+        ("cpuid_MONITOR_MWAIT_Features_info", cpuid),
+        ("cpuid_Thermal_Power_Management_info", cpuid),
         ("cpuid_Extended_Feature_Enumeration_info", cpuid_extended_feature_enumeration_info),
+        ("cpuid_Direct_Cache_Access_info", cpuid),
+        ("cpuid_Architectural_Performance_Monitoring_info", cpuid),
+        ("cpuid_Extended_Topology_info", cpuid),
         ("cpuid_Processor_Extended_States_info", cpuid_xstate_info),
+        ("cpuid_Quality_of_Service_info", cpuid),
+        ("cpuid_brand_part1_info", cpuid),
+        ("cpuid_brand_part2_info", cpuid),
+        ("cpuid_brand_part3_info", cpuid),
         ("cpuid", cpuid),
         ("xgetbv", xgetbv),
         ("xsetbv", xsetbv),
@@ -278,6 +290,306 @@ pub mod x86 {
         ("xrstor64", xrstor64),
         ("vpbroadcastd_avx512vl", vpbroadcastd_128),
         ("vpbroadcastd_avx512f", vpbroadcastd_128),
+        ("vpbroadcastb_avx512vl", vpbroadcastb_128),
+        ("vpbroadcastb_avx512bw", vpbroadcastb_128),
+        ("vpbroadcastw_avx512vl", vpbroadcastw_128),
+        ("vpbroadcastw_avx512bw", vpbroadcastw_128),
+        ("vpbroadcastq_avx512vl", vpbroadcastq_128),
+        ("vpbroadcastq_avx512f", vpbroadcastq_128),
+        ("vbroadcastss_avx512vl", vpbroadcastd_128),
+        ("vbroadcastss_avx512f", vpbroadcastd_128),
+        ("vbroadcastsd_avx512vl", vpbroadcastq_128),
+        ("vbroadcastsd_avx512f", vpbroadcastq_128),
+        ("vbroadcastf32x4_avx512vl", copy_128),
+        ("vbroadcastf32x4_avx512f", copy_128),
+        ("vbroadcasti32x4_avx512vl", copy_128),
+        ("vbroadcasti32x4_avx512f", copy_128),
+        ("vaddpd_avx512vl", addpd_masked),
+        ("vaddpd_avx512f", addpd_masked),
+        ("vaddps_avx512vl", addps_masked),
+        ("vaddps_avx512f", addps_masked),
+        ("vaddsubpd_avx", addsubpd),
+        ("vaddsubps_avx", addsubps),
+        ("vdivpd_avx", divpd),
+        ("vdivpd_avx512vl", divpd_masked),
+        ("vdivpd_avx512f", divpd_masked),
+        ("vdivps_avx", divps),
+        ("vdivps_avx512vl", divps_masked),
+        ("vdivps_avx512f", divps_masked),
+        ("vmaxpd_avx", maxpd),
+        ("vmaxpd_avx512vl", maxpd_masked),
+        ("vmaxpd_avx512f", maxpd_masked),
+        ("vmaxps_avx", maxps),
+        ("vmaxps_avx512vl", maxps_masked),
+        ("vmaxps_avx512f", maxps_masked),
+        ("vmaxsd_avx", maxsd),
+        ("vmaxss_avx", maxss),
+        ("vmaxsd_avx512f", maxsd_masked),
+        ("vmaxss_avx512f", maxss_masked),
+        ("vminpd_avx", minpd),
+        ("vminpd_avx512vl", minpd_masked),
+        ("vminpd_avx512f", minpd_masked),
+        ("vminps_avx", minps),
+        ("vminps_avx512vl", minps_masked),
+        ("vminps_avx512f", minps_masked),
+        ("vminsd_avx", minsd),
+        ("vminss_avx", minss),
+        ("vminsd_avx512f", minsd_masked),
+        ("vminss_avx512f", minss_masked),
+        ("vaddsd_avx512f", addsd_masked),
+        ("vaddss_avx512f", addss_masked),
+        ("vdivsd_avx512f", divsd_masked),
+        ("vdivss_avx512f", divss_masked),
+        ("vmulsd_avx512f", mulsd_masked),
+        ("vmulss_avx512f", mulss_masked),
+        ("vsubsd_avx512f", subsd_masked),
+        ("vsubss_avx512f", subss_masked),
+        ("vmulpd_avx512vl", mulpd_masked),
+        ("vmulpd_avx512f", mulpd_masked),
+        ("vmulps_avx512vl", mulps_masked),
+        ("vmulps_avx512f", mulps_masked),
+        ("vsqrtpd_avx", vector_sqrtpd),
+        ("vsqrtpd_avx512vl", vector_sqrtpd_masked),
+        ("vsqrtpd_avx512f", vector_sqrtpd_masked),
+        ("vsqrtps_avx", vector_sqrtps),
+        ("vsqrtps_avx512vl", vector_sqrtps_masked),
+        ("vsqrtps_avx512f", vector_sqrtps_masked),
+        ("vsubpd_avx", subpd),
+        ("vsubpd_avx512vl", subpd_masked),
+        ("vsubpd_avx512f", subpd_masked),
+        ("vsubps_avx", subps),
+        ("vsubps_avx512vl", subps_masked),
+        ("vsubps_avx512f", subps_masked),
+        ("vunpckhpd_avx", packed_unpack_high_q_128),
+        ("vunpckhpd_avx512vl", packed_unpack_high_q_128),
+        ("vunpckhpd_avx512f", packed_unpack_high_q_128),
+        ("vunpcklpd_avx", punpcklqdq),
+        ("vunpcklpd_avx512vl", punpcklqdq),
+        ("vunpcklpd_avx512f", punpcklqdq),
+        ("vunpckhps_avx", packed_unpack_high_d_128),
+        ("vunpckhps_avx512vl", packed_unpack_high_d_128),
+        ("vunpckhps_avx512f", packed_unpack_high_d_128),
+        ("vunpcklps_avx", packed_unpack_low_d_128),
+        ("vunpcklps_avx512vl", packed_unpack_low_d_128),
+        ("vunpcklps_avx512f", packed_unpack_low_d_128),
+        ("vblendpd_avx", packed_blend_pd_indexed),
+        ("vblendps_avx", packed_blend_ps_indexed),
+        ("vblendvpd_avx", blendvpd),
+        ("vblendvps_avx", blendvps),
+        ("vblendmpd_avx512vl", copy_second_128),
+        ("vblendmpd_avx512f", copy_second_128),
+        ("vblendmps_avx512vl", copy_second_128),
+        ("vblendmps_avx512f", copy_second_128),
+        ("vmovddup_avx512vl", packed_move_ddup_128),
+        ("vmovddup_avx512f", packed_move_ddup_128),
+        ("vmovshdup_avx", packed_move_shdup_128),
+        ("vmovshdup_avx512vl", packed_move_shdup_128),
+        ("vmovshdup_avx512f", packed_move_shdup_128),
+        ("vmovsldup_avx", packed_move_sldup_128),
+        ("vmovsldup_avx512vl", packed_move_sldup_128),
+        ("vmovsldup_avx512f", packed_move_sldup_128),
+        ("vmovntdqa_avx", copy_128),
+        ("vmovntdqa_avx2", copy_128),
+        ("vmovntdqa_avx512vl", copy_128),
+        ("vmovntdqa_avx512f", copy_128),
+        ("vlddqu_avx", copy_128),
+        ("vmovntpd_avx", copy_128),
+        ("vmovntpd_avx512vl", copy_128),
+        ("vmovntpd_avx512f", copy_128),
+        ("vmovntps_avx", copy_128),
+        ("vmovntps_avx512vl", copy_128),
+        ("vmovntps_avx512f", copy_128),
+        ("vextractps_avx", extractps),
+        ("vextractps_avx512f", extractps),
+        ("vinsertps_avx", insertps),
+        ("vinsertps_avx512f", insertps),
+        ("vmovmskpd_avx", vmovmskpd),
+        ("vmovmskps_avx", vmovmskps),
+        ("webtos_vmovmskpd_256", vmovmskpd_256),
+        ("webtos_vmovmskps_256", vmovmskps_256),
+        ("vmovhlps_avx", vmovhlps),
+        ("vmovhpd_avx", vmov_high64),
+        ("vmovhpd_avx512f", vmov_high64),
+        ("vmovhps_avx", vmov_high64),
+        ("vmovhps_avx512f", vmov_high64),
+        ("vmovlhps_avx", vmovlhps),
+        ("vmovlhps_avx512f", vmovlhps),
+        ("vmovlpd_avx", vmov_low64),
+        ("vmovlpd_avx512f", vmov_low64),
+        ("vmovlps_avx", vmov_low64),
+        ("vmovlps_avx512f", vmov_low64),
+        ("vpermilpd_avx", vpermilpd),
+        ("vpermilpd_avx512vl", vpermilpd),
+        ("vpermilpd_avx512f", vpermilpd),
+        ("vpermilps_avx", vpermilps),
+        ("vpermilps_avx512vl", vpermilps),
+        ("vpermilps_avx512f", vpermilps),
+        ("vroundpd_avx", roundpd),
+        ("vroundps_avx", roundps),
+        ("vroundsd_avx", roundsd),
+        ("vroundss_avx", roundss),
+        ("vrcpps_avx", reciprocal_ps),
+        ("vrcpss_avx", reciprocal_ss),
+        ("vrsqrtps_avx", reciprocal_sqrt_ps),
+        ("vrsqrtss_avx", reciprocal_sqrt_ss),
+        ("vmpsadbw_avx", packed_mpsadbw_128),
+        ("vmpsadbw_avx2", packed_mpsadbw_128),
+        ("vdppd_avx", dotpd),
+        ("vdpps_avx", dotps),
+        ("vcmppd_avx", compare_pd),
+        ("vcmpps_avx", compare_ps),
+        ("vcmpsd_avx", compare_sd),
+        ("vcmpss_avx", compare_ss),
+        ("webtos_vcmppd_mask_128", compare_pd_mask_128),
+        ("webtos_vcmpps_mask_128", compare_ps_mask_128),
+        ("webtos_vcmpsd_mask", compare_sd_mask),
+        ("webtos_vcmpss_mask", compare_ss_mask),
+        ("vcvtdq2pd_avx", convert_i32_to_f64_128),
+        ("vcvtdq2ps_avx", convert_i32_to_f32_128),
+        ("vcvtps2dq_avx", convert_f32_to_i32_128),
+        ("vcvtps2pd_avx", convert_f32_to_f64_128),
+        ("vcvtdq2pd_avx512vl", convert_i32_to_f64_128),
+        ("vcvtdq2pd_avx512f", convert_i32_to_f64_128),
+        ("vcvtdq2ps_avx512vl", convert_i32_to_f32_128),
+        ("vcvtdq2ps_avx512f", convert_i32_to_f32_128),
+        ("vcvtpd2dq_avx512vl", convert_f64_to_i32),
+        ("vcvtpd2dq_avx512f", convert_f64_to_i32),
+        ("vcvtpd2ps_avx512vl", convert_f64_pair_to_f32),
+        ("vcvtpd2ps_avx512f", convert_f64_pair_to_f32),
+        ("vcvtpd2udq_avx512vl", convert_f64_to_u32),
+        ("vcvtpd2udq_avx512f", convert_f64_to_u32),
+        ("vcvtph2ps_avx512vl", convert_f16_to_f32),
+        ("vcvtph2ps_avx512f", convert_f16_to_f32),
+        ("vcvtps2dq_avx512vl", convert_f32_to_i32_128),
+        ("vcvtps2dq_avx512f", convert_f32_to_i32_128),
+        ("vcvtps2pd_avx512vl", convert_f32_to_f64_128),
+        ("vcvtps2pd_avx512f", convert_f32_to_f64_128),
+        ("vcvtps2ph_avx512vl", convert_f32_to_f16),
+        ("vcvtps2ph_avx512f", convert_f32_to_f16),
+        ("vcvtps2udq_avx512vl", convert_f32_to_u32),
+        ("vcvtps2udq_avx512f", convert_f32_to_u32),
+        ("vcvtsd2si_avx512f", convert_scalar_f64_to_i),
+        ("vcvtsd2ss_avx512f", convert_scalar_f64_to_f32),
+        ("vcvtsd2usi_avx512f", convert_scalar_f64_to_u),
+        ("vcvtsi2sd_avx512f", convert_scalar_i_to_f64),
+        ("vcvtsi2ss_avx512f", convert_scalar_i_to_f32),
+        ("vcvtss2sd_avx512f", convert_scalar_f32_to_f64),
+        ("vcvtss2si_avx512f", convert_scalar_f32_to_i),
+        ("vcvtss2usi_avx512f", convert_scalar_f32_to_u),
+        ("vcvttpd2dq_avx512vl", truncate_f64_to_i32),
+        ("vcvttpd2dq_avx512f", truncate_f64_to_i32),
+        ("vcvttpd2udq_avx512vl", truncate_f64_to_u32),
+        ("vcvttpd2udq_avx512f", truncate_f64_to_u32),
+        ("vcvttps2dq_avx512vl", truncate_f32_to_i32),
+        ("vcvttps2dq_avx512f", truncate_f32_to_i32),
+        ("vcvttps2udq_avx512vl", truncate_f32_to_u32),
+        ("vcvttps2udq_avx512f", truncate_f32_to_u32),
+        ("vcvttsd2si_avx512f", truncate_scalar_f64_to_i),
+        ("vcvttsd2usi_avx512f", truncate_scalar_f64_to_u),
+        ("vcvttss2si_avx512f", truncate_scalar_f32_to_i),
+        ("vcvttss2usi_avx512f", truncate_scalar_f32_to_u),
+        ("vcvtudq2pd_avx512vl", convert_u32_to_f64),
+        ("vcvtudq2pd_avx512f", convert_u32_to_f64),
+        ("vcvtudq2ps_avx512vl", convert_u32_to_f32),
+        ("vcvtudq2ps_avx512f", convert_u32_to_f32),
+        ("vcvtusi2sd_avx512f", convert_scalar_u_to_f64),
+        ("vcvtusi2ss_avx512f", convert_scalar_u_to_f32),
+        ("vgatherdpd", vex_vsib_gather),
+        ("vgatherdps", vex_vsib_gather),
+        ("vgatherqpd", vex_vsib_gather),
+        ("vgatherqps", vex_vsib_gather),
+        ("vpgatherdd", vex_vsib_gather),
+        ("vpgatherdq", vex_vsib_gather),
+        ("vpgatherqd", vex_vsib_gather),
+        ("vpgatherqq", vex_vsib_gather),
+        ("vgatherdpd_avx512vl", vsib_gather),
+        ("vgatherdpd_avx512f", vsib_gather),
+        ("vgatherdps_avx512vl", vsib_gather),
+        ("vgatherdps_avx512f", vsib_gather),
+        ("vgatherqpd_avx512vl", vsib_gather),
+        ("vgatherqpd_avx512f", vsib_gather),
+        ("vgatherqps_avx512vl", vsib_gather),
+        ("vgatherqps_avx512f", vsib_gather),
+        ("vpgatherdd_avx512vl", vsib_gather),
+        ("vpgatherdd_avx512f", vsib_gather),
+        ("vpgatherdq_avx512vl", vsib_gather),
+        ("vpgatherdq_avx512f", vsib_gather),
+        ("vpgatherqd_avx512vl", vsib_gather),
+        ("vpgatherqd_avx512f", vsib_gather),
+        ("vpgatherqq_avx512vl", vsib_gather),
+        ("vpgatherqq_avx512f", vsib_gather),
+        ("vpscatterdd_avx512vl", vsib_scatter),
+        ("vpscatterdd_avx512f", vsib_scatter),
+        ("vpscatterdq_avx512vl", vsib_scatter),
+        ("vpscatterdq_avx512f", vsib_scatter),
+        ("vpscatterqd_avx512vl", vsib_scatter),
+        ("vpscatterqd_avx512f", vsib_scatter),
+        ("vpscatterqq_avx512vl", vsib_scatter),
+        ("vpscatterqq_avx512f", vsib_scatter),
+        ("vscatterdpd_avx512vl", vsib_scatter),
+        ("vscatterdpd_avx512f", vsib_scatter),
+        ("vscatterdps_avx512vl", vsib_scatter),
+        ("vscatterdps_avx512f", vsib_scatter),
+        ("vscatterqpd_avx512vl", vsib_scatter),
+        ("vscatterqpd_avx512f", vsib_scatter),
+        ("vscatterqps_avx512vl", vsib_scatter),
+        ("vscatterqps_avx512f", vsib_scatter),
+        ("vfixupimmpd_avx512vl", fixup_pd),
+        ("vfixupimmpd_avx512f", fixup_pd),
+        ("vfixupimmps_avx512vl", fixup_ps),
+        ("vfixupimmps_avx512f", fixup_ps),
+        ("vfixupimmsd_avx512f", fixup_sd),
+        ("vfixupimmss_avx512f", fixup_ss),
+        ("vgetexppd_avx512vl", getexp_pd),
+        ("vgetexppd_avx512f", getexp_pd),
+        ("vgetexpps_avx512vl", getexp_ps),
+        ("vgetexpps_avx512f", getexp_ps),
+        ("vgetexpsd_avx512f", getexp_sd),
+        ("vgetexpss_avx512f", getexp_ss),
+        ("vgetmantpd_avx512vl", getmant_pd),
+        ("vgetmantpd_avx512f", getmant_pd),
+        ("vgetmantps_avx512vl", getmant_ps),
+        ("vgetmantps_avx512f", getmant_ps),
+        ("vgetmantsd_avx512f", getmant_sd),
+        ("vgetmantss_avx512f", getmant_ss),
+        ("vrcp14pd_avx512vl", rcp14_pd),
+        ("vrcp14pd_avx512f", rcp14_pd),
+        ("vrcp14ps_avx512vl", rcp14_ps),
+        ("vrcp14ps_avx512f", rcp14_ps),
+        ("vrcp14sd_avx512f", rcp14_sd),
+        ("vrcp14ss_avx512f", rcp14_ss),
+        ("vrndscalepd_avx512vl", rndscale_pd),
+        ("vrndscalepd_avx512f", rndscale_pd),
+        ("vrndscaleps_avx512vl", rndscale_ps),
+        ("vrndscaleps_avx512f", rndscale_ps),
+        ("vrndscalesd_avx512f", rndscale_sd),
+        ("vrndscaless_avx512f", rndscale_ss),
+        ("vrsqrt14pd_avx512vl", rsqrt14_pd),
+        ("vrsqrt14pd_avx512f", rsqrt14_pd),
+        ("vrsqrt14ps_avx512vl", rsqrt14_ps),
+        ("vrsqrt14ps_avx512f", rsqrt14_ps),
+        ("vrsqrt14sd_avx512f", rsqrt14_sd),
+        ("vrsqrt14ss_avx512f", rsqrt14_ss),
+        ("vscalefpd_avx512vl", scalef_pd),
+        ("vscalefpd_avx512f", scalef_pd),
+        ("vscalefps_avx512vl", scalef_ps),
+        ("vscalefps_avx512f", scalef_ps),
+        ("vscalefsd_avx512f", scalef_sd),
+        ("vscalefss_avx512f", scalef_ss),
+        ("webtos_cvtpd2dq_pair", convert_f64_pair_to_i32),
+        ("webtos_cvtpd2ps_pair", convert_f64_pair_to_f32),
+        ("vmaskmovdqu_avx", maskmovdqu),
+        ("vhaddps_avx", haddps),
+        ("vhsubpd_avx", hsubpd),
+        ("vhsubps_avx", hsubps),
+        ("vldmxcsr_avx", vldmxcsr),
+        ("vstmxcsr_avx", vstmxcsr),
+        ("vshufpd_avx", packed_shuffle_pd_indexed),
+        ("vshufpd_avx512vl", packed_shuffle_pd_indexed),
+        ("vshufpd_avx512f", packed_shuffle_pd_indexed),
+        ("vshufps_avx", packed_shuffle_ps_128),
+        ("vshufps_avx512vl", packed_shuffle_ps_128),
+        ("vshufps_avx512f", packed_shuffle_ps_128),
         ("vpternlogd_avx512vl", vpternlog_128),
         ("vpternlogd_avx512f", vpternlog_128),
         ("vpternlogq_avx512vl", vpternlog_128),
@@ -319,6 +631,10 @@ pub mod x86 {
         ("vpsrld_avx2", packed_shift_right_d),
         ("vpsrld_avx512vl", packed_shift_right_d),
         ("vpsrld_avx512f", packed_shift_right_d),
+        ("vpsllq_avx", packed_shift_left_q),
+        ("vpsllq_avx2", packed_shift_left_q),
+        ("vpsllq_avx512vl", packed_shift_left_q),
+        ("vpsllq_avx512f", packed_shift_left_q),
         ("vpslld_avx", packed_shift_left_d),
         ("vpslld_avx2", packed_shift_left_d),
         ("vpslld_avx512vl", packed_shift_left_d),
@@ -327,41 +643,440 @@ pub mod x86 {
         ("vpsrldq_avx2", packed_shift_right_lane_bytes),
         ("vpsrldq_avx512vl", packed_shift_right_lane_bytes),
         ("vpsrldq_avx512bw", packed_shift_right_lane_bytes),
+        ("vpslldq_avx", packed_shift_left_lane_bytes),
+        ("vpslldq_avx2", packed_shift_left_lane_bytes),
+        ("vpslldq_avx512vl", packed_shift_left_lane_bytes),
+        ("vpslldq_avx512bw", packed_shift_left_lane_bytes),
+        ("pcmpistri", packed_compare_implicit_index),
+        ("vpcmpistri_avx", packed_compare_implicit_index),
+        ("pcmpistrm", packed_compare_implicit_mask),
+        ("vpcmpistrm_avx", packed_compare_implicit_mask),
+        ("pcmpestri", packed_compare_explicit_index),
+        ("vpcmpestri_avx", packed_compare_explicit_index),
+        ("pcmpestrm", packed_compare_explicit_mask),
+        ("vpcmpestrm_avx", packed_compare_explicit_mask),
         ("vpsllvd_avx2", packed_shift_left_variable_d),
         ("vpsllvd_avx512vl", packed_shift_left_variable_d),
         ("vpsllvd_avx512f", packed_shift_left_variable_d),
         ("vpsrlvd_avx2", packed_shift_right_variable_d),
         ("vpsrlvd_avx512vl", packed_shift_right_variable_d),
         ("vpsrlvd_avx512f", packed_shift_right_variable_d),
+        ("vpsllvq_avx2", packed_shift_left_variable_q_128),
+        ("vpsllvq_avx512vl", packed_shift_left_variable_q_128),
+        ("vpsllvq_avx512f", packed_shift_left_variable_q_128),
+        ("vpsllvw_avx512vl", packed_shift_left_variable_w_128),
+        ("vpsllvw_avx512bw", packed_shift_left_variable_w_128),
+        ("vpsrlvq_avx2", packed_shift_right_variable_q_128),
+        ("vpsrlvq_avx512vl", packed_shift_right_variable_q_128),
+        ("vpsrlvq_avx512f", packed_shift_right_variable_q_128),
+        ("vpsrlvw_avx512vl", packed_shift_right_variable_w_128),
+        ("vpsrlvw_avx512bw", packed_shift_right_variable_w_128),
+        ("vpsravd_avx2", packed_shift_right_arithmetic_variable_d_128),
+        ("vpsravd_avx512vl", packed_shift_right_arithmetic_variable_d_128),
+        ("vpsravd_avx512f", packed_shift_right_arithmetic_variable_d_128),
+        ("vpsravq_avx512vl", packed_shift_right_arithmetic_variable_q_128),
+        ("vpsravq_avx512f", packed_shift_right_arithmetic_variable_q_128),
+        ("vpsravw_avx512vl", packed_shift_right_arithmetic_variable_w_128),
+        ("vpsravw_avx512bw", packed_shift_right_arithmetic_variable_w_128),
+        ("vpsrad_avx", packed_shift_right_arithmetic_d_128),
+        ("vpsrad_avx2", packed_shift_right_arithmetic_d_128),
+        ("vpsrad_avx512vl", packed_shift_right_arithmetic_d_128),
+        ("vpsrad_avx512f", packed_shift_right_arithmetic_d_128),
+        ("vpsraq_avx512vl", packed_shift_right_arithmetic_q_128),
+        ("vpsraq_avx512f", packed_shift_right_arithmetic_q_128),
+        ("vpsraw_avx", psraw),
+        ("vpsraw_avx2", psraw),
+        ("vpsraw_avx512vl", psraw),
+        ("vpsraw_avx512bw", psraw),
+        ("vprold_avx512vl", packed_rotate_left_d_128),
+        ("vprold_avx512f", packed_rotate_left_d_128),
+        ("vprolvd_avx512vl", packed_rotate_left_d_128),
+        ("vprolvd_avx512f", packed_rotate_left_d_128),
+        ("vprolq_avx512vl", packed_rotate_left_q_128),
+        ("vprolq_avx512f", packed_rotate_left_q_128),
+        ("vprolvq_avx512vl", packed_rotate_left_q_128),
+        ("vprolvq_avx512f", packed_rotate_left_q_128),
+        ("vprord_avx512vl", packed_rotate_right_d_128),
+        ("vprord_avx512f", packed_rotate_right_d_128),
+        ("vprorvd_avx512vl", packed_rotate_right_d_128),
+        ("vprorvd_avx512f", packed_rotate_right_d_128),
+        ("vprorq_avx512vl", packed_rotate_right_q_128),
+        ("vprorq_avx512f", packed_rotate_right_q_128),
+        ("vprorvq_avx512vl", packed_rotate_right_q_128),
+        ("vprorvq_avx512f", packed_rotate_right_q_128),
+        ("vplzcntd_avx512vl", packed_leading_zeros_d_128),
+        ("vplzcntd_avx512cd", packed_leading_zeros_d_128),
+        ("vplzcntq_avx512vl", packed_leading_zeros_q_128),
+        ("vplzcntq_avx512cd", packed_leading_zeros_q_128),
+        ("webtos_vpconflictd_128_chunk", packed_conflict_d_128_chunk),
+        ("webtos_vpconflictd_256_chunk", packed_conflict_d_256_chunk),
+        ("webtos_vpconflictd_512_chunk", packed_conflict_d_512_chunk),
+        ("webtos_vpconflictq_128_chunk", packed_conflict_q_128_chunk),
+        ("webtos_vpconflictq_256_chunk", packed_conflict_q_256_chunk),
+        ("webtos_vpconflictq_512_chunk", packed_conflict_q_512_chunk),
         ("webtos_vpshiftvd_mem_128", packed_shift_variable_d_mem_128),
-        ("vpabsb_avx", packed_abs_b_128),
-        ("vpabsb_avx2", packed_abs_b_128),
-        ("vpabsb_avx512vl", packed_abs_b_128),
-        ("vpabsb_avx512bw", packed_abs_b_128),
+        ("vpabsb_avx", packed_abs_b),
+        ("vpabsb_avx2", packed_abs_b),
+        ("vpabsb_avx512vl", packed_abs_b),
+        ("vpabsb_avx512bw", packed_abs_b),
+        ("vpabsw_avx", packed_abs_w),
+        ("vpabsw_avx2", packed_abs_w),
+        ("vpabsw_avx512vl", packed_abs_w),
+        ("vpabsw_avx512bw", packed_abs_w),
+        ("vpabsd_avx", packed_abs_d),
+        ("vpabsd_avx2", packed_abs_d),
+        ("vpabsd_avx512vl", packed_abs_d),
+        ("vpabsd_avx512f", packed_abs_d),
+        ("vpabsq_avx512vl", packed_abs_q),
+        ("vpabsq_avx512f", packed_abs_q),
         ("vpaddw_avx512vl", packed_add_w_128),
         ("vpaddw_avx512bw", packed_add_w_128),
+        ("vpaddb_avx", packed_add_b),
+        ("vpaddb_avx2", packed_add_b),
+        ("vpaddb_avx512vl", packed_add_b),
+        ("vpaddb_avx512bw", packed_add_b),
+        ("webtos_vpaddb_128", packed_add_b),
+        ("webtos_vpaddq_128", packed_add_q_128),
+        ("webtos_vpsadbw_128", packed_sum_absolute_differences_b_128),
+        ("webtos_vextract128_256", packed_extract_128_256),
+        ("webtos_vextract128_512", packed_extract_128_512),
         ("vpsubb_avx", packed_sub_b_128),
         ("vpsubb_avx2", packed_sub_b_128),
         ("vpsubb_avx512vl", packed_sub_b_128),
         ("vpsubb_avx512bw", packed_sub_b_128),
+        ("vpsubw_avx", packed_sub_w),
+        ("vpsubw_avx2", packed_sub_w),
+        ("vpsubw_avx512vl", packed_sub_w),
+        ("vpsubw_avx512bw", packed_sub_w),
         ("vpaddusb_avx", paddusb),
         ("vpaddusb_avx2", paddusb),
         ("vpaddusb_avx512vl", paddusb),
         ("vpaddusb_avx512bw", paddusb),
+        ("vpaddsb_avx", paddsb),
+        ("vpaddsb_avx2", paddsb),
+        ("vpaddsb_avx512vl", paddsb),
+        ("vpaddsb_avx512bw", paddsb),
+        ("vpaddsw_avx", paddsw),
+        ("vpaddsw_avx2", paddsw),
+        ("vpaddsw_avx512vl", paddsw),
+        ("vpaddsw_avx512bw", paddsw),
+        ("vpaddusw_avx", paddusw),
+        ("vpaddusw_avx2", paddusw),
+        ("vpaddusw_avx512vl", paddusw),
+        ("vpaddusw_avx512bw", paddusw),
+        ("vpmulhuw_avx", pmulhuw),
+        ("vpmulhuw_avx2", pmulhuw),
+        ("vpmulhuw_avx512vl", pmulhuw),
+        ("vpmulhuw_avx512bw", pmulhuw),
+        ("vpmullw_avx", packed_mul_low_w_128),
+        ("vpmullw_avx2", packed_mul_low_w_128),
+        ("vpmullw_avx512vl", packed_mul_low_w_128),
+        ("vpmullw_avx512bw", packed_mul_low_w_128),
+        ("vpunpcklwd_avx", packed_unpack_low_w_128),
+        ("vpunpcklwd_avx2", packed_unpack_low_w_128),
+        ("vpunpcklwd_avx512vl", packed_unpack_low_w_128),
+        ("vpunpcklwd_avx512bw", packed_unpack_low_w_128),
+        ("vpunpckhwd_avx", packed_unpack_high_w_128),
+        ("vpunpckhwd_avx2", packed_unpack_high_w_128),
+        ("vpunpckhwd_avx512vl", packed_unpack_high_w_128),
+        ("vpunpckhwd_avx512bw", packed_unpack_high_w_128),
+        ("vpunpcklqdq_avx", punpcklqdq),
+        ("vpunpcklqdq_avx2", punpcklqdq),
+        ("vpunpcklqdq_avx512vl", punpcklqdq),
+        ("vpunpcklqdq_avx512f", punpcklqdq),
+        ("vpunpckhqdq_avx", packed_unpack_high_q_128),
+        ("vpunpckhqdq_avx2", packed_unpack_high_q_128),
+        ("vpunpckhqdq_avx512vl", packed_unpack_high_q_128),
+        ("vpunpckhqdq_avx512f", packed_unpack_high_q_128),
+        ("vpshufd_avx", packed_shuffle_d_128),
+        ("vpshufd_avx2", packed_shuffle_d_128),
+        ("vpshufd_avx512vl", packed_shuffle_d_128),
+        ("vpshufd_avx512f", packed_shuffle_d_128),
         ("vpsubusb_avx", psubusb),
         ("vpsubusb_avx2", psubusb),
         ("vpsubusb_avx512vl", psubusb),
         ("vpsubusb_avx512bw", psubusb),
+        ("vpsubusw_avx", psubusw),
+        ("vpsubusw_avx2", psubusw),
+        ("vpsubusw_avx512vl", psubusw),
+        ("vpsubusw_avx512bw", psubusw),
         ("vpmovzxbw_avx", pmovzxbw_single),
         ("vpmovzxbw_avx2", pmovzxbw_single),
         ("vpmovzxbw_avx512vl", pmovzxbw_single),
         ("vpmovzxbw_avx512bw", pmovzxbw_single),
         ("vpmovwb_avx512vl", packed_narrow_w_to_b_128),
         ("vpmovwb_avx512bw", packed_narrow_w_to_b_128),
+        ("vpmovdb_avx512vl", narrow_dword_to_byte),
+        ("vpmovdb_avx512f", narrow_dword_to_byte),
+        ("vpmovsdb_avx512vl", narrow_signed_dword_to_byte),
+        ("vpmovsdb_avx512f", narrow_signed_dword_to_byte),
+        ("vpmovusdb_avx512vl", narrow_unsigned_dword_to_byte),
+        ("vpmovusdb_avx512f", narrow_unsigned_dword_to_byte),
+        ("vpmovdw_avx512vl", narrow_dword_to_word),
+        ("vpmovdw_avx512f", narrow_dword_to_word),
+        ("vpmovsdw_avx512vl", narrow_signed_dword_to_word),
+        ("vpmovsdw_avx512f", narrow_signed_dword_to_word),
+        ("vpmovusdw_avx512vl", narrow_unsigned_dword_to_word),
+        ("vpmovusdw_avx512f", narrow_unsigned_dword_to_word),
+        ("vpmovqb_avx512vl", narrow_qword_to_byte),
+        ("vpmovqb_avx512f", narrow_qword_to_byte),
+        ("vpmovsqb_avx512vl", narrow_signed_qword_to_byte),
+        ("vpmovsqb_avx512f", narrow_signed_qword_to_byte),
+        ("vpmovusqb_avx512vl", narrow_unsigned_qword_to_byte),
+        ("vpmovusqb_avx512f", narrow_unsigned_qword_to_byte),
+        ("vpmovqw_avx512vl", narrow_qword_to_word),
+        ("vpmovqw_avx512f", narrow_qword_to_word),
+        ("vpmovsqw_avx512vl", narrow_signed_qword_to_word),
+        ("vpmovsqw_avx512f", narrow_signed_qword_to_word),
+        ("vpmovusqw_avx512vl", narrow_unsigned_qword_to_word),
+        ("vpmovusqw_avx512f", narrow_unsigned_qword_to_word),
+        ("vpmovqd_avx512vl", narrow_qword_to_dword),
+        ("vpmovqd_avx512f", narrow_qword_to_dword),
+        ("vpmovsqd_avx512vl", narrow_signed_qword_to_dword),
+        ("vpmovsqd_avx512f", narrow_signed_qword_to_dword),
+        ("vpmovusqd_avx512vl", narrow_unsigned_qword_to_dword),
+        ("vpmovusqd_avx512f", narrow_unsigned_qword_to_dword),
+        ("vpmovswb_avx512vl", narrow_signed_word_to_byte),
+        ("vpmovswb_avx512bw", narrow_signed_word_to_byte),
+        ("vpmovuswb_avx512vl", narrow_unsigned_word_to_byte),
+        ("vpmovuswb_avx512bw", narrow_unsigned_word_to_byte),
         ("vpmovzxwd_avx", pmovzxwd_single),
         ("vpmovzxwd_avx2", pmovzxwd_single),
         ("vpmovzxwd_avx512vl", pmovzxwd_single),
         ("vpmovzxwd_avx512f", pmovzxwd_single),
+        ("vpmovzxbd_avx", pmovzxbd_single),
+        ("vpmovzxbd_avx2", pmovzxbd_single),
+        ("vpmovzxbd_avx512vl", pmovzxbd_single),
+        ("vpmovzxbd_avx512f", pmovzxbd_single),
+        ("vpmovzxbq_avx", packed_move_zxbq_128_indexed),
+        ("vpmovzxbq_avx2", packed_move_zxbq_128_indexed),
+        ("vpmovzxbq_avx512vl", packed_move_zxbq_128_indexed),
+        ("vpmovzxbq_avx512f", packed_move_zxbq_128_indexed),
+        ("vpmovzxwq_avx", packed_move_zxwq_128_indexed),
+        ("vpmovzxwq_avx2", packed_move_zxwq_128_indexed),
+        ("vpmovzxwq_avx512vl", packed_move_zxwq_128_indexed),
+        ("vpmovzxwq_avx512f", packed_move_zxwq_128_indexed),
+        ("webtos_vpmovzxbd_mem_128_chunk", packed_move_zxbd_mem_128_chunk),
+        ("vpmovzxdq_avx", pmovzxdq_single),
+        ("vpmovzxdq_avx2", pmovzxdq_single),
+        ("vpmovzxdq_avx512vl", pmovzxdq_single),
+        ("vpmovzxdq_avx512f", pmovzxdq_single),
+        ("vpmaxud_avx", packed_max_unsigned_d_128),
+        ("vpmaxud_avx2", packed_max_unsigned_d_128),
+        ("vpmaxud_avx512vl", packed_max_unsigned_d_128),
+        ("vpmaxud_avx512f", packed_max_unsigned_d_128),
+        ("vpmaxsb_avx", packed_max_signed_b_128),
+        ("vpmaxsb_avx2", packed_max_signed_b_128),
+        ("vpmaxsb_avx512vl", packed_max_signed_b_128),
+        ("vpmaxsb_avx512bw", packed_max_signed_b_128),
+        ("vpmaxsw_avx", packed_max_signed_w_128),
+        ("vpmaxsw_avx2", packed_max_signed_w_128),
+        ("vpmaxsw_avx512vl", packed_max_signed_w_128),
+        ("vpmaxsw_avx512bw", packed_max_signed_w_128),
+        ("vpmaxsd_avx", packed_max_signed_d_128),
+        ("vpmaxsd_avx2", packed_max_signed_d_128),
+        ("vpmaxsd_avx512vl", packed_max_signed_d_128),
+        ("vpmaxsd_avx512f", packed_max_signed_d_128),
+        ("vpmaxsq_avx512vl", packed_max_signed_q_128),
+        ("vpmaxsq_avx512f", packed_max_signed_q_128),
+        ("vpmaxub_avx", packed_max_unsigned_b_128),
+        ("vpmaxub_avx2", packed_max_unsigned_b_128),
+        ("vpmaxub_avx512vl", packed_max_unsigned_b_128),
+        ("vpmaxub_avx512bw", packed_max_unsigned_b_128),
+        ("vpmaxuw_avx", packed_max_unsigned_w_128),
+        ("vpmaxuw_avx2", packed_max_unsigned_w_128),
+        ("vpmaxuw_avx512vl", packed_max_unsigned_w_128),
+        ("vpmaxuw_avx512bw", packed_max_unsigned_w_128),
+        ("vpmaxuq_avx512vl", packed_max_unsigned_q_128),
+        ("vpmaxuq_avx512f", packed_max_unsigned_q_128),
+        ("vpminub_avx", packed_min_unsigned_b_128),
+        ("vpminub_avx2", packed_min_unsigned_b_128),
+        ("vpminub_avx512vl", packed_min_unsigned_b_128),
+        ("vpminub_avx512bw", packed_min_unsigned_b_128),
+        ("vpavgb_avx", packed_average_unsigned_b_128),
+        ("vpavgb_avx2", packed_average_unsigned_b_128),
+        ("vpavgb_avx512vl", packed_average_unsigned_b_128),
+        ("vpavgb_avx512bw", packed_average_unsigned_b_128),
+        ("vpavgw_avx", packed_average_unsigned_w_128),
+        ("vpavgw_avx2", packed_average_unsigned_w_128),
+        ("vpavgw_avx512vl", packed_average_unsigned_w_128),
+        ("vpavgw_avx512bw", packed_average_unsigned_w_128),
+        ("vpcmpgtb_avx", packed_compare_greater_b_128),
+        ("vpcmpgtb_avx2", packed_compare_greater_b_128),
+        ("vpcmpgtd_avx", packed_compare_greater_d_128),
+        ("vpcmpgtd_avx2", packed_compare_greater_d_128),
+        ("vpcmpgtd_avx512vl", packed_compare_d_signed),
+        ("vpcmpgtd_avx512f", packed_compare_d_signed),
+        ("vpcmpgtb_avx512vl", packed_compare_b_signed),
+        ("vpcmpgtb_avx512bw", packed_compare_b_signed),
+        ("vpcmpeqb_avx", packed_compare_equal_b_128),
+        ("vpcmpeqb_avx2", packed_compare_equal_b_128),
+        ("vpcmpeqd_avx", packed_compare_equal_d_128),
+        ("vpcmpeqd_avx2", packed_compare_equal_d_128),
+        ("vpackusdw_avx", packusdw),
+        ("vpackusdw_avx2", packusdw),
+        ("vpackusdw_avx512vl", packusdw),
+        ("vpackusdw_avx512bw", packusdw),
+        ("vpmovsxbw_avx", pmovsxbw_single),
+        ("vpmovsxbw_avx2", pmovsxbw_single),
+        ("vpmovsxbw_avx512vl", pmovsxbw_single),
+        ("vpmovsxbw_avx512bw", pmovsxbw_single),
+        ("vpmovsxbd_avx", packed_move_sxbd_128_indexed),
+        ("vpmovsxbd_avx2", packed_move_sxbd_128_indexed),
+        ("vpmovsxbd_avx512vl", packed_move_sxbd_128_indexed),
+        ("vpmovsxbd_avx512f", packed_move_sxbd_128_indexed),
+        ("vpmovsxbq_avx", packed_move_sxbq_128_indexed),
+        ("vpmovsxbq_avx2", packed_move_sxbq_128_indexed),
+        ("vpmovsxbq_avx512vl", packed_move_sxbq_128_indexed),
+        ("vpmovsxbq_avx512f", packed_move_sxbq_128_indexed),
+        ("vpmovsxwq_avx", packed_move_sxwq_128_indexed),
+        ("vpmovsxwq_avx2", packed_move_sxwq_128_indexed),
+        ("vpmovsxwq_avx512vl", packed_move_sxwq_128_indexed),
+        ("vpmovsxwq_avx512f", packed_move_sxwq_128_indexed),
+        ("vpmovsxwd_avx", pmovsxwd_single),
+        ("vpmovsxwd_avx2", pmovsxwd_single),
+        ("vpmovsxwd_avx512vl", pmovsxwd_single),
+        ("vpmovsxwd_avx512f", pmovsxwd_single),
+        ("vpmovsxdq_avx", pmovsxdq_single),
+        ("vpmovsxdq_avx2", pmovsxdq_single),
+        ("vpmovsxdq_avx512vl", pmovsxdq_single),
+        ("vpmovsxdq_avx512f", pmovsxdq_single),
+        ("vpackuswb_avx", packuswb),
+        ("vpackuswb_avx2", packuswb),
+        ("vpackuswb_avx512vl", packuswb),
+        ("vpackuswb_avx512bw", packuswb),
+        ("vpsubsb_avx", psubsb),
+        ("vpsubsb_avx2", psubsb),
+        ("vpsubsb_avx512vl", psubsb),
+        ("vpsubsb_avx512bw", psubsb),
+        ("vpsubsw_avx", psubsw),
+        ("vpsubsw_avx2", psubsw),
+        ("vpsubsw_avx512vl", psubsw),
+        ("vpsubsw_avx512bw", psubsw),
+        ("vpminuw_avx", packed_min_unsigned_w_128),
+        ("vpminuw_avx2", packed_min_unsigned_w_128),
+        ("vpminuw_avx512vl", packed_min_unsigned_w_128),
+        ("vpminuw_avx512bw", packed_min_unsigned_w_128),
+        ("vpminsb_avx", packed_min_signed_b_128),
+        ("vpminsb_avx2", packed_min_signed_b_128),
+        ("vpminsb_avx512vl", packed_min_signed_b_128),
+        ("vpminsb_avx512bw", packed_min_signed_b_128),
+        ("vpminsw_avx", packed_min_signed_w_128),
+        ("vpminsw_avx2", packed_min_signed_w_128),
+        ("vpminsw_avx512vl", packed_min_signed_w_128),
+        ("vpminsw_avx512bw", packed_min_signed_w_128),
+        ("vpminsd_avx", packed_min_signed_d_128),
+        ("vpminsd_avx2", packed_min_signed_d_128),
+        ("vpminsd_avx512vl", packed_min_signed_d_128),
+        ("vpminsd_avx512f", packed_min_signed_d_128),
+        ("vpminsq_avx512vl", packed_min_signed_q_128),
+        ("vpminsq_avx512f", packed_min_signed_q_128),
+        ("vpminud_avx", packed_min_unsigned_d_128),
+        ("vpminud_avx2", packed_min_unsigned_d_128),
+        ("vpminud_avx512vl", packed_min_unsigned_d_128),
+        ("vpminud_avx512f", packed_min_unsigned_d_128),
+        ("vpminuq_avx512vl", packed_min_unsigned_q_128),
+        ("vpminuq_avx512f", packed_min_unsigned_q_128),
+        ("vpackssdw_avx", packssdw),
+        ("vpackssdw_avx2", packssdw),
+        ("vpackssdw_avx512vl", packssdw),
+        ("vpackssdw_avx512bw", packssdw),
+        ("vpacksswb_avx", packsswb),
+        ("vpacksswb_avx2", packsswb),
+        ("vpacksswb_avx512vl", packsswb),
+        ("vpacksswb_avx512bw", packsswb),
+        ("vpmulld_avx", pmulld),
+        ("vpmulld_avx2", pmulld),
+        ("vpmulld_avx512vl", pmulld),
+        ("vpmulld_avx512f", pmulld),
+        ("vpmulhw_avx", pmulhw),
+        ("vpmulhw_avx2", pmulhw),
+        ("vpmulhw_avx512vl", pmulhw),
+        ("vpmulhw_avx512bw", pmulhw),
+        ("vpmulhuw_avx", pmulhuw),
+        ("vpmulhuw_avx2", pmulhuw),
+        ("vpmulhuw_avx512vl", pmulhuw),
+        ("vpmulhuw_avx512bw", pmulhuw),
+        ("vpmuldq_avx", pmuldq),
+        ("vpmuldq_avx2", pmuldq),
+        ("vpmuldq_avx512vl", pmuldq),
+        ("vpmuldq_avx512f", pmuldq),
+        ("vpmuludq_avx", packed_mul_unsigned_dq_128),
+        ("vpmuludq_avx2", packed_mul_unsigned_dq_128),
+        ("vpmuludq_avx512vl", packed_mul_unsigned_dq_128),
+        ("vpmuludq_avx512f", packed_mul_unsigned_dq_128),
+        ("vpmulhrsw_avx", pmulhrsw),
+        ("vpmulhrsw_avx2", pmulhrsw),
+        ("vpmulhrsw_avx512vl", pmulhrsw),
+        ("vpmulhrsw_avx512bw", pmulhrsw),
+        ("vpsignb_avx", psignb),
+        ("vpsignb_avx2", psignb),
+        ("vpsignw_avx", psignw),
+        ("vpsignw_avx2", psignw),
+        ("vpsignd_avx", psignd),
+        ("vpsignd_avx2", psignd),
+        ("vpandn_avx", packed_and_not_128),
+        ("vpandn_avx2", packed_and_not_128),
+        ("vpcmpgtw_avx", packed_compare_greater_w_128),
+        ("vpcmpgtw_avx2", packed_compare_greater_w_128),
+        ("vpcmpgtw_avx512vl", packed_compare_w_signed),
+        ("vpcmpgtw_avx512bw", packed_compare_w_signed),
+        ("vpcmpgtq_avx", packed_compare_greater_q_128),
+        ("vpcmpgtq_avx2", packed_compare_greater_q_128),
+        ("vpcmpgtq_avx512vl", packed_compare_q_signed),
+        ("vpcmpgtq_avx512f", packed_compare_q_signed),
+        ("vpshufhw_avx", packed_shuffle_high_w_128),
+        ("vpshufhw_avx2", packed_shuffle_high_w_128),
+        ("vpshufhw_avx512vl", packed_shuffle_high_w_128),
+        ("vpshufhw_avx512bw", packed_shuffle_high_w_128),
+        ("vpshuflw_avx", packed_shuffle_low_w_128),
+        ("vpshuflw_avx2", packed_shuffle_low_w_128),
+        ("vpshuflw_avx512vl", packed_shuffle_low_w_128),
+        ("vpshuflw_avx512bw", packed_shuffle_low_w_128),
+        ("vpunpckhbw_avx", packed_unpack_high_b_128),
+        ("vpunpckhbw_avx2", packed_unpack_high_b_128),
+        ("vpunpckhbw_avx512vl", packed_unpack_high_b_128),
+        ("vpunpckhbw_avx512bw", packed_unpack_high_b_128),
+        ("vpunpcklbw_avx", packed_unpack_low_b_128),
+        ("vpunpcklbw_avx2", packed_unpack_low_b_128),
+        ("vpunpcklbw_avx512vl", packed_unpack_low_b_128),
+        ("vpunpcklbw_avx512bw", packed_unpack_low_b_128),
+        ("vpunpckhdq_avx", packed_unpack_high_d_128),
+        ("vpunpckhdq_avx2", packed_unpack_high_d_128),
+        ("vpunpckhdq_avx512vl", packed_unpack_high_d_128),
+        ("vpunpckhdq_avx512f", packed_unpack_high_d_128),
+        ("vpunpckldq_avx", packed_unpack_low_d_128),
+        ("vpunpckldq_avx2", packed_unpack_low_d_128),
+        ("vpunpckldq_avx512vl", packed_unpack_low_d_128),
+        ("vpunpckldq_avx512f", packed_unpack_low_d_128),
+        ("vphaddw_avx", phaddw),
+        ("vphaddw_avx2", phaddw),
+        ("vphaddd_avx", phaddd),
+        ("vphaddd_avx2", phaddd),
+        ("vphaddsw_avx", phaddsw),
+        ("vphaddsw_avx2", phaddsw),
+        ("vphsubw_avx", phsubw),
+        ("vphsubw_avx2", phsubw),
+        ("vphsubd_avx", phsubd),
+        ("vphsubd_avx2", phsubd),
+        ("vphsubsw_avx", phsubsw),
+        ("vphsubsw_avx2", phsubsw),
+        ("vphminposuw_avx", phminposuw),
+        ("vpblendd_avx2", packed_blend_d_128),
+        ("vpinsrb_avx", packed_insert_b_128),
+        ("vpinsrb_avx512bw", packed_insert_b_128),
+        ("vpinsrw_avx512bw", packed_insert_w_128),
+        ("vpcmpeqw_avx", packed_compare_equal_w_128),
+        ("vpcmpeqw_avx2", packed_compare_equal_w_128),
+        ("vpsrlq_avx", packed_shift_right_q_128),
+        ("vpsrlq_avx2", packed_shift_right_q_128),
+        ("vpsrlq_avx512vl", packed_shift_right_q_128),
+        ("vpsrlq_avx512f", packed_shift_right_q_128),
+        ("vpblendvb_avx", pblendvb),
+        ("vpblendvb_avx2", pblendvb),
+        ("vpblendw_avx", pblendw),
+        ("vpblendw_avx2", pblendw),
+        ("vpinsrw_avx", packed_insert_w_128),
         ("psraw", psraw),
         ("divpd", divpd),
         ("divps", divps),
@@ -415,6 +1130,10 @@ pub mod x86 {
         ("vpsubq_avx2", packed_sub_q),
         ("vpsubq_avx512vl", packed_sub_q),
         ("vpsubq_avx512f", packed_sub_q),
+        ("vpsubd_avx", packed_sub_d),
+        ("vpsubd_avx2", packed_sub_d),
+        ("vpsubd_avx512vl", packed_sub_d),
+        ("vpsubd_avx512f", packed_sub_d),
         ("vpaddd_avx512vl", packed_add_d),
         ("vpaddd_avx512f", packed_add_d),
         ("vpcmpb_avx512vl", packed_compare_b_signed),
@@ -463,15 +1182,52 @@ pub mod x86 {
         ("webtos_vperm2b_mem_128_chunk", packed_permute2_b_mem_128_chunk),
         ("webtos_vperm2b_mem_256_chunk", packed_permute2_b_mem_256_chunk),
         ("webtos_vperm2b_mem_512_chunk", packed_permute2_b_mem_512_chunk),
+        ("webtos_vperm2d_128_chunk", packed_permute2_d_128_chunk),
+        ("webtos_vperm2d_256_chunk", packed_permute2_d_256_chunk),
+        ("webtos_vperm2d_512_chunk", packed_permute2_d_512_chunk),
+        ("webtos_vperm2q_128_chunk", packed_permute2_q_128_chunk),
+        ("webtos_vperm2q_256_chunk", packed_permute2_q_256_chunk),
+        ("webtos_vperm2q_512_chunk", packed_permute2_q_512_chunk),
+        ("webtos_vperm2w_128_chunk", packed_permute2_w_128_chunk),
+        ("webtos_vperm2w_256_chunk", packed_permute2_w_256_chunk),
+        ("webtos_vperm2w_512_chunk", packed_permute2_w_512_chunk),
+        ("webtos_vpalignr_128_chunk", packed_align_right_128_chunk),
+        ("webtos_valignd_128_chunk", packed_align_d_128_chunk),
+        ("webtos_valignd_256_chunk", packed_align_d_256_chunk),
+        ("webtos_valignd_512_chunk", packed_align_d_512_chunk),
+        ("webtos_valignq_128_chunk", packed_align_q_128_chunk),
+        ("webtos_valignq_256_chunk", packed_align_q_256_chunk),
+        ("webtos_valignq_512_chunk", packed_align_q_512_chunk),
+        ("webtos_vshuffle128_256_chunk", packed_shuffle_128_256_chunk),
+        ("webtos_vshuffle128_512_chunk", packed_shuffle_128_512_chunk),
+        ("webtos_vinsert128_256_chunk", packed_insert_128_256_chunk),
+        ("webtos_vinsert128_512_chunk", packed_insert_128_512_chunk),
+        ("webtos_vinsert256_512_chunk", packed_insert_256_512_chunk),
+        ("vpshldw_avx512_vbmi2", packed_shift_left_double_w),
+        ("vpshldd_avx512_vbmi2", packed_shift_left_double_d),
+        ("vpshldq_avx512_vbmi2", packed_shift_left_double_q),
+        ("vpshrdw_avx512_vbmi2", packed_shift_right_double_w),
+        ("vpshrdd_avx512_vbmi2", packed_shift_right_double_d),
+        ("vpshrdq_avx512_vbmi2", packed_shift_right_double_q),
+        ("webtos_vpshld_128", packed_shift_left_double_128),
+        ("webtos_vpshrd_128", packed_shift_right_double_128),
+        ("webtos_vpshldv_128", packed_shift_left_double_variable_128),
+        ("webtos_vpshrdv_128", packed_shift_right_double_variable_128),
         ("webtos_apply_byte_mask_128", apply_byte_mask_128),
+        ("webtos_apply_dword_mask_128", apply_dword_mask_128),
         ("webtos_vpmaddubsw_128", packed_maddubs_128),
         ("webtos_vpmaddwd_128", packed_maddwd_128),
         ("vpmaddubsw_avx", packed_maddubs_128),
         ("vpmaddwd_avx", packed_maddwd_128),
         ("webtos_vpmaddubsw_avx2_128", packed_maddubs_128),
         ("webtos_vpmaddwd_avx2_128", packed_maddwd_128),
+        ("vdbpsadbw_avx512vl", packed_dbsad_bw),
+        ("vdbpsadbw_avx512bw", packed_dbsad_bw),
+        ("webtos_vdbpsadbw_128", packed_dbsad_bw),
         ("webtos_vpmovm2b_128", packed_mask_to_bytes_128),
         ("webtos_vpmovb2m_128", packed_bytes_to_mask_128),
+        ("webtos_vpmovm2w_128", packed_mask_to_words_128),
+        ("webtos_vpmovw2m_128", packed_words_to_mask_128),
         ("webtos_vpcompressd_128_chunk", packed_compress_d_128_chunk),
         ("webtos_vpcompressd_256_chunk", packed_compress_d_256_chunk),
         ("webtos_vpcompressd_512_chunk", packed_compress_d_512_chunk),
@@ -491,6 +1247,9 @@ pub mod x86 {
         ("webtos_vpexpand_mem_256", packed_expand_mem_256),
         ("webtos_vpexpand_mem_512", packed_expand_mem_512),
         ("webtos_masked_load_128", masked_load_128),
+        ("webtos_vmask_load_128", vector_sign_masked_load_128),
+        ("webtos_vmask_store_128", vector_sign_masked_store_128),
+        ("webtos_vmask_store_256", vector_sign_masked_store_256),
         ("webtos_masked_store_128", masked_store_128),
         ("webtos_masked_store_256", masked_store_256),
         ("webtos_masked_store_512", masked_store_512),
@@ -538,6 +1297,605 @@ pub mod x86 {
         ("fscale", fscale),
     ];
 
+    /// EVEX fused multiply-add operations. They share one decoder-driven,
+    /// strictly fused implementation; the frontend splits packed YMM/ZMM
+    /// forms into independently masked 128-bit chunks.
+    pub const FMA_HELPERS: &[(&str, PcodeOpHelper)] = &[
+        ("vfmadd132pd_avx512f", packed_fma),
+        ("vfmadd132pd_avx512vl", packed_fma),
+        ("vfmadd132ps_avx512f", packed_fma),
+        ("vfmadd132ps_avx512vl", packed_fma),
+        ("vfmadd132sd_avx512f", packed_fma),
+        ("vfmadd132ss_avx512f", packed_fma),
+        ("vfmadd213pd_avx512f", packed_fma),
+        ("vfmadd213pd_avx512vl", packed_fma),
+        ("vfmadd213ps_avx512f", packed_fma),
+        ("vfmadd213ps_avx512vl", packed_fma),
+        ("vfmadd213sd_avx512f", packed_fma),
+        ("vfmadd213ss_avx512f", packed_fma),
+        ("vfmadd231pd_avx512f", packed_fma),
+        ("vfmadd231pd_avx512vl", packed_fma),
+        ("vfmadd231ps_avx512f", packed_fma),
+        ("vfmadd231ps_avx512vl", packed_fma),
+        ("vfmadd231sd_avx512f", packed_fma),
+        ("vfmadd231ss_avx512f", packed_fma),
+        ("vfmaddsub132pd_avx512f", packed_fma),
+        ("vfmaddsub132pd_avx512vl", packed_fma),
+        ("vfmaddsub132ps_avx512f", packed_fma),
+        ("vfmaddsub132ps_avx512vl", packed_fma),
+        ("vfmaddsub213pd_avx512f", packed_fma),
+        ("vfmaddsub213pd_avx512vl", packed_fma),
+        ("vfmaddsub213ps_avx512f", packed_fma),
+        ("vfmaddsub213ps_avx512vl", packed_fma),
+        ("vfmaddsub231pd_avx512f", packed_fma),
+        ("vfmaddsub231pd_avx512vl", packed_fma),
+        ("vfmaddsub231ps_avx512f", packed_fma),
+        ("vfmaddsub231ps_avx512vl", packed_fma),
+        ("vfmsub132pd_avx512f", packed_fma),
+        ("vfmsub132pd_avx512vl", packed_fma),
+        ("vfmsub132ps_avx512f", packed_fma),
+        ("vfmsub132ps_avx512vl", packed_fma),
+        ("vfmsub132sd_avx512f", packed_fma),
+        ("vfmsub132ss_avx512f", packed_fma),
+        ("vfmsub213pd_avx512f", packed_fma),
+        ("vfmsub213pd_avx512vl", packed_fma),
+        ("vfmsub213ps_avx512f", packed_fma),
+        ("vfmsub213ps_avx512vl", packed_fma),
+        ("vfmsub213sd_avx512f", packed_fma),
+        ("vfmsub213ss_avx512f", packed_fma),
+        ("vfmsub231pd_avx512f", packed_fma),
+        ("vfmsub231pd_avx512vl", packed_fma),
+        ("vfmsub231ps_avx512f", packed_fma),
+        ("vfmsub231ps_avx512vl", packed_fma),
+        ("vfmsub231sd_avx512f", packed_fma),
+        ("vfmsub231ss_avx512f", packed_fma),
+        ("vfmsubadd132pd_avx512f", packed_fma),
+        ("vfmsubadd132pd_avx512vl", packed_fma),
+        ("vfmsubadd132ps_avx512f", packed_fma),
+        ("vfmsubadd132ps_avx512vl", packed_fma),
+        ("vfmsubadd213pd_avx512f", packed_fma),
+        ("vfmsubadd213pd_avx512vl", packed_fma),
+        ("vfmsubadd213ps_avx512f", packed_fma),
+        ("vfmsubadd213ps_avx512vl", packed_fma),
+        ("vfmsubadd231pd_avx512f", packed_fma),
+        ("vfmsubadd231pd_avx512vl", packed_fma),
+        ("vfmsubadd231ps_avx512f", packed_fma),
+        ("vfmsubadd231ps_avx512vl", packed_fma),
+        ("vfnmadd132pd_avx512f", packed_fma),
+        ("vfnmadd132pd_avx512vl", packed_fma),
+        ("vfnmadd132ps_avx512vl", packed_fma),
+        ("vfnmadd132sd_avx512f", packed_fma),
+        ("vfnmadd132ss_avx512f", packed_fma),
+        ("vfnmadd213pd_avx512f", packed_fma),
+        ("vfnmadd213pd_avx512vl", packed_fma),
+        ("vfnmadd213ps_avx512f", packed_fma),
+        ("vfnmadd213ps_avx512vl", packed_fma),
+        ("vfnmadd213sd_avx512f", packed_fma),
+        ("vfnmadd213ss_avx512f", packed_fma),
+        ("vfnmadd231pd_avx512f", packed_fma),
+        ("vfnmadd231pd_avx512vl", packed_fma),
+        ("vfnmadd231ps_avx512f", packed_fma),
+        ("vfnmadd231ps_avx512vl", packed_fma),
+        ("vfnmadd231sd_avx512f", packed_fma),
+        ("vfnmadd231ss_avx512f", packed_fma),
+        ("vfnmsub132pd_avx512f", packed_fma),
+        ("vfnmsub132pd_avx512vl", packed_fma),
+        ("vfnmsub132ps_avx512f", packed_fma),
+        ("vfnmsub132ps_avx512vl", packed_fma),
+        ("vfnmsub132sd_avx512f", packed_fma),
+        ("vfnmsub132ss_avx512f", packed_fma),
+        ("vfnmsub213pd_avx512f", packed_fma),
+        ("vfnmsub213pd_avx512vl", packed_fma),
+        ("vfnmsub213ps_avx512f", packed_fma),
+        ("vfnmsub213ps_avx512vl", packed_fma),
+        ("vfnmsub213sd_avx512f", packed_fma),
+        ("vfnmsub213ss_avx512f", packed_fma),
+        ("vfnmsub231pd_avx512f", packed_fma),
+        ("vfnmsub231pd_avx512vl", packed_fma),
+        ("vfnmsub231ps_avx512f", packed_fma),
+        ("vfnmsub231ps_avx512vl", packed_fma),
+        ("vfnmsub231sd_avx512f", packed_fma),
+        ("vfnmsub231ss_avx512f", packed_fma),
+    ];
+
+    /// Narrowing operations need proportional source/result splitting when a
+    /// 256- or 512-bit source crosses the runtime's u128 helper boundary.
+    pub const NARROW_USER_OPS: &[(&str, u8)] = &[
+        ("vcvtpd2dq_avx512vl", 2),
+        ("vcvtpd2dq_avx512f", 2),
+        ("vcvtpd2ps_avx512vl", 2),
+        ("vcvtpd2ps_avx512f", 2),
+        ("vcvtpd2udq_avx512vl", 2),
+        ("vcvtpd2udq_avx512f", 2),
+        ("vcvtps2ph_avx512vl", 2),
+        ("vcvtps2ph_avx512f", 2),
+        ("vcvttpd2dq_avx512vl", 2),
+        ("vcvttpd2dq_avx512f", 2),
+        ("vcvttpd2udq_avx512vl", 2),
+        ("vcvttpd2udq_avx512f", 2),
+        ("vpmovdb_avx512vl", 4),
+        ("vpmovdb_avx512f", 4),
+        ("vpmovsdb_avx512vl", 4),
+        ("vpmovsdb_avx512f", 4),
+        ("vpmovusdb_avx512vl", 4),
+        ("vpmovusdb_avx512f", 4),
+        ("vpmovdw_avx512vl", 2),
+        ("vpmovdw_avx512f", 2),
+        ("vpmovsdw_avx512vl", 2),
+        ("vpmovsdw_avx512f", 2),
+        ("vpmovusdw_avx512vl", 2),
+        ("vpmovusdw_avx512f", 2),
+        ("vpmovqb_avx512vl", 8),
+        ("vpmovqb_avx512f", 8),
+        ("vpmovsqb_avx512vl", 8),
+        ("vpmovsqb_avx512f", 8),
+        ("vpmovusqb_avx512vl", 8),
+        ("vpmovusqb_avx512f", 8),
+        ("vpmovqw_avx512vl", 4),
+        ("vpmovqw_avx512f", 4),
+        ("vpmovsqw_avx512vl", 4),
+        ("vpmovsqw_avx512f", 4),
+        ("vpmovusqw_avx512vl", 4),
+        ("vpmovusqw_avx512f", 4),
+        ("vpmovqd_avx512vl", 2),
+        ("vpmovqd_avx512f", 2),
+        ("vpmovsqd_avx512vl", 2),
+        ("vpmovsqd_avx512f", 2),
+        ("vpmovusqd_avx512vl", 2),
+        ("vpmovusqd_avx512f", 2),
+        ("vpmovswb_avx512vl", 2),
+        ("vpmovswb_avx512bw", 2),
+        ("vpmovuswb_avx512vl", 2),
+        ("vpmovuswb_avx512bw", 2),
+    ];
+
+    pub const WIDEN_USER_OPS: &[(&str, u8)] = &[
+        ("vcvtdq2pd_avx512vl", 2),
+        ("vcvtdq2pd_avx512f", 2),
+        ("vcvtph2ps_avx512vl", 2),
+        ("vcvtph2ps_avx512f", 2),
+        ("vcvtps2pd_avx512vl", 2),
+        ("vcvtps2pd_avx512f", 2),
+        ("vcvtudq2pd_avx512vl", 2),
+        ("vcvtudq2pd_avx512f", 2),
+    ];
+
+    pub const SAME_WIDTH_CONVERSION_USER_OPS: &[&str] = &[
+        "vcvtdq2ps_avx512vl",
+        "vcvtdq2ps_avx512f",
+        "vcvtps2dq_avx512vl",
+        "vcvtps2dq_avx512f",
+        "vcvtps2udq_avx512vl",
+        "vcvtps2udq_avx512f",
+        "vcvttps2dq_avx512vl",
+        "vcvttps2dq_avx512f",
+        "vcvttps2udq_avx512vl",
+        "vcvttps2udq_avx512f",
+        "vcvtudq2ps_avx512vl",
+        "vcvtudq2ps_avx512f",
+    ];
+
+    /// Ice Lake floating-point operations whose packed forms are independent
+    /// in every 128-bit chunk. Indexed splitting preserves the architectural
+    /// opmask lane number across YMM/ZMM chunks.
+    pub const EVEX_SPECIAL_FLOAT_USER_OPS: &[&str] = &[
+        "vfixupimmpd_avx512vl",
+        "vfixupimmpd_avx512f",
+        "vfixupimmps_avx512vl",
+        "vfixupimmps_avx512f",
+        "vgetexppd_avx512vl",
+        "vgetexppd_avx512f",
+        "vgetexpps_avx512vl",
+        "vgetexpps_avx512f",
+        "vgetmantpd_avx512vl",
+        "vgetmantpd_avx512f",
+        "vgetmantps_avx512vl",
+        "vgetmantps_avx512f",
+        "vrcp14pd_avx512vl",
+        "vrcp14pd_avx512f",
+        "vrcp14ps_avx512vl",
+        "vrcp14ps_avx512f",
+        "vrndscalepd_avx512vl",
+        "vrndscalepd_avx512f",
+        "vrndscaleps_avx512vl",
+        "vrndscaleps_avx512f",
+        "vrsqrt14pd_avx512vl",
+        "vrsqrt14pd_avx512f",
+        "vrsqrt14ps_avx512vl",
+        "vrsqrt14ps_avx512f",
+        "vscalefpd_avx512vl",
+        "vscalefpd_avx512f",
+        "vscalefps_avx512vl",
+        "vscalefps_avx512f",
+    ];
+
+    pub const EVEX_VSIB_GATHER_USER_OPS: &[&str] = &[
+        "vgatherdpd_avx512vl",
+        "vgatherdpd_avx512f",
+        "vgatherdps_avx512vl",
+        "vgatherdps_avx512f",
+        "vgatherqpd_avx512vl",
+        "vgatherqpd_avx512f",
+        "vgatherqps_avx512vl",
+        "vgatherqps_avx512f",
+        "vpgatherdd_avx512vl",
+        "vpgatherdd_avx512f",
+        "vpgatherdq_avx512vl",
+        "vpgatherdq_avx512f",
+        "vpgatherqd_avx512vl",
+        "vpgatherqd_avx512f",
+        "vpgatherqq_avx512vl",
+        "vpgatherqq_avx512f",
+    ];
+
+    pub const VEX_VSIB_GATHER_USER_OPS: &[&str] = &[
+        "vgatherdpd",
+        "vgatherdps",
+        "vgatherqpd",
+        "vgatherqps",
+        "vpgatherdd",
+        "vpgatherdq",
+        "vpgatherqd",
+        "vpgatherqq",
+    ];
+
+    /// Opaque operations that are independently lane-local in each 128-bit
+    /// chunk. The x86 frontend uses this explicit allowlist to lower wide
+    /// SLEIGH results without passing YMM/ZMM values through the u128 helper
+    /// ABI. Cross-lane operations must never be added here.
+    pub const LANE_LOCAL_128_USER_OPS: &[&str] = &[
+        "vbroadcastss_avx512vl",
+        "vbroadcastss_avx512f",
+        "vbroadcastsd_avx512vl",
+        "vbroadcastsd_avx512f",
+        "vbroadcastf32x4_avx512vl",
+        "vbroadcastf32x4_avx512f",
+        "vbroadcasti32x4_avx512vl",
+        "vbroadcasti32x4_avx512f",
+        "vaddpd_avx512vl",
+        "vaddpd_avx512f",
+        "vaddps_avx512vl",
+        "vaddps_avx512f",
+        "vaddsubpd_avx",
+        "vaddsubps_avx",
+        "vblendmpd_avx512vl",
+        "vblendmpd_avx512f",
+        "vblendmps_avx512vl",
+        "vblendmps_avx512f",
+        "vdivpd_avx",
+        "vdivpd_avx512vl",
+        "vdivpd_avx512f",
+        "vdivps_avx",
+        "vdivps_avx512vl",
+        "vdivps_avx512f",
+        "vmaxpd_avx",
+        "vmaxpd_avx512vl",
+        "vmaxpd_avx512f",
+        "vmaxps_avx",
+        "vmaxps_avx512vl",
+        "vmaxps_avx512f",
+        "vminpd_avx",
+        "vminpd_avx512vl",
+        "vminpd_avx512f",
+        "vminps_avx",
+        "vminps_avx512vl",
+        "vminps_avx512f",
+        "vmulpd_avx512vl",
+        "vmulpd_avx512f",
+        "vmulps_avx512vl",
+        "vmulps_avx512f",
+        "vsqrtpd_avx",
+        "vsqrtpd_avx512vl",
+        "vsqrtpd_avx512f",
+        "vsqrtps_avx",
+        "vsqrtps_avx512vl",
+        "vsqrtps_avx512f",
+        "vsubpd_avx",
+        "vsubpd_avx512vl",
+        "vsubpd_avx512f",
+        "vsubps_avx",
+        "vsubps_avx512vl",
+        "vsubps_avx512f",
+        "vhaddps_avx",
+        "vhsubpd_avx",
+        "vhsubps_avx",
+        "vroundpd_avx",
+        "vroundps_avx",
+        "vrcpps_avx",
+        "vrsqrtps_avx",
+        "vmpsadbw_avx",
+        "vmpsadbw_avx2",
+        "vdpps_avx",
+        "vcmppd_avx",
+        "vcmpps_avx",
+        "vcvtdq2pd_avx",
+        "vcvtdq2ps_avx",
+        "vcvtps2dq_avx",
+        "vcvtps2pd_avx",
+        "vunpckhpd_avx",
+        "vunpckhpd_avx512vl",
+        "vunpckhpd_avx512f",
+        "vunpcklpd_avx",
+        "vunpcklpd_avx512vl",
+        "vunpcklpd_avx512f",
+        "vunpckhps_avx",
+        "vunpckhps_avx512vl",
+        "vunpckhps_avx512f",
+        "vunpcklps_avx",
+        "vunpcklps_avx512vl",
+        "vunpcklps_avx512f",
+        "vblendvpd_avx",
+        "vblendvps_avx",
+        "vmovddup_avx512vl",
+        "vmovddup_avx512f",
+        "vmovshdup_avx",
+        "vmovshdup_avx512vl",
+        "vmovshdup_avx512f",
+        "vmovsldup_avx",
+        "vmovsldup_avx512vl",
+        "vmovsldup_avx512f",
+        "vmovntdqa_avx",
+        "vmovntdqa_avx2",
+        "vmovntdqa_avx512vl",
+        "vmovntdqa_avx512f",
+        "vlddqu_avx",
+        "vmovntpd_avx",
+        "vmovntpd_avx512vl",
+        "vmovntpd_avx512f",
+        "vmovntps_avx",
+        "vmovntps_avx512vl",
+        "vmovntps_avx512f",
+        "vpermilpd_avx",
+        "vpermilpd_avx512vl",
+        "vpermilpd_avx512f",
+        "vpermilps_avx",
+        "vpermilps_avx512vl",
+        "vpermilps_avx512f",
+        "vshufps_avx",
+        "vshufps_avx512vl",
+        "vshufps_avx512f",
+        "vpmaxsb_avx",
+        "vpmaxsb_avx2",
+        "vpmaxsb_avx512vl",
+        "vpmaxsb_avx512bw",
+        "vpmaxsw_avx",
+        "vpmaxsw_avx2",
+        "vpmaxsw_avx512vl",
+        "vpmaxsw_avx512bw",
+        "vpmaxsd_avx",
+        "vpmaxsd_avx2",
+        "vpmaxsd_avx512vl",
+        "vpmaxsd_avx512f",
+        "vpmaxsq_avx512vl",
+        "vpmaxsq_avx512f",
+        "vpmaxub_avx",
+        "vpmaxub_avx2",
+        "vpmaxub_avx512vl",
+        "vpmaxub_avx512bw",
+        "vpmaxuw_avx",
+        "vpmaxuw_avx2",
+        "vpmaxuw_avx512vl",
+        "vpmaxuw_avx512bw",
+        "vpmaxuq_avx512vl",
+        "vpmaxuq_avx512f",
+        "vpminsb_avx",
+        "vpminsb_avx2",
+        "vpminsb_avx512vl",
+        "vpminsb_avx512bw",
+        "vpminsw_avx",
+        "vpminsw_avx2",
+        "vpminsw_avx512vl",
+        "vpminsw_avx512bw",
+        "vpminsd_avx",
+        "vpminsd_avx2",
+        "vpminsd_avx512vl",
+        "vpminsd_avx512f",
+        "vpminsq_avx512vl",
+        "vpminsq_avx512f",
+        "vpminud_avx",
+        "vpminud_avx2",
+        "vpminud_avx512vl",
+        "vpminud_avx512f",
+        "vpminuq_avx512vl",
+        "vpminuq_avx512f",
+        "vpackssdw_avx",
+        "vpackssdw_avx2",
+        "vpackssdw_avx512vl",
+        "vpackssdw_avx512bw",
+        "vpacksswb_avx",
+        "vpacksswb_avx2",
+        "vpacksswb_avx512vl",
+        "vpacksswb_avx512bw",
+        "vpmulld_avx",
+        "vpmulld_avx2",
+        "vpmulld_avx512vl",
+        "vpmulld_avx512f",
+        "vpmulhw_avx",
+        "vpmulhw_avx2",
+        "vpmulhw_avx512vl",
+        "vpmulhw_avx512bw",
+        "vpmulhuw_avx",
+        "vpmulhuw_avx2",
+        "vpmulhuw_avx512vl",
+        "vpmulhuw_avx512bw",
+        "vpmuldq_avx",
+        "vpmuldq_avx2",
+        "vpmuldq_avx512vl",
+        "vpmuldq_avx512f",
+        "vpmuludq_avx",
+        "vpmuludq_avx2",
+        "vpmuludq_avx512vl",
+        "vpmuludq_avx512f",
+        "vpmulhrsw_avx",
+        "vpmulhrsw_avx2",
+        "vpmulhrsw_avx512vl",
+        "vpmulhrsw_avx512bw",
+        "vpsignb_avx",
+        "vpsignb_avx2",
+        "vpsignw_avx",
+        "vpsignw_avx2",
+        "vpsignd_avx",
+        "vpsignd_avx2",
+        "vpandn_avx",
+        "vpandn_avx2",
+        "vpcmpgtw_avx",
+        "vpcmpgtw_avx2",
+        "vpcmpgtq_avx",
+        "vpcmpgtq_avx2",
+        "vpshufhw_avx",
+        "vpshufhw_avx2",
+        "vpshufhw_avx512vl",
+        "vpshufhw_avx512bw",
+        "vpshuflw_avx",
+        "vpshuflw_avx2",
+        "vpshuflw_avx512vl",
+        "vpshuflw_avx512bw",
+        "vpunpckhbw_avx",
+        "vpunpckhbw_avx2",
+        "vpunpckhbw_avx512vl",
+        "vpunpckhbw_avx512bw",
+        "vpunpcklbw_avx",
+        "vpunpcklbw_avx2",
+        "vpunpcklbw_avx512vl",
+        "vpunpcklbw_avx512bw",
+        "vpunpckhdq_avx",
+        "vpunpckhdq_avx2",
+        "vpunpckhdq_avx512vl",
+        "vpunpckhdq_avx512f",
+        "vpunpckldq_avx",
+        "vpunpckldq_avx2",
+        "vpunpckldq_avx512vl",
+        "vpunpckldq_avx512f",
+        "vphaddw_avx",
+        "vphaddw_avx2",
+        "vphaddd_avx",
+        "vphaddd_avx2",
+        "vphaddsw_avx",
+        "vphaddsw_avx2",
+        "vphsubw_avx",
+        "vphsubw_avx2",
+        "vphsubd_avx",
+        "vphsubd_avx2",
+        "vphsubsw_avx",
+        "vphsubsw_avx2",
+        "vpsllvq_avx2",
+        "vpsllvq_avx512vl",
+        "vpsllvq_avx512f",
+        "vpsllvw_avx512vl",
+        "vpsllvw_avx512bw",
+        "vpsrlvq_avx2",
+        "vpsrlvq_avx512vl",
+        "vpsrlvq_avx512f",
+        "vpsrlvw_avx512vl",
+        "vpsrlvw_avx512bw",
+        "vpsravd_avx2",
+        "vpsravd_avx512vl",
+        "vpsravd_avx512f",
+        "vpsravq_avx512vl",
+        "vpsravq_avx512f",
+        "vpsravw_avx512vl",
+        "vpsravw_avx512bw",
+        "vpsrad_avx",
+        "vpsrad_avx2",
+        "vpsrad_avx512vl",
+        "vpsrad_avx512f",
+        "vpsraq_avx512vl",
+        "vpsraq_avx512f",
+        "vpsraw_avx",
+        "vpsraw_avx2",
+        "vpsraw_avx512vl",
+        "vpsraw_avx512bw",
+        "vprold_avx512vl",
+        "vprold_avx512f",
+        "vprolvd_avx512vl",
+        "vprolvd_avx512f",
+        "vprolq_avx512vl",
+        "vprolq_avx512f",
+        "vprolvq_avx512vl",
+        "vprolvq_avx512f",
+        "vprord_avx512vl",
+        "vprord_avx512f",
+        "vprorvd_avx512vl",
+        "vprorvd_avx512f",
+        "vprorq_avx512vl",
+        "vprorq_avx512f",
+        "vprorvq_avx512vl",
+        "vprorvq_avx512f",
+        "vplzcntd_avx512vl",
+        "vplzcntd_avx512cd",
+        "vplzcntq_avx512vl",
+        "vplzcntq_avx512cd",
+    ];
+
+    /// Lane-local operations that need their architectural 128-bit chunk
+    /// number in order to suppress floating-point exceptions in masked-off
+    /// EVEX lanes before the destination merge is evaluated.
+    pub const INDEXED_LANE_LOCAL_128_USER_OPS: &[&str] = &[
+        "vaddpd_avx512vl",
+        "vaddpd_avx512f",
+        "vaddps_avx512vl",
+        "vaddps_avx512f",
+        "vdivpd_avx512vl",
+        "vdivpd_avx512f",
+        "vdivps_avx512vl",
+        "vdivps_avx512f",
+        "vmaxpd_avx512vl",
+        "vmaxpd_avx512f",
+        "vmaxps_avx512vl",
+        "vmaxps_avx512f",
+        "vminpd_avx512vl",
+        "vminpd_avx512f",
+        "vminps_avx512vl",
+        "vminps_avx512f",
+        "vmulpd_avx512vl",
+        "vmulpd_avx512f",
+        "vmulps_avx512vl",
+        "vmulps_avx512f",
+        "vsqrtpd_avx512vl",
+        "vsqrtpd_avx512f",
+        "vsqrtps_avx512vl",
+        "vsqrtps_avx512f",
+        "vsubpd_avx512vl",
+        "vsubpd_avx512f",
+        "vsubps_avx512vl",
+        "vsubps_avx512f",
+        "vblendpd_avx",
+        "vblendps_avx",
+        "vshufpd_avx",
+        "vshufpd_avx512vl",
+        "vshufpd_avx512f",
+        "vpmovsxbd_avx",
+        "vpmovsxbd_avx2",
+        "vpmovsxbd_avx512vl",
+        "vpmovsxbd_avx512f",
+        "vpmovsxbq_avx",
+        "vpmovsxbq_avx2",
+        "vpmovsxbq_avx512vl",
+        "vpmovsxbq_avx512f",
+        "vpmovsxwq_avx",
+        "vpmovsxwq_avx2",
+        "vpmovsxwq_avx512vl",
+        "vpmovsxwq_avx512f",
+        "vpmovzxbq_avx",
+        "vpmovzxbq_avx2",
+        "vpmovzxbq_avx512vl",
+        "vpmovzxbq_avx512f",
+        "vpmovzxwq_avx",
+        "vpmovzxwq_avx2",
+        "vpmovzxwq_avx512vl",
+        "vpmovzxwq_avx512f",
+        "vmpsadbw_avx",
+        "vmpsadbw_avx2",
+        "vcvtdq2pd_avx",
+        "vcvtps2pd_avx",
+        "vpermilpd_avx",
+        "vpermilpd_avx512vl",
+        "vpermilpd_avx512f",
+        "vpermilps_avx",
+        "vpermilps_avx512vl",
+        "vpermilps_avx512f",
+    ];
+
     fn packed_sub_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         if dst.size == 0
             || dst.size > 64
@@ -553,6 +1911,24 @@ pub mod x86 {
             let left = cpu.read::<u64>(args[0].slice(offset, 8));
             let right = cpu.read::<u64>(args[1].slice(offset, 8));
             cpu.write_var(dst.slice(offset, 8), left.wrapping_sub(right));
+        }
+    }
+
+    fn packed_sub_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size == 0
+            || dst.size > 64
+            || dst.size % 4 != 0
+            || args[0].size() != dst.size
+            || args[1].size() != dst.size
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0..dst.size).step_by(4) {
+            let left = cpu.read::<u32>(args[0].slice(offset, 4));
+            let right = cpu.read::<u32>(args[1].slice(offset, 4));
+            cpu.write_var(dst.slice(offset, 4), left.wrapping_sub(right));
         }
     }
 
@@ -596,12 +1972,8 @@ pub mod x86 {
         let mut mask = 0_u16;
         for lane in 0..lane_count {
             let offset = (lane * element_size) as u8;
-            let left: u128 = cpu
-                .read_dynamic(args[0].slice(offset, element_size as u8))
-                .zxt();
-            let right: u128 = cpu
-                .read_dynamic(args[1].slice(offset, element_size as u8))
-                .zxt();
+            let left: u128 = cpu.read_dynamic(args[0].slice(offset, element_size as u8)).zxt();
+            let right: u128 = cpu.read_dynamic(args[1].slice(offset, element_size as u8)).zxt();
             let matches = if signed {
                 let shift = 128 - element_size * 8;
                 let left = ((left << shift) as i128) >> shift;
@@ -617,7 +1989,8 @@ pub mod x86 {
                     7 => true,
                     _ => unreachable!(),
                 }
-            } else {
+            }
+            else {
                 match predicate {
                     0 => left == right,
                     1 => left < right,
@@ -1018,6 +2391,571 @@ pub mod x86 {
         );
     }
 
+    fn packed_permute2_elements_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        indexes: Value,
+        first: [u128; 4],
+        second: [u128; 4],
+        lane_width: usize,
+        lane_count: usize,
+    ) {
+        if dst.size != 16
+            || indexes.size() != 16
+            || !matches!(lane_width, 2 | 4 | 8)
+            || !lane_count.is_power_of_two()
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let first = first.map(u128::to_le_bytes);
+        let second = second.map(u128::to_le_bytes);
+        let mut output = [0_u8; 16];
+        for lane in 0..16 / lane_width {
+            let offset = lane * lane_width;
+            let source_lane = match lane_width {
+                2 => u16::from_le_bytes(indexes[offset..offset + 2].try_into().unwrap()) as usize,
+                4 => u32::from_le_bytes(indexes[offset..offset + 4].try_into().unwrap()) as usize,
+                8 => u64::from_le_bytes(indexes[offset..offset + 8].try_into().unwrap()) as usize,
+                _ => unreachable!(),
+            } & (lane_count * 2 - 1);
+            let (table, source_lane) = if source_lane < lane_count {
+                (&first, source_lane)
+            }
+            else {
+                (&second, source_lane - lane_count)
+            };
+            let source_offset = source_lane * lane_width;
+            let source_chunk = source_offset / 16;
+            let source_chunk_offset = source_offset % 16;
+            output[offset..offset + lane_width].copy_from_slice(
+                &table[source_chunk][source_chunk_offset..source_chunk_offset + lane_width],
+            );
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_permute2_d_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            [cpu.args[0], 0, 0, 0],
+            4,
+            4,
+        );
+    }
+
+    fn packed_permute2_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            [cpu.args[1], cpu.args[2], 0, 0],
+            4,
+            8,
+        );
+    }
+
+    fn packed_permute2_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            [cpu.args[3], cpu.args[4], cpu.args[5], cpu.args[6]],
+            4,
+            16,
+        );
+    }
+
+    fn packed_permute2_q_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            [cpu.args[0], 0, 0, 0],
+            8,
+            2,
+        );
+    }
+
+    fn packed_permute2_q_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            [cpu.args[1], cpu.args[2], 0, 0],
+            8,
+            4,
+        );
+    }
+
+    fn packed_permute2_q_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            [cpu.args[3], cpu.args[4], cpu.args[5], cpu.args[6]],
+            8,
+            8,
+        );
+    }
+
+    fn packed_permute2_w_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            [cpu.args[0], 0, 0, 0],
+            2,
+            8,
+        );
+    }
+
+    fn packed_permute2_w_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            [cpu.args[1], cpu.args[2], 0, 0],
+            2,
+            16,
+        );
+    }
+
+    fn packed_permute2_w_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_elements_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            [cpu.args[3], cpu.args[4], cpu.args[5], cpu.args[6]],
+            2,
+            32,
+        );
+    }
+
+    fn packed_align_right_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let upper = cpu.read::<u128>(args[0]).to_le_bytes();
+        let lower = cpu.read::<u128>(args[1]).to_le_bytes();
+        let shift = cpu.args[0] as usize;
+        let mut output = [0_u8; 16];
+        for (lane, byte) in output.iter_mut().enumerate() {
+            let source = lane + shift;
+            *byte = if source < 16 {
+                lower[source]
+            }
+            else if source < 32 {
+                upper[source - 16]
+            }
+            else {
+                0
+            };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_align_elements_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        first: [u128; 4],
+        second: [u128; 4],
+        vector_size: usize,
+        lane_bytes: usize,
+        immediate: usize,
+        output_chunk: usize,
+    ) {
+        if dst.size != 16
+            || !matches!(vector_size, 16 | 32 | 64)
+            || output_chunk >= vector_size / 16
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = vector_size as u64;
+            return;
+        }
+        let lane_count = vector_size / lane_bytes;
+        let source_start = immediate & (lane_count - 1);
+        let first = first.map(u128::to_le_bytes);
+        let second = second.map(u128::to_le_bytes);
+        let mut output = [0_u8; 16];
+        let lanes_per_chunk = 16 / lane_bytes;
+        for lane_in_chunk in 0..lanes_per_chunk {
+            let destination_lane = output_chunk * lanes_per_chunk + lane_in_chunk;
+            let source_lane = source_start + destination_lane;
+            let (source, source_lane) = if source_lane < lane_count {
+                (&second, source_lane)
+            }
+            else {
+                (&first, source_lane - lane_count)
+            };
+            let source_chunk = source_lane / lanes_per_chunk;
+            let source_offset = (source_lane % lanes_per_chunk) * lane_bytes;
+            let output_offset = lane_in_chunk * lane_bytes;
+            output[output_offset..output_offset + lane_bytes]
+                .copy_from_slice(&source[source_chunk][source_offset..source_offset + lane_bytes]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_align_d_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), 0, 0, 0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            16,
+            4,
+            cpu.args[0] as usize,
+            0,
+        );
+    }
+
+    fn packed_align_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            [cpu.args[0], cpu.args[1], 0, 0],
+            32,
+            4,
+            cpu.args[2] as usize,
+            cpu.args[3] as usize,
+        );
+    }
+
+    fn packed_align_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            [cpu.args[2], cpu.args[3], cpu.args[4], cpu.args[5]],
+            64,
+            4,
+            cpu.args[6] as usize,
+            cpu.args[7] as usize,
+        );
+    }
+
+    fn packed_align_q_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), 0, 0, 0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            16,
+            8,
+            cpu.args[0] as usize,
+            0,
+        );
+    }
+
+    fn packed_align_q_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            [cpu.args[0], cpu.args[1], 0, 0],
+            32,
+            8,
+            cpu.args[2] as usize,
+            cpu.args[3] as usize,
+        );
+    }
+
+    fn packed_align_q_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_align_elements_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            [cpu.args[2], cpu.args[3], cpu.args[4], cpu.args[5]],
+            64,
+            8,
+            cpu.args[6] as usize,
+            cpu.args[7] as usize,
+        );
+    }
+
+    fn packed_shuffle_128_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let first = [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1])];
+        let second = [cpu.args[0], cpu.args[1]];
+        let immediate = cpu.args[2] as usize;
+        let output_chunk = cpu.args[3] as usize;
+        let result = match output_chunk {
+            0 => first[immediate & 1],
+            1 => second[(immediate >> 1) & 1],
+            _ => {
+                cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+                cpu.exception.value = output_chunk as u64;
+                return;
+            }
+        };
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_shuffle_128_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let first =
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]];
+        let second = [cpu.args[2], cpu.args[3], cpu.args[4], cpu.args[5]];
+        let immediate = cpu.args[6] as usize;
+        let output_chunk = cpu.args[7] as usize;
+        if output_chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = output_chunk as u64;
+            return;
+        }
+        let source_chunk = (immediate >> (output_chunk * 2)) & 3;
+        let source = if output_chunk < 2 { first } else { second };
+        cpu.write_var(dst, source[source_chunk]);
+    }
+
+    fn packed_insert_128_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source = [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1])];
+        let inserted = cpu.args[0];
+        let selected_chunk = (cpu.args[1] & 1) as usize;
+        let output_chunk = cpu.args[2] as usize;
+        if output_chunk >= source.len() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = output_chunk as u64;
+            return;
+        }
+        let result = if output_chunk == selected_chunk { inserted } else { source[output_chunk] };
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_insert_128_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source =
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]];
+        let inserted = cpu.args[2];
+        let selected_chunk = (cpu.args[3] & 3) as usize;
+        let output_chunk = cpu.args[4] as usize;
+        if output_chunk >= source.len() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = output_chunk as u64;
+            return;
+        }
+        let result = if output_chunk == selected_chunk { inserted } else { source[output_chunk] };
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_insert_256_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source =
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]];
+        let inserted = [cpu.args[2], cpu.args[3]];
+        let selected_base = ((cpu.args[4] & 1) as usize) * 2;
+        let output_chunk = cpu.args[5] as usize;
+        if output_chunk >= source.len() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = output_chunk as u64;
+            return;
+        }
+        let result = if output_chunk == selected_base {
+            inserted[0]
+        }
+        else if output_chunk == selected_base + 1 {
+            inserted[1]
+        }
+        else {
+            source[output_chunk]
+        };
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_shift_double(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+        left: bool,
+    ) {
+        if dst.size == 0
+            || dst.size > 64
+            || dst.size % element_size != 0
+            || args[0].size() != dst.size
+            || args[1].size() != dst.size
+            || !matches!(element_size, 2 | 4 | 8)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let element_bits = u32::from(element_size) * 8;
+        let shift = (cpu.args[0] as u32) & (element_bits - 1);
+        let element_mask = (1_u128 << element_bits) - 1;
+        for offset in (0..dst.size).step_by(element_size as usize) {
+            let first: u128 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let second: u128 = cpu.read_dynamic(args[1].slice(offset, element_size)).zxt();
+            let result = if shift == 0 {
+                first
+            }
+            else if left {
+                ((first << shift) | (second >> (element_bits - shift))) & element_mask
+            }
+            else {
+                ((first >> shift) | (second << (element_bits - shift))) & element_mask
+            };
+            match element_size {
+                2 => cpu.write_var(dst.slice(offset, element_size), result as u16),
+                4 => cpu.write_var(dst.slice(offset, element_size), result as u32),
+                8 => cpu.write_var(dst.slice(offset, element_size), result as u64),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn packed_shift_left_double_w(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 2, true);
+    }
+
+    fn packed_shift_left_double_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 4, true);
+    }
+
+    fn packed_shift_left_double_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 8, true);
+    }
+
+    fn packed_shift_right_double_w(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 2, false);
+    }
+
+    fn packed_shift_right_double_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 4, false);
+    }
+
+    fn packed_shift_right_double_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, 8, false);
+    }
+
+    fn packed_shift_left_double_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, cpu.args[1] as u8, true);
+    }
+
+    fn packed_shift_right_double_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double(cpu, dst, args, cpu.args[1] as u8, false);
+    }
+
+    fn packed_shift_double_variable_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], left: bool) {
+        let element_size = cpu.args[1] as u8;
+        if dst.size != 16
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 2 | 4 | 8)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let first = cpu.read::<u128>(args[0]).to_le_bytes();
+        let second = cpu.read::<u128>(args[1]).to_le_bytes();
+        let counts = cpu.args[0].to_le_bytes();
+        let element_bits = u32::from(element_size) * 8;
+        let element_mask = (1_u128 << element_bits) - 1;
+        let mut output = [0_u8; 16];
+        for offset in (0..16).step_by(element_size as usize) {
+            let mut first_lane = 0_u128;
+            let mut second_lane = 0_u128;
+            let mut count_lane = 0_u128;
+            for byte in 0..element_size as usize {
+                first_lane |= u128::from(first[offset + byte]) << (byte * 8);
+                second_lane |= u128::from(second[offset + byte]) << (byte * 8);
+                count_lane |= u128::from(counts[offset + byte]) << (byte * 8);
+            }
+            let shift = (count_lane as u32) & (element_bits - 1);
+            let result = if shift == 0 {
+                first_lane
+            }
+            else if left {
+                ((first_lane << shift) | (second_lane >> (element_bits - shift))) & element_mask
+            }
+            else {
+                ((first_lane >> shift) | (second_lane << (element_bits - shift))) & element_mask
+            };
+            for byte in 0..element_size as usize {
+                output[offset + byte] = (result >> (byte * 8)) as u8;
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_shift_left_double_variable_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double_variable_128(cpu, dst, args, true);
+    }
+
+    fn packed_shift_right_double_variable_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_double_variable_128(cpu, dst, args, false);
+    }
+
     fn apply_byte_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
@@ -1046,6 +2984,31 @@ pub mod x86 {
         cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
+    fn apply_dword_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let result = cpu.read::<u128>(args[0]).to_le_bytes();
+        let old_destination = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mask = cpu.args[0] as u64;
+        let chunk = cpu.args[1] as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..4 {
+            let range = lane * 4..lane * 4 + 4;
+            let source =
+                if mask & (1_u64 << (chunk * 4 + lane)) != 0 { &result } else { &old_destination };
+            output[range.clone()].copy_from_slice(&source[range]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
     fn packed_maddubs_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
@@ -1064,6 +3027,72 @@ pub mod x86 {
             );
         }
         cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_mpsadbw_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let first = cpu.read::<u128>(args[0]).to_le_bytes();
+        let second = cpu.read::<u128>(args[1]).to_le_bytes();
+        let chunk = cpu.args[7] as usize;
+        if chunk > 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let control = ((cpu.args[0] >> (chunk * 3)) & 7) as usize;
+        let first_base = ((control >> 2) & 1) * 4;
+        let second_base = (control & 3) * 4;
+        let mut output = [0_u8; 16];
+        for lane in 0..8 {
+            let mut sum = 0_u16;
+            for byte in 0..4 {
+                sum = sum.saturating_add(u16::from(
+                    first[first_base + lane + byte].abs_diff(second[second_base + byte]),
+                ));
+            }
+            output[lane * 2..lane * 2 + 2].copy_from_slice(&sum.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_dbsad_bw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if !matches!(dst.size, 16 | 32 | 64)
+            || args[0].size() != dst.size
+            || args[1].size() != dst.size
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let control = cpu.args[0] as usize;
+        for chunk in (0..dst.size).step_by(16) {
+            let first = cpu.read::<u128>(args[0].slice(chunk, 16)).to_le_bytes();
+            let second = cpu.read::<u128>(args[1].slice(chunk, 16)).to_le_bytes();
+            let mut selected = [0_u8; 16];
+            for dword in 0..4 {
+                let source = ((control >> (dword * 2)) & 3) * 4;
+                selected[dword * 4..dword * 4 + 4].copy_from_slice(&second[source..source + 4]);
+            }
+            let mut output = [0_u8; 16];
+            for half in 0..2 {
+                for lane_in_half in 0..4 {
+                    let mut sum = 0_u16;
+                    for byte in 0..4 {
+                        sum = sum.saturating_add(u16::from(
+                            first[half * 8 + (lane_in_half / 2) * 4 + byte]
+                                .abs_diff(selected[half * 8 + lane_in_half + byte]),
+                        ));
+                    }
+                    let lane = half * 4 + lane_in_half;
+                    output[lane * 2..lane * 2 + 2].copy_from_slice(&sum.to_le_bytes());
+                }
+            }
+            cpu.write_var(dst.slice(chunk, 16), u128::from_le_bytes(output));
+        }
     }
 
     fn packed_maddwd_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -1121,6 +3150,136 @@ pub mod x86 {
             mask |= u16::from(byte >> 7) << lane;
         }
         cpu.write_var(dst, mask);
+    }
+
+    fn packed_mask_to_words_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mask = cpu.read::<u64>(args[0]);
+        let chunk = cpu.read::<u8>(args[1]) as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..8 {
+            let word = if mask & (1_u64 << (chunk * 8 + lane)) != 0 { u16::MAX } else { 0 };
+            output[lane * 2..lane * 2 + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_words_to_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 1 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bytes = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut mask = 0_u8;
+        for lane in 0..8 {
+            mask |= ((bytes[lane * 2 + 1] >> 7) & 1) << lane;
+        }
+        cpu.write_var(dst, mask);
+    }
+
+    fn packed_conflict_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        sources: [u128; 4],
+        vector_size: usize,
+        element_size: usize,
+        output_chunk: usize,
+    ) {
+        if dst.size != 16
+            || !matches!(vector_size, 16 | 32 | 64)
+            || !matches!(element_size, 4 | 8)
+            || output_chunk >= vector_size / 16
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = vector_size as u64;
+            return;
+        }
+        let source = sources.map(u128::to_le_bytes);
+        let lane_count = vector_size / element_size;
+        let lanes_per_chunk = 16 / element_size;
+        let lane = |index: usize| {
+            let offset = index * element_size;
+            let mut bytes = [0_u8; 8];
+            for byte in 0..element_size {
+                bytes[byte] = source[(offset + byte) / 16][(offset + byte) % 16];
+            }
+            u64::from_le_bytes(bytes)
+        };
+        let mut output = [0_u8; 16];
+        for local in 0..lanes_per_chunk {
+            let current = output_chunk * lanes_per_chunk + local;
+            let mut conflicts = 0_u64;
+            for previous in 0..current.min(lane_count) {
+                if lane(previous) == lane(current) {
+                    conflicts |= 1_u64 << previous;
+                }
+            }
+            output[local * element_size..(local + 1) * element_size]
+                .copy_from_slice(&conflicts.to_le_bytes()[..element_size]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_conflict_d_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(cpu, dst, [cpu.read::<u128>(args[0]), 0, 0, 0], 16, 4, 0);
+    }
+
+    fn packed_conflict_d_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            32,
+            4,
+            cpu.args[0] as usize,
+        );
+    }
+
+    fn packed_conflict_d_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            64,
+            4,
+            cpu.args[2] as usize,
+        );
+    }
+
+    fn packed_conflict_q_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(cpu, dst, [cpu.read::<u128>(args[0]), 0, 0, 0], 16, 8, 0);
+    }
+
+    fn packed_conflict_q_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            32,
+            8,
+            cpu.args[0] as usize,
+        );
+    }
+
+    fn packed_conflict_q_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_conflict_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            64,
+            8,
+            cpu.args[2] as usize,
+        );
     }
 
     fn packed_compact_d_chunk(
@@ -1773,6 +3932,140 @@ pub mod x86 {
         cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
+    fn vector_sign_mask(value: u128, element_size: usize) -> Option<u64> {
+        if !matches!(element_size, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let bytes = value.to_le_bytes();
+        let mut mask = 0_u64;
+        for lane in 0..16 / element_size {
+            mask |= u64::from(bytes[(lane + 1) * element_size - 1] >> 7) << lane;
+        }
+        Some(mask)
+    }
+
+    fn vector_sign_masked_load_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let element_size = cpu.args[0] as usize;
+        let chunk = cpu.args[1] as usize;
+        let Some(mask) = vector_sign_mask(cpu.read::<u128>(args[1]), element_size)
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        };
+        let Some(address) = cpu.read::<u64>(args[0]).checked_add((chunk.saturating_mul(16)) as u64)
+        else {
+            cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+            cpu.exception.value = u64::MAX;
+            return;
+        };
+        let mut output = [0_u8; 16];
+        for lane in 0..16 / element_size {
+            if mask & (1 << lane) == 0 {
+                continue;
+            }
+            for byte in 0..element_size {
+                let offset = lane * element_size + byte;
+                let current = address + offset as u64;
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => output[offset] = value[0],
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn vector_sign_masked_store_128(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let element_size = cpu.args[1] as usize;
+        let Some(mask) = vector_sign_mask(cpu.read::<u128>(args[1]), element_size)
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        };
+        masked_store(cpu, cpu.read::<u64>(args[0]), [cpu.args[0], 0, 0, 0], 1, mask, element_size);
+    }
+
+    fn vector_sign_masked_store_256(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let element_size = cpu.args[3] as usize;
+        let Some(low_mask) = vector_sign_mask(cpu.read::<u128>(args[1]), element_size)
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        };
+        let Some(high_mask) = vector_sign_mask(cpu.args[0], element_size)
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        };
+        let lanes_per_chunk = 16 / element_size;
+        masked_store(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.args[1], cpu.args[2], 0, 0],
+            2,
+            low_mask | (high_mask << lanes_per_chunk),
+            element_size,
+        );
+    }
+
+    fn maskmovdqu(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let Some(address) = read_named::<u64>(cpu, "RDI")
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = 0;
+            return;
+        };
+        // MASKMOVDQU's non-temporal memory reference covers the full
+        // 16-byte destination. Native hardware faults on an inaccessible
+        // masked-off tail, so validate the complete span before writing the
+        // selected bytes.
+        for byte in 0..16_u64 {
+            let Some(current) = address.checked_add(byte)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            if let Err(error) =
+                icicle_mem::perm::check(cpu.mem.get_perm(current), icicle_mem::perm::WRITE)
+            {
+                cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                cpu.exception.value = current;
+                return;
+            }
+        }
+        let mask = vector_sign_mask(cpu.read::<u128>(args[1]), 1).unwrap_or(0);
+        masked_store(cpu, address, [cpu.read::<u128>(args[0]), 0, 0, 0], 1, mask, 1);
+    }
+
     fn aligned_vector_address(cpu: &mut Cpu, address: u64, mask: u64, width: usize) -> bool {
         if !matches!(width, 16 | 32 | 64) {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
@@ -2421,6 +4714,339 @@ pub mod x86 {
         }
         let lane = u128::from(cpu.read::<u32>(args[0].slice(0, 4)));
         cpu.write_var(dst, lane | lane << 32 | lane << 64 | lane << 96);
+    }
+
+    /// One 128-bit slice of an integer broadcast. The SLEIGH constructors
+    /// lower every wide destination into slices so the helper ABI never has
+    /// to transport a YMM or ZMM value.
+    fn broadcast_integer_lane_128(cpu: &mut Cpu, dst: VarNode, source: Value, lane_bytes: usize) {
+        if dst.size != 16 || usize::from(source.size()) < lane_bytes {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lane = match lane_bytes {
+            1 => u128::from(cpu.read::<u8>(source.slice(0, 1))),
+            2 => u128::from(cpu.read::<u16>(source.slice(0, 2))),
+            8 => u128::from(cpu.read::<u64>(source.slice(0, 8))),
+            _ => unreachable!("broadcast helper has a fixed lane width"),
+        };
+        let lane_bits = lane_bytes * 8;
+        let lane_mask = u128::MAX >> (128 - lane_bits);
+        let mut output = 0_u128;
+        for offset in (0..128).step_by(lane_bits) {
+            output |= (lane & lane_mask) << offset;
+        }
+        cpu.write_var(dst, output);
+    }
+
+    fn vpbroadcastb_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        broadcast_integer_lane_128(cpu, dst, args[0], 1);
+    }
+
+    fn vpbroadcastw_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        broadcast_integer_lane_128(cpu, dst, args[0], 2);
+    }
+
+    fn vpbroadcastq_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        broadcast_integer_lane_128(cpu, dst, args[0], 8);
+    }
+
+    fn copy_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let value = cpu.read::<u128>(args[0]);
+        cpu.write_var(dst, value);
+    }
+
+    fn copy_second_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let value = cpu.read::<u128>(args[1]);
+        cpu.write_var(dst, value);
+    }
+
+    #[derive(Clone, Copy)]
+    struct PackedStringComparison {
+        int_res2: u16,
+        element_count: usize,
+        left_terminated: bool,
+        right_terminated: bool,
+    }
+
+    /// Intel SDM Vol. 2, "Imm8 Control Byte Operation for PCMPESTRI /
+    /// PCMPESTRM / PCMPISTRI / PCMPISTRM". This is deliberately expressed as
+    /// the two architectural intermediate results rather than as a libc-style
+    /// string helper: invalid elements participate differently in each of the
+    /// four aggregation modes, including positions beyond the end of a
+    /// candidate in equal-ordered mode.
+    fn compare_strings(
+        cpu: &mut Cpu,
+        left_value: Value,
+        right_value: Value,
+        control: u8,
+        explicit_lengths: Option<(u32, u32)>,
+    ) -> Option<PackedStringComparison> {
+        if left_value.size() != 16 || right_value.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(left_value.size());
+            return None;
+        }
+
+        let left_bytes = cpu.read::<u128>(left_value).to_le_bytes();
+        let right_bytes = cpu.read::<u128>(right_value).to_le_bytes();
+        let words = control & 1 != 0;
+        let signed = control & 2 != 0;
+        let element_count = if words { 8 } else { 16 };
+        let mut left = [0_i32; 16];
+        let mut right = [0_i32; 16];
+        for index in 0..element_count {
+            if words {
+                let offset = index * 2;
+                let left_word = u16::from_le_bytes([left_bytes[offset], left_bytes[offset + 1]]);
+                let right_word = u16::from_le_bytes([right_bytes[offset], right_bytes[offset + 1]]);
+                left[index] =
+                    if signed { i32::from(left_word as i16) } else { i32::from(left_word) };
+                right[index] =
+                    if signed { i32::from(right_word as i16) } else { i32::from(right_word) };
+            }
+            else {
+                left[index] = if signed {
+                    i32::from(left_bytes[index] as i8)
+                }
+                else {
+                    i32::from(left_bytes[index])
+                };
+                right[index] = if signed {
+                    i32::from(right_bytes[index] as i8)
+                }
+                else {
+                    i32::from(right_bytes[index])
+                };
+            }
+        }
+
+        let (left_length, right_length) = match explicit_lengths {
+            Some((left_length, right_length)) => (
+                (left_length as i32).unsigned_abs().min(element_count as u32) as usize,
+                (right_length as i32).unsigned_abs().min(element_count as u32) as usize,
+            ),
+            None => (
+                left[..element_count]
+                    .iter()
+                    .position(|&element| element == 0)
+                    .unwrap_or(element_count),
+                right[..element_count]
+                    .iter()
+                    .position(|&element| element == 0)
+                    .unwrap_or(element_count),
+            ),
+        };
+        let aggregation = (control >> 2) & 3;
+
+        let comparison = |left_index: usize, right_index: usize| {
+            let left_valid = left_index < left_length;
+            let right_valid = right_index < right_length && right_index < element_count;
+            if !left_valid || !right_valid {
+                return match aggregation {
+                    0 | 1 => false,
+                    2 => !left_valid && !right_valid,
+                    3 => !left_valid,
+                    _ => unreachable!(),
+                };
+            }
+            match aggregation {
+                0 | 2 | 3 => left[left_index] == right[right_index],
+                1 if left_index & 1 == 0 => right[right_index] >= left[left_index],
+                1 => right[right_index] <= left[left_index],
+                _ => unreachable!(),
+            }
+        };
+
+        let mut int_res1 = 0_u16;
+        match aggregation {
+            // Equal any: each output bit says whether the corresponding
+            // right-hand element matched any valid member of the left set.
+            0 => {
+                for right_index in 0..element_count {
+                    if (0..element_count).any(|left_index| comparison(left_index, right_index)) {
+                        int_res1 |= 1 << right_index;
+                    }
+                }
+            }
+            // Ranges: consecutive left elements are inclusive lower/upper
+            // bounds. Invalid pairs are forced false by the SDM table.
+            1 => {
+                for right_index in 0..element_count {
+                    if (0..element_count).step_by(2).any(|left_index| {
+                        comparison(left_index, right_index)
+                            && comparison(left_index + 1, right_index)
+                    }) {
+                        int_res1 |= 1 << right_index;
+                    }
+                }
+            }
+            // Equal each compares elements at the same index.
+            2 => {
+                for index in 0..element_count {
+                    if comparison(index, index) {
+                        int_res1 |= 1 << index;
+                    }
+                }
+            }
+            // Equal ordered tests the left string at every possible starting
+            // position in the right string. Out-of-register right positions
+            // are invalid, so a still-valid left element forces failure.
+            3 => {
+                for right_start in 0..element_count {
+                    if (0..element_count)
+                        .all(|left_index| comparison(left_index, right_start + left_index))
+                    {
+                        int_res1 |= 1 << right_start;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let all_elements =
+            if element_count == 16 { u16::MAX } else { (1_u16 << element_count) - 1 };
+        let valid_right = if right_length == 16 { u16::MAX } else { (1_u16 << right_length) - 1 };
+        let int_res2 = match (control >> 4) & 3 {
+            0 | 2 => int_res1,
+            1 => (!int_res1) & all_elements,
+            3 => int_res1 ^ valid_right,
+            _ => unreachable!(),
+        };
+
+        Some(PackedStringComparison {
+            int_res2,
+            element_count,
+            left_terminated: left_length < element_count,
+            right_terminated: right_length < element_count,
+        })
+    }
+
+    fn write_packed_string_flags(cpu: &mut Cpu, comparison: PackedStringComparison) -> Option<()> {
+        for (name, value) in [
+            ("CF", comparison.int_res2 != 0),
+            ("ZF", comparison.right_terminated),
+            ("SF", comparison.left_terminated),
+            ("OF", comparison.int_res2 & 1 != 0),
+            ("AF", false),
+            ("PF", false),
+        ] {
+            write_named(cpu, name, u8::from(value))?;
+        }
+        Some(())
+    }
+
+    fn packed_compare_implicit_index(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let Some(comparison) = compare_strings(cpu, args[0], args[1], cpu.args[0] as u8, None)
+        else {
+            return;
+        };
+        if write_packed_string_flags(cpu, comparison).is_none() {
+            return;
+        }
+        let index = if comparison.int_res2 == 0 {
+            comparison.element_count as u32
+        }
+        else if cpu.args[0] & 0x40 == 0 {
+            comparison.int_res2.trailing_zeros()
+        }
+        else {
+            u16::BITS - 1 - comparison.int_res2.leading_zeros()
+        };
+        cpu.write_trunc(dst, index);
+    }
+
+    fn packed_compare_implicit_mask(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let Some(comparison) = compare_strings(cpu, args[0], args[1], cpu.args[0] as u8, None)
+        else {
+            return;
+        };
+        if write_packed_string_flags(cpu, comparison).is_none() {
+            return;
+        }
+        let result = if cpu.args[0] & 0x40 == 0 {
+            u128::from(comparison.int_res2)
+        }
+        else {
+            let lane_bits = if comparison.element_count == 16 { 8 } else { 16 };
+            let lane_mask = (1_u128 << lane_bits) - 1;
+            let mut expanded = 0_u128;
+            for index in 0..comparison.element_count {
+                if comparison.int_res2 & (1 << index) != 0 {
+                    expanded |= lane_mask << (index * lane_bits);
+                }
+            }
+            expanded
+        };
+        cpu.write_var(dst, result);
+    }
+
+    fn packed_compare_explicit_index(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let Some(comparison) = compare_strings(
+            cpu,
+            args[0],
+            args[1],
+            cpu.args[0] as u8,
+            Some((cpu.args[1] as u32, cpu.args[2] as u32)),
+        )
+        else {
+            return;
+        };
+        if write_packed_string_flags(cpu, comparison).is_none() {
+            return;
+        }
+        let index = if comparison.int_res2 == 0 {
+            comparison.element_count as u32
+        }
+        else if cpu.args[0] & 0x40 == 0 {
+            comparison.int_res2.trailing_zeros()
+        }
+        else {
+            u16::BITS - 1 - comparison.int_res2.leading_zeros()
+        };
+        cpu.write_trunc(dst, index);
+    }
+
+    fn packed_compare_explicit_mask(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let Some(comparison) = compare_strings(
+            cpu,
+            args[0],
+            args[1],
+            cpu.args[0] as u8,
+            Some((cpu.args[1] as u32, cpu.args[2] as u32)),
+        )
+        else {
+            return;
+        };
+        if write_packed_string_flags(cpu, comparison).is_none() {
+            return;
+        }
+        let result = if cpu.args[0] & 0x40 == 0 {
+            u128::from(comparison.int_res2)
+        }
+        else {
+            let lane_bits = if comparison.element_count == 16 { 8 } else { 16 };
+            let lane_mask = (1_u128 << lane_bits) - 1;
+            let mut expanded = 0_u128;
+            for index in 0..comparison.element_count {
+                if comparison.int_res2 & (1 << index) != 0 {
+                    expanded |= lane_mask << (index * lane_bits);
+                }
+            }
+            expanded
+        };
+        cpu.write_var(dst, result);
     }
 
     /// One 128-bit slice of VPTERNLOGD/Q. The truth-table operation is bitwise,
@@ -3171,6 +5797,179 @@ pub mod x86 {
         cpu.write_var(VarNode::new(dst.id, 8), result as u64);
     }
 
+    fn vector_movemask_value(cpu: &mut Cpu, source: Value, lane_size: u8) -> Option<u32> {
+        if source.size() != 16 || source.size() % lane_size != 0 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return None;
+        }
+        let mut result = 0_u32;
+        for lane in 0..source.size() / lane_size {
+            let sign_byte = source.slice(lane * lane_size + lane_size - 1, 1);
+            result |= u32::from(cpu.read::<u8>(sign_byte) >> 7) << lane;
+        }
+        Some(result)
+    }
+
+    fn vmovmskpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if let Some(result) = vector_movemask_value(cpu, args[0], 8) {
+            cpu.write_var(VarNode::new(dst.id, 8), u64::from(result));
+        }
+    }
+
+    fn vmovmskps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if let Some(result) = vector_movemask_value(cpu, args[0], 4) {
+            cpu.write_var(VarNode::new(dst.id, 8), u64::from(result));
+        }
+    }
+
+    fn vector_movemask_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane_size: u8) {
+        let Some(low) = vector_movemask_value(cpu, args[0], lane_size)
+        else {
+            return;
+        };
+        let Some(high) = vector_movemask_value(cpu, args[1], lane_size)
+        else {
+            return;
+        };
+        let lanes_per_chunk = 16 / u32::from(lane_size);
+        cpu.write_var(VarNode::new(dst.id, 8), u64::from(low | (high << lanes_per_chunk)));
+    }
+
+    fn vmovmskpd_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        vector_movemask_256(cpu, dst, args, 8);
+    }
+
+    fn vmovmskps_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        vector_movemask_256(cpu, dst, args, 4);
+    }
+
+    fn vmovhlps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let low = cpu.read::<u64>(args[1].slice(8, 8));
+        let high = cpu.read::<u64>(args[0].slice(8, 8));
+        cpu.write_var(dst.slice(0, 8), low);
+        cpu.write_var(dst.slice(8, 8), high);
+    }
+
+    fn vmovlhps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let low = cpu.read::<u64>(args[0].slice(0, 8));
+        let high = cpu.read::<u64>(args[1].slice(0, 8));
+        cpu.write_var(dst.slice(0, 8), low);
+        cpu.write_var(dst.slice(8, 8), high);
+    }
+
+    fn vmov_high64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        match dst.size {
+            8 if args[0].size() == 16 => {
+                cpu.write_var(dst, cpu.read::<u64>(args[0].slice(8, 8)));
+            }
+            16 if args[0].size() == 16 && args[1].size() == 8 => {
+                let low = cpu.read::<u64>(args[0].slice(0, 8));
+                let high = cpu.read::<u64>(args[1]);
+                cpu.write_var(dst.slice(0, 8), low);
+                cpu.write_var(dst.slice(8, 8), high);
+            }
+            _ => {
+                cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+                cpu.exception.value = u64::from(dst.size);
+            }
+        }
+    }
+
+    fn vmov_low64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        match dst.size {
+            8 if args[0].size() == 16 => {
+                cpu.write_var(dst, cpu.read::<u64>(args[0].slice(0, 8)));
+            }
+            16 if args[0].size() == 16 && args[1].size() == 8 => {
+                let low = cpu.read::<u64>(args[1]);
+                let high = cpu.read::<u64>(args[0].slice(8, 8));
+                cpu.write_var(dst.slice(0, 8), low);
+                cpu.write_var(dst.slice(8, 8), high);
+            }
+            _ => {
+                cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+                cpu.exception.value = u64::from(dst.size);
+            }
+        }
+    }
+
+    fn vpermil(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane_size: u8) {
+        if dst.size != 16 || !matches!(lane_size, 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lanes = 16 / lane_size;
+        if args[1].size() == 1 {
+            if args[0].size() != 16 {
+                cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+                cpu.exception.value = u64::from(args[0].size());
+                return;
+            }
+            let immediate = cpu.read::<u8>(args[1]);
+            let chunk = cpu.args[7] as u8;
+            for lane in 0..lanes {
+                let bits = if lane_size == 4 { 2 } else { 1 };
+                let control_lane = chunk * lanes + lane;
+                let source_lane = (immediate >> (control_lane * bits)) & ((1 << bits) - 1);
+                let value: u64 =
+                    cpu.read_dynamic(args[0].slice(source_lane * lane_size, lane_size)).zxt();
+                cpu.write_trunc(dst.slice(lane * lane_size, lane_size), value);
+            }
+        }
+        else {
+            if args[0].size() != 16 || args[1].size() != 16 {
+                cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+                cpu.exception.value = u64::from(args[1].size());
+                return;
+            }
+            for lane in 0..lanes {
+                let control: u64 =
+                    cpu.read_dynamic(args[1].slice(lane * lane_size, lane_size)).zxt();
+                let source_lane =
+                    if lane_size == 4 { control as u8 & 3 } else { (control as u8 >> 1) & 1 };
+                let value: u64 =
+                    cpu.read_dynamic(args[0].slice(source_lane * lane_size, lane_size)).zxt();
+                cpu.write_trunc(dst.slice(lane * lane_size, lane_size), value);
+            }
+        }
+    }
+
+    fn vpermilpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        vpermil(cpu, dst, args, 8);
+    }
+
+    fn vpermilps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        vpermil(cpu, dst, args, 4);
+    }
+
+    fn vldmxcsr(cpu: &mut Cpu, _dst: VarNode, args: [Value; 2]) {
+        let value = cpu.read::<u32>(args[0]);
+        if value & !MXCSR_MASK != 0 {
+            cpu.exception.code = ExceptionCode::GeneralProtection as u32;
+            cpu.exception.value = 0;
+            return;
+        }
+        let _ = write_named(cpu, "MXCSR", value);
+    }
+
+    fn vstmxcsr(cpu: &mut Cpu, dst: VarNode, _args: [Value; 2]) {
+        if let Some(value) = read_named::<u32>(cpu, "MXCSR") {
+            cpu.write_var(dst, value);
+        }
+    }
+
     /// Insert word
     #[allow(unused)]
     fn pinsrw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3243,6 +6042,62 @@ pub mod x86 {
         }
     }
 
+    fn rounding_control(cpu: &mut Cpu, immediate: u8) -> (u8, bool, bool) {
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = if immediate & 4 != 0 { ((mxcsr >> 13) & 3) as u8 } else { immediate & 3 };
+        (mode, mxcsr & (1 << 6) != 0, immediate & 8 != 0)
+    }
+
+    fn round_f64_bits(bits: u64, mode: u8, denormals_are_zero: bool) -> (u64, u32) {
+        let sign = bits & (1_u64 << 63);
+        let exponent = bits & 0x7ff0_0000_0000_0000;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        if exponent == 0x7ff0_0000_0000_0000 {
+            if fraction == 0 {
+                return (bits, 0);
+            }
+            let signaling = bits & 0x0008_0000_0000_0000 == 0;
+            return (bits | u64::from(signaling) * 0x0008_0000_0000_0000, u32::from(signaling));
+        }
+        let subnormal = exponent == 0 && fraction != 0;
+        let effective = if subnormal && denormals_are_zero { sign } else { bits };
+        let value = f64::from_bits(effective);
+        let rounded = match mode {
+            0 => value.round_ties_even(),
+            1 => value.floor(),
+            2 => value.ceil(),
+            _ => value.trunc(),
+        };
+        let inexact = rounded != value;
+        let flags = (u32::from(subnormal && !denormals_are_zero) << 1) | (u32::from(inexact) << 5);
+        (rounded.to_bits(), flags)
+    }
+
+    fn round_f32_bits(bits: u32, mode: u8, denormals_are_zero: bool) -> (u32, u32) {
+        let sign = bits & (1_u32 << 31);
+        let exponent = bits & 0x7f80_0000;
+        let fraction = bits & 0x007f_ffff;
+        if exponent == 0x7f80_0000 {
+            if fraction == 0 {
+                return (bits, 0);
+            }
+            let signaling = bits & 0x0040_0000 == 0;
+            return (bits | u32::from(signaling) * 0x0040_0000, u32::from(signaling));
+        }
+        let subnormal = exponent == 0 && fraction != 0;
+        let effective = if subnormal && denormals_are_zero { sign } else { bits };
+        let value = f32::from_bits(effective);
+        let rounded = match mode {
+            0 => value.round_ties_even(),
+            1 => value.floor(),
+            2 => value.ceil(),
+            _ => value.trunc(),
+        };
+        let inexact = rounded != value;
+        let flags = (u32::from(subnormal && !denormals_are_zero) << 1) | (u32::from(inexact) << 5);
+        (rounded.to_bits(), flags)
+    }
+
     fn roundsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         // Scalar round of the low f64 of args[1], with the upper 64 bits taken
         // from args[0]. The imm8 rounding mode is the pcodeop's third input,
@@ -3263,17 +6118,14 @@ pub mod x86 {
             return;
         }
         let imm = cpu.args[0] as u8;
-        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
+        let (mode, daz, suppress_precision) = rounding_control(cpu, imm);
         let upper = u128::from_le_bytes(upper);
-        let value = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
-        let rounded = match mode {
-            0 => value.round_ties_even(),
-            1 => value.floor(),
-            2 => value.ceil(),
-            _ => value.trunc(),
+        let (rounded, mut flags) = round_f64_bits(cpu.read::<u64>(args[1].slice(0, 8)), mode, daz);
+        if suppress_precision {
+            flags &= !(1 << 5);
         }
-        .to_bits();
         write_xmm(cpu, dst, ((upper & !0xffff_ffff_ffff_ffffu128) | rounded as u128).to_le_bytes());
+        raise_mxcsr_flags(cpu, flags);
     }
 
     fn roundss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3289,17 +6141,14 @@ pub mod x86 {
             return;
         }
         let imm = cpu.args[0] as u8;
-        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
+        let (mode, daz, suppress_precision) = rounding_control(cpu, imm);
         let upper = u128::from_le_bytes(upper);
-        let value = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
-        let rounded = match mode {
-            0 => value.round_ties_even(),
-            1 => value.floor(),
-            2 => value.ceil(),
-            _ => value.trunc(),
+        let (rounded, mut flags) = round_f32_bits(cpu.read::<u32>(args[1].slice(0, 4)), mode, daz);
+        if suppress_precision {
+            flags &= !(1 << 5);
         }
-        .to_bits();
         write_xmm(cpu, dst, ((upper & !0xffff_ffffu128) | rounded as u128).to_le_bytes());
+        raise_mxcsr_flags(cpu, flags);
     }
 
     fn pshufb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3349,6 +6198,89 @@ pub mod x86 {
             out[2 * i..2 * i + 2].copy_from_slice(&(((x * y) >> 16) as u16).to_le_bytes());
         }
         write_xmm(cpu, dst, out);
+    }
+
+    fn packed_mul_low_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..8_u8 {
+            let offset = lane * 2;
+            let left = cpu.read::<u16>(args[0].slice(offset, 2));
+            let right = cpu.read::<u16>(args[1].slice(offset, 2));
+            cpu.write_var(dst.slice(offset, 2), left.wrapping_mul(right));
+        }
+    }
+
+    fn packed_unpack_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], high: bool) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source_start = if high { 4_u8 } else { 0_u8 };
+        for lane in 0..4_u8 {
+            let source_offset = (source_start + lane) * 2;
+            let destination_offset = lane * 4;
+            let left = cpu.read::<u16>(args[0].slice(source_offset, 2));
+            let right = cpu.read::<u16>(args[1].slice(source_offset, 2));
+            cpu.write_var(dst.slice(destination_offset, 2), left);
+            cpu.write_var(dst.slice(destination_offset + 2, 2), right);
+        }
+    }
+
+    fn packed_unpack_low_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_w_128(cpu, dst, args, false);
+    }
+
+    fn packed_unpack_high_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_w_128(cpu, dst, args, true);
+    }
+
+    fn packed_unpack_lanes_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+        high: bool,
+    ) {
+        if dst.size != 16
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 1 | 4)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lanes_per_half = 8 / element_size;
+        let source_base = if high { 8 } else { 0 };
+        for lane in 0..lanes_per_half {
+            let source_offset = source_base + lane * element_size;
+            let destination_offset = lane * element_size * 2;
+            let left: u64 = cpu.read_dynamic(args[0].slice(source_offset, element_size)).zxt();
+            let right: u64 = cpu.read_dynamic(args[1].slice(source_offset, element_size)).zxt();
+            cpu.write_trunc(dst.slice(destination_offset, element_size), left);
+            cpu.write_trunc(dst.slice(destination_offset + element_size, element_size), right);
+        }
+    }
+
+    fn packed_unpack_high_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_lanes_128(cpu, dst, args, 1, true);
+    }
+
+    fn packed_unpack_low_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_lanes_128(cpu, dst, args, 1, false);
+    }
+
+    fn packed_unpack_high_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_lanes_128(cpu, dst, args, 4, true);
+    }
+
+    fn packed_unpack_low_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_unpack_lanes_128(cpu, dst, args, 4, false);
     }
 
     fn pmulhw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3435,7 +6367,9 @@ pub mod x86 {
     /// count past the element width as a full shift-out.
     fn simd_shift_count(cpu: &mut Cpu, v: Value) -> u32 {
         let raw: u128 = match v.size() {
-            16 => cpu.read::<u128>(v),
+            // Packed shifts consume the low unsigned qword of an XMM count
+            // operand; bits 127:64 do not participate in the count.
+            16 => u128::from(cpu.read::<u64>(v.slice(0, 8))),
             _ => {
                 let x: u64 = cpu.read_dynamic(v).zxt();
                 x as u128
@@ -3461,6 +6395,19 @@ pub mod x86 {
         }
     }
 
+    fn packed_shift_right_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let count = simd_shift_count(cpu, args[1]);
+        for offset in [0_u8, 8] {
+            let value = cpu.read::<u64>(args[0].slice(offset, 8));
+            cpu.write_var(dst.slice(offset, 8), if count >= 64 { 0 } else { value >> count });
+        }
+    }
+
     fn packed_shift_right_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         let count = simd_shift_count(cpu, args[1]);
         for i in (0..dst.size).step_by(4) {
@@ -3474,6 +6421,19 @@ pub mod x86 {
         for i in (0..dst.size).step_by(4) {
             let dword: u32 = cpu.read(args[0].slice(i, 4));
             cpu.write_var(dst.slice(i, 4), if count >= 32 { 0 } else { dword << count });
+        }
+    }
+
+    fn packed_shift_left_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != args[0].size() || dst.size % 8 != 0 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let count = simd_shift_count(cpu, args[1]);
+        for offset in (0..dst.size).step_by(8) {
+            let value = cpu.read::<u64>(args[0].slice(offset, 8));
+            cpu.write_var(dst.slice(offset, 8), if count >= 64 { 0 } else { value << count });
         }
     }
 
@@ -3493,6 +6453,18 @@ pub mod x86 {
                 cpu.write_var(dst.slice(lane + byte, 1), value);
             }
         }
+    }
+
+    fn packed_shift_left_lane_bytes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let count = cpu.read::<u8>(args[1]);
+        let result =
+            if count >= 16 { 0 } else { cpu.read::<u128>(args[0]) << (u32::from(count) * 8) };
+        cpu.write_var(dst, result);
     }
 
     fn packed_shift_variable_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], left: bool) {
@@ -3518,6 +6490,193 @@ pub mod x86 {
 
     fn packed_shift_right_variable_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         packed_shift_variable_d(cpu, dst, args, false);
+    }
+
+    fn packed_shift_variable_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+        direction: i8,
+    ) {
+        if dst.size != 16
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 2 | 4 | 8)
+            || !matches!(direction, -1 | 0 | 1)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bits = u32::from(element_size) * 8;
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let value: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let count: u64 = cpu.read_dynamic(args[1].slice(offset, element_size)).zxt();
+            let result = match direction {
+                1 => {
+                    if count >= u64::from(bits) {
+                        0
+                    }
+                    else {
+                        value << count
+                    }
+                }
+                -1 => {
+                    if count >= u64::from(bits) {
+                        0
+                    }
+                    else {
+                        value >> count
+                    }
+                }
+                0 => {
+                    let shift = 64 - bits;
+                    let signed = ((value << shift) as i64) >> shift;
+                    let count = count.min(u64::from(bits - 1)) as u32;
+                    (signed >> count) as u64
+                }
+                _ => unreachable!(),
+            };
+            cpu.write_trunc(dst.slice(offset, element_size), result);
+        }
+    }
+
+    fn packed_shift_left_variable_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 8, 1);
+    }
+
+    fn packed_shift_left_variable_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 2, 1);
+    }
+
+    fn packed_shift_right_variable_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 8, -1);
+    }
+
+    fn packed_shift_right_variable_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 2, -1);
+    }
+
+    fn packed_shift_right_arithmetic_variable_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 4, 0);
+    }
+
+    fn packed_shift_right_arithmetic_variable_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 8, 0);
+    }
+
+    fn packed_shift_right_arithmetic_variable_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_128(cpu, dst, args, 2, 0);
+    }
+
+    fn packed_shift_right_arithmetic_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+    ) {
+        if dst.size != 16 || args[0].size() != 16 || !matches!(element_size, 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bits = u32::from(element_size) * 8;
+        let count = simd_shift_count(cpu, args[1]).min(bits - 1);
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let value: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let shift = 64 - bits;
+            let signed = ((value << shift) as i64) >> shift;
+            cpu.write_trunc(dst.slice(offset, element_size), (signed >> count) as u64);
+        }
+    }
+
+    fn packed_shift_right_arithmetic_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_right_arithmetic_128(cpu, dst, args, 4);
+    }
+
+    fn packed_shift_right_arithmetic_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_right_arithmetic_128(cpu, dst, args, 8);
+    }
+
+    fn packed_rotate_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+        left: bool,
+    ) {
+        if dst.size != 16
+            || args[0].size() != 16
+            || !matches!(args[1].size(), 1 | 16)
+            || !matches!(element_size, 4 | 8)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bits = u32::from(element_size) * 8;
+        let mask = if bits == 64 { u64::MAX } else { (1_u64 << bits) - 1 };
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let value: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let raw_count: u64 = if args[1].size() == 1 {
+                u64::from(cpu.read::<u8>(args[1]))
+            }
+            else {
+                cpu.read_dynamic(args[1].slice(offset, element_size)).zxt()
+            };
+            let count = (raw_count as u32) & (bits - 1);
+            let result = if count == 0 {
+                value
+            }
+            else if left {
+                (value << count) | (value >> (bits - count))
+            }
+            else {
+                (value >> count) | (value << (bits - count))
+            };
+            cpu.write_trunc(dst.slice(offset, element_size), result & mask);
+        }
+    }
+
+    fn packed_rotate_left_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_rotate_128(cpu, dst, args, 4, true);
+    }
+
+    fn packed_rotate_left_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_rotate_128(cpu, dst, args, 8, true);
+    }
+
+    fn packed_rotate_right_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_rotate_128(cpu, dst, args, 4, false);
+    }
+
+    fn packed_rotate_right_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_rotate_128(cpu, dst, args, 8, false);
+    }
+
+    fn packed_leading_zeros_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], element_size: u8) {
+        if dst.size != 16 || args[0].size() != 16 || !matches!(element_size, 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let unused_bits = 64 - u32::from(element_size) * 8;
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let value: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            cpu.write_trunc(
+                dst.slice(offset, element_size),
+                u64::from(value.leading_zeros() - unused_bits),
+            );
+        }
+    }
+
+    fn packed_leading_zeros_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_leading_zeros_128(cpu, dst, args, 4);
+    }
+
+    fn packed_leading_zeros_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_leading_zeros_128(cpu, dst, args, 8);
     }
 
     /// Computes one 128-bit chunk of an EVEX variable dword shift whose
@@ -3582,16 +6741,44 @@ pub mod x86 {
         cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
-    fn packed_abs_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
-        if dst.size != 16 || args[0].size() != 16 {
+    fn packed_abs(cpu: &mut Cpu, dst: VarNode, source: Value, element_size: u8) {
+        if dst.size == 0
+            || dst.size > 64
+            || dst.size != source.size()
+            || dst.size % element_size != 0
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+        {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
             cpu.exception.value = u64::from(dst.size);
             return;
         }
-        for byte in 0_u8..16 {
-            let value = cpu.read::<u8>(args[0].slice(byte, 1)) as i8;
-            cpu.write_var(dst.slice(byte, 1), value.unsigned_abs());
+        for offset in (0..dst.size).step_by(usize::from(element_size)) {
+            let source = source.slice(offset, element_size);
+            let destination = dst.slice(offset, element_size);
+            match element_size {
+                1 => cpu.write_var(destination, (cpu.read::<u8>(source) as i8).unsigned_abs()),
+                2 => cpu.write_var(destination, (cpu.read::<u16>(source) as i16).unsigned_abs()),
+                4 => cpu.write_var(destination, (cpu.read::<u32>(source) as i32).unsigned_abs()),
+                8 => cpu.write_var(destination, (cpu.read::<u64>(source) as i64).unsigned_abs()),
+                _ => unreachable!(),
+            }
         }
+    }
+
+    fn packed_abs_b(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_abs(cpu, dst, args[0], 1);
+    }
+
+    fn packed_abs_w(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_abs(cpu, dst, args[0], 2);
+    }
+
+    fn packed_abs_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_abs(cpu, dst, args[0], 4);
+    }
+
+    fn packed_abs_q(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_abs(cpu, dst, args[0], 8);
     }
 
     fn packed_add_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3607,6 +6794,73 @@ pub mod x86 {
         }
     }
 
+    fn packed_add_b(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != dst.size || args[1].size() != dst.size {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in 0..dst.size {
+            let lhs = cpu.read::<u8>(args[0].slice(offset, 1));
+            let rhs = cpu.read::<u8>(args[1].slice(offset, 1));
+            cpu.write_var(dst.slice(offset, 1), lhs.wrapping_add(rhs));
+        }
+    }
+
+    fn packed_add_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in [0_u8, 8] {
+            let lhs = cpu.read::<u64>(args[0].slice(offset, 8));
+            let rhs = cpu.read::<u64>(args[1].slice(offset, 8));
+            cpu.write_var(dst.slice(offset, 8), lhs.wrapping_add(rhs));
+        }
+    }
+
+    fn packed_sum_absolute_differences_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for group in 0_u8..2 {
+            let mut sum = 0_u64;
+            for lane in 0_u8..8 {
+                let offset = group * 8 + lane;
+                let lhs = cpu.read::<u8>(args[0].slice(offset, 1));
+                let rhs = cpu.read::<u8>(args[1].slice(offset, 1));
+                sum += u64::from(lhs.abs_diff(rhs));
+            }
+            cpu.write_var(dst.slice(group * 8, 8), sum);
+        }
+    }
+
+    fn packed_extract_128_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source = [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1])];
+        let value = source[cpu.args[0] as usize & 1];
+        cpu.write_var(dst, value);
+    }
+
+    fn packed_extract_128_512(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source =
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]];
+        let value = source[cpu.args[2] as usize & 3];
+        cpu.write_var(dst, value);
+    }
+
     fn packed_sub_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
             cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
@@ -3617,6 +6871,19 @@ pub mod x86 {
             let lhs = cpu.read::<u8>(args[0].slice(offset, 1));
             let rhs = cpu.read::<u8>(args[1].slice(offset, 1));
             cpu.write_var(dst.slice(offset, 1), lhs.wrapping_sub(rhs));
+        }
+    }
+
+    fn packed_sub_w(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0_u8..16).step_by(2) {
+            let lhs = cpu.read::<u16>(args[0].slice(offset, 2));
+            let rhs = cpu.read::<u16>(args[1].slice(offset, 2));
+            cpu.write_var(dst.slice(offset, 2), lhs.wrapping_sub(rhs));
         }
     }
 
@@ -3651,6 +6918,61 @@ pub mod x86 {
         out[0..8].copy_from_slice(&a[0..8]);
         out[8..16].copy_from_slice(&b[0..8]);
         write_xmm(cpu, dst, out);
+    }
+
+    fn packed_unpack_high_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u64>(args[0].slice(8, 8));
+        let right = cpu.read::<u64>(args[1].slice(8, 8));
+        cpu.write_var(dst.slice(0, 8), left);
+        cpu.write_var(dst.slice(8, 8), right);
+    }
+
+    fn packed_shuffle_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let immediate = cpu.read::<u8>(args[1]);
+        let source = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..4 {
+            let source_lane = usize::from((immediate >> (lane * 2)) & 0x3);
+            output[lane * 4..lane * 4 + 4]
+                .copy_from_slice(&source[source_lane * 4..source_lane * 4 + 4]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_shuffle_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], high: bool) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let immediate = cpu.read::<u8>(args[1]);
+        let source = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut output = source;
+        let base = usize::from(high) * 8;
+        for lane in 0..4 {
+            let source_lane = usize::from((immediate >> (lane * 2)) & 0x3);
+            output[base + lane * 2..base + lane * 2 + 2]
+                .copy_from_slice(&source[base + source_lane * 2..base + source_lane * 2 + 2]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_shuffle_high_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shuffle_w_128(cpu, dst, args, true);
+    }
+
+    fn packed_shuffle_low_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shuffle_w_128(cpu, dst, args, false);
     }
 
     /// pabs* take the source in the second operand; the first is the (unused)
@@ -3692,7 +7014,165 @@ pub mod x86 {
     // SSE max/min return the second operand on unordered/equal, matching
     // `(a OP b) ? a : b`.
 
+    /// Execute host floating-point operations under the guest's MXCSR control
+    /// and merge the resulting sticky exception flags back into the guest.
+    /// All exceptions stay masked while the helper runs; architectural trap
+    /// delivery is handled by the x86 frontend rather than leaking a host
+    /// SIGFPE into the emulator process.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[allow(deprecated)]
+    fn with_guest_mxcsr(cpu: &mut Cpu, operation: impl FnOnce(&mut Cpu)) {
+        #[cfg(target_arch = "x86")]
+        use std::arch::x86::{_mm_getcsr, _mm_setcsr};
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+
+        let Some(guest_mxcsr) = read_named::<u32>(cpu, "MXCSR")
+        else {
+            return;
+        };
+        let host_mxcsr = unsafe { _mm_getcsr() };
+        // Clear sticky status and force every exception mask on, while
+        // preserving guest rounding, DAZ and FTZ controls.
+        unsafe { _mm_setcsr((guest_mxcsr & !0x3f) | 0x1f80) };
+        operation(cpu);
+        let status = unsafe { _mm_getcsr() } & 0x3f;
+        unsafe { _mm_setcsr(host_mxcsr) };
+        let _ = write_named(cpu, "MXCSR", guest_mxcsr | status);
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    fn with_guest_mxcsr(cpu: &mut Cpu, operation: impl FnOnce(&mut Cpu)) {
+        operation(cpu);
+    }
+
+    fn packed_fma(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let pc = cpu.read_pc();
+        let Some(prefix_offset) = current_evex_prefix_offset(cpu)
+        else {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            return;
+        };
+        let Some(opcode) = read_instruction_byte(cpu, pc, prefix_offset + 4)
+        else {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            return;
+        };
+        let Some(p1) = read_instruction_byte(cpu, pc, prefix_offset + 2)
+        else {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            return;
+        };
+        let order = match opcode >> 4 {
+            0x9 => 132,
+            0xa => 213,
+            0xb => 231,
+            _ => {
+                cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+                cpu.exception.value = u64::from(opcode);
+                return;
+            }
+        };
+        let kind = opcode & 0x0f;
+        if !matches!(kind, 0x6..=0xf) {
+            cpu.exception.code = ExceptionCode::UnimplementedOp as u32;
+            cpu.exception.value = u64::from(opcode);
+            return;
+        }
+        let scalar = matches!(kind, 0x9 | 0xb | 0xd | 0xf);
+        let lane_bytes = if p1 & 0x80 != 0 { 8 } else { 4 };
+        let lane_count = if scalar { 1 } else { 16 / lane_bytes };
+        let chunk = cpu.args[7] as usize;
+        let mask = current_evex_mask(cpu);
+        let old_destination = cpu.read::<u128>(args[0]).to_le_bytes();
+        let second = cpu.read::<u128>(args[1]).to_le_bytes();
+        let third = cpu.args[0].to_le_bytes();
+        let mut output = if scalar { second } else { [0_u8; 16] };
+
+        with_guest_mxcsr(cpu, |cpu| {
+            for lane in 0..lane_count {
+                if mask & (1_u64 << (chunk * (16 / lane_bytes) + lane)) == 0 {
+                    continue;
+                }
+                let offset = lane * lane_bytes;
+                if lane_bytes == 8 {
+                    let destination = f64::from_bits(u64::from_le_bytes(
+                        old_destination[offset..offset + 8].try_into().unwrap(),
+                    ));
+                    let source1 = f64::from_bits(u64::from_le_bytes(
+                        second[offset..offset + 8].try_into().unwrap(),
+                    ));
+                    let source2 = f64::from_bits(u64::from_le_bytes(
+                        third[offset..offset + 8].try_into().unwrap(),
+                    ));
+                    let (multiplicand, multiplier, addend) = match order {
+                        132 => (destination, source2, source1),
+                        213 => (source1, destination, source2),
+                        231 => (source1, source2, destination),
+                        _ => unreachable!(),
+                    };
+                    let subtract = match kind {
+                        0x6 => (chunk * 2 + lane) % 2 == 0,
+                        0x7 => (chunk * 2 + lane) % 2 != 0,
+                        0xa | 0xb | 0xe | 0xf => true,
+                        _ => false,
+                    };
+                    let negate_product = matches!(kind, 0xc..=0xf);
+                    let a = if negate_product { -multiplicand } else { multiplicand };
+                    let c = if subtract { -addend } else { addend };
+                    output[offset..offset + 8]
+                        .copy_from_slice(&a.mul_add(multiplier, c).to_bits().to_le_bytes());
+                }
+                else {
+                    let destination = f32::from_bits(u32::from_le_bytes(
+                        old_destination[offset..offset + 4].try_into().unwrap(),
+                    ));
+                    let source1 = f32::from_bits(u32::from_le_bytes(
+                        second[offset..offset + 4].try_into().unwrap(),
+                    ));
+                    let source2 = f32::from_bits(u32::from_le_bytes(
+                        third[offset..offset + 4].try_into().unwrap(),
+                    ));
+                    let (multiplicand, multiplier, addend) = match order {
+                        132 => (destination, source2, source1),
+                        213 => (source1, destination, source2),
+                        231 => (source1, source2, destination),
+                        _ => unreachable!(),
+                    };
+                    let subtract = match kind {
+                        0x6 => (chunk * 4 + lane) % 2 == 0,
+                        0x7 => (chunk * 4 + lane) % 2 != 0,
+                        0xa | 0xb | 0xe | 0xf => true,
+                        _ => false,
+                    };
+                    let negate_product = matches!(kind, 0xc..=0xf);
+                    let a = if negate_product { -multiplicand } else { multiplicand };
+                    let c = if subtract { -addend } else { addend };
+                    let result = a.mul_add(multiplier, c);
+                    output[offset..offset + 4].copy_from_slice(&result.to_bits().to_le_bytes());
+                }
+            }
+            write_xmm(cpu, dst, output);
+        });
+    }
+
     fn f64x2_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f64, f64) -> f64) {
+        f64x2_binop_masked(cpu, dst, args, u64::MAX, 0, f);
+    }
+
+    fn f64x2_binop_masked(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        mask: u64,
+        chunk: usize,
+        f: fn(f64, f64) -> f64,
+    ) {
         let Some(a) = xmm_bytes(cpu, args[0])
         else {
             return;
@@ -3701,16 +7181,32 @@ pub mod x86 {
         else {
             return;
         };
-        let mut out = [0u8; 16];
-        for i in 0..2 {
-            let x = f64::from_bits(u64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap()));
-            let y = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
-            out[8 * i..8 * i + 8].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
-        }
-        write_xmm(cpu, dst, out);
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0u8; 16];
+            for i in 0..2 {
+                if mask & (1 << (chunk * 2 + i)) == 0 {
+                    continue;
+                }
+                let x = f64::from_bits(u64::from_le_bytes(a[8 * i..8 * i + 8].try_into().unwrap()));
+                let y = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
+                out[8 * i..8 * i + 8].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
+            }
+            write_xmm(cpu, dst, out);
+        });
     }
 
     fn f32x4_binop(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], f: fn(f32, f32) -> f32) {
+        f32x4_binop_masked(cpu, dst, args, u64::MAX, 0, f);
+    }
+
+    fn f32x4_binop_masked(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        mask: u64,
+        chunk: usize,
+        f: fn(f32, f32) -> f32,
+    ) {
         let Some(a) = xmm_bytes(cpu, args[0])
         else {
             return;
@@ -3719,40 +7215,2851 @@ pub mod x86 {
         else {
             return;
         };
-        let mut out = [0u8; 16];
-        for i in 0..4 {
-            let x = f32::from_bits(u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap()));
-            let y = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
-            out[4 * i..4 * i + 4].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0u8; 16];
+            for i in 0..4 {
+                if mask & (1 << (chunk * 4 + i)) == 0 {
+                    continue;
+                }
+                let x = f32::from_bits(u32::from_le_bytes(a[4 * i..4 * i + 4].try_into().unwrap()));
+                let y = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
+                out[4 * i..4 * i + 4].copy_from_slice(&f(x, y).to_bits().to_le_bytes());
+            }
+            write_xmm(cpu, dst, out);
+        });
+    }
+
+    fn current_evex_prefix_offset(cpu: &mut Cpu) -> Option<usize> {
+        let pc = cpu.read_pc();
+        for offset in 0..15 {
+            match read_instruction_byte(cpu, pc, offset)? {
+                0x62 => return Some(offset),
+                0x67 | 0x64 | 0x65 | 0x2e | 0x3e | 0x26 | 0x36 => {}
+                _ => return None,
+            }
         }
-        write_xmm(cpu, dst, out);
+        None
+    }
+
+    fn current_evex_mask(cpu: &mut Cpu) -> u64 {
+        let Some(offset) = current_evex_prefix_offset(cpu)
+        else {
+            return u64::MAX;
+        };
+        let Some(p2) = read_instruction_byte(cpu, cpu.read_pc(), offset + 3)
+        else {
+            return u64::MAX;
+        };
+        let selector = p2 & 7;
+        if selector == 0 {
+            return u64::MAX;
+        }
+        read_named::<u64>(cpu, &format!("K{selector}")).unwrap_or(0)
+    }
+
+    fn current_evex_embedded_rounding(cpu: &mut Cpu) -> Option<u8> {
+        let pc = cpu.read_pc();
+        let offset = current_evex_prefix_offset(cpu)?;
+        let p2 = read_instruction_byte(cpu, pc, offset + 3)?;
+        let modrm = read_instruction_byte(cpu, pc, offset + 5)?;
+        (p2 & 0x10 != 0 && modrm >> 6 == 3).then_some((p2 >> 5) & 3)
+    }
+
+    fn masked_binary_context(cpu: &mut Cpu) -> (u64, usize) {
+        (current_evex_mask(cpu), cpu.args[7] as usize)
+    }
+
+    fn raise_mxcsr_flags(cpu: &mut Cpu, flags: u32) {
+        if flags == 0 {
+            return;
+        }
+        if let Some(mxcsr) = read_named::<u32>(cpu, "MXCSR") {
+            let _ = write_named(cpu, "MXCSR", mxcsr | flags);
+        }
+    }
+
+    fn packed_sqrt_is_invalid(
+        cpu: &mut Cpu,
+        source: Value,
+        lane_bytes: usize,
+        mask: u64,
+        chunk: usize,
+    ) -> bool {
+        let lanes = 16 / lane_bytes;
+        (0..lanes).any(|lane| {
+            if mask & (1 << (chunk * lanes + lane)) == 0 {
+                return false;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            match lane_bytes {
+                4 => {
+                    let bits = cpu.read::<u32>(source.slice(offset, 4));
+                    let magnitude = bits & 0x7fff_ffff;
+                    let negative_nonzero = bits >> 31 != 0 && magnitude != 0;
+                    let signaling_nan = magnitude > 0x7f80_0000 && bits & 0x0040_0000 == 0;
+                    negative_nonzero || signaling_nan
+                }
+                8 => {
+                    let bits = cpu.read::<u64>(source.slice(offset, 8));
+                    let magnitude = bits & 0x7fff_ffff_ffff_ffff;
+                    let negative_nonzero = bits >> 63 != 0 && magnitude != 0;
+                    let signaling_nan =
+                        magnitude > 0x7ff0_0000_0000_0000 && bits & 0x0008_0000_0000_0000 == 0;
+                    negative_nonzero || signaling_nan
+                }
+                _ => unreachable!("packed sqrt has a fixed IEEE lane width"),
+            }
+        })
     }
 
     fn divpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f64x2_binop(cpu, dst, args, |x, y| x / y);
     }
+    fn divpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| x / y);
+    }
     fn divps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f32x4_binop(cpu, dst, args, |x, y| x / y);
+    }
+    fn divps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| x / y);
+    }
+    fn addpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| x + y);
+    }
+    fn addps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| x + y);
+    }
+    fn addsubpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0_u8; 16];
+            for lane in 0..2 {
+                let offset = lane * 8;
+                let x =
+                    f64::from_bits(u64::from_le_bytes(a[offset..offset + 8].try_into().unwrap()));
+                let y =
+                    f64::from_bits(u64::from_le_bytes(b[offset..offset + 8].try_into().unwrap()));
+                let result = if lane & 1 == 0 { x - y } else { x + y };
+                out[offset..offset + 8].copy_from_slice(&result.to_bits().to_le_bytes());
+            }
+            write_xmm(cpu, dst, out);
+        });
+    }
+    fn addsubps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0_u8; 16];
+            for lane in 0..4 {
+                let offset = lane * 4;
+                let x =
+                    f32::from_bits(u32::from_le_bytes(a[offset..offset + 4].try_into().unwrap()));
+                let y =
+                    f32::from_bits(u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap()));
+                let result = if lane & 1 == 0 { x - y } else { x + y };
+                out[offset..offset + 4].copy_from_slice(&result.to_bits().to_le_bytes());
+            }
+            write_xmm(cpu, dst, out);
+        });
+    }
+
+    fn horizontal_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], subtract: bool) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0_u8; 16];
+            for (pair, source) in [a, b].into_iter().enumerate() {
+                for lane in 0..2 {
+                    let source_offset = lane * 8;
+                    let x = f32::from_bits(u32::from_le_bytes(
+                        source[source_offset..source_offset + 4].try_into().unwrap(),
+                    ));
+                    let y = f32::from_bits(u32::from_le_bytes(
+                        source[source_offset + 4..source_offset + 8].try_into().unwrap(),
+                    ));
+                    let result = if subtract { x - y } else { x + y };
+                    let output_offset = (pair * 2 + lane) * 4;
+                    out[output_offset..output_offset + 4]
+                        .copy_from_slice(&result.to_bits().to_le_bytes());
+                }
+            }
+            write_xmm(cpu, dst, out);
+        });
+    }
+
+    fn haddps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        horizontal_ps(cpu, dst, args, false);
+    }
+
+    fn hsubps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        horizontal_ps(cpu, dst, args, true);
+    }
+
+    fn hsubpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut out = [0_u8; 16];
+            for (lane, source) in [a, b].into_iter().enumerate() {
+                let x = f64::from_bits(u64::from_le_bytes(source[0..8].try_into().unwrap()));
+                let y = f64::from_bits(u64::from_le_bytes(source[8..16].try_into().unwrap()));
+                out[lane * 8..lane * 8 + 8].copy_from_slice(&(x - y).to_bits().to_le_bytes());
+            }
+            write_xmm(cpu, dst, out);
+        });
+    }
+
+    #[inline(never)]
+    fn strict_mul_f32(first: f32, second: f32) -> f32 {
+        std::hint::black_box(first) * std::hint::black_box(second)
+    }
+
+    #[inline(never)]
+    fn strict_add_f32(first: f32, second: f32) -> f32 {
+        std::hint::black_box(first) + std::hint::black_box(second)
+    }
+
+    #[inline(never)]
+    fn strict_mul_f64(first: f64, second: f64) -> f64 {
+        std::hint::black_box(first) * std::hint::black_box(second)
+    }
+
+    #[inline(never)]
+    fn strict_add_f64(first: f64, second: f64) -> f64 {
+        std::hint::black_box(first) + std::hint::black_box(second)
+    }
+
+    fn dotpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        let control = cpu.args[0] as u8;
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut products = [0.0_f64; 2];
+            for lane in 0..2 {
+                if control & (1 << (lane + 4)) == 0 {
+                    continue;
+                }
+                let offset = lane * 8;
+                let first =
+                    f64::from_bits(u64::from_le_bytes(a[offset..offset + 8].try_into().unwrap()));
+                let second =
+                    f64::from_bits(u64::from_le_bytes(b[offset..offset + 8].try_into().unwrap()));
+                products[lane] = strict_mul_f64(first, second);
+            }
+            let sum = strict_add_f64(products[0], products[1]);
+            let mut output = [0_u8; 16];
+            for lane in 0..2 {
+                if control & (1 << lane) != 0 {
+                    output[lane * 8..lane * 8 + 8].copy_from_slice(&sum.to_bits().to_le_bytes());
+                }
+            }
+            write_xmm(cpu, dst, output);
+        });
+    }
+
+    fn dotps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        let control = cpu.args[0] as u8;
+        with_guest_mxcsr(cpu, |cpu| {
+            let mut products = [0.0_f32; 4];
+            for lane in 0..4 {
+                if control & (1 << (lane + 4)) == 0 {
+                    continue;
+                }
+                let offset = lane * 4;
+                let first =
+                    f32::from_bits(u32::from_le_bytes(a[offset..offset + 4].try_into().unwrap()));
+                let second =
+                    f32::from_bits(u32::from_le_bytes(b[offset..offset + 4].try_into().unwrap()));
+                products[lane] = strict_mul_f32(first, second);
+            }
+            let low = strict_add_f32(products[0], products[1]);
+            let high = strict_add_f32(products[2], products[3]);
+            let sum = strict_add_f32(low, high);
+            let mut output = [0_u8; 16];
+            for lane in 0..4 {
+                if control & (1 << lane) != 0 {
+                    output[lane * 4..lane * 4 + 4].copy_from_slice(&sum.to_bits().to_le_bytes());
+                }
+            }
+            write_xmm(cpu, dst, output);
+        });
+    }
+
+    fn compare_truth<T: PartialEq + PartialOrd>(
+        first: T,
+        second: T,
+        unordered: bool,
+        control: u8,
+    ) -> bool {
+        match control & 0xf {
+            0 => !unordered && first == second,
+            1 => !unordered && first < second,
+            2 => !unordered && first <= second,
+            3 => unordered,
+            4 => unordered || first != second,
+            5 => unordered || first >= second,
+            6 => unordered || first > second,
+            7 => !unordered,
+            8 => unordered || first == second,
+            9 => unordered || first < second,
+            10 => unordered || first <= second,
+            11 => false,
+            12 => !unordered && first != second,
+            13 => !unordered && first >= second,
+            14 => !unordered && first > second,
+            _ => true,
+        }
+    }
+
+    fn signaling_compare_predicate(control: u8) -> bool {
+        matches!(
+            control & 0x1f,
+            1 | 2 | 5 | 6 | 9 | 10 | 13 | 14 | 16 | 19 | 20 | 23 | 24 | 27 | 28 | 31
+        )
+    }
+
+    fn f32_nan_kind(bits: u32) -> (bool, bool) {
+        let nan = bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff != 0;
+        (nan, nan && bits & 0x0040_0000 == 0)
+    }
+
+    fn f64_nan_kind(bits: u64) -> (bool, bool) {
+        let nan = bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+            && bits & 0x000f_ffff_ffff_ffff != 0;
+        (nan, nan && bits & 0x0008_0000_0000_0000 == 0)
+    }
+
+    fn compare_pd_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let chunk = cpu.args[1] as usize;
+        let active = current_evex_mask(cpu);
+        let mut output = 0_u64;
+        let mut invalid = false;
+        for lane in 0..2_u8 {
+            if active & (1 << (chunk * 2 + usize::from(lane))) == 0 {
+                continue;
+            }
+            let offset = lane * 8;
+            let first_bits = cpu.read::<u64>(args[0].slice(offset, 8));
+            let second_bits = cpu.read::<u64>(args[1].slice(offset, 8));
+            let (first_nan, first_signaling) = f64_nan_kind(first_bits);
+            let (second_nan, second_signaling) = f64_nan_kind(second_bits);
+            let unordered = first_nan || second_nan;
+            invalid |= first_signaling
+                || second_signaling
+                || (unordered && signaling_compare_predicate(control));
+            if compare_truth(
+                f64::from_bits(first_bits),
+                f64::from_bits(second_bits),
+                unordered,
+                control,
+            ) {
+                output |= 1 << lane;
+            }
+        }
+        cpu.write_var(dst, output);
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_ps_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let chunk = cpu.args[1] as usize;
+        let active = current_evex_mask(cpu);
+        let mut output = 0_u64;
+        let mut invalid = false;
+        for lane in 0..4_u8 {
+            if active & (1 << (chunk * 4 + usize::from(lane))) == 0 {
+                continue;
+            }
+            let offset = lane * 4;
+            let first_bits = cpu.read::<u32>(args[0].slice(offset, 4));
+            let second_bits = cpu.read::<u32>(args[1].slice(offset, 4));
+            let (first_nan, first_signaling) = f32_nan_kind(first_bits);
+            let (second_nan, second_signaling) = f32_nan_kind(second_bits);
+            let unordered = first_nan || second_nan;
+            invalid |= first_signaling
+                || second_signaling
+                || (unordered && signaling_compare_predicate(control));
+            if compare_truth(
+                f32::from_bits(first_bits),
+                f32::from_bits(second_bits),
+                unordered,
+                control,
+            ) {
+                output |= 1 << lane;
+            }
+        }
+        cpu.write_var(dst, output);
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_sd_mask(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() < 8 || args[1].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        if current_evex_mask(cpu) & 1 == 0 {
+            cpu.write_var(dst, 0_u64);
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let first_bits = cpu.read::<u64>(args[0].slice(0, 8));
+        let second_bits = cpu.read::<u64>(args[1].slice(0, 8));
+        let (first_nan, first_signaling) = f64_nan_kind(first_bits);
+        let (second_nan, second_signaling) = f64_nan_kind(second_bits);
+        let unordered = first_nan || second_nan;
+        let result = compare_truth(
+            f64::from_bits(first_bits),
+            f64::from_bits(second_bits),
+            unordered,
+            control,
+        );
+        cpu.write_var(dst, u64::from(result));
+        let invalid = first_signaling
+            || second_signaling
+            || (unordered && signaling_compare_predicate(control));
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_ss_mask(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() < 4 || args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        if current_evex_mask(cpu) & 1 == 0 {
+            cpu.write_var(dst, 0_u64);
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let first_bits = cpu.read::<u32>(args[0].slice(0, 4));
+        let second_bits = cpu.read::<u32>(args[1].slice(0, 4));
+        let (first_nan, first_signaling) = f32_nan_kind(first_bits);
+        let (second_nan, second_signaling) = f32_nan_kind(second_bits);
+        let unordered = first_nan || second_nan;
+        let result = compare_truth(
+            f32::from_bits(first_bits),
+            f32::from_bits(second_bits),
+            unordered,
+            control,
+        );
+        cpu.write_var(dst, u64::from(result));
+        let invalid = first_signaling
+            || second_signaling
+            || (unordered && signaling_compare_predicate(control));
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(first), Some(second)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        let control = cpu.args[0] as u8;
+        let mut output = [0_u8; 16];
+        let mut invalid = false;
+        for lane in 0..2 {
+            let offset = lane * 8;
+            let first_bits = u64::from_le_bytes(first[offset..offset + 8].try_into().unwrap());
+            let second_bits = u64::from_le_bytes(second[offset..offset + 8].try_into().unwrap());
+            let (first_nan, first_signaling) = f64_nan_kind(first_bits);
+            let (second_nan, second_signaling) = f64_nan_kind(second_bits);
+            let unordered = first_nan || second_nan;
+            invalid |= first_signaling
+                || second_signaling
+                || (unordered && signaling_compare_predicate(control));
+            if compare_truth(
+                f64::from_bits(first_bits),
+                f64::from_bits(second_bits),
+                unordered,
+                control,
+            ) {
+                output[offset..offset + 8].fill(0xff);
+            }
+        }
+        write_xmm(cpu, dst, output);
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (Some(first), Some(second)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1]))
+        else {
+            return;
+        };
+        let control = cpu.args[0] as u8;
+        let mut output = [0_u8; 16];
+        let mut invalid = false;
+        for lane in 0..4 {
+            let offset = lane * 4;
+            let first_bits = u32::from_le_bytes(first[offset..offset + 4].try_into().unwrap());
+            let second_bits = u32::from_le_bytes(second[offset..offset + 4].try_into().unwrap());
+            let (first_nan, first_signaling) = f32_nan_kind(first_bits);
+            let (second_nan, second_signaling) = f32_nan_kind(second_bits);
+            let unordered = first_nan || second_nan;
+            invalid |= first_signaling
+                || second_signaling
+                || (unordered && signaling_compare_predicate(control));
+            if compare_truth(
+                f32::from_bits(first_bits),
+                f32::from_bits(second_bits),
+                unordered,
+                control,
+            ) {
+                output[offset..offset + 4].fill(0xff);
+            }
+        }
+        write_xmm(cpu, dst, output);
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let first_bits = cpu.read::<u64>(args[0].slice(0, 8));
+        let second_bits = cpu.read::<u64>(args[1].slice(0, 8));
+        let (first_nan, first_signaling) = f64_nan_kind(first_bits);
+        let (second_nan, second_signaling) = f64_nan_kind(second_bits);
+        let unordered = first_nan || second_nan;
+        let result = compare_truth(
+            f64::from_bits(first_bits),
+            f64::from_bits(second_bits),
+            unordered,
+            control,
+        );
+        let upper = cpu.read::<u128>(args[0]) & !u128::from(u64::MAX);
+        cpu.write_var(dst, upper | u128::from(if result { u64::MAX } else { 0 }));
+        let invalid = first_signaling
+            || second_signaling
+            || (unordered && signaling_compare_predicate(control));
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn compare_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        let first_bits = cpu.read::<u32>(args[0].slice(0, 4));
+        let second_bits = cpu.read::<u32>(args[1].slice(0, 4));
+        let (first_nan, first_signaling) = f32_nan_kind(first_bits);
+        let (second_nan, second_signaling) = f32_nan_kind(second_bits);
+        let unordered = first_nan || second_nan;
+        let result = compare_truth(
+            f32::from_bits(first_bits),
+            f32::from_bits(second_bits),
+            unordered,
+            control,
+        );
+        let upper = cpu.read::<u128>(args[0]) & !u128::from(u32::MAX);
+        cpu.write_var(dst, upper | u128::from(if result { u32::MAX } else { 0 }));
+        let invalid = first_signaling
+            || second_signaling
+            || (unordered && signaling_compare_predicate(control));
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn convert_i32_to_f64_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let chunk = cpu.args[7] as u8;
+        let source_offset = if args[0].size() == 8 { 0 } else { chunk.saturating_mul(8) };
+        if source_offset.saturating_add(8) > args[0].size() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source_offset);
+            return;
+        }
+        for lane in 0..2_u8 {
+            let value = cpu.read::<i32>(args[0].slice(source_offset + lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 8, 8), (value as f64).to_bits());
+        }
+    }
+
+    fn i32_to_f32_bits(value: i32, mode: u8) -> (u32, bool) {
+        if value == 0 {
+            return (0, false);
+        }
+        let negative = value < 0;
+        let sign = u32::from(negative) << 31;
+        let magnitude = value.unsigned_abs();
+        let highest = 31 - magnitude.leading_zeros();
+        if highest <= 23 {
+            let significand = magnitude << (23 - highest);
+            return (sign | ((highest + 127) << 23) | (significand & 0x007f_ffff), false);
+        }
+        let shift = highest - 23;
+        let mut significand = magnitude >> shift;
+        let remainder_mask = (1_u32 << shift) - 1;
+        let remainder = magnitude & remainder_mask;
+        let half = 1_u32 << (shift - 1);
+        let increment = match mode {
+            0 => remainder > half || (remainder == half && significand & 1 != 0),
+            1 => negative && remainder != 0,
+            2 => !negative && remainder != 0,
+            _ => false,
+        };
+        let mut exponent = highest + 127;
+        if increment {
+            significand += 1;
+            if significand == 1 << 24 {
+                significand >>= 1;
+                exponent += 1;
+            }
+        }
+        (sign | (exponent << 23) | (significand & 0x007f_ffff), remainder != 0)
+    }
+
+    fn convert_i32_to_f32_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = ((mxcsr >> 13) & 3) as u8;
+        let mut inexact = false;
+        for lane in 0..4_u8 {
+            let value = cpu.read::<i32>(args[0].slice(lane * 4, 4));
+            let (bits, lane_inexact) = i32_to_f32_bits(value, mode);
+            inexact |= lane_inexact;
+            cpu.write_var(dst.slice(lane * 4, 4), bits);
+        }
+        raise_mxcsr_flags(cpu, u32::from(inexact) << 5);
+    }
+
+    fn convert_f32_to_i32_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = ((mxcsr >> 13) & 3) as u8;
+        let daz = mxcsr & (1 << 6) != 0;
+        let mut flags = 0_u32;
+        for lane in 0..4_u8 {
+            let bits = cpu.read::<u32>(args[0].slice(lane * 4, 4));
+            let exponent = bits & 0x7f80_0000;
+            let fraction = bits & 0x007f_ffff;
+            let subnormal = exponent == 0 && fraction != 0;
+            let effective = if subnormal && daz { bits & 0x8000_0000 } else { bits };
+            let value = f64::from(f32::from_bits(effective));
+            let rounded = match mode {
+                0 => value.round_ties_even(),
+                1 => value.floor(),
+                2 => value.ceil(),
+                _ => value.trunc(),
+            };
+            let invalid = !value.is_finite()
+                || rounded < f64::from(i32::MIN)
+                || rounded > f64::from(i32::MAX);
+            let result = if invalid { i32::MIN } else { rounded as i32 };
+            flags |= u32::from(invalid);
+            if !invalid && rounded != value {
+                flags |= 1 << 5;
+            }
+            if subnormal && !daz {
+                flags |= 1 << 1;
+            }
+            cpu.write_var(dst.slice(lane * 4, 4), result);
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn convert_f64_pair_to_i32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 8 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = ((mxcsr >> 13) & 3) as u8;
+        let daz = mxcsr & (1 << 6) != 0;
+        let mut flags = 0_u32;
+        for lane in 0..2_u8 {
+            let bits = cpu.read::<u64>(args[0].slice(lane * 8, 8));
+            let exponent = bits & 0x7ff0_0000_0000_0000;
+            let fraction = bits & 0x000f_ffff_ffff_ffff;
+            let subnormal = exponent == 0 && fraction != 0;
+            let effective = if subnormal && daz { bits & (1_u64 << 63) } else { bits };
+            let value = f64::from_bits(effective);
+            let rounded = match mode {
+                0 => value.round_ties_even(),
+                1 => value.floor(),
+                2 => value.ceil(),
+                _ => value.trunc(),
+            };
+            let invalid = !value.is_finite()
+                || rounded < f64::from(i32::MIN)
+                || rounded > f64::from(i32::MAX);
+            let result = if invalid { i32::MIN } else { rounded as i32 };
+            flags |= u32::from(invalid);
+            if !invalid && rounded != value {
+                flags |= 1 << 5;
+            }
+            if subnormal && !daz {
+                flags |= 1 << 1;
+            }
+            cpu.write_var(dst.slice(lane * 4, 4), result);
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn round_shift_u64(value: u64, shift: u32, negative: bool, mode: u8) -> (u64, bool) {
+        if shift == 0 {
+            return (value, false);
+        }
+
+        let (truncated, remainder, greater_than_half, exactly_half) = if shift < 64 {
+            let truncated = value >> shift;
+            let remainder = value & ((1_u64 << shift) - 1);
+            let half = 1_u64 << (shift - 1);
+            (truncated, remainder, remainder > half, remainder == half)
+        }
+        else if shift == 64 {
+            let half = 1_u64 << 63;
+            (0, value, value > half, value == half)
+        }
+        else {
+            (0, value, false, false)
+        };
+        let inexact = remainder != 0;
+        let increment = match mode {
+            0 => greater_than_half || (exactly_half && truncated & 1 != 0),
+            1 => negative && inexact,
+            2 => !negative && inexact,
+            _ => false,
+        };
+        (truncated + u64::from(increment), inexact)
+    }
+
+    fn narrow_f64_bits(bits: u64, mode: u8, daz: bool, ftz: bool) -> (u32, u32) {
+        let negative = bits >> 63 != 0;
+        let sign = u32::from(negative) << 31;
+        let raw_exponent = ((bits >> 52) & 0x7ff) as u32;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+
+        if raw_exponent == 0x7ff {
+            if fraction == 0 {
+                return (sign | 0x7f80_0000, 0);
+            }
+            let signaling = fraction & 0x0008_0000_0000_0000 == 0;
+            let mut payload = (fraction >> 29) as u32 & 0x007f_ffff;
+            payload |= 0x0040_0000;
+            return (sign | 0x7f80_0000 | payload, u32::from(signaling));
+        }
+
+        if raw_exponent == 0 && fraction == 0 {
+            return (sign, 0);
+        }
+
+        let source_subnormal = raw_exponent == 0;
+        if source_subnormal && daz {
+            return (sign, 0);
+        }
+        let mut flags = u32::from(source_subnormal) << 1;
+        let (significand, exponent): (u64, i32) = if source_subnormal {
+            (fraction, -1022 - 52)
+        }
+        else {
+            ((1_u64 << 52) | fraction, raw_exponent as i32 - 1023 - 52)
+        };
+        let highest = 63 - significand.leading_zeros();
+        let unbiased = exponent + highest as i32;
+
+        if unbiased >= -126 {
+            let shift = highest.saturating_sub(23);
+            let (mut rounded, inexact) = round_shift_u64(significand, shift, negative, mode);
+            let mut result_exponent = unbiased;
+            if rounded == 1 << 24 {
+                rounded >>= 1;
+                result_exponent += 1;
+            }
+            if result_exponent > 127 {
+                let infinity = match mode {
+                    0 => true,
+                    1 => negative,
+                    2 => !negative,
+                    _ => false,
+                };
+                let magnitude = if infinity { 0x7f80_0000 } else { 0x7f7f_ffff };
+                return (sign | magnitude, flags | (1 << 3) | (1 << 5));
+            }
+            if inexact {
+                flags |= 1 << 5;
+            }
+            let result =
+                sign | (((result_exponent + 127) as u32) << 23) | (rounded as u32 & 0x007f_ffff);
+            return (result, flags);
+        }
+
+        // A binary32 subnormal stores value * 2^149 as its fraction.
+        let shift = (-149 - exponent) as u32;
+        let (rounded, inexact) = round_shift_u64(significand, shift, negative, mode);
+        if rounded == 1 << 23 {
+            if inexact {
+                flags |= 1 << 5;
+            }
+            return (sign | 0x0080_0000, flags);
+        }
+        if inexact {
+            flags |= (1 << 4) | (1 << 5);
+        }
+        if ftz && rounded != 0 {
+            flags |= (1 << 4) | (1 << 5);
+            return (sign, flags);
+        }
+        (sign | rounded as u32, flags)
+    }
+
+    fn convert_f64_pair_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 8 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = ((mxcsr >> 13) & 3) as u8;
+        let daz = mxcsr & (1 << 6) != 0;
+        let ftz = mxcsr & (1 << 15) != 0;
+        let mut flags = 0_u32;
+        for lane in 0..2_u8 {
+            let source = cpu.read::<u64>(args[0].slice(lane * 8, 8));
+            let (result, lane_flags) = narrow_f64_bits(source, mode, daz, ftz);
+            cpu.write_var(dst.slice(lane * 4, 4), result);
+            flags |= lane_flags;
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn quiet_f32_nan(bits: u32) -> u32 {
+        bits | 0x0040_0000
+    }
+
+    fn reciprocal_f32_bits(bits: u32) -> u32 {
+        let magnitude = bits & 0x7fff_ffff;
+        let sign = bits & 0x8000_0000;
+        if magnitude > 0x7f80_0000 {
+            return quiet_f32_nan(bits);
+        }
+        if magnitude == 0 || magnitude < 0x0080_0000 {
+            return sign | 0x7f80_0000;
+        }
+        if magnitude == 0x7f80_0000 {
+            return sign;
+        }
+        (1.0_f32 / f32::from_bits(bits)).to_bits()
+    }
+
+    fn reciprocal_sqrt_f32_bits(bits: u32) -> u32 {
+        let magnitude = bits & 0x7fff_ffff;
+        let sign = bits & 0x8000_0000;
+        if magnitude > 0x7f80_0000 {
+            return quiet_f32_nan(bits);
+        }
+        if magnitude == 0 || magnitude < 0x0080_0000 {
+            return sign | 0x7f80_0000;
+        }
+        if sign != 0 {
+            return 0xffc0_0000;
+        }
+        if magnitude == 0x7f80_0000 {
+            return 0;
+        }
+        (1.0_f32 / f32::from_bits(bits).sqrt()).to_bits()
+    }
+
+    fn approximate_ps(cpu: &mut Cpu, dst: VarNode, source: Value, operation: fn(u32) -> u32) {
+        if dst.size != 16 || source.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return;
+        }
+        for lane in 0..4_u8 {
+            let bits = cpu.read::<u32>(source.slice(lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 4, 4), operation(bits));
+        }
+    }
+
+    fn reciprocal_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_ps(cpu, dst, args[0], reciprocal_f32_bits);
+    }
+
+    fn reciprocal_sqrt_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_ps(cpu, dst, args[0], reciprocal_sqrt_f32_bits);
+    }
+
+    fn approximate_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], operation: fn(u32) -> u32) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let upper = cpu.read::<u128>(args[0]) & !u128::from(u32::MAX);
+        let source = cpu.read::<u32>(args[1].slice(0, 4));
+        cpu.write_var(dst, upper | u128::from(operation(source)));
+    }
+
+    fn reciprocal_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_ss(cpu, dst, args, reciprocal_f32_bits);
+    }
+
+    fn reciprocal_sqrt_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_ss(cpu, dst, args, reciprocal_sqrt_f32_bits);
+    }
+
+    fn widen_f32_bits(bits: u32, denormals_are_zero: bool) -> (u64, u32) {
+        let sign = u64::from(bits >> 31) << 63;
+        let exponent = bits & 0x7f80_0000;
+        let fraction = bits & 0x007f_ffff;
+        if exponent == 0x7f80_0000 {
+            if fraction == 0 {
+                return (sign | 0x7ff0_0000_0000_0000, 0);
+            }
+            let signaling = bits & 0x0040_0000 == 0;
+            let payload = (u64::from(fraction) << 29) | (u64::from(signaling) << 51);
+            return (sign | 0x7ff0_0000_0000_0000 | payload, u32::from(signaling));
+        }
+        let subnormal = exponent == 0 && fraction != 0;
+        if subnormal && denormals_are_zero {
+            return (sign, 0);
+        }
+        ((f32::from_bits(bits) as f64).to_bits(), u32::from(subnormal) << 1)
+    }
+
+    fn convert_f32_to_f64_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        let chunk = cpu.args[7] as u8;
+        let source_offset = if args[0].size() == 8 { 0 } else { chunk.saturating_mul(8) };
+        if source_offset.saturating_add(8) > args[0].size() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source_offset);
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let daz = mxcsr & (1 << 6) != 0;
+        let mut flags = 0_u32;
+        for lane in 0..2_u8 {
+            let bits = cpu.read::<u32>(args[0].slice(source_offset + lane * 4, 4));
+            let (value, lane_flags) = widen_f32_bits(bits, daz);
+            flags |= lane_flags;
+            cpu.write_var(dst.slice(lane * 8, 8), value);
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn convert_float_to_integer(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        source: Value,
+        source_lane_size: u8,
+        destination_lane_size: u8,
+        unsigned: bool,
+        truncate: bool,
+    ) {
+        if !matches!(source_lane_size, 4 | 8)
+            || !matches!(destination_lane_size, 4 | 8)
+            || source.size() % source_lane_size != 0
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return;
+        }
+        let lanes = source.size() / source_lane_size;
+        if lanes * destination_lane_size > dst.size {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let embedded_rounding = current_evex_embedded_rounding(cpu);
+        let mode =
+            if truncate { 3 } else { embedded_rounding.unwrap_or(((mxcsr >> 13) & 3) as u8) };
+        let daz = mxcsr & (1 << 6) != 0;
+        let mut flags = 0_u32;
+        let mask = current_evex_mask(cpu);
+        let chunk = cpu.args[7] as u8;
+        for lane in 0..lanes {
+            if mask & (1_u64 << (usize::from(chunk) * usize::from(lanes) + usize::from(lane))) == 0
+            {
+                continue;
+            }
+            let lane_source = source.slice(lane * source_lane_size, source_lane_size);
+            let (mut value, subnormal) = if source_lane_size == 8 {
+                let bits = cpu.read::<u64>(lane_source);
+                let subnormal =
+                    bits & 0x7ff0_0000_0000_0000 == 0 && bits & 0x000f_ffff_ffff_ffff != 0;
+                (f64::from_bits(bits), subnormal)
+            }
+            else {
+                let bits = cpu.read::<u32>(lane_source);
+                let subnormal = bits & 0x7f80_0000 == 0 && bits & 0x007f_ffff != 0;
+                (f64::from(f32::from_bits(bits)), subnormal)
+            };
+            if subnormal {
+                if daz {
+                    value = value.copysign(0.0);
+                }
+                else {
+                    flags |= 1 << 1;
+                }
+            }
+            let rounded = match mode {
+                0 => value.round_ties_even(),
+                1 => value.floor(),
+                2 => value.ceil(),
+                _ => value.trunc(),
+            };
+            let bits = u32::from(destination_lane_size) * 8;
+            let invalid = if unsigned {
+                !value.is_finite() || rounded < 0.0 || rounded > (u64::MAX >> (64 - bits)) as f64
+            }
+            else {
+                let minimum = -(1_i128 << (bits - 1)) as f64;
+                let maximum = ((1_i128 << (bits - 1)) - 1) as f64;
+                !value.is_finite() || rounded < minimum || rounded > maximum
+            };
+            let result = if invalid {
+                flags |= 1;
+                if unsigned { u64::MAX >> (64 - bits) } else { 1_u64 << (bits - 1) }
+            }
+            else {
+                if rounded != value {
+                    flags |= 1 << 5;
+                }
+                if unsigned { rounded as u64 } else { (rounded as i64) as u64 }
+            };
+            cpu.write_trunc(dst.slice(lane * destination_lane_size, destination_lane_size), result);
+        }
+        if embedded_rounding.is_none() {
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+
+    fn convert_f64_to_i32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 8, 4, false, false);
+    }
+    fn convert_f64_to_u32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 8, 4, true, false);
+    }
+    fn convert_f32_to_u32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 4, 4, true, false);
+    }
+    fn truncate_f64_to_i32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 8, 4, false, true);
+    }
+    fn truncate_f64_to_u32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 8, 4, true, true);
+    }
+    fn truncate_f32_to_i32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 4, 4, false, true);
+    }
+    fn truncate_f32_to_u32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        convert_float_to_integer(cpu, dst, args[0], 4, 4, true, true);
+    }
+
+    fn scalar_float_to_integer(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        source: Value,
+        source_size: u8,
+        unsigned: bool,
+        truncate: bool,
+    ) {
+        cpu.args[7] = 0;
+        convert_float_to_integer(
+            cpu,
+            dst,
+            source.slice(0, source_size),
+            source_size,
+            dst.size,
+            unsigned,
+            truncate,
+        );
+    }
+    fn convert_scalar_f64_to_i(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 8, false, false);
+    }
+    fn convert_scalar_f64_to_u(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 8, true, false);
+    }
+    fn convert_scalar_f32_to_i(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 4, false, false);
+    }
+    fn convert_scalar_f32_to_u(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 4, true, false);
+    }
+    fn truncate_scalar_f64_to_i(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 8, false, true);
+    }
+    fn truncate_scalar_f64_to_u(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 8, true, true);
+    }
+    fn truncate_scalar_f32_to_i(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 4, false, true);
+    }
+    fn truncate_scalar_f32_to_u(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_float_to_integer(cpu, dst, args[0], 4, true, true);
+    }
+
+    fn convert_u32_to_f64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        for lane in 0..2_u8 {
+            let value = cpu.read::<u32>(args[0].slice(lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 8, 8), f64::from(value).to_bits());
+        }
+    }
+
+    fn convert_u32_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = ((mxcsr >> 13) & 3) as u8;
+        let mask = current_evex_mask(cpu);
+        let chunk = cpu.args[7] as usize;
+        let mut inexact = false;
+        for lane in 0..4_u8 {
+            if mask & (1_u64 << (chunk * 4 + usize::from(lane))) == 0 {
+                continue;
+            }
+            let value = cpu.read::<u32>(args[0].slice(lane * 4, 4));
+            if value == 0 {
+                cpu.write_var(dst.slice(lane * 4, 4), 0_u32);
+                continue;
+            }
+            let highest = 31 - value.leading_zeros();
+            let (significand, lane_inexact) = if highest <= 23 {
+                (value << (23 - highest), false)
+            }
+            else {
+                let shift = highest - 23;
+                let truncated = value >> shift;
+                let remainder = value & ((1_u32 << shift) - 1);
+                let half = 1_u32 << (shift - 1);
+                let increment = match mode {
+                    0 => remainder > half || (remainder == half && truncated & 1 != 0),
+                    2 => remainder != 0,
+                    _ => false,
+                };
+                (truncated + u32::from(increment), remainder != 0)
+            };
+            let mut exponent = highest + 127;
+            let mut significand = significand;
+            if significand == 1 << 24 {
+                significand >>= 1;
+                exponent += 1;
+            }
+            cpu.write_var(dst.slice(lane * 4, 4), (exponent << 23) | (significand & 0x007f_ffff));
+            inexact |= lane_inexact;
+        }
+        raise_mxcsr_flags(cpu, u32::from(inexact) << 5);
+    }
+
+    fn scalar_integer_to_float(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        unsigned: bool,
+        double: bool,
+    ) {
+        if dst.size != 16 || args[0].size() != 16 || !matches!(args[1].size(), 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        let merge = cpu.read::<u128>(args[0]);
+        cpu.write_var(dst, merge);
+        let raw: u64 = cpu.read_dynamic(args[1]).zxt();
+        let value = if unsigned {
+            if args[1].size() == 4 { f64::from(raw as u32) } else { raw as f64 }
+        }
+        else if args[1].size() == 4 {
+            f64::from(raw as u32 as i32)
+        }
+        else {
+            raw as i64 as f64
+        };
+        if double {
+            cpu.write_var(dst.slice(0, 8), value.to_bits());
+        }
+        else {
+            cpu.write_var(dst.slice(0, 4), (value as f32).to_bits());
+        }
+    }
+    fn convert_scalar_i_to_f64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_integer_to_float(cpu, dst, args, false, true);
+    }
+    fn convert_scalar_i_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_integer_to_float(cpu, dst, args, false, false);
+    }
+    fn convert_scalar_u_to_f64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_integer_to_float(cpu, dst, args, true, true);
+    }
+    fn convert_scalar_u_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_integer_to_float(cpu, dst, args, true, false);
+    }
+
+    struct EvexVsib {
+        destination_register: usize,
+        index_register: usize,
+        base_register: Option<usize>,
+        displacement: i64,
+        scale: u64,
+        address32: bool,
+        segment_base: u64,
+        data_size: usize,
+        index_size: usize,
+        lane_count: usize,
+        destination_size: usize,
+        mask_register: usize,
+    }
+
+    fn read_instruction_byte(cpu: &mut Cpu, pc: u64, offset: usize) -> Option<u8> {
+        let Some(address) = pc.checked_add(offset as u64)
+        else {
+            cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+            cpu.exception.value = u64::MAX;
+            return None;
+        };
+        match cpu.mem.read::<1>(address, icicle_mem::perm::NONE) {
+            Ok(value) => Some(value[0]),
+            Err(error) => {
+                cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                cpu.exception.value = address;
+                None
+            }
+        }
+    }
+
+    fn decode_evex_vsib(cpu: &mut Cpu) -> Option<EvexVsib> {
+        let pc = cpu.read_pc();
+        let mut offset = 0_usize;
+        let mut address32 = false;
+        let mut segment_name = None;
+        loop {
+            if offset >= 15 {
+                cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                cpu.exception.value = pc;
+                return None;
+            }
+            match read_instruction_byte(cpu, pc, offset)? {
+                0x67 => address32 = true,
+                0x64 => segment_name = Some("FS_OFFSET"),
+                0x65 => segment_name = Some("GS_OFFSET"),
+                0x2e | 0x3e | 0x26 | 0x36 => {}
+                _ => break,
+            }
+            offset += 1;
+        }
+        if read_instruction_byte(cpu, pc, offset)? != 0x62 || offset + 7 > 15 {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let p0 = read_instruction_byte(cpu, pc, offset + 1)?;
+        let p1 = read_instruction_byte(cpu, pc, offset + 2)?;
+        let p2 = read_instruction_byte(cpu, pc, offset + 3)?;
+        let opcode = read_instruction_byte(cpu, pc, offset + 4)?;
+        let modrm = read_instruction_byte(cpu, pc, offset + 5)?;
+        let sib = read_instruction_byte(cpu, pc, offset + 6)?;
+        let mode = modrm >> 6;
+        if p0 & 0x0b != 0x02
+            || p1 & 0x7c != 0x7c
+            || p2 & 7 == 0
+            || p2 & 0x90 != 0
+            || mode == 3
+            || modrm & 7 != 4
+        {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let is_vsib_opcode = matches!(opcode, 0x90..=0x93 | 0xa0..=0xa3);
+        if !is_vsib_opcode {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = u64::from(opcode);
+            return None;
+        }
+        let vector_size = match (p2 >> 5) & 3 {
+            0 => 16,
+            1 => 32,
+            2 => 64,
+            _ => {
+                cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                cpu.exception.value = pc;
+                return None;
+            }
+        };
+        let data_size = if p1 & 0x80 == 0 { 4 } else { 8 };
+        let index_size = if opcode & 1 == 0 { 4 } else { 8 };
+        let lane_count = vector_size / data_size.max(index_size);
+        let destination_size = lane_count * data_size;
+        let inverted = |byte: u8, bit: u8| usize::from(((byte >> bit) & 1) ^ 1);
+        let destination_register =
+            usize::from((modrm >> 3) & 7) + inverted(p0, 7) * 8 + inverted(p0, 4) * 16;
+        let index_register =
+            usize::from((sib >> 3) & 7) + inverted(p0, 6) * 8 + inverted(p2, 3) * 16;
+        if destination_register == index_register {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let base_field = sib & 7;
+        let base_register =
+            (mode != 0 || base_field != 5).then_some(usize::from(base_field) + inverted(p0, 5) * 8);
+        let displacement_offset = offset + 7;
+        let displacement = match mode {
+            0 if base_field == 5 => {
+                if displacement_offset + 4 > 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                let value = i32::from_le_bytes([
+                    read_instruction_byte(cpu, pc, displacement_offset)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 1)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 2)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 3)?,
+                ]);
+                i64::from(value)
+            }
+            1 => {
+                if displacement_offset >= 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                let value = i64::from(read_instruction_byte(cpu, pc, displacement_offset)? as i8)
+                    * data_size as i64;
+                value
+            }
+            2 => {
+                if displacement_offset + 4 > 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                let value = i32::from_le_bytes([
+                    read_instruction_byte(cpu, pc, displacement_offset)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 1)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 2)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 3)?,
+                ]);
+                i64::from(value)
+            }
+            _ => 0,
+        };
+        let segment_base = segment_name.and_then(|name| read_named::<u64>(cpu, name)).unwrap_or(0);
+        Some(EvexVsib {
+            destination_register,
+            index_register,
+            base_register,
+            displacement,
+            scale: 1_u64 << (sib >> 6),
+            address32,
+            segment_base,
+            data_size,
+            index_size,
+            lane_count,
+            destination_size,
+            mask_register: usize::from(p2 & 7),
+        })
+    }
+
+    fn decode_vex_vsib(cpu: &mut Cpu) -> Option<EvexVsib> {
+        let pc = cpu.read_pc();
+        let mut offset = 0_usize;
+        let mut address32 = false;
+        let mut segment_name = None;
+        loop {
+            if offset >= 15 {
+                cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                cpu.exception.value = pc;
+                return None;
+            }
+            match read_instruction_byte(cpu, pc, offset)? {
+                0x67 => address32 = true,
+                0x64 => segment_name = Some("FS_OFFSET"),
+                0x65 => segment_name = Some("GS_OFFSET"),
+                0x2e | 0x3e | 0x26 | 0x36 => {}
+                _ => break,
+            }
+            offset += 1;
+        }
+        if read_instruction_byte(cpu, pc, offset)? != 0xc4 || offset + 6 > 15 {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let p0 = read_instruction_byte(cpu, pc, offset + 1)?;
+        let p1 = read_instruction_byte(cpu, pc, offset + 2)?;
+        let opcode = read_instruction_byte(cpu, pc, offset + 3)?;
+        let modrm = read_instruction_byte(cpu, pc, offset + 4)?;
+        let sib = read_instruction_byte(cpu, pc, offset + 5)?;
+        let mode = modrm >> 6;
+        if p0 & 0x1f != 2
+            || p1 & 3 != 1
+            || !matches!(opcode, 0x90..=0x93)
+            || mode == 3
+            || modrm & 7 != 4
+        {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let vector_size = if p1 & 4 == 0 { 16 } else { 32 };
+        let data_size = if p1 & 0x80 == 0 { 4 } else { 8 };
+        let index_size = if opcode & 1 == 0 { 4 } else { 8 };
+        let lane_count = vector_size / data_size.max(index_size);
+        let destination_size = lane_count * data_size;
+        let inverted = |byte: u8, bit: u8| usize::from(((byte >> bit) & 1) ^ 1);
+        let destination_register = usize::from((modrm >> 3) & 7) + inverted(p0, 7) * 8;
+        let index_register = usize::from((sib >> 3) & 7) + inverted(p0, 6) * 8;
+        let mask_register = usize::from((p1 >> 3) & 0xf) ^ 0xf;
+        if destination_register == index_register
+            || destination_register == mask_register
+            || index_register == mask_register
+        {
+            cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+            cpu.exception.value = pc;
+            return None;
+        }
+        let base_field = sib & 7;
+        let base_register =
+            (mode != 0 || base_field != 5).then_some(usize::from(base_field) + inverted(p0, 5) * 8);
+        let displacement_offset = offset + 6;
+        let displacement = match mode {
+            0 if base_field == 5 => {
+                if displacement_offset + 4 > 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                i64::from(i32::from_le_bytes([
+                    read_instruction_byte(cpu, pc, displacement_offset)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 1)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 2)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 3)?,
+                ]))
+            }
+            1 => {
+                if displacement_offset >= 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                i64::from(read_instruction_byte(cpu, pc, displacement_offset)? as i8)
+            }
+            2 => {
+                if displacement_offset + 4 > 15 {
+                    cpu.exception.code = ExceptionCode::InvalidInstruction as u32;
+                    cpu.exception.value = pc;
+                    return None;
+                }
+                i64::from(i32::from_le_bytes([
+                    read_instruction_byte(cpu, pc, displacement_offset)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 1)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 2)?,
+                    read_instruction_byte(cpu, pc, displacement_offset + 3)?,
+                ]))
+            }
+            _ => 0,
+        };
+        let segment_base = segment_name.and_then(|name| read_named::<u64>(cpu, name)).unwrap_or(0);
+        Some(EvexVsib {
+            destination_register,
+            index_register,
+            base_register,
+            displacement,
+            scale: 1_u64 << (sib >> 6),
+            address32,
+            segment_base,
+            data_size,
+            index_size,
+            lane_count,
+            destination_size,
+            mask_register,
+        })
+    }
+
+    const GPR_NAMES: [&str; 16] = [
+        "RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI", "R8", "R9", "R10", "R11", "R12",
+        "R13", "R14", "R15",
+    ];
+
+    fn vsib_lane_address(cpu: &mut Cpu, decoded: &EvexVsib, lane: usize) -> Option<u64> {
+        let index_var = named_slice(
+            cpu,
+            &format!("ZMM{}", decoded.index_register),
+            (lane * decoded.index_size) as u8,
+            decoded.index_size as u8,
+        )?;
+        let index = if decoded.index_size == 4 {
+            i64::from(cpu.read_var::<u32>(index_var) as i32)
+        }
+        else {
+            cpu.read_var::<u64>(index_var) as i64
+        };
+        let base = decoded
+            .base_register
+            .and_then(|register| read_named::<u64>(cpu, GPR_NAMES[register]))
+            .unwrap_or(0);
+        let indexed = (index as u64).wrapping_mul(decoded.scale);
+        let address = if decoded.address32 {
+            u64::from(
+                (base as u32)
+                    .wrapping_add(indexed as u32)
+                    .wrapping_add(decoded.displacement as u32),
+            )
+        }
+        else {
+            base.wrapping_add(indexed).wrapping_add(decoded.displacement as u64)
+        };
+        Some(decoded.segment_base.wrapping_add(address))
+    }
+
+    fn vsib_gather(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
+        let Some(decoded) = decode_evex_vsib(cpu)
+        else {
+            return;
+        };
+        let lanes_per_chunk = 16 / decoded.data_size;
+        let chunk = if decoded.destination_size <= 16 { 0 } else { cpu.args[7] as usize };
+        let destination_name = format!("ZMM{}", decoded.destination_register);
+        let Some(destination_chunk) = named_slice(cpu, &destination_name, (chunk * 16) as u8, 16)
+        else {
+            return;
+        };
+        cpu.write_var(dst, cpu.read_var::<u128>(destination_chunk));
+        let mask_name = format!("K{}", decoded.mask_register);
+        let mut mask = read_named::<u64>(cpu, &mask_name).unwrap_or(0);
+        for local_lane in 0..lanes_per_chunk {
+            let lane = chunk * lanes_per_chunk + local_lane;
+            if lane >= decoded.lane_count || mask & (1_u64 << lane) == 0 {
+                continue;
+            }
+            let Some(address) = vsib_lane_address(cpu, &decoded, lane)
+            else {
+                return;
+            };
+            let mut bytes = [0_u8; 8];
+            if read_guest(cpu, address, &mut bytes[..decoded.data_size]).is_none() {
+                let _ = write_named(cpu, &mask_name, mask);
+                return;
+            }
+            let offset = (local_lane * decoded.data_size) as u8;
+            if decoded.data_size == 4 {
+                let value = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                cpu.write_var(dst.slice(offset, 4), value);
+                if let Some(lane_var) = named_slice(cpu, &destination_name, (lane * 4) as u8, 4) {
+                    cpu.write_var(lane_var, value);
+                }
+            }
+            else {
+                let value = u64::from_le_bytes(bytes);
+                cpu.write_var(dst.slice(offset, 8), value);
+                if let Some(lane_var) = named_slice(cpu, &destination_name, (lane * 8) as u8, 8) {
+                    cpu.write_var(lane_var, value);
+                }
+            }
+            mask &= !(1_u64 << lane);
+        }
+        if (chunk + 1) * lanes_per_chunk >= decoded.lane_count {
+            mask = 0;
+        }
+        let _ = write_named(cpu, &mask_name, mask);
+    }
+
+    fn vex_vsib_gather(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
+        let Some(decoded) = decode_vex_vsib(cpu)
+        else {
+            return;
+        };
+        let lanes_per_chunk = 16 / decoded.data_size;
+        let chunk = if decoded.destination_size <= 16 { 0 } else { cpu.args[7] as usize };
+        let destination_name = format!("ZMM{}", decoded.destination_register);
+        let mask_name = format!("ZMM{}", decoded.mask_register);
+        if chunk == 0 {
+            for name in [&destination_name, &mask_name] {
+                for byte in (decoded.destination_size..64).step_by(16) {
+                    let Some(slice) = named_slice(cpu, name, byte as u8, 16)
+                    else {
+                        return;
+                    };
+                    cpu.write_var(slice, 0_u128);
+                }
+            }
+            // AVX2 gather restart state canonicalizes every selected mask
+            // element to all ones. Completed elements are then cleared one by
+            // one, leaving a hardware-compatible retry mask after a fault.
+            for lane in 0..decoded.lane_count {
+                let Some(mask_lane) = named_slice(
+                    cpu,
+                    &mask_name,
+                    (lane * decoded.data_size) as u8,
+                    decoded.data_size as u8,
+                )
+                else {
+                    return;
+                };
+                let active = if decoded.data_size == 4 {
+                    cpu.read_var::<u32>(mask_lane) >> 31 != 0
+                }
+                else {
+                    cpu.read_var::<u64>(mask_lane) >> 63 != 0
+                };
+                if active {
+                    if decoded.data_size == 4 {
+                        cpu.write_var(mask_lane, u32::MAX);
+                    }
+                    else {
+                        cpu.write_var(mask_lane, u64::MAX);
+                    }
+                }
+            }
+        }
+        let Some(destination_chunk) = named_slice(cpu, &destination_name, (chunk * 16) as u8, 16)
+        else {
+            return;
+        };
+        cpu.write_var(dst, cpu.read_var::<u128>(destination_chunk));
+        for local_lane in 0..lanes_per_chunk {
+            let lane = chunk * lanes_per_chunk + local_lane;
+            if lane >= decoded.lane_count {
+                continue;
+            }
+            let Some(mask_lane) = named_slice(
+                cpu,
+                &mask_name,
+                (lane * decoded.data_size) as u8,
+                decoded.data_size as u8,
+            )
+            else {
+                return;
+            };
+            let active = if decoded.data_size == 4 {
+                cpu.read_var::<u32>(mask_lane) >> 31 != 0
+            }
+            else {
+                cpu.read_var::<u64>(mask_lane) >> 63 != 0
+            };
+            if !active {
+                continue;
+            }
+            let Some(address) = vsib_lane_address(cpu, &decoded, lane)
+            else {
+                return;
+            };
+            let mut bytes = [0_u8; 8];
+            if read_guest(cpu, address, &mut bytes[..decoded.data_size]).is_none() {
+                return;
+            }
+            let output_offset = (local_lane * decoded.data_size) as u8;
+            let destination_offset = (lane * decoded.data_size) as u8;
+            if decoded.data_size == 4 {
+                let value = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                cpu.write_var(dst.slice(output_offset, 4), value);
+                if let Some(lane_var) = named_slice(cpu, &destination_name, destination_offset, 4) {
+                    cpu.write_var(lane_var, value);
+                }
+                cpu.write_var(mask_lane, 0_u32);
+            }
+            else {
+                let value = u64::from_le_bytes(bytes);
+                cpu.write_var(dst.slice(output_offset, 8), value);
+                if let Some(lane_var) = named_slice(cpu, &destination_name, destination_offset, 8) {
+                    cpu.write_var(lane_var, value);
+                }
+                cpu.write_var(mask_lane, 0_u64);
+            }
+        }
+        if (chunk + 1) * lanes_per_chunk >= decoded.lane_count {
+            for mask_chunk in 0..4 {
+                let Some(slice) = named_slice(cpu, &mask_name, mask_chunk * 16, 16)
+                else {
+                    return;
+                };
+                cpu.write_var(slice, 0_u128);
+            }
+        }
+    }
+
+    fn vsib_scatter(cpu: &mut Cpu, _: VarNode, _: [Value; 2]) {
+        let Some(decoded) = decode_evex_vsib(cpu)
+        else {
+            return;
+        };
+        let source_name = format!("ZMM{}", decoded.destination_register);
+        let mask_name = format!("K{}", decoded.mask_register);
+        let mut mask = read_named::<u64>(cpu, &mask_name).unwrap_or(0);
+        for lane in 0..decoded.lane_count {
+            if mask & (1_u64 << lane) == 0 {
+                continue;
+            }
+            let Some(address) = vsib_lane_address(cpu, &decoded, lane)
+            else {
+                return;
+            };
+            let Some(source) = named_slice(
+                cpu,
+                &source_name,
+                (lane * decoded.data_size) as u8,
+                decoded.data_size as u8,
+            )
+            else {
+                return;
+            };
+            let bytes = if decoded.data_size == 4 {
+                cpu.read_var::<u32>(source).to_le_bytes().to_vec()
+            }
+            else {
+                cpu.read_var::<u64>(source).to_le_bytes().to_vec()
+            };
+            if write_guest(cpu, address, &bytes).is_none() {
+                let _ = write_named(cpu, &mask_name, mask);
+                return;
+            }
+            mask &= !(1_u64 << lane);
+        }
+        let _ = write_named(cpu, &mask_name, 0_u64);
+    }
+
+    fn evex_lane_active(cpu: &mut Cpu, lane: usize, lanes_per_chunk: usize) -> bool {
+        let chunk = cpu.args[7] as usize;
+        current_evex_mask(cpu) & (1_u64 << (chunk * lanes_per_chunk + lane)) != 0
+    }
+
+    fn evex_scalar_lane_active(cpu: &mut Cpu) -> bool {
+        current_evex_mask(cpu) & 1 != 0
+    }
+
+    fn getexp_f32(bits: u32) -> (u32, u32) {
+        let exponent = (bits >> 23) & 0xff;
+        let fraction = bits & 0x007f_ffff;
+        match (exponent, fraction) {
+            (0xff, 0) => (0x7f80_0000, 0),
+            (0xff, _) => {
+                let signaling = fraction & 0x0040_0000 == 0;
+                (bits | 0x0040_0000, u32::from(signaling))
+            }
+            (0, 0) => (0xff80_0000, 0),
+            (0, _) => {
+                let unbiased = 31_i32 - fraction.leading_zeros() as i32 - 149;
+                ((unbiased as f32).to_bits(), 1 << 1)
+            }
+            _ => (((exponent as i32 - 127) as f32).to_bits(), 0),
+        }
+    }
+
+    fn getexp_f64(bits: u64) -> (u64, u32) {
+        let exponent = (bits >> 52) & 0x7ff;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        match (exponent, fraction) {
+            (0x7ff, 0) => (0x7ff0_0000_0000_0000, 0),
+            (0x7ff, _) => {
+                let signaling = fraction & 0x0008_0000_0000_0000 == 0;
+                (bits | 0x0008_0000_0000_0000, u32::from(signaling))
+            }
+            (0, 0) => (0xfff0_0000_0000_0000, 0),
+            (0, _) => {
+                let unbiased = 63_i32 - fraction.leading_zeros() as i32 - 1074;
+                ((unbiased as f64).to_bits(), 1 << 1)
+            }
+            _ => (((exponent as i32 - 1023) as f64).to_bits(), 0),
+        }
+    }
+
+    fn getexp_packed(cpu: &mut Cpu, dst: VarNode, source: Value, double: bool) {
+        let lane_bytes = if double { 8 } else { 4 };
+        if dst.size != 16 || source.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        let lanes = 16 / lane_bytes;
+        let mut flags = 0;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let (value, lane_flags) = getexp_f64(cpu.read::<u64>(source.slice(offset, 8)));
+                cpu.write_var(dst.slice(offset, 8), value);
+                flags |= lane_flags;
+            }
+            else {
+                let (value, lane_flags) = getexp_f32(cpu.read::<u32>(source.slice(offset, 4)));
+                cpu.write_var(dst.slice(offset, 4), value);
+                flags |= lane_flags;
+            }
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn getexp_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        getexp_packed(cpu, dst, args[0], true);
+    }
+    fn getexp_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        getexp_packed(cpu, dst, args[0], false);
+    }
+    fn getexp_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) = getexp_f64(cpu.read::<u64>(args[1].slice(0, 8)));
+            cpu.write_var(dst.slice(0, 8), value);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+    fn getexp_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) = getexp_f32(cpu.read::<u32>(args[1].slice(0, 4)));
+            cpu.write_var(dst.slice(0, 4), value);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+
+    fn quiet_nan_f32(bits: u32) -> (u32, u32) {
+        (bits | 0x0040_0000, u32::from(bits & 0x0040_0000 == 0))
+    }
+    fn quiet_nan_f64(bits: u64) -> (u64, u32) {
+        (bits | 0x0008_0000_0000_0000, u32::from(bits & 0x0008_0000_0000_0000 == 0))
+    }
+
+    fn getmant_f32(bits: u32, immediate: u8) -> (u32, u32) {
+        let sign = bits & 0x8000_0000;
+        let exponent = bits & 0x7f80_0000;
+        let fraction = bits & 0x007f_ffff;
+        if exponent == 0x7f80_0000 {
+            if fraction != 0 {
+                return quiet_nan_f32(bits);
+            }
+            if immediate & 0x0c == 0x08 && sign != 0 {
+                return (0xffc0_0000, 1);
+            }
+            return (0x3f80_0000 | if immediate & 0x0c == 0 { sign } else { 0 }, 0);
+        }
+        if exponent == 0 && fraction == 0 {
+            return (0x3f80_0000 | if immediate & 0x0c == 0x04 { 0 } else { sign }, 0);
+        }
+        if immediate & 0x0c == 0x08 && sign != 0 {
+            return (0xffc0_0000, 1);
+        }
+        let (normalized_fraction, unbiased_exponent, flags) = if exponent == 0 {
+            let highest = 31 - fraction.leading_zeros();
+            let shift = 23 - highest;
+            ((fraction << shift) & 0x007f_ffff, highest as i32 - 149, 1 << 1)
+        }
+        else {
+            (fraction, ((exponent >> 23) as i32) - 127, 0)
+        };
+        let output_exponent = match immediate & 3 {
+            0 => 127,
+            1 if unbiased_exponent & 1 != 0 => 126,
+            1 => 127,
+            2 => 126,
+            3 if normalized_fraction >= 0x0040_0000 => 126,
+            3 => 127,
+            _ => unreachable!(),
+        };
+        let output_sign = if immediate & 0x0c == 0 { sign } else { 0 };
+        (output_sign | ((output_exponent as u32) << 23) | normalized_fraction, flags)
+    }
+
+    fn getmant_f64(bits: u64, immediate: u8) -> (u64, u32) {
+        let sign = bits & 0x8000_0000_0000_0000;
+        let exponent = bits & 0x7ff0_0000_0000_0000;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        if exponent == 0x7ff0_0000_0000_0000 {
+            if fraction != 0 {
+                return quiet_nan_f64(bits);
+            }
+            if immediate & 0x0c == 0x08 && sign != 0 {
+                return (0xfff8_0000_0000_0000, 1);
+            }
+            return (0x3ff0_0000_0000_0000 | if immediate & 0x0c == 0 { sign } else { 0 }, 0);
+        }
+        if exponent == 0 && fraction == 0 {
+            return (0x3ff0_0000_0000_0000 | if immediate & 0x0c == 0x04 { 0 } else { sign }, 0);
+        }
+        if immediate & 0x0c == 0x08 && sign != 0 {
+            return (0xfff8_0000_0000_0000, 1);
+        }
+        let (normalized_fraction, unbiased_exponent, flags) = if exponent == 0 {
+            let highest = 63 - fraction.leading_zeros();
+            let shift = 52 - highest;
+            ((fraction << shift) & 0x000f_ffff_ffff_ffff, highest as i32 - 1074, 1 << 1)
+        }
+        else {
+            (fraction, ((exponent >> 52) as i32) - 1023, 0)
+        };
+        let output_exponent = match immediate & 3 {
+            0 => 1023,
+            1 if unbiased_exponent & 1 != 0 => 1022,
+            1 => 1023,
+            2 => 1022,
+            3 if normalized_fraction >= 0x0008_0000_0000_0000 => 1022,
+            3 => 1023,
+            _ => unreachable!(),
+        };
+        let output_sign = if immediate & 0x0c == 0 { sign } else { 0 };
+        (output_sign | ((output_exponent as u64) << 52) | normalized_fraction, flags)
+    }
+
+    fn getmant_packed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
+        let immediate = cpu.read::<u8>(args[1]);
+        let lane_bytes = if double { 8 } else { 4 };
+        let lanes = 16 / lane_bytes;
+        let mut flags = 0;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let (value, lane_flags) =
+                    getmant_f64(cpu.read::<u64>(args[0].slice(offset, 8)), immediate);
+                cpu.write_var(dst.slice(offset, 8), value);
+                flags |= lane_flags;
+            }
+            else {
+                let (value, lane_flags) =
+                    getmant_f32(cpu.read::<u32>(args[0].slice(offset, 4)), immediate);
+                cpu.write_var(dst.slice(offset, 4), value);
+                flags |= lane_flags;
+            }
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+    fn getmant_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        getmant_packed(cpu, dst, args, true);
+    }
+    fn getmant_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        getmant_packed(cpu, dst, args, false);
+    }
+    fn getmant_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let immediate = cpu.args[0] as u8;
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) = getmant_f64(cpu.read::<u64>(args[1].slice(0, 8)), immediate);
+            cpu.write_var(dst.slice(0, 8), value);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+    fn getmant_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let immediate = cpu.args[0] as u8;
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) = getmant_f32(cpu.read::<u32>(args[1].slice(0, 4)), immediate);
+            cpu.write_var(dst.slice(0, 4), value);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+
+    fn quantize_f32_14(value: f32) -> f32 {
+        let bits = value.to_bits();
+        if bits & 0x7f80_0000 == 0x7f80_0000 || bits & 0x7fff_ffff == 0 {
+            return value;
+        }
+        f32::from_bits((bits.wrapping_add(1 << 8)) & !0x1ff)
+    }
+
+    fn quantize_f64_14(value: f64) -> f64 {
+        let bits = value.to_bits();
+        if bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+            || bits & 0x7fff_ffff_ffff_ffff == 0
+        {
+            return value;
+        }
+        f64::from_bits((bits.wrapping_add(1 << 37)) & !((1_u64 << 38) - 1))
+    }
+
+    fn approximate_unary_packed(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        source: Value,
+        double: bool,
+        reciprocal_sqrt: bool,
+    ) {
+        let lane_bytes = if double { 8 } else { 4 };
+        let lanes = 16 / lane_bytes;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let input = f64::from_bits(cpu.read::<u64>(source.slice(offset, 8)));
+                let result = if reciprocal_sqrt { 1.0 / input.sqrt() } else { 1.0 / input };
+                cpu.write_var(dst.slice(offset, 8), quantize_f64_14(result).to_bits());
+            }
+            else {
+                let input = f32::from_bits(cpu.read::<u32>(source.slice(offset, 4)));
+                let result = if reciprocal_sqrt { 1.0 / input.sqrt() } else { 1.0 / input };
+                cpu.write_var(dst.slice(offset, 4), quantize_f32_14(result).to_bits());
+            }
+        }
+    }
+
+    fn rcp14_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_packed(cpu, dst, args[0], true, false);
+    }
+    fn rcp14_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_packed(cpu, dst, args[0], false, false);
+    }
+    fn rsqrt14_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_packed(cpu, dst, args[0], true, true);
+    }
+    fn rsqrt14_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_packed(cpu, dst, args[0], false, true);
+    }
+
+    fn approximate_unary_scalar(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        double: bool,
+        reciprocal_sqrt: bool,
+    ) {
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if !evex_scalar_lane_active(cpu) {
+            return;
+        }
+        if double {
+            let input = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
+            let result = if reciprocal_sqrt { 1.0 / input.sqrt() } else { 1.0 / input };
+            cpu.write_var(dst.slice(0, 8), quantize_f64_14(result).to_bits());
+        }
+        else {
+            let input = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
+            let result = if reciprocal_sqrt { 1.0 / input.sqrt() } else { 1.0 / input };
+            cpu.write_var(dst.slice(0, 4), quantize_f32_14(result).to_bits());
+        }
+    }
+    fn rcp14_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_scalar(cpu, dst, args, true, false);
+    }
+    fn rcp14_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_scalar(cpu, dst, args, false, false);
+    }
+    fn rsqrt14_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_scalar(cpu, dst, args, true, true);
+    }
+    fn rsqrt14_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        approximate_unary_scalar(cpu, dst, args, false, true);
+    }
+
+    fn rndscale_f64(bits: u64, immediate: u8, mxcsr: u32) -> (u64, u32) {
+        let exponent = bits & 0x7ff0_0000_0000_0000;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        if exponent == 0x7ff0_0000_0000_0000 && fraction != 0 {
+            return quiet_nan_f64(bits);
+        }
+        let scale = i32::from(immediate >> 4);
+        let mode = if immediate & 4 != 0 { ((mxcsr >> 13) & 3) as u8 } else { immediate & 3 };
+        let daz = mxcsr & (1 << 6) != 0;
+        let scaled = f64::from_bits(bits) * 2.0_f64.powi(scale);
+        let (rounded, flags) = round_f64_bits(scaled.to_bits(), mode, daz);
+        ((f64::from_bits(rounded) * 2.0_f64.powi(-scale)).to_bits(), flags & !(1 << 1))
+    }
+    fn rndscale_f32(bits: u32, immediate: u8, mxcsr: u32) -> (u32, u32) {
+        let exponent = bits & 0x7f80_0000;
+        let fraction = bits & 0x007f_ffff;
+        if exponent == 0x7f80_0000 && fraction != 0 {
+            return quiet_nan_f32(bits);
+        }
+        let scale = i32::from(immediate >> 4);
+        let mode = if immediate & 4 != 0 { ((mxcsr >> 13) & 3) as u8 } else { immediate & 3 };
+        let daz = mxcsr & (1 << 6) != 0;
+        let scaled = f32::from_bits(bits) * 2.0_f32.powi(scale);
+        let (rounded, flags) = round_f32_bits(scaled.to_bits(), mode, daz);
+        ((f32::from_bits(rounded) * 2.0_f32.powi(-scale)).to_bits(), flags & !(1 << 1))
+    }
+
+    fn rndscale_packed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
+        let immediate = cpu.read::<u8>(args[1]);
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let lane_bytes = if double { 8 } else { 4 };
+        let lanes = 16 / lane_bytes;
+        let mut flags = 0;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let (value, lane_flags) =
+                    rndscale_f64(cpu.read::<u64>(args[0].slice(offset, 8)), immediate, mxcsr);
+                cpu.write_var(dst.slice(offset, 8), value);
+                flags |= lane_flags;
+            }
+            else {
+                let (value, lane_flags) =
+                    rndscale_f32(cpu.read::<u32>(args[0].slice(offset, 4)), immediate, mxcsr);
+                cpu.write_var(dst.slice(offset, 4), value);
+                flags |= lane_flags;
+            }
+        }
+        raise_mxcsr_flags(cpu, if immediate & 8 == 0 { flags } else { flags & !(1 << 5) });
+    }
+    fn rndscale_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        rndscale_packed(cpu, dst, args, true);
+    }
+    fn rndscale_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        rndscale_packed(cpu, dst, args, false);
+    }
+    fn rndscale_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let immediate = cpu.args[0] as u8;
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) =
+                rndscale_f64(cpu.read::<u64>(args[1].slice(0, 8)), immediate, mxcsr);
+            cpu.write_var(dst.slice(0, 8), value);
+            raise_mxcsr_flags(cpu, if immediate & 8 == 0 { flags } else { flags & !(1 << 5) });
+        }
+    }
+    fn rndscale_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let immediate = cpu.args[0] as u8;
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (value, flags) =
+                rndscale_f32(cpu.read::<u32>(args[1].slice(0, 4)), immediate, mxcsr);
+            cpu.write_var(dst.slice(0, 4), value);
+            raise_mxcsr_flags(cpu, if immediate & 8 == 0 { flags } else { flags & !(1 << 5) });
+        }
+    }
+
+    fn scalef_f32(value_bits: u32, scale_bits: u32) -> (u32, u32) {
+        let (value_nan, value_signaling) = f32_nan_kind(value_bits);
+        if value_nan {
+            return (value_bits | 0x0040_0000, u32::from(value_signaling));
+        }
+        let (scale_nan, scale_signaling) = f32_nan_kind(scale_bits);
+        if scale_nan {
+            return (scale_bits | 0x0040_0000, u32::from(scale_signaling));
+        }
+        let value_zero = value_bits & 0x7fff_ffff == 0;
+        let value_infinite = value_bits & 0x7fff_ffff == 0x7f80_0000;
+        let scale_positive_infinite = scale_bits == 0x7f80_0000;
+        let scale_negative_infinite = scale_bits == 0xff80_0000;
+        if (value_zero && scale_positive_infinite) || (value_infinite && scale_negative_infinite) {
+            return (0xffc0_0000, 1);
+        }
+        let value = f32::from_bits(value_bits);
+        let scale = f32::from_bits(scale_bits).floor();
+        // SCALEF applies the (floored) source exponent before IEEE-754
+        // rounding.  Clamping at the f32 result limits is incorrect: a large
+        // finite significand can still produce a subnormal at -150, while an
+        // exponent below that must continue toward signed zero.  f64 is wide
+        // enough to evaluate every f32 result-relevant exponent exactly; the
+        // wider bounds only avoid feeding an unbounded converted exponent to
+        // powi.  Values beyond them already have the same f32 result and
+        // exception class as the chosen endpoint.
+        let exponent = scale.clamp(-512.0, 512.0) as i32;
+        let exact = f64::from(value) * 2.0_f64.powi(exponent);
+        let result = exact as f32;
+        let mut flags = 0_u32;
+        let value_subnormal = value_bits & 0x7f80_0000 == 0 && value_bits & 0x007f_ffff != 0;
+        let scale_subnormal = scale_bits & 0x7f80_0000 == 0 && scale_bits & 0x007f_ffff != 0;
+        if value_subnormal || scale_subnormal {
+            flags |= 1 << 1;
+        }
+        if value.is_finite() && value != 0.0 {
+            if result.is_infinite() {
+                flags |= (1 << 3) | (1 << 5);
+            }
+            else if f64::from(result) != exact {
+                flags |= 1 << 5;
+                if result == 0.0 || result.is_subnormal() {
+                    flags |= 1 << 4;
+                }
+            }
+        }
+        (result.to_bits(), flags)
+    }
+
+    fn scalef_f64(value_bits: u64, scale_bits: u64) -> (u64, u32) {
+        let (value_nan, value_signaling) = f64_nan_kind(value_bits);
+        if value_nan {
+            return (value_bits | 0x0008_0000_0000_0000, u32::from(value_signaling));
+        }
+        let (scale_nan, scale_signaling) = f64_nan_kind(scale_bits);
+        if scale_nan {
+            return (scale_bits | 0x0008_0000_0000_0000, u32::from(scale_signaling));
+        }
+        let value_zero = value_bits & 0x7fff_ffff_ffff_ffff == 0;
+        let value_infinite = value_bits & 0x7fff_ffff_ffff_ffff == 0x7ff0_0000_0000_0000;
+        let scale_positive_infinite = scale_bits == 0x7ff0_0000_0000_0000;
+        let scale_negative_infinite = scale_bits == 0xfff0_0000_0000_0000;
+        if (value_zero && scale_positive_infinite) || (value_infinite && scale_negative_infinite) {
+            return (0xfff8_0000_0000_0000, 1);
+        }
+        let value = f64::from_bits(value_bits);
+        let scale = f64::from_bits(scale_bits).floor();
+        let exponent = scale.clamp(-1075.0, 1024.0) as i32;
+        let result = if exponent < -1022 {
+            (value * 2.0_f64.powi(exponent + 1022)) * 2.0_f64.powi(-1022)
+        }
+        else if exponent > 1023 {
+            (value * 2.0) * 2.0_f64.powi(1023)
+        }
+        else {
+            value * 2.0_f64.powi(exponent)
+        };
+        let mut flags = 0_u32;
+        let value_subnormal =
+            value_bits & 0x7ff0_0000_0000_0000 == 0 && value_bits & 0x000f_ffff_ffff_ffff != 0;
+        let scale_subnormal =
+            scale_bits & 0x7ff0_0000_0000_0000 == 0 && scale_bits & 0x000f_ffff_ffff_ffff != 0;
+        if value_subnormal || scale_subnormal {
+            flags |= 1 << 1;
+        }
+        if value.is_finite() && value != 0.0 {
+            if result.is_infinite() {
+                flags |= (1 << 3) | (1 << 5);
+            }
+            else if result == 0.0 {
+                flags |= (1 << 4) | (1 << 5);
+            }
+        }
+        (result.to_bits(), flags)
+    }
+
+    fn scalef_packed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
+        let lane_bytes = if double { 8 } else { 4 };
+        let lanes = 16 / lane_bytes;
+        let mut flags = 0_u32;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let (result, lane_flags) = scalef_f64(
+                    cpu.read::<u64>(args[0].slice(offset, 8)),
+                    cpu.read::<u64>(args[1].slice(offset, 8)),
+                );
+                flags |= lane_flags;
+                cpu.write_var(dst.slice(offset, 8), result);
+            }
+            else {
+                let (result, lane_flags) = scalef_f32(
+                    cpu.read::<u32>(args[0].slice(offset, 4)),
+                    cpu.read::<u32>(args[1].slice(offset, 4)),
+                );
+                flags |= lane_flags;
+                cpu.write_var(dst.slice(offset, 4), result);
+            }
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+    fn scalef_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalef_packed(cpu, dst, args, true);
+    }
+    fn scalef_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalef_packed(cpu, dst, args, false);
+    }
+    fn scalef_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (result, flags) = scalef_f64(
+                cpu.read::<u64>(args[0].slice(0, 8)),
+                cpu.read::<u64>(args[1].slice(0, 8)),
+            );
+            cpu.write_var(dst.slice(0, 8), result);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+    fn scalef_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if evex_scalar_lane_active(cpu) {
+            let (result, flags) = scalef_f32(
+                cpu.read::<u32>(args[0].slice(0, 4)),
+                cpu.read::<u32>(args[1].slice(0, 4)),
+            );
+            cpu.write_var(dst.slice(0, 4), result);
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+
+    fn fixup_class_f32(bits: u32) -> usize {
+        let exponent = bits & 0x7f80_0000;
+        let fraction = bits & 0x007f_ffff;
+        if exponent == 0x7f80_0000 && fraction != 0 {
+            usize::from(fraction & 0x0040_0000 == 0)
+        }
+        else if bits & 0x7fff_ffff == 0 {
+            2
+        }
+        else if bits == 0x3f80_0000 {
+            3
+        }
+        else if bits == 0xff80_0000 {
+            4
+        }
+        else if bits == 0x7f80_0000 {
+            5
+        }
+        else if bits >> 31 != 0 {
+            6
+        }
+        else {
+            7
+        }
+    }
+    fn fixup_class_f64(bits: u64) -> usize {
+        let exponent = bits & 0x7ff0_0000_0000_0000;
+        let fraction = bits & 0x000f_ffff_ffff_ffff;
+        if exponent == 0x7ff0_0000_0000_0000 && fraction != 0 {
+            usize::from(fraction & 0x0008_0000_0000_0000 == 0)
+        }
+        else if bits & 0x7fff_ffff_ffff_ffff == 0 {
+            2
+        }
+        else if bits == 0x3ff0_0000_0000_0000 {
+            3
+        }
+        else if bits == 0xfff0_0000_0000_0000 {
+            4
+        }
+        else if bits == 0x7ff0_0000_0000_0000 {
+            5
+        }
+        else if bits >> 63 != 0 {
+            6
+        }
+        else {
+            7
+        }
+    }
+    fn fixup_action_f32(old: u32, source: u32, action: u8) -> u32 {
+        match action & 0xf {
+            0 => old,
+            1 => source,
+            2 => 0x7fc0_0000,
+            3 => 0xffc0_0000,
+            4 => 0xff80_0000,
+            5 => 0x7f80_0000,
+            6 => (source & 0x8000_0000) | 0x7f80_0000,
+            7 => 0x8000_0000,
+            8 => 0,
+            9 => 0xbf80_0000,
+            10 => 0x3f80_0000,
+            11 => 0x3f00_0000,
+            12 => 90.0_f32.to_bits(),
+            13 => core::f32::consts::FRAC_PI_2.to_bits(),
+            14 => 0x7f7f_ffff,
+            _ => 0xff7f_ffff,
+        }
+    }
+    fn fixup_action_f64(old: u64, source: u64, action: u8) -> u64 {
+        match action & 0xf {
+            0 => old,
+            1 => source,
+            2 => 0x7ff8_0000_0000_0000,
+            3 => 0xfff8_0000_0000_0000,
+            4 => 0xfff0_0000_0000_0000,
+            5 => 0x7ff0_0000_0000_0000,
+            6 => (source & 0x8000_0000_0000_0000) | 0x7ff0_0000_0000_0000,
+            7 => 0x8000_0000_0000_0000,
+            8 => 0,
+            9 => 0xbff0_0000_0000_0000,
+            10 => 0x3ff0_0000_0000_0000,
+            11 => 0x3fe0_0000_0000_0000,
+            12 => 90.0_f64.to_bits(),
+            13 => core::f64::consts::FRAC_PI_2.to_bits(),
+            14 => 0x7fef_ffff_ffff_ffff,
+            _ => 0xffef_ffff_ffff_ffff,
+        }
+    }
+    fn fixup_packed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], double: bool) {
+        let control = cpu.args[0].to_le_bytes();
+        let immediate = cpu.args[1] as u8;
+        let lane_bytes = if double { 8 } else { 4 };
+        let lanes = 16 / lane_bytes;
+        let mut flags = 0;
+        for lane in 0..lanes {
+            if !evex_lane_active(cpu, lane, lanes) {
+                continue;
+            }
+            let offset = (lane * lane_bytes) as u8;
+            if double {
+                let old = cpu.read::<u64>(args[0].slice(offset, 8));
+                let source = cpu.read::<u64>(args[1].slice(offset, 8));
+                let table = u64::from_le_bytes(control[lane * 8..lane * 8 + 8].try_into().unwrap());
+                let class = fixup_class_f64(source);
+                cpu.write_var(
+                    dst.slice(offset, 8),
+                    fixup_action_f64(old, source, ((table >> (class * 4)) & 0xf) as u8),
+                );
+                if immediate & (1 << class) != 0 {
+                    flags |= if class == 2 { 1 << 2 } else { 1 };
+                }
+            }
+            else {
+                let old = cpu.read::<u32>(args[0].slice(offset, 4));
+                let source = cpu.read::<u32>(args[1].slice(offset, 4));
+                let table = u32::from_le_bytes(control[lane * 4..lane * 4 + 4].try_into().unwrap());
+                let class = fixup_class_f32(source);
+                cpu.write_var(
+                    dst.slice(offset, 4),
+                    fixup_action_f32(old, source, ((table >> (class * 4)) & 0xf) as u8),
+                );
+                if immediate & (1 << class) != 0 {
+                    flags |= if class == 2 { 1 << 2 } else { 1 };
+                }
+            }
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+    fn fixup_pd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        fixup_packed(cpu, dst, args, true);
+    }
+    fn fixup_ps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        fixup_packed(cpu, dst, args, false);
+    }
+    fn fixup_sd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[1]));
+        if current_evex_mask(cpu) & 1 == 0 {
+            return;
+        }
+        let old = cpu.read::<u64>(args[0].slice(0, 8));
+        let source = cpu.read::<u64>(args[1].slice(0, 8));
+        let class = fixup_class_f64(source);
+        let table = cpu.args[0] as u64;
+        cpu.write_var(
+            dst.slice(0, 8),
+            fixup_action_f64(old, source, ((table >> (class * 4)) & 0xf) as u8),
+        );
+    }
+    fn fixup_ss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        cpu.write_var(dst, cpu.read::<u128>(args[1]));
+        if current_evex_mask(cpu) & 1 == 0 {
+            return;
+        }
+        let old = cpu.read::<u32>(args[0].slice(0, 4));
+        let source = cpu.read::<u32>(args[1].slice(0, 4));
+        let class = fixup_class_f32(source);
+        let table = cpu.args[0] as u32;
+        cpu.write_var(
+            dst.slice(0, 4),
+            fixup_action_f32(old, source, ((table >> (class * 4)) & 0xf) as u8),
+        );
+    }
+
+    fn convert_scalar_f64_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if current_evex_mask(cpu) & 1 == 0 {
+            return;
+        }
+        let source = cpu.read::<u64>(args[1].slice(0, 8));
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let (result, flags) = narrow_f64_bits(
+            source,
+            ((mxcsr >> 13) & 3) as u8,
+            mxcsr & (1 << 6) != 0,
+            mxcsr & (1 << 15) != 0,
+        );
+        cpu.write_var(dst.slice(0, 4), result);
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn convert_scalar_f32_to_f64(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        cpu.write_var(dst, cpu.read::<u128>(args[0]));
+        if current_evex_mask(cpu) & 1 == 0 {
+            return;
+        }
+        let bits = cpu.read::<u32>(args[1].slice(0, 4));
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let (result, flags) = widen_f32_bits(bits, mxcsr & (1 << 6) != 0);
+        cpu.write_var(dst.slice(0, 8), result);
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn half_to_f32_bits(bits: u16) -> (u32, u32) {
+        let sign = u32::from(bits & 0x8000) << 16;
+        let exponent = (bits >> 10) & 0x1f;
+        let fraction = bits & 0x03ff;
+        match (exponent, fraction) {
+            (0, 0) => (sign, 0),
+            (0, _) => {
+                let leading = fraction.leading_zeros() - 6;
+                let normalized = u32::from(fraction) << (leading + 1);
+                let exponent = 127 - 15 - leading;
+                (sign | (exponent << 23) | ((normalized & 0x03ff) << 13), 1 << 1)
+            }
+            (0x1f, 0) => (sign | 0x7f80_0000, 0),
+            (0x1f, _) => {
+                let signaling = fraction & 0x0200 == 0;
+                (
+                    sign | 0x7f80_0000 | (u32::from(fraction) << 13) | 0x0040_0000,
+                    u32::from(signaling),
+                )
+            }
+            _ => (sign | (u32::from(exponent + (127 - 15)) << 23) | (u32::from(fraction) << 13), 0),
+        }
+    }
+
+    fn convert_f16_to_f32(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        let mut flags = 0;
+        for lane in 0..4_u8 {
+            let (bits, lane_flags) = half_to_f32_bits(cpu.read::<u16>(args[0].slice(lane * 2, 2)));
+            cpu.write_var(dst.slice(lane * 4, 4), bits);
+            flags |= lane_flags;
+        }
+        raise_mxcsr_flags(cpu, flags);
+    }
+
+    fn f32_to_half_bits(bits: u32, mode: u8) -> (u16, u32) {
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exponent = ((bits >> 23) & 0xff) as i32;
+        let fraction = bits & 0x007f_ffff;
+        let source_flags = if exponent == 0 && fraction != 0 { 1 << 1 } else { 0 };
+        if exponent == 0xff {
+            if fraction == 0 {
+                return (sign | 0x7c00, 0);
+            }
+            return (
+                sign | 0x7c00 | ((fraction >> 13) as u16) | 0x0200,
+                u32::from(fraction & 0x0040_0000 == 0),
+            );
+        }
+        let value = f32::from_bits(bits);
+        if value == 0.0 {
+            return (sign, source_flags);
+        }
+        let negative = sign != 0;
+        let unbiased = exponent - 127;
+        let (mut significand, shift, half_exponent) = if unbiased >= -14 {
+            ((1_u64 << 23) | u64::from(fraction), 13_u32, unbiased + 15)
+        }
+        else {
+            ((1_u64 << 23) | u64::from(fraction), (-unbiased - 1) as u32, 0)
+        };
+        let (rounded, inexact) = round_shift_u64(significand, shift, negative, mode);
+        significand = rounded;
+        if half_exponent >= 31 || significand >= 0x800 && half_exponent == 30 {
+            return (sign | 0x7c00, source_flags | (1 << 3) | (1 << 5));
+        }
+        let mut exponent_bits = half_exponent.max(0) as u16;
+        if significand == 0x800 {
+            exponent_bits += 1;
+            significand = 0x400;
+        }
+        let result = sign | (exponent_bits << 10) | (significand as u16 & 0x03ff);
+        let mut flags = source_flags;
+        if inexact {
+            flags |= 1 << 5;
+            if exponent_bits == 0 {
+                flags |= 1 << 4;
+            }
+        }
+        (result, flags)
+    }
+
+    fn convert_f32_to_f16(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || dst.size < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            return;
+        }
+        let immediate = cpu.read::<u8>(args[1]);
+        let mxcsr = read_named::<u32>(cpu, "MXCSR").unwrap_or(0x1f80);
+        let mode = if immediate & 4 != 0 { ((mxcsr >> 13) & 3) as u8 } else { immediate & 3 };
+        let mut flags = 0;
+        for lane in 0..4_u8 {
+            let (bits, lane_flags) =
+                f32_to_half_bits(cpu.read::<u32>(args[0].slice(lane * 4, 4)), mode);
+            cpu.write_var(dst.slice(lane * 2, 2), bits);
+            flags |= lane_flags;
+        }
+        if immediate & 8 == 0 {
+            raise_mxcsr_flags(cpu, flags);
+        }
+    }
+    fn mulpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| x * y);
+    }
+    fn mulps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| x * y);
+    }
+    fn subpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f64x2_binop(cpu, dst, args, |x, y| x - y);
+    }
+    fn subpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| x - y);
+    }
+    fn subps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        f32x4_binop(cpu, dst, args, |x, y| x - y);
+    }
+    fn subps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| x - y);
     }
     fn maxpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f64x2_binop(cpu, dst, args, |x, y| if x > y { x } else { y });
     }
+    fn maxpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| if x > y { x } else { y });
+    }
     fn maxps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f32x4_binop(cpu, dst, args, |x, y| if x > y { x } else { y });
+    }
+    fn maxps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| if x > y { x } else { y });
     }
     fn minpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f64x2_binop(cpu, dst, args, |x, y| if x < y { x } else { y });
     }
+    fn minpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f64x2_binop_masked(cpu, dst, args, mask, chunk, |x, y| if x < y { x } else { y });
+    }
     fn minps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         f32x4_binop(cpu, dst, args, |x, y| if x < y { x } else { y });
+    }
+    fn minps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let (mask, chunk) = masked_binary_context(cpu);
+        f32x4_binop_masked(cpu, dst, args, mask, chunk, |x, y| if x < y { x } else { y });
+    }
+
+    fn scalar_f64_binop_masked(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        operation: fn(f64, f64) -> f64,
+    ) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let mut out = cpu.read::<u128>(args[0]).to_le_bytes();
+        if current_evex_mask(cpu) & 1 != 0 {
+            with_guest_mxcsr(cpu, |cpu| {
+                let first = f64::from_bits(u64::from_le_bytes(out[0..8].try_into().unwrap()));
+                let second = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
+                out[0..8].copy_from_slice(&operation(first, second).to_bits().to_le_bytes());
+            });
+        }
+        write_xmm(cpu, dst, out);
+    }
+
+    fn scalar_f32_binop_masked(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        operation: fn(f32, f32) -> f32,
+    ) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let mut out = cpu.read::<u128>(args[0]).to_le_bytes();
+        if current_evex_mask(cpu) & 1 != 0 {
+            with_guest_mxcsr(cpu, |cpu| {
+                let first = f32::from_bits(u32::from_le_bytes(out[0..4].try_into().unwrap()));
+                let second = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
+                out[0..4].copy_from_slice(&operation(first, second).to_bits().to_le_bytes());
+            });
+        }
+        write_xmm(cpu, dst, out);
+    }
+
+    fn addsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| x + y);
+    }
+    fn addss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| x + y);
+    }
+    fn divsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| x / y);
+    }
+    fn divss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| x / y);
+    }
+    fn mulsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| x * y);
+    }
+    fn mulss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| x * y);
+    }
+    fn subsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| x - y);
+    }
+    fn subss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| x - y);
+    }
+
+    fn scalar_minmax(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane_bytes: u8, maximum: bool) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < lane_bytes {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        let mut out = cpu.read::<u128>(args[0]).to_le_bytes();
+        with_guest_mxcsr(cpu, |cpu| match lane_bytes {
+            4 => {
+                let first = f32::from_bits(u32::from_le_bytes(out[0..4].try_into().unwrap()));
+                let second = f32::from_bits(cpu.read::<u32>(args[1].slice(0, 4)));
+                let result = if if maximum { first > second } else { first < second } {
+                    first
+                }
+                else {
+                    second
+                };
+                out[0..4].copy_from_slice(&result.to_bits().to_le_bytes());
+                write_xmm(cpu, dst, out);
+            }
+            8 => {
+                let first = f64::from_bits(u64::from_le_bytes(out[0..8].try_into().unwrap()));
+                let second = f64::from_bits(cpu.read::<u64>(args[1].slice(0, 8)));
+                let result = if if maximum { first > second } else { first < second } {
+                    first
+                }
+                else {
+                    second
+                };
+                out[0..8].copy_from_slice(&result.to_bits().to_le_bytes());
+                write_xmm(cpu, dst, out);
+            }
+            _ => unreachable!("scalar min/max has a fixed IEEE lane width"),
+        });
+    }
+
+    fn maxsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_minmax(cpu, dst, args, 8, true);
+    }
+
+    fn maxss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_minmax(cpu, dst, args, 4, true);
+    }
+
+    fn minsd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_minmax(cpu, dst, args, 8, false);
+    }
+
+    fn minss(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_minmax(cpu, dst, args, 4, false);
+    }
+
+    fn maxsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| if x > y { x } else { y });
+    }
+    fn maxss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| if x > y { x } else { y });
+    }
+    fn minsd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f64_binop_masked(cpu, dst, args, |x, y| if x < y { x } else { y });
+    }
+    fn minss_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        scalar_f32_binop_masked(cpu, dst, args, |x, y| if x < y { x } else { y });
     }
 
     // sqrt takes its source in the second operand (like pabs).
     fn sqrtpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let invalid = packed_sqrt_is_invalid(cpu, args[1], 8, u64::MAX, 0);
         f64x2_binop(cpu, dst, [args[1], args[1]], |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
     }
     fn sqrtps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let invalid = packed_sqrt_is_invalid(cpu, args[1], 4, u64::MAX, 0);
         f32x4_binop(cpu, dst, [args[1], args[1]], |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn vector_sqrtpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let invalid = packed_sqrt_is_invalid(cpu, args[0], 8, u64::MAX, 0);
+        f64x2_binop(cpu, dst, [args[0], args[0]], |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn vector_sqrtpd_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let mask = current_evex_mask(cpu);
+        let chunk = cpu.args[7] as usize;
+        let invalid = packed_sqrt_is_invalid(cpu, args[0], 8, mask, chunk);
+        f64x2_binop_masked(cpu, dst, [args[0], args[0]], mask, chunk, |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn vector_sqrtps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let invalid = packed_sqrt_is_invalid(cpu, args[0], 4, u64::MAX, 0);
+        f32x4_binop(cpu, dst, [args[0], args[0]], |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
+    }
+
+    fn vector_sqrtps_masked(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let mask = current_evex_mask(cpu);
+        let chunk = cpu.args[7] as usize;
+        let invalid = packed_sqrt_is_invalid(cpu, args[0], 4, mask, chunk);
+        f32x4_binop_masked(cpu, dst, [args[0], args[0]], mask, chunk, |x, _| x.sqrt());
+        raise_mxcsr_flags(cpu, u32::from(invalid));
     }
 
     // --- SSE4.1 / SSSE3 -------------------------------------------------
@@ -3809,6 +10116,100 @@ pub mod x86 {
         blendv_lanes(cpu, dst, args, 8);
     }
 
+    fn packed_blend_immediate_indexed(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        lane_bytes: usize,
+    ) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let immediate = cpu.args[0] as u8;
+        let chunk = cpu.args[7] as usize;
+        let lanes = 16 / lane_bytes;
+        for lane in 0..lanes {
+            let source =
+                if immediate & (1 << (chunk * lanes + lane)) == 0 { args[0] } else { args[1] };
+            let offset = (lane * lane_bytes) as u8;
+            let value: u128 = cpu.read_dynamic(source.slice(offset, lane_bytes as u8)).zxt();
+            cpu.write_trunc(dst.slice(offset, lane_bytes as u8), value);
+        }
+    }
+
+    fn packed_blend_pd_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_blend_immediate_indexed(cpu, dst, args, 8);
+    }
+
+    fn packed_blend_ps_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_blend_immediate_indexed(cpu, dst, args, 4);
+    }
+
+    fn packed_shuffle_pd_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let control = (cpu.args[0] as u8) >> (cpu.args[7] as usize * 2);
+        let left_lane = if control & 1 == 0 { 0 } else { 8 };
+        let right_lane = if control & 2 == 0 { 0 } else { 8 };
+        let left = cpu.read::<u64>(args[0].slice(left_lane, 8));
+        let right = cpu.read::<u64>(args[1].slice(right_lane, 8));
+        cpu.write_var(dst.slice(0, 8), left);
+        cpu.write_var(dst.slice(8, 8), right);
+    }
+
+    fn packed_shuffle_ps_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let control = cpu.args[0] as u8;
+        for lane in 0..4_u8 {
+            let source = if lane < 2 { args[0] } else { args[1] };
+            let source_lane = (control >> (lane * 2)) & 3;
+            let value = cpu.read::<u32>(source.slice(source_lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 4, 4), value);
+        }
+    }
+
+    fn packed_move_ddup_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() < 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let value = cpu.read::<u64>(args[0].slice(0, 8));
+        cpu.write_var(dst.slice(0, 8), value);
+        cpu.write_var(dst.slice(8, 8), value);
+    }
+
+    fn packed_move_dup_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], high: bool) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for pair in 0..2_u8 {
+            let source_lane = pair * 2 + u8::from(high);
+            let value = cpu.read::<u32>(args[0].slice(source_lane * 4, 4));
+            cpu.write_var(dst.slice(pair * 8, 4), value);
+            cpu.write_var(dst.slice(pair * 8 + 4, 4), value);
+        }
+    }
+
+    fn packed_move_shdup_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_dup_d_128(cpu, dst, args, true);
+    }
+
+    fn packed_move_sldup_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_dup_d_128(cpu, dst, args, false);
+    }
+
     /// Packed move-with-extend: widen `count` elements of `from` bytes each
     /// to `16 / count` bytes, zero- or sign-extending. The source operand
     /// may be a narrow memory value, so only the needed low bytes are read.
@@ -3837,6 +10238,78 @@ pub mod x86 {
         write_xmm(cpu, dst, out);
     }
 
+    fn packed_move_extend_128_indexed(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        source: Value,
+        source_lane_size: u8,
+        destination_lane_size: u8,
+        signed: bool,
+    ) {
+        if dst.size != 16
+            || source_lane_size == 0
+            || destination_lane_size == 0
+            || destination_lane_size < source_lane_size
+            || 16 % destination_lane_size != 0
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let lanes = 16 / destination_lane_size;
+        let chunk = cpu.args[7] as u8;
+        let Some(source_start) =
+            chunk.checked_mul(lanes).and_then(|lane| lane.checked_mul(source_lane_size))
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = cpu.args[7] as u64;
+            return;
+        };
+        let Some(source_end) = source_start.checked_add(lanes * source_lane_size)
+        else {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return;
+        };
+        if source_end > source.size() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return;
+        }
+        for lane in 0..lanes {
+            let source = source.slice(source_start + lane * source_lane_size, source_lane_size);
+            let raw: u64 = cpu.read_dynamic(source).zxt();
+            let value = if signed {
+                let shift = 64 - u32::from(source_lane_size) * 8;
+                ((raw << shift) as i64 >> shift) as u64
+            }
+            else {
+                raw
+            };
+            cpu.write_trunc(dst.slice(lane * destination_lane_size, destination_lane_size), value);
+        }
+    }
+
+    fn packed_move_sxbd_128_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_extend_128_indexed(cpu, dst, args[0], 1, 4, true);
+    }
+
+    fn packed_move_sxbq_128_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_extend_128_indexed(cpu, dst, args[0], 1, 8, true);
+    }
+
+    fn packed_move_sxwq_128_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_extend_128_indexed(cpu, dst, args[0], 2, 8, true);
+    }
+
+    fn packed_move_zxbq_128_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_extend_128_indexed(cpu, dst, args[0], 1, 8, false);
+    }
+
+    fn packed_move_zxwq_128_indexed(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_move_extend_128_indexed(cpu, dst, args[0], 2, 8, false);
+    }
+
     fn pmovzxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 8, false);
     }
@@ -3859,8 +10332,422 @@ pub mod x86 {
             cpu.write_var(dst.slice(lane, 1), value);
         }
     }
+
+    #[derive(Clone, Copy)]
+    enum PackedNarrowMode {
+        Truncate,
+        SignedSaturate,
+        UnsignedSaturate,
+    }
+
+    fn packed_narrow_integer(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        source: Value,
+        source_lane_size: u8,
+        destination_lane_size: u8,
+        mode: PackedNarrowMode,
+    ) {
+        if source_lane_size == 0
+            || destination_lane_size == 0
+            || source_lane_size > 8
+            || destination_lane_size >= source_lane_size
+            || source.size() % source_lane_size != 0
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(source.size());
+            return;
+        }
+        let lanes = source.size() / source_lane_size;
+        let meaningful_size = lanes * destination_lane_size;
+        if meaningful_size > dst.size {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in 0..dst.size {
+            cpu.write_var(dst.slice(offset, 1), 0_u8);
+        }
+        let source_bits = u32::from(source_lane_size) * 8;
+        let destination_bits = u32::from(destination_lane_size) * 8;
+        let signed_min = -(1_i128 << (destination_bits - 1));
+        let signed_max = (1_i128 << (destination_bits - 1)) - 1;
+        let unsigned_max = (1_i128 << destination_bits) - 1;
+        for lane in 0..lanes {
+            let raw: u64 =
+                cpu.read_dynamic(source.slice(lane * source_lane_size, source_lane_size)).zxt();
+            let shift = 64 - source_bits;
+            let signed = ((raw << shift) as i64 >> shift) as i128;
+            let result = match mode {
+                PackedNarrowMode::Truncate => raw,
+                PackedNarrowMode::SignedSaturate => signed.clamp(signed_min, signed_max) as u64,
+                PackedNarrowMode::UnsignedSaturate => (raw as i128).min(unsigned_max) as u64,
+            };
+            cpu.write_trunc(dst.slice(lane * destination_lane_size, destination_lane_size), result);
+        }
+    }
+
+    macro_rules! integer_narrow_helper {
+        ($name:ident, $source:expr, $destination:expr, $mode:expr) => {
+            fn $name(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+                packed_narrow_integer(cpu, dst, args[0], $source, $destination, $mode);
+            }
+        };
+    }
+
+    integer_narrow_helper!(narrow_dword_to_byte, 4, 1, PackedNarrowMode::Truncate);
+    integer_narrow_helper!(narrow_signed_dword_to_byte, 4, 1, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(narrow_unsigned_dword_to_byte, 4, 1, PackedNarrowMode::UnsignedSaturate);
+    integer_narrow_helper!(narrow_dword_to_word, 4, 2, PackedNarrowMode::Truncate);
+    integer_narrow_helper!(narrow_signed_dword_to_word, 4, 2, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(narrow_unsigned_dword_to_word, 4, 2, PackedNarrowMode::UnsignedSaturate);
+    integer_narrow_helper!(narrow_qword_to_byte, 8, 1, PackedNarrowMode::Truncate);
+    integer_narrow_helper!(narrow_signed_qword_to_byte, 8, 1, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(narrow_unsigned_qword_to_byte, 8, 1, PackedNarrowMode::UnsignedSaturate);
+    integer_narrow_helper!(narrow_qword_to_word, 8, 2, PackedNarrowMode::Truncate);
+    integer_narrow_helper!(narrow_signed_qword_to_word, 8, 2, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(narrow_unsigned_qword_to_word, 8, 2, PackedNarrowMode::UnsignedSaturate);
+    integer_narrow_helper!(narrow_qword_to_dword, 8, 4, PackedNarrowMode::Truncate);
+    integer_narrow_helper!(narrow_signed_qword_to_dword, 8, 4, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(
+        narrow_unsigned_qword_to_dword,
+        8,
+        4,
+        PackedNarrowMode::UnsignedSaturate
+    );
+    integer_narrow_helper!(narrow_signed_word_to_byte, 2, 1, PackedNarrowMode::SignedSaturate);
+    integer_narrow_helper!(narrow_unsigned_word_to_byte, 2, 1, PackedNarrowMode::UnsignedSaturate);
     fn pmovzxbd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 4, false);
+    }
+    fn pmovzxbd_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 1, 4, false);
+    }
+
+    fn pmovzxdq_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 4, 2, false);
+    }
+
+    fn packed_max_unsigned_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..4_u8 {
+            let left = cpu.read::<u32>(args[0].slice(lane * 4, 4));
+            let right = cpu.read::<u32>(args[1].slice(lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 4, 4), left.max(right));
+        }
+    }
+
+    fn packed_minmax_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+        signed: bool,
+        maximum: bool,
+    ) {
+        if dst.size != 16
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let left: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let right: u64 = cpu.read_dynamic(args[1].slice(offset, element_size)).zxt();
+            let choose_left = if signed {
+                let shift = 64 - u32::from(element_size) * 8;
+                let left = ((left << shift) as i64) >> shift;
+                let right = ((right << shift) as i64) >> shift;
+                if maximum { left >= right } else { left <= right }
+            }
+            else if maximum {
+                left >= right
+            }
+            else {
+                left <= right
+            };
+            cpu.write_trunc(
+                dst.slice(offset, element_size),
+                if choose_left { left } else { right },
+            );
+        }
+    }
+
+    macro_rules! minmax_helper {
+        ($name:ident, $size:literal, $signed:literal, $maximum:literal) => {
+            fn $name(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+                packed_minmax_128(cpu, dst, args, $size, $signed, $maximum);
+            }
+        };
+    }
+
+    minmax_helper!(packed_max_signed_b_128, 1, true, true);
+    minmax_helper!(packed_max_signed_w_128, 2, true, true);
+    minmax_helper!(packed_max_signed_d_128, 4, true, true);
+    minmax_helper!(packed_max_signed_q_128, 8, true, true);
+    minmax_helper!(packed_max_unsigned_b_128, 1, false, true);
+    minmax_helper!(packed_max_unsigned_w_128, 2, false, true);
+    minmax_helper!(packed_max_unsigned_q_128, 8, false, true);
+    minmax_helper!(packed_min_signed_b_128, 1, true, false);
+    minmax_helper!(packed_min_signed_w_128, 2, true, false);
+    minmax_helper!(packed_min_signed_d_128, 4, true, false);
+    minmax_helper!(packed_min_signed_q_128, 8, true, false);
+    minmax_helper!(packed_min_unsigned_d_128, 4, false, false);
+    minmax_helper!(packed_min_unsigned_q_128, 8, false, false);
+
+    fn packed_min_unsigned_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u128>(args[0]).to_le_bytes();
+        let right = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..16 {
+            output[lane] = left[lane].min(right[lane]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_average_unsigned_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..16_u8 {
+            let left = u16::from(cpu.read::<u8>(args[0].slice(lane, 1)));
+            let right = u16::from(cpu.read::<u8>(args[1].slice(lane, 1)));
+            cpu.write_var(dst.slice(lane, 1), ((left + right + 1) >> 1) as u8);
+        }
+    }
+
+    fn packed_average_unsigned_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0_u8..16).step_by(2) {
+            let left = u32::from(cpu.read::<u16>(args[0].slice(offset, 2)));
+            let right = u32::from(cpu.read::<u16>(args[1].slice(offset, 2)));
+            cpu.write_var(dst.slice(offset, 2), ((left + right + 1) >> 1) as u16);
+        }
+    }
+
+    fn packed_min_unsigned_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..8_u8 {
+            let left = cpu.read::<u16>(args[0].slice(lane * 2, 2));
+            let right = cpu.read::<u16>(args[1].slice(lane * 2, 2));
+            cpu.write_var(dst.slice(lane * 2, 2), left.min(right));
+        }
+    }
+
+    fn packed_compare_greater_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u128>(args[0]).to_le_bytes();
+        let right = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..16 {
+            output[lane] = if (left[lane] as i8) > (right[lane] as i8) { u8::MAX } else { 0 };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_compare_greater_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..4_u8 {
+            let offset = lane * 4;
+            let left = cpu.read::<u32>(args[0].slice(offset, 4)) as i32;
+            let right = cpu.read::<u32>(args[1].slice(offset, 4)) as i32;
+            cpu.write_var(dst.slice(offset, 4), if left > right { u32::MAX } else { 0 });
+        }
+    }
+
+    fn packed_compare_greater_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_greater_lanes_128(cpu, dst, args, 2);
+    }
+
+    fn packed_compare_greater_q_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_compare_greater_lanes_128(cpu, dst, args, 8);
+    }
+
+    fn packed_compare_greater_lanes_128(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        args: [Value; 2],
+        element_size: u8,
+    ) {
+        if dst.size != 16
+            || args[0].size() != 16
+            || args[1].size() != 16
+            || !matches!(element_size, 2 | 8)
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0_u8..16).step_by(usize::from(element_size)) {
+            let left: u64 = cpu.read_dynamic(args[0].slice(offset, element_size)).zxt();
+            let right: u64 = cpu.read_dynamic(args[1].slice(offset, element_size)).zxt();
+            let shift = 64 - u32::from(element_size) * 8;
+            let left = ((left << shift) as i64) >> shift;
+            let right = ((right << shift) as i64) >> shift;
+            let result = if left > right { u64::MAX } else { 0 };
+            cpu.write_trunc(dst.slice(offset, element_size), result);
+        }
+    }
+
+    fn packed_and_not_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u128>(args[0]);
+        let right = cpu.read::<u128>(args[1]);
+        cpu.write_var(dst, !left & right);
+    }
+
+    fn packed_compare_equal_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u128>(args[0]).to_le_bytes();
+        let right = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..16 {
+            output[lane] = if left[lane] == right[lane] { u8::MAX } else { 0 };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_compare_equal_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..4_u8 {
+            let left = cpu.read::<u32>(args[0].slice(lane * 4, 4));
+            let right = cpu.read::<u32>(args[1].slice(lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 4, 4), if left == right { u32::MAX } else { 0 });
+        }
+    }
+
+    fn packed_compare_equal_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for lane in 0..8_u8 {
+            let left = cpu.read::<u16>(args[0].slice(lane * 2, 2));
+            let right = cpu.read::<u16>(args[1].slice(lane * 2, 2));
+            cpu.write_var(dst.slice(lane * 2, 2), if left == right { u16::MAX } else { 0 });
+        }
+    }
+
+    fn packed_insert_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 2 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let source = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut output = source;
+        let lane = cpu.args[0] as usize & 7;
+        let value: u64 = cpu.read_dynamic(args[1]).zxt();
+        output[lane * 2..lane * 2 + 2].copy_from_slice(&(value as u16).to_le_bytes());
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_insert_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() < 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mut output = cpu.read::<u128>(args[0]).to_le_bytes();
+        let lane = cpu.args[0] as usize & 15;
+        output[lane] = cpu.read::<u8>(args[1].slice(0, 1));
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_blend_d_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let immediate = cpu.args[0] as u8;
+        for lane in 0..4_u8 {
+            let source = if immediate & (1 << lane) == 0 { args[0] } else { args[1] };
+            let value = cpu.read::<u32>(source.slice(lane * 4, 4));
+            cpu.write_var(dst.slice(lane * 4, 4), value);
+        }
+    }
+
+    fn packed_move_zxbd_mem_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 8 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.read::<u64>(args[1]);
+        let chunk = cpu.args[0] as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..4 {
+            let source_lane = chunk * 4 + lane;
+            if mask & (1_u64 << source_lane) == 0 {
+                continue;
+            }
+            let Some(current) = address.checked_add(source_lane as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            let value = match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                Ok(value) => value[0],
+                Err(error) => {
+                    cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                    cpu.exception.value = current;
+                    return;
+                }
+            };
+            output[lane * 4] = value;
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
     }
     fn pmovzxbq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 2, false);
@@ -3877,6 +10764,9 @@ pub mod x86 {
     fn pmovsxbw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 8, true);
     }
+    fn pmovsxbw_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 1, 8, true);
+    }
     fn pmovsxbd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 1, 4, true);
     }
@@ -3886,11 +10776,17 @@ pub mod x86 {
     fn pmovsxwd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 2, 4, true);
     }
+    fn pmovsxwd_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 2, 4, true);
+    }
     fn pmovsxwq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 2, 2, true);
     }
     fn pmovsxdq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
         pmov_extend(cpu, dst, args[1], 4, 2, true);
+    }
+    fn pmovsxdq_single(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        pmov_extend(cpu, dst, args[0], 4, 2, true);
     }
 
     fn pmuldq(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -3906,6 +10802,19 @@ pub mod x86 {
             out[8 * i..8 * i + 8].copy_from_slice(&x.wrapping_mul(y).to_le_bytes());
         }
         write_xmm(cpu, dst, out);
+    }
+
+    fn packed_mul_unsigned_dq_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in [0_u8, 8] {
+            let left = u64::from(cpu.read::<u32>(args[0].slice(offset, 4)));
+            let right = u64::from(cpu.read::<u32>(args[1].slice(offset, 4)));
+            cpu.write_var(dst.slice(offset, 8), left * right);
+        }
     }
 
     fn pmulhrsw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
@@ -4109,33 +11018,31 @@ pub mod x86 {
         else {
             return;
         };
-        // Bit 2 selects MXCSR rounding, which this machine keeps at the
-        // default (nearest-even); bits 1:0 give the explicit mode.
         let imm = cpu.args[0] as u8;
-        let mode = if imm & 4 != 0 { 0 } else { imm & 3 };
-        let round64 = |v: f64| -> f64 {
-            match mode {
-                0 => v.round_ties_even(),
-                1 => v.floor(),
-                2 => v.ceil(),
-                _ => v.trunc(),
-            }
-        };
+        let (mode, daz, suppress_precision) = rounding_control(cpu, imm);
         let mut out = [0u8; 16];
+        let mut flags = 0_u32;
         if double {
             for i in 0..2 {
-                let v = f64::from_bits(u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap()));
-                out[8 * i..8 * i + 8].copy_from_slice(&round64(v).to_bits().to_le_bytes());
+                let bits = u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().unwrap());
+                let (rounded, lane_flags) = round_f64_bits(bits, mode, daz);
+                flags |= lane_flags;
+                out[8 * i..8 * i + 8].copy_from_slice(&rounded.to_le_bytes());
             }
         }
         else {
             for i in 0..4 {
-                let v = f32::from_bits(u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap()));
-                let r = round64(v as f64) as f32;
-                out[4 * i..4 * i + 4].copy_from_slice(&r.to_bits().to_le_bytes());
+                let bits = u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+                let (rounded, lane_flags) = round_f32_bits(bits, mode, daz);
+                flags |= lane_flags;
+                out[4 * i..4 * i + 4].copy_from_slice(&rounded.to_le_bytes());
             }
         }
+        if suppress_precision {
+            flags &= !(1 << 5);
+        }
         write_xmm(cpu, dst, out);
+        raise_mxcsr_flags(cpu, flags);
     }
 
     fn roundps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {

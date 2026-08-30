@@ -25,9 +25,9 @@ Verification: a dynamic execution-differential harness
 (`crates/linux-compat/examples/exec_diff_dyn.rs`) runs a dynamically linked
 glibc binary through the fork spec and this patched master spec in lockstep;
 after the patches below they agree instruction-for-instruction for >3,000,000
-instructions (to process exit). A decode diff against iced-x86 shows zero
-gaps on glibc and a 0.0049% residual on Node (VEX-AES / VEX-PCLMULQDQ / XOP,
-which are not on the SSE execution path).
+instructions (to process exit). At that pre-M9 revision, a decode diff against
+iced-x86 showed zero gaps on glibc and a 0.0049% residual on Node. M9 replaces
+that historical SSE-only boundary with the validated profile described below.
 
 ## Local patches (re-applied from the icicle-emu fork)
 
@@ -57,11 +57,27 @@ were validated against. See `third_party/icicle/PROVENANCE.md` patch #7 for a
 companion lifter fix (nested `export` sub-tables) that the newer spec's
 short-jump encoding requires.
 
-## Known limitation
+## M9 local execution patches
 
-AVX-512 (and VEX-AES/PCLMULQDQ) now *decode*, but their p-code *semantics*
-are not all validated, so CPUID is deliberately configured (in
-`third_party/icicle/icicle-cpu/src/exec/helpers.rs`) to advertise only an SSE
-baseline — userspace stays on the SSE paths, which execute correctly. Raising
-the advertised feature level to exercise AVX execution is future work and
-depends on validating those semantics against a reference CPU.
+M9 repairs the VEX/AVX2/EVEX rules used by the versioned
+`webtos-x86_64-icelake-simdutf-v1` profile. The local changes bind complete
+XMM/YMM/ZMM aliases, implement upper-lane clearing, mask merge/zero behavior,
+compressed and VSIB addressing, masked memory fault suppression, and lower
+wide operations into width-safe slices or registered helpers. The inherited
+VAES and VPCLMULQDQ rules were also changed to clear the complete ZMM alias;
+the native oracle caught the previous stale high 256 bits.
+
+These changes are not accepted by decode coverage alone. The authoritative
+gates are `crates/x64-engine/tests/native_oracle.rs`, the xstate suites,
+`crates/x64-engine/examples/feature_coverage.rs`, and the portable
+native/interpreter/JIT/browser fingerprint. See
+`docs/M9_ICE_LAKE_EXECUTION_PARITY.md` for the exact contract and evidence.
+
+## Current feature boundary
+
+The public profile advertises AVX, AVX2, BMI1/BMI2, AVX-512F/CD/BW/VL/VBMI2/
+VPOPCNTDQ and the separately published AES-NI/PCLMULQDQ VEX forms. It
+deliberately does not advertise AVX-512DQ, XOP, or another extension merely
+because the language files decode it. The coverage ledger fails if an opaque
+operation becomes reachable behind a published bit without a registered
+helper.

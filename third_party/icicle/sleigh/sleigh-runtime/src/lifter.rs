@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     AttachmentId, ConstructorId, Instruction, MAX_REG_SIZE, SleighData,
@@ -181,6 +181,35 @@ pub struct Lifter {
 
     /// Keeps track of temporaries that have a constant value during disassembly time.
     disassembly_constants: HashMap<pcode::VarId, u64>,
+
+    /// User p-code operations whose semantics are independently lane-local in
+    /// each 128-bit chunk. Wide operands for these operations are lowered to
+    /// multiple ordinary helper calls instead of crossing the u128 runtime
+    /// ABI. Architecture frontends opt in exact operation IDs; no unknown or
+    /// cross-lane operation is split implicitly.
+    split_large_user_ops: HashSet<pcode::HookId>,
+
+    /// Lane-local user operations that additionally receive the zero-based
+    /// 128-bit chunk number through reserved `Arg(7)`. This lets helpers
+    /// apply architectural masks and exception suppression before SLEIGH's
+    /// destination merge without guessing from temporary-register offsets.
+    indexed_split_large_user_ops: HashSet<pcode::HookId>,
+
+    /// Lane-local user operations whose first operand is wider than their
+    /// result by an integral byte ratio (for example, VPMOVDB is 4:1).
+    /// Each 128-bit source chunk is lowered to a correspondingly smaller,
+    /// contiguous destination chunk.
+    narrow_large_user_ops: BTreeMap<pcode::HookId, u8>,
+
+    /// Lane-local user operations whose result is wider than their first
+    /// operand by an integral byte ratio (for example, VCVTDQ2PD is 2:1).
+    /// The helper still receives at most one 128-bit result chunk.
+    widen_large_user_ops: BTreeMap<pcode::HookId, u8>,
+
+    /// SLEIGH emits third-and-later user-op operands as standalone `Arg(n)`
+    /// operations. Wide values are retained until the following explicitly
+    /// splittable user-op can emit the matching 128-bit argument chunk.
+    pending_large_user_args: BTreeMap<u16, ResolvedValue>,
 }
 
 impl Lifter {
@@ -195,8 +224,32 @@ impl Lifter {
             next_sleigh_offset: 0,
             default_size: 0,
             disassembly_constants: HashMap::new(),
+            split_large_user_ops: HashSet::new(),
+            indexed_split_large_user_ops: HashSet::new(),
+            narrow_large_user_ops: BTreeMap::new(),
+            widen_large_user_ops: BTreeMap::new(),
+            pending_large_user_args: BTreeMap::new(),
             label_at_end: None,
         }
+    }
+
+    pub fn split_large_user_op(&mut self, id: pcode::HookId) {
+        self.split_large_user_ops.insert(id);
+    }
+
+    pub fn split_large_user_op_indexed(&mut self, id: pcode::HookId) {
+        self.split_large_user_ops.insert(id);
+        self.indexed_split_large_user_ops.insert(id);
+    }
+
+    pub fn split_narrow_user_op(&mut self, id: pcode::HookId, input_bytes_per_output: u8) {
+        assert!(input_bytes_per_output > 1);
+        self.narrow_large_user_ops.insert(id, input_bytes_per_output);
+    }
+
+    pub fn split_widen_user_op(&mut self, id: pcode::HookId, output_bytes_per_input: u8) {
+        assert!(output_bytes_per_input > 1);
+        self.widen_large_user_ops.insert(id, output_bytes_per_input);
     }
 
     pub fn lift(&mut self, sleigh: &SleighData, inst: &Instruction) -> Result<&pcode::Block> {
@@ -210,11 +263,15 @@ impl Lifter {
         self.next_sleigh_offset = 0;
         self.label_at_end = None;
         self.disassembly_constants.clear();
+        self.pending_large_user_args.clear();
 
         self.default_size = sleigh.default_space_size;
 
         self.block.push((pcode::Op::InstructionMarker, (inst.inst_start, inst.num_bytes())));
         self.build_subtable(inst.root(sleigh))?;
+        if !self.pending_large_user_args.is_empty() {
+            return Err(Error::Internal("wide user-op argument was not consumed"));
+        }
 
         if let Some(label) = self.label_at_end {
             self.block.push(pcode::Op::PcodeLabel(label));
@@ -608,10 +665,50 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         inputs: &[ResolvedValue],
         output: Option<VarNode>,
     ) -> Result<()> {
+        self.emit_inner(op, inputs, output, true)
+    }
+
+    fn emit_inner(
+        &mut self,
+        op: pcode::Op,
+        inputs: &[ResolvedValue],
+        output: Option<VarNode>,
+        append_zero_chunk: bool,
+    ) -> Result<()> {
+        if let pcode::Op::Arg(index) = op {
+            if output.is_none() && inputs.len() == 1 && inputs[0].size() > MAX_REG_SIZE as ValueSize
+            {
+                if self.lifter.pending_large_user_args.insert(index, inputs[0]).is_some() {
+                    return Err(Error::Internal("duplicate pending wide user-op argument"));
+                }
+                return Ok(());
+            }
+        }
         if let Some(output) = output {
+            if let pcode::Op::PcodeOp(id) = op {
+                let has_wide_input =
+                    inputs.iter().any(|input| input.size() > MAX_REG_SIZE as ValueSize);
+                if append_zero_chunk
+                    && (self.lifter.narrow_large_user_ops.contains_key(&id)
+                        || ((output.size > MAX_REG_SIZE as ValueSize || has_wide_input)
+                            && self.lifter.widen_large_user_ops.contains_key(&id)))
+                {
+                    return self.emit_scaled_user_op(id, inputs, output);
+                }
+            }
             // Handle special cases to support operating on large varnodes.
             if output.size > MAX_REG_SIZE as ValueSize {
                 return self.emit_large_op(op, inputs, output);
+            }
+
+            if append_zero_chunk
+                && matches!(op, pcode::Op::PcodeOp(id) if self.lifter.indexed_split_large_user_ops.contains(&id))
+            {
+                // SLEIGH has already emitted Arg(0..N) operations for user-op
+                // inputs beyond the two ordinary p-code value slots. Keep
+                // those intact and reserve Arg(7) exclusively for the
+                // architecture-provided 128-bit chunk index.
+                self.push((pcode::Op::Arg(7), pcode::Inputs::one(pcode::Value::Const(0, 1))));
             }
 
             // If there were any subpiece operations that were not able to be resolved statically
@@ -652,6 +749,94 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         Ok(())
     }
 
+    fn emit_scaled_user_op(
+        &mut self,
+        id: pcode::HookId,
+        inputs: &[ResolvedValue],
+        output: VarNode,
+    ) -> Result<()> {
+        let Some(source) = inputs.first().copied()
+        else {
+            return Err(Error::Internal("scaled user-op has no source operand"));
+        };
+        if !self.lifter.pending_large_user_args.is_empty() {
+            return Err(Error::Internal("scaled user-op does not support deferred wide arguments"));
+        }
+
+        // A SLEIGH temporary is commonly wider than the architecturally
+        // meaningful narrowed result. Clear it before filling the exact
+        // produced chunks so unused bytes can never retain stale state.
+        self.emit_copy(ResolvedValue::Const(0, 1), output)?;
+
+        if let Some(&ratio) = self.lifter.narrow_large_user_ops.get(&id) {
+            let ratio = ValueSize::from(ratio);
+            let source_size = source.size();
+            for source_offset in (0..source_size).step_by(MAX_REG_SIZE as usize) {
+                let source_chunk_size = (source_size - source_offset).min(MAX_REG_SIZE as u16);
+                if source_chunk_size % ratio != 0 {
+                    return Err(Error::UnsupportedVarNodeSize(source_chunk_size));
+                }
+                let output_offset = source_offset / ratio;
+                let output_chunk_size = source_chunk_size / ratio;
+                if output_offset + output_chunk_size > output.size {
+                    return Err(Error::UnsupportedVarNodeSize(output.size));
+                }
+                let mut chunk_inputs = Vec::with_capacity(inputs.len());
+                chunk_inputs.push(source.slice(source_offset, source_chunk_size));
+                chunk_inputs.extend_from_slice(&inputs[1..]);
+                self.push((
+                    pcode::Op::Arg(7),
+                    pcode::Inputs::one(pcode::Value::Const(
+                        u64::from(source_offset / MAX_REG_SIZE as ValueSize),
+                        1,
+                    )),
+                ));
+                self.emit_inner(
+                    pcode::Op::PcodeOp(id),
+                    &chunk_inputs,
+                    Some(output.slice(output_offset, output_chunk_size)),
+                    false,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let ratio = ValueSize::from(
+            *self
+                .lifter
+                .widen_large_user_ops
+                .get(&id)
+                .ok_or(Error::Internal("missing scaled user-op ratio"))?,
+        );
+        let source_chunk_size = (MAX_REG_SIZE as u16) / ratio;
+        if source_chunk_size == 0 || source.size() % source_chunk_size != 0 {
+            return Err(Error::UnsupportedVarNodeSize(source.size()));
+        }
+        for source_offset in (0..source.size()).step_by(source_chunk_size as usize) {
+            let output_offset = source_offset * ratio;
+            if output_offset + MAX_REG_SIZE as u16 > output.size {
+                return Err(Error::UnsupportedVarNodeSize(output.size));
+            }
+            let mut chunk_inputs = Vec::with_capacity(inputs.len());
+            chunk_inputs.push(source.slice(source_offset, source_chunk_size));
+            chunk_inputs.extend_from_slice(&inputs[1..]);
+            self.push((
+                pcode::Op::Arg(7),
+                pcode::Inputs::one(pcode::Value::Const(
+                    u64::from(output_offset / MAX_REG_SIZE as ValueSize),
+                    1,
+                )),
+            ));
+            self.emit_inner(
+                pcode::Op::PcodeOp(id),
+                &chunk_inputs,
+                Some(output.slice(output_offset, MAX_REG_SIZE as u16)),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     fn emit_large_op(
         &mut self,
         op: pcode::Op,
@@ -659,6 +844,57 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         output: VarNode,
     ) -> Result<()> {
         match op {
+            pcode::Op::PcodeOp(id) if self.lifter.split_large_user_ops.contains(&id) => {
+                if output.size % MAX_REG_SIZE as ValueSize != 0 {
+                    return Err(Error::UnsupportedVarNodeSize(output.size));
+                }
+                let pending_args = std::mem::take(&mut self.lifter.pending_large_user_args);
+                for offset in (0..output.size).step_by(MAX_REG_SIZE as usize) {
+                    let indexed = self.lifter.indexed_split_large_user_ops.contains(&id);
+                    let mut chunk_inputs = Vec::with_capacity(inputs.len());
+                    for input in inputs {
+                        let input_size = input.size();
+                        if input_size == output.size {
+                            chunk_inputs.push(input.slice(offset, MAX_REG_SIZE as ValueSize));
+                        }
+                        else if input_size <= MAX_REG_SIZE as ValueSize {
+                            chunk_inputs.push(*input);
+                        }
+                        else {
+                            return Err(Error::UnsupportedVarNodeSize(input_size));
+                        }
+                    }
+                    if indexed {
+                        self.push((
+                            pcode::Op::Arg(7),
+                            pcode::Inputs::one(pcode::Value::Const(
+                                u64::from(offset / MAX_REG_SIZE as ValueSize),
+                                1,
+                            )),
+                        ));
+                    }
+                    for (&arg, &input) in &pending_args {
+                        let input = if input.size() == output.size {
+                            input.slice(offset, MAX_REG_SIZE as ValueSize)
+                        }
+                        else if input.size() <= MAX_REG_SIZE as ValueSize {
+                            input
+                        }
+                        else {
+                            return Err(Error::UnsupportedVarNodeSize(input.size()));
+                        };
+                        let value = self.get_runtime_value(input)?;
+                        self.push((pcode::Op::Arg(arg), pcode::Inputs::one(value)));
+                    }
+                    self.emit_inner(
+                        pcode::Op::PcodeOp(id),
+                        &chunk_inputs,
+                        Some(output.slice(offset, MAX_REG_SIZE as ValueSize)),
+                        false,
+                    )?;
+                }
+                Ok(())
+            }
             pcode::Op::Copy => self.emit_copy(inputs[0], output),
             pcode::Op::ZeroExtend => {
                 self.emit_copy(inputs[0], output.slice(0, inputs[0].size()))?;
@@ -764,15 +1000,26 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
     }
 
     fn emit_copy(&mut self, src: ResolvedValue, dst: VarNode) -> Result<()> {
-        self.split_large_op(dst, |this, i, dst| {
-            let src = this.get_runtime_value(src.slice(i, dst.size))?;
-            let dst = this.get_runtime_var(dst)?;
-            this.push(src.copy_to(dst));
-            if dst.is_temp() && dst.offset == 0 && src.is_const() {
-                this.lifter.disassembly_constants.insert(dst.id, src.as_u64());
+        let mut offset = 0;
+        while offset < dst.size {
+            let dst_boundary = self.var_chunk_remaining(dst, offset);
+            let src_boundary = match src {
+                ResolvedValue::Var(var) => self.var_chunk_remaining(var, offset),
+                ResolvedValue::Const(..) => MAX_REG_SIZE as ValueSize,
+            };
+            let chunk_size = (dst.size - offset)
+                .min(MAX_REG_SIZE as ValueSize)
+                .min(dst_boundary)
+                .min(src_boundary);
+            let runtime_src = self.get_runtime_value(src.slice(offset, chunk_size))?;
+            let runtime_dst = self.get_runtime_var(dst.slice(offset, chunk_size))?;
+            self.push(runtime_src.copy_to(runtime_dst));
+            if runtime_dst.is_temp() && runtime_dst.offset == 0 && runtime_src.is_const() {
+                self.lifter.disassembly_constants.insert(runtime_dst.id, runtime_src.as_u64());
             }
-            Ok(())
-        })
+            offset += chunk_size;
+        }
+        Ok(())
     }
 
     fn emit_bitwise(
@@ -783,13 +1030,29 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         b: ResolvedValue,
     ) -> Result<()> {
         debug_assert!(matches!(op, pcode::Op::IntAnd | pcode::Op::IntOr | pcode::Op::IntXor));
-        self.split_large_op(dst, |this, i, dst| {
-            let a = this.get_runtime_value(a.slice(i, dst.size))?;
-            let b = this.get_runtime_value(b.slice(i, dst.size))?;
-            let dst = this.get_runtime_var(dst)?;
-            this.push((dst, op, [a, b]));
-            Ok(())
-        })
+        let mut offset = 0;
+        while offset < dst.size {
+            let dst_boundary = self.var_chunk_remaining(dst, offset);
+            let a_boundary = match a {
+                ResolvedValue::Var(var) => self.var_chunk_remaining(var, offset),
+                ResolvedValue::Const(..) => MAX_REG_SIZE as ValueSize,
+            };
+            let b_boundary = match b {
+                ResolvedValue::Var(var) => self.var_chunk_remaining(var, offset),
+                ResolvedValue::Const(..) => MAX_REG_SIZE as ValueSize,
+            };
+            let chunk_size = (dst.size - offset)
+                .min(MAX_REG_SIZE as ValueSize)
+                .min(dst_boundary)
+                .min(a_boundary)
+                .min(b_boundary);
+            let runtime_a = self.get_runtime_value(a.slice(offset, chunk_size))?;
+            let runtime_b = self.get_runtime_value(b.slice(offset, chunk_size))?;
+            let runtime_dst = self.get_runtime_var(dst.slice(offset, chunk_size))?;
+            self.push((runtime_dst, op, [runtime_a, runtime_b]));
+            offset += chunk_size;
+        }
+        Ok(())
     }
 
     fn emit_load(&mut self, addr: ResolvedValue, offset: u64, dst: VarNode) -> Result<()> {
@@ -848,11 +1111,13 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         mut func: impl FnMut(&mut Self, ValueSize, VarNode) -> Result<()>,
     ) -> Result<()> {
         if var.size > MAX_REG_SIZE as ValueSize {
-            if var.size % MAX_REG_SIZE as ValueSize != 0 {
-                return Err(Error::UnsupportedVarNodeSize(var.size));
-            }
-            for i in (0..var.size).step_by(MAX_REG_SIZE as usize) {
-                func(self, i, var.slice(i, MAX_REG_SIZE as ValueSize))?;
+            let mut i = 0;
+            while i < var.size {
+                let register_chunk_remaining = self.var_chunk_remaining(var, i);
+                let chunk_size =
+                    (var.size - i).min(MAX_REG_SIZE as ValueSize).min(register_chunk_remaining);
+                func(self, i, var.slice(i, chunk_size))?;
+                i += chunk_size;
             }
         }
         else {
@@ -860,6 +1125,20 @@ impl<'a, 'b> LifterCtx<'a, 'b> {
         }
 
         Ok(())
+    }
+
+    fn var_chunk_remaining(&self, var: VarNode, offset: ValueSize) -> ValueSize {
+        let absolute = var.offset + u32::from(offset);
+        let inner = if var.is_tmp {
+            absolute % u32::from(MAX_REG_SIZE)
+        }
+        else {
+            self.subtable
+                .data
+                .map_sleigh_reg(absolute, 1)
+                .map_or(absolute % u32::from(MAX_REG_SIZE), |(_, inner)| u32::from(inner))
+        };
+        MAX_REG_SIZE as ValueSize - (inner % u32::from(MAX_REG_SIZE)) as ValueSize
     }
 
     pub fn push(&mut self, instruction: impl Into<pcode::Instruction>) {

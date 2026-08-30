@@ -1,6 +1,7 @@
 # Milestone 9: Ice Lake Execution Parity
 
-- **Status:** proposed, not started
+- **Status:** implementation complete; final live Claude task and full browser
+  acceptance are being recorded
 - **Relationship to M7:** follow-on ISA coverage; it is not required to close
   the Claude Code TUI gate
 - **Primary target:** the pinned Claude Code/Bun workload selects simdutf's
@@ -9,35 +10,32 @@
 
 ## Why this is a separate milestone
 
-webTOS currently advertises a conservative SSE CPU profile. The upgraded
-Ghidra specification can decode VEX and EVEX encodings, and it defines YMM,
-ZMM, and opmask registers, but decode coverage is not execution correctness.
-The AVX and AVX-512 feature bits remain clear because their p-code semantics,
-extended state, and OS-visible save/restore behavior have not been validated as
-one coherent architecture.
+Before M9, webTOS advertised a conservative SSE CPU profile. The upgraded
+Ghidra specification could decode VEX and EVEX encodings and represented YMM,
+ZMM, and opmask registers, but decode coverage was not execution correctness.
+M9 closes that gap as one coherent architecture: the versioned
+`webtos-x86_64-icelake-simdutf-v1` profile now publishes only the AVX-family
+features whose p-code semantics, extended state, faults, and OS-visible
+save/restore behavior are covered by the native authority and portable replay.
 
-The existing baseline is not fully self-consistent even before AVX is added:
-CPUID.1 advertises XSAVE while CPUID.0 reports a maximum basic leaf of 1, XCR0
-resets to zero, the leaf 0x0d and XSAVE/XRSTOR user operations have no execution
-helper, and the Linux signal frame does not transfer guest-visible fp/xstate.
-M9-A must first make the conservative profile truthful. A temporary removal of
-an unsupported bit is preferable to preserving a false capability claim.
+The pre-M9 baseline was not fully self-consistent even before AVX was added:
+CPUID.1 advertised XSAVE while CPUID.0 reported a maximum basic leaf of 1,
+XCR0 reset to zero, leaf 0x0d and XSAVE/XRSTOR had no execution helper, and the
+Linux signal frame did not transfer guest-visible fp/xstate. The completed
+profile derives CPUID.0d and serialization from the same xstate table, starts
+with XCR0 `0xe7`, faults invalid XGETBV/XSETBV use, and transfers the standard
+Linux xstate image through `rt_sigframe` and `rt_sigreturn`.
 
-There is also a confirmed CPUID.1 register-order defect: the Rust helper writes
-its intended ECX mask into tuple slice 8 and EDX mask into slice 12, while the
-SLEIGH instruction maps those slices to RDX and RCX respectively. Existing
-tests observe only selected bits whose positions happen to collide across the
-two masks. The same hand-encoded ordering puts the extended leaf 0x80000001
-SYSCALL and LONG_MODE bits in RCX instead of EDX. M9-A's first red gate must
-compare all four output registers for every supported leaf and catch these
-swaps before any new feature is considered. The implementation should route
-all leaves through one typed `CpuidResult { eax, ebx, ecx, edx }` adapter so
-individual helpers cannot re-invent the SLEIGH tuple layout.
+The starting implementation also had a CPUID register-order defect: feature
+masks intended for ECX and EDX were exchanged at the Rust/SLEIGH tuple
+boundary, including extended-leaf SYSCALL and LONG_MODE bits. The typed
+`CpuidResult { eax, ebx, ecx, edx }` adapter and all-register golden tests now
+prevent this class of defect.
 
 The distinction is observable in the pinned Claude Code 2.1.247 fixture
 (`sha256:5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15`).
-With normal dispatch, simdutf does not select an accelerated implementation
-under the current virtual CPU profile. Forcing
+With normal dispatch, simdutf did not select an accelerated implementation
+under the pre-M9 virtual CPU profile. Forcing
 `SIMDUTF_FORCE_IMPLEMENTATION=westmere` gets past that dispatch failure and is
 useful for diagnosing M7, but it is not a CPU implementation. Forcing
 `SIMDUTF_FORCE_IMPLEMENTATION=icelake` selects the Ice Lake object and reaches
@@ -53,8 +51,8 @@ RIP 0x399b8f0: 62 f3 75 48 25 06 f8
 Both encodings decode. Their generated semantics call opaque p-code operations
 that have no registered execution helper, so the VM converts
 `UnimplementedOp` into its guest-visible `IllegalInstruction` exit. The failure
-occurs before the previously observed simdutf path loop and proves that
-selecting the Ice Lake implementation activates broad AVX-512 code in
+occurred before the previously observed simdutf path loop and proved that
+selecting the Ice Lake implementation activated broad AVX-512 code in
 Bun/JavaScriptCore, not one isolated UTF routine. M9 therefore treats CPUID,
 extended state, instruction execution, Linux signal state, and the native
 oracle as one milestone.
@@ -218,11 +216,14 @@ skipped native oracle is not a pass. Browser CI replays the committed oracle
 corpus and must agree across Chromium, Firefox, and WebKit instruction for
 instruction.
 
-The currently available x86-64 fixture host is a Xeon Platinum 8455C
-(Sapphire Rapids), not Ice Lake. It can serve as a feature-superset semantic
-oracle for deterministic instructions, but it is not an Ice Lake CPUID or
-microarchitecture authority. M9-A must obtain and record an actual Ice Lake
-profile capture; any hardware job run elsewhere must label itself accurately.
+The recorded x86-64 fixture host is a Xeon Platinum 8455C (Sapphire Rapids),
+not Ice Lake. It is a valid feature-superset execution authority for the
+architecturally deterministic instructions in this userspace profile, and the
+evidence labels it accurately. It is not used as an Ice Lake CPUID, cache,
+timing, approximation, or microarchitecture authority. An actual Ice Lake
+capture is required only before making one of those model-specific claims;
+none is part of M9. Architecturally approximate operations are instead held to
+their specified error bounds and special-value behavior.
 
 The published evidence bundle contains the normalized environment and CPUID
 capture, XCR0/XSAVE layout, versioned corpus plus digest, native and emulator
@@ -251,9 +252,74 @@ default workload dispatch.
 | M9-K | Validate EVEX operands, masks, tuple addressing, and instruction-family semantics in parallel child packages | M9-C, M9-I | Includes the two Claude canaries plus systematic widths, masks, memory, and fault cases |
 | M9-L | Close the feature-coverage ledger, enable the profile, and integrate JIT fallback, workloads, browsers, and evidence | M9-A-M9-K | No unvalidated opcode sits behind a bit; simdutf auto-selects `icelake`; all release gates pass |
 
-Parallel changes must not edit shared feature constants opportunistically.
-Packages add semantics and tests while the public profile remains conservative;
-M9-L is the only package that enables the completed profile by default.
+During implementation, parallel changes did not edit shared feature constants
+opportunistically. Packages added semantics and tests while the public profile
+remained conservative; M9-L alone enabled the completed profile by default.
+
+## Implementation record
+
+All work packages are implemented on `feat/m9-ice-lake-parity`. The public
+profile was enabled only after the state-transfer and execution authorities
+were green.
+
+| Package | Result | Authoritative gate |
+|---|---|---|
+| M9-A/B | Complete | `cpuid.rs` compares complete register tuples, finite leaf boundaries, the xstate-derived leaf 0x0d, and the exact simdutf Ice Lake selector prerequisites. |
+| M9-C | Complete | `wide_state.rs` covers all ZMM slices, K registers, aliases, and upper-lane behavior without transporting a YMM/ZMM through a `u128` helper argument. |
+| M9-D | Complete | `xstate_policy.rs` covers XCR0 `0xe7`, invalid selectors, and user-mode XSETBV faulting without mutation. |
+| M9-E/F | Complete | `fxsave.rs` and `xsave.rs` cover standard layouts, requested masks, init state, complete round trips, reserved bytes, MXCSR, alignment, and precise page-crossing faults. |
+| M9-G/H | Complete | `signal_context.rs` compiles a real Linux handler that inspects and edits GPRs and the complete standard xstate image, then verifies the lawful edits after `rt_sigreturn`. |
+| M9-I | Complete | `native_oracle.rs` uses ptrace GPR and `NT_X86_XSTATE` authority, runs each normalized native case twice, and detects deliberately corrupted GPR, xstate, memory, and fault results. `m9_icelake_oracle.elf` is the portable replay. |
+| M9-J/K | Complete | The native corpus covers VEX/AVX2 and the published EVEX families across widths, masks, register/memory forms, VSIB gather/scatter, special floating-point classes, page boundaries, and partial-fault restart state. |
+| M9-L | Complete | `feature_coverage` reports 789 published-profile mnemonics, including BMI1/BMI2 and VEX AES/PCLMUL, and zero reachable opaque operations without helpers. Interpreter and JIT produce the same portable result; browser replay uses the same digest-pinned ELF. |
+
+The portable corpus is intentionally smaller than the ptrace corpus. The
+ptrace suite is the per-instruction hardware comparison authority; the static
+ELF composes representative operations from every published extension and
+provides a deterministic cross-engine replay fingerprint. Treating the latter
+as a replacement for the former would weaken the gate.
+
+### Recorded authority and portable artifact
+
+The 2026-08-30 native authority is Linux 6.8.0 x86-64 on a GenuineIntel Xeon
+Platinum 8455C (family 6, model 143, stepping 8, microcode `0x2b000661`). The
+toolchain is Rust `1.100.0-nightly (e7769602a 2026-08-24)`, GCC 15.2.0, and GNU
+binutils 2.38. The host advertises every feature required by the corpus; an
+absent feature fails the tests rather than becoming a skip.
+
+The portable artifact is reproducible with:
+
+```sh
+gcc -nostdlib -static -Wl,--build-id=none -march=icelake-server \
+  -o test_data/m9_icelake_oracle.elf test_data/m9_icelake_oracle.S
+```
+
+Its SHA-256 is
+`94e367834d46c0ebb18d8ef0a30399b9dd3edecd4b9b49a3c2524c4f4dcad7c9` and
+its native output is:
+
+```text
+M9_ORACLE_FNV1A64=0a7c58fd00cdfc14
+```
+
+That output commits AVX/AVX2, BMI1/BMI2, VEX AES/PCLMUL with complete ZMM
+upper-lane clearing, and the selected AVX-512 feature closure. Both interpreter
+and JIT replays must match the native text exactly.
+
+The final browser matrix used `web/webtos_web.wasm` SHA-256
+`28aaa4a7903e35364a36955e1a9c0f6d71124d5175b8f2f661875ce79a6a1fb4`.
+Chromium and Firefox passed 47/47 checks; WebKit passed 38/38 applicable checks
+and reported eight explicit OPFS capability skips. The M9 interpreter and JIT
+replays each retired 2,485 instructions in every engine with identical
+fingerprints. The OPFS skips do not apply to the M9 replay and are not counted
+as ISA passes.
+
+The pinned Claude Code 2.1.247 input is SHA-256
+`5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15`.
+Its version gate retired 185,487,665 identical instructions in Chromium,
+Firefox, and WebKit. The separate live-task gate uses the same WASM and binary,
+scoped host credentials, an API-only network allowlist, and no simdutf forcing
+variable.
 
 ## Acceptance gates
 
@@ -289,36 +355,31 @@ M9 is complete only when all of the following hold:
 - Requiring M9 to close the M7 Claude TUI gate; the conservative SSE/Westmere
   route remains the shorter M7 correctness path.
 
-## Starting evidence and code anchors
+## Implementation and evidence anchors
 
-- `third_party/icicle/icicle-cpu/src/exec/helpers.rs`: current CPUID maximum
-  basic leaf, the currently inconsistent XSAVE claim, and conservative feature
-  constants.
-- `third_party/ghidra-x86/languages/ia.sinc`: XCR0, XMM/YMM/ZMM aliases,
-  K0-K7, XGETBV/XSETBV, the unimplemented CPUID.0d user operation, and opaque
-  XSAVE/XRSTOR p-code operations.
-- `third_party/ghidra-x86/languages/avx512.sinc`: generated EVEX decode and
-  semantics requiring validation, including opaque canary operations and the
-  GPR-source broadcast rule whose input is currently missing.
-- `third_party/ghidra-x86/PROVENANCE.md`: the explicit warning that AVX-512
-  decode exists while execution semantics are not validated.
-- `crates/x64-engine/examples/sse_probe.rs`: native-intrinsic differential
-  precedent.
-- `crates/x64-engine/examples/exec_diff.rs`: current instruction-step state
-  comparison precedent; it compares only GPRs and must not be mistaken for the
-  M9 native oracle.
-- `crates/x64-engine/tests/decode_diff.rs`: current VEX/EVEX exemptions that
-  the advertised profile must remove.
-- `third_party/icicle/icicle-cpu/src/regs.rs`: dynamic register accesses that
-  currently truncate or reject values wider than 128 bits.
-- `third_party/icicle/sleigh/sleigh-runtime/src/lifter.rs` and
-  `third_party/icicle/icicle-cpu/src/exec/interpreter.rs`: additional p-code
-  arguments and the `u128` helper-argument slot that cannot transport a whole
-  YMM/ZMM operand.
-- `crates/linux-compat/src/syscall.rs`: current signal delivery uses a fixed
-  zeroed ucontext area and restores private saved state rather than transferring
-  guest-visible fp/xstate.
-- `docs/workloads/node.md`: current workload-level AVX/AVX-512 limitation.
+- `third_party/icicle/icicle-cpu/src/exec/x86_profile.rs`: the named CPUID and
+  xstate contract, including the shared standard component table.
+- `third_party/icicle/icicle-cpu/src/exec/helpers.rs`: CPUID, FXSAVE/FXRSTOR,
+  XSAVE/XRSTOR, VEX/AVX2/EVEX execution helpers, precise memory access, and
+  standard xstate serialization.
+- `third_party/ghidra-x86/languages/{ia,avx,avx2,avx512}.sinc`: the repaired
+  instruction lowering and explicit feature annotations consumed by the
+  coverage ledger.
+- `crates/x64-engine/tests/{cpuid,wide_state,xstate_policy,fxsave,xsave}.rs`:
+  coherent profile and state-transfer gates.
+- `crates/x64-engine/tests/native_oracle.rs`: ptrace-supervised, twice-stable
+  native execution authority with exact per-case comparison.
+- `crates/x64-engine/examples/feature_coverage.rs`: fail-closed mapping from
+  published feature bits to reachable p-code operations and registered
+  helpers.
+- `crates/linux-compat/tests/signal_context.rs`: compiled guest-visible Linux
+  signal-context and complete xstate round trip.
+- `test_data/m9_icelake_oracle.{S,elf}` and
+  `crates/linux-compat/tests/m9_oracle.rs`: digest-pinned native/interpreter/JIT
+  portable replay, also executed by `web/test_browsers.mjs`.
+- `web/probe_claude_tui.mjs`: real Claude TUI task gate with scoped credentials,
+  API-only network authority, a real Edit operation, clean exit, and final file
+  verification.
 
 ## Normative references
 

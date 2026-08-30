@@ -7,10 +7,14 @@
 // Usage: node web/probe_claude_tui.mjs [minutes]
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { createConnection } from "node:net";
+import { createSocket } from "node:dgram";
+import { resolve4 } from "node:dns/promises";
 import { makeJitHost } from "./jit_host.mjs";
 
 const wasmPath = new URL("./webtos_web.wasm", import.meta.url).pathname;
 const minutes = Number(process.argv[2] ?? 10);
+const realTask = process.env.PROBE_REAL_TASK === "1";
 
 const claude = await readFile(new URL("./claude", import.meta.url));
 const libDir = new URL("./claude-libs/", import.meta.url);
@@ -27,6 +31,21 @@ const files = [
   await lib("libpthread.so.0"),
   await lib("librt.so.1"),
 ];
+if (realTask) {
+  files.push(
+    { path: "/bin/busybox", bytes: await readFile(new URL("./busybox-musl", import.meta.url)) },
+    {
+      path: "/root/.claude.json",
+      bytes: Buffer.from(JSON.stringify({
+        hasCompletedOnboarding: true,
+        theme: "dark",
+        projects: { "/work": { allowedTools: [], hasTrustDialogAccepted: true } },
+      })),
+    },
+    { path: "/etc/resolv.conf", bytes: Buffer.from("nameserver 1.1.1.1\n") },
+    { path: "/work/input.txt", bytes: Buffer.from("M9_PENDING\n") },
+  );
+}
 
 const chunkSize = 64 * 1024;
 const chunks = new Map();
@@ -71,19 +90,48 @@ const err = () => new TextDecoder().decode(mem().slice(e.wtw_error_ptr(), e.wtw_
 
 const useJit = process.env.PROBE_JIT !== "0";
 const usePty = process.env.PROBE_PTY !== "0";
+const jitAfter = Number(process.env.PROBE_JIT_AFTER ?? 10);
+if (!Number.isSafeInteger(jitAfter) || jitAfter < 1) {
+  throw new Error(`PROBE_JIT_AFTER must be a positive integer, got ${process.env.PROBE_JIT_AFTER}`);
+}
 if (e.wtw_init() !== 0) throw new Error(`init: ${err()}`);
 if (e.wtw_set_guest_memory_mb(2048) !== 0) throw new Error(`guestmem: ${err()}`);
-if (useJit && e.wtw_jit_enable(10) !== 0) throw new Error(`jit: ${err()}`);
+if (useJit && e.wtw_jit_enable(jitAfter) !== 0) throw new Error(`jit: ${err()}`);
 if (e.wtw_install_chunk_manifest(...put(manifest)) !== 0) throw new Error(`manifest: ${err()}`);
-e.wtw_arg(...put("claude"));
-// Minimal-startup flags: --bare skips hooks/LSP/plugin sync/keychain reads,
-// --ax-screen-reader renders flat text and prints an early, stable marker
-// ("[Screen Reader Mode: on via flag]") the paint detector keys on.
-e.wtw_arg(...put("--bare"));
-e.wtw_arg(...put("--ax-screen-reader"));
+const executable = realTask ? "/bin/busybox" : "/bin/claude";
+if (realTask) {
+  e.wtw_arg(...put("sh"));
+  e.wtw_arg(...put("-i"));
+  const principal = "claude-m9-acceptance";
+  const credentials = await readFile(
+    process.env.PROBE_CLAUDE_CREDENTIALS ?? "/home/tomi/.claude/.credentials.json",
+  );
+  if (e.wtw_agent_principal(...put(principal)) !== 0) {
+    throw new Error(`agent principal: ${err()}`);
+  }
+  if (e.wtw_secret_handle(
+    ...put("CLAUDE_OAUTH_PROFILE"),
+    ...put(credentials),
+    ...put("/root/.claude/.credentials.json"),
+    ...put(principal),
+  ) !== 0) {
+    throw new Error(`credential handle: ${err()}`);
+  }
+  if (e.wtw_net_enable() !== 0) throw new Error(`network: ${err()}`);
+} else {
+  e.wtw_arg(...put("claude"));
+  // Minimal-startup mode is useful for an unauthenticated paint-only probe.
+  e.wtw_arg(...put("--bare"));
+  e.wtw_arg(...put("--ax-screen-reader"));
+}
 e.wtw_env(...put("PATH=/bin"));
 e.wtw_env(...put("HOME=/root"));
 e.wtw_env(...put("TERM=xterm-256color"));
+e.wtw_env(...put("PS1=webtos:\\w$ "));
+e.wtw_env(...put("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"));
+if (process.env.PROBE_GLIBC_TUNABLES) {
+  e.wtw_env(...put(`GLIBC_TUNABLES=${process.env.PROBE_GLIBC_TUNABLES}`));
+}
 
 const deliver = (ctx) => {
   const len = e.wtw_page_request_take();
@@ -98,28 +146,183 @@ const deliver = (ctx) => {
   }
 };
 
+const STATUS_AWAITING_NETWORK = 8;
+const NET_BUDGET_UNBOUNDED = 0xffff_ffff;
+const ENETUNREACH = 101;
+const ECONNRESET = 104;
+const ETIMEDOUT = 110;
+const ECONNREFUSED = 111;
+const apiAddresses = new Set(realTask ? await resolve4("api.anthropic.com") : []);
+const sockets = new Map();
+let netEvents = 0;
+let netWake = null;
+const noteNetEvent = () => {
+  netEvents += 1;
+  if (netWake) {
+    const wake = netWake;
+    netWake = null;
+    wake();
+  }
+};
+const deliverNetError = (handle, errno) => {
+  e.wtw_net_error(handle, errno);
+  noteNetEvent();
+};
+const nodeErrno = (error) => {
+  if (error?.code === "ECONNREFUSED") return ECONNREFUSED;
+  if (error?.code === "ETIMEDOUT") return ETIMEDOUT;
+  if (error?.code === "ECONNRESET") return ECONNRESET;
+  return ENETUNREACH;
+};
+const permitted = (ip, port) =>
+  (ip === "1.1.1.1" && port === 53) || (apiAddresses.has(ip) && port === 443);
+const deliverNetData = (handle, bytes) => {
+  e.wtw_net_data(handle, ...put(bytes));
+  noteNetEvent();
+};
+const openTcp = (handle, ip, port) => {
+  if (!permitted(ip, port)) {
+    console.error(`[network] refused tcp ${ip}:${port}`);
+    deliverNetError(handle, ENETUNREACH);
+    return;
+  }
+  const socket = createConnection({ host: ip, port });
+  sockets.set(handle, { kind: "tcp", socket });
+  socket.on("connect", () => {
+    e.wtw_net_connected(handle, 0, 0);
+    noteNetEvent();
+  });
+  socket.on("data", (bytes) => deliverNetData(handle, bytes));
+  socket.on("end", () => {
+    e.wtw_net_closed(handle);
+    noteNetEvent();
+  });
+  socket.on("error", (error) => deliverNetError(handle, nodeErrno(error)));
+};
+const openUdp = (handle) => {
+  const socket = createSocket("udp4");
+  sockets.set(handle, { kind: "udp", socket });
+  socket.on("message", (bytes, remote) => {
+    const octets = remote.address.split(".").map(Number);
+    const ip = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
+    e.wtw_net_datagram(handle, ip, remote.port, ...put(bytes));
+    noteNetEvent();
+  });
+  socket.on("error", (error) => deliverNetError(handle, nodeErrno(error)));
+};
+const takeNetworkCommands = () => {
+  const len = e.wtw_net_take();
+  if (len < 0) throw new Error(`network drain: ${err()}`);
+  return mem().slice(e.wtw_net_cmd_ptr(), e.wtw_net_cmd_ptr() + len);
+};
+const performNetwork = (stream) => {
+  const view = new DataView(stream.buffer, stream.byteOffset, stream.byteLength);
+  let offset = 0;
+  const u32 = () => {
+    const value = view.getUint32(offset, true);
+    offset += 4;
+    return value;
+  };
+  const destination = () => {
+    const ip = `${stream[offset]}.${stream[offset + 1]}.${stream[offset + 2]}.${stream[offset + 3]}`;
+    const port = view.getUint16(offset + 4, false);
+    offset += 6;
+    return { ip, port };
+  };
+  const payload = () => {
+    const length = u32();
+    const bytes = stream.slice(offset, offset + length);
+    offset += length;
+    return bytes;
+  };
+  while (offset < stream.length) {
+    const op = stream[offset++];
+    const handle = u32();
+    if (op === 1) {
+      const { ip, port } = destination();
+      openTcp(handle, ip, port);
+    } else if (op === 2) {
+      sockets.get(handle)?.socket.write(payload());
+    } else if (op === 3) {
+      sockets.get(handle)?.socket.end();
+    } else if (op === 4) {
+      openUdp(handle);
+    } else if (op === 5) {
+      const { ip, port } = destination();
+      const bytes = payload();
+      if (!permitted(ip, port)) {
+        console.error(`[network] refused udp ${ip}:${port}`);
+        deliverNetError(handle, ENETUNREACH);
+      } else {
+        sockets.get(handle)?.socket.send(bytes, port, ip);
+      }
+    } else if (op === 6) {
+      const entry = sockets.get(handle);
+      if (entry?.kind === "udp") entry.socket.close();
+      else entry?.socket.destroy();
+      sockets.delete(handle);
+    } else {
+      throw new Error(`unknown network opcode ${op}`);
+    }
+  }
+};
+const pumpNetwork = async () => {
+  const before = netEvents;
+  performNetwork(takeNetworkCommands());
+  if (netEvents !== before) return;
+  const budget = e.wtw_net_budget_ms() >>> 0;
+  const waitMs = Math.min(budget === NET_BUDGET_UNBOUNDED ? 1000 : budget, 1000);
+  await new Promise((resolve) => {
+    netWake = resolve;
+    setTimeout(() => {
+      if (netWake === resolve) {
+        netWake = null;
+        resolve();
+      }
+    }, waitMs);
+  });
+  if (netEvents === before) e.wtw_net_expire();
+};
+
 for (;;) {
-  const s = e.wtw_load(...put("/bin/claude"));
+  const s = e.wtw_load(...put(executable));
   if (s === 0) break;
   if (s !== 10) throw new Error(`load: status ${s}: ${err()}`);
   deliver("metadata");
 }
 if (usePty && e.wtw_pty_install(40, 120) !== 0) throw new Error(`pty: ${err()}`);
+const maxFuel = process.env.PROBE_MAX_FUEL ? Number(process.env.PROBE_MAX_FUEL) : 50_000_000;
+if (!Number.isSafeInteger(maxFuel) || maxFuel < 1) {
+  throw new Error(`PROBE_MAX_FUEL must be a positive integer, got ${process.env.PROBE_MAX_FUEL}`);
+}
 
 const deadline = Date.now() + minutes * 60_000;
 let rendered = "";
 let status = 0;
 let slices = 0;
+let pageIns = 0;
+let taskPhase = realTask ? "shell" : "paint";
+let taskSucceeded = false;
+let networkWaits = 0;
+let taskNetworkBaseline = 0;
+let exitMarkerBaseline = 0;
+const currentIcount = () =>
+  (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
 const painted = () =>
-  /Screen Reader Mode|trust this folder|Welcome to Claude|Choose the text style/.test(rendered) ||
+  /Screen Reader Mode|trust this folder|Welcome to Claude|Choose the text style|What can I help|How can I help/.test(rendered) ||
   (rendered.length > 500 && rendered.includes("\x1b[38;5;"));
 const drain = () => {
   const n = e.wtw_output_len();
   if (n > 0) rendered += new TextDecoder().decode(mem().slice(e.wtw_output_ptr(), e.wtw_output_ptr() + n));
 };
+const input = (text) => {
+  if (e.wtw_pty_input(...put(text)) !== 0) throw new Error(`pty input: ${err()}`);
+};
+const occurrences = (needle) => rendered.split(needle).length - 1;
+const claudeExited = () => /(?:^|\r?\n)WEBTOS_CLAUDE_EXIT=\d+/.test(rendered);
 while (Date.now() < deadline) {
   const t0 = Date.now();
-  status = e.wtw_run(50_000_000);
+  status = e.wtw_run(maxFuel);
   slices += 1;
   if (slices <= 20 || slices % 50 === 0) {
     const ic = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
@@ -128,8 +331,71 @@ while (Date.now() < deadline) {
     );
   }
   drain();
-  if (painted()) break;
-  if (status === 10) { deliver("run"); continue; }
+  if (status === STATUS_AWAITING_NETWORK) {
+    networkWaits += 1;
+    await pumpNetwork();
+    continue;
+  }
+  if (status === 10) {
+    deliver("run");
+    pageIns += 1;
+    continue;
+  }
+  if (realTask) {
+    if (taskPhase === "shell" && status === 7) {
+      input(
+        "cd /work && /bin/claude --safe-mode --ax-screen-reader --no-chrome " +
+          "--strict-mcp-config --mcp-config '{}' --permission-mode acceptEdits " +
+          "--allowedTools Read,Edit --model haiku; echo WEBTOS_CLAUDE_EXIT=$?\r",
+      );
+      taskPhase = "claude-start";
+      continue;
+    }
+    if (taskPhase === "claude-start" && painted()) {
+      input(
+        "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
+          "then reply with exactly WEBTOS_TASK_DONE.\r",
+      );
+      taskNetworkBaseline = networkWaits;
+      taskPhase = "task";
+      continue;
+    }
+    if (taskPhase === "claude-start" && claudeExited()) {
+      const visible = rendered
+        .replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]/g, "")
+        .trim();
+      throw new Error(`Claude exited before painting: ${JSON.stringify(visible.slice(-800))}`);
+    }
+    if (
+      taskPhase === "task" &&
+      status === 7 &&
+      networkWaits > taskNetworkBaseline &&
+      occurrences("WEBTOS_TASK_DONE") >= 2
+    ) {
+      exitMarkerBaseline = occurrences("WEBTOS_CLAUDE_EXIT=");
+      input("/exit\r");
+      taskPhase = "exit";
+      continue;
+    }
+    if (
+      taskPhase === "exit" &&
+      status === 7 &&
+      occurrences("WEBTOS_CLAUDE_EXIT=") > exitMarkerBaseline
+    ) {
+      input("printf 'WEBTOS_FILE='; cat /work/input.txt; echo WEBTOS_FILE_CHECK\r");
+      taskPhase = "verify";
+      continue;
+    }
+    if (
+      taskPhase === "verify" &&
+      rendered.includes("WEBTOS_FILE=M9_CLAUDE_COMPLETED") &&
+      rendered.includes("WEBTOS_FILE_CHECK")
+    ) {
+      taskSucceeded = true;
+      break;
+    }
+  }
+  if (!realTask && painted()) break;
   if (status === 7) continue; // awaiting input: the TUI may idle-wait; keep pumping
   if (status !== 0) break;
 }
@@ -137,9 +403,19 @@ drain();
 
 const icount = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
 const alt = painted();
-console.log(`jit=${useJit} pty=${usePty} status=${status} slices=${slices} icount=${icount.toLocaleString()}`);
+console.log(
+  `jit=${useJit} jit_after=${jitAfter} pty=${usePty} status=${status} slices=${slices} ` +
+    `page_ins=${pageIns} icount=${icount.toLocaleString()}`,
+);
 if (status !== 0 && status !== 1 && status !== 7) console.log(`engine error: ${err()}`);
-console.log(`painted=${alt} rendered_bytes=${rendered.length}`);
+console.log(
+  `painted=${alt} real_task=${realTask} task_phase=${taskPhase} task_succeeded=${taskSucceeded} ` +
+    `rendered_bytes=${rendered.length}`,
+);
 const printable = rendered.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]/g, "").trim();
 console.log(`visible text (first 400): ${JSON.stringify(printable.slice(0, 400))}`);
-process.exit(alt ? 0 : 2);
+for (const entry of sockets.values()) {
+  if (entry.kind === "udp") entry.socket.close();
+  else entry.socket.destroy();
+}
+process.exit(realTask ? (taskSucceeded ? 0 : 2) : alt ? 0 : 2);

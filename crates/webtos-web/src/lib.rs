@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 
-use icicle_cpu::mem::perm;
+use icicle_cpu::{mem::perm, ValueSource};
 use linux_compat::{net::HostBroker, Machine};
 use pcode::{Op, VarNode};
 use x64_engine::jit::{
@@ -62,6 +62,16 @@ pub const STATUS_AWAITING_PAGEIN: i32 = 10;
 /// `wtw_net_budget_ms` when the guest armed no timer: the host may wait as
 /// long as it wants.
 pub const NET_BUDGET_UNBOUNDED: u32 = u32::MAX;
+
+/// A synchronous WebAssembly export cannot be preempted by the browser event
+/// loop. Bound each host call even when a caller offers a much larger fuel
+/// slice; returning `STATUS_RUNNING` early is already part of the ABI and lets
+/// page delivery, terminal input, timers, cancellation, and rendering run.
+const RUN_CALL_FUEL_CAP: u64 = 65_536;
+
+fn bounded_run_fuel(fuel: u32) -> u64 {
+    u64::from(fuel).min(RUN_CALL_FUEL_CAP)
+}
 
 struct HostState {
     machine: Option<Machine>,
@@ -915,7 +925,8 @@ pub extern "C" fn wtw_run(fuel: u32) -> i32 {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_run called before wtw_init");
         };
-        machine.vm_mut().icount_limit = machine.icount().saturating_add(fuel as u64);
+        let fuel = bounded_run_fuel(fuel);
+        machine.vm_mut().icount_limit = machine.icount().saturating_add(fuel);
         let exit = machine.run();
         // With stdio on a pty the guest's writes land in the pty, not the
         // plain output buffer; exactly one of the two is ever non-empty.
@@ -952,7 +963,64 @@ fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
         CpuExit::OutOfMemory => STATUS_OUT_OF_MEMORY,
         CpuExit::OutOfCpu => STATUS_OUT_OF_CPU,
         CpuExit::PageFault { address, access } => {
-            state.error = format!("page fault: {access:?} at {address:#x}");
+            let vm = machine.vm_mut();
+            let rip = vm.cpu.read_pc();
+            let mut instruction = [0_u8; 15];
+            let bytes = if vm
+                .cpu
+                .mem
+                .read_bytes(rip, &mut instruction, perm::NONE)
+                .is_ok()
+            {
+                instruction
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                "unavailable".to_owned()
+            };
+            let register_names = [
+                "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11",
+                "R12", "R13", "R14", "R15",
+            ];
+            let registers = register_names
+                .iter()
+                .filter_map(|name| {
+                    vm.cpu
+                        .arch
+                        .sleigh
+                        .get_varnode(name)
+                        .map(|node| format!("{name}={:#x}", vm.cpu.read_var::<u64>(node)))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let rsp = vm
+                .cpu
+                .arch
+                .sleigh
+                .get_varnode("RSP")
+                .map(|node| vm.cpu.read_var::<u64>(node));
+            let stack = rsp.map_or_else(
+                || "unavailable".to_owned(),
+                |rsp| {
+                    let mut stack = [0_u8; 64];
+                    if vm.cpu.mem.read_bytes(rsp, &mut stack, perm::NONE).is_err() {
+                        return "unavailable".to_owned();
+                    }
+                    stack
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|bytes| format!("{:#x}", u64::from_le_bytes(*bytes)))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            );
+            state.error = format!(
+                "page fault: {access:?} at {address:#x}; rip={rip:#x}; bytes={bytes}; \
+                 registers={registers}; stack_qwords={stack}"
+            );
             STATUS_PAGE_FAULT
         }
         CpuExit::IllegalInstruction { rip } => {
@@ -1132,7 +1200,7 @@ pub extern "C" fn wtw_run_traced(fuel: u32) -> i32 {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_run_traced called before wtw_init");
         };
-        let exit = machine.run_traced(fuel as u64);
+        let exit = machine.run_traced(bounded_run_fuel(fuel));
         state.output = machine.take_output();
         if state.pty {
             state.output.extend(machine.drain_terminal_output());
@@ -1890,4 +1958,19 @@ pub extern "C" fn wtw_reset() {
         state.allocations.clear();
         state.scratch = Vec::new();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_run_fuel, RUN_CALL_FUEL_CAP};
+
+    #[test]
+    fn synchronous_run_fuel_is_bounded_for_browser_liveness() {
+        assert_eq!(bounded_run_fuel(1), 1);
+        assert_eq!(
+            bounded_run_fuel(RUN_CALL_FUEL_CAP as u32),
+            RUN_CALL_FUEL_CAP
+        );
+        assert_eq!(bounded_run_fuel(u32::MAX), RUN_CALL_FUEL_CAP);
+    }
 }

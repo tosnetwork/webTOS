@@ -416,6 +416,29 @@ impl Pager {
         space.generation = space.generation.wrapping_add(1).max(1);
     }
 
+    /// Makes immutable file-backed pages nonresident without changing their
+    /// virtual mappings. The caller removes guest access permission from the
+    /// corresponding MMU pages; the next access then resolves the exact
+    /// manifest-pinned bytes again.
+    pub fn discard(&mut self, asid: u64, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        let Some(space) = self.spaces.get_mut(&asid) else {
+            return;
+        };
+        if !space
+            .mappings
+            .iter()
+            .any(|mapping| mapping.start < end && mapping.end > start)
+        {
+            return;
+        }
+        space.generation = space.generation.wrapping_add(1).max(1);
+        self.resident
+            .retain(|&(space_asid, page)| space_asid != asid || page < start || page >= end);
+    }
+
     pub fn remap(&mut self, asid: u64, old_start: u64, old_len: u64, new_start: u64, new_len: u64) {
         let Some(space) = self.spaces.get_mut(&asid) else {
             return;
@@ -608,6 +631,42 @@ mod tests {
                 "stale page-in ticket"
             );
         }
+    }
+
+    #[test]
+    fn discarded_page_becomes_nonresident_and_resolves_from_the_same_digest() {
+        let (mut vfs, mut pager, bytes, _) = fixture();
+        let FaultResolution::Missing(request) = pager.resolve(&vfs, 7, 0x20_0000, AccessKind::Read)
+        else {
+            panic!("expected initial miss");
+        };
+        pager
+            .complete(&mut vfs, request.ticket, bytes.clone())
+            .expect("deliver fixture");
+        pager.mark_resident(7, 0x20_0000, AccessKind::Read);
+        assert_eq!(
+            pager.page_state(7, 0x20_0000),
+            Some((true, perm::READ | perm::EXEC | perm::INIT))
+        );
+
+        let generation = pager.generation(7);
+        pager.discard(7, 0x20_0000, PAGE_SIZE);
+        assert!(pager.generation(7) > generation);
+        assert_eq!(
+            pager.page_state(7, 0x20_0000),
+            Some((false, perm::READ | perm::EXEC | perm::INIT))
+        );
+        let FaultResolution::Ready {
+            page,
+            bytes: reloaded,
+            perm,
+        } = pager.resolve(&vfs, 7, 0x20_0000, AccessKind::Read)
+        else {
+            panic!("cached immutable bytes should resolve immediately");
+        };
+        assert_eq!(page, 0x20_0000);
+        assert_eq!(reloaded, bytes);
+        assert_eq!(perm, perm::READ | perm::EXEC | perm::INIT);
     }
 
     #[test]

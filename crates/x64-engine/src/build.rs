@@ -15,6 +15,7 @@ pub enum BuildError {
     SpecNotFound(std::path::PathBuf),
     SpecCompileError(String),
     MissingVarnode(&'static str),
+    MissingUserOp(&'static str),
     EnvironmentSetup(String),
 }
 
@@ -24,6 +25,7 @@ impl std::fmt::Display for BuildError {
             Self::SpecNotFound(path) => write!(f, "SLEIGH spec not found: {}", path.display()),
             Self::SpecCompileError(err) => write!(f, "SLEIGH spec compile error: {err}"),
             Self::MissingVarnode(name) => write!(f, "SLEIGH spec is missing varnode: {name}"),
+            Self::MissingUserOp(name) => write!(f, "SLEIGH spec is missing user-op: {name}"),
             Self::EnvironmentSetup(err) => write!(f, "failed to set up environment: {err}"),
         }
     }
@@ -224,7 +226,79 @@ fn finish_vm(mut spec: SpecOutput, config: &EngineConfig) -> Result<InterpVm, Bu
         optimize_block: config.optimize_block,
         ..Default::default()
     };
-    let instruction_lifter = lifter::InstructionLifter::new();
+    let mut instruction_lifter = lifter::InstructionLifter::new();
+    for &name in helpers::x86::LANE_LOCAL_128_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op(id);
+    }
+    for &name in helpers::x86::INDEXED_LANE_LOCAL_128_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
+    for &(name, _) in helpers::x86::FMA_HELPERS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
+    for &(name, ratio) in helpers::x86::NARROW_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_narrow_user_op(id, ratio);
+    }
+    for &(name, ratio) in helpers::x86::WIDEN_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_widen_user_op(id, ratio);
+    }
+    for &name in helpers::x86::SAME_WIDTH_CONVERSION_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
+    for &name in helpers::x86::EVEX_SPECIAL_FLOAT_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
+    for &name in helpers::x86::EVEX_VSIB_GATHER_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
+    for &name in helpers::x86::VEX_VSIB_GATHER_USER_OPS {
+        let id = cpu
+            .arch
+            .sleigh
+            .get_userop(name)
+            .ok_or(BuildError::MissingUserOp(name))?;
+        instruction_lifter.split_large_user_op_indexed(id);
+    }
     let mut block_lifter = lifter::BlockLifter::new(settings, instruction_lifter);
     for var in &cpu.arch.temporaries {
         block_lifter.mark_as_temporary(*var);
@@ -245,7 +319,11 @@ fn on_boot(cpu: &mut Cpu, entry: u64) {
 fn register_x86_helpers(vm: &mut InterpVm) -> Result<(), BuildError> {
     lifter::get_injectors(&mut vm.cpu, &mut vm.lifter.op_injectors);
 
-    for &(name, func) in helpers::HELPERS.iter().chain(helpers::x86::HELPERS) {
+    for &(name, func) in helpers::HELPERS
+        .iter()
+        .chain(helpers::x86::HELPERS)
+        .chain(helpers::x86::FMA_HELPERS)
+    {
         if let Some(id) = vm.cpu.arch.sleigh.get_userop(name) {
             vm.cpu.set_helper(id, func);
         }

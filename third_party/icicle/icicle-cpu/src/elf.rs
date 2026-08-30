@@ -308,7 +308,7 @@ fn get_layout<H>(
 where
     H: ProgramHeader,
 {
-    let mut base = std::u64::MAX;
+    let mut base = u64::MAX;
     let mut size = 0;
     let mut align = 0;
     let mut loadable = 0;

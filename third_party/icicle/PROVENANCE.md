@@ -71,13 +71,12 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
    two operands, so the instruction's imm8 rounding-mode is dropped during
    lifting; the IEEE/MXCSR default is used.
 
-9. `icicle-cpu/src/exec/helpers.rs`: CPUID now advertises an SSE/SSE2/SSE3
+9. `icicle-cpu/src/exec/helpers.rs`: the pre-M9 CPUID profile advertised an SSE/SSE2/SSE3
    baseline. `cpuid_basic_info` reports max-basic-leaf 1 (was 0) so software
    reads leaf 1 at all — V8 aborts (`Check failed: cpu.has_sse2()`) otherwise;
    leaf 1 EDX gains the SSE2 baseline (`FeatureInformationEdx`) and ECX keeps
-   SSE3/AES-NI. AVX/AVX-512 are still not advertised (their execution
-   semantics are unvalidated); leaves 2..6 stay unqueried (max-leaf is 1) so
-   the still-unimplemented cache/topology pcodeops are never reached.
+   SSE3/AES-NI. At that stage AVX/AVX-512 remained unadvertised. Item 11
+   records the later M9 profile that supersedes this baseline.
 
 10. `icicle-mem/src/physical.rs`: raised `MAX_PAGES` from 50,000 (~195 MiB of
     guest physical memory) to 262,144 (1 GiB). Pages are allocated lazily, so
@@ -86,21 +85,25 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
     ~246 MiB Codex musl build needs ~63,000 pages for its segments alone,
     before any runtime heap.
 
+11. M9 adds the versioned `webtos-x86_64-icelake-simdutf-v1` userspace
+    execution profile. `icicle-cpu/src/exec/x86_profile.rs` is the single
+    CPUID/XCR0/xstate component authority; `helpers.rs` implements standard
+    FXSAVE/FXRSTOR and XSAVE/XRSTOR plus the published VEX/AVX2/EVEX p-code
+    operations; the x86 language files bind complete XMM/YMM/ZMM aliases,
+    masking, upper-lane clearing, and precise memory forms. The profile
+    publishes AVX, AVX2, BMI1/BMI2, AVX-512F/CD/BW/VL/VBMI2/VPOPCNTDQ and
+    deliberately omits AVX-512DQ. VAES and VPCLMULQDQ remain reachable through
+    the separately published AES-NI/PCLMULQDQ bits and are included in the
+    native oracle. The execution contract is gated by
+    `x64-engine/tests/native_oracle.rs`, the xstate tests, and the portable
+    native/interpreter/JIT/browser fingerprint; see
+    `docs/M9_ICE_LAKE_EXECUTION_PARITY.md`.
+
 When updating this vendor copy, re-apply the patches and rerun the
 `x64-engine` and `linux-compat` test suites for native and
 `wasm32-unknown-unknown` targets.
 
 ## Known issues
-
-- The x86 SLEIGH lifter mis-decodes the length of at least one instruction
-  reached during glibc's `init_cpu_features` when CPUID advertises a
-  max-basic-leaf above 1 (so leaf 2+ cache/topology descriptors are
-  walked). The symptom is a later fetch landing mid-instruction and
-  faulting. CPUID leaf handling in `icicle-cpu/src/exec/helpers.rs` is
-  therefore left at the upstream default (max basic leaf 1). Raising it
-  (needed for Node.js/V8, milestone 7) requires closing the decode gap
-  first, ideally with a differential-decode harness.
-
 
 - On `wasm32-unknown-unknown`, building the interpreter at `opt-level = 3`
   miscompiles instruction semantics (BusyBox `ls` enters an endless loop

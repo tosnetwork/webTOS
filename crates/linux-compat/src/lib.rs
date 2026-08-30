@@ -75,6 +75,13 @@ pub(crate) fn alloc_asid() -> u64 {
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
+// Linux does not place the final argv byte against an unmapped VMA boundary.
+// Dynamic loaders and libc are therefore free to use bounded word/SIMD scans
+// that read beyond the terminating NUL while staying in the same mapped page.
+// Keep one zero-filled page above the initial strings for the same reason.
+// The page remains part of the stack mapping; it is not included in argv or
+// envp and does not change the System V stack-vector layout.
+const STACK_STRING_SCAN_SLACK: u64 = PAGE_SIZE;
 // 16 MiB: the kernel's default RLIMIT_STACK is 8 MiB, but argv/envp/auxv
 // consume the top of the region here, and a real workload's helper process
 // faulted exactly 8 bytes below an 8 MiB stack. Pages are demand-allocated,
@@ -199,6 +206,13 @@ pub struct LinuxEnv {
     /// once per process, is the workload this exists for; a fork does not see
     /// the parent's later stores (documented divergence).
     pub(crate) shared_maps: Vec<SharedMap>,
+    /// Address ranges whose bytes originate in an ELF image or file-backed
+    /// mmap. This is deliberately source-agnostic: until eager mappings retain
+    /// enough metadata to reload their exact file bytes, `MADV_DONTNEED` must
+    /// reject them instead of silently replacing file data with anonymous
+    /// zeros. Manifest-backed ranges are recreated by `pager` and remain
+    /// eligible for discard.
+    pub(crate) file_backed_ranges: Vec<FileBackedRange>,
     /// VFS node ids the guest has opened, when access tracking is on (`Some`).
     /// A delivered file never in this set was materialized for nothing — the
     /// measure of how much a lazy image could avoid. Off by default so the set
@@ -318,6 +332,7 @@ impl LinuxEnv {
             regs: Regs::resolve(cpu)?,
             vfs: Vfs::new(),
             shared_maps: Vec::new(),
+            file_backed_ranges: Vec::new(),
             opened_files: None,
             proc: Process::initial(),
             sched: Scheduler::new(),
@@ -936,6 +951,59 @@ impl LinuxEnv {
         x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
+    pub(crate) fn record_file_backed_range(&mut self, asid: u64, start: u64, len: u64) {
+        if let Some(end) = start.checked_add(len) {
+            if start < end {
+                self.file_backed_ranges
+                    .push(FileBackedRange { asid, start, end });
+            }
+        }
+    }
+
+    pub(crate) fn forget_file_backed_range(&mut self, asid: u64, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len) else {
+            self.file_backed_ranges.retain(|range| range.asid != asid);
+            return;
+        };
+        let mut kept = Vec::with_capacity(self.file_backed_ranges.len() + 1);
+        for range in self.file_backed_ranges.drain(..) {
+            if range.asid != asid || range.end <= start || range.start >= end {
+                kept.push(range);
+                continue;
+            }
+            if range.start < start {
+                kept.push(FileBackedRange {
+                    end: start,
+                    ..range
+                });
+            }
+            if range.end > end {
+                kept.push(FileBackedRange {
+                    start: end,
+                    ..range
+                });
+            }
+        }
+        self.file_backed_ranges = kept;
+    }
+
+    pub(crate) fn fork_file_backed_ranges(&mut self, parent_asid: u64, child_asid: u64) {
+        let inherited: Vec<FileBackedRange> = self
+            .file_backed_ranges
+            .iter()
+            .filter(|range| range.asid == parent_asid)
+            .map(|range| FileBackedRange {
+                asid: child_asid,
+                ..*range
+            })
+            .collect();
+        self.file_backed_ranges.extend(inherited);
+    }
+
+    pub(crate) fn drop_file_backed_space(&mut self, asid: u64) {
+        self.file_backed_ranges.retain(|range| range.asid != asid);
+    }
+
     #[allow(dead_code)]
     pub(crate) fn alloc_mmap(&mut self, len: u64) -> u64 {
         let target = self.proc.mmap_next.get();
@@ -990,6 +1058,20 @@ impl LinuxEnv {
         } else {
             self.load_elf(cpu, path)?
         };
+
+        // `start_image` replaces this address space. Keep just the new ELF
+        // ranges so stale metadata cannot classify a later anonymous mmap as
+        // file-backed after exec.
+        self.file_backed_ranges
+            .retain(|range| range.asid != self.proc.asid);
+        self.record_file_backed_range(
+            self.proc.asid,
+            metadata.binary.base_ptr,
+            metadata.binary.length,
+        );
+        if let Some(interpreter) = &metadata.interpreter {
+            self.record_file_backed_range(self.proc.asid, interpreter.base_ptr, interpreter.length);
+        }
 
         self.proc.exe_path = if path.first() == Some(&b'/') {
             path.to_vec()
@@ -1047,7 +1129,7 @@ impl LinuxEnv {
             .then_some(())
             .ok_or("failed to map stack")?;
 
-        let mut write_top = STACK_TOP;
+        let mut write_top = STACK_TOP - STACK_STRING_SCAN_SLACK;
         let mut push_bytes = |cpu: &mut Cpu, bytes: &[u8]| -> Result<u64, String> {
             write_top -= bytes.len() as u64;
             cpu.mem
@@ -1178,6 +1260,7 @@ impl Environment for LinuxEnv {
         // the process that was just discarded.
         let old_asid = self.proc.asid;
         self.pager.drop_space(old_asid);
+        self.drop_file_backed_space(old_asid);
         self.file_chunk_wait = None;
         // A fresh root process; the filesystem persists across loads, any
         // tasks from a previous run do not.
@@ -1396,6 +1479,13 @@ pub(crate) struct SharedMap {
     pub(crate) len: u64,
     pub(crate) node: usize,
     pub(crate) offset: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FileBackedRange {
+    pub(crate) asid: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
 }
 
 impl Machine {

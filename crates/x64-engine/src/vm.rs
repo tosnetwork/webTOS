@@ -11,6 +11,13 @@ use icicle_cpu::{
     InternalError, ValueSource, VmExit,
 };
 
+/// Bound one compiled loop dispatch independently of the caller's fuel slice.
+/// Browser hosts cannot preempt a synchronous WebAssembly call. Giving a hot
+/// REP/string loop an entire multi-million-instruction slice can therefore
+/// freeze page-in, terminal, timer, and cancellation handling for minutes.
+/// Re-dispatch is architecturally invisible and keeps exact fuel accounting.
+const JIT_REGION_DISPATCH_BUDGET: u64 = 65_536;
+
 // Mirrors of the running machine's state, for code that cannot reach the CPU
 // — memory-write hooks, and the block cache's key.
 //
@@ -1302,9 +1309,11 @@ impl InterpVm {
                                     crate::jit::RegionOutcome::Unavailable
                                 } else {
                                     match self.jit.as_mut() {
-                                        Some(j) => {
-                                            j.call_region(handle, &mut self.cpu, fuel_before)
-                                        }
+                                        Some(j) => j.call_region(
+                                            handle,
+                                            &mut self.cpu,
+                                            fuel_before.min(JIT_REGION_DISPATCH_BUDGET),
+                                        ),
                                         None => crate::jit::RegionOutcome::Unavailable,
                                     }
                                 };
@@ -1480,7 +1489,8 @@ impl InterpVm {
                                 // Bound the region to the fuel budget so it never
                                 // retires more than the interpreter would in this
                                 // slice; at least one iteration by the guard above.
-                                let max_iters = self.cpu.fuel.remaining / num;
+                                let max_iters =
+                                    (self.cpu.fuel.remaining / num).min(JIT_REGION_DISPATCH_BUDGET);
                                 let outcome = match self.jit.as_mut() {
                                     Some(j) => j.call_region(handle, &mut self.cpu, max_iters),
                                     None => crate::jit::RegionOutcome::Unavailable,

@@ -387,6 +387,20 @@ fn run_argv(machine: &mut Machine, path: &str, args: &[&str]) -> Run {
     machine.load(path.as_bytes()).expect("ELF load failed");
     machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
     let exit = machine.run();
+    if let CpuExit::IllegalInstruction { rip } = exit {
+        let mut instruction = [0_u8; 15];
+        let readable = machine
+            .vm_mut()
+            .cpu
+            .mem
+            .read_bytes(rip, &mut instruction, icicle_cpu::mem::perm::NONE)
+            .is_ok();
+        if readable {
+            eprintln!("illegal instruction at {rip:#x}: {instruction:02x?}");
+        } else {
+            eprintln!("illegal instruction at {rip:#x}: <unmapped>");
+        }
+    }
     let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
     Run { exit, output }
 }
