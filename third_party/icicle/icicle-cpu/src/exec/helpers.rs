@@ -387,6 +387,14 @@ pub mod x86 {
         ("webtos_vperm2b_mem_256_chunk", packed_permute2_b_mem_256_chunk),
         ("webtos_vperm2b_mem_512_chunk", packed_permute2_b_mem_512_chunk),
         ("webtos_apply_byte_mask_128", apply_byte_mask_128),
+        ("webtos_vpmaddubsw_128", packed_maddubs_128),
+        ("webtos_vpmaddwd_128", packed_maddwd_128),
+        ("vpmaddubsw_avx", packed_maddubs_128),
+        ("vpmaddwd_avx", packed_maddwd_128),
+        ("webtos_vpmaddubsw_avx2_128", packed_maddubs_128),
+        ("webtos_vpmaddwd_avx2_128", packed_maddwd_128),
+        ("webtos_vpmovm2b_128", packed_mask_to_bytes_128),
+        ("webtos_vpmovb2m_128", packed_bytes_to_mask_128),
         ("webtos_vpcompressd_128_chunk", packed_compress_d_128_chunk),
         ("webtos_vpcompressd_256_chunk", packed_compress_d_256_chunk),
         ("webtos_vpcompressd_512_chunk", packed_compress_d_512_chunk),
@@ -889,6 +897,83 @@ pub mod x86 {
             };
         }
         cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_maddubs_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let unsigned = cpu.read::<u128>(args[0]).to_le_bytes();
+        let signed = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..8 {
+            let offset = lane * 2;
+            let sum = i32::from(unsigned[offset]) * i32::from(signed[offset] as i8)
+                + i32::from(unsigned[offset + 1]) * i32::from(signed[offset + 1] as i8);
+            output[offset..offset + 2].copy_from_slice(
+                &(sum.clamp(i16::MIN.into(), i16::MAX.into()) as i16).to_le_bytes(),
+            );
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_maddwd_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let left = cpu.read::<u128>(args[0]).to_le_bytes();
+        let right = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..4 {
+            let offset = lane * 4;
+            let left0 = i16::from_le_bytes(left[offset..offset + 2].try_into().unwrap());
+            let left1 = i16::from_le_bytes(left[offset + 2..offset + 4].try_into().unwrap());
+            let right0 = i16::from_le_bytes(right[offset..offset + 2].try_into().unwrap());
+            let right1 = i16::from_le_bytes(right[offset + 2..offset + 4].try_into().unwrap());
+            let sum = i32::from(left0)
+                .wrapping_mul(i32::from(right0))
+                .wrapping_add(i32::from(left1).wrapping_mul(i32::from(right1)));
+            output[offset..offset + 4].copy_from_slice(&sum.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_mask_to_bytes_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mask = cpu.read::<u64>(args[0]);
+        let chunk = cpu.read::<u8>(args[1]) as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for (lane, byte) in output.iter_mut().enumerate() {
+            *byte = if mask & (1_u64 << (chunk * 16 + lane)) != 0 { 0xff } else { 0 };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_bytes_to_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 2 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let bytes = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut mask = 0_u16;
+        for (lane, byte) in bytes.into_iter().enumerate() {
+            mask |= u16::from(byte >> 7) << lane;
+        }
+        cpu.write_var(dst, mask);
     }
 
     fn packed_compact_d_chunk(

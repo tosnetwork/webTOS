@@ -1052,6 +1052,126 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
         },
         Case {
+            name: "vpmaddubsw xmm1,xmm2,xmm3",
+            bytes: &[0xc4, 0xe2, 0x69, 0x04, 0xcb],
+        },
+        Case {
+            name: "vpmaddubsw xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf2, 0x4d, 0x0d, 0x04, 0xe7],
+        },
+        Case {
+            name: "vpmaddubsw xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x52, 0x35, 0x8d, 0x04, 0xc2],
+        },
+        Case {
+            name: "vpmaddubsw ymm11,ymm12,ymm13",
+            bytes: &[0xc4, 0x42, 0x1d, 0x04, 0xdd],
+        },
+        Case {
+            name: "vpmaddubsw ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x32, 0x05, 0x2d, 0x04, 0xf0],
+        },
+        Case {
+            name: "vpmaddubsw ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa2, 0x6d, 0xa5, 0x04, 0xcb],
+        },
+        Case {
+            name: "vpmaddubsw zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa2, 0x55, 0x40, 0x04, 0xe6],
+        },
+        Case {
+            name: "vpmaddubsw zmm23{k5},zmm24,zmm25",
+            bytes: &[0x62, 0x82, 0x3d, 0x45, 0x04, 0xf9],
+        },
+        Case {
+            name: "vpmaddubsw zmm26{k5}{z},zmm27,zmm28",
+            bytes: &[0x62, 0x02, 0x25, 0xc5, 0x04, 0xd4],
+        },
+        Case {
+            name: "vpmaddubsw xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0x6d, 0x8d, 0x04, 0x0e],
+        },
+        Case {
+            name: "vpmaddubsw ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0x5d, 0xad, 0x04, 0x1e],
+        },
+        Case {
+            name: "vpmaddubsw zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf2, 0x4d, 0xcd, 0x04, 0x2e],
+        },
+        Case {
+            name: "vpmaddwd xmm1,xmm2,xmm3",
+            bytes: &[0xc5, 0xe9, 0xf5, 0xcb],
+        },
+        Case {
+            name: "vpmaddwd xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf1, 0x4d, 0x0d, 0xf5, 0xe7],
+        },
+        Case {
+            name: "vpmaddwd xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x51, 0x35, 0x8d, 0xf5, 0xc2],
+        },
+        Case {
+            name: "vpmaddwd ymm11,ymm12,ymm13",
+            bytes: &[0xc4, 0x41, 0x1d, 0xf5, 0xdd],
+        },
+        Case {
+            name: "vpmaddwd ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x31, 0x05, 0x2d, 0xf5, 0xf0],
+        },
+        Case {
+            name: "vpmaddwd ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa1, 0x6d, 0xa5, 0xf5, 0xcb],
+        },
+        Case {
+            name: "vpmaddwd zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa1, 0x55, 0x40, 0xf5, 0xe6],
+        },
+        Case {
+            name: "vpmaddwd zmm23{k5},zmm24,zmm25",
+            bytes: &[0x62, 0x81, 0x3d, 0x45, 0xf5, 0xf9],
+        },
+        Case {
+            name: "vpmaddwd zmm26{k5}{z},zmm27,zmm28",
+            bytes: &[0x62, 0x01, 0x25, 0xc5, 0xf5, 0xd4],
+        },
+        Case {
+            name: "vpmaddwd xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf1, 0x6d, 0x8d, 0xf5, 0x0e],
+        },
+        Case {
+            name: "vpmaddwd ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf1, 0x5d, 0xad, 0xf5, 0x1e],
+        },
+        Case {
+            name: "vpmaddwd zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf1, 0x4d, 0xcd, 0xf5, 0x2e],
+        },
+        Case {
+            name: "vpmovm2b xmm1,k2",
+            bytes: &[0x62, 0xf2, 0x7e, 0x08, 0x28, 0xca],
+        },
+        Case {
+            name: "vpmovm2b ymm3,k4",
+            bytes: &[0x62, 0xf2, 0x7e, 0x28, 0x28, 0xdc],
+        },
+        Case {
+            name: "vpmovm2b zmm5,k6",
+            bytes: &[0x62, 0xf2, 0x7e, 0x48, 0x28, 0xee],
+        },
+        Case {
+            name: "vpmovb2m k1,xmm2",
+            bytes: &[0x62, 0xf2, 0x7e, 0x08, 0x29, 0xca],
+        },
+        Case {
+            name: "vpmovb2m k3,ymm4",
+            bytes: &[0x62, 0xf2, 0x7e, 0x28, 0x29, 0xdc],
+        },
+        Case {
+            name: "vpmovb2m k5,zmm6",
+            bytes: &[0x62, 0xf2, 0x7e, 0x48, 0x29, 0xee],
+        },
+        Case {
             name: "vpermb xmm1,xmm2,xmm3",
             bytes: &[0x62, 0xf2, 0x6d, 0x08, 0x8d, 0xcb],
         },

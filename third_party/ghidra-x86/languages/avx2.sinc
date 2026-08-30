@@ -359,18 +359,22 @@ define pcodeop vphsubsw_avx2 ;
 }
 
 # PMADDUBSW 4-298 PAGE 1418 LINE 73555
-define pcodeop vpmaddubsw_avx2 ;
+define pcodeop webtos_vpmaddubsw_avx2_128;
 :VPMADDUBSW YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0x04; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpmaddubsw_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32;
+	tmp[0,128] = webtos_vpmaddubsw_avx2_128(vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128]);
+	tmp[128,128] = webtos_vpmaddubsw_avx2_128(vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128]);
 	ZmmReg1 = zext(tmp);
 }
 
 # PMADDWD 4-301 PAGE 1421 LINE 73704
-define pcodeop vpmaddwd_avx2 ;
+define pcodeop webtos_vpmaddwd_avx2_128;
 :VPMADDWD YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xF5; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpmaddwd_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32;
+	tmp[0,128] = webtos_vpmaddwd_avx2_128(vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128]);
+	tmp[128,128] = webtos_vpmaddwd_avx2_128(vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128]);
 	ZmmReg1 = zext(tmp);
 }
 
