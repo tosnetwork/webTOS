@@ -12855,20 +12855,47 @@ define pcodeop vpternlogq_avx512f ;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117559
+define pcodeop webtos_vptestm_128;
+define pcodeop webtos_vptestm_512;
+define pcodeop webtos_vptestm_mem_128;
+define pcodeop webtos_vptestm_mem_256;
+define pcodeop webtos_vptestm_mem_512;
 define pcodeop vptestmb_avx512vl ;
 :VPTESTMB KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg; byte=0x26; KReg_reg ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmb_avx512vl( evexV5_XmmReg, XmmReg2_m128 );
-	KReg_reg = zext(AVXOpMask[0,16]) & tmp;
+	local tmp:2 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128, 1:1, 0:1);
+	local masked:2 = AVXOpMask[0,16] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,16] = masked;
+}
+
+:VPTESTMB KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x26; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 1:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117562
 :VPTESTMB KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg; byte=0x26; KReg_reg ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
-	KReg_reg = zext(AVXOpMask[0,32]) & tmp;
+	local low:2 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256[0,128], 1:1, 0:1);
+	local high:2 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256[128,128], 1:1, 0:1);
+	local tmp:4 = zext(low) | (zext(high) << 16);
+	local masked:4 = AVXOpMask[0,32] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,32] = masked;
+}
+
+:VPTESTMB KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x26; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:4 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 1:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,32] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117565
@@ -12876,8 +12903,15 @@ define pcodeop vptestmb_avx512bw ;
 :VPTESTMB KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg; byte=0x26; KReg_reg ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmb_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
-	KReg_reg = zext(AVXOpMask[0,64]) & tmp;
+	local tmp:8 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512[0,128], ZmmReg2_m512[128,128], ZmmReg2_m512[256,128], ZmmReg2_m512[384,128], 1:1, 0:1);
+	KReg_reg = AVXOpMask & tmp;
+}
+
+:VPTESTMB KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x26; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:8 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 1:1, 0:1, 0:1);
+	KReg_reg = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117568
@@ -12885,16 +12919,38 @@ define pcodeop vptestmw_avx512vl ;
 :VPTESTMW KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg; byte=0x26; KReg_reg ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmw_avx512vl( evexV5_XmmReg, XmmReg2_m128 );
-	KReg_reg = zext(AVXOpMask[0,8]) & tmp;
+	local tmp:1 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128, 2:1, 0:1);
+	local masked:1 = AVXOpMask[0,8] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTMW KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x26; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 2:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117571
 :VPTESTMW KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg; byte=0x26; KReg_reg ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmw_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
-	KReg_reg = zext(AVXOpMask[0,16]) & tmp;
+	local low:1 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256[0,128], 2:1, 0:1);
+	local high:1 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256[128,128], 2:1, 0:1);
+	local tmp:2 = zext(low) | (zext(high) << 8);
+	local masked:2 = AVXOpMask[0,16] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,16] = masked;
+}
+
+:VPTESTMW KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x26; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 2:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117574
@@ -12902,13 +12958,21 @@ define pcodeop vptestmw_avx512bw ;
 :VPTESTMW KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg; byte=0x26; KReg_reg ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestmw_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
-	KReg_reg = zext(AVXOpMask[0,32]) & tmp;
+	local tmp:4 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512[0,128], ZmmReg2_m512[128,128], ZmmReg2_m512[256,128], ZmmReg2_m512[384,128], 2:1, 0:1);
+	local masked:4 = AVXOpMask[0,32] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,32] = masked;
+}
+
+:VPTESTMW KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x26; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:4 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 2:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,32] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117577
-define pcodeop webtos_vptestm_128;
-define pcodeop webtos_vptestm_512;
 :VPTESTMD KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128_m32bcst  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg; byte=0x27; KReg_reg ... & XmmReg2_m128_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
@@ -12916,6 +12980,22 @@ define pcodeop webtos_vptestm_512;
 	local masked:1 = AVXOpMask[0,4] & tmp[0,4];
 	KReg_reg = 0;
 	KReg_reg[0,8] = masked;
+}
+
+:VPTESTMD KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x27; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 4:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTMD KReg_reg AVXOpMask, evexV5_XmmReg, m32Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m32Addr, evexV5_XmmReg, AVXOpMask, 4:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117581
@@ -12930,6 +13010,22 @@ define pcodeop webtos_vptestm_512;
 	KReg_reg[0,8] = masked;
 }
 
+:VPTESTMD KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x27; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 4:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTMD KReg_reg AVXOpMask, evexV5_YmmReg, m32Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m32Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 4:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117585
 :VPTESTMD KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512_m32bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg; byte=0x27; KReg_reg ... & ZmmReg2_m512_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
@@ -12940,21 +13036,75 @@ define pcodeop webtos_vptestm_512;
 	KReg_reg[0,16] = masked;
 }
 
+:VPTESTMD KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x27; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 4:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
+}
+
+:VPTESTMD KReg_reg AVXOpMask, evexV5_ZmmReg, m32Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_512(m32Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 4:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
+}
+
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117589
 define pcodeop vptestmq_avx512vl ;
 :VPTESTMQ KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128_m64bcst  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg; byte=0x27; KReg_reg ... & XmmReg2_m128_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestmq_avx512vl( evexV5_XmmReg, XmmReg2_m128_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,2]) & tmp;
+	local tmp:1 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128_m64bcst, 8:1, 0:1);
+	local masked:1 = AVXOpMask[0,2] & tmp[0,2];
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x27; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 8:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_XmmReg, m64Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m64Addr, evexV5_XmmReg, AVXOpMask, 8:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117593
 :VPTESTMQ KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256_m64bcst  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg; byte=0x27; KReg_reg ... & YmmReg2_m256_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestmq_avx512vl( evexV5_YmmReg, YmmReg2_m256_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,4]) & tmp;
+	local low:1 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256_m64bcst[0,128], 8:1, 0:1);
+	local high:1 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256_m64bcst[128,128], 8:1, 0:1);
+	local tmp:1 = low[0,2] | (high[0,2] << 2);
+	local masked:1 = AVXOpMask[0,4] & tmp[0,4];
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x27; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 8:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_YmmReg, m64Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m64Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 8:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTMB/VPTESTMW/VPTESTMD/VPTESTMQ 5-463 PAGE 2287 LINE 117597
@@ -12962,8 +13112,26 @@ define pcodeop vptestmq_avx512f ;
 :VPTESTMQ KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512_m64bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg; byte=0x27; KReg_reg ... & ZmmReg2_m512_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestmq_avx512f( evexV5_ZmmReg, ZmmReg2_m512_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,8]) & tmp;
+	local tmp:1 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512_m64bcst[0,128], ZmmReg2_m512_m64bcst[128,128], ZmmReg2_m512_m64bcst[256,128], ZmmReg2_m512_m64bcst[384,128], 8:1, 0:1);
+	local masked:1 = AVXOpMask[0,8] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x27; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 8:1, 0:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTMQ KReg_reg AVXOpMask, evexV5_ZmmReg, m64Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_512(m64Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 8:1, 0:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117717
@@ -12971,16 +13139,38 @@ define pcodeop vptestnmb_avx512vl ;
 :VPTESTNMB KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg; byte=0x26; KReg_reg ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmb_avx512vl( evexV5_XmmReg, XmmReg2_m128 );
-	KReg_reg = zext(AVXOpMask[0,16]) & tmp;
+	local tmp:2 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128, 1:1, 1:1);
+	local masked:2 = AVXOpMask[0,16] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,16] = masked;
+}
+
+:VPTESTNMB KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x26; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 1:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117721
 :VPTESTNMB KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg; byte=0x26; KReg_reg ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
-	KReg_reg = zext(AVXOpMask[0,32]) & tmp;
+	local low:2 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256[0,128], 1:1, 1:1);
+	local high:2 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256[128,128], 1:1, 1:1);
+	local tmp:4 = zext(low) | (zext(high) << 16);
+	local masked:4 = AVXOpMask[0,32] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,32] = masked;
+}
+
+:VPTESTNMB KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x26; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:4 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 1:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,32] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117725
@@ -12988,8 +13178,15 @@ define pcodeop vptestnmb_avx512f ;
 :VPTESTNMB KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg; byte=0x26; KReg_reg ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmb_avx512f( evexV5_ZmmReg, ZmmReg2_m512 );
-	KReg_reg = zext(AVXOpMask[0,64]) & tmp;
+	local tmp:8 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512[0,128], ZmmReg2_m512[128,128], ZmmReg2_m512[256,128], ZmmReg2_m512[384,128], 1:1, 1:1);
+	KReg_reg = AVXOpMask & tmp;
+}
+
+:VPTESTNMB KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x26; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:8 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 1:1, 1:1, 0:1);
+	KReg_reg = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117729
@@ -12997,16 +13194,38 @@ define pcodeop vptestnmw_avx512vl ;
 :VPTESTNMW KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg; byte=0x26; KReg_reg ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmw_avx512vl( evexV5_XmmReg, XmmReg2_m128 );
-	KReg_reg = zext(AVXOpMask[0,8]) & tmp;
+	local tmp:1 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128, 2:1, 1:1);
+	local masked:1 = AVXOpMask[0,8] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMW KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x26; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 2:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117733
 :VPTESTNMW KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg; byte=0x26; KReg_reg ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmw_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
-	KReg_reg = zext(AVXOpMask[0,16]) & tmp;
+	local low:1 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256[0,128], 2:1, 1:1);
+	local high:1 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256[128,128], 2:1, 1:1);
+	local tmp:2 = zext(low) | (zext(high) << 8);
+	local masked:2 = AVXOpMask[0,16] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,16] = masked;
+}
+
+:VPTESTNMW KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x26; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 2:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117737
@@ -13014,8 +13233,18 @@ define pcodeop vptestnmw_avx512f ;
 :VPTESTNMW KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg; byte=0x26; KReg_reg ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vptestnmw_avx512f( evexV5_ZmmReg, ZmmReg2_m512 );
-	KReg_reg = zext(AVXOpMask[0,32]) & tmp;
+	local tmp:4 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512[0,128], ZmmReg2_m512[128,128], ZmmReg2_m512[256,128], ZmmReg2_m512[384,128], 2:1, 1:1);
+	local masked:4 = AVXOpMask[0,32] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,32] = masked;
+}
+
+:VPTESTNMW KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x26; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 1; evexTType = 0; ]
+{
+	local tmp:4 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 2:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,32] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117741
@@ -13023,16 +13252,54 @@ define pcodeop vptestnmd_avx512vl ;
 :VPTESTNMD KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128_m32bcst  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg; byte=0x27; KReg_reg ... & XmmReg2_m128_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmd_avx512vl( evexV5_XmmReg, XmmReg2_m128_m32bcst );
-	KReg_reg = zext(AVXOpMask[0,4]) & tmp;
+	local tmp:1 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128_m32bcst, 4:1, 1:1);
+	local masked:1 = AVXOpMask[0,4] & tmp[0,4];
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x27; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 4:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_XmmReg, m32Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_XmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m32Addr, evexV5_XmmReg, AVXOpMask, 4:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117745
 :VPTESTNMD KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256_m32bcst  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg; byte=0x27; KReg_reg ... & YmmReg2_m256_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmd_avx512vl( evexV5_YmmReg, YmmReg2_m256_m32bcst );
-	KReg_reg = zext(AVXOpMask[0,8]) & tmp;
+	local low:1 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256_m32bcst[0,128], 4:1, 1:1);
+	local high:1 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256_m32bcst[128,128], 4:1, 1:1);
+	local tmp:1 = low[0,4] | (high[0,4] << 4);
+	local masked:1 = AVXOpMask[0,8] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x27; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 4:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_YmmReg, m32Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_YmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m32Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 4:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117749
@@ -13040,8 +13307,26 @@ define pcodeop vptestnmd_avx512f ;
 :VPTESTNMD KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512_m32bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg; byte=0x27; KReg_reg ... & ZmmReg2_m512_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmd_avx512f( evexV5_ZmmReg, ZmmReg2_m512_m32bcst );
-	KReg_reg = zext(AVXOpMask[0,16]) & tmp;
+	local tmp:2 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512_m32bcst[0,128], ZmmReg2_m512_m32bcst[128,128], ZmmReg2_m512_m32bcst[256,128], ZmmReg2_m512_m32bcst[384,128], 4:1, 1:1);
+	local masked:2 = AVXOpMask[0,16] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,16] = masked;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x27; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 4:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
+}
+
+:VPTESTNMD KReg_reg AVXOpMask, evexV5_ZmmReg, m32Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexV5_ZmmReg & evexB=1; byte=0x27; KReg_reg ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:2 = webtos_vptestm_mem_512(m32Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 4:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,16] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117753
@@ -13049,16 +13334,54 @@ define pcodeop vptestnmq_avx512vl ;
 :VPTESTNMQ KReg_reg AVXOpMask, evexV5_XmmReg, XmmReg2_m128_m64bcst  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg; byte=0x27; KReg_reg ... & XmmReg2_m128_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmq_avx512vl( evexV5_XmmReg, XmmReg2_m128_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,2]) & tmp;
+	local tmp:1 = webtos_vptestm_128(evexV5_XmmReg, XmmReg2_m128_m64bcst, 8:1, 1:1);
+	local masked:1 = AVXOpMask[0,2] & tmp[0,2];
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_XmmReg, m128Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=0; byte=0x27; KReg_reg ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m128Addr, evexV5_XmmReg, AVXOpMask, 8:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_XmmReg, m64Addr  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_XmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_128(m64Addr, evexV5_XmmReg, AVXOpMask, 8:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117757
 :VPTESTNMQ KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256_m64bcst  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg; byte=0x27; KReg_reg ... & YmmReg2_m256_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmq_avx512vl( evexV5_YmmReg, YmmReg2_m256_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,4]) & tmp;
+	local low:1 = webtos_vptestm_128(evexV5_YmmReg[0,128], YmmReg2_m256_m64bcst[0,128], 8:1, 1:1);
+	local high:1 = webtos_vptestm_128(evexV5_YmmReg[128,128], YmmReg2_m256_m64bcst[128,128], 8:1, 1:1);
+	local tmp:1 = low[0,2] | (high[0,2] << 2);
+	local masked:1 = AVXOpMask[0,4] & tmp[0,4];
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_YmmReg, m256Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=0; byte=0x27; KReg_reg ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m256Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 8:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_YmmReg, m64Addr  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_YmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_256(m64Addr, evexV5_YmmReg[0,128], evexV5_YmmReg[128,128], AVXOpMask, 8:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VPTESTNMB/W/D/Q 5-466 PAGE 2290 LINE 117761
@@ -13066,8 +13389,26 @@ define pcodeop vptestnmq_avx512f ;
 :VPTESTNMQ KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512_m64bcst  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg; byte=0x27; KReg_reg ... & ZmmReg2_m512_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType FV)
 {
-	local tmp = vptestnmq_avx512f( evexV5_ZmmReg, ZmmReg2_m512_m64bcst );
-	KReg_reg = zext(AVXOpMask[0,8]) & tmp;
+	local tmp:1 = webtos_vptestm_512(evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], ZmmReg2_m512_m64bcst[0,128], ZmmReg2_m512_m64bcst[128,128], ZmmReg2_m512_m64bcst[256,128], ZmmReg2_m512_m64bcst[384,128], 8:1, 1:1);
+	local masked:1 = AVXOpMask[0,8] & tmp;
+	KReg_reg = 0;
+	KReg_reg[0,8] = masked;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_ZmmReg, m512Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=0; byte=0x27; KReg_reg ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_512(m512Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 8:1, 1:1, 0:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
+}
+
+:VPTESTNMQ KReg_reg AVXOpMask, evexV5_ZmmReg, m64Addr  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexV5_ZmmReg & evexB=1; byte=0x27; KReg_reg ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	local tmp:1 = webtos_vptestm_mem_512(m64Addr, evexV5_ZmmReg[0,128], evexV5_ZmmReg[128,128], evexV5_ZmmReg[256,128], evexV5_ZmmReg[384,128], AVXOpMask, 8:1, 1:1, 1:1);
+	KReg_reg = 0;
+	KReg_reg[0,8] = tmp;
 }
 
 # VRANGEPD 5-470 PAGE 2294 LINE 117905

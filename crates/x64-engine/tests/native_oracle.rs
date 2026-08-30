@@ -154,11 +154,34 @@ fn native(case: Case) -> ResultState {
     native_with_layout(case, 0, false)
 }
 
-fn native_with_layout(case: Case, data_offset: usize, protect_tail: bool) -> ResultState {
+fn require_oracle_feature_set() {
+    let required = [
+        ("avx2", std::is_x86_feature_detected!("avx2")),
+        ("bmi1", std::is_x86_feature_detected!("bmi1")),
+        ("bmi2", std::is_x86_feature_detected!("bmi2")),
+        ("avx512f", std::is_x86_feature_detected!("avx512f")),
+        ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
+        ("avx512cd", std::is_x86_feature_detected!("avx512cd")),
+        ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+        ("avx512vbmi2", std::is_x86_feature_detected!("avx512vbmi2")),
+        (
+            "avx512vpopcntdq",
+            std::is_x86_feature_detected!("avx512vpopcntdq"),
+        ),
+    ];
+    let missing: Vec<_> = required
+        .into_iter()
+        .filter_map(|(name, present)| (!present).then_some(name))
+        .collect();
     assert!(
-        std::is_x86_feature_detected!("avx512f"),
-        "native oracle requires AVX-512F"
+        missing.is_empty(),
+        "native oracle host lacks required Ice Lake execution features: {}",
+        missing.join(", ")
     );
+}
+
+fn native_with_layout(case: Case, data_offset: usize, protect_tail: bool) -> ResultState {
+    require_oracle_feature_set();
     let mapping = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -357,6 +380,15 @@ fn emulated_with_layout(
         .write_bytes(data_base, &vec![0x5a; PAGE], perm::NONE)
         .unwrap();
     (vm.cpu.arch.on_boot)(&mut vm.cpu, code);
+    let decoded = x64_engine::decode::decode_one(&vm.cpu, case.bytes)
+        .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", case.name));
+    assert_eq!(
+        decoded.len,
+        case.bytes.len(),
+        "{} decoded with the wrong length as {}",
+        case.name,
+        decoded.disasm
+    );
 
     let names = [
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12",
@@ -653,6 +685,234 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xf2, 0x7d, 0x48, 0x27, 0xc0],
         },
         Case {
+            name: "vptestmb k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0x65, 0x0a, 0x26, 0xcc],
+        },
+        Case {
+            name: "vptestmb k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0x55, 0x2c, 0x26, 0xde],
+        },
+        Case {
+            name: "vptestmb k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0x45, 0x4e, 0x26, 0xe8],
+        },
+        Case {
+            name: "vptestmw k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0xe5, 0x0a, 0x26, 0xcc],
+        },
+        Case {
+            name: "vptestmw k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0xd5, 0x2c, 0x26, 0xde],
+        },
+        Case {
+            name: "vptestmw k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0xc5, 0x4e, 0x26, 0xe8],
+        },
+        Case {
+            name: "vptestmq k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0xe5, 0x0a, 0x27, 0xcc],
+        },
+        Case {
+            name: "vptestmq k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0xd5, 0x2c, 0x27, 0xde],
+        },
+        Case {
+            name: "vptestmq k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0xc5, 0x4e, 0x27, 0xe8],
+        },
+        Case {
+            name: "vptestnmb k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0x66, 0x0a, 0x26, 0xcc],
+        },
+        Case {
+            name: "vptestnmb k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0x56, 0x2c, 0x26, 0xde],
+        },
+        Case {
+            name: "vptestnmb k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0x46, 0x4e, 0x26, 0xe8],
+        },
+        Case {
+            name: "vptestnmw k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0xe6, 0x0a, 0x26, 0xcc],
+        },
+        Case {
+            name: "vptestnmw k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0xd6, 0x2c, 0x26, 0xde],
+        },
+        Case {
+            name: "vptestnmw k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0xc6, 0x4e, 0x26, 0xe8],
+        },
+        Case {
+            name: "vptestnmd k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0x66, 0x0a, 0x27, 0xcc],
+        },
+        Case {
+            name: "vptestnmd k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0x56, 0x2c, 0x27, 0xde],
+        },
+        Case {
+            name: "vptestnmd k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0x46, 0x4e, 0x27, 0xe8],
+        },
+        Case {
+            name: "vptestnmq k1{k2},xmm3,xmm4",
+            bytes: &[0x62, 0xf2, 0xe6, 0x0a, 0x27, 0xcc],
+        },
+        Case {
+            name: "vptestnmq k3{k4},ymm5,ymm6",
+            bytes: &[0x62, 0xf2, 0xd6, 0x2c, 0x27, 0xde],
+        },
+        Case {
+            name: "vptestnmq k5{k6},zmm7,zmm8",
+            bytes: &[0x62, 0xd2, 0xc6, 0x4e, 0x27, 0xe8],
+        },
+        Case {
+            name: "vptestmb k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x0a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmb k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x2a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmb k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x4a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmw k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x0a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmw k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x2a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmw k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x4a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x0a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x2a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x65, 0x4a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x0a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x2a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe5, 0x4a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmb k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x0a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmb k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x2a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmb k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x4a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmw k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x0a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmw k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x2a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmw k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x4a, 0x26, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x0a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x2a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0x66, 0x4a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},xmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x0a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},ymm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x2a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},zmm3,[rsi]",
+            bytes: &[0x62, 0xf2, 0xe6, 0x4a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},xmm3,[rsi]{1to4}",
+            bytes: &[0x62, 0xf2, 0x65, 0x1a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},ymm3,[rsi]{1to8}",
+            bytes: &[0x62, 0xf2, 0x65, 0x3a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmd k1{k2},zmm3,[rsi]{1to16}",
+            bytes: &[0x62, 0xf2, 0x65, 0x5a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},xmm3,[rsi]{1to2}",
+            bytes: &[0x62, 0xf2, 0xe5, 0x1a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},ymm3,[rsi]{1to4}",
+            bytes: &[0x62, 0xf2, 0xe5, 0x3a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestmq k1{k2},zmm3,[rsi]{1to8}",
+            bytes: &[0x62, 0xf2, 0xe5, 0x5a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},xmm3,[rsi]{1to4}",
+            bytes: &[0x62, 0xf2, 0x66, 0x1a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},ymm3,[rsi]{1to8}",
+            bytes: &[0x62, 0xf2, 0x66, 0x3a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmd k1{k2},zmm3,[rsi]{1to16}",
+            bytes: &[0x62, 0xf2, 0x66, 0x5a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},xmm3,[rsi]{1to2}",
+            bytes: &[0x62, 0xf2, 0xe6, 0x1a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},ymm3,[rsi]{1to4}",
+            bytes: &[0x62, 0xf2, 0xe6, 0x3a, 0x27, 0x0e],
+        },
+        Case {
+            name: "vptestnmq k1{k2},zmm3,[rsi]{1to8}",
+            bytes: &[0x62, 0xf2, 0xe6, 0x5a, 0x27, 0x0e],
+        },
+        Case {
             name: "vpermd zmm15,zmm16,zmm17",
             bytes: &[0x62, 0x32, 0x7d, 0x40, 0x36, 0xf9],
         },
@@ -929,6 +1189,137 @@ fn masked_vmovdqu_suppresses_inactive_page_faults_and_matches_native_store_atomi
                 should_fault,
             );
             assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
+            let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
+            let mismatches = differences(&native, &emulated);
+            assert!(
+                mismatches.is_empty(),
+                "{} at offset {data_offset:#x}:\n{}",
+                case.name,
+                mismatches.join("\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn vptest_memory_suppresses_inactive_element_faults() {
+    let cases = [
+        (
+            Case {
+                name: "vptestmb k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x65, 0x4a, 0x26, 0x0e],
+            },
+            57,
+        ),
+        (
+            Case {
+                name: "vptestmw k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0xe5, 0x4a, 0x26, 0x0e],
+            },
+            54,
+        ),
+        (
+            Case {
+                name: "vptestmd k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x65, 0x4a, 0x27, 0x0e],
+            },
+            44,
+        ),
+        (
+            Case {
+                name: "vptestmq k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0xe5, 0x4a, 0x27, 0x0e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vptestnmb k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x66, 0x4a, 0x26, 0x0e],
+            },
+            57,
+        ),
+        (
+            Case {
+                name: "vptestnmw k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0xe6, 0x4a, 0x26, 0x0e],
+            },
+            54,
+        ),
+        (
+            Case {
+                name: "vptestnmd k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x66, 0x4a, 0x27, 0x0e],
+            },
+            44,
+        ),
+        (
+            Case {
+                name: "vptestnmq k1{k2},zmm3,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0xe6, 0x4a, 0x27, 0x0e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vptestmd k1{k2},zmm3,[rsi]{1to16} boundary",
+                bytes: &[0x62, 0xf2, 0x65, 0x5a, 0x27, 0x0e],
+            },
+            4,
+        ),
+        (
+            Case {
+                name: "vptestmq k1{k2},zmm3,[rsi]{1to8} boundary",
+                bytes: &[0x62, 0xf2, 0xe5, 0x5a, 0x27, 0x0e],
+            },
+            8,
+        ),
+        (
+            Case {
+                name: "vptestnmd k1{k2},zmm3,[rsi]{1to16} boundary",
+                bytes: &[0x62, 0xf2, 0x66, 0x5a, 0x27, 0x0e],
+            },
+            4,
+        ),
+        (
+            Case {
+                name: "vptestnmq k1{k2},zmm3,[rsi]{1to8} boundary",
+                bytes: &[0x62, 0xf2, 0xe6, 0x5a, 0x27, 0x0e],
+            },
+            8,
+        ),
+    ];
+
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+    for (case, selected_span) in cases {
+        // K2 selects a sparse set of elements. Masked-off source elements do
+        // suppress faults; the last selected element ends at selected_span.
+        // Shifting the source one byte later makes precisely that element
+        // cross into the guard page.
+        for (data_offset, should_fault) in [
+            (PAGE - selected_span, false),
+            (PAGE - selected_span + 1, true),
+        ] {
+            let native = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
+            let native_repeat = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            let native_instability = differences(&native, &native_repeat);
+            assert!(
+                native_instability.is_empty(),
+                "{} at offset {data_offset:#x} native authority was not repeatable:\n{}",
+                case.name,
+                native_instability.join("\n")
+            );
             let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
             let mismatches = differences(&native, &emulated);
             assert!(

@@ -1166,6 +1166,8 @@ m512: "zmmword ptr" Mem is Mem      { export *:64 Mem; }
 m128Addr: "xmmword ptr" Mem is Mem { export Mem; }
 m256Addr: "ymmword ptr" Mem is Mem { export Mem; }
 m512Addr: "zmmword ptr" Mem is Mem { export Mem; }
+m32Addr: "dword ptr" Mem is Mem { export Mem; }
+m64Addr: "qword ptr" Mem is Mem { export Mem; }
 
 m32fp: "float ptr" Mem              is Mem      { export *:4 Mem; }
 m64fp: "double ptr" Mem             is Mem      { export *:8 Mem; }
