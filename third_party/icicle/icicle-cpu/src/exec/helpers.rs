@@ -374,6 +374,19 @@ pub mod x86 {
         ("webtos_vpermd_256_chunk", packed_permute_d_256_chunk),
         ("webtos_vpermd_512_chunk", packed_permute_d_512_chunk),
         ("webtos_vpermq_256_chunk", packed_permute_q_256_chunk),
+        ("webtos_vpermb_128_chunk", packed_permute_b_128_chunk),
+        ("webtos_vpermb_256_chunk", packed_permute_b_256_chunk),
+        ("webtos_vpermb_512_chunk", packed_permute_b_512_chunk),
+        ("webtos_vpermb_mem_128_chunk", packed_permute_b_mem_128_chunk),
+        ("webtos_vpermb_mem_256_chunk", packed_permute_b_mem_256_chunk),
+        ("webtos_vpermb_mem_512_chunk", packed_permute_b_mem_512_chunk),
+        ("webtos_vperm2b_128_chunk", packed_permute2_b_128_chunk),
+        ("webtos_vperm2b_256_chunk", packed_permute2_b_256_chunk),
+        ("webtos_vperm2b_512_chunk", packed_permute2_b_512_chunk),
+        ("webtos_vperm2b_mem_128_chunk", packed_permute2_b_mem_128_chunk),
+        ("webtos_vperm2b_mem_256_chunk", packed_permute2_b_mem_256_chunk),
+        ("webtos_vperm2b_mem_512_chunk", packed_permute2_b_mem_512_chunk),
+        ("webtos_apply_byte_mask_128", apply_byte_mask_128),
         ("webtos_vpcompressd_128_chunk", packed_compress_d_128_chunk),
         ("webtos_vpcompressd_256_chunk", packed_compress_d_256_chunk),
         ("webtos_vpcompressd_512_chunk", packed_compress_d_512_chunk),
@@ -611,6 +624,271 @@ pub mod x86 {
             );
             cpu.write_var(dst.slice(lane_in_pair * 8, 8), value);
         }
+    }
+
+    fn packed_permute_b_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        indexes: Value,
+        sources: [u128; 4],
+        lane_count: usize,
+    ) {
+        if dst.size != 16 || indexes.size() != 16 || !lane_count.is_power_of_two() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let sources = sources.map(u128::to_le_bytes);
+        let mut output = [0_u8; 16];
+        for (lane, index) in indexes.into_iter().enumerate() {
+            let source_lane = usize::from(index) & (lane_count - 1);
+            output[lane] = sources[source_lane / 16][source_lane % 16];
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_permute_b_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_chunk(cpu, dst, args[0], [cpu.read::<u128>(args[1]), 0, 0, 0], 16);
+    }
+
+    fn packed_permute_b_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            32,
+        );
+    }
+
+    fn packed_permute_b_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            64,
+        );
+    }
+
+    fn packed_permute_b_mem_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        address: Value,
+        indexes: Value,
+        lane_count: usize,
+    ) {
+        if address.size() != 8 || dst.size != 16 || indexes.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(address);
+        let mut source = [0_u8; 64];
+        for (offset, byte) in source[..lane_count].iter_mut().enumerate() {
+            let Some(current) = address.checked_add(offset as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                Ok(value) => *byte = value[0],
+                Err(error) => {
+                    cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                    cpu.exception.value = current;
+                    return;
+                }
+            }
+        }
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for (lane, index) in indexes.into_iter().enumerate() {
+            output[lane] = source[usize::from(index) & (lane_count - 1)];
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_permute_b_mem_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_mem_chunk(cpu, dst, args[0], args[1], 16);
+    }
+
+    fn packed_permute_b_mem_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_mem_chunk(cpu, dst, args[0], args[1], 32);
+    }
+
+    fn packed_permute_b_mem_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute_b_mem_chunk(cpu, dst, args[0], args[1], 64);
+    }
+
+    fn packed_permute2_b_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        indexes: Value,
+        first: [u128; 4],
+        second: [u128; 4],
+        lane_count: usize,
+    ) {
+        if dst.size != 16 || indexes.size() != 16 || !lane_count.is_power_of_two() {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let first = first.map(u128::to_le_bytes);
+        let second = second.map(u128::to_le_bytes);
+        let mut output = [0_u8; 16];
+        for (lane, index) in indexes.into_iter().enumerate() {
+            let source_lane = usize::from(index) & (lane_count * 2 - 1);
+            let (table, source_lane) = if source_lane < lane_count {
+                (&first, source_lane)
+            }
+            else {
+                (&second, source_lane - lane_count)
+            };
+            output[lane] = table[source_lane / 16][source_lane % 16];
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_permute2_b_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            [cpu.args[0], 0, 0, 0],
+            16,
+        );
+    }
+
+    fn packed_permute2_b_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            [cpu.args[1], cpu.args[2], 0, 0],
+            32,
+        );
+    }
+
+    fn packed_permute2_b_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            [cpu.args[3], cpu.args[4], cpu.args[5], cpu.args[6]],
+            64,
+        );
+    }
+
+    fn packed_permute2_b_mem_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        indexes: Value,
+        first: [u128; 4],
+        address: u64,
+        lane_count: usize,
+    ) {
+        if dst.size != 16 || indexes.size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mut second = [0_u8; 64];
+        for (offset, byte) in second[..lane_count].iter_mut().enumerate() {
+            let Some(current) = address.checked_add(offset as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                Ok(value) => *byte = value[0],
+                Err(error) => {
+                    cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                    cpu.exception.value = current;
+                    return;
+                }
+            }
+        }
+        let indexes = cpu.read::<u128>(indexes).to_le_bytes();
+        let first = first.map(u128::to_le_bytes);
+        let mut output = [0_u8; 16];
+        for (lane, index) in indexes.into_iter().enumerate() {
+            let source_lane = usize::from(index) & (lane_count * 2 - 1);
+            output[lane] = if source_lane < lane_count {
+                first[source_lane / 16][source_lane % 16]
+            }
+            else {
+                second[source_lane - lane_count]
+            };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_permute2_b_mem_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_mem_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            cpu.args[0] as u64,
+            16,
+        );
+    }
+
+    fn packed_permute2_b_mem_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_mem_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            cpu.args[1] as u64,
+            32,
+        );
+    }
+
+    fn packed_permute2_b_mem_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_permute2_b_mem_chunk(
+            cpu,
+            dst,
+            args[0],
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            cpu.args[3] as u64,
+            64,
+        );
+    }
+
+    fn apply_byte_mask_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let result = cpu.read::<u128>(args[0]).to_le_bytes();
+        let old_destination = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mask = cpu.args[0] as u64;
+        let chunk = cpu.args[1] as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..16 {
+            let global_lane = chunk * 16 + lane;
+            output[lane] = if mask & (1_u64 << global_lane) != 0 {
+                result[lane]
+            }
+            else {
+                old_destination[lane]
+            };
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
     fn packed_compact_d_chunk(

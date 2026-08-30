@@ -166,6 +166,7 @@ fn require_oracle_feature_set() {
         ("avx512bw", std::is_x86_feature_detected!("avx512bw")),
         ("avx512cd", std::is_x86_feature_detected!("avx512cd")),
         ("avx512vl", std::is_x86_feature_detected!("avx512vl")),
+        ("avx512vbmi", std::is_x86_feature_detected!("avx512vbmi")),
         ("avx512vbmi2", std::is_x86_feature_detected!("avx512vbmi2")),
         (
             "avx512vpopcntdq",
@@ -1051,6 +1052,150 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
         },
         Case {
+            name: "vpermb xmm1,xmm2,xmm3",
+            bytes: &[0x62, 0xf2, 0x6d, 0x08, 0x8d, 0xcb],
+        },
+        Case {
+            name: "vpermb xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf2, 0x4d, 0x0d, 0x8d, 0xe7],
+        },
+        Case {
+            name: "vpermb xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x52, 0x35, 0x8d, 0x8d, 0xc2],
+        },
+        Case {
+            name: "vpermb ymm11,ymm12,ymm13",
+            bytes: &[0x62, 0x52, 0x1d, 0x28, 0x8d, 0xdd],
+        },
+        Case {
+            name: "vpermb ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x32, 0x05, 0x2d, 0x8d, 0xf0],
+        },
+        Case {
+            name: "vpermb ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa2, 0x6d, 0xa5, 0x8d, 0xcb],
+        },
+        Case {
+            name: "vpermb zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa2, 0x55, 0x40, 0x8d, 0xe6],
+        },
+        Case {
+            name: "vpermb zmm23{k5},zmm24,zmm25",
+            bytes: &[0x62, 0x82, 0x3d, 0x45, 0x8d, 0xf9],
+        },
+        Case {
+            name: "vpermb zmm26{k5}{z},zmm27,zmm28",
+            bytes: &[0x62, 0x02, 0x25, 0xc5, 0x8d, 0xd4],
+        },
+        Case {
+            name: "vpermb xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0x6d, 0x8d, 0x8d, 0x0e],
+        },
+        Case {
+            name: "vpermb ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0x5d, 0xad, 0x8d, 0x1e],
+        },
+        Case {
+            name: "vpermb zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf2, 0x4d, 0xcd, 0x8d, 0x2e],
+        },
+        Case {
+            name: "vpermi2b xmm1,xmm2,xmm3",
+            bytes: &[0x62, 0xf2, 0x6d, 0x08, 0x75, 0xcb],
+        },
+        Case {
+            name: "vpermi2b xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf2, 0x4d, 0x0d, 0x75, 0xe7],
+        },
+        Case {
+            name: "vpermi2b xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x52, 0x35, 0x8d, 0x75, 0xc2],
+        },
+        Case {
+            name: "vpermi2b ymm11,ymm12,ymm13",
+            bytes: &[0x62, 0x52, 0x1d, 0x28, 0x75, 0xdd],
+        },
+        Case {
+            name: "vpermi2b ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x32, 0x05, 0x2d, 0x75, 0xf0],
+        },
+        Case {
+            name: "vpermi2b ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa2, 0x6d, 0xa5, 0x75, 0xcb],
+        },
+        Case {
+            name: "vpermi2b zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa2, 0x55, 0x40, 0x75, 0xe6],
+        },
+        Case {
+            name: "vpermi2b zmm23{k5},zmm24,zmm25",
+            bytes: &[0x62, 0x82, 0x3d, 0x45, 0x75, 0xf9],
+        },
+        Case {
+            name: "vpermi2b zmm26{k5}{z},zmm27,zmm28",
+            bytes: &[0x62, 0x02, 0x25, 0xc5, 0x75, 0xd4],
+        },
+        Case {
+            name: "vpermi2b xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0x6d, 0x8d, 0x75, 0x0e],
+        },
+        Case {
+            name: "vpermi2b ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0x5d, 0xad, 0x75, 0x1e],
+        },
+        Case {
+            name: "vpermi2b zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf2, 0x4d, 0xcd, 0x75, 0x2e],
+        },
+        Case {
+            name: "vpermt2b xmm1,xmm2,xmm3",
+            bytes: &[0x62, 0xf2, 0x6d, 0x08, 0x7d, 0xcb],
+        },
+        Case {
+            name: "vpermt2b xmm4{k5},xmm6,xmm7",
+            bytes: &[0x62, 0xf2, 0x4d, 0x0d, 0x7d, 0xe7],
+        },
+        Case {
+            name: "vpermt2b xmm8{k5}{z},xmm9,xmm10",
+            bytes: &[0x62, 0x52, 0x35, 0x8d, 0x7d, 0xc2],
+        },
+        Case {
+            name: "vpermt2b ymm11,ymm12,ymm13",
+            bytes: &[0x62, 0x52, 0x1d, 0x28, 0x7d, 0xdd],
+        },
+        Case {
+            name: "vpermt2b ymm14{k5},ymm15,ymm16",
+            bytes: &[0x62, 0x32, 0x05, 0x2d, 0x7d, 0xf0],
+        },
+        Case {
+            name: "vpermt2b ymm17{k5}{z},ymm18,ymm19",
+            bytes: &[0x62, 0xa2, 0x6d, 0xa5, 0x7d, 0xcb],
+        },
+        Case {
+            name: "vpermt2b zmm20,zmm21,zmm22",
+            bytes: &[0x62, 0xa2, 0x55, 0x40, 0x7d, 0xe6],
+        },
+        Case {
+            name: "vpermt2b zmm23{k5},zmm24,zmm25",
+            bytes: &[0x62, 0x82, 0x3d, 0x45, 0x7d, 0xf9],
+        },
+        Case {
+            name: "vpermt2b zmm26{k5}{z},zmm27,zmm28",
+            bytes: &[0x62, 0x02, 0x25, 0xc5, 0x7d, 0xd4],
+        },
+        Case {
+            name: "vpermt2b xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0x6d, 0x8d, 0x7d, 0x0e],
+        },
+        Case {
+            name: "vpermt2b ymm3{k5}{z},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0x5d, 0xad, 0x7d, 0x1e],
+        },
+        Case {
+            name: "vpermt2b zmm5{k5}{z},zmm6,[rsi]",
+            bytes: &[0x62, 0xf2, 0x4d, 0xcd, 0x7d, 0x2e],
+        },
+        Case {
             name: "vpmultishiftqb xmm1,xmm2,xmm3",
             bytes: &[0x62, 0xf2, 0xed, 0x08, 0x83, 0xcb],
         },
@@ -1835,6 +1980,113 @@ fn vpmultishift_memory_masks_and_broadcasts_have_precise_faults() {
         // not suppress ordinary source reads. The normal form consumes the
         // complete vector even though K7 selects only lanes 0..7, while the
         // broadcast form consumes exactly one qword.
+        for (data_offset, should_fault) in
+            [(PAGE - source_span, false), (PAGE - source_span + 1, true)]
+        {
+            let native = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
+            let native_repeat = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            let native_instability = differences(&native, &native_repeat);
+            assert!(
+                native_instability.is_empty(),
+                "{} at offset {data_offset:#x} native authority was not repeatable:\n{}",
+                case.name,
+                native_instability.join("\n")
+            );
+            let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
+            let mismatches = differences(&native, &emulated);
+            assert!(
+                mismatches.is_empty(),
+                "{} at offset {data_offset:#x}:\n{}",
+                case.name,
+                mismatches.join("\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn byte_permute_memory_forms_have_precise_full_source_faults() {
+    let cases = [
+        (
+            Case {
+                name: "vpermb xmm1{k7}{z},xmm2,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x6d, 0x8f, 0x8d, 0x0e],
+            },
+            16,
+        ),
+        (
+            Case {
+                name: "vpermb ymm3{k7}{z},ymm4,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x5d, 0xaf, 0x8d, 0x1e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vpermb zmm5{k7}{z},zmm6,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x4d, 0xcf, 0x8d, 0x2e],
+            },
+            64,
+        ),
+        (
+            Case {
+                name: "vpermi2b xmm1{k7}{z},xmm2,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x6d, 0x8f, 0x75, 0x0e],
+            },
+            16,
+        ),
+        (
+            Case {
+                name: "vpermi2b ymm3{k7}{z},ymm4,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x5d, 0xaf, 0x75, 0x1e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vpermi2b zmm5{k7}{z},zmm6,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x4d, 0xcf, 0x75, 0x2e],
+            },
+            64,
+        ),
+        (
+            Case {
+                name: "vpermt2b xmm1{k7}{z},xmm2,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x6d, 0x8f, 0x7d, 0x0e],
+            },
+            16,
+        ),
+        (
+            Case {
+                name: "vpermt2b ymm3{k7}{z},ymm4,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x5d, 0xaf, 0x7d, 0x1e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vpermt2b zmm5{k7}{z},zmm6,[rsi] boundary",
+                bytes: &[0x62, 0xf2, 0x4d, 0xcf, 0x7d, 0x2e],
+            },
+            64,
+        ),
+    ];
+
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+    for (case, source_span) in cases {
+        // These full-vector memory operands consume every source byte even
+        // when K7 selects only result lanes 0..7.
         for (data_offset, should_fault) in
             [(PAGE - source_span, false), (PAGE - source_span + 1, true)]
         {
