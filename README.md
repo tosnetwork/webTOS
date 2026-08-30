@@ -53,6 +53,34 @@ The short version:
 > The interface may be generated for the task. The tools behind it are real.
 > The execution stays local and bounded in the browser.
 
+### Core innovation
+
+webTOS is not innovative merely because it emulates x86. Its central
+innovation is a **capability-bounded Linux computer inside a browser tab**:
+real, unmodified software runs locally, while authority remains with the
+browser host and the user.
+
+🔸 **The program, not a port.** Existing Linux x86-64 ELF binaries run without
+being rebuilt for WebAssembly or rewritten in JavaScript. The compatibility
+boundary includes the processes, threads, signals, files, sockets, and
+pseudoterminals that real tools and coding agents expect.
+
+🔸 **Local execution without ambient authority.** Compute and workspace state
+remain on the user's machine, but the guest does not inherit the machine's
+authority. Network destinations, credentials, files, and external effects are
+made available only through explicit host policy.
+
+🔸 **Resource limits that software can survive.** CPU, memory, storage,
+network, and event-log budgets are enforced by the runtime. Where possible, a
+workload over a limit receives a Linux error it can handle instead of taking
+down the browser tab.
+
+🔸 **A foundation for intent-native applications.** The shipped runtime gives
+a dynamically composed interface real Linux tools, local processes,
+persistent state, and enforceable capabilities behind it. Application Graphs
+and public composition APIs remain product direction rather than shipped
+functionality.
+
 ### Current goal and future direction
 
 The current engineering goal is to run unmodified Linux x86-64 AI agent

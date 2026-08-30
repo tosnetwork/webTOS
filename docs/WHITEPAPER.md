@@ -43,6 +43,51 @@ The one-line pitch: **the link is the install, and the tab is the computer.**
 
 ---
 
+## The Core Innovation
+
+The core innovation is not x86 emulation in isolation. It is a
+**capability-bounded Linux computer inside a browser tab**: an execution
+environment substantial enough for unmodified Linux agents and tools, local
+enough to keep compute and workspace state on the user's machine, and bounded
+enough that software receives only the authority the host deliberately
+grants.
+
+🔸 **The program, not a port.** webTOS runs existing Linux x86-64 ELF binaries
+rather than requiring a WebAssembly rebuild, a JavaScript reimplementation,
+or a vendor-maintained browser edition. Compatibility therefore follows the
+software users already depend on, including dynamic loaders, subprocesses,
+signals, terminals, and ordinary Unix tools.
+
+🔸 **A third deployment shape for agents.** A coding agent no longer has to run
+only in an operator's cloud container or as an unbounded local installation.
+It can run on the user's hardware inside the browser sandbox, opened through a
+link and isolated from the host operating system.
+
+🔸 **Useful agency with explicit authority.** The guest can perform real work,
+but it begins without ambient access to the network, credentials, host files,
+or external services. The browser host grants narrowly scoped capabilities,
+and graph or agent behavior may rearrange granted authority but cannot create
+new authority.
+
+🔸 **Budgets and state as runtime primitives.** CPU, memory, storage, network,
+and event-log limits are enforced inside the execution model; persistent
+filesystem state can survive a browser reload; and content-addressed manifests
+bind large, lazily delivered workloads to the bytes the host approved.
+
+🔸 **An execution substrate for intent-native applications.** Generating an
+interface is only the visible half of a dynamic application. webTOS supplies
+the repository, processes, tools, state, permissions, approval boundaries, and
+resource budgets behind that interface. The current Linux runtime is concrete;
+Application Graphs and public composition APIs are explicitly roadmap work.
+
+These properties are valuable as a system. An emulator without the authority
+boundary is only another virtual machine; a generated interface without the
+execution substrate is only generated markup; and a remote sandbox does not
+provide local-by-architecture execution. webTOS combines the three into one
+browser-native runtime.
+
+---
+
 ## 1. The Argument in One Page
 
 1. **The software worth running ships as Linux x86-64 binaries.** Coding
