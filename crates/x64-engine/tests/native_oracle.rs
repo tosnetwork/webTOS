@@ -1021,6 +1021,182 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0x62, 0x7d, 0xce, 0x89, 0x1e],
         },
         Case {
+            name: "vpcompressb xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0x7d, 0x08, 0x63, 0xd1],
+        },
+        Case {
+            name: "vpcompressb xmm3{k5},xmm4",
+            bytes: &[0x62, 0xf2, 0x7d, 0x0d, 0x63, 0xe3],
+        },
+        Case {
+            name: "vpcompressb xmm5{k5}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0x7d, 0x8d, 0x63, 0xf5],
+        },
+        Case {
+            name: "vpcompressb ymm7,ymm8",
+            bytes: &[0x62, 0x72, 0x7d, 0x28, 0x63, 0xc7],
+        },
+        Case {
+            name: "vpcompressb ymm9{k5},ymm10",
+            bytes: &[0x62, 0x52, 0x7d, 0x2d, 0x63, 0xd1],
+        },
+        Case {
+            name: "vpcompressb ymm11{k5}{z},ymm12",
+            bytes: &[0x62, 0x52, 0x7d, 0xad, 0x63, 0xe3],
+        },
+        Case {
+            name: "vpcompressb zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0x7d, 0x48, 0x63, 0xf5],
+        },
+        Case {
+            name: "vpcompressb zmm15{k5}{z},zmm16",
+            bytes: &[0x62, 0xc2, 0x7d, 0xcd, 0x63, 0xc7],
+        },
+        Case {
+            name: "vpcompressb [rdi]{k5},xmm26",
+            bytes: &[0x62, 0x62, 0x7d, 0x0d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpcompressb [rdi]{k5},ymm26",
+            bytes: &[0x62, 0x62, 0x7d, 0x2d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpcompressb [rdi]{k5},zmm26",
+            bytes: &[0x62, 0x62, 0x7d, 0x4d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpcompressw xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0xfd, 0x08, 0x63, 0xd1],
+        },
+        Case {
+            name: "vpcompressw xmm3{k5},xmm4",
+            bytes: &[0x62, 0xf2, 0xfd, 0x0d, 0x63, 0xe3],
+        },
+        Case {
+            name: "vpcompressw xmm5{k5}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0xfd, 0x8d, 0x63, 0xf5],
+        },
+        Case {
+            name: "vpcompressw ymm7,ymm8",
+            bytes: &[0x62, 0x72, 0xfd, 0x28, 0x63, 0xc7],
+        },
+        Case {
+            name: "vpcompressw ymm9{k5},ymm10",
+            bytes: &[0x62, 0x52, 0xfd, 0x2d, 0x63, 0xd1],
+        },
+        Case {
+            name: "vpcompressw ymm11{k5}{z},ymm12",
+            bytes: &[0x62, 0x52, 0xfd, 0xad, 0x63, 0xe3],
+        },
+        Case {
+            name: "vpcompressw zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0xfd, 0x48, 0x63, 0xf5],
+        },
+        Case {
+            name: "vpcompressw zmm15{k5}{z},zmm16",
+            bytes: &[0x62, 0xc2, 0xfd, 0xcd, 0x63, 0xc7],
+        },
+        Case {
+            name: "vpcompressw [rdi]{k5},xmm26",
+            bytes: &[0x62, 0x62, 0xfd, 0x0d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpcompressw [rdi]{k5},ymm26",
+            bytes: &[0x62, 0x62, 0xfd, 0x2d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpcompressw [rdi]{k5},zmm26",
+            bytes: &[0x62, 0x62, 0xfd, 0x4d, 0x63, 0x17],
+        },
+        Case {
+            name: "vpexpandb xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0x7d, 0x08, 0x62, 0xca],
+        },
+        Case {
+            name: "vpexpandb xmm3{k6},xmm4",
+            bytes: &[0x62, 0xf2, 0x7d, 0x0e, 0x62, 0xdc],
+        },
+        Case {
+            name: "vpexpandb xmm5{k6}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0x7d, 0x8e, 0x62, 0xee],
+        },
+        Case {
+            name: "vpexpandb ymm7,ymm8",
+            bytes: &[0x62, 0xd2, 0x7d, 0x28, 0x62, 0xf8],
+        },
+        Case {
+            name: "vpexpandb ymm9{k6},ymm10",
+            bytes: &[0x62, 0x52, 0x7d, 0x2e, 0x62, 0xca],
+        },
+        Case {
+            name: "vpexpandb ymm11{k6}{z},ymm12",
+            bytes: &[0x62, 0x52, 0x7d, 0xae, 0x62, 0xdc],
+        },
+        Case {
+            name: "vpexpandb zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0x7d, 0x48, 0x62, 0xee],
+        },
+        Case {
+            name: "vpexpandb zmm15{k6},zmm16",
+            bytes: &[0x62, 0x32, 0x7d, 0x4e, 0x62, 0xf8],
+        },
+        Case {
+            name: "vpexpandb xmm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0x7d, 0x8e, 0x62, 0x1e],
+        },
+        Case {
+            name: "vpexpandb ymm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0x7d, 0xae, 0x62, 0x1e],
+        },
+        Case {
+            name: "vpexpandb zmm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0x7d, 0xce, 0x62, 0x1e],
+        },
+        Case {
+            name: "vpexpandw xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0xfd, 0x08, 0x62, 0xca],
+        },
+        Case {
+            name: "vpexpandw xmm3{k6},xmm4",
+            bytes: &[0x62, 0xf2, 0xfd, 0x0e, 0x62, 0xdc],
+        },
+        Case {
+            name: "vpexpandw xmm5{k6}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0xfd, 0x8e, 0x62, 0xee],
+        },
+        Case {
+            name: "vpexpandw ymm7,ymm8",
+            bytes: &[0x62, 0xd2, 0xfd, 0x28, 0x62, 0xf8],
+        },
+        Case {
+            name: "vpexpandw ymm9{k6},ymm10",
+            bytes: &[0x62, 0x52, 0xfd, 0x2e, 0x62, 0xca],
+        },
+        Case {
+            name: "vpexpandw ymm11{k6}{z},ymm12",
+            bytes: &[0x62, 0x52, 0xfd, 0xae, 0x62, 0xdc],
+        },
+        Case {
+            name: "vpexpandw zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0xfd, 0x48, 0x62, 0xee],
+        },
+        Case {
+            name: "vpexpandw zmm15{k6},zmm16",
+            bytes: &[0x62, 0x32, 0xfd, 0x4e, 0x62, 0xf8],
+        },
+        Case {
+            name: "vpexpandw xmm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0xfd, 0x8e, 0x62, 0x1e],
+        },
+        Case {
+            name: "vpexpandw ymm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0xfd, 0xae, 0x62, 0x1e],
+        },
+        Case {
+            name: "vpexpandw zmm27{k6}{z},[rsi]",
+            bytes: &[0x62, 0x62, 0xfd, 0xce, 0x62, 0x1e],
+        },
+        Case {
             name: "vpbroadcastd zmm1,[rdi]",
             bytes: &[0x62, 0xf2, 0x7d, 0x48, 0x58, 0x0f],
         },
@@ -1064,22 +1240,59 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
 #[test]
 fn compress_expand_masked_page_boundaries_match_native_faults_and_partial_memory() {
     let cases = [
-        Case {
-            name: "vpcompressd [rdi]{k5},zmm26 boundary",
-            bytes: &[0x62, 0x62, 0x7d, 0x4d, 0x8b, 0x17],
-        },
-        Case {
-            name: "vpexpandd zmm27{k6}{z},[rsi] boundary",
-            bytes: &[0x62, 0x62, 0x7d, 0xce, 0x89, 0x1e],
-        },
+        (
+            Case {
+                name: "vpcompressd [rdi]{k5},zmm26 boundary",
+                bytes: &[0x62, 0x62, 0x7d, 0x4d, 0x8b, 0x17],
+            },
+            24,
+        ),
+        (
+            Case {
+                name: "vpexpandd zmm27{k6}{z},[rsi] boundary",
+                bytes: &[0x62, 0x62, 0x7d, 0xce, 0x89, 0x1e],
+            },
+            24,
+        ),
+        (
+            Case {
+                name: "vpcompressb [rdi]{k5},zmm26 boundary",
+                bytes: &[0x62, 0x62, 0x7d, 0x4d, 0x63, 0x17],
+            },
+            15,
+        ),
+        (
+            Case {
+                name: "vpexpandb zmm27{k6}{z},[rsi] boundary",
+                bytes: &[0x62, 0x62, 0x7d, 0xce, 0x62, 0x1e],
+            },
+            15,
+        ),
+        (
+            Case {
+                name: "vpcompressw [rdi]{k5},zmm26 boundary",
+                bytes: &[0x62, 0x62, 0xfd, 0x4d, 0x63, 0x17],
+            },
+            20,
+        ),
+        (
+            Case {
+                name: "vpexpandw zmm27{k6}{z},[rsi] boundary",
+                bytes: &[0x62, 0x62, 0xfd, 0xce, 0x62, 0x1e],
+            },
+            20,
+        ),
     ];
 
     let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
-    for case in cases {
-        // Each seeded mask selects six dwords. A pointer 24 bytes before the
-        // guard page must succeed without touching the masked-off lanes; four
-        // bytes later, the sixth selected element must fault at the guard.
-        for (data_offset, should_fault) in [(PAGE - 24, false), (PAGE - 20, true)] {
+    for (case, selected_span) in cases {
+        // Only compacted/expanded selected elements are accessed. Place the
+        // exact selected span before the guard to succeed, then advance one
+        // byte so the final selected element crosses into the guard page.
+        for (data_offset, should_fault) in [
+            (PAGE - selected_span, false),
+            (PAGE - selected_span + 1, true),
+        ] {
             let native = normalize_native(
                 native_with_layout(case, data_offset, true),
                 case,

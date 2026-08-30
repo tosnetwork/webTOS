@@ -383,6 +383,15 @@ pub mod x86 {
         ("webtos_vpexpandd_128_chunk", packed_expand_d_128_chunk),
         ("webtos_vpexpandd_256_chunk", packed_expand_d_256_chunk),
         ("webtos_vpexpandd_512_chunk", packed_expand_d_512_chunk),
+        ("webtos_vpcompact_128_chunk", packed_compact_128_chunk),
+        ("webtos_vpcompact_256_chunk", packed_compact_256_chunk),
+        ("webtos_vpcompact_512_chunk", packed_compact_512_chunk),
+        ("webtos_vpcompress_mem_128", packed_compress_mem_128),
+        ("webtos_vpcompress_mem_256", packed_compress_mem_256),
+        ("webtos_vpcompress_mem_512", packed_compress_mem_512),
+        ("webtos_vpexpand_mem_128", packed_expand_mem_128),
+        ("webtos_vpexpand_mem_256", packed_expand_mem_256),
+        ("webtos_vpexpand_mem_512", packed_expand_mem_512),
         ("webtos_masked_load_128", masked_load_128),
         ("webtos_masked_store_128", masked_store_128),
         ("webtos_masked_store_256", masked_store_256),
@@ -838,6 +847,353 @@ pub mod x86 {
             cpu.args[3] as u64,
             cpu.args[4] as usize,
             true,
+        );
+    }
+
+    fn packed_compact_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        sources: [u128; 4],
+        vector_size: usize,
+        old_destination: u128,
+        mask: u64,
+        output_chunk: usize,
+        element_size: usize,
+        expand: bool,
+    ) {
+        if dst.size != 16
+            || !matches!(vector_size, 16 | 32 | 64)
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+            || vector_size % element_size != 0
+            || output_chunk >= vector_size / 16
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = vector_size as u64;
+            return;
+        }
+
+        let source = sources.map(u128::to_le_bytes);
+        let mut output = old_destination.to_le_bytes();
+        let lane_count = vector_size / element_size;
+        let lanes_per_chunk = 16 / element_size;
+        let mut packed = [0_u8; 64];
+        let mut packed_len = 0;
+        if !expand {
+            for source_lane in 0..lane_count {
+                if mask & (1_u64 << source_lane) == 0 {
+                    continue;
+                }
+                let source_offset = source_lane * element_size;
+                let packed_offset = packed_len * element_size;
+                for byte in 0..element_size {
+                    let source_byte = source_offset + byte;
+                    packed[packed_offset + byte] = source[source_byte / 16][source_byte % 16];
+                }
+                packed_len += 1;
+            }
+        }
+
+        for lane_in_chunk in 0..lanes_per_chunk {
+            let destination_lane = output_chunk * lanes_per_chunk + lane_in_chunk;
+            let source_lane = if expand {
+                if mask & (1_u64 << destination_lane) == 0 {
+                    continue;
+                }
+                (mask & ((1_u64 << destination_lane) - 1)).count_ones() as usize
+            }
+            else {
+                if destination_lane >= packed_len {
+                    continue;
+                }
+                destination_lane
+            };
+            let output_offset = lane_in_chunk * element_size;
+            let source_offset = source_lane * element_size;
+            for byte in 0..element_size {
+                output[output_offset + byte] = if expand {
+                    let source_byte = source_offset + byte;
+                    source[source_byte / 16][source_byte % 16]
+                }
+                else {
+                    packed[source_offset + byte]
+                };
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_compact_128_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_compact_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), 0, 0, 0],
+            16,
+            cpu.read::<u128>(args[1]),
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            cpu.args[2] as usize,
+            cpu.args[3] != 0,
+        );
+    }
+
+    fn packed_compact_256_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_compact_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), 0, 0],
+            32,
+            cpu.args[0],
+            cpu.args[1] as u64,
+            cpu.args[2] as usize,
+            cpu.args[3] as usize,
+            cpu.args[4] != 0,
+        );
+    }
+
+    fn packed_compact_512_chunk(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[0].size());
+            return;
+        }
+        packed_compact_chunk(
+            cpu,
+            dst,
+            [cpu.read::<u128>(args[0]), cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1]],
+            64,
+            cpu.args[2],
+            cpu.args[3] as u64,
+            cpu.args[4] as usize,
+            cpu.args[5] as usize,
+            cpu.args[6] != 0,
+        );
+    }
+
+    fn packed_compress_memory(
+        cpu: &mut Cpu,
+        address: u64,
+        sources: [u128; 4],
+        vector_size: usize,
+        mask: u64,
+        element_size: usize,
+    ) {
+        if !matches!(vector_size, 16 | 32 | 64)
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+            || vector_size % element_size != 0
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = vector_size as u64;
+            return;
+        }
+        let source = sources.map(u128::to_le_bytes);
+        let lane_count = vector_size / element_size;
+        let mut packed = [0_u8; 64];
+        let mut packed_len = 0;
+        for source_lane in 0..lane_count {
+            if mask & (1_u64 << source_lane) == 0 {
+                continue;
+            }
+            for byte in 0..element_size {
+                let source_byte = source_lane * element_size + byte;
+                packed[packed_len * element_size + byte] =
+                    source[source_byte / 16][source_byte % 16];
+            }
+            packed_len += 1;
+        }
+
+        // Compact stores are fault-atomic. Probe the complete selected output
+        // before exposing the first byte, matching native restart behavior.
+        for output_lane in 0..packed_len {
+            let Some(element_start) = address.checked_add((output_lane * element_size) as u64)
+            else {
+                cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                cpu.exception.value = u64::MAX;
+                return;
+            };
+            for byte in 0..element_size {
+                let Some(current) = element_start.checked_add(byte as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                if let Err(error) =
+                    icicle_mem::perm::check(cpu.mem.get_perm(current), icicle_mem::perm::WRITE)
+                {
+                    cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                    cpu.exception.value = element_start.saturating_add((element_size - 1) as u64);
+                    return;
+                }
+            }
+        }
+        for byte in 0..packed_len * element_size {
+            let current = address + byte as u64;
+            if let Err(error) = cpu.mem.write::<1>(current, [packed[byte]], icicle_mem::perm::WRITE)
+            {
+                cpu.exception.code = ExceptionCode::from_store_error(error) as u32;
+                cpu.exception.value = current;
+                return;
+            }
+        }
+    }
+
+    fn packed_compress_mem_128(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), 0, 0, 0],
+            16,
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+        );
+    }
+
+    fn packed_compress_mem_256(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], 0, 0],
+            32,
+            cpu.args[1] as u64,
+            cpu.args[2] as usize,
+        );
+    }
+
+    fn packed_compress_mem_512(cpu: &mut Cpu, _: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_compress_memory(
+            cpu,
+            cpu.read::<u64>(args[0]),
+            [cpu.read::<u128>(args[1]), cpu.args[0], cpu.args[1], cpu.args[2]],
+            64,
+            cpu.args[3] as u64,
+            cpu.args[4] as usize,
+        );
+    }
+
+    fn packed_expand_memory_chunk(
+        cpu: &mut Cpu,
+        dst: VarNode,
+        address: u64,
+        old_destination: u128,
+        vector_size: usize,
+        mask: u64,
+        output_chunk: usize,
+        element_size: usize,
+    ) {
+        if dst.size != 16
+            || !matches!(vector_size, 16 | 32 | 64)
+            || !matches!(element_size, 1 | 2 | 4 | 8)
+            || vector_size % element_size != 0
+            || output_chunk >= vector_size / 16
+        {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = vector_size as u64;
+            return;
+        }
+        let lanes_per_chunk = 16 / element_size;
+        let mut output = old_destination.to_le_bytes();
+        for lane_in_chunk in 0..lanes_per_chunk {
+            let destination_lane = output_chunk * lanes_per_chunk + lane_in_chunk;
+            if mask & (1_u64 << destination_lane) == 0 {
+                continue;
+            }
+            let packed_lane = (mask & ((1_u64 << destination_lane) - 1)).count_ones() as usize;
+            for byte in 0..element_size {
+                let Some(current) = address.checked_add((packed_lane * element_size + byte) as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => output[lane_in_chunk * element_size + byte] = value[0],
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_expand_mem_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_expand_memory_chunk(
+            cpu,
+            dst,
+            cpu.read::<u64>(args[0]),
+            cpu.read::<u128>(args[1]),
+            16,
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            cpu.args[2] as usize,
+        );
+    }
+
+    fn packed_expand_mem_256(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_expand_memory_chunk(
+            cpu,
+            dst,
+            cpu.read::<u64>(args[0]),
+            cpu.read::<u128>(args[1]),
+            32,
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            cpu.args[2] as usize,
+        );
+    }
+
+    fn packed_expand_mem_512(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(args[1].size());
+            return;
+        }
+        packed_expand_memory_chunk(
+            cpu,
+            dst,
+            cpu.read::<u64>(args[0]),
+            cpu.read::<u128>(args[1]),
+            64,
+            cpu.args[0] as u64,
+            cpu.args[1] as usize,
+            cpu.args[2] as usize,
         );
     }
 

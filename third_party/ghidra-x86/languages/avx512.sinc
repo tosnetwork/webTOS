@@ -11709,6 +11709,9 @@ define pcodeop vpermt2pd_avx512f;
 define pcodeop webtos_vpexpandd_128_chunk;
 define pcodeop webtos_vpexpandd_256_chunk;
 define pcodeop webtos_vpexpandd_512_chunk;
+define pcodeop webtos_vpexpand_mem_128;
+define pcodeop webtos_vpexpand_mem_256;
+define pcodeop webtos_vpexpand_mem_512;
 :VPEXPANDD XmmReg1^AVXOpMask^XmmMaskMode, XmmReg2  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode; byte=0x89; XmmReg1 & ZmmReg1 & mod=3 & XmmReg2
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType T1S)
 {
@@ -11723,21 +11726,7 @@ define pcodeop webtos_vpexpandd_512_chunk;
 {
 	XmmMask = XmmReg1;
 	build XmmMaskMode;
-	XmmResult = XmmMask;
-	local address = m128Addr;
-	local mask = AVXOpMask;
-	if (mask[0,1] == 0) goto <expandd128_1>;
-	XmmResult[0,32] = *:4 address; address = address + 4;
-	<expandd128_1>
-	if (mask[1,1] == 0) goto <expandd128_2>;
-	XmmResult[32,32] = *:4 address; address = address + 4;
-	<expandd128_2>
-	if (mask[2,1] == 0) goto <expandd128_3>;
-	XmmResult[64,32] = *:4 address; address = address + 4;
-	<expandd128_3>
-	if (mask[3,1] == 0) goto <expandd128_done>;
-	XmmResult[96,32] = *:4 address;
-	<expandd128_done>
+	XmmResult = webtos_vpexpand_mem_128(m128Addr, XmmMask, AVXOpMask, 0:1, 4:1);
 	ZmmReg1 = zext(XmmResult);
 }
 
@@ -11757,33 +11746,8 @@ define pcodeop webtos_vpexpandd_512_chunk;
 {
 	YmmMask = YmmReg1;
 	build YmmMaskMode;
-	YmmResult = YmmMask;
-	local address = m256Addr;
-	local mask = AVXOpMask;
-	if (mask[0,1] == 0) goto <expandd256_1>;
-	YmmResult[0,32] = *:4 address; address = address + 4;
-	<expandd256_1>
-	if (mask[1,1] == 0) goto <expandd256_2>;
-	YmmResult[32,32] = *:4 address; address = address + 4;
-	<expandd256_2>
-	if (mask[2,1] == 0) goto <expandd256_3>;
-	YmmResult[64,32] = *:4 address; address = address + 4;
-	<expandd256_3>
-	if (mask[3,1] == 0) goto <expandd256_4>;
-	YmmResult[96,32] = *:4 address; address = address + 4;
-	<expandd256_4>
-	if (mask[4,1] == 0) goto <expandd256_5>;
-	YmmResult[128,32] = *:4 address; address = address + 4;
-	<expandd256_5>
-	if (mask[5,1] == 0) goto <expandd256_6>;
-	YmmResult[160,32] = *:4 address; address = address + 4;
-	<expandd256_6>
-	if (mask[6,1] == 0) goto <expandd256_7>;
-	YmmResult[192,32] = *:4 address; address = address + 4;
-	<expandd256_7>
-	if (mask[7,1] == 0) goto <expandd256_done>;
-	YmmResult[224,32] = *:4 address;
-	<expandd256_done>
+	YmmResult[0,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[0,128], AVXOpMask, 0:1, 4:1);
+	YmmResult[128,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[128,128], AVXOpMask, 1:1, 4:1);
 	ZmmReg1 = zext(YmmResult);
 }
 
@@ -11806,57 +11770,10 @@ define pcodeop vpexpandd_avx512f ;
 {
 	ZmmMask = ZmmReg1;
 	build ZmmMaskMode;
-	ZmmResult = ZmmMask;
-	local address = m512Addr;
-	local mask = AVXOpMask;
-	if (mask[0,1] == 0) goto <expandd512_1>;
-	ZmmResult[0,32] = *:4 address; address = address + 4;
-	<expandd512_1>
-	if (mask[1,1] == 0) goto <expandd512_2>;
-	ZmmResult[32,32] = *:4 address; address = address + 4;
-	<expandd512_2>
-	if (mask[2,1] == 0) goto <expandd512_3>;
-	ZmmResult[64,32] = *:4 address; address = address + 4;
-	<expandd512_3>
-	if (mask[3,1] == 0) goto <expandd512_4>;
-	ZmmResult[96,32] = *:4 address; address = address + 4;
-	<expandd512_4>
-	if (mask[4,1] == 0) goto <expandd512_5>;
-	ZmmResult[128,32] = *:4 address; address = address + 4;
-	<expandd512_5>
-	if (mask[5,1] == 0) goto <expandd512_6>;
-	ZmmResult[160,32] = *:4 address; address = address + 4;
-	<expandd512_6>
-	if (mask[6,1] == 0) goto <expandd512_7>;
-	ZmmResult[192,32] = *:4 address; address = address + 4;
-	<expandd512_7>
-	if (mask[7,1] == 0) goto <expandd512_8>;
-	ZmmResult[224,32] = *:4 address; address = address + 4;
-	<expandd512_8>
-	if (mask[8,1] == 0) goto <expandd512_9>;
-	ZmmResult[256,32] = *:4 address; address = address + 4;
-	<expandd512_9>
-	if (mask[9,1] == 0) goto <expandd512_10>;
-	ZmmResult[288,32] = *:4 address; address = address + 4;
-	<expandd512_10>
-	if (mask[10,1] == 0) goto <expandd512_11>;
-	ZmmResult[320,32] = *:4 address; address = address + 4;
-	<expandd512_11>
-	if (mask[11,1] == 0) goto <expandd512_12>;
-	ZmmResult[352,32] = *:4 address; address = address + 4;
-	<expandd512_12>
-	if (mask[12,1] == 0) goto <expandd512_13>;
-	ZmmResult[384,32] = *:4 address; address = address + 4;
-	<expandd512_13>
-	if (mask[13,1] == 0) goto <expandd512_14>;
-	ZmmResult[416,32] = *:4 address; address = address + 4;
-	<expandd512_14>
-	if (mask[14,1] == 0) goto <expandd512_15>;
-	ZmmResult[448,32] = *:4 address; address = address + 4;
-	<expandd512_15>
-	if (mask[15,1] == 0) goto <expandd512_done>;
-	ZmmResult[480,32] = *:4 address;
-	<expandd512_done>
+	ZmmResult[0,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[0,128], AVXOpMask, 0:1, 4:1);
+	ZmmResult[128,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[128,128], AVXOpMask, 1:1, 4:1);
+	ZmmResult[256,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[256,128], AVXOpMask, 2:1, 4:1);
+	ZmmResult[384,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[384,128], AVXOpMask, 3:1, 4:1);
 	ZmmReg1 = ZmmResult;
 }
 
@@ -16897,39 +16814,68 @@ define pcodeop vp2intersectq_avx512f ;
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124606
-define pcodeop vpcompressb_avx512_vbmi2 ;
-:VPCOMPRESSB m128^XmmOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask; byte=0x63; XmmReg1 ... & m128
+define pcodeop webtos_vpcompact_128_chunk;
+define pcodeop webtos_vpcompact_256_chunk;
+define pcodeop webtos_vpcompact_512_chunk;
+define pcodeop webtos_vpcompress_mem_128;
+define pcodeop webtos_vpcompress_mem_256;
+define pcodeop webtos_vpcompress_mem_512;
+:VPCOMPRESSB XmmReg2^AVXOpMask^XmmMaskMode, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode; byte=0x63; XmmReg1 & mod=3 & XmmReg2 & ZmmReg2
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
-	XmmResult = vpcompressb_avx512_vbmi2( XmmReg1, XmmOpMask );
-	m128 = XmmResult;
+	XmmMask = XmmReg2;
+	build XmmMaskMode;
+	XmmResult = webtos_vpcompact_128_chunk(XmmReg1, XmmMask, AVXOpMask, 0:1, 1:1, 0:1);
+	ZmmReg2 = zext(XmmResult);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124608
 # WARNING: duplicate opcode EVEX.128.66.0F38.W0 63 /r last seen on 5-449 PAGE 2273 LINE 124606 for "VPCOMPRESSB xmm1{k1}{z}, xmm2"
-:VPCOMPRESSB XmmReg2^XmmOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask; byte=0x63; XmmReg1 & (mod=0x3 & (XmmReg2 & ZmmReg2))
+:VPCOMPRESSB m128Addr^AVXOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x63; XmmReg1 ... & m128Addr
+[ evexD8Type = 1; evexTType = 3; ]
 {
-	XmmResult = vpcompressb_avx512_vbmi2( XmmReg1, XmmOpMask );
-	ZmmReg2 = zext(XmmResult);
+	webtos_vpcompress_mem_128(m128Addr, XmmReg1, AVXOpMask, 1:1);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124610
-:VPCOMPRESSB m256^YmmOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & YmmOpMask; byte=0x63; YmmReg1 ... & m256
+:VPCOMPRESSB YmmReg2^AVXOpMask^YmmMaskMode, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & YmmMaskMode; byte=0x63; YmmReg1 & mod=3 & YmmReg2 & ZmmReg2
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
-	YmmResult = vpcompressb_avx512_vbmi2( YmmReg1, YmmOpMask );
-	m256 = YmmResult;
+	YmmMask = YmmReg2;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpcompact_256_chunk(YmmReg1[0,128], YmmReg1[128,128], YmmMask[0,128], AVXOpMask, 0:1, 1:1, 0:1);
+	YmmResult[128,128] = webtos_vpcompact_256_chunk(YmmReg1[0,128], YmmReg1[128,128], YmmMask[128,128], AVXOpMask, 1:1, 1:1, 0:1);
+	ZmmReg2 = zext(YmmResult);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124612
 # WARNING: duplicate opcode EVEX.256.66.0F38.W0 63 /r last seen on 5-449 PAGE 2273 LINE 124610 for "VPCOMPRESSB ymm1{k1}{z}, ymm2"
-:VPCOMPRESSB YmmReg2^YmmOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & YmmOpMask; byte=0x63; YmmReg1 & (mod=0x3 & (YmmReg2 & ZmmReg2))
+:VPCOMPRESSB m256Addr^AVXOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x63; YmmReg1 ... & m256Addr
+[ evexD8Type = 1; evexTType = 3; ]
 {
-	YmmResult = vpcompressb_avx512_vbmi2( YmmReg1, YmmOpMask );
-	ZmmReg2 = zext(YmmResult);
+	webtos_vpcompress_mem_256(m256Addr, YmmReg1[0,128], YmmReg1[128,128], AVXOpMask, 1:1);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124614
+# webTOS precise compact semantics
+:VPCOMPRESSB ZmmReg2^AVXOpMask^ZmmMaskMode, ZmmReg1 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & ZmmMaskMode; byte=0x63; ZmmReg1 & mod=3 & ZmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg2;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[0,128], AVXOpMask, 0:1, 1:1, 0:1);
+	ZmmResult[128,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[128,128], AVXOpMask, 1:1, 1:1, 0:1);
+	ZmmResult[256,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[256,128], AVXOpMask, 2:1, 1:1, 0:1);
+	ZmmResult[384,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 1:1, 0:1);
+	ZmmReg2 = ZmmResult;
+}
+
+:VPCOMPRESSB m512Addr^AVXOpMask, ZmmReg1 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & evexZ=0; byte=0x63; ZmmReg1 ... & m512Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	webtos_vpcompress_mem_512(m512Addr, ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], AVXOpMask, 1:1);
+}
+
 :VPCOMPRESSB m512^ZmmOpMask, ZmmReg1 is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & ZmmOpMask; byte=0x63; ZmmReg1 ... & m512
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
@@ -16947,38 +16893,62 @@ define pcodeop vpcompressb_avx512_vbmi2 ;
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124618
 define pcodeop vpcompressw_avx512_vbmi2 ;
-:VPCOMPRESSW m128^XmmOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & XmmOpMask; byte=0x63; XmmReg1 ... & m128
+:VPCOMPRESSW XmmReg2^AVXOpMask^XmmMaskMode, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode; byte=0x63; XmmReg1 & mod=3 & XmmReg2 & ZmmReg2
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
-	XmmResult = vpcompressw_avx512_vbmi2( XmmReg1, XmmOpMask );
-	m128 = XmmResult;
+	XmmMask = XmmReg2;
+	build XmmMaskMode;
+	XmmResult = webtos_vpcompact_128_chunk(XmmReg1, XmmMask, AVXOpMask, 0:1, 2:1, 0:1);
+	ZmmReg2 = zext(XmmResult);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124620
 # WARNING: duplicate opcode EVEX.128.66.0F38.W1 63 /r last seen on 5-449 PAGE 2273 LINE 124618 for "VPCOMPRESSW xmm1{k1}{z}, xmm2"
-:VPCOMPRESSW XmmReg2^XmmOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & XmmOpMask; byte=0x63; XmmReg1 & (mod=0x3 & (XmmReg2 & ZmmReg2))
+:VPCOMPRESSW m128Addr^AVXOpMask, XmmReg1 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexZ=0; byte=0x63; XmmReg1 ... & m128Addr
+[ evexD8Type = 1; evexTType = 3; ]
 {
-	XmmResult = vpcompressw_avx512_vbmi2( XmmReg1, XmmOpMask );
-	ZmmReg2 = zext(XmmResult);
+	webtos_vpcompress_mem_128(m128Addr, XmmReg1, AVXOpMask, 2:1);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124622
-:VPCOMPRESSW m256^YmmOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & YmmOpMask; byte=0x63; YmmReg1 ... & m256
+:VPCOMPRESSW YmmReg2^AVXOpMask^YmmMaskMode, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode; byte=0x63; YmmReg1 & mod=3 & YmmReg2 & ZmmReg2
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
-	YmmResult = vpcompressw_avx512_vbmi2( YmmReg1, YmmOpMask );
-	m256 = YmmResult;
+	YmmMask = YmmReg2;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpcompact_256_chunk(YmmReg1[0,128], YmmReg1[128,128], YmmMask[0,128], AVXOpMask, 0:1, 2:1, 0:1);
+	YmmResult[128,128] = webtos_vpcompact_256_chunk(YmmReg1[0,128], YmmReg1[128,128], YmmMask[128,128], AVXOpMask, 1:1, 2:1, 0:1);
+	ZmmReg2 = zext(YmmResult);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124624
 # WARNING: duplicate opcode EVEX.256.66.0F38.W1 63 /r last seen on 5-449 PAGE 2273 LINE 124622 for "VPCOMPRESSW ymm1{k1}{z}, ymm2"
-:VPCOMPRESSW YmmReg2^YmmOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & YmmOpMask; byte=0x63; YmmReg1 & (mod=0x3 & (YmmReg2 & ZmmReg2))
+:VPCOMPRESSW m256Addr^AVXOpMask, YmmReg1 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexZ=0; byte=0x63; YmmReg1 ... & m256Addr
+[ evexD8Type = 1; evexTType = 3; ]
 {
-	YmmResult = vpcompressw_avx512_vbmi2( YmmReg1, YmmOpMask );
-	ZmmReg2 = zext(YmmResult);
+	webtos_vpcompress_mem_256(m256Addr, YmmReg1[0,128], YmmReg1[128,128], AVXOpMask, 2:1);
 }
 
 # VPCOMPRESSB/VCOMPRESSW 5-449 PAGE 2273 LINE 124626
+# webTOS precise compact-word semantics
+:VPCOMPRESSW ZmmReg2^AVXOpMask^ZmmMaskMode, ZmmReg1 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode; byte=0x63; ZmmReg1 & mod=3 & ZmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg2;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[0,128], AVXOpMask, 0:1, 2:1, 0:1);
+	ZmmResult[128,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[128,128], AVXOpMask, 1:1, 2:1, 0:1);
+	ZmmResult[256,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[256,128], AVXOpMask, 2:1, 2:1, 0:1);
+	ZmmResult[384,128] = webtos_vpcompact_512_chunk(ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 2:1, 0:1);
+	ZmmReg2 = ZmmResult;
+}
+
+:VPCOMPRESSW m512Addr^AVXOpMask, ZmmReg1 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & evexZ=0; byte=0x63; ZmmReg1 ... & m512Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	webtos_vpcompress_mem_512(m512Addr, ZmmReg1[0,128], ZmmReg1[128,128], ZmmReg1[256,128], ZmmReg1[384,128], AVXOpMask, 2:1);
+}
+
 :VPCOMPRESSW m512^ZmmOpMask, ZmmReg1 is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & ZmmOpMask; byte=0x63; ZmmReg1 ... & m512
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
 {
@@ -17343,6 +17313,132 @@ define pcodeop vpermt2ps_avx512f ;
 }
 
 # VPEXPANDB/VPEXPANDW 5-510 PAGE 2334 LINE 127806
+# webTOS precise register and fault-suppressing memory semantics
+
+:VPEXPANDB XmmReg1^AVXOpMask^XmmMaskMode, XmmReg2 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode; byte=0x62; XmmReg1 & ZmmReg1 & mod=3 & XmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpcompact_128_chunk(XmmReg2, XmmMask, AVXOpMask, 0:1, 1:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPEXPANDB XmmReg1^AVXOpMask^XmmMaskMode, m128Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode; byte=0x62; (XmmReg1 & ZmmReg1) ... & m128Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpexpand_mem_128(m128Addr, XmmMask, AVXOpMask, 0:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPEXPANDB YmmReg1^AVXOpMask^YmmMaskMode, YmmReg2 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & YmmMaskMode; byte=0x62; YmmReg1 & ZmmReg1 & mod=3 & YmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpcompact_256_chunk(YmmReg2[0,128], YmmReg2[128,128], YmmMask[0,128], AVXOpMask, 0:1, 1:1, 1:1);
+	YmmResult[128,128] = webtos_vpcompact_256_chunk(YmmReg2[0,128], YmmReg2[128,128], YmmMask[128,128], AVXOpMask, 1:1, 1:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPEXPANDB YmmReg1^AVXOpMask^YmmMaskMode, m256Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & YmmMaskMode; byte=0x62; (YmmReg1 & ZmmReg1) ... & m256Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[0,128], AVXOpMask, 0:1, 1:1);
+	YmmResult[128,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[128,128], AVXOpMask, 1:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPEXPANDB ZmmReg1^AVXOpMask^ZmmMaskMode, ZmmReg2 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & ZmmMaskMode; byte=0x62; ZmmReg1 & mod=3 & ZmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[0,128], AVXOpMask, 0:1, 1:1, 1:1);
+	ZmmResult[128,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[128,128], AVXOpMask, 1:1, 1:1, 1:1);
+	ZmmResult[256,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[256,128], AVXOpMask, 2:1, 1:1, 1:1);
+	ZmmResult[384,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 1:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPEXPANDB ZmmReg1^AVXOpMask^ZmmMaskMode, m512Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & ZmmMaskMode; byte=0x62; ZmmReg1 ... & m512Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[0,128], AVXOpMask, 0:1, 1:1);
+	ZmmResult[128,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[128,128], AVXOpMask, 1:1, 1:1);
+	ZmmResult[256,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[256,128], AVXOpMask, 2:1, 1:1);
+	ZmmResult[384,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[384,128], AVXOpMask, 3:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPEXPANDW XmmReg1^AVXOpMask^XmmMaskMode, XmmReg2 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode; byte=0x62; XmmReg1 & ZmmReg1 & mod=3 & XmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpcompact_128_chunk(XmmReg2, XmmMask, AVXOpMask, 0:1, 2:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPEXPANDW XmmReg1^AVXOpMask^XmmMaskMode, m128Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode; byte=0x62; (XmmReg1 & ZmmReg1) ... & m128Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpexpand_mem_128(m128Addr, XmmMask, AVXOpMask, 0:1, 2:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPEXPANDW YmmReg1^AVXOpMask^YmmMaskMode, YmmReg2 is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode; byte=0x62; YmmReg1 & ZmmReg1 & mod=3 & YmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpcompact_256_chunk(YmmReg2[0,128], YmmReg2[128,128], YmmMask[0,128], AVXOpMask, 0:1, 2:1, 1:1);
+	YmmResult[128,128] = webtos_vpcompact_256_chunk(YmmReg2[0,128], YmmReg2[128,128], YmmMask[128,128], AVXOpMask, 1:1, 2:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPEXPANDW YmmReg1^AVXOpMask^YmmMaskMode, m256Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode; byte=0x62; (YmmReg1 & ZmmReg1) ... & m256Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[0,128], AVXOpMask, 0:1, 2:1);
+	YmmResult[128,128] = webtos_vpexpand_mem_256(m256Addr, YmmMask[128,128], AVXOpMask, 1:1, 2:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPEXPANDW ZmmReg1^AVXOpMask^ZmmMaskMode, ZmmReg2 is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode; byte=0x62; ZmmReg1 & mod=3 & ZmmReg2
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[0,128], AVXOpMask, 0:1, 2:1, 1:1);
+	ZmmResult[128,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[128,128], AVXOpMask, 1:1, 2:1, 1:1);
+	ZmmResult[256,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[256,128], AVXOpMask, 2:1, 2:1, 1:1);
+	ZmmResult[384,128] = webtos_vpcompact_512_chunk(ZmmReg2[0,128], ZmmReg2[128,128], ZmmReg2[256,128], ZmmReg2[384,128], ZmmMask[384,128], AVXOpMask, 3:1, 2:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPEXPANDW ZmmReg1^AVXOpMask^ZmmMaskMode, m512Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode; byte=0x62; ZmmReg1 ... & m512Addr
+[ evexD8Type = 1; evexTType = 3; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[0,128], AVXOpMask, 0:1, 2:1);
+	ZmmResult[128,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[128,128], AVXOpMask, 1:1, 2:1);
+	ZmmResult[256,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[256,128], AVXOpMask, 2:1, 2:1);
+	ZmmResult[384,128] = webtos_vpexpand_mem_512(m512Addr, ZmmMask[384,128], AVXOpMask, 3:1, 2:1);
+	ZmmReg1 = ZmmResult;
+}
+
 define pcodeop vpexpandb_avx512_vbmi2 ;
 :VPEXPANDB XmmReg1^XmmOpMask, XmmReg2_m128 is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask; byte=0x62; (XmmReg1 & ZmmReg1) ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 3; ] # (TupleType Tuple1 Scalar)
