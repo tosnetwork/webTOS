@@ -1168,6 +1168,66 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0x72, 0x1d, 0xdd, 0x45, 0x1e],
         },
         Case {
+            name: "vpabsb xmm1,xmm2",
+            bytes: &[0xc4, 0xe2, 0x79, 0x1c, 0xca],
+        },
+        Case {
+            name: "vpabsb ymm3,ymm4",
+            bytes: &[0xc4, 0xe2, 0x7d, 0x1c, 0xdc],
+        },
+        Case {
+            name: "vpabsb zmm5{k5}{z},zmm6",
+            bytes: &[0x62, 0xf2, 0x7d, 0xcd, 0x1c, 0xee],
+        },
+        Case {
+            name: "vpaddw xmm7{k5},xmm8,xmm9",
+            bytes: &[0x62, 0xd1, 0x3d, 0x0d, 0xfd, 0xf9],
+        },
+        Case {
+            name: "vpaddw ymm10{k5}{z},ymm11,ymm12",
+            bytes: &[0x62, 0x51, 0x25, 0xad, 0xfd, 0xd4],
+        },
+        Case {
+            name: "vpaddw zmm13,zmm14,[rsi]",
+            bytes: &[0x62, 0x71, 0x0d, 0x48, 0xfd, 0x2e],
+        },
+        Case {
+            name: "vpaddusb xmm15,xmm1,xmm2",
+            bytes: &[0xc5, 0x71, 0xdc, 0xfa],
+        },
+        Case {
+            name: "vpaddusb ymm3,ymm4,ymm5",
+            bytes: &[0xc5, 0xdd, 0xdc, 0xdd],
+        },
+        Case {
+            name: "vpaddusb zmm6{k5}{z},zmm7,zmm8",
+            bytes: &[0x62, 0xd1, 0x45, 0xcd, 0xdc, 0xf0],
+        },
+        Case {
+            name: "vpsubb xmm9,xmm10,xmm11",
+            bytes: &[0xc4, 0x41, 0x29, 0xf8, 0xcb],
+        },
+        Case {
+            name: "vpsubb ymm12,ymm13,ymm14",
+            bytes: &[0xc4, 0x41, 0x15, 0xf8, 0xe6],
+        },
+        Case {
+            name: "vpsubb zmm15{k5}{z},zmm16,zmm17",
+            bytes: &[0x62, 0x31, 0x7d, 0xc5, 0xf8, 0xf9],
+        },
+        Case {
+            name: "vpsubusb xmm18,xmm19,xmm20",
+            bytes: &[0x62, 0xa1, 0x65, 0x00, 0xd8, 0xd4],
+        },
+        Case {
+            name: "vpsubusb ymm5,ymm6,[rsi]",
+            bytes: &[0xc5, 0xcd, 0xd8, 0x2e],
+        },
+        Case {
+            name: "vpsubusb zmm7{k5},zmm8,zmm9",
+            bytes: &[0x62, 0xd1, 0x3d, 0x4d, 0xd8, 0xf9],
+        },
+        Case {
             name: "vpmaddubsw xmm1,xmm2,xmm3",
             bytes: &[0xc4, 0xe2, 0x69, 0x04, 0xcb],
         },

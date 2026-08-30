@@ -2460,6 +2460,7 @@ define pcodeop vmulss_avx512f ;
 }
 
 # PABSB/PABSW/PABSD/PABSQ 4-180 PAGE 1300 LINE 67320
+define pcodeop webtos_apply_byte_mask_128;
 define pcodeop vpabsb_avx512vl ;
 :VPABSB XmmReg1^XmmOpMask8, XmmReg2_m128  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) ; byte=0x1C; (XmmReg1 & ZmmReg1 & XmmOpMask8) ... & XmmReg2_m128
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
@@ -2474,7 +2475,8 @@ define pcodeop vpabsb_avx512vl ;
 :VPABSB YmmReg1^YmmOpMask8, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) ; byte=0x1C; (YmmReg1 & ZmmReg1 & YmmOpMask8) ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	YmmResult = vpabsb_avx512vl( YmmReg2_m256 );
+	YmmResult[0,128] = vpabsb_avx512vl( YmmReg2_m256[0,128] );
+	YmmResult[128,128] = vpabsb_avx512vl( YmmReg2_m256[128,128] );
 	YmmMask = YmmReg1;
 	build YmmOpMask8;
 	ZmmReg1 = zext(YmmResult);
@@ -2482,12 +2484,19 @@ define pcodeop vpabsb_avx512vl ;
 
 # PABSB/PABSW/PABSD/PABSQ 4-180 PAGE 1300 LINE 67326
 define pcodeop vpabsb_avx512bw ;
-:VPABSB ZmmReg1^ZmmOpMask8, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) ; byte=0x1C; (ZmmReg1 & ZmmOpMask8) ... & ZmmReg2_m512
+:VPABSB ZmmReg1^AVXOpMask^ZmmMaskMode, ZmmReg2_m512  is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG) & AVXOpMask & ZmmMaskMode; byte=0x1C; (ZmmReg1 & AVXOpMask & ZmmMaskMode) ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	ZmmResult = vpabsb_avx512bw( ZmmReg2_m512 );
+	ZmmResult[0,128] = vpabsb_avx512bw( ZmmReg2_m512[0,128] );
+	ZmmResult[128,128] = vpabsb_avx512bw( ZmmReg2_m512[128,128] );
+	ZmmResult[256,128] = vpabsb_avx512bw( ZmmReg2_m512[256,128] );
+	ZmmResult[384,128] = vpabsb_avx512bw( ZmmReg2_m512[384,128] );
 	ZmmMask = ZmmReg1;
-	build ZmmOpMask8;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_apply_byte_mask_128(ZmmResult[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_apply_byte_mask_128(ZmmResult[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_apply_byte_mask_128(ZmmResult[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_apply_byte_mask_128(ZmmResult[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 	ZmmReg1 = ZmmResult;
 }
 
@@ -2773,7 +2782,8 @@ define pcodeop vpaddq_avx512vl ;
 :VPADDW YmmReg1^YmmOpMask16, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_YmmReg; byte=0xFD; (YmmReg1 & ZmmReg1 & YmmOpMask16) ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	YmmResult = vpaddw_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
+	YmmResult[0,128] = vpaddw_avx512vl( evexV5_YmmReg[0,128], YmmReg2_m256[0,128] );
+	YmmResult[128,128] = vpaddw_avx512vl( evexV5_YmmReg[128,128], YmmReg2_m256[128,128] );
 	YmmMask = YmmReg1;
 	build YmmOpMask16;
 	ZmmReg1 = zext(YmmResult);
@@ -2816,7 +2826,10 @@ define pcodeop vpaddw_avx512bw ;
 :VPADDW ZmmReg1^ZmmOpMask16, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_ZmmReg; byte=0xFD; (ZmmReg1 & ZmmOpMask16) ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	ZmmResult = vpaddw_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
+	ZmmResult[0,128] = vpaddw_avx512bw( evexV5_ZmmReg[0,128], ZmmReg2_m512[0,128] );
+	ZmmResult[128,128] = vpaddw_avx512bw( evexV5_ZmmReg[128,128], ZmmReg2_m512[128,128] );
+	ZmmResult[256,128] = vpaddw_avx512bw( evexV5_ZmmReg[256,128], ZmmReg2_m512[256,128] );
+	ZmmResult[384,128] = vpaddw_avx512bw( evexV5_ZmmReg[384,128], ZmmReg2_m512[384,128] );
 	ZmmMask = ZmmReg1;
 	build ZmmOpMask16;
 	ZmmReg1 = ZmmResult;
@@ -2926,7 +2939,8 @@ define pcodeop vpaddusb_avx512vl ;
 :VPADDUSB YmmReg1^YmmOpMask8, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_YmmReg; byte=0xDC; (YmmReg1 & ZmmReg1 & YmmOpMask8) ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	YmmResult = vpaddusb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
+	YmmResult[0,128] = vpaddusb_avx512vl( evexV5_YmmReg[0,128], YmmReg2_m256[0,128] );
+	YmmResult[128,128] = vpaddusb_avx512vl( evexV5_YmmReg[128,128], YmmReg2_m256[128,128] );
 	YmmMask = YmmReg1;
 	build YmmOpMask8;
 	ZmmReg1 = zext(YmmResult);
@@ -2934,12 +2948,19 @@ define pcodeop vpaddusb_avx512vl ;
 
 # PADDUSB/PADDUSW 4-215 PAGE 1335 LINE 69277
 define pcodeop vpaddusb_avx512bw ;
-:VPADDUSB ZmmReg1^ZmmOpMask8, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_ZmmReg; byte=0xDC; (ZmmReg1 & ZmmOpMask8) ... & ZmmReg2_m512
+:VPADDUSB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg; byte=0xDC; (ZmmReg1 & AVXOpMask & ZmmMaskMode) ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	ZmmResult = vpaddusb_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
+	ZmmResult[0,128] = vpaddusb_avx512bw( evexV5_ZmmReg[0,128], ZmmReg2_m512[0,128] );
+	ZmmResult[128,128] = vpaddusb_avx512bw( evexV5_ZmmReg[128,128], ZmmReg2_m512[128,128] );
+	ZmmResult[256,128] = vpaddusb_avx512bw( evexV5_ZmmReg[256,128], ZmmReg2_m512[256,128] );
+	ZmmResult[384,128] = vpaddusb_avx512bw( evexV5_ZmmReg[384,128], ZmmReg2_m512[384,128] );
 	ZmmMask = ZmmReg1;
-	build ZmmOpMask8;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_apply_byte_mask_128(ZmmResult[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_apply_byte_mask_128(ZmmResult[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_apply_byte_mask_128(ZmmResult[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_apply_byte_mask_128(ZmmResult[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 	ZmmReg1 = ZmmResult;
 }
 
@@ -5606,7 +5627,8 @@ define pcodeop vpsubb_avx512vl ;
 :VPSUBB YmmReg1^YmmOpMask8, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_YmmReg; byte=0xF8; (YmmReg1 & ZmmReg1 & YmmOpMask8) ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	YmmResult = vpsubb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
+	YmmResult[0,128] = vpsubb_avx512vl( evexV5_YmmReg[0,128], YmmReg2_m256[0,128] );
+	YmmResult[128,128] = vpsubb_avx512vl( evexV5_YmmReg[128,128], YmmReg2_m256[128,128] );
 	YmmMask = YmmReg1;
 	build YmmOpMask8;
 	ZmmReg1 = zext(YmmResult);
@@ -5614,12 +5636,19 @@ define pcodeop vpsubb_avx512vl ;
 
 # PSUBB/PSUBW/PSUBD 4-469 PAGE 1589 LINE 82708
 define pcodeop vpsubb_avx512bw ;
-:VPSUBB ZmmReg1^ZmmOpMask8, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_ZmmReg; byte=0xF8; (ZmmReg1 & ZmmOpMask8) ... & ZmmReg2_m512
+:VPSUBB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg; byte=0xF8; (ZmmReg1 & AVXOpMask & ZmmMaskMode) ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	ZmmResult = vpsubb_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
+	ZmmResult[0,128] = vpsubb_avx512bw( evexV5_ZmmReg[0,128], ZmmReg2_m512[0,128] );
+	ZmmResult[128,128] = vpsubb_avx512bw( evexV5_ZmmReg[128,128], ZmmReg2_m512[128,128] );
+	ZmmResult[256,128] = vpsubb_avx512bw( evexV5_ZmmReg[256,128], ZmmReg2_m512[256,128] );
+	ZmmResult[384,128] = vpsubb_avx512bw( evexV5_ZmmReg[384,128], ZmmReg2_m512[384,128] );
 	ZmmMask = ZmmReg1;
-	build ZmmOpMask8;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_apply_byte_mask_128(ZmmResult[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_apply_byte_mask_128(ZmmResult[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_apply_byte_mask_128(ZmmResult[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_apply_byte_mask_128(ZmmResult[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 	ZmmReg1 = ZmmResult;
 }
 
@@ -5801,7 +5830,8 @@ define pcodeop vpsubusb_avx512vl ;
 :VPSUBUSB YmmReg1^YmmOpMask8, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_YmmReg; byte=0xD8; (YmmReg1 & ZmmReg1 & YmmOpMask8) ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	YmmResult = vpsubusb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
+	YmmResult[0,128] = vpsubusb_avx512vl( evexV5_YmmReg[0,128], YmmReg2_m256[0,128] );
+	YmmResult[128,128] = vpsubusb_avx512vl( evexV5_YmmReg[128,128], YmmReg2_m256[128,128] );
 	YmmMask = YmmReg1;
 	build YmmOpMask8;
 	ZmmReg1 = zext(YmmResult);
@@ -5809,12 +5839,19 @@ define pcodeop vpsubusb_avx512vl ;
 
 # PSUBUSB/PSUBUSW 4-483 PAGE 1603 LINE 83518
 define pcodeop vpsubusb_avx512bw ;
-:VPSUBUSB ZmmReg1^ZmmOpMask8, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG)  & evexV5_ZmmReg; byte=0xD8; (ZmmReg1 & ZmmOpMask8) ... & ZmmReg2_m512
+:VPSUBUSB ZmmReg1^AVXOpMask^ZmmMaskMode, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & AVXOpMask & ZmmMaskMode & evexV5_ZmmReg; byte=0xD8; (ZmmReg1 & AVXOpMask & ZmmMaskMode) ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	ZmmResult = vpsubusb_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
+	ZmmResult[0,128] = vpsubusb_avx512bw( evexV5_ZmmReg[0,128], ZmmReg2_m512[0,128] );
+	ZmmResult[128,128] = vpsubusb_avx512bw( evexV5_ZmmReg[128,128], ZmmReg2_m512[128,128] );
+	ZmmResult[256,128] = vpsubusb_avx512bw( evexV5_ZmmReg[256,128], ZmmReg2_m512[256,128] );
+	ZmmResult[384,128] = vpsubusb_avx512bw( evexV5_ZmmReg[384,128], ZmmReg2_m512[384,128] );
 	ZmmMask = ZmmReg1;
-	build ZmmOpMask8;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_apply_byte_mask_128(ZmmResult[0,128], ZmmMask[0,128], AVXOpMask, 0:1);
+	ZmmResult[128,128] = webtos_apply_byte_mask_128(ZmmResult[128,128], ZmmMask[128,128], AVXOpMask, 1:1);
+	ZmmResult[256,128] = webtos_apply_byte_mask_128(ZmmResult[256,128], ZmmMask[256,128], AVXOpMask, 2:1);
+	ZmmResult[384,128] = webtos_apply_byte_mask_128(ZmmResult[384,128], ZmmMask[384,128], AVXOpMask, 3:1);
 	ZmmReg1 = ZmmResult;
 }
 
@@ -17275,7 +17312,6 @@ define pcodeop vpdpwssds_avx512_vnni ;
 define pcodeop webtos_vpermb_128_chunk;
 define pcodeop webtos_vpermb_256_chunk;
 define pcodeop webtos_vpermb_512_chunk;
-define pcodeop webtos_apply_byte_mask_128;
 define pcodeop webtos_vpermb_mem_128_chunk;
 define pcodeop webtos_vpermb_mem_256_chunk;
 define pcodeop webtos_vpermb_mem_512_chunk;

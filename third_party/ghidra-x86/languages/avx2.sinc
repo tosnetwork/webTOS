@@ -22,7 +22,9 @@ define pcodeop vmpsadbw_avx2 ;
 define pcodeop vpabsb_avx2 ;
 :VPABSB YmmReg1, YmmReg2_m256 is $(VEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_WIG); byte=0x1C; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpabsb_avx2( YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpabsb_avx2( YmmReg2_m256[0,128] );
+	tmp[128,128] = vpabsb_avx2( YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 
@@ -186,7 +188,9 @@ define pcodeop vpaddsw_avx2 ;
 define pcodeop vpaddusb_avx2 ;
 :VPADDUSB YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xDC; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpaddusb_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpaddusb_avx2( vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128] );
+	tmp[128,128] = vpaddusb_avx2( vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 
@@ -848,7 +852,9 @@ define pcodeop vpsrlq_avx2 ;
 define pcodeop vpsubb_avx2 ;
 :VPSUBB YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xF8; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpsubb_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpsubb_avx2( vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128] );
+	tmp[128,128] = vpsubb_avx2( vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 
@@ -898,7 +904,9 @@ define pcodeop vpsubsw_avx2 ;
 define pcodeop vpsubusb_avx2 ;
 :VPSUBUSB YmmReg1, vexVVVV_YmmReg, YmmReg2_m256 is $(VEX_NDS) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & vexVVVV_YmmReg; byte=0xD8; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256
 {
-	local tmp:32 = vpsubusb_avx2( vexVVVV_YmmReg, YmmReg2_m256 );
+	local tmp:32 = 0;
+	tmp[0,128] = vpsubusb_avx2( vexVVVV_YmmReg[0,128], YmmReg2_m256[0,128] );
+	tmp[128,128] = vpsubusb_avx2( vexVVVV_YmmReg[128,128], YmmReg2_m256[128,128] );
 	ZmmReg1 = zext(tmp);
 }
 

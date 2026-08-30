@@ -330,6 +330,24 @@ pub mod x86 {
         ("vpsrlvd_avx512vl", packed_shift_right_variable_d),
         ("vpsrlvd_avx512f", packed_shift_right_variable_d),
         ("webtos_vpshiftvd_mem_128", packed_shift_variable_d_mem_128),
+        ("vpabsb_avx", packed_abs_b_128),
+        ("vpabsb_avx2", packed_abs_b_128),
+        ("vpabsb_avx512vl", packed_abs_b_128),
+        ("vpabsb_avx512bw", packed_abs_b_128),
+        ("vpaddw_avx512vl", packed_add_w_128),
+        ("vpaddw_avx512bw", packed_add_w_128),
+        ("vpsubb_avx", packed_sub_b_128),
+        ("vpsubb_avx2", packed_sub_b_128),
+        ("vpsubb_avx512vl", packed_sub_b_128),
+        ("vpsubb_avx512bw", packed_sub_b_128),
+        ("vpaddusb_avx", paddusb),
+        ("vpaddusb_avx2", paddusb),
+        ("vpaddusb_avx512vl", paddusb),
+        ("vpaddusb_avx512bw", paddusb),
+        ("vpsubusb_avx", psubusb),
+        ("vpsubusb_avx2", psubusb),
+        ("vpsubusb_avx512vl", psubusb),
+        ("vpsubusb_avx512bw", psubusb),
         ("psraw", psraw),
         ("divpd", divpd),
         ("divps", divps),
@@ -3378,6 +3396,44 @@ pub mod x86 {
             output[start..start + 4].copy_from_slice(&result.to_le_bytes());
         }
         cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_abs_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for byte in 0_u8..16 {
+            let value = cpu.read::<u8>(args[0].slice(byte, 1)) as i8;
+            cpu.write_var(dst.slice(byte, 1), value.unsigned_abs());
+        }
+    }
+
+    fn packed_add_w_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in (0_u8..16).step_by(2) {
+            let lhs = cpu.read::<u16>(args[0].slice(offset, 2));
+            let rhs = cpu.read::<u16>(args[1].slice(offset, 2));
+            cpu.write_var(dst.slice(offset, 2), lhs.wrapping_add(rhs));
+        }
+    }
+
+    fn packed_sub_b_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        for offset in 0_u8..16 {
+            let lhs = cpu.read::<u8>(args[0].slice(offset, 1));
+            let rhs = cpu.read::<u8>(args[1].slice(offset, 1));
+            cpu.write_var(dst.slice(offset, 1), lhs.wrapping_sub(rhs));
+        }
     }
 
     fn psraw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
