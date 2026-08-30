@@ -913,6 +913,118 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xf2, 0xe6, 0x5a, 0x27, 0x0e],
         },
         Case {
+            name: "vpopcntd xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0x7d, 0x08, 0x55, 0xca],
+        },
+        Case {
+            name: "vpopcntd xmm3{k5},xmm4",
+            bytes: &[0x62, 0xf2, 0x7d, 0x0d, 0x55, 0xdc],
+        },
+        Case {
+            name: "vpopcntd xmm5{k5}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0x7d, 0x8d, 0x55, 0xee],
+        },
+        Case {
+            name: "vpopcntd ymm7,ymm8",
+            bytes: &[0x62, 0xd2, 0x7d, 0x28, 0x55, 0xf8],
+        },
+        Case {
+            name: "vpopcntd ymm9{k5},ymm10",
+            bytes: &[0x62, 0x52, 0x7d, 0x2d, 0x55, 0xca],
+        },
+        Case {
+            name: "vpopcntd ymm11{k5}{z},ymm12",
+            bytes: &[0x62, 0x52, 0x7d, 0xad, 0x55, 0xdc],
+        },
+        Case {
+            name: "vpopcntd zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0x7d, 0x48, 0x55, 0xee],
+        },
+        Case {
+            name: "vpopcntd zmm15{k5}{z},zmm16",
+            bytes: &[0x62, 0x32, 0x7d, 0xcd, 0x55, 0xf8],
+        },
+        Case {
+            name: "vpopcntd xmm17{k5}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0x7d, 0x8d, 0x55, 0x0e],
+        },
+        Case {
+            name: "vpopcntd ymm18{k5}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0x7d, 0xad, 0x55, 0x16],
+        },
+        Case {
+            name: "vpopcntd zmm19{k5}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0x7d, 0xcd, 0x55, 0x1e],
+        },
+        Case {
+            name: "vpopcntd xmm20{k5}{z},[rsi]{1to4}",
+            bytes: &[0x62, 0xe2, 0x7d, 0x9d, 0x55, 0x26],
+        },
+        Case {
+            name: "vpopcntd ymm21{k5}{z},[rsi]{1to8}",
+            bytes: &[0x62, 0xe2, 0x7d, 0xbd, 0x55, 0x2e],
+        },
+        Case {
+            name: "vpopcntd zmm22{k5}{z},[rsi]{1to16}",
+            bytes: &[0x62, 0xe2, 0x7d, 0xdd, 0x55, 0x36],
+        },
+        Case {
+            name: "vpopcntq xmm1,xmm2",
+            bytes: &[0x62, 0xf2, 0xfd, 0x08, 0x55, 0xca],
+        },
+        Case {
+            name: "vpopcntq xmm3{k6},xmm4",
+            bytes: &[0x62, 0xf2, 0xfd, 0x0e, 0x55, 0xdc],
+        },
+        Case {
+            name: "vpopcntq xmm5{k6}{z},xmm6",
+            bytes: &[0x62, 0xf2, 0xfd, 0x8e, 0x55, 0xee],
+        },
+        Case {
+            name: "vpopcntq ymm7,ymm8",
+            bytes: &[0x62, 0xd2, 0xfd, 0x28, 0x55, 0xf8],
+        },
+        Case {
+            name: "vpopcntq ymm9{k6},ymm10",
+            bytes: &[0x62, 0x52, 0xfd, 0x2e, 0x55, 0xca],
+        },
+        Case {
+            name: "vpopcntq ymm11{k6}{z},ymm12",
+            bytes: &[0x62, 0x52, 0xfd, 0xae, 0x55, 0xdc],
+        },
+        Case {
+            name: "vpopcntq zmm13,zmm14",
+            bytes: &[0x62, 0x52, 0xfd, 0x48, 0x55, 0xee],
+        },
+        Case {
+            name: "vpopcntq zmm15{k6}{z},zmm16",
+            bytes: &[0x62, 0x32, 0xfd, 0xce, 0x55, 0xf8],
+        },
+        Case {
+            name: "vpopcntq xmm17{k6}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0xfd, 0x8e, 0x55, 0x0e],
+        },
+        Case {
+            name: "vpopcntq ymm18{k6}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0xfd, 0xae, 0x55, 0x16],
+        },
+        Case {
+            name: "vpopcntq zmm19{k6}{z},[rsi]",
+            bytes: &[0x62, 0xe2, 0xfd, 0xce, 0x55, 0x1e],
+        },
+        Case {
+            name: "vpopcntq xmm20{k6}{z},[rsi]{1to2}",
+            bytes: &[0x62, 0xe2, 0xfd, 0x9e, 0x55, 0x26],
+        },
+        Case {
+            name: "vpopcntq ymm21{k6}{z},[rsi]{1to4}",
+            bytes: &[0x62, 0xe2, 0xfd, 0xbe, 0x55, 0x2e],
+        },
+        Case {
+            name: "vpopcntq zmm22{k6}{z},[rsi]{1to8}",
+            bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
+        },
+        Case {
             name: "vpermd zmm15,zmm16,zmm17",
             bytes: &[0x62, 0x32, 0x7d, 0x40, 0x36, 0xf9],
         },
@@ -1509,6 +1621,77 @@ fn vptest_memory_suppresses_inactive_element_faults() {
         // suppress faults; the last selected element ends at selected_span.
         // Shifting the source one byte later makes precisely that element
         // cross into the guard page.
+        for (data_offset, should_fault) in [
+            (PAGE - selected_span, false),
+            (PAGE - selected_span + 1, true),
+        ] {
+            let native = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
+            let native_repeat = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            let native_instability = differences(&native, &native_repeat);
+            assert!(
+                native_instability.is_empty(),
+                "{} at offset {data_offset:#x} native authority was not repeatable:\n{}",
+                case.name,
+                native_instability.join("\n")
+            );
+            let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
+            let mismatches = differences(&native, &emulated);
+            assert!(
+                mismatches.is_empty(),
+                "{} at offset {data_offset:#x}:\n{}",
+                case.name,
+                mismatches.join("\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn vpopcnt_memory_masks_and_broadcasts_have_precise_faults() {
+    let cases = [
+        (
+            Case {
+                name: "vpopcntd zmm19{k5}{z},[rsi] boundary",
+                bytes: &[0x62, 0xe2, 0x7d, 0xcd, 0x55, 0x1e],
+            },
+            44,
+        ),
+        (
+            Case {
+                name: "vpopcntq zmm19{k6}{z},[rsi] boundary",
+                bytes: &[0x62, 0xe2, 0xfd, 0xce, 0x55, 0x1e],
+            },
+            32,
+        ),
+        (
+            Case {
+                name: "vpopcntd zmm22{k5}{z},[rsi]{1to16} boundary",
+                bytes: &[0x62, 0xe2, 0x7d, 0xdd, 0x55, 0x36],
+            },
+            4,
+        ),
+        (
+            Case {
+                name: "vpopcntq zmm22{k6}{z},[rsi]{1to8} boundary",
+                bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
+            },
+            8,
+        ),
+    ];
+
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+    for (case, selected_span) in cases {
         for (data_offset, should_fault) in [
             (PAGE - selected_span, false),
             (PAGE - selected_span + 1, true),

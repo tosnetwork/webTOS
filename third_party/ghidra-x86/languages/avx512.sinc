@@ -17644,11 +17644,74 @@ define pcodeop vpopcntw_avx512_bitalg ;
 }
 
 # VPOPCNT 5-573 PAGE 2397 LINE 130956
-define pcodeop vpopcntd_avx512_vpopcntdq ;
+define pcodeop webtos_vpopcnt_128;
+define pcodeop webtos_vpopcnt_mem_128;
+:VPOPCNTD XmmReg1^AVXOpMask^XmmMaskMode, m128Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode & evexB=0; byte=0x55; (XmmReg1 & ZmmReg1) ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpopcnt_mem_128(m128Addr, XmmMask, AVXOpMask, 4:1, 0:1, 0:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPOPCNTD XmmReg1^AVXOpMask^XmmMaskMode, m32Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & XmmMaskMode & evexB=1; byte=0x55; (XmmReg1 & ZmmReg1) ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpopcnt_mem_128(m32Addr, XmmMask, AVXOpMask, 4:1, 0:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPOPCNTD YmmReg1^AVXOpMask^YmmMaskMode, m256Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & YmmMaskMode & evexB=0; byte=0x55; (YmmReg1 & ZmmReg1) ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpopcnt_mem_128(m256Addr, YmmMask[0,128], AVXOpMask, 4:1, 0:1, 0:1);
+	YmmResult[128,128] = webtos_vpopcnt_mem_128(m256Addr, YmmMask[128,128], AVXOpMask, 4:1, 1:1, 0:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPOPCNTD YmmReg1^AVXOpMask^YmmMaskMode, m32Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & YmmMaskMode & evexB=1; byte=0x55; (YmmReg1 & ZmmReg1) ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpopcnt_mem_128(m32Addr, YmmMask[0,128], AVXOpMask, 4:1, 0:1, 1:1);
+	YmmResult[128,128] = webtos_vpopcnt_mem_128(m32Addr, YmmMask[128,128], AVXOpMask, 4:1, 1:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPOPCNTD ZmmReg1^AVXOpMask^ZmmMaskMode, m512Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & ZmmMaskMode & evexB=0; byte=0x55; ZmmReg1 ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[0,128], AVXOpMask, 4:1, 0:1, 0:1);
+	ZmmResult[128,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[128,128], AVXOpMask, 4:1, 1:1, 0:1);
+	ZmmResult[256,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[256,128], AVXOpMask, 4:1, 2:1, 0:1);
+	ZmmResult[384,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[384,128], AVXOpMask, 4:1, 3:1, 0:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPOPCNTD ZmmReg1^AVXOpMask^ZmmMaskMode, m32Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & AVXOpMask & ZmmMaskMode & evexB=1; byte=0x55; ZmmReg1 ... & m32Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpopcnt_mem_128(m32Addr, ZmmMask[0,128], AVXOpMask, 4:1, 0:1, 1:1);
+	ZmmResult[128,128] = webtos_vpopcnt_mem_128(m32Addr, ZmmMask[128,128], AVXOpMask, 4:1, 1:1, 1:1);
+	ZmmResult[256,128] = webtos_vpopcnt_mem_128(m32Addr, ZmmMask[256,128], AVXOpMask, 4:1, 2:1, 1:1);
+	ZmmResult[384,128] = webtos_vpopcnt_mem_128(m32Addr, ZmmMask[384,128], AVXOpMask, 4:1, 3:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
 :VPOPCNTD XmmReg1^XmmOpMask32, XmmReg2_m128_m32bcst is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & XmmOpMask32; byte=0x55; (XmmReg1 & ZmmReg1) ... & XmmReg2_m128_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	XmmResult = vpopcntd_avx512_vpopcntdq( XmmReg2_m128_m32bcst );
+	XmmResult = webtos_vpopcnt_128(XmmReg2_m128_m32bcst, 4:1);
 	XmmMask = XmmReg1;
 	build XmmOpMask32;
 	ZmmReg1 = zext(XmmResult);
@@ -17658,7 +17721,8 @@ define pcodeop vpopcntd_avx512_vpopcntdq ;
 :VPOPCNTD YmmReg1^YmmOpMask32, YmmReg2_m256_m32bcst is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & YmmOpMask32; byte=0x55; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	YmmResult = vpopcntd_avx512_vpopcntdq( YmmReg2_m256_m32bcst );
+	YmmResult[0,128] = webtos_vpopcnt_128(YmmReg2_m256_m32bcst[0,128], 4:1);
+	YmmResult[128,128] = webtos_vpopcnt_128(YmmReg2_m256_m32bcst[128,128], 4:1);
 	YmmMask = YmmReg1;
 	build YmmOpMask32;
 	ZmmReg1 = zext(YmmResult);
@@ -17668,18 +17732,82 @@ define pcodeop vpopcntd_avx512_vpopcntdq ;
 :VPOPCNTD ZmmReg1^ZmmOpMask32, ZmmReg2_m512_m32bcst is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W0) & ZmmOpMask32; byte=0x55; ZmmReg1 ... & ZmmReg2_m512_m32bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	ZmmResult = vpopcntd_avx512_vpopcntdq( ZmmReg2_m512_m32bcst );
+	ZmmResult[0,128] = webtos_vpopcnt_128(ZmmReg2_m512_m32bcst[0,128], 4:1);
+	ZmmResult[128,128] = webtos_vpopcnt_128(ZmmReg2_m512_m32bcst[128,128], 4:1);
+	ZmmResult[256,128] = webtos_vpopcnt_128(ZmmReg2_m512_m32bcst[256,128], 4:1);
+	ZmmResult[384,128] = webtos_vpopcnt_128(ZmmReg2_m512_m32bcst[384,128], 4:1);
 	ZmmMask = ZmmReg1;
 	build ZmmOpMask32;
 	ZmmReg1 = ZmmResult;
 }
 
 # VPOPCNT 5-573 PAGE 2397 LINE 130965
-define pcodeop vpopcntq_avx512_vpopcntdq ;
+:VPOPCNTQ XmmReg1^AVXOpMask^XmmMaskMode, m128Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode & evexB=0; byte=0x55; (XmmReg1 & ZmmReg1) ... & m128Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpopcnt_mem_128(m128Addr, XmmMask, AVXOpMask, 8:1, 0:1, 0:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPOPCNTQ XmmReg1^AVXOpMask^XmmMaskMode, m64Addr is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & XmmMaskMode & evexB=1; byte=0x55; (XmmReg1 & ZmmReg1) ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	XmmMask = XmmReg1;
+	build XmmMaskMode;
+	XmmResult = webtos_vpopcnt_mem_128(m64Addr, XmmMask, AVXOpMask, 8:1, 0:1, 1:1);
+	ZmmReg1 = zext(XmmResult);
+}
+
+:VPOPCNTQ YmmReg1^AVXOpMask^YmmMaskMode, m256Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode & evexB=0; byte=0x55; (YmmReg1 & ZmmReg1) ... & m256Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpopcnt_mem_128(m256Addr, YmmMask[0,128], AVXOpMask, 8:1, 0:1, 0:1);
+	YmmResult[128,128] = webtos_vpopcnt_mem_128(m256Addr, YmmMask[128,128], AVXOpMask, 8:1, 1:1, 0:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPOPCNTQ YmmReg1^AVXOpMask^YmmMaskMode, m64Addr is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & YmmMaskMode & evexB=1; byte=0x55; (YmmReg1 & ZmmReg1) ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	YmmMask = YmmReg1;
+	build YmmMaskMode;
+	YmmResult[0,128] = webtos_vpopcnt_mem_128(m64Addr, YmmMask[0,128], AVXOpMask, 8:1, 0:1, 1:1);
+	YmmResult[128,128] = webtos_vpopcnt_mem_128(m64Addr, YmmMask[128,128], AVXOpMask, 8:1, 1:1, 1:1);
+	ZmmReg1 = zext(YmmResult);
+}
+
+:VPOPCNTQ ZmmReg1^AVXOpMask^ZmmMaskMode, m512Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode & evexB=0; byte=0x55; ZmmReg1 ... & m512Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[0,128], AVXOpMask, 8:1, 0:1, 0:1);
+	ZmmResult[128,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[128,128], AVXOpMask, 8:1, 1:1, 0:1);
+	ZmmResult[256,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[256,128], AVXOpMask, 8:1, 2:1, 0:1);
+	ZmmResult[384,128] = webtos_vpopcnt_mem_128(m512Addr, ZmmMask[384,128], AVXOpMask, 8:1, 3:1, 0:1);
+	ZmmReg1 = ZmmResult;
+}
+
+:VPOPCNTQ ZmmReg1^AVXOpMask^ZmmMaskMode, m64Addr is $(EVEX_NONE) & $(VEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & AVXOpMask & ZmmMaskMode & evexB=1; byte=0x55; ZmmReg1 ... & m64Addr & evexDisp8N
+[ evexD8Type = 0; evexTType = 0; ]
+{
+	ZmmMask = ZmmReg1;
+	build ZmmMaskMode;
+	ZmmResult[0,128] = webtos_vpopcnt_mem_128(m64Addr, ZmmMask[0,128], AVXOpMask, 8:1, 0:1, 1:1);
+	ZmmResult[128,128] = webtos_vpopcnt_mem_128(m64Addr, ZmmMask[128,128], AVXOpMask, 8:1, 1:1, 1:1);
+	ZmmResult[256,128] = webtos_vpopcnt_mem_128(m64Addr, ZmmMask[256,128], AVXOpMask, 8:1, 2:1, 1:1);
+	ZmmResult[384,128] = webtos_vpopcnt_mem_128(m64Addr, ZmmMask[384,128], AVXOpMask, 8:1, 3:1, 1:1);
+	ZmmReg1 = ZmmResult;
+}
+
 :VPOPCNTQ XmmReg1^XmmOpMask64, XmmReg2_m128_m64bcst is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & XmmOpMask64; byte=0x55; (XmmReg1 & ZmmReg1) ... & XmmReg2_m128_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	XmmResult = vpopcntq_avx512_vpopcntdq( XmmReg2_m128_m64bcst );
+	XmmResult = webtos_vpopcnt_128(XmmReg2_m128_m64bcst, 8:1);
 	XmmMask = XmmReg1;
 	build XmmOpMask64;
 	ZmmReg1 = zext(XmmResult);
@@ -17689,7 +17817,8 @@ define pcodeop vpopcntq_avx512_vpopcntdq ;
 :VPOPCNTQ YmmReg1^YmmOpMask64, YmmReg2_m256_m64bcst is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & YmmOpMask64; byte=0x55; (YmmReg1 & ZmmReg1) ... & YmmReg2_m256_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	YmmResult = vpopcntq_avx512_vpopcntdq( YmmReg2_m256_m64bcst );
+	YmmResult[0,128] = webtos_vpopcnt_128(YmmReg2_m256_m64bcst[0,128], 8:1);
+	YmmResult[128,128] = webtos_vpopcnt_128(YmmReg2_m256_m64bcst[128,128], 8:1);
 	YmmMask = YmmReg1;
 	build YmmOpMask64;
 	ZmmReg1 = zext(YmmResult);
@@ -17699,7 +17828,10 @@ define pcodeop vpopcntq_avx512_vpopcntdq ;
 :VPOPCNTQ ZmmReg1^ZmmOpMask64, ZmmReg2_m512_m64bcst is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F38) & $(VEX_W1) & ZmmOpMask64; byte=0x55; ZmmReg1 ... & ZmmReg2_m512_m64bcst
 [ evexD8Type = 0; evexTType = 0; ] # (TupleType Full)
 {
-	ZmmResult = vpopcntq_avx512_vpopcntdq( ZmmReg2_m512_m64bcst );
+	ZmmResult[0,128] = webtos_vpopcnt_128(ZmmReg2_m512_m64bcst[0,128], 8:1);
+	ZmmResult[128,128] = webtos_vpopcnt_128(ZmmReg2_m512_m64bcst[128,128], 8:1);
+	ZmmResult[256,128] = webtos_vpopcnt_128(ZmmReg2_m512_m64bcst[256,128], 8:1);
+	ZmmResult[384,128] = webtos_vpopcnt_128(ZmmReg2_m512_m64bcst[384,128], 8:1);
 	ZmmMask = ZmmReg1;
 	build ZmmOpMask64;
 	ZmmReg1 = ZmmResult;

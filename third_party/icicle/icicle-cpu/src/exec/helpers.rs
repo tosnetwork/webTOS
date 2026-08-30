@@ -401,6 +401,8 @@ pub mod x86 {
         ("webtos_vptestm_mem_128", packed_test_mask_mem_128),
         ("webtos_vptestm_mem_256", packed_test_mask_mem_256),
         ("webtos_vptestm_mem_512", packed_test_mask_mem_512),
+        ("webtos_vpopcnt_128", packed_popcount_128),
+        ("webtos_vpopcnt_mem_128", packed_popcount_mem_128),
         // MMX/SSE2 saturating packed arithmetic (also opaque in the spec).
         ("paddsb", paddsb),
         ("paddsw", paddsw),
@@ -1544,6 +1546,80 @@ pub mod x86 {
             cpu.args[5] != 0,
             cpu.args[6] != 0,
         );
+    }
+
+    fn packed_popcount_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 16 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let element_size = cpu.read::<u8>(args[1]) as usize;
+        if !matches!(element_size, 1 | 2 | 4 | 8) {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        }
+        let source = cpu.read::<u128>(args[0]).to_le_bytes();
+        let mut output = [0_u8; 16];
+        for lane in 0..16 / element_size {
+            let start = lane * element_size;
+            let count: u64 = source[start..start + element_size]
+                .iter()
+                .map(|byte| u64::from(byte.count_ones()))
+                .sum();
+            output[start..start + element_size]
+                .copy_from_slice(&count.to_le_bytes()[..element_size]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_popcount_mem_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let mask = cpu.args[0] as u64;
+        let element_size = cpu.args[1] as usize;
+        let chunk = cpu.args[2] as usize;
+        let broadcast = cpu.args[3] != 0;
+        if !matches!(element_size, 1 | 2 | 4 | 8) || chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = element_size as u64;
+            return;
+        }
+        let lanes_per_chunk = 16 / element_size;
+        let mut output = cpu.read::<u128>(args[1]).to_le_bytes();
+        for lane_in_chunk in 0..lanes_per_chunk {
+            let global_lane = chunk * lanes_per_chunk + lane_in_chunk;
+            if mask & (1_u64 << global_lane) == 0 {
+                continue;
+            }
+            let source_offset = if broadcast { 0 } else { global_lane * element_size };
+            let mut count = 0_u64;
+            for byte in 0..element_size {
+                let Some(current) = address.checked_add((source_offset + byte) as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => count += u64::from(value[0].count_ones()),
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+            let output_offset = lane_in_chunk * element_size;
+            output[output_offset..output_offset + element_size]
+                .copy_from_slice(&count.to_le_bytes()[..element_size]);
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
     fn rdtsc(cpu: &mut Cpu, dst: VarNode, _: [Value; 2]) {
