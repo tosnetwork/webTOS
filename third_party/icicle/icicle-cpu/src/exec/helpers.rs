@@ -307,6 +307,29 @@ pub mod x86 {
         ("pabsw", pabsw),
         ("pabsd", pabsd),
         ("psllw", psllw),
+        ("vpsllw_avx", psllw),
+        ("vpsllw_avx2", psllw),
+        ("vpsllw_avx512vl", psllw),
+        ("vpsllw_avx512bw", psllw),
+        ("vpsrlw_avx", packed_shift_right_w),
+        ("vpsrlw_avx2", packed_shift_right_w),
+        ("vpsrlw_avx512vl", packed_shift_right_w),
+        ("vpsrlw_avx512bw", packed_shift_right_w),
+        ("vpsrld_avx", packed_shift_right_d),
+        ("vpsrld_avx2", packed_shift_right_d),
+        ("vpsrld_avx512vl", packed_shift_right_d),
+        ("vpsrld_avx512f", packed_shift_right_d),
+        ("vpsrldq_avx", packed_shift_right_lane_bytes),
+        ("vpsrldq_avx2", packed_shift_right_lane_bytes),
+        ("vpsrldq_avx512vl", packed_shift_right_lane_bytes),
+        ("vpsrldq_avx512bw", packed_shift_right_lane_bytes),
+        ("vpsllvd_avx2", packed_shift_left_variable_d),
+        ("vpsllvd_avx512vl", packed_shift_left_variable_d),
+        ("vpsllvd_avx512f", packed_shift_left_variable_d),
+        ("vpsrlvd_avx2", packed_shift_right_variable_d),
+        ("vpsrlvd_avx512vl", packed_shift_right_variable_d),
+        ("vpsrlvd_avx512f", packed_shift_right_variable_d),
+        ("webtos_vpshiftvd_mem_128", packed_shift_variable_d_mem_128),
         ("psraw", psraw),
         ("divpd", divpd),
         ("divps", divps),
@@ -3234,6 +3257,127 @@ pub mod x86 {
             let r = if count >= 16 { 0 } else { w << count };
             cpu.write_var(dst.slice(i, 2), r);
         }
+    }
+
+    fn packed_shift_right_w(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]);
+        for i in (0..dst.size).step_by(2) {
+            let word: u16 = cpu.read(args[0].slice(i, 2));
+            cpu.write_var(dst.slice(i, 2), if count >= 16 { 0 } else { word >> count });
+        }
+    }
+
+    fn packed_shift_right_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]);
+        for i in (0..dst.size).step_by(4) {
+            let dword: u32 = cpu.read(args[0].slice(i, 4));
+            cpu.write_var(dst.slice(i, 4), if count >= 32 { 0 } else { dword >> count });
+        }
+    }
+
+    /// VPSRLDQ shifts each architectural 128-bit lane independently. Counts
+    /// greater than 15 zero the complete lane rather than crossing a lane
+    /// boundary.
+    fn packed_shift_right_lane_bytes(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        let count = simd_shift_count(cpu, args[1]).min(16) as u8;
+        for lane in (0..dst.size).step_by(16) {
+            for byte in 0_u8..16 {
+                let value = if byte + count < 16 {
+                    cpu.read::<u8>(args[0].slice(lane + byte + count, 1))
+                }
+                else {
+                    0
+                };
+                cpu.write_var(dst.slice(lane + byte, 1), value);
+            }
+        }
+    }
+
+    fn packed_shift_variable_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], left: bool) {
+        for i in (0..dst.size).step_by(4) {
+            let value: u32 = cpu.read(args[0].slice(i, 4));
+            let count: u32 = cpu.read(args[1].slice(i, 4));
+            let result = if count >= 32 {
+                0
+            }
+            else if left {
+                value << count
+            }
+            else {
+                value >> count
+            };
+            cpu.write_var(dst.slice(i, 4), result);
+        }
+    }
+
+    fn packed_shift_left_variable_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_d(cpu, dst, args, true);
+    }
+
+    fn packed_shift_right_variable_d(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        packed_shift_variable_d(cpu, dst, args, false);
+    }
+
+    /// Computes one 128-bit chunk of an EVEX variable dword shift whose
+    /// count vector is in memory. SLEIGH passes the address rather than
+    /// materializing the vector so inactive mask elements suppress faults.
+    fn packed_shift_variable_d_mem_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 16 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let address = cpu.read::<u64>(args[0]);
+        let values = cpu.read::<u128>(args[1]).to_le_bytes();
+        let mut output = cpu.args[0].to_le_bytes();
+        let mask = cpu.args[1] as u64;
+        let chunk = cpu.args[2] as usize;
+        let left = cpu.args[3] != 0;
+        let broadcast = cpu.args[4] != 0;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+
+        for lane in 0..4 {
+            let global_lane = chunk * 4 + lane;
+            if mask & (1_u64 << global_lane) == 0 {
+                continue;
+            }
+            let source_offset = if broadcast { 0 } else { global_lane * 4 };
+            let mut count_bytes = [0_u8; 4];
+            for (byte, output_byte) in count_bytes.iter_mut().enumerate() {
+                let Some(current) = address.checked_add((source_offset + byte) as u64)
+                else {
+                    cpu.exception.code = ExceptionCode::AddressOverflow as u32;
+                    cpu.exception.value = u64::MAX;
+                    return;
+                };
+                match cpu.mem.read::<1>(current, icicle_mem::perm::READ) {
+                    Ok(value) => *output_byte = value[0],
+                    Err(error) => {
+                        cpu.exception.code = ExceptionCode::from_load_error(error) as u32;
+                        cpu.exception.value = current;
+                        return;
+                    }
+                }
+            }
+            let count = u32::from_le_bytes(count_bytes);
+            let start = lane * 4;
+            let value = u32::from_le_bytes(values[start..start + 4].try_into().unwrap());
+            let result = if count >= 32 {
+                0
+            }
+            else if left {
+                value << count
+            }
+            else {
+                value >> count
+            };
+            output[start..start + 4].copy_from_slice(&result.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
     }
 
     fn psraw(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {

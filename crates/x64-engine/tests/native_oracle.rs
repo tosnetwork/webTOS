@@ -1052,6 +1052,122 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             bytes: &[0x62, 0xe2, 0xfd, 0xde, 0x55, 0x36],
         },
         Case {
+            name: "vpsllw xmm1,xmm2,3",
+            bytes: &[0xc5, 0xf1, 0x71, 0xf2, 0x03],
+        },
+        Case {
+            name: "vpsllw ymm3,ymm4,15",
+            bytes: &[0xc5, 0xe5, 0x71, 0xf4, 0x0f],
+        },
+        Case {
+            name: "vpsllw zmm5{k5}{z},zmm6,16",
+            bytes: &[0x62, 0xf1, 0x55, 0xcd, 0x71, 0xf6, 0x10],
+        },
+        Case {
+            name: "vpsrlw xmm7,xmm8,4",
+            bytes: &[0xc4, 0xc1, 0x41, 0x71, 0xd0, 0x04],
+        },
+        Case {
+            name: "vpsrlw ymm9,ymm10,15",
+            bytes: &[0xc4, 0xc1, 0x35, 0x71, 0xd2, 0x0f],
+        },
+        Case {
+            name: "vpsrlw zmm11{k5}{z},zmm12,16",
+            bytes: &[0x62, 0xd1, 0x25, 0xcd, 0x71, 0xd4, 0x10],
+        },
+        Case {
+            name: "vpsrld xmm13,xmm14,7",
+            bytes: &[0xc4, 0xc1, 0x11, 0x72, 0xd6, 0x07],
+        },
+        Case {
+            name: "vpsrld ymm15,ymm16,31",
+            bytes: &[0x62, 0xb1, 0x05, 0x28, 0x72, 0xd0, 0x1f],
+        },
+        Case {
+            name: "vpsrld zmm17{k5}{z},zmm18,32",
+            bytes: &[0x62, 0xb1, 0x75, 0xc5, 0x72, 0xd2, 0x20],
+        },
+        Case {
+            name: "vpsrldq xmm19,xmm20,7",
+            bytes: &[0x62, 0xb1, 0x65, 0x00, 0x73, 0xdc, 0x07],
+        },
+        Case {
+            name: "vpsrldq ymm21,ymm22,15",
+            bytes: &[0x62, 0xb1, 0x55, 0x20, 0x73, 0xde, 0x0f],
+        },
+        Case {
+            name: "vpsrldq zmm23,zmm24,16",
+            bytes: &[0x62, 0x91, 0x45, 0x40, 0x73, 0xd8, 0x10],
+        },
+        Case {
+            name: "vpsllvd xmm1,xmm2,xmm3",
+            bytes: &[0xc4, 0xe2, 0x69, 0x47, 0xcb],
+        },
+        Case {
+            name: "vpsllvd ymm4,ymm5,ymm6",
+            bytes: &[0xc4, 0xe2, 0x55, 0x47, 0xe6],
+        },
+        Case {
+            name: "vpsllvd zmm7{k5}{z},zmm8,zmm9",
+            bytes: &[0x62, 0xd2, 0x3d, 0xcd, 0x47, 0xf9],
+        },
+        Case {
+            name: "vpsrlvd xmm10,xmm11,xmm12",
+            bytes: &[0xc4, 0x42, 0x21, 0x45, 0xd4],
+        },
+        Case {
+            name: "vpsrlvd ymm13,ymm14,ymm15",
+            bytes: &[0xc4, 0x42, 0x0d, 0x45, 0xef],
+        },
+        Case {
+            name: "vpsrlvd zmm16{k5}{z},zmm17,zmm18",
+            bytes: &[0x62, 0xa2, 0x75, 0xc5, 0x45, 0xc2],
+        },
+        Case {
+            name: "vpsllw zmm19{k5},zmm20,[rsi]",
+            bytes: &[0x62, 0xe1, 0x5d, 0x45, 0xf1, 0x1e],
+        },
+        Case {
+            name: "vpsrlw zmm21{k5},zmm22,[rsi]",
+            bytes: &[0x62, 0xe1, 0x4d, 0x45, 0xd1, 0x2e],
+        },
+        Case {
+            name: "vpsrld zmm23{k5},zmm24,[rsi]",
+            bytes: &[0x62, 0xe1, 0x3d, 0x45, 0xd2, 0x3e],
+        },
+        Case {
+            name: "vpsllvd zmm25{k5},zmm26,[rsi]",
+            bytes: &[0x62, 0x62, 0x2d, 0x45, 0x47, 0x0e],
+        },
+        Case {
+            name: "vpsrlvd zmm27{k5},zmm28,[rsi]",
+            bytes: &[0x62, 0x62, 0x1d, 0x45, 0x45, 0x1e],
+        },
+        Case {
+            name: "vpsllvd xmm1{k5}{z},xmm2,[rsi]",
+            bytes: &[0x62, 0xf2, 0x6d, 0x8d, 0x47, 0x0e],
+        },
+        Case {
+            name: "vpsllvd ymm3{k5},ymm4,[rsi]",
+            bytes: &[0x62, 0xf2, 0x5d, 0x2d, 0x47, 0x1e],
+        },
+        Case {
+            name: "vpsllvd zmm5{k5}{z},zmm6,[rsi]{1to16}",
+            bytes: &[0x62, 0xf2, 0x4d, 0xdd, 0x47, 0x2e],
+        },
+        Case {
+            name: "vpsrlvd xmm7{k5}{z},xmm8,[rsi]",
+            bytes: &[0x62, 0xf2, 0x3d, 0x8d, 0x45, 0x3e],
+        },
+        Case {
+            name: "vpsrlvd ymm9{k5},ymm10,[rsi]",
+            bytes: &[0x62, 0x72, 0x2d, 0x2d, 0x45, 0x0e],
+        },
+        Case {
+            name: "vpsrlvd zmm11{k5}{z},zmm12,[rsi]{1to16}",
+            bytes: &[0x62, 0x72, 0x1d, 0xdd, 0x45, 0x1e],
+        },
+        Case {
             name: "vpmaddubsw xmm1,xmm2,xmm3",
             bytes: &[0xc4, 0xe2, 0x69, 0x04, 0xcb],
         },
@@ -2063,6 +2179,66 @@ fn vpopcnt_memory_masks_and_broadcasts_have_precise_faults() {
                 case.name,
                 native_instability.join("\n")
             );
+            let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
+            let mismatches = differences(&native, &emulated);
+            assert!(
+                mismatches.is_empty(),
+                "{} at offset {data_offset:#x}:\n{}",
+                case.name,
+                mismatches.join("\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn variable_shift_memory_suppresses_inactive_dword_faults() {
+    let cases = [
+        (
+            Case {
+                name: "vpsllvd zmm25{k5},zmm26,[rsi] boundary",
+                bytes: &[0x62, 0x62, 0x2d, 0x45, 0x47, 0x0e],
+            },
+            44,
+        ),
+        (
+            Case {
+                name: "vpsrlvd zmm27{k5},zmm28,[rsi] boundary",
+                bytes: &[0x62, 0x62, 0x1d, 0x45, 0x45, 0x1e],
+            },
+            44,
+        ),
+        (
+            Case {
+                name: "vpsllvd zmm5{k5}{z},zmm6,[rsi]{1to16} boundary",
+                bytes: &[0x62, 0xf2, 0x4d, 0xdd, 0x47, 0x2e],
+            },
+            4,
+        ),
+        (
+            Case {
+                name: "vpsrlvd zmm11{k5}{z},zmm12,[rsi]{1to16} boundary",
+                bytes: &[0x62, 0x72, 0x1d, 0xdd, 0x45, 0x1e],
+            },
+            4,
+        ),
+    ];
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+
+    // K5's highest selected dword is lane 10. Masked-off lanes 11 through 15
+    // must not fault, while shifting lane 10 one byte into the guard must.
+    for (case, selected_span) in cases {
+        for (data_offset, should_fault) in [
+            (PAGE - selected_span, false),
+            (PAGE - selected_span + 1, true),
+        ] {
+            let native = normalize_native(
+                native_with_layout(case, data_offset, true),
+                case,
+                data_offset,
+                should_fault,
+            );
+            assert_eq!(native.fault_signal.is_some(), should_fault, "{}", case.name);
             let emulated = emulated_with_layout(&mut vm, case, 0x1000, 0x2000, data_offset);
             let mismatches = differences(&native, &emulated);
             assert!(
