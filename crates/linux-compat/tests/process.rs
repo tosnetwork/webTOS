@@ -195,6 +195,7 @@ static void *worker(void *arg) {
     }
     return (void *)123;
 }
+
 int main(void) {
     pthread_t a, b;
     if (pthread_create(&a, 0, worker, 0)) return 1;
@@ -213,6 +214,316 @@ int main(void) {
     expect_clean(&run);
     assert!(
         run.output.contains("counter=4000"),
+        "output: {:?}",
+        run.output
+    );
+}
+
+/// A successful FUTEX_WAKE completes the already-admitted FUTEX_WAIT with
+/// zero.  The kernel does not restart the syscall and compare the userspace
+/// word a second time: the waker normally changes that word before waking the
+/// waiter, so such a replay would incorrectly turn every successful wake into
+/// EAGAIN.  Bun/JSC relies on the distinction in its worker hand-off path.
+#[test]
+fn futex_wake_returns_success_without_rechecking_the_word() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/futex.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static atomic_int word;
+static atomic_int waiter_ready;
+static long wait_result = -2;
+static int wait_errno = -1;
+
+static void *waiter(void *arg) {
+    (void)arg;
+    atomic_store_explicit(&waiter_ready, 1, memory_order_release);
+    errno = 0;
+    wait_result = syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0, 0, 0, 0);
+    wait_errno = errno;
+    return 0;
+}
+
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, waiter, 0)) return 1;
+    while (!atomic_load_explicit(&waiter_ready, memory_order_acquire))
+        sched_yield();
+    atomic_store_explicit(&word, 1, memory_order_release);
+    long woken = syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+    if (pthread_join(thread, 0)) return 2;
+    printf("wake=%ld wait=%ld errno=%d\n", woken, wait_result, wait_errno);
+    return woken == 1 && wait_result == 0 && wait_errno == 0 ? 0 : 3;
+}
+"#;
+    let Some(image) = compile_c("futex_wake_result", source, &["-pthread"]) else {
+        return;
+    };
+    let run = run_image(image, "futex_wake_result");
+    expect_clean(&run);
+    assert_eq!(run.output, "wake=1 wait=0 errno=0\n");
+}
+
+#[test]
+fn clone3_process_and_extensible_argument_validation() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    struct clone_args args;
+    memset(&args, 0, sizeof(args));
+    args.exit_signal = SIGCHLD;
+    long pid = syscall(SYS_clone3, &args, sizeof(args));
+    if (pid < 0) { perror("clone3"); return 1; }
+    if (pid == 0) _exit(37);
+    int status = 0;
+    if (waitpid((pid_t)pid, &status, 0) != pid) return 2;
+
+    errno = 0;
+    if (syscall(SYS_clone3, &args, 63) != -1 || errno != EINVAL) return 3;
+
+    unsigned char future[sizeof(args) + 8];
+    memset(future, 0, sizeof(future));
+    memcpy(future, &args, sizeof(args));
+    future[sizeof(args)] = 1;
+    errno = 0;
+    if (syscall(SYS_clone3, future, sizeof(future)) != -1 || errno != E2BIG) return 4;
+
+    printf("clone3 child=%d validation=ok\n", WEXITSTATUS(status));
+    return WIFEXITED(status) && WEXITSTATUS(status) == 37 ? 0 : 5;
+}
+
+"#;
+    let Some(image) = compile_c("clone3_process", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "clone3_process");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("clone3 child=37 validation=ok"),
+        "output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn virtual_cpu_topology_matches_the_affinity_contract() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    FILE *file = fopen("/sys/devices/system/cpu/online", "r");
+    char online[32] = {0};
+    if (!file || !fgets(online, sizeof(online), file)) return 1;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set)) return 2;
+    int count = CPU_COUNT(&set);
+    printf("online=%scount=%d cpus=%d%d%d%d\n", online, count,
+           CPU_ISSET(0, &set), CPU_ISSET(1, &set),
+           CPU_ISSET(2, &set), CPU_ISSET(3, &set));
+    return strcmp(online, "0-3\n") == 0 && count == 4 ? 0 : 3;
+}
+"#;
+    let Some(image) = compile_c("cpu_topology", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "cpu_topology");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("count=4 cpus=1111"),
+        "output: {:?}",
+        run.output
+    );
+}
+
+/// A userspace spinner must not starve a runnable sibling. Bun/V8 use this
+/// pattern around GC and worker hand-offs: the waiter may poll clocks and
+/// atomics without entering a blocking syscall, so syscall-only scheduling
+/// deadlocks even though useful work is ready.
+#[test]
+fn runnable_thread_preempts_userspace_spin() {
+    let source = r#"
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdio.h>
+static atomic_int ready;
+static void *worker(void *arg) {
+    (void)arg;
+    atomic_store_explicit(&ready, 1, memory_order_release);
+    return (void *)77;
+}
+
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, worker, 0)) return 1;
+    while (!atomic_load_explicit(&ready, memory_order_acquire)) {
+        __asm__ volatile ("" ::: "memory");
+    }
+    void *result = 0;
+    if (pthread_join(thread, &result)) return 2;
+    printf("preempted result=%ld\n", (long)result);
+    return (long)result == 77 ? 0 : 3;
+}
+"#;
+    let Some(image) = compile_c("thread_preempt", source, &["-pthread"]) else {
+        return;
+    };
+    let run = run_image(image, "thread_preempt");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("preempted result=77"),
+        "output: {:?}",
+        run.output
+    );
+    assert!(
+        run.icount < 5_000_000,
+        "preemption took {} instructions",
+        run.icount
+    );
+}
+
+#[test]
+fn thread_cpu_clock_excludes_sibling_work_while_process_clock_aggregates_it() {
+    let source = r#"
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+
+static uint64_t worker_cpu;
+
+static uint64_t ns(clockid_t id) {
+    struct timespec ts;
+    if (clock_gettime(id, &ts)) return UINT64_MAX;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void *worker(void *arg) {
+    (void)arg;
+    uint64_t before = ns(CLOCK_THREAD_CPUTIME_ID);
+    volatile uint64_t value = 1;
+    for (uint64_t i = 0; i < 20000000; i++) value = value * 3 + i;
+    uint64_t after = ns(CLOCK_THREAD_CPUTIME_ID);
+    worker_cpu = after - before;
+    return (void *)(uintptr_t)(value != 0);
+}
+
+int main(void) {
+    uint64_t thread_before = ns(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t process_before = ns(CLOCK_PROCESS_CPUTIME_ID);
+    pthread_t thread;
+    if (pthread_create(&thread, 0, worker, 0)) return 1;
+    void *result = 0;
+    if (pthread_join(thread, &result)) return 2;
+    uint64_t thread_after = ns(CLOCK_THREAD_CPUTIME_ID);
+    uint64_t process_after = ns(CLOCK_PROCESS_CPUTIME_ID);
+    uint64_t parent_cpu = thread_after - thread_before;
+    uint64_t process_cpu = process_after - process_before;
+    printf("parent=%llu worker=%llu process=%llu\n",
+           (unsigned long long)parent_cpu,
+           (unsigned long long)worker_cpu,
+           (unsigned long long)process_cpu);
+    if (!result || worker_cpu < 1000000) return 3;
+    if (parent_cpu >= worker_cpu / 4) return 4;
+    if (process_cpu < worker_cpu + parent_cpu) return 5;
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("thread_cpu_clock", source, &["-pthread"]) else {
+        return;
+    };
+    let run = run_image(image, "thread_cpu_clock");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("parent=")
+            && run.output.contains("worker=")
+            && run.output.contains("process="),
+        "output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn sched_setscheduler_accepts_only_the_bun_identity_policy() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static atomic_int worker_tid;
+static atomic_int release_worker;
+
+static void *worker(void *arg) {
+    (void)arg;
+    atomic_store_explicit(&worker_tid, (int)syscall(SYS_gettid), memory_order_release);
+    while (!atomic_load_explicit(&release_worker, memory_order_acquire))
+        __asm__ volatile ("" ::: "memory");
+    return 0;
+}
+
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, 0, worker, 0)) return 1;
+    int tid;
+    while (!(tid = atomic_load_explicit(&worker_tid, memory_order_acquire)))
+        __asm__ volatile ("" ::: "memory");
+
+    struct sched_param param = { .sched_priority = 0 };
+    if (syscall(SYS_sched_setscheduler, tid, 0x40000000, &param)) return 2;
+    errno = 0;
+    if (syscall(SYS_sched_setscheduler, tid, SCHED_FIFO, &param) != -1 || errno != EINVAL)
+        return 3;
+    param.sched_priority = 1;
+    errno = 0;
+    if (syscall(SYS_sched_setscheduler, tid, SCHED_OTHER, &param) != -1 || errno != EINVAL)
+        return 4;
+    errno = 0;
+    if (syscall(SYS_sched_setscheduler, 999999, SCHED_OTHER, &(struct sched_param){0}) != -1 || errno != ESRCH)
+        return 5;
+    errno = 0;
+    long null_result = syscall(SYS_sched_setscheduler, tid, SCHED_OTHER, 0);
+    if (null_result != -1 || errno != EFAULT) {
+        printf("null result=%ld errno=%d\n", null_result, errno);
+        return 6;
+    }
+
+    atomic_store_explicit(&release_worker, 1, memory_order_release);
+    if (pthread_join(thread, 0)) return 7;
+    puts("sched identity policy accepted and bounded");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("sched_setscheduler", source, &["-pthread"]) else {
+        return;
+    };
+    let run = run_image(image, "sched_setscheduler");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("sched identity policy accepted and bounded"),
         "output: {:?}",
         run.output
     );
@@ -534,6 +845,7 @@ fn sigchld_self_pipe_wakes_a_parent_not_in_wait() {
     let source = r#"
 #include <signal.h>
 #include <spawn.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -557,7 +869,9 @@ int main(void) {
     if (rc != 0) { printf("spawn failed rc=%d\n", rc); return 3; }
     /* Block on the self-pipe, not wait4: only SIGCHLD delivery can wake us. */
     char buf;
-    if (read(wake[0], &buf, 1) != 1) { printf("wakeup read failed\n"); return 4; }
+    ssize_t n;
+    do { n = read(wake[0], &buf, 1); } while (n < 0 && errno == EINTR);
+    if (n != 1) { printf("wakeup read failed\n"); return 4; }
     int status = 0;
     if (waitpid(pid, &status, 0) != pid) { printf("reap failed\n"); return 5; }
     printf("reaped-status=%d\n", WEXITSTATUS(status));

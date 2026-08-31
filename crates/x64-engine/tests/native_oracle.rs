@@ -11,6 +11,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr;
 
+use iced_x86::{Decoder, DecoderOptions};
 use icicle_cpu::{mem::perm, mem::Mapping, ValueSource};
 use x64_engine::{build::build_x64_vm, EngineConfig, InterpVm, VmExit};
 
@@ -28,10 +29,30 @@ struct Case {
 #[derive(Clone)]
 struct ResultState {
     gprs: [u64; 18],
+    rflags_mask: u64,
     xstate: Vec<u8>,
     memory: Vec<u8>,
     fault_signal: Option<i32>,
     fault_offset: Option<u64>,
+}
+
+const COMPARABLE_RFLAGS: u64 = 0x0004_0dd5;
+
+fn comparison_rflags_mask(case: Case) -> u64 {
+    let mut decoder = Decoder::with_ip(64, case.bytes, 0, DecoderOptions::NONE);
+    let instruction = decoder.decode();
+    if instruction.is_invalid() {
+        // An invalid encoding faults before changing RFLAGS. Its complete
+        // seeded comparison mask remains authoritative.
+        return COMPARABLE_RFLAGS;
+    }
+    assert_eq!(
+        instruction.len(),
+        case.bytes.len(),
+        "{} contains bytes beyond its one-instruction oracle case",
+        case.name
+    );
+    COMPARABLE_RFLAGS & !u64::from(instruction.rflags_undefined())
 }
 
 fn ldef() -> PathBuf {
@@ -606,11 +627,11 @@ fn native_with_layout_and_lengths(
     assert!(libc::WIFSTOPPED(status), "child status {status:#x}");
     let stop_signal = libc::WSTOPSIG(status);
     assert!(
-        matches!(stop_signal, libc::SIGTRAP | libc::SIGSEGV),
+        matches!(stop_signal, libc::SIGTRAP | libc::SIGSEGV | libc::SIGILL),
         "{} stopped with unexpected signal {stop_signal}",
         case.name
     );
-    let (fault_signal, fault_offset) = if stop_signal == libc::SIGSEGV {
+    let (fault_signal, fault_offset) = if matches!(stop_signal, libc::SIGSEGV | libc::SIGILL) {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         unsafe {
             checked_ptrace(
@@ -621,7 +642,12 @@ fn native_with_layout_and_lengths(
             );
         }
         let address = unsafe { info.si_addr() } as u64;
-        (Some(stop_signal), Some(address.wrapping_sub(data_base)))
+        let base = if stop_signal == libc::SIGILL {
+            code
+        } else {
+            data_base
+        };
+        (Some(stop_signal), Some(address.wrapping_sub(base)))
     } else {
         (None, None)
     };
@@ -655,6 +681,7 @@ fn native_with_layout_and_lengths(
     result_xstate.truncate(result_iov.iov_len);
     ResultState {
         gprs: from_native_regs(&regs),
+        rflags_mask: comparison_rflags_mask(case),
         xstate: result_xstate,
         memory,
         fault_signal,
@@ -706,15 +733,23 @@ fn emulated_with_layout_and_lengths(
         .write_bytes(data_base, &vec![0x5a; PAGE], perm::NONE)
         .unwrap();
     (vm.cpu.arch.on_boot)(&mut vm.cpu, code);
-    let decoded = x64_engine::decode::decode_one(&vm.cpu, case.bytes)
-        .unwrap_or_else(|error| panic!("{} failed to decode: {error:?}", case.name));
-    assert_eq!(
-        decoded.len,
-        case.bytes.len(),
-        "{} decoded with the wrong length as {}",
-        case.name,
-        decoded.disasm
-    );
+    match x64_engine::decode::decode_one(&vm.cpu, case.bytes) {
+        Ok(decoded) => assert_eq!(
+            decoded.len,
+            case.bytes.len(),
+            "{} decoded with the wrong length as {}",
+            case.name,
+            decoded.disasm
+        ),
+        Err(error) => {
+            let mut reference = Decoder::with_ip(64, case.bytes, code, DecoderOptions::NONE);
+            assert!(
+                reference.decode().is_invalid(),
+                "{} failed to decode as {error:?}, but the reference decoder accepts it",
+                case.name
+            );
+        }
+    }
 
     let names = [
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12",
@@ -758,6 +793,10 @@ fn emulated_with_layout_and_lengths(
     let exit = vm.run();
     let (fault_signal, fault_offset) = match exit {
         VmExit::InstructionLimit => (None, None),
+        VmExit::UnhandledException((x64_engine::ExceptionCode::InvalidInstruction, _)) => (
+            Some(libc::SIGILL),
+            Some(vm.cpu.read_pc().wrapping_sub(code)),
+        ),
         VmExit::UnhandledException((
             x64_engine::ExceptionCode::ReadUnmapped
             | x64_engine::ExceptionCode::ReadPerm
@@ -817,6 +856,7 @@ fn emulated_with_layout_and_lengths(
         .expect("read emulator data memory");
     ResultState {
         gprs,
+        rflags_mask: comparison_rflags_mask(case),
         xstate,
         memory,
         fault_signal,
@@ -828,12 +868,56 @@ fn defined_xstate_offsets() -> impl Iterator<Item = usize> {
     (0..416).chain(576..832).chain(1088..2688)
 }
 
+fn fnv1a64(mut digest: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
+
+const EXPECTED_NATIVE_FNV1A64: u64 = 0xbee2_b17f_0b24_7fde;
+
+fn digest_authority(mut digest: u64, case: Case, state: &ResultState) -> u64 {
+    digest = fnv1a64(digest, case.name.as_bytes());
+    digest = fnv1a64(digest, case.bytes);
+    digest = fnv1a64(digest, &state.rflags_mask.to_le_bytes());
+    for (index, value) in state.gprs.iter().copied().enumerate() {
+        let value = if index == 17 {
+            value & state.rflags_mask
+        } else {
+            value
+        };
+        digest = fnv1a64(digest, &value.to_le_bytes());
+    }
+    let xstate_bv = u64::from_le_bytes(state.xstate[512..520].try_into().unwrap()) & XFEATURES & !1;
+    digest = fnv1a64(digest, &xstate_bv.to_le_bytes());
+    for offset in defined_xstate_offsets() {
+        digest = fnv1a64(digest, &state.xstate[offset..offset + 1]);
+    }
+    digest = fnv1a64(digest, &state.memory);
+    digest = fnv1a64(
+        digest,
+        &i64::from(state.fault_signal.unwrap_or(-1)).to_le_bytes(),
+    );
+    fnv1a64(
+        digest,
+        &state.fault_offset.unwrap_or(u64::MAX).to_le_bytes(),
+    )
+}
+
 fn differences(expected: &ResultState, actual: &ResultState) -> Vec<String> {
     let names = [
         "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12",
         "R13", "R14", "R15", "RIP", "RFLAGS",
     ];
     let mut differences = Vec::new();
+    if expected.rflags_mask != actual.rflags_mask {
+        differences.push(format!(
+            "RFLAGS comparison mask: native={:#x} emulator={:#x}",
+            expected.rflags_mask, actual.rflags_mask
+        ));
+    }
     if expected.fault_signal != actual.fault_signal {
         differences.push(format!(
             "fault signal: native={:?} emulator={:?}",
@@ -849,8 +933,8 @@ fn differences(expected: &ResultState, actual: &ResultState) -> Vec<String> {
     for (index, name) in names.into_iter().enumerate() {
         let (expected, actual) = if name == "RFLAGS" {
             (
-                expected.gprs[index] & 0x0004_0dd5,
-                actual.gprs[index] & 0x0004_0dd5,
+                expected.gprs[index] & expected.rflags_mask,
+                actual.gprs[index] & expected.rflags_mask,
             )
         } else {
             (expected.gprs[index], actual.gprs[index])
@@ -893,6 +977,90 @@ fn differences(expected: &ResultState, actual: &ResultState) -> Vec<String> {
         }
     }
     differences
+}
+
+#[test]
+fn comparison_rejects_corruption_in_every_authoritative_field() {
+    let expected = ResultState {
+        gprs: [0; 18],
+        rflags_mask: COMPARABLE_RFLAGS,
+        xstate: vec![0; XSTATE_SIZE],
+        memory: vec![0; PAGE],
+        fault_signal: None,
+        fault_offset: None,
+    };
+    let assert_detected = |field: &str, corrupted: ResultState| {
+        assert!(
+            !differences(&expected, &corrupted).is_empty(),
+            "comparison accepted corrupted {field}"
+        );
+    };
+
+    let mut corrupted = expected.clone();
+    corrupted.gprs[0] ^= 1;
+    assert_detected("GPR", corrupted);
+
+    let mut corrupted = expected.clone();
+    corrupted.xstate[160] ^= 1;
+    assert_detected("xstate", corrupted);
+
+    let mut corrupted = expected.clone();
+    corrupted.memory[0] ^= 1;
+    assert_detected("memory", corrupted);
+
+    let mut corrupted = expected.clone();
+    corrupted.fault_signal = Some(libc::SIGSEGV);
+    assert_detected("fault signal", corrupted);
+
+    let mut corrupted = expected.clone();
+    corrupted.fault_offset = Some(0x20);
+    assert_detected("fault address", corrupted);
+
+    let mut corrupted = expected.clone();
+    corrupted.rflags_mask ^= 1;
+    assert_detected("comparison mask", corrupted);
+
+    let mut ignored = expected.clone();
+    ignored.gprs[17] ^= 1 << 21;
+    assert!(
+        differences(&expected, &ignored).is_empty(),
+        "a flag outside the explicit comparison mask became authority"
+    );
+}
+
+#[test]
+fn invalid_evex_encodings_match_native_sigill_and_restart_rip() {
+    let cases = [
+        Case {
+            name: "invalid EVEX reserved P1 bit",
+            bytes: &[0x62, 0xf1, 0x70, 0x48, 0x58, 0xc2],
+        },
+        Case {
+            name: "invalid EVEX zeroing with k0",
+            bytes: &[0x62, 0xf1, 0x74, 0xc8, 0x58, 0xc2],
+        },
+    ];
+    let mut vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
+    for case in cases {
+        let native_authority = normalize_native(native(case), case, 0, true);
+        let native_repeat = normalize_native(native(case), case, 0, true);
+        assert!(
+            differences(&native_authority, &native_repeat).is_empty(),
+            "{} native SIGILL authority was not repeatable",
+            case.name
+        );
+        assert_eq!(native_authority.fault_signal, Some(libc::SIGILL));
+        assert_eq!(native_authority.fault_offset, Some(0));
+
+        let emulated = emulated(&mut vm, case, 0x1000, 0x2000);
+        let mismatches = differences(&native_authority, &emulated);
+        assert!(
+            mismatches.is_empty(),
+            "{}:\n{}",
+            case.name,
+            mismatches.join("\n")
+        );
+    }
 }
 
 fn normalize_native(
@@ -4781,6 +4949,7 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             "{name} was not installed in the execution helper table"
         );
     }
+    let mut native_digest = 0xcbf2_9ce4_8422_2325;
     for case in cases {
         let native_authority = normalize_native(native(case), case, 0, false);
         let native_repeat = normalize_native(native(case), case, 0, false);
@@ -4791,6 +4960,7 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             case.name,
             native_instability.join("\n")
         );
+        native_digest = digest_authority(native_digest, case, &native_authority);
         // Native mmap addresses are intentionally not reused by the emulator;
         // normalize the two address-bearing inputs while preserving every
         // other seeded GPR. The instruction uses only the pointed-to bytes.
@@ -4812,6 +4982,11 @@ fn vex_avx2_and_evex_families_match_native_gprs_and_xstate_bit_for_bit() {
             "comparison mask failed to detect a defined-byte corruption"
         );
     }
+    assert_eq!(
+        native_digest, EXPECTED_NATIVE_FNV1A64,
+        "normalized native authority changed; review and deliberately repin the evidence digest"
+    );
+    eprintln!("M9_NATIVE_FNV1A64={native_digest:016x}");
 }
 
 #[test]

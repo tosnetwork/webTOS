@@ -7,6 +7,8 @@
 //! exempt: a rejection or mis-sized decode can desynchronize every later
 //! fetch even when execution of that particular opcode remains fail-closed.
 
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -48,14 +50,12 @@ int main(void) { long a[8] = {1,2,3,4,5,6,7,8}; return (int)work(a, 8); }
         .args(["-O3", "-static", "-march=icelake-server", "-o"])
         .arg(&out)
         .arg(&cpath)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        _ => {
-            eprintln!("skipping: gcc unavailable");
-            return;
-        }
-    }
+        .status()
+        .expect("M9 decode authority requires GCC on x86-64 Linux");
+    assert!(
+        status.success(),
+        "M9 decode authority fixture failed to compile with -march=icelake-server"
+    );
 
     let vm = build_x64_vm(&ldef(), &EngineConfig::default()).expect("build engine");
     let data = std::fs::read(&out).expect("read fixture");

@@ -77,6 +77,71 @@ fn run_with_suspension(image: Vec<u8>, gap: u64, marker: &str) -> (CpuExit, Stri
 }
 
 #[test]
+fn invariant_tsc_and_monotonic_clock_advance_together_across_a_gap() {
+    let Some(image) = compile_c(
+        "tsc_gap",
+        r#"
+#include <stdio.h>
+#include <stdint.h>
+#include <time.h>
+
+static inline uint64_t tsc(void) {
+    unsigned lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+int main(void) {
+    struct timespec before, after, cpu_before, cpu_after;
+    uint64_t t0 = tsc();
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_before);
+    printf("READY\n");
+    fflush(stdout);
+    for (volatile long i = 0; i < 30000000L; i++) { }
+    uint64_t t1 = tsc();
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_after);
+    uint64_t clock_ns = (uint64_t)(after.tv_sec - before.tv_sec) * 1000000000ULL
+                      + (uint64_t)(after.tv_nsec - before.tv_nsec);
+    uint64_t cpu_ns = (uint64_t)(cpu_after.tv_sec - cpu_before.tv_sec) * 1000000000ULL
+                    + (uint64_t)(cpu_after.tv_nsec - cpu_before.tv_nsec);
+    printf("tsc_delta=%llu clock_delta=%llu cpu_delta=%llu\n",
+           (unsigned long long)(t1 - t0), (unsigned long long)clock_ns,
+           (unsigned long long)cpu_ns);
+    return 0;
+}
+"#,
+    ) else {
+        return;
+    };
+    let gap = 3_000_000_000_u64;
+    let (exit, output) = run_with_suspension(image, gap, "READY");
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "{output}");
+    let number = |prefix: &str| {
+        output
+            .split(prefix)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("missing {prefix} in {output}"))
+    };
+    let tsc_delta = number("tsc_delta=");
+    let clock_delta = number("clock_delta=");
+    let cpu_delta = number("cpu_delta=");
+    assert!(tsc_delta >= gap, "TSC missed the suspension gap: {output}");
+    assert_eq!(
+        tsc_delta.abs_diff(clock_delta),
+        0,
+        "1 GHz invariant TSC diverged from monotonic nanoseconds: {output}"
+    );
+    assert!(
+        cpu_delta < gap,
+        "process CPU time incorrectly included the suspension gap: {output}"
+    );
+}
+
+#[test]
 fn a_periodic_timer_reports_the_periods_it_missed_rather_than_firing_for_each() {
     let Some(image) = compile_c(
         "periodic",

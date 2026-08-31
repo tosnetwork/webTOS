@@ -90,7 +90,7 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
     assert_eq!(
         probe.run(0, 0),
         CpuidRegisters {
-            eax: 0x0d,
+            eax: 0x1f,
             ebx: u32::from_le_bytes(*b"Genu"),
             ecx: u32::from_le_bytes(*b"ntel"),
             edx: u32::from_le_bytes(*b"ineI"),
@@ -121,12 +121,13 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
         | (1 << 23) // MMX
         | (1 << 24) // FXSR
         | (1 << 25) // SSE
-        | (1 << 26); // SSE2
+        | (1 << 26) // SSE2
+        | (1 << 28); // package has more than one logical processor
     assert_eq!(
         probe.run(1, 0),
         CpuidRegisters {
-            eax: 0x0009_06e0,
-            ebx: 0,
+            eax: 0x0006_06a0,
+            ebx: (8 << 8) | (4 << 16),
             ecx: expected_leaf_1_ecx,
             edx: expected_leaf_1_edx,
         },
@@ -139,9 +140,83 @@ fn cpuid_results_use_architectural_register_order_and_truthful_features() {
             eax: 0,
             ebx: 0,
             ecx: 0,
-            edx: (1 << 11) | (1 << 29), // SYSCALL and LONG_MODE
+            edx: (1 << 11) | (1 << 27) | (1 << 29), // SYSCALL, RDTSCP and LONG_MODE
         },
         "extended feature bits belong in EDX"
+    );
+}
+
+#[test]
+fn cpuid_topology_matches_the_four_cpu_linux_view() {
+    let mut probe = CpuidProbe::new();
+
+    assert_eq!(
+        probe.run(0x0b, 0),
+        CpuidRegisters {
+            eax: 0,
+            ebx: 1,
+            ecx: 1 << 8,
+            edx: 0,
+        }
+    );
+    assert_eq!(
+        probe.run(0x0b, 1),
+        CpuidRegisters {
+            eax: 2,
+            ebx: 4,
+            ecx: (2 << 8) | 1,
+            edx: 0,
+        }
+    );
+    assert_eq!(probe.run(0x1f, 0), probe.run(0x0b, 0));
+    assert_eq!(probe.run(0x1f, 1), probe.run(0x0b, 1));
+    assert_eq!(
+        probe.run(0x1f, 2),
+        CpuidRegisters {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        }
+    );
+}
+
+#[test]
+fn tsc_frequency_and_invariance_are_a_single_coherent_contract() {
+    let mut probe = CpuidProbe::new();
+
+    assert_eq!(
+        probe.run(0x15, 0),
+        CpuidRegisters {
+            eax: 1,
+            ebx: 40,
+            ecx: 25_000_000,
+            edx: 0,
+        },
+        "25 MHz * 40 / 1 must publish the engine's 1 GHz TSC"
+    );
+    assert_eq!(
+        probe.run(0x16, 0),
+        CpuidRegisters {
+            eax: 1000,
+            ebx: 1000,
+            ecx: 100,
+            edx: 0,
+        }
+    );
+    assert_eq!(
+        probe.run(0x8000_0000, 0).eax,
+        0x8000_0007,
+        "the invariant-TSC leaf must be within the advertised range"
+    );
+    assert_eq!(
+        probe.run(0x8000_0007, 0),
+        CpuidRegisters {
+            eax: 0,
+            ebx: 0,
+            ecx: 0,
+            edx: 1 << 8,
+        }
     );
 }
 

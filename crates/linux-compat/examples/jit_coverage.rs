@@ -97,7 +97,10 @@ fn main() {
     machine.profile_blocks(true);
     machine.set_phase_timing(true);
     machine.set_access_tracking(true);
-    machine.vm_mut().icount_limit = 50_000_000_000;
+    machine.vm_mut().icount_limit = std::env::var("GUEST_ICOUNT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(50_000_000_000);
     let wall_start = std::time::Instant::now();
     loop {
         let exit = machine.run();

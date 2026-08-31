@@ -102,6 +102,15 @@ pub struct Process {
     /// A stop the parent has not yet collected through `wait4(WUNTRACED)`:
     /// the signal that caused it. Held by the thread-group leader.
     pub stop_report: Option<u64>,
+    /// Retired work charged to this thread before its current CPU turn.
+    /// `cpu_started_at` anchors the running portion in the machine-global
+    /// instruction counter; parked tasks have no uncharged interval.
+    pub thread_cpu_nanos: u64,
+    pub cpu_started_at: u64,
+    /// Aggregate retired work for the thread group. Threads share this cell;
+    /// fork starts a new accounting domain. One retired instruction is one
+    /// virtual nanosecond, matching the runtime's documented CPU-clock scale.
+    pub group_cpu_nanos: Rc<Cell<u64>>,
 }
 
 impl Process {
@@ -130,6 +139,9 @@ impl Process {
             vfork_done: None,
             stopped: false,
             stop_report: None,
+            thread_cpu_nanos: 0,
+            cpu_started_at: 0,
+            group_cpu_nanos: Rc::new(Cell::new(0)),
         }
     }
 
@@ -163,6 +175,9 @@ impl Process {
             vfork_done: None,
             stopped: false,
             stop_report: None,
+            thread_cpu_nanos: 0,
+            cpu_started_at: 0,
+            group_cpu_nanos: Rc::new(Cell::new(0)),
         }
     }
 
@@ -197,7 +212,35 @@ impl Process {
             vfork_done: None,
             stopped: false,
             stop_report: None,
+            thread_cpu_nanos: 0,
+            cpu_started_at: 0,
+            group_cpu_nanos: Rc::clone(&self.group_cpu_nanos),
         }
+    }
+
+    /// Charges the current CPU turn exactly once before this task is parked.
+    pub fn finish_cpu_turn(&mut self, global_icount: u64) {
+        let elapsed = global_icount.saturating_sub(self.cpu_started_at);
+        self.thread_cpu_nanos = self.thread_cpu_nanos.saturating_add(elapsed);
+        self.group_cpu_nanos
+            .set(self.group_cpu_nanos.get().saturating_add(elapsed));
+        self.cpu_started_at = global_icount;
+    }
+
+    /// Starts a new running interval after restoring this task.
+    pub fn start_cpu_turn(&mut self, global_icount: u64) {
+        self.cpu_started_at = global_icount;
+    }
+
+    pub fn current_thread_cpu_nanos(&self, global_icount: u64) -> u64 {
+        self.thread_cpu_nanos
+            .saturating_add(global_icount.saturating_sub(self.cpu_started_at))
+    }
+
+    pub fn current_group_cpu_nanos(&self, global_icount: u64) -> u64 {
+        self.group_cpu_nanos
+            .get()
+            .saturating_add(global_icount.saturating_sub(self.cpu_started_at))
     }
 }
 
@@ -346,6 +389,17 @@ impl Scheduler {
         let pid = self.next_pid;
         self.next_pid += 1;
         pid
+    }
+
+    /// Invalidates execution positions derived from the VM's lifted-block
+    /// table in every parked CPU snapshot. Architectural PCs live in the
+    /// saved register files and remain authoritative; a resumed task will
+    /// lift that PC again against current memory.
+    pub fn invalidate_code_positions(&mut self) {
+        for task in &mut self.parked {
+            task.cpu.block_id = u64::MAX;
+            task.cpu.block_offset = 0;
+        }
     }
 
     /// True if the process `ppid` has any child (parked, running elsewhere,

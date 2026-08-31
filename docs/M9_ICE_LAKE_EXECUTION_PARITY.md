@@ -1,12 +1,13 @@
 # Milestone 9: Ice Lake Execution Parity
 
-- **Status:** implementation complete; final live Claude task and full browser
-  acceptance are being recorded
-- **Relationship to M7:** follow-on ISA coverage; it is not required to close
-  the Claude Code TUI gate
-- **Primary target:** the pinned Claude Code/Bun workload selects simdutf's
-  `icelake` implementation through normal runtime detection and completes a
-  real interactive task without an environment override
+- **Status:** implementation and browser acceptance complete; the final live
+  Claude task is being recorded
+- **Relationship to M7:** follow-on ISA coverage. M7 could use the conservative
+  SSE/Westmere route, but M9's own final acceptance requires the pinned Claude
+  Code workload to complete under the published Ice Lake profile
+- **Primary target:** the profile satisfies the pinned simdutf `icelake`
+  selector through normal runtime detection, and the pinned Claude Code/Bun
+  workload completes a real interactive task without a dispatch override
 
 ## Why this is a separate milestone
 
@@ -85,6 +86,8 @@ advertised maximum must return the profile's documented result without an
 traps. The profile must provide mutually consistent results for at least:
 
 - CPUID leaves 0, 1, 7, and 0x0d, including valid maximum leaf/subleaf values;
+- CPUID leaves 0x15, 0x16, and 0x80000007 publishing one coherent 1 GHz
+  invariant-TSC contract, plus the matching Ice Lake Server family/model;
 - XSAVE, OSXSAVE, AVX, AVX2, BMI1/BMI2, and the exact AVX-512 dependency closure
   required by the chosen Ice Lake profile;
 - the state-component sizes, offsets, and capabilities reported by leaf 0x0d;
@@ -102,7 +105,30 @@ XSETBV must retain its architectural privilege behavior rather than becoming a
 guest-controlled feature switch.
 
 The milestone emulates a truthful userspace execution profile, not Ice Lake
-cache topology, timing, frequency, or a marketing model number.
+cache topology, branch prediction, or physical-core performance. Its virtual
+timing contract is intentionally simple and explicit: one invariant-TSC tick
+per nanosecond, advanced across host suspension together with
+`CLOCK_MONOTONIC`.
+
+### Runtime thread and clock substrate
+
+The ISA profile cannot be validated with a runtime that silently takes a
+different operating-system path. The pinned Bun/Claude image reads
+`/sys/devices/system/cpu/online` before creating its GC helpers and uses Linux
+`clone3`. The Linux layer therefore exposes one stable four-logical-CPU
+contract through sysfs and `sched_getaffinity`, and decodes `struct clone_args`
+versions 0-2 into the same `CloneSpec` used by legacy `clone`. Future non-zero
+fields and unsupported PID-fd, explicit-PID, and cgroup authorities fail
+closed. Logical CPUs are deterministically time-sliced by the single execution
+engine; the topology controls bounded runtime helper provisioning, not host
+parallelism.
+
+Realtime, monotonic, process-CPU, and thread-CPU clocks are separate domains.
+Only realtime clocks carry the epoch, only realtime/monotonic clocks include a
+host suspension gap, and CPU clocks count retired work. RDTSC/RDTSCP use the
+same global invariant offset as monotonic time. This prevents a runtime from
+interpreting a browser pause as CPU consumed or calibrating two contradictory
+clocks.
 
 ### YMM, ZMM, and opmask state
 
@@ -201,10 +227,13 @@ Undefined and implementation-dependent result bits must be represented by an
 explicit per-case comparison mask; the harness must never hide a mismatch by
 globally ignoring a register or flag. Corpus inputs combine edge cases,
 deterministic pseudo-random values, register/memory aliases, every mask pattern,
-each vector length, page-boundary operands, and invalid encodings. Native
-results are stored as versioned evidence with CPU identity, microcode, kernel,
-compiler/assembler versions, source bytes, input state, comparison mask, and
-result digest.
+each vector length, page-boundary operands, and invalid encodings. The
+normalized core-corpus result is pinned in the oracle source as a versioned
+digest. Its reproducibility context records CPU identity, microcode, kernel,
+compiler/assembler versions, source bytes, deterministic input construction,
+and the per-instruction comparison mask. Specialized approximation and fault
+cases remain named executable gates rather than being folded into a misleading
+bitwise digest.
 
 Architecturally approximate operations are tested against their specified
 error bounds unless the oracle is the exact microarchitecture whose result is
@@ -247,7 +276,7 @@ default workload dispatch.
 | M9-F | Implement standard XSAVE/XRSTOR and derive CPUID leaf 0x0d from the same component table | M9-D, M9-E | Independently seeded state components round-trip and native-layout bytes match |
 | M9-G | Implement guest-visible x86-64 `rt_sigframe` for GPRs, mask, altstack, and legacy fp/SSE state | M9-E | A handler reads and edits context; validated sigreturn applies lawful edits |
 | M9-H | Extend Linux signal frames to YMM, opmask, and ZMM xstate | M9-F, M9-G | Handler clobber/edit/preserve tests match Linux UAPI layout and behavior |
-| M9-I | Build the raw-byte native oracle, comparison schema, minimizer, and portable replay runner | none | Deliberately corrupted result, mask, state, memory, and fault metadata all fail |
+| M9-I | Build the raw-byte native oracle, comparison schema, one-instruction reproducers, and portable replay runner | none | Deliberately corrupted GPR, mask, xstate, memory, and fault metadata all fail |
 | M9-J | Validate and repair VEX/AVX/AVX2 execution while feature publication remains off | M9-C, M9-I | Advertised-candidate corpus matches native state and faults |
 | M9-K | Validate EVEX operands, masks, tuple addressing, and instruction-family semantics in parallel child packages | M9-C, M9-I | Includes the two Claude canaries plus systematic widths, masks, memory, and fault cases |
 | M9-L | Close the feature-coverage ledger, enable the profile, and integrate JIT fallback, workloads, browsers, and evidence | M9-A-M9-K | No unvalidated opcode sits behind a bit; simdutf auto-selects `icelake`; all release gates pass |
@@ -269,9 +298,9 @@ were green.
 | M9-D | Complete | `xstate_policy.rs` covers XCR0 `0xe7`, invalid selectors, and user-mode XSETBV faulting without mutation. |
 | M9-E/F | Complete | `fxsave.rs` and `xsave.rs` cover standard layouts, requested masks, init state, complete round trips, reserved bytes, MXCSR, alignment, and precise page-crossing faults. |
 | M9-G/H | Complete | `signal_context.rs` compiles a real Linux handler that inspects and edits GPRs and the complete standard xstate image, then verifies the lawful edits after `rt_sigreturn`. |
-| M9-I | Complete | `native_oracle.rs` uses ptrace GPR and `NT_X86_XSTATE` authority, runs each normalized native case twice, and detects deliberately corrupted GPR, xstate, memory, and fault results. `m9_icelake_oracle.elf` is the portable replay. |
-| M9-J/K | Complete | The native corpus covers VEX/AVX2 and the published EVEX families across widths, masks, register/memory forms, VSIB gather/scatter, special floating-point classes, page boundaries, and partial-fault restart state. |
-| M9-L | Complete | `feature_coverage` reports 789 published-profile mnemonics, including BMI1/BMI2 and VEX AES/PCLMUL, and zero reachable opaque operations without helpers. Interpreter and JIT produce the same portable result; browser replay uses the same digest-pinned ELF. |
+| M9-I | Complete | `native_oracle.rs` uses ptrace GPR and `NT_X86_XSTATE` authority, derives an explicit undefined-flags mask for each instruction, runs every normalized native case twice, and detects deliberately corrupted GPR, mask, xstate, memory, and fault results. The core authority digest is `bee2b17f0b247fde`; `m9_icelake_oracle.elf` is the portable replay. |
+| M9-J/K | Complete | The native corpus covers VEX/AVX2 and the published EVEX families across widths, masks, register/memory forms, VSIB gather/scatter, special floating-point classes, page boundaries, and partial-fault restart state. BMI1 `TZCNT` lowers to the width-aware p-code `IntCountTrailingZeroes` operation, so JavaScript-runtime bitmap scans use one interpreter/wasm `ctz` instead of a data-dependent p-code loop. |
+| M9-L | Complete | `feature_coverage` reports 789 published-profile mnemonics, including BMI1/BMI2 and VEX AES/PCLMUL, and zero reachable opaque operations without helpers. Interpreter and JIT produce the same portable result; browser replay uses the same digest-pinned ELF. The Linux contract exposes four coherent logical CPUs, a 1 GHz invariant TSC, separate thread/process CPU clocks, deterministic preemption, and the Bun-safe `sched_setscheduler` subset. |
 
 The portable corpus is intentionally smaller than the ptrace corpus. The
 ptrace suite is the per-instruction hardware comparison authority; the static
@@ -286,6 +315,17 @@ Platinum 8455C (family 6, model 143, stepping 8, microcode `0x2b000661`). The
 toolchain is Rust `1.100.0-nightly (e7769602a 2026-08-24)`, GCC 15.2.0, and GNU
 binutils 2.38. The host advertises every feature required by the corpus; an
 absent feature fails the tests rather than becoming a skip.
+
+The normalized ptrace core-corpus output is pinned as:
+
+```text
+M9_NATIVE_FNV1A64=bee2b17f0b247fde
+```
+
+The digest covers each instruction's raw bytes, normalized GPRs and defined
+RFLAGS, explicit RFLAGS comparison mask, profile-defined xstate bytes, touched
+memory, and fault signal/address. Every case is executed twice before it may
+contribute to the digest.
 
 The portable artifact is reproducible with:
 
@@ -307,16 +347,16 @@ upper-lane clearing, and the selected AVX-512 feature closure. Both interpreter
 and JIT replays must match the native text exactly.
 
 The final browser matrix used `web/webtos_web.wasm` SHA-256
-`28aaa4a7903e35364a36955e1a9c0f6d71124d5175b8f2f661875ce79a6a1fb4`.
-Chromium and Firefox passed 47/47 checks; WebKit passed 38/38 applicable checks
-and reported eight explicit OPFS capability skips. The M9 interpreter and JIT
-replays each retired 2,485 instructions in every engine with identical
-fingerprints. The OPFS skips do not apply to the M9 replay and are not counted
-as ISA passes.
+`4795c298ead472433d07f7b34664ec5cb0ab5509d9d8eca35ae133738373870d`.
+Chromium 151.0.7922.34 and Firefox 153.0 passed 47/47 checks; WebKit 26.5
+passed 38/38 applicable checks and reported eight explicit OPFS capability
+skips. The M9 interpreter and JIT replays each retired 2,485 instructions in
+every engine with identical fingerprints. The OPFS skips do not apply to the
+M9 replay and are not counted as ISA passes.
 
 The pinned Claude Code 2.1.247 input is SHA-256
 `5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15`.
-Its version gate retired 185,487,665 identical instructions in Chromium,
+Its version gate retired 171,923,284 identical instructions in Chromium,
 Firefox, and WebKit. The separate live-task gate uses the same WASM and binary,
 scoped host credentials, an API-only network allowlist, and no simdutf forcing
 variable.
@@ -330,7 +370,9 @@ M9 is complete only when all of the following hold:
   implied by the advertised feature bits, including defined faults and state.
 - XSAVE/XRSTOR and signal delivery preserve every enabled user-state component.
 - The strict x86-64 Linux suites pass with `WEBTOS_REQUIRE_FIXTURES=1` and no
-  skip.
+  M9-relevant skip. Explicitly ignored rewrite and optional measurement tests
+  are outside the M9 gate and are reported as such rather than counted as
+  passes.
 - Interpreter and JIT modes produce the same architectural traces; unsupported
   wide JIT operations take an explicit interpreter fallback.
 - The oracle corpus passes in Chromium, Firefox, and WebKit with identical
@@ -339,21 +381,22 @@ M9 is complete only when all of the following hold:
   profile.
 - The pinned Node, Codex, OpenFox, and Claude Code compatibility profiles do not
   regress.
-- Claude Code completes a real interactive TUI task with simdutf reporting
-  `icelake`, selected through normal detection, with no
-  `SIMDUTF_FORCE_IMPLEMENTATION` variable.
+- The pinned simdutf selector gate reports `icelake` from the guest-visible
+  CPUID/XGETBV tuple, and Claude Code completes a real interactive TUI task
+  under the same profile with no `SIMDUTF_FORCE_IMPLEMENTATION` variable.
 - The milestone publishes correctness and performance evidence separately;
   no speedup is required for correctness completion.
 
 ## Out of scope
 
-- Exact Ice Lake timing, cache hierarchy, branch prediction, power behavior,
-  or RDTSC wall-clock behavior.
+- Exact physical Ice Lake timing, cache hierarchy, branch prediction, power
+  behavior, or frequency scaling beyond the documented virtual invariant-TSC
+  contract.
 - Privileged instructions, kernel boot, devices, SGX, and other platform
   facilities not required by the Linux userspace execution contract.
 - Enabling an extension merely to satisfy a library's name check.
-- Requiring M9 to close the M7 Claude TUI gate; the conservative SSE/Westmere
-  route remains the shorter M7 correctness path.
+- Requiring M7 to adopt the Ice Lake profile; its conservative SSE/Westmere
+  route remains valid independently of M9.
 
 ## Implementation and evidence anchors
 
@@ -362,9 +405,13 @@ M9 is complete only when all of the following hold:
 - `third_party/icicle/icicle-cpu/src/exec/helpers.rs`: CPUID, FXSAVE/FXRSTOR,
   XSAVE/XRSTOR, VEX/AVX2/EVEX execution helpers, precise memory access, and
   standard xstate serialization.
-- `third_party/ghidra-x86/languages/{ia,avx,avx2,avx512}.sinc`: the repaired
+- `third_party/ghidra-x86/languages/{ia,bmi1,avx,avx2,avx512}.sinc`: the repaired
   instruction lowering and explicit feature annotations consumed by the
   coverage ledger.
+- `third_party/icicle/sleigh/pcode`, `sleigh-compile`, and
+  `icicle-cpu/src/exec/{interpreter,const_eval}.rs`: the width-aware trailing-
+  zero p-code primitive shared by SLEIGH, constant evaluation, the interpreter,
+  and the wasm JIT.
 - `crates/x64-engine/tests/{cpuid,wide_state,xstate_policy,fxsave,xsave}.rs`:
   coherent profile and state-transfer gates.
 - `crates/x64-engine/tests/native_oracle.rs`: ptrace-supervised, twice-stable
@@ -374,6 +421,9 @@ M9 is complete only when all of the following hold:
   helpers.
 - `crates/linux-compat/tests/signal_context.rs`: compiled guest-visible Linux
   signal-context and complete xstate round trip.
+- `crates/linux-compat/tests/{process,suspend}.rs`: `clone3`, virtual CPU
+  topology, deterministic preemption, clock-domain, suspension, and
+  invariant-TSC gates used by the live runtime.
 - `test_data/m9_icelake_oracle.{S,elf}` and
   `crates/linux-compat/tests/m9_oracle.rs`: digest-pinned native/interpreter/JIT
   portable replay, also executed by `web/test_browsers.mjs`.

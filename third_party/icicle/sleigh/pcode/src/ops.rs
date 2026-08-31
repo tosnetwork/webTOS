@@ -559,6 +559,7 @@ pub enum Op {
     IntNegate,
     IntCountOnes,
     IntCountLeadingZeroes,
+    IntCountTrailingZeroes,
 
     BoolAnd,
     BoolOr,
@@ -699,9 +700,11 @@ impl Op {
             | Op::IntCarry
             | Op::IntSignedCarry
             | Op::IntSignedBorrow => (BOOL_SIZE, (INT_SIZES, INT_SIZES)),
-            Op::IntNot | Op::IntNegate | Op::IntCountOnes | Op::IntCountLeadingZeroes => {
-                (INT_SIZES, (INT_SIZES, NONE_SIZE))
-            }
+            Op::IntNot
+            | Op::IntNegate
+            | Op::IntCountOnes
+            | Op::IntCountLeadingZeroes
+            | Op::IntCountTrailingZeroes => (INT_SIZES, (INT_SIZES, NONE_SIZE)),
 
             Op::BoolAnd | Op::BoolOr | Op::BoolXor => (BOOL_SIZE, (BOOL_SIZE, BOOL_SIZE)),
             Op::BoolNot => (BOOL_SIZE, (BOOL_SIZE, NONE_SIZE)),

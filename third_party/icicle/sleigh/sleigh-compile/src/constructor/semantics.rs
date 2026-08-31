@@ -235,7 +235,8 @@ impl<'a, 'b> Builder<'a, 'b> {
             | pcode::Op::FloatToFloat
             | pcode::Op::FloatToInt
             | pcode::Op::IntCountOnes
-            | pcode::Op::IntCountLeadingZeroes => {}
+            | pcode::Op::IntCountLeadingZeroes
+            | pcode::Op::IntCountTrailingZeroes => {}
 
             // Unconstrained input/output size.
             pcode::Op::Arg(_)
@@ -1135,6 +1136,7 @@ fn translate_inbuilt_func(name: &str) -> Option<(pcode::Op, usize)> {
 
         "popcount" => (Op::IntCountOnes, 1),
         "lzcount" => (Op::IntCountLeadingZeroes, 1),
+        "tzcount" => (Op::IntCountTrailingZeroes, 1),
         _ => return None,
     })
 }

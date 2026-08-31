@@ -100,6 +100,7 @@ pub const SYS_SETSID: u64 = 112;
 pub const SYS_GETGROUPS: u64 = 115;
 pub const SYS_GETPGID: u64 = 121;
 pub const SYS_SIGALTSTACK: u64 = 131;
+pub const SYS_SCHED_SETSCHEDULER: u64 = 144;
 pub const SYS_PRCTL: u64 = 157;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_SETRLIMIT: u64 = 160;
@@ -154,6 +155,7 @@ pub const SYS_GETRANDOM: u64 = 318;
 pub const SYS_STATX: u64 = 332;
 pub const SYS_RSEQ: u64 = 334;
 pub const SYS_CLOSE_RANGE: u64 = 436;
+pub const SYS_CLONE3: u64 = 435;
 pub const SYS_FACCESSAT2: u64 = 439;
 
 // ── Errno ───────────────────────────────────────────────────────────────────

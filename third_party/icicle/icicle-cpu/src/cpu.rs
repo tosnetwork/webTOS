@@ -264,6 +264,10 @@ pub struct Cpu {
     pub jit_ctx: JitContext,
 
     pub icount: u64,
+    /// Virtual invariant-TSC cycles added while the machine was not running.
+    /// The x86 profile uses a 1 GHz TSC, so this is also nanoseconds. It is
+    /// global machine time even though it travels with the active CPU state.
+    pub time_offset: u64,
     pub fuel: Fuel,
 
     pub exception: Exception,
@@ -311,6 +315,7 @@ impl Cpu {
             jit_ctx: JitContext::default(),
 
             icount: 0,
+            time_offset: 0,
             fuel: Fuel::default(),
 
             exception: Exception::default(),
@@ -339,6 +344,7 @@ impl Cpu {
         self.shadow_stack.offset = 0;
 
         self.icount = 0;
+        self.time_offset = 0;
         self.fuel = Fuel::default();
 
         self.exception.code = ExceptionCode::None as u32;
@@ -750,6 +756,7 @@ pub struct CpuSnapshot {
     pub exception: Exception,
     pub pending_exception: Option<Exception>,
     pub icount: u64,
+    pub time_offset: u64,
     pub block_id: u64,
     pub block_offset: u64,
 }
@@ -763,6 +770,7 @@ impl Cpu {
             exception: self.exception,
             pending_exception: self.pending_exception,
             icount: self.icount,
+            time_offset: self.time_offset,
             block_id: self.block_id,
             block_offset: self.block_offset,
         })
@@ -778,6 +786,7 @@ impl Cpu {
         self.exception = snapshot.exception;
         self.pending_exception = snapshot.pending_exception;
         self.icount = snapshot.icount;
+        self.time_offset = snapshot.time_offset;
         self.fuel = Fuel::default();
 
         // @fixme: Check if we can avoiding needing to save/restore these values.

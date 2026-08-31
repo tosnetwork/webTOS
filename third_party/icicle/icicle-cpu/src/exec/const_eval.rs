@@ -379,6 +379,19 @@ pub trait BitVecExt {
         Some(count)
     }
 
+    /// Counts trailing zero bits, returning `None` if an unknown bit occurs
+    /// before the first known one bit.
+    fn count_trailing_zeros(&self) -> Option<u32> {
+        let mut count = 0;
+        for bit in self.slice() {
+            if bit.const_value()? as u32 == 1 {
+                return Some(count);
+            }
+            count += 1;
+        }
+        Some(count)
+    }
+
     /// Set the bit vector to be equal to `value`.
     fn set_const(&mut self, mut value: u64) {
         for bit in self.slice_mut().iter_mut() {
@@ -834,6 +847,10 @@ fn eval(op: pcode::Op, a: &[Bit], b: &[Bit], output: &mut [Bit]) {
             Some(count) => output.set_const(count as u64),
             None => output.fill(Bit::Unknown),
         },
+        Op::IntCountTrailingZeroes => match a.count_trailing_zeros() {
+            Some(count) => output.set_const(count as u64),
+            None => output.fill(Bit::Unknown),
+        },
         Op::IntSignedLess => {
             let (result, overflow) = a.sub_overflow(b);
             *output.bool_mut() = result.sign().xor(overflow);
@@ -1200,5 +1217,15 @@ mod test {
             result.get_const() == Some(value.leading_zeros() as u64)
         }
         quickcheck::quickcheck(do_count_leading_zeros as fn(u16) -> bool)
+    }
+
+    #[test]
+    fn count_trailing_zeros() {
+        fn do_count_trailing_zeros(value: u16) -> bool {
+            let tmp = pcode::VarNode::new(1, 2);
+            let result = eval_op(pcode::Op::IntCountTrailingZeroes, &[value.into()], tmp);
+            result.get_const() == Some(value.trailing_zeros() as u64)
+        }
+        quickcheck::quickcheck(do_count_trailing_zeros as fn(u16) -> bool)
     }
 }

@@ -74,6 +74,11 @@ pub(crate) fn alloc_asid() -> u64 {
 }
 
 pub(crate) const PAGE_SIZE: u64 = 0x1000;
+/// Stable virtual topology exposed through sysfs and sched_getaffinity.
+/// Threads are deterministically time-sliced on one emulated execution
+/// engine, but four online logical CPUs let runtimes provision their bounded
+/// helper pools exactly as they do on a small Linux machine.
+pub(crate) const VIRTUAL_CPU_COUNT: u8 = 4;
 const STACK_TOP: u64 = 0x7fff_ff00_0000;
 // Linux does not place the final argv byte against an unmapped VMA boundary.
 // Dynamic loaders and libc are therefore free to use bounded word/SIMD scans
@@ -328,9 +333,23 @@ impl LinuxEnv {
     }
 
     pub fn new(cpu: &Cpu) -> Result<Self, String> {
+        let mut vfs = Vfs::new();
+        for path in [
+            b"/sys/devices/system/cpu/online".as_slice(),
+            b"/sys/devices/system/cpu/possible".as_slice(),
+            b"/sys/devices/system/cpu/present".as_slice(),
+        ] {
+            vfs.add_node(path, NodeKind::File(b"0-3\n".to_vec()), 0o444)
+                .map_err(|errno| {
+                    format!(
+                        "cannot create virtual CPU topology {}: errno {errno}",
+                        path.escape_ascii()
+                    )
+                })?;
+        }
         Ok(Self {
             regs: Regs::resolve(cpu)?,
-            vfs: Vfs::new(),
+            vfs,
             shared_maps: Vec::new(),
             file_backed_ranges: Vec::new(),
             opened_files: None,
@@ -2301,6 +2320,7 @@ impl Machine {
     pub fn skip_time(&mut self, nanos: u64) {
         let env = self.env();
         env.warp_nanos = env.warp_nanos.saturating_add(nanos);
+        self.vm.cpu.time_offset = self.vm.cpu.time_offset.saturating_add(nanos);
     }
 
     /// Raises or lowers the guest's physical-memory cap, in mebibytes. The
@@ -2432,6 +2452,13 @@ impl Machine {
 
     /// Runs until the workload exits or faults.
     pub fn run(&mut self) -> CpuExit {
+        // Native runtimes may spin in userspace while a sibling worker is
+        // expected to make progress. Bound one task's uninterrupted turn so
+        // Linux thread scheduling does not depend on reaching a blocking
+        // syscall. The value matches the browser ABI's maximum synchronous
+        // run slice and is part of deterministic replay, not host timing.
+        const THREAD_QUANTUM_INSTRUCTIONS: u64 = 65_536;
+
         // Before anything executes. A ceiling noticed after the fact is not a
         // ceiling, and the host's own loop is what would otherwise keep
         // handing a spinning guest another turn.
@@ -2444,6 +2471,7 @@ impl Machine {
             let ceiling = self.icount().saturating_add(headroom);
             self.vm.icount_limit = self.vm.icount_limit.min(ceiling);
         }
+        let caller_limit = self.vm.icount_limit;
         // A previous run paused waiting on the host — for a keystroke or for
         // network activity. Put a task back on the CPU now that the host has
         // had its turn; with still nothing to deliver, stay paused rather
@@ -2477,6 +2505,8 @@ impl Machine {
             }
         }
         let exit = loop {
+            self.vm.icount_limit =
+                caller_limit.min(self.icount().saturating_add(THREAD_QUANTUM_INSTRUCTIONS));
             let exit = self.vm.run();
             let recompile = {
                 let env = self.env();
@@ -2491,10 +2521,24 @@ impl Machine {
                 self.vm.flush_code();
                 self.vm.cpu.block_id = u64::MAX;
                 self.vm.cpu.block_offset = 0;
+                self.env().sched.invalidate_code_positions();
                 continue;
+            }
+            if exit == VmExit::InstructionLimit {
+                let caller_turn_complete = self.icount() >= caller_limit;
+                let InterpVm { cpu, env, .. } = &mut self.vm;
+                let env = env
+                    .as_mut_any()
+                    .downcast_mut::<LinuxEnv>()
+                    .expect("machine environment is always LinuxEnv");
+                syscall::preempt_ready(env, cpu);
+                if !caller_turn_complete {
+                    continue;
+                }
             }
             break exit;
         };
+        self.vm.icount_limit = caller_limit;
         if exit == VmExit::Interrupted && self.env().page_in_wait {
             self.vm.suspend_for_page_in();
         }

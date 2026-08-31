@@ -908,6 +908,28 @@ fn cases() -> Vec<Case> {
         });
     }
 
+    // --- IntCountTrailingZeroes: ctz within the input width. ---
+    for (name, size, val) in [
+        ("IntCtz u8 zero", 1u8, 0x00u64),
+        ("IntCtz u8 high bit", 1, 0x80),
+        ("IntCtz u16 zero", 2, 0x0000),
+        ("IntCtz u16 one", 2, 0x0001),
+        ("IntCtz u16 high bit", 2, 0x8000),
+        ("IntCtz u32 zero", 4, 0x0000_0000),
+        ("IntCtz u32 bit 20", 4, 0x0010_0000),
+        ("IntCtz u64 zero", 8, 0x0000_0000_0000_0000),
+        ("IntCtz u64 high bit", 8, 0x8000_0000_0000_0000),
+    ] {
+        let (o, a) = (reg(1, size), reg(2, size));
+        let mut block = pcode::Block::new();
+        block.push((o, Op::IntCountTrailingZeroes, a, pcode::Value::invalid()));
+        out.push(Case {
+            name,
+            seeds: vec![(a, val)],
+            block,
+        });
+    }
+
     // Select (conditional move): out = cond != 0 ? a : b. The condition is a
     // separate 1-byte varnode named by the op. One case per branch, so a wrong
     // operand order or a dropped condition load shows immediately.

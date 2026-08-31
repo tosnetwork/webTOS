@@ -94,7 +94,18 @@ vendored; webTOS provides its own interpreter loop and Linux environment in
     publishes AVX, AVX2, BMI1/BMI2, AVX-512F/CD/BW/VL/VBMI2/VPOPCNTDQ and
     deliberately omits AVX-512DQ. VAES and VPCLMULQDQ remain reachable through
     the separately published AES-NI/PCLMULQDQ bits and are included in the
-    native oracle. The execution contract is gated by
+    native oracle. The generic lifter also rejects the x86-64 EVEX reserved
+    combination `z=1, aaa=000` before generated SLEIGH semantics can execute
+    it as an unmasked operation; ptrace verifies SIGILL and the restart RIP.
+    CPUID.15H/16H and extended leaf 0x80000007 publish the virtual engine's
+    explicit 1 GHz invariant-TSC contract, and RDTSC/RDTSCP include the same
+    suspension offset as the Linux monotonic clock.
+    The p-code core also gains a width-aware `IntCountTrailingZeroes` operation
+    (`tzcount` in SLEIGH, Wasm `ctz` in the JIT); BMI1 `TZCNT` uses it instead
+    of a data-dependent 16/32/64-iteration p-code loop. This preserves the
+    native result and flags while avoiding pathological bitmap-scan overhead
+    in the pinned JavaScript runtime.
+    The execution contract is gated by
     `x64-engine/tests/native_oracle.rs`, the xstate tests, and the portable
     native/interpreter/JIT/browser fingerprint; see
     `docs/M9_ICE_LAKE_EXECUTION_PARITY.md`.

@@ -4583,7 +4583,7 @@ pub mod x86 {
         // one-instruction-one-nanosecond model (an invariant 1 GHz TSC). The
         // counter must advance: code that spin-waits on `rdtsc` deltas (timer
         // calibration, backoff loops) never terminates on a constant TSC.
-        cpu.write_var(dst, cpu.icount());
+        cpu.write_var(dst, cpu.icount().saturating_add(cpu.time_offset));
     }
 
     // The SLEIGH spec calls `rdtscp()` with no output, so the helper writes
@@ -4591,7 +4591,7 @@ pub mod x86 {
     // (0: single processor), each as a full 64-bit register write, which
     // zeroes the upper halves exactly as 32-bit destinations do on x86-64.
     fn rdtscp(cpu: &mut Cpu, _: VarNode, _: [Value; 2]) {
-        let tsc = cpu.icount();
+        let tsc = cpu.icount().saturating_add(cpu.time_offset);
         for (name, value) in [("RAX", tsc & 0xffff_ffff), ("RDX", tsc >> 32), ("RCX", 0)] {
             if let Some(var) = cpu.arch.sleigh.get_varnode(name) {
                 cpu.write_var(var, value);

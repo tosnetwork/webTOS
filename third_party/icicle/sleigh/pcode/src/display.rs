@@ -100,6 +100,7 @@ where
             Op::IntNegate => write!(f, "{out} = -{a}"),
             Op::IntCountOnes => write!(f, "{out} = popcount({a})"),
             Op::IntCountLeadingZeroes => write!(f, "{out} = lzcount({a})"),
+            Op::IntCountTrailingZeroes => write!(f, "{out} = tzcount({a})"),
 
             Op::BoolNot => write!(f, "{out} = !{a}"),
             Op::BoolAnd => write!(f, "{out} = {a} && {b}"),

@@ -90,12 +90,24 @@ const err = () => new TextDecoder().decode(mem().slice(e.wtw_error_ptr(), e.wtw_
 
 const useJit = process.env.PROBE_JIT !== "0";
 const usePty = process.env.PROBE_PTY !== "0";
+const traceEvery = Number(process.env.PROBE_TRACE_EVERY ?? 0);
+if (!Number.isSafeInteger(traceEvery) || traceEvery < 0 || traceEvery > 0xffff_ffff) {
+  throw new Error(`PROBE_TRACE_EVERY must be a non-negative u32, got ${process.env.PROBE_TRACE_EVERY}`);
+}
+const logEvery = Number(process.env.PROBE_LOG_EVERY ?? 50);
+if (!Number.isSafeInteger(logEvery) || logEvery < 1) {
+  throw new Error(`PROBE_LOG_EVERY must be a positive integer, got ${process.env.PROBE_LOG_EVERY}`);
+}
+const guestMemoryMb = Number(process.env.PROBE_GUEST_MEMORY_MB ?? 2048);
+if (!Number.isSafeInteger(guestMemoryMb) || guestMemoryMb < 1) {
+  throw new Error(`PROBE_GUEST_MEMORY_MB must be a positive integer, got ${process.env.PROBE_GUEST_MEMORY_MB}`);
+}
 const jitAfter = Number(process.env.PROBE_JIT_AFTER ?? 10);
 if (!Number.isSafeInteger(jitAfter) || jitAfter < 1) {
   throw new Error(`PROBE_JIT_AFTER must be a positive integer, got ${process.env.PROBE_JIT_AFTER}`);
 }
 if (e.wtw_init() !== 0) throw new Error(`init: ${err()}`);
-if (e.wtw_set_guest_memory_mb(2048) !== 0) throw new Error(`guestmem: ${err()}`);
+if (e.wtw_set_guest_memory_mb(guestMemoryMb) !== 0) throw new Error(`guestmem: ${err()}`);
 if (useJit && e.wtw_jit_enable(jitAfter) !== 0) throw new Error(`jit: ${err()}`);
 if (e.wtw_install_chunk_manifest(...put(manifest)) !== 0) throw new Error(`manifest: ${err()}`);
 const executable = realTask ? "/bin/busybox" : "/bin/claude";
@@ -291,6 +303,9 @@ for (;;) {
   deliver("metadata");
 }
 if (usePty && e.wtw_pty_install(40, 120) !== 0) throw new Error(`pty: ${err()}`);
+if (traceEvery > 0 && e.wtw_trace_start(traceEvery) !== 0) {
+  throw new Error(`trace start: ${err()}`);
+}
 const maxFuel = process.env.PROBE_MAX_FUEL ? Number(process.env.PROBE_MAX_FUEL) : 50_000_000;
 if (!Number.isSafeInteger(maxFuel) || maxFuel < 1) {
   throw new Error(`PROBE_MAX_FUEL must be a positive integer, got ${process.env.PROBE_MAX_FUEL}`);
@@ -308,6 +323,25 @@ let taskNetworkBaseline = 0;
 let exitMarkerBaseline = 0;
 const currentIcount = () =>
   (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
+// The cost of emulating runnable guest instructions is not guest-visible wall
+// time. Feeding that host overhead back into the VM makes a slow emulator look
+// like a suspended machine and can fire minutes of maintenance timers during
+// process startup. Real blocking network waits advance through `net_expire`;
+// suspension is tested separately. Keep this diagnostic warp opt-in only.
+const realtimeClock = realTask && process.env.PROBE_REALTIME_CLOCK === "1";
+const realtimeHostStart = performance.now();
+const realtimeIcountStart = currentIcount();
+let realtimeWarpAppliedMs = 0;
+const syncRealtimeClock = () => {
+  if (!realtimeClock) return;
+  const hostElapsedMs = performance.now() - realtimeHostStart;
+  const instructionElapsedMs = (currentIcount() - realtimeIcountStart) / 1_000_000;
+  const deficitMs = Math.floor(hostElapsedMs - instructionElapsedMs - realtimeWarpAppliedMs);
+  if (deficitMs > 0) {
+    if (e.wtw_skip_time_ms(deficitMs) !== 0) throw new Error(`clock sync: ${err()}`);
+    realtimeWarpAppliedMs += deficitMs;
+  }
+};
 const painted = () =>
   /Screen Reader Mode|trust this folder|Welcome to Claude|Choose the text style|What can I help|How can I help/.test(rendered) ||
   (rendered.length > 500 && rendered.includes("\x1b[38;5;"));
@@ -322,12 +356,16 @@ const occurrences = (needle) => rendered.split(needle).length - 1;
 const claudeExited = () => /(?:^|\r?\n)WEBTOS_CLAUDE_EXIT=\d+/.test(rendered);
 while (Date.now() < deadline) {
   const t0 = Date.now();
-  status = e.wtw_run(maxFuel);
+  status = traceEvery > 0 ? e.wtw_run_traced(maxFuel) : e.wtw_run(maxFuel);
+  syncRealtimeClock();
   slices += 1;
-  if (slices <= 20 || slices % 50 === 0) {
+  if (slices <= 20 || slices % logEvery === 0) {
     const ic = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
     console.error(
-      `[slice ${slices}] status=${status} icount=${ic.toLocaleString()} ms=${Date.now() - t0} rendered=${rendered.length}`,
+      `[slice ${slices}] status=${status} icount=${ic.toLocaleString()} ms=${Date.now() - t0} ` +
+        `rendered=${rendered.length} jit_blocks=${Number(e.wtw_jit_block_dispatch_count()).toLocaleString()} ` +
+        `jit_regions=${Number(e.wtw_jit_region_dispatch_count()).toLocaleString()} ` +
+        `guest_mem_mb=${e.wtw_guest_memory_used_mb()}/${e.wtw_guest_memory_cap_mb()}`,
     );
   }
   drain();
@@ -345,7 +383,7 @@ while (Date.now() < deadline) {
     if (taskPhase === "shell" && status === 7) {
       input(
         "cd /work && /bin/claude --safe-mode --ax-screen-reader --no-chrome " +
-          "--strict-mcp-config --mcp-config '{}' --permission-mode acceptEdits " +
+          "--strict-mcp-config --mcp-config '{\"mcpServers\":{}}' --permission-mode acceptEdits " +
           "--allowedTools Read,Edit --model haiku; echo WEBTOS_CLAUDE_EXIT=$?\r",
       );
       taskPhase = "claude-start";
@@ -404,8 +442,12 @@ drain();
 const icount = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
 const alt = painted();
 console.log(
-  `jit=${useJit} jit_after=${jitAfter} pty=${usePty} status=${status} slices=${slices} ` +
-    `page_ins=${pageIns} icount=${icount.toLocaleString()}`,
+  `jit=${useJit} jit_after=${jitAfter} pty=${usePty} realtime_clock=${realtimeClock} ` +
+    `guest_memory_mb=${guestMemoryMb} ` +
+    `clock_warp_ms=${realtimeWarpAppliedMs} status=${status} slices=${slices} ` +
+    `page_ins=${pageIns} icount=${icount.toLocaleString()} ` +
+    `jit_blocks=${Number(e.wtw_jit_block_dispatch_count()).toLocaleString()} ` +
+    `jit_regions=${Number(e.wtw_jit_region_dispatch_count()).toLocaleString()}`,
 );
 if (status !== 0 && status !== 1 && status !== 7) console.log(`engine error: ${err()}`);
 console.log(
@@ -414,6 +456,60 @@ console.log(
 );
 const printable = rendered.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]/g, "").trim();
 console.log(`visible text (first 400): ${JSON.stringify(printable.slice(0, 400))}`);
+if (traceEvery > 0) {
+  const traceLen = e.wtw_trace_take();
+  if (traceLen < 0) throw new Error(`trace take: ${err()}`);
+  const traceText = new TextDecoder().decode(
+    mem().slice(e.wtw_trace_ptr(), e.wtw_trace_ptr() + traceLen),
+  );
+  const ripCounts = new Map();
+  const syscallCounts = new Map();
+  const syscallShapeCounts = new Map();
+  let stateSamples = 0;
+  for (const line of traceText.split("\n")) {
+    const fields = line.trim().split(/\s+/);
+    if (fields[1] === "state" && fields.length >= 19) {
+      stateSamples += 1;
+      const rip = fields[18]; // RAX..R15 are fields 2..17; RIP is field 18.
+      ripCounts.set(rip, (ripCounts.get(rip) ?? 0) + 1);
+      continue;
+    }
+    const syscall = line.match(
+      / syscall pid=(\d+) nr=(\d+) args=([^ ]+) ret=([^ ]+)/,
+    );
+    if (syscall) {
+      const key = `pid=${syscall[1]} nr=${syscall[2]}`;
+      syscallCounts.set(key, (syscallCounts.get(key) ?? 0) + 1);
+      const nr = Number(syscall[2]);
+      const args = syscall[3].split(",").map((value) => BigInt(value));
+      let shape;
+      if (nr === 202) {
+        const timeout = args[3] === 0n ? "none" : "some";
+        shape = `futex pid=${syscall[1]} cmd=${Number(args[1] & 0x7fn)} op=${args[1].toString(16)} timeout=${timeout} ret=${syscall[4]}`;
+      } else if (nr === 228 || nr === 229) {
+        shape = `clock pid=${syscall[1]} nr=${nr} id=${args[0]} ret=${syscall[4]}`;
+      } else if (nr === 24 || nr === 56 || nr === 435) {
+        shape = `thread pid=${syscall[1]} nr=${nr} arg0=${args[0].toString(16)} ret=${syscall[4]}`;
+      }
+      if (shape) syscallShapeCounts.set(shape, (syscallShapeCounts.get(shape) ?? 0) + 1);
+    }
+  }
+  const top = (counts, limit) =>
+    [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, limit)
+      .map(([key, count]) => `${key}:${count}`)
+      .join(" ");
+  console.log(
+    `trace_summary bytes=${traceLen} states=${stateSamples} unique_rips=${ripCounts.size} ` +
+      `top_rips=${top(ripCounts, 24)}`,
+  );
+  console.log(`trace_syscalls=${top(syscallCounts, 24)}`);
+  console.log(`trace_syscall_shapes=${top(syscallShapeCounts, 40)}`);
+  if (process.env.PROBE_TRACE_RAW === "1") {
+    console.log(`architectural trace (last 32768 bytes):\n${traceText.slice(-32768)}`);
+  }
+}
 for (const entry of sockets.values()) {
   if (entry.kind === "udp") entry.socket.close();
   else entry.socket.destroy();

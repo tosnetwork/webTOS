@@ -180,6 +180,25 @@ impl InstructionLifter {
         // know the length of the instruction.
         src.read_bytes(vaddr, &mut buf);
 
+        // In 64-bit x86 mode 0x62 introduces EVEX. EVEX.z requests zeroing,
+        // which is reserved when EVEX.aaa selects k0 (the unmasked form).
+        // Ghidra's generated constructors accept that combination and would
+        // execute it as an unmasked zeroing operation, while hardware raises
+        // #UD. Reject the prefix before SLEIGH can turn it into semantics.
+        // Keep this check architecture-scoped: 0x62 can be BOUND outside
+        // long mode and this generic lifter also serves non-x86 targets.
+        let invalid_evex_zeroing_without_mask = src.arch().triple.architecture
+            == target_lexicon::Architecture::X86_64
+            && buf[0] == 0x62
+            && buf[3] & 0x80 != 0
+            && buf[3] & 0x07 == 0;
+        if invalid_evex_zeroing_without_mask {
+            return Err(src
+                .ensure_exec(vaddr, 1)
+                .then_some(DecodeError::InvalidInstruction)
+                .unwrap_or(DecodeError::NonExecutableMemory(vaddr)));
+        }
+
         self.decoder.set_inst(vaddr, &buf);
         if self.decoder.decode_into(&src.arch().sleigh, &mut self.decoded).is_none() {
             // If the decoding fails we need to check if it failed because the memory is not

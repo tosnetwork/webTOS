@@ -227,6 +227,16 @@ fn main() {
                 }
                 Err(_) => true,
             };
+            let show = show
+                && match std::env::var("BREAK_NONZERO") {
+                    Ok(reg) => vm
+                        .cpu
+                        .arch
+                        .sleigh
+                        .get_varnode(&reg)
+                        .is_some_and(|var| vm.cpu.read_reg(var) != 0),
+                    Err(_) => true,
+                };
             if !sticky {
                 vm.code.breakpoints.remove(&rip);
             }
@@ -432,6 +442,24 @@ fn main() {
             eprintln!("[profile] hottest blocks (weight = entries x instructions):");
             for (weight, addr, entries) in hot.iter().take(30) {
                 eprintln!("[profile]   {addr:#x} weight={weight} entries={entries}");
+            }
+        }
+        if let Some(coverage) = machine.jit_coverage() {
+            let percent = |weight: u64| {
+                if coverage.hot_insns == 0 {
+                    0.0
+                } else {
+                    100.0 * weight as f64 / coverage.hot_insns as f64
+                }
+            };
+            eprintln!(
+                "[profile] JIT-able {:.1}% ({} of {} weighted instructions)",
+                percent(coverage.covered_insns),
+                coverage.covered_insns,
+                coverage.hot_insns
+            );
+            for (cause, weight) in coverage.bails.iter().take(20) {
+                eprintln!("[profile]   bail {cause}: {:.1}%", percent(*weight));
             }
         }
     }

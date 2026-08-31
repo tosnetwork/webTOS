@@ -1875,6 +1875,44 @@ pub fn translate_instruction(
             emit_store(f, out)
         }
 
+        // IntCountTrailingZeroes maps directly to Wasm ctz. Zero-extension of
+        // sub-word inputs cannot change their low-order zero count; zero is
+        // the only special case, where the architectural width (8 or 16)
+        // rather than Wasm's 32-bit width is required.
+        Op::IntCountTrailingZeroes => {
+            if b.size() != 0 {
+                return None;
+            }
+            let in_size = a.size();
+            let in_ty = wasm_ty(in_size)?;
+            let out_ty = wasm_ty(out.size)?;
+            emit_store_addr(f);
+            emit_load(f, a, in_size)?;
+            match in_ty {
+                ValType::I64 => {
+                    f.instruction(&Instruction::I64Ctz);
+                    f.instruction(&Instruction::I32WrapI64);
+                }
+                _ => {
+                    f.instruction(&Instruction::I32Ctz);
+                    if in_size < 4 {
+                        // Select W for zero and ctz32(x) otherwise. The stack
+                        // order is [ctz, W, x != 0], so `select` preserves the
+                        // first value for every non-zero sub-word input.
+                        f.instruction(&Instruction::I32Const(in_size as i32 * 8));
+                        emit_load(f, a, in_size)?;
+                        f.instruction(&Instruction::I32Const(0));
+                        f.instruction(&Instruction::I32Ne);
+                        f.instruction(&Instruction::Select);
+                    }
+                }
+            }
+            if matches!(out_ty, ValType::I64) {
+                f.instruction(&Instruction::I64ExtendI32U);
+            }
+            emit_store(f, out)
+        }
+
         // out = cond != 0 ? a : b, a conditional move. `cond` is the 1-byte
         // varnode named by the op; the interpreter reads it as u8 and copies
         // whichever input into `out`. Wasm's `select` is exactly this — it

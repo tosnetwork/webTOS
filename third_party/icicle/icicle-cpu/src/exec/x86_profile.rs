@@ -33,8 +33,15 @@ pub(crate) const XSTATE_COMPONENTS: &[XstateComponent] = &[
     XstateComponent { bit: 7, size: 1024, offset: 1664 },
 ];
 
-const MAX_BASIC_LEAF: u32 = 0x0d;
-const MAX_EXTENDED_LEAF: u32 = 0x8000_0001;
+const MAX_BASIC_LEAF: u32 = 0x1f;
+const MAX_EXTENDED_LEAF: u32 = 0x8000_0007;
+
+/// The virtual machine advances its invariant TSC by one tick per nanosecond.
+/// Publish the same 1 GHz ratio through CPUID.15H so runtimes never have to
+/// infer or calibrate a different frequency from wall-clock observations.
+const TSC_CRYSTAL_HZ: u32 = 25_000_000;
+const TSC_RATIO_NUMERATOR: u32 = 40;
+const TSC_RATIO_DENOMINATOR: u32 = 1;
 
 /// Architectural CPUID output registers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,10 +134,16 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
             edx: u32::from_le_bytes(*b"ineI"),
         },
         (1, _) => CpuidResult {
-            // Family 6, model 0x9e.  The profile is an execution contract, not
-            // a claim about cache topology or physical model identity.
-            eax: 0x0009_06e0,
-            ebx: 0,
+            // Family 6, model 0x6a (Ice Lake server), stepping zero. The model
+            // identity matches the ISA generation named by this profile.
+            eax: 0x0006_06a0,
+            // Four single-threaded cores in one package. Bits 15:8 encode the
+            // 64-byte CLFLUSH line size in eight-byte units; bits 23:16 are
+            // the maximum addressable logical processors. The initial APIC
+            // ID is zero because this deterministic engine migrates tasks
+            // over one execution context rather than exposing per-core CPU
+            // state.
+            ebx: (8 << 8) | (4 << 16),
             // SSE3, PCLMULQDQ, TM2, PDCM, POPCNT, TSC deadline, AES-NI,
             // XSAVE, OSXSAVE and AVX.
             ecx: (1 << 0)
@@ -158,8 +171,15 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
                 | (1 << 23)
                 | (1 << 24)
                 | (1 << 25)
-                | (1 << 26),
+                | (1 << 26)
+                | (1 << 28),
         },
+        // Extended topology enumeration. There is one hardware thread per
+        // core and four cores in the package. Leaf 1FH is preferred by newer
+        // runtimes; leaf 0BH carries the identical legacy view.
+        (0x0b, 0) | (0x1f, 0) => CpuidResult { eax: 0, ebx: 1, ecx: 1 << 8, edx: 0 },
+        (0x0b, 1) | (0x1f, 1) => CpuidResult { eax: 2, ebx: 4, ecx: (2 << 8) | 1, edx: 0 },
+        (0x0b, _) | (0x1f, _) => CpuidResult::default(),
         // Structured extended features: subleaf zero is the only supported
         // subleaf, and EAX reports that finite maximum.
         (7, 0) => CpuidResult {
@@ -185,10 +205,25 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> CpuidResult {
             .find(|entry| u32::from(entry.bit) == component)
             .map(|entry| CpuidResult { eax: entry.size, ebx: entry.offset, ecx: 0, edx: 0 })
             .unwrap_or_default(),
+        (0x15, _) => CpuidResult {
+            eax: TSC_RATIO_DENOMINATOR,
+            ebx: TSC_RATIO_NUMERATOR,
+            ecx: TSC_CRYSTAL_HZ,
+            edx: 0,
+        },
+        // The virtual core and TSC both run at 1 GHz. A 100 MHz bus clock is
+        // descriptive only; no userspace-visible clock is derived from it.
+        (0x16, _) => CpuidResult { eax: 1000, ebx: 1000, ecx: 100, edx: 0 },
         (0x8000_0000, _) => CpuidResult { eax: MAX_EXTENDED_LEAF, ..CpuidResult::default() },
         (0x8000_0001, _) => CpuidResult {
-            // SYSCALL and long mode.
-            edx: (1 << 11) | (1 << 29),
+            // SYSCALL, RDTSCP and long mode.
+            edx: (1 << 11) | (1 << 27) | (1 << 29),
+            ..CpuidResult::default()
+        },
+        (0x8000_0007, _) => CpuidResult {
+            // Invariant TSC: the counter advances at the CPUID.15H frequency
+            // across scheduling gaps and virtual idle time.
+            edx: 1 << 8,
             ..CpuidResult::default()
         },
         _ => CpuidResult::default(),

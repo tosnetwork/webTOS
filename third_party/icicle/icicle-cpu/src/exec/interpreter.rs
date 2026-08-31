@@ -84,7 +84,8 @@ where
                     output,
                     if t.is_nan() || t < f64::from(i16::MIN) || t > f64::from(i16::MAX) {
                         i16::MIN
-                    } else {
+                    }
+                    else {
                         t as i16
                     },
                 ),
@@ -92,7 +93,8 @@ where
                     output,
                     if t.is_nan() || t < f64::from(i32::MIN) || t > f64::from(i32::MAX) {
                         i32::MIN
-                    } else {
+                    }
+                    else {
                         t as i32
                     },
                 ),
@@ -103,7 +105,8 @@ where
                     // range, so the comparisons are exact at both edges.
                     if t.is_nan() || t < i64::MIN as f64 || t >= -(i64::MIN as f64) {
                         i64::MIN
-                    } else {
+                    }
+                    else {
                         t as i64
                     },
                 ),
@@ -161,6 +164,12 @@ where
     macro_rules! count_leading_zeros {
         ($ty:ty) => {{
             exec.write_trunc(output, exec.read::<$ty>(a).leading_zeros());
+        }};
+    }
+
+    macro_rules! count_trailing_zeros {
+        ($ty:ty) => {{
+            exec.write_trunc(output, exec.read::<$ty>(a).trailing_zeros());
         }};
     }
     macro_rules! bool_binary_op {
@@ -450,6 +459,13 @@ where
         (Op::IntCountLeadingZeroes, _, (8, 0)) => count_leading_zeros!(u64),
         (Op::IntCountLeadingZeroes, _, (16, 0)) => count_leading_zeros!(u128),
         (Op::IntCountLeadingZeroes, ..) => exec.invalid_op_size(0),
+
+        (Op::IntCountTrailingZeroes, _, (1, 0)) => count_trailing_zeros!(u8),
+        (Op::IntCountTrailingZeroes, _, (2, 0)) => count_trailing_zeros!(u16),
+        (Op::IntCountTrailingZeroes, _, (4, 0)) => count_trailing_zeros!(u32),
+        (Op::IntCountTrailingZeroes, _, (8, 0)) => count_trailing_zeros!(u64),
+        (Op::IntCountTrailingZeroes, _, (16, 0)) => count_trailing_zeros!(u128),
+        (Op::IntCountTrailingZeroes, ..) => exec.invalid_op_size(0),
 
         (Op::BoolAnd, 1, (1, 1)) => bool_binary_op!(BoolAnd),
         (Op::BoolAnd, ..) => exec.invalid_op_size(0),
@@ -925,24 +941,18 @@ pub(crate) fn f80_to_f64(v: [u8; 10]) -> f64 {
     let neg = se & 0x8000 != 0;
     let exp = (se & 0x7fff) as i32;
     let magnitude = if exp == 0x7fff {
-        if mant << 1 == 0 {
-            f64::INFINITY
-        } else {
-            f64::NAN
-        }
-    } else if mant == 0 && exp == 0 {
+        if mant << 1 == 0 { f64::INFINITY } else { f64::NAN }
+    }
+    else if mant == 0 && exp == 0 {
         0.0
-    } else {
+    }
+    else {
         // Denormals (exp == 0, no integer bit) use the 2^-16382 scale,
         // which is the same as treating the exponent field as 1.
         let e = if exp == 0 { 1 } else { exp };
         ldexp(mant as f64, e - 16383 - 63)
     };
-    if neg {
-        -magnitude
-    } else {
-        magnitude
-    }
+    if neg { -magnitude } else { magnitude }
 }
 
 /// `x * 2^e` in steps, so extended-range exponents can still land on
@@ -969,16 +979,19 @@ pub(crate) fn f64_to_f80(v: f64) -> [u8; 10] {
     let (exp80, mant): (u16, u64) = if exp64 == 0x7ff {
         // Infinity keeps a bare integer bit; NaN keeps its payload, quieted.
         (0x7fff, if frac == 0 { 1 << 63 } else { (0b11 << 62) | (frac << 11) })
-    } else if exp64 == 0 {
+    }
+    else if exp64 == 0 {
         if frac == 0 {
             (0, 0)
-        } else {
+        }
+        else {
             // An f64 subnormal (frac * 2^-1074) normalizes: shifting the
             // fraction to the integer bit gives mant * 2^(15372 - lz - 16446).
             let lz = frac.leading_zeros();
             ((15372 - lz) as u16, frac << lz)
         }
-    } else {
+    }
+    else {
         ((exp64 - 1023 + 16383) as u16, (1 << 63) | (frac << 11))
     };
     let mut out = [0u8; 10];
@@ -1281,11 +1294,7 @@ pub(crate) mod softfp80 {
         // Denormals (e == 0) scale as if e were 1; unnormals normalize.
         let lz = mant.leading_zeros() as i32;
         let e0 = if e == 0 { 1 } else { e };
-        Num {
-            sign,
-            exp: e0 - 16383 - lz,
-            mant: mant << lz,
-        }
+        Num { sign, exp: e0 - 16383 - lz, mant: mant << lz }
     }
 
     fn enc(sign: bool, e: u16, mant: u64) -> [u8; 10] {
@@ -1335,7 +1344,8 @@ pub(crate) mod softfp80 {
                 Some(v) => (v, false),
                 None => (1 << 63, true),
             }
-        } else {
+        }
+        else {
             (hi, false)
         }
     }
@@ -1367,21 +1377,20 @@ pub(crate) mod softfp80 {
             (Inf(sa), Inf(sb)) => {
                 if sa == sb {
                     Inf(sa)
-                } else {
+                }
+                else {
                     Nan
                 }
             }
             (Inf(s), _) | (_, Inf(s)) => Inf(s),
             (Zero(sa), Zero(sb)) => Zero(sa && sb),
             (Zero(_), n) | (n, Zero(_)) => n,
-            (
-                Num { sign: sa, exp: ea, mant: ma },
-                Num { sign: sb, exp: eb, mant: mb },
-            ) => {
+            (Num { sign: sa, exp: ea, mant: ma }, Num { sign: sb, exp: eb, mant: mb }) => {
                 // Order by magnitude so the first operand dominates.
                 let (sa, ea, ma, sb, eb, mb) = if (ea, ma) >= (eb, mb) {
                     (sa, ea, ma, sb, eb, mb)
-                } else {
+                }
+                else {
                     (sb, eb, mb, sa, ea, ma)
                 };
                 let shift = (ea - eb) as u32;
@@ -1389,26 +1398,22 @@ pub(crate) mod softfp80 {
                 let small_full = (mb as u128) << 63;
                 let (small, sticky) = if shift == 0 {
                     (small_full, false)
-                } else if shift >= 128 {
+                }
+                else if shift >= 128 {
                     (0, true)
-                } else {
-                    (
-                        small_full >> shift,
-                        small_full << (128 - shift) != 0,
-                    )
+                }
+                else {
+                    (small_full >> shift, small_full << (128 - shift) != 0)
                 };
                 let scale = ea - 126;
                 if sa == sb {
                     let acc = big + small + sticky as u128;
                     norm128(sa, scale, acc)
-                } else {
+                }
+                else {
                     // The sticky bit borrows from the difference.
                     let acc = big - small - sticky as u128;
-                    if acc == 0 {
-                        Zero(false)
-                    } else {
-                        norm128(sa, scale, acc)
-                    }
+                    if acc == 0 { Zero(false) } else { norm128(sa, scale, acc) }
                 }
             }
         }
@@ -1429,10 +1434,7 @@ pub(crate) mod softfp80 {
             (Inf(sa), Num { sign, .. }) | (Num { sign, .. }, Inf(sa)) => Inf(sa != sign),
             (Zero(sa), Zero(sb)) => Zero(sa != sb),
             (Zero(sa), Num { sign, .. }) | (Num { sign, .. }, Zero(sa)) => Zero(sa != sign),
-            (
-                Num { sign: sa, exp: ea, mant: ma },
-                Num { sign: sb, exp: eb, mant: mb },
-            ) => {
+            (Num { sign: sa, exp: ea, mant: ma }, Num { sign: sb, exp: eb, mant: mb }) => {
                 let p = (ma as u128) * (mb as u128);
                 norm128(sa != sb, ea + eb - 126, p)
             }
@@ -1448,10 +1450,7 @@ pub(crate) mod softfp80 {
             (Zero(sa), Num { sign, .. }) => Zero(sa != sign),
             (Zero(sa), Inf(sb)) => Zero(sa != sb),
             (Num { sign: sa, .. }, Zero(sb)) => Inf(sa != sb),
-            (
-                Num { sign: sa, exp: ea, mant: ma },
-                Num { sign: sb, exp: eb, mant: mb },
-            ) => {
+            (Num { sign: sa, exp: ea, mant: ma }, Num { sign: sb, exp: eb, mant: mb }) => {
                 let num = (ma as u128) << 63;
                 let den = mb as u128;
                 let q = num / den;
@@ -1474,7 +1473,8 @@ pub(crate) mod softfp80 {
                 Num { sign, exp, mant } => {
                     if sign {
                         Some((-1, -(exp as i64), u64::MAX - mant))
-                    } else {
+                    }
+                    else {
                         Some((1, exp as i64, mant))
                     }
                 }
@@ -1493,13 +1493,17 @@ pub(crate) mod softfp80 {
 
     /// Rounds to an integral value, exactly.
     pub fn round_int(x: X87, mode: RoundMode) -> X87 {
-        let Num { sign, exp, mant } = x else { return x };
+        let Num { sign, exp, mant } = x
+        else {
+            return x;
+        };
         if exp >= 63 {
             return x; // already integral
         }
         let (int_part, frac_nonzero, frac_half_or_more) = if exp < 0 {
             (0u64, mant != 0, exp == -1 && mant != 0)
-        } else {
+        }
+        else {
             let sh = (63 - exp) as u32;
             let ip = mant >> sh;
             let frac = mant << (64 - sh);
@@ -1509,7 +1513,8 @@ pub(crate) mod softfp80 {
             // The half flag alone cannot distinguish 0.5 from 0.5+eps.
             if exp < 0 {
                 exp == -1 && mant == 1 << 63
-            } else {
+            }
+            else {
                 (mant << (64 - (63 - exp) as u32)) << 1 == 0
             }
         };
@@ -1518,20 +1523,14 @@ pub(crate) mod softfp80 {
             RoundMode::Ceil => !sign && frac_nonzero,
             RoundMode::Floor => sign && frac_nonzero,
             RoundMode::NearestTiesAway => frac_half_or_more,
-            RoundMode::NearestTiesEven => {
-                frac_half_or_more && (!exactly_half || int_part & 1 == 1)
-            }
+            RoundMode::NearestTiesEven => frac_half_or_more && (!exactly_half || int_part & 1 == 1),
         };
         let value = int_part + bump as u64;
         if value == 0 {
             return Zero(sign);
         }
         let lz = value.leading_zeros() as i32;
-        Num {
-            sign,
-            exp: 63 - lz,
-            mant: value << lz,
-        }
+        Num { sign, exp: 63 - lz, mant: value << lz }
     }
 
     /// Truncates toward zero into an i128 (saturating).
@@ -1542,27 +1541,28 @@ pub(crate) mod softfp80 {
             Inf(s) => {
                 if s {
                     i128::MIN
-                } else {
+                }
+                else {
                     i128::MAX
                 }
             }
             Num { sign, exp, mant } => {
                 let mag: i128 = if exp < 0 {
                     0
-                } else if exp <= 63 {
+                }
+                else if exp <= 63 {
                     (mant >> (63 - exp)) as i128
-                } else if exp <= 126 {
+                }
+                else if exp <= 126 {
                     (mant as i128) << (exp - 63)
-                } else if sign {
+                }
+                else if sign {
                     return i128::MIN;
-                } else {
+                }
+                else {
                     return i128::MAX;
                 };
-                if sign {
-                    -mag
-                } else {
-                    mag
-                }
+                if sign { -mag } else { mag }
             }
         }
     }
@@ -1634,10 +1634,7 @@ mod softfp80_tests {
         let v = from_f64(-2.5);
         assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Ceil))), -2.0);
         assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Floor))), -3.0);
-        assert_eq!(
-            f80_to_f64(pack(round_int(v, RoundMode::NearestTiesAway))),
-            -3.0
-        );
+        assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::NearestTiesAway))), -3.0);
         assert_eq!(f80_to_f64(pack(round_int(v, RoundMode::Trunc))), -2.0);
     }
 }

@@ -100,7 +100,11 @@ fn host_touch(
 
 fn read_mem(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
     host_touch(env, cpu, addr, len, crate::pager::AccessKind::Read)?;
-    read_mem_raw(cpu, addr, len)
+    let mut buf = vec![0_u8; len];
+    cpu.mem
+        .read_bytes(addr, &mut buf, perm::READ)
+        .map_err(|_| abi::EFAULT)?;
+    Ok(buf)
 }
 
 /// [`read_mem`] without the lazy-page fill — for diagnostics that must never
@@ -115,7 +119,9 @@ fn read_mem_raw(cpu: &mut Cpu, addr: u64, len: usize) -> Result<Vec<u8>, u64> {
 
 fn write_mem(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, bytes: &[u8]) -> Result<(), u64> {
     host_touch(env, cpu, addr, bytes.len(), crate::pager::AccessKind::Write)?;
-    write_mem_raw(cpu, addr, bytes)
+    cpu.mem
+        .write_bytes(addr, bytes, perm::WRITE)
+        .map_err(|_| abi::EFAULT)
 }
 
 /// [`write_mem`] without the lazy-page fill (see [`read_mem_raw`]).
@@ -363,6 +369,23 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
             }
             r
         }
+        abi::SYS_CLONE3 => match clone3_spec(env, cpu, a[0], a[1]) {
+            Ok(spec) => {
+                let flags = spec.flags;
+                let r = sys_clone_impl(env, cpu, spec);
+                if std::env::var_os("THREAD_TRACE").is_some() {
+                    if let Outcome::Ret(Ok(child)) = &r {
+                        eprintln!(
+                            "[thread] clone3 parent={} child={child} flags={flags:#x} @{}",
+                            env.proc.pid,
+                            cpu.icount()
+                        );
+                    }
+                }
+                r
+            }
+            Err(errno) => Outcome::Ret(Err(errno)),
+        },
         abi::SYS_EXECVE => sys_execve(env, cpu, a[0], a[1], a[2]),
         abi::SYS_WAIT4 => sys_wait4(env, cpu, a[0], a[1], a[2]),
         abi::SYS_PIPE => sys_pipe(env, cpu, a[0], 0).into(),
@@ -589,6 +612,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_GETRANDOM => sys_getrandom(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETRES => {
+            validate_clock_id(a[0])?;
             if a[1] != 0 {
                 let res: [u8; 16] = encode_timespec(0, 1);
                 write_mem(env, cpu, a[1], &res)?;
@@ -612,6 +636,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_GETPPID => Ok(env.proc.ppid),
         abi::SYS_GETUID | abi::SYS_GETGID | abi::SYS_GETEUID | abi::SYS_GETEGID => Ok(0),
         abi::SYS_GETGROUPS => Ok(0),
+        abi::SYS_SCHED_SETSCHEDULER => sys_sched_setscheduler(env, cpu, a[0], a[1], a[2]),
         abi::SYS_SETSID => {
             // A new session's leader also leads a new process group.
             let tgid = env.proc.tgid;
@@ -645,15 +670,17 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
                 }
             }
         }
-        // One virtual CPU: a one-bit affinity mask, and the mask size (in
-        // bytes) as the return value, per the kernel convention.
+        // The affinity mask and sysfs online topology are one contract. The
+        // deterministic scheduler may time-slice those logical CPUs on one
+        // execution engine, just as a host may schedule many runnable threads
+        // on fewer physical cores.
         abi::SYS_SCHED_GETAFFINITY => {
             let size = (a[1] as usize).min(128);
             if size < 8 {
                 return Err(abi::EINVAL);
             }
             let mut mask = vec![0_u8; size];
-            mask[0] = 1;
+            mask[0] = (1_u8 << crate::VIRTUAL_CPU_COUNT) - 1;
             write_mem(env, cpu, a[2], &mask)?;
             Ok(8)
         }
@@ -3007,16 +3034,86 @@ fn encode_timespec(sec: i64, nsec: i64) -> [u8; 16] {
 }
 
 fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) -> SysResult {
+    const CLOCK_REALTIME: u64 = 0;
     const CLOCK_MONOTONIC: u64 = 1;
+    const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+    const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
     const CLOCK_MONOTONIC_RAW: u64 = 4;
+    const CLOCK_REALTIME_COARSE: u64 = 5;
+    const CLOCK_MONOTONIC_COARSE: u64 = 6;
     const CLOCK_BOOTTIME: u64 = 7;
-    // Monotonic clocks count from machine start (no wall-clock epoch); the
-    // realtime clocks are epoch-based.
+    const CLOCK_REALTIME_ALARM: u64 = 8;
+    const CLOCK_BOOTTIME_ALARM: u64 = 9;
+
+    // CPU clocks advance only while the selected thread group executes. They
+    // must not inherit either the realtime epoch or host suspension gaps;
+    // runtimes use these clocks to budget GC and compilation work.
     let (sec, nsec) = match clock_id {
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => env.now_monotonic(cpu),
-        _ => env.now(cpu),
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => env.now(cpu),
+        CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_BOOTTIME_ALARM => env.now_monotonic(cpu),
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
+            let nanos = if clock_id == CLOCK_PROCESS_CPUTIME_ID {
+                env.proc.current_group_cpu_nanos(cpu.icount())
+            } else {
+                env.proc.current_thread_cpu_nanos(cpu.icount())
+            };
+            (
+                (nanos / 1_000_000_000) as i64,
+                (nanos % 1_000_000_000) as i64,
+            )
+        }
+        _ => return Err(abi::EINVAL),
     };
     write_mem(env, cpu, ts, &encode_timespec(sec, nsec))?;
+    Ok(0)
+}
+
+fn validate_clock_id(clock_id: u64) -> Result<(), u64> {
+    match clock_id {
+        0..=9 if clock_id != 10 => Ok(()),
+        _ => Err(abi::EINVAL),
+    }
+}
+
+fn sys_sched_setscheduler(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    pid: u64,
+    policy: u64,
+    param: u64,
+) -> SysResult {
+    const SCHED_OTHER: u64 = 0;
+    const SCHED_RESET_ON_FORK: u64 = 0x4000_0000;
+
+    // The deterministic scheduler has no priority classes. Linux nevertheless
+    // permits an unprivileged runtime to reaffirm SCHED_OTHER with priority
+    // zero and request reset-on-fork; Bun does exactly this for its helper
+    // threads. Supporting that identity operation is exact. Pretending to
+    // implement FIFO/RR/BATCH/IDLE priorities would not be.
+    if policy & !SCHED_RESET_ON_FORK != SCHED_OTHER {
+        return Err(abi::EINVAL);
+    }
+    let priority = i32::from_le_bytes(
+        read_mem(env, cpu, param, 4)?
+            .try_into()
+            .expect("sched_param is four bytes"),
+    );
+    if priority != 0 {
+        return Err(abi::EINVAL);
+    }
+
+    let pid = pid as i64;
+    if pid < 0 {
+        return Err(abi::EINVAL);
+    }
+    let tid = if pid == 0 { env.proc.pid } else { pid as u64 };
+    if tid != env.proc.pid && !env.sched.parked.iter().any(|task| task.proc.pid == tid) {
+        return Err(abi::ESRCH);
+    }
     Ok(0)
 }
 
@@ -3074,11 +3171,13 @@ use crate::proc::{ParkState, ParkedTask, Process, SignalFrame, Zombie, ROOT_PID}
 const SYSCALL_INSN_LEN: u64 = 2;
 
 const CLONE_VM: u64 = 0x100;
+const CLONE_PIDFD: u64 = 0x1000;
 const CLONE_VFORK: u64 = 0x4000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
@@ -3130,6 +3229,99 @@ impl CloneSpec {
             tls: a[4],
         }
     }
+}
+
+/// Decodes Linux's extensible `struct clone_args` into the scheduler's one
+/// canonical clone representation.
+///
+/// Version zero is 64 bytes (through `tls`); version one adds `set_tid` and
+/// `set_tid_size`, and version two adds `cgroup`. Future zero-filled tail
+/// bytes are accepted just like `copy_struct_from_user`, while a non-zero
+/// field whose semantics this kernel does not implement fails closed.
+fn clone3_spec(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    args_addr: u64,
+    size: u64,
+) -> Result<CloneSpec, u64> {
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    const CLONE_ARGS_SIZE_VER2: usize = 88;
+    const MAX_EXTENSIBLE_STRUCT: usize = PAGE_SIZE as usize;
+
+    let size = usize::try_from(size).map_err(|_| abi::E2BIG)?;
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(abi::EINVAL);
+    }
+    if size > MAX_EXTENSIBLE_STRUCT {
+        return Err(abi::E2BIG);
+    }
+    let bytes = read_mem(env, cpu, args_addr, size)?;
+    if bytes[CLONE_ARGS_SIZE_VER2.min(size)..]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(abi::E2BIG);
+    }
+    let field = |offset: usize| -> u64 {
+        if offset + 8 > size {
+            return 0;
+        }
+        u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("checked clone3 field"),
+        )
+    };
+
+    let flags = field(0);
+    let pidfd = field(8);
+    let child_tid = field(16);
+    let parent_tid = field(24);
+    let exit_signal = field(32);
+    let stack = field(40);
+    let stack_size = field(48);
+    let tls = field(56);
+    let set_tid = field(64);
+    let set_tid_size = field(72);
+    let cgroup = field(80);
+
+    if std::env::var_os("CLONE_TRACE").is_some() {
+        eprintln!(
+            "[clone3-args] size={size} flags={flags:#x} pidfd={pidfd:#x} child_tid={child_tid:#x} parent_tid={parent_tid:#x} exit_signal={exit_signal} stack={stack:#x} stack_size={stack_size:#x} tls={tls:#x} set_tid={set_tid:#x} set_tid_size={set_tid_size} cgroup={cgroup:#x}"
+        );
+    }
+
+    // clone3 carries the termination signal separately, unlike legacy clone.
+    // Signals outside Linux's 1..64 range and legacy CSIGNAL bits in `flags`
+    // would make the same byte sequence ambiguous.
+    if flags & 0xff != 0 || exit_signal > 64 {
+        return Err(abi::EINVAL);
+    }
+    // PID-fd allocation, explicit PID selection and cgroup placement require
+    // kernel authorities this deterministic userspace kernel does not expose.
+    if flags & CLONE_PIDFD != 0
+        || set_tid != 0
+        || set_tid_size != 0
+        || flags & CLONE_INTO_CGROUP != 0
+    {
+        return Err(abi::EINVAL);
+    }
+    if (stack == 0) != (stack_size == 0) {
+        return Err(abi::EINVAL);
+    }
+    let new_sp = if stack == 0 {
+        0
+    } else {
+        stack.checked_add(stack_size).ok_or(abi::EINVAL)?
+    };
+
+    Ok(CloneSpec {
+        flags: flags | exit_signal,
+        new_sp,
+        parent_tid,
+        child_tid,
+        tls,
+    })
 }
 
 /// Prepares the current CPU state so that, when this task is next resumed,
@@ -3196,6 +3388,7 @@ fn stop_thread_group(env: &mut LinuxEnv, cpu: &mut Cpu, signal: u64, restart: bo
 /// stays in the MMU: sibling threads share it, and `schedule_next` swaps
 /// it out only when handing the CPU to a different thread group.
 fn park_current(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState) {
+    env.proc.finish_cpu_turn(cpu.icount());
     let snapshot = cpu.snapshot();
     let proc = std::mem::replace(&mut env.proc, Process::initial());
     env.sched.parked.push(ParkedTask {
@@ -3222,6 +3415,21 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     let timed_out = matches!(
         &task.state,
         ParkState::Futex { woken: false, deadline: Some(deadline), .. } if now >= *deadline
+    );
+    // An untimed futex wait is parked at the syscall instruction so that a
+    // signal installed with SA_RESTART can replay it.  A real FUTEX_WAKE is
+    // different: it completes the admitted wait with zero and must not
+    // compare the userspace word again.  Replaying after the waker changes
+    // the word turns a successful wake into EAGAIN and breaks runtime worker
+    // hand-offs.  Timed waits are already parked after the syscall because
+    // their original deadline must not be recomputed.
+    let untimed_futex_woken = matches!(
+        &task.state,
+        ParkState::Futex {
+            woken: true,
+            deadline: None,
+            ..
+        }
     );
     // Every wait but vfork's is interruptible: a signal that runs a handler
     // ends the syscall unless the handler asked for it to be restarted.
@@ -3260,9 +3468,12 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     // The instruction counter is global (energy, limits, deterministic
     // time); it must never rewind on a task switch.
     let icount = cpu.icount;
+    let time_offset = cpu.time_offset;
     cpu.restore(&task.cpu);
     cpu.icount = icount;
+    cpu.time_offset = time_offset;
     env.proc = task.proc;
+    env.proc.start_cpu_turn(cpu.icount());
     crate::set_current_pid(env.proc.pid);
     x64_engine::vm::set_current_asid(env.proc.asid);
     // SWAP_WATCH=hexaddr: read the 8 bytes at that guest VA in whichever
@@ -3287,7 +3498,9 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
             );
         }
     }
-    if timed_out {
+    if untimed_futex_woken {
+        end_wait_with(env, cpu, 0);
+    } else if timed_out {
         cpu.write_var(env.regs.rax, neg(abi::ETIMEDOUT));
     }
     // A task woken with a pending signal enters its handler before resuming
@@ -3306,6 +3519,28 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
         }
         deliver_signal(env, cpu);
     }
+    true
+}
+
+/// Gives another runnable task a deterministic CPU turn.
+///
+/// Blocking syscalls already switch tasks through [`block_and_switch`], but
+/// native runtimes also use bounded userspace spins while a worker is making
+/// progress. A purely cooperative scheduler lets that spinner monopolize the
+/// emulated CPU forever. The machine calls this at an instruction-quantum
+/// boundary; stable queue order makes the hand-off replayable.
+pub(crate) fn preempt_ready(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
+    let now = env.now_nanos(cpu);
+    if env.sched.find_ready(now).is_none() {
+        return false;
+    }
+    park_current(env, cpu, ParkState::Ready);
+    // A ready task was observed before the current task was appended, so the
+    // stable queue must still contain a schedulable entry.
+    assert!(
+        schedule_next(env, cpu),
+        "ready task disappeared during preemption"
+    );
     true
 }
 
@@ -3701,6 +3936,12 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
         let _ = write_mem(env, cpu, addr, &0_u32.to_le_bytes());
         env.sched.futex_wake(addr, u64::MAX);
     }
+
+    // An exiting task is never parked, so close its running CPU interval
+    // explicitly before the Process value is discarded. This keeps both the
+    // departed thread's final clock and the surviving thread group's process
+    // clock authoritative.
+    env.proc.finish_cpu_turn(cpu.icount());
 
     let (pid, tgid, ppid) = (env.proc.pid, env.proc.tgid, env.proc.ppid);
     if exit_group {
