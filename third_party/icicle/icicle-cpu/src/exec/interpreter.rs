@@ -10,6 +10,12 @@ pub trait PcodeExecutor: ValueSource {
     fn exception(&mut self, code: ExceptionCode, value: u64);
     fn next_instruction(&mut self, addr: u64, len: u64);
     fn load_mem<const N: usize>(&mut self, id: MemId, addr: u64) -> Option<[u8; N]>;
+    /// Check that a store can begin without leaving a partial write behind.
+    ///
+    /// Some p-code values are wider than a native host store. Executors may
+    /// lower those stores into multiple writes, so a protection failure in a
+    /// later chunk must be discovered before the first chunk is committed.
+    fn validate_store(&mut self, id: MemId, addr: u64, value: &[u8]) -> Option<()>;
     fn store_mem<const N: usize>(&mut self, id: MemId, addr: u64, value: [u8; N]) -> Option<()>;
     fn set_arg(&mut self, id: u16, value: u128);
     fn call_helper(&mut self, id: u16, output: VarNode, inputs: [Value; 2]);
@@ -751,13 +757,20 @@ fn store<E: PcodeExecutor>(exec: &mut E, id: MemId, addr: u64, value: Value) {
         4 => writer!(addr, exec.read::<u32>(value)),
         8 => writer!(addr, exec.read::<u64>(value)),
         16 => {
+            let mut bytes = [0; 16];
             if exec.is_big_endian() && id == pcode::RAM_SPACE {
-                writer!(addr, exec.read::<u64>(value.slice(8, 8)));
-                writer!(addr.wrapping_add(8), exec.read::<u64>(value.slice(0, 8)));
+                bytes[..8].copy_from_slice(&exec.read::<u64>(value.slice(8, 8)).to_be_bytes());
+                bytes[8..].copy_from_slice(&exec.read::<u64>(value.slice(0, 8)).to_be_bytes());
             }
             else {
-                writer!(addr, exec.read::<u64>(value.slice(0, 8)));
-                writer!(addr.wrapping_add(8), exec.read::<u64>(value.slice(8, 8)));
+                bytes[..8].copy_from_slice(&exec.read::<u64>(value.slice(0, 8)).to_le_bytes());
+                bytes[8..].copy_from_slice(&exec.read::<u64>(value.slice(8, 8)).to_le_bytes());
+            }
+            if exec.validate_store(id, addr, &bytes).is_none() {
+                return;
+            }
+            if exec.store_mem(id, addr, bytes).is_none() {
+                return;
             }
         }
         size => {

@@ -993,6 +993,20 @@ impl InterpVm {
             return exit;
         }
 
+        // Some host-side memory operations (notably Linux MADV_DONTNEED)
+        // legitimately replace guest bytes without passing through a p-code
+        // store. The MMU clears executable-page marks before that mutation
+        // and raises this latch so the corresponding lifted blocks cannot
+        // survive into the next dispatch. Do this after the environment has
+        // completed its syscall state transition, so the resumed PC is the
+        // instruction following the syscall and is re-lifted from its actual
+        // current bytes.
+        if std::mem::take(&mut self.cpu.mem.invalidate_icache) {
+            self.flush_code();
+            self.cpu.block_id = u64::MAX;
+            self.cpu.block_offset = 0;
+        }
+
         let code = ExceptionCode::from_u32(self.cpu.exception.code);
         match code {
             ExceptionCode::None | ExceptionCode::InstructionLimit => {

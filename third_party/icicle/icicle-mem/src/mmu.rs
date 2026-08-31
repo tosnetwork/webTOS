@@ -1306,6 +1306,29 @@ impl Mmu {
         }
     }
 
+    /// Checks whether a multi-part guest store may start without violating
+    /// self-modifying-code protection. This does not change memory or TLB
+    /// state; callers that lower one architectural store into several writes
+    /// must call it before committing the first part.
+    pub fn validate_write_before_mutation(&self, addr: u64, value: &[u8]) -> MemResult<()> {
+        if !self.detect_self_modifying_code {
+            return Ok(());
+        }
+
+        for (offset, byte) in value.iter().copied().enumerate() {
+            let current = addr.wrapping_add(offset as u64) & self.address_mask;
+            let Some(MemoryMapping::Physical(mapping)) = self.mapping.get(current)
+            else {
+                continue;
+            };
+            let page = self.physical.get(mapping.index);
+            if page.executed {
+                check_self_modifying_write(page.data(), current, std::slice::from_ref(&byte))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_cstr(&mut self, mut addr: u64, buf: &mut Vec<u8>) -> MemResult<u64> {
         loop {
             match self.read_u8(addr, perm::READ)? {

@@ -691,6 +691,17 @@ impl<'a> PcodeExecutor for UncheckedExecutor<'a> {
         }
     }
 
+    fn validate_store(&mut self, id: pcode::MemId, addr: u64, value: &[u8]) -> Option<()> {
+        if id != pcode::RAM_SPACE {
+            return Some(());
+        }
+        if let Err(err) = self.cpu.mem.validate_write_before_mutation(addr, value) {
+            self.exception(ExceptionCode::from_store_error(err), addr);
+            return None;
+        }
+        Some(())
+    }
+
     fn store_mem<const N: usize>(
         &mut self,
         id: pcode::MemId,

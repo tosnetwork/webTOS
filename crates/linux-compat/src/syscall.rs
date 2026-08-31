@@ -254,8 +254,10 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
                 Err(errno) => {
                     if std::env::var_os("SYSCALL_ERR_TRACE").is_some() {
                         let path = match nr {
-                            2 => read_cstr_raw(cpu, a0).ok(),
-                            257 | 262 | abi::SYS_STATX => read_cstr_raw(cpu, a1).ok(),
+                            2 | abi::SYS_READLINK => read_cstr_raw(cpu, a0).ok(),
+                            257 | 262 | abi::SYS_STATX | abi::SYS_READLINKAT => {
+                                read_cstr_raw(cpu, a1).ok()
+                            }
                             _ => None,
                         }
                         .map(|p| format!(" path={}", p.escape_ascii()))
@@ -1930,8 +1932,48 @@ fn sys_readlinkat(
     size: u64,
 ) -> SysResult {
     let path = path_arg(env, cpu, path_ptr)?;
+    let pid_cwd = format!("/proc/{}/cwd", env.proc.pid);
+    let pid_fd_prefix = format!("/proc/{}/fd/", env.proc.pid);
     let target = if path == b"/proc/self/exe" {
         env.proc.exe_path.clone()
+    } else if path == b"/proc/self/cwd" || path == pid_cwd.as_bytes() {
+        // Runtimes use this procfs symlink to canonicalize their startup
+        // directory. It must agree with getcwd(2), not with the advisory
+        // PWD environment variable. Answer it directly because this VFS does
+        // not materialize every procfs directory as a persistent inode.
+        env.vfs.abs_path_of(env.proc.cwd)
+    } else if let Some(fd_text) = path
+        .strip_prefix(b"/proc/self/fd/")
+        .or_else(|| path.strip_prefix(pid_fd_prefix.as_bytes()))
+    {
+        let fd = std::str::from_utf8(fd_text)
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(abi::ENOENT)?;
+        let fds = env.proc.fds.borrow();
+        let desc = fds.get(fd)?.desc.borrow();
+        match &desc.backing {
+            Backing::File { node } | Backing::Dir { node, .. } => env.vfs.abs_path_of(*node),
+            Backing::Std(StdStream::In) => b"/dev/stdin".to_vec(),
+            Backing::Std(StdStream::Out) => b"/dev/stdout".to_vec(),
+            Backing::Std(StdStream::Err) => b"/dev/stderr".to_vec(),
+            Backing::Dev(crate::vfs::Dev::Null) => b"/dev/null".to_vec(),
+            Backing::Dev(crate::vfs::Dev::Zero) => b"/dev/zero".to_vec(),
+            Backing::Dev(crate::vfs::Dev::Random) => b"/dev/urandom".to_vec(),
+            Backing::Dev(crate::vfs::Dev::Ptmx) => b"/dev/ptmx".to_vec(),
+            Backing::Dev(crate::vfs::Dev::Tty) | Backing::PtyMaster(_) | Backing::PtySlave(_) => {
+                b"/dev/pts/0".to_vec()
+            }
+            // These kernel-created objects have no namespace path. A stable
+            // Linux-style descriptor is sufficient for callers which only
+            // need to distinguish an anonymous endpoint from a directory.
+            Backing::Pipe { .. } => format!("pipe:[{fd}]").into_bytes(),
+            Backing::SocketPair { .. } | Backing::Net(_) => format!("socket:[{fd}]").into_bytes(),
+            Backing::EventFd(_) => format!("anon_inode:[eventfd:{fd}]").into_bytes(),
+            Backing::TimerFd(_) => format!("anon_inode:[timerfd:{fd}]").into_bytes(),
+            Backing::Epoll(_) => format!("anon_inode:[eventpoll:{fd}]").into_bytes(),
+            Backing::Inotify(_) => format!("anon_inode:[inotify:{fd}]").into_bytes(),
+        }
     } else {
         let base = dir_of(env, dirfd)?;
         let resolved = env.vfs.resolve(base, &path, false)?;
@@ -2947,6 +2989,22 @@ fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u
             }
             return Err(abi::EINVAL);
         }
+    }
+
+    // `madvise` changes bytes from the host-side syscall implementation, so
+    // it cannot take the normal guest-store exception path that the engine
+    // uses for self-modifying code.  Detect an overlap *before* changing any
+    // page: otherwise a multi-page DONTNEED can zero an initial page and
+    // later fail on an executed one, leaving a partially mutated range while
+    // its lifted p-code remains live.  Clear the MMU execution marks first;
+    // the VM observes `invalidate_icache` after the syscall and atomically
+    // drops its lifted-code arena before dispatching another guest block.
+    let invalidates_code = (addr..end)
+        .step_by(PAGE_SIZE as usize)
+        .any(|page| cpu.mem.get_perm(page) & perm::IN_CODE_CACHE != 0);
+    if invalidates_code {
+        cpu.mem.clear_code_cache();
+        cpu.mem.invalidate_icache = true;
     }
 
     let mut page = addr;

@@ -348,6 +348,29 @@ fn main() {
             );
         }
         eprintln!("[runner] syscall trail (pid:nr@icount): {syscall_trail}");
+        // FAULT_CODE_WINDOW=N dumps N bytes before and after RIP. This is
+        // deliberately relative to the actual fault rather than a manually
+        // supplied address: generated runtimes allocate code at a different
+        // address every run, and the predecessor branch often explains an
+        // invalid value at the first faulting load.
+        if let Ok(radius) = std::env::var("FAULT_CODE_WINDOW") {
+            let radius: u64 = radius.parse().unwrap_or(64);
+            let start = rip.saturating_sub(radius);
+            let len = radius.saturating_mul(2).min(4096) as usize;
+            let mut bytes = vec![0_u8; len];
+            if vm
+                .cpu
+                .mem
+                .read_bytes(start, &mut bytes, icicle_mem::perm::NONE)
+                .is_ok()
+            {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x} ")).collect();
+                eprintln!(
+                    "[runner] code window start={start:#x} rip-offset={:#x}: {hex}",
+                    rip.saturating_sub(start)
+                );
+            }
+        }
         // FAULT_PCODE=1 prints the current lifted block around the failing
         // p-code operation. Generated runtimes often fault far from a symbol,
         // so the guest instruction alone is not enough to tell whether an

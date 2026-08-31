@@ -51,6 +51,27 @@ fn write_across_boundary() {
 }
 
 #[test]
+fn validates_a_wide_store_before_committing_any_part() {
+    let mut mmu = Mmu::default();
+    mmu.map_memory_len(0x10_000, 0x2_000, Mapping {
+        perm: perm::READ | perm::WRITE | perm::EXEC,
+        value: 0,
+    });
+    mmu.write_bytes(0x10ff8, &[0; 16], perm::WRITE).unwrap();
+    assert!(mmu.ensure_executable(0x11000, 1));
+
+    let value = [0xA5; 16];
+    assert_eq!(
+        mmu.validate_write_before_mutation(0x10ff8, &value),
+        Err(MemError::SelfModifyingCode)
+    );
+
+    let mut actual = [0_u8; 16];
+    mmu.read_bytes(0x10ff8, &mut actual, perm::READ).unwrap();
+    assert_eq!(actual, [0; 16]);
+}
+
+#[test]
 fn memset() {
     let mut mmu = Mmu::default();
     mmu.map_memory_len(0x10000, 0x2000, Mapping { perm: perm::NONE, value: 0xAA });
