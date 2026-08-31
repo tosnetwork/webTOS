@@ -48,17 +48,19 @@ fn main() {
         .join("../../third_party/ghidra-x86/languages/x86.ldefs");
     let mut machine = Machine::from_ldef(&ldef, &EngineConfig::default()).expect("build");
 
-    // GUEST_MEM_MB=N raises the guest's physical-memory cap (default 1 GiB).
-    // Large workloads (a package download landing in the in-memory fs, plus
-    // copy-on-write pages of a fork-heavy runtime) can exceed the default.
-    if let Ok(mb) = std::env::var("GUEST_MEM_MB") {
-        let mb: usize = mb.parse().expect("GUEST_MEM_MB must be a number");
-        let pages = mb.saturating_mul(256); // 4 KiB pages
-        assert!(
-            machine.vm_mut().cpu.mem.set_capacity(pages),
-            "cannot shrink below allocated pages"
-        );
-    }
+    // GUEST_MEM_MB=N sets the guest's physical-memory cap (default 2 GiB).
+    // The cap is lazy: it reserves no host memory up front. A modern agent
+    // CLI can fork several helpers while its language runtime holds a large
+    // JIT heap, which exceeds the engine's conservative 1 GiB default before
+    // the child has even built its exec stack. Hosts needing a tighter limit
+    // can still select it explicitly through GUEST_MEM_MB.
+    let mb: usize = std::env::var("GUEST_MEM_MB")
+        .map_or(2048, |value| value.parse().expect("GUEST_MEM_MB must be a number"));
+    let pages = mb.saturating_mul(256); // 4 KiB pages
+    assert!(
+        machine.vm_mut().cpu.mem.set_capacity(pages),
+        "cannot shrink below allocated pages"
+    );
 
     // The debug runner talks to real services (TLS certificates, tokens), so
     // give the guest the host's actual wall clock instead of the fixed

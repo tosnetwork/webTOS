@@ -239,9 +239,12 @@ fn stdio_pty_drives_an_interactive_program() {
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/ioctl.h>
 
 int main(void) {
-    dprintf(1, "tty=%d\n", isatty(0));
+    pid_t sid = -1;
+    if (ioctl(0, TIOCGSID, &sid) != 0) return 2;
+    dprintf(1, "tty=%d sid=%d\n", isatty(0), (int)sid);
     char buf[128];
     int n = 0;
     while (n < (int)sizeof(buf) - 1) {
@@ -281,7 +284,7 @@ int main(void) {
         "stdio pty: {rendered:?}"
     );
     assert!(
-        rendered.contains("tty=1") && rendered.contains("echo:hello-terminal"),
+        rendered.contains("tty=1 sid=1000") && rendered.contains("echo:hello-terminal"),
         "terminal output: {rendered:?}"
     );
 }

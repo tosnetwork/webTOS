@@ -283,6 +283,8 @@ pub const TIOCSCTTY: u64 = 0x540E; // set controlling terminal
 pub const TIOCNOTTY: u64 = 0x5422; // drop controlling terminal
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
+/// Return the session ID that owns a controlling terminal.
+pub const TIOCGSID: u64 = 0x5429;
 // General fd ioctls, valid on any descriptor (not tty-specific).
 pub const FIONREAD: u64 = 0x541B;
 pub const FIONBIO: u64 = 0x5421;

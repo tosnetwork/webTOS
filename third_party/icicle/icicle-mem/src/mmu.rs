@@ -789,6 +789,48 @@ impl Mmu {
         self.mapping_changed = true;
     }
 
+    /// Drops the current address-space map and returns frames that are no
+    /// longer referenced by another live map to the physical-page allocator.
+    ///
+    /// Forked address spaces share copy-on-write frames, so freeing every
+    /// frame in the departing map would corrupt a sibling. Conversely, simply
+    /// dropping the map leaks every private frame until the entire machine is
+    /// reset. `live_maps` is the authoritative set of other address spaces;
+    /// only frames absent from it are recycled. Callers must not use this
+    /// while another thread still shares the current map.
+    pub fn reset_virtual_reclaiming<'a>(
+        &mut self,
+        live_maps: impl IntoIterator<Item = &'a VirtualMemoryMap>,
+    ) -> usize {
+        let mut live = HashSet::default();
+        for map in live_maps {
+            for (_, _, entry) in map.iter() {
+                if let MemoryMapping::Physical(mapping) = entry {
+                    live.insert(mapping.index);
+                }
+            }
+        }
+
+        let stale = std::mem::take(&mut self.mapping);
+        let mut released = HashSet::default();
+        for (_, _, entry) in stale.iter() {
+            if let MemoryMapping::Physical(mapping) = entry {
+                let index = mapping.index;
+                if !index.is_zero_page() && !live.contains(&index) {
+                    released.insert(index);
+                }
+            }
+        }
+        for index in &released {
+            self.physical.free(*index);
+        }
+        self.tlb.clear();
+        self.last_io_handler = None;
+        self.modified.clear();
+        self.mapping_changed = true;
+        released.len()
+    }
+
     /// Clears all executable-page tracking (the `executed` flags and
     /// `IN_CODE_CACHE` permission bits) so that writes over previously
     /// executed bytes can proceed. The caller must flush any lifted or

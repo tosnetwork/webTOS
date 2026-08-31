@@ -51,6 +51,29 @@ fn write_across_boundary() {
 }
 
 #[test]
+fn dropping_a_map_reclaims_only_frames_not_referenced_by_a_sibling() {
+    let mut mmu = Mmu::default();
+    mmu.map_memory_len(
+        0x20_000,
+        0x1000,
+        Mapping {
+            perm: perm::READ | perm::WRITE,
+            value: 0,
+        },
+    );
+    mmu.write::<1>(0x20_000, [0xA5], perm::WRITE).unwrap();
+    assert_eq!(mmu.total_pages(), 3);
+
+    let sibling = mmu.snapshot_virtual_mapping();
+    assert_eq!(mmu.reset_virtual_reclaiming([&sibling]), 0);
+    assert_eq!(mmu.total_pages(), 3, "shared COW frame must survive");
+
+    mmu.restore_virtual_mapping(sibling);
+    assert_eq!(mmu.reset_virtual_reclaiming(std::iter::empty()), 1);
+    assert_eq!(mmu.total_pages(), 2, "unreferenced frame must be recycled");
+}
+
+#[test]
 fn validates_a_wide_store_before_committing_any_part() {
     let mut mmu = Mmu::default();
     mmu.map_memory_len(0x10_000, 0x2_000, Mapping {

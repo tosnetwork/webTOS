@@ -643,6 +643,7 @@ impl LinuxEnv {
         pty.slaves = 3; // fds 0, 1, 2
         pty.slave_ever_opened = true;
         pty.fg_pgrp = self.proc.pgid;
+        pty.session_id = self.proc.sid;
         let pty = std::rc::Rc::new(std::cell::RefCell::new(pty));
         self.ptys.insert(id, std::rc::Rc::clone(&pty));
         self.stdio_pty = Some(std::rc::Rc::clone(&pty));
@@ -1120,16 +1121,22 @@ impl LinuxEnv {
     /// prepares registers and the initial stack. Shared by `load` (initial
     /// process) and `execve`.
     pub(crate) fn start_image(&mut self, cpu: &mut Cpu, path: &[u8]) -> Result<(), String> {
-        // `reset_virtual` drops the mapping but leaks the physical pages
-        // (the engine never frees them individually), so a long-lived
-        // machine running many processes would exhaust memory. When no
-        // other task is alive we can reclaim everything with `clear`
-        // (keeping only the shared zero page); with siblings parked, their
-        // maps still reference physical pages, so we must not clear — an
-        // execve inside a multi-process guest keeps the (bounded) leak.
+        // An exec replaces this process's map. Other process groups can still
+        // share COW frames with it, so reclaim only frames absent from every
+        // parked group's map. Threads in this same group share the active map
+        // itself and must retain the conservative old behavior until thread
+        // teardown is modeled as part of exec.
+        let same_group_alive = self
+            .sched
+            .parked
+            .iter()
+            .any(|task| task.proc.tgid == self.proc.tgid);
         let others_alive = !self.sched.parked.is_empty() || !self.sched.group_maps.is_empty();
-        if others_alive {
+        if same_group_alive {
             cpu.mem.reset_virtual();
+        } else if others_alive {
+            cpu.mem
+                .reset_virtual_reclaiming(self.sched.group_maps.values());
         } else {
             cpu.mem.clear();
         }

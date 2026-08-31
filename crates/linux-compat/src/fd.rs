@@ -61,6 +61,9 @@ pub struct Pty {
     /// or TIOCSPGRP, and the target for terminal-generated signals such as
     /// SIGWINCH on a window-size change.
     pub fg_pgrp: u64,
+    /// Session which owns this terminal. Separate from `fg_pgrp`: shells
+    /// move foreground jobs between process groups without changing session.
+    pub session_id: u64,
 }
 
 impl Pty {
@@ -106,6 +109,7 @@ impl Pty {
             slave_ever_opened: false,
             activity: 0,
             fg_pgrp: 0,
+            session_id: 0,
         }
     }
 

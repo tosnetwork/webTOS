@@ -677,6 +677,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             // A new session's leader also leads a new process group.
             let tgid = env.proc.tgid;
             set_group_pgid(env, tgid, tgid);
+            env.proc.sid = tgid;
             Ok(tgid)
         }
         abi::SYS_SET_TID_ADDRESS => {
@@ -2419,7 +2420,9 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             abi::TIOCSCTTY => {
                 // The caller claims this pty as its controlling terminal and
                 // becomes the foreground group.
-                pty.borrow_mut().fg_pgrp = env.proc.pgid;
+                let mut pty = pty.borrow_mut();
+                pty.fg_pgrp = env.proc.pgid;
+                pty.session_id = env.proc.sid;
                 return Ok(0);
             }
             abi::TIOCSPGRP => {
@@ -2431,6 +2434,11 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
             abi::TIOCGPGRP => {
                 let pgrp = pty.borrow().fg_pgrp as u32;
                 write_mem(env, cpu, arg, &pgrp.to_le_bytes())?;
+                return Ok(0);
+            }
+            abi::TIOCGSID => {
+                let sid = pty.borrow().session_id as u32;
+                write_mem(env, cpu, arg, &sid.to_le_bytes())?;
                 return Ok(0);
             }
             abi::TIOCNOTTY => return Ok(0),
@@ -2476,6 +2484,10 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
         | abi::TIOCNOTTY => Ok(0),
         abi::TIOCGPGRP => {
             write_mem(env, cpu, arg, &(PID as u32).to_le_bytes())?;
+            Ok(0)
+        }
+        abi::TIOCGSID => {
+            write_mem(env, cpu, arg, &(env.proc.sid as u32).to_le_bytes())?;
             Ok(0)
         }
         _ => {

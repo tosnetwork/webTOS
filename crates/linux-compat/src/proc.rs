@@ -67,6 +67,9 @@ pub struct Process {
     /// Process-group id (job control): inherited across fork, changed by
     /// `setpgid`/`setsid`. Signals sent to `-pgid` reach the whole group.
     pub pgid: u64,
+    /// Session ID. A session survives fork and changes only through setsid;
+    /// terminal ioctls expose it independently from the foreground group.
+    pub sid: u64,
     /// Shared with sibling threads (`CLONE_FILES`); `fork` deep-clones the
     /// table (entries still share open file descriptions).
     pub fds: Rc<RefCell<FdTable>>,
@@ -147,6 +150,7 @@ impl Process {
             tgid: ROOT_PID,
             ppid: 1,
             pgid: ROOT_PID,
+            sid: ROOT_PID,
             fds: Rc::new(RefCell::new(FdTable::new())),
             cwd: crate::vfs::ROOT,
             umask: 0o022,
@@ -181,6 +185,7 @@ impl Process {
             tgid: pid,
             ppid: self.tgid,
             pgid: self.pgid,
+            sid: self.sid,
             fds: Rc::new(RefCell::new(self.fds.borrow().clone())),
             cwd: self.cwd,
             umask: self.umask,
@@ -220,6 +225,7 @@ impl Process {
             tgid: self.tgid,
             ppid: self.ppid,
             pgid: self.pgid,
+            sid: self.sid,
             fds: Rc::clone(&self.fds),
             cwd: self.cwd,
             umask: self.umask,

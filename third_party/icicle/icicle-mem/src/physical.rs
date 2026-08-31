@@ -24,7 +24,7 @@ pub const PAGE_MASK: u64 = (PAGE_SIZE - 1) as u64;
 pub const MAX_PAGES: usize = 262_144;
 
 /// Represents an opaque index into physical memory.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Index(u32);
 
 impl std::fmt::Debug for Index {
