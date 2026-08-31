@@ -172,6 +172,7 @@ pub const EAGAIN: u64 = 11;
 pub const ENOMEM: u64 = 12;
 pub const EACCES: u64 = 13;
 pub const EFAULT: u64 = 14;
+pub const EBUSY: u64 = 16;
 pub const EEXIST: u64 = 17;
 pub const EPIPE: u64 = 32;
 pub const ENOTDIR: u64 = 20;

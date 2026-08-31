@@ -141,6 +141,23 @@ e.wtw_env(...put("HOME=/root"));
 e.wtw_env(...put("TERM=xterm-256color"));
 e.wtw_env(...put("PS1=webtos:\\w$ "));
 e.wtw_env(...put("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"));
+// Diagnostic only: isolate JSC's concurrent collectors and compilation pools
+// from the main-thread startup path.  The acceptance gate never sets this;
+// a result obtained with it cannot count as workload compatibility.
+if (process.env.PROBE_JSC_SINGLE_THREADED === "1") {
+  for (const setting of [
+    "BUN_JSC_useConcurrentGC=false",
+    "BUN_JSC_numberOfGCMarkers=1",
+    "BUN_JSC_minNumberOfWorklistThreads=1",
+    "BUN_JSC_maxNumberOfWorklistThreads=1",
+    "BUN_JSC_numberOfBaselineCompilerThreads=1",
+    "BUN_JSC_numberOfDFGCompilerThreads=1",
+    "BUN_JSC_numberOfFTLCompilerThreads=1",
+    "BUN_JSC_numberOfWasmCompilerThreads=1",
+  ]) {
+    e.wtw_env(...put(setting));
+  }
+}
 if (process.env.PROBE_GLIBC_TUNABLES) {
   e.wtw_env(...put(`GLIBC_TUNABLES=${process.env.PROBE_GLIBC_TUNABLES}`));
 }
@@ -465,6 +482,7 @@ if (traceEvery > 0) {
   const ripCounts = new Map();
   const syscallCounts = new Map();
   const syscallShapeCounts = new Map();
+  const syscallErrorCounts = new Map();
   let stateSamples = 0;
   for (const line of traceText.split("\n")) {
     const fields = line.trim().split(/\s+/);
@@ -482,6 +500,14 @@ if (traceEvery > 0) {
       syscallCounts.set(key, (syscallCounts.get(key) ?? 0) + 1);
       const nr = Number(syscall[2]);
       const args = syscall[3].split(",").map((value) => BigInt(value));
+      if (syscall[4].startsWith("0x")) {
+        const raw = BigInt(syscall[4]);
+        if (raw >= 0xffff_ffff_ffff_f001n) {
+          const errno = 0x1_0000_0000_0000_0000n - raw;
+          const error = `pid=${syscall[1]} nr=${nr} errno=${errno}`;
+          syscallErrorCounts.set(error, (syscallErrorCounts.get(error) ?? 0) + 1);
+        }
+      }
       let shape;
       if (nr === 202) {
         const timeout = args[3] === 0n ? "none" : "some";
@@ -504,8 +530,9 @@ if (traceEvery > 0) {
     `trace_summary bytes=${traceLen} states=${stateSamples} unique_rips=${ripCounts.size} ` +
       `top_rips=${top(ripCounts, 24)}`,
   );
-  console.log(`trace_syscalls=${top(syscallCounts, 24)}`);
+  console.log(`trace_syscalls=${top(syscallCounts, 100)}`);
   console.log(`trace_syscall_shapes=${top(syscallShapeCounts, 40)}`);
+  console.log(`trace_syscall_errors=${top(syscallErrorCounts, 100)}`);
   if (process.env.PROBE_TRACE_RAW === "1") {
     console.log(`architectural trace (last 32768 bytes):\n${traceText.slice(-32768)}`);
   }

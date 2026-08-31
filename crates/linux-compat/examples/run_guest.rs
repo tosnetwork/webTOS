@@ -237,6 +237,22 @@ fn main() {
                         .is_some_and(|var| vm.cpu.read_reg(var) != 0),
                     Err(_) => true,
                 };
+            let show = show
+                && match std::env::var("BREAK_EQ") {
+                    Ok(spec) => {
+                        let (reg, value) = spec
+                            .split_once(':')
+                            .expect("BREAK_EQ must be REGISTER:VALUE");
+                        let expected = u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                            .expect("BREAK_EQ value must be hexadecimal");
+                        vm.cpu
+                            .arch
+                            .sleigh
+                            .get_varnode(reg)
+                            .is_some_and(|var| vm.cpu.read_reg(var) == expected)
+                    }
+                    Err(_) => true,
+                };
             if !sticky {
                 vm.code.breakpoints.remove(&rip);
             }

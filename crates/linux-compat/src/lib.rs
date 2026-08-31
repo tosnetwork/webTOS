@@ -954,6 +954,27 @@ impl LinuxEnv {
         )
     }
 
+    /// Linux's coarse clocks are snapshots updated at the kernel tick rather
+    /// than aliases of the nanosecond clocks.  Keep the deterministic time
+    /// source, but quantize its observation to the 1 ms resolution reported
+    /// by the virtual kernel.
+    pub(crate) fn now_coarse(&self, cpu: &Cpu) -> (i64, i64) {
+        let nanos = self.now_nanos(cpu) / 1_000_000 * 1_000_000;
+        (
+            self.epoch_base_sec
+                .saturating_add((nanos / 1_000_000_000) as i64),
+            (nanos % 1_000_000_000) as i64,
+        )
+    }
+
+    pub(crate) fn now_monotonic_coarse(&self, cpu: &Cpu) -> (i64, i64) {
+        let nanos = self.now_nanos(cpu) / 1_000_000 * 1_000_000;
+        (
+            (nanos / 1_000_000_000) as i64,
+            (nanos % 1_000_000_000) as i64,
+        )
+    }
+
     /// Deterministic monotonic clock: one retired instruction is one
     /// nanosecond, plus the idle time-warp offset.
     pub(crate) fn now_nanos(&self, cpu: &Cpu) -> u64 {

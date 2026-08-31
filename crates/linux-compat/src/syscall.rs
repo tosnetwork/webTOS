@@ -197,6 +197,23 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     let a4: u64 = cpu.read_var(env.regs.r8);
     let a5: u64 = cpu.read_var(env.regs.r9);
     env.record_syscall(nr, cpu.icount());
+    // Host-only diagnostic for resolving a syscall wrapper back to the exact
+    // guest ELF mapping.  This is deliberately opt-in: it is useful when a
+    // dynamically linked workload has several libc wrappers for one syscall,
+    // while keeping the normal runner and browser surface silent.
+    if std::env::var_os("SYSCALL_IP_TRACE").is_some()
+        && std::env::var("SYSCALL_IP_TRACE_NR")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none_or(|wanted| wanted == nr)
+    {
+        eprintln!(
+            "[syscall-ip] pid={} ic={} rip={:#x} nr={nr} args=({a0:#x},{a1:#x},{a2:#x},{a3:#x},{a4:#x},{a5:#x})",
+            env.proc.pid,
+            cpu.icount(),
+            cpu.read_pc(),
+        );
+    }
     let trace_entry = env.trace.is_some().then(|| (cpu.icount(), env.proc.pid));
 
     // A signal whose disposition is the default action and whose default is
@@ -612,9 +629,9 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_GETRANDOM => sys_getrandom(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETTIME => sys_clock_gettime(env, cpu, a[0], a[1]),
         abi::SYS_CLOCK_GETRES => {
-            validate_clock_id(a[0])?;
+            let resolution = clock_resolution_nanos(a[0])?;
             if a[1] != 0 {
-                let res: [u8; 16] = encode_timespec(0, 1);
+                let res: [u8; 16] = encode_timespec(0, resolution);
                 write_mem(env, cpu, a[1], &res)?;
             }
             Ok(0)
@@ -685,7 +702,13 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             Ok(8)
         }
 
-        abi::SYS_SET_ROBUST_LIST | abi::SYS_RSEQ => Err(abi::ENOSYS),
+        // Robust-list teardown needs the complete linked-list protocol; do
+        // not claim support before it exists.  rseq is different: this
+        // userspace kernel executes one stable virtual CPU at a time, so the
+        // registration ABI can be implemented faithfully without pretending
+        // to provide host scheduling behaviour.
+        abi::SYS_SET_ROBUST_LIST => Err(abi::ENOSYS),
+        abi::SYS_RSEQ => sys_rseq(env, cpu, a[0], a[1], a[2], a[3]),
 
         abi::SYS_SYSINFO => sys_sysinfo(env, cpu, a[0]),
         abi::SYS_GETRUSAGE => sys_getrusage(env, cpu, a[0] as i64, a[1]),
@@ -3033,28 +3056,28 @@ fn encode_timespec(sec: i64, nsec: i64) -> [u8; 16] {
     out
 }
 
-fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) -> SysResult {
-    const CLOCK_REALTIME: u64 = 0;
-    const CLOCK_MONOTONIC: u64 = 1;
-    const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
-    const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
-    const CLOCK_MONOTONIC_RAW: u64 = 4;
-    const CLOCK_REALTIME_COARSE: u64 = 5;
-    const CLOCK_MONOTONIC_COARSE: u64 = 6;
-    const CLOCK_BOOTTIME: u64 = 7;
-    const CLOCK_REALTIME_ALARM: u64 = 8;
-    const CLOCK_BOOTTIME_ALARM: u64 = 9;
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
+const CLOCK_BOOTTIME: u64 = 7;
+const CLOCK_REALTIME_ALARM: u64 = 8;
+const CLOCK_BOOTTIME_ALARM: u64 = 9;
 
+fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) -> SysResult {
     // CPU clocks advance only while the selected thread group executes. They
     // must not inherit either the realtime epoch or host suspension gaps;
     // runtimes use these clocks to budget GC and compilation work.
     let (sec, nsec) = match clock_id {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => env.now(cpu),
-        CLOCK_MONOTONIC
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME
-        | CLOCK_BOOTTIME_ALARM => env.now_monotonic(cpu),
+        CLOCK_REALTIME | CLOCK_REALTIME_ALARM => env.now(cpu),
+        CLOCK_REALTIME_COARSE => env.now_coarse(cpu),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
+            env.now_monotonic(cpu)
+        }
+        CLOCK_MONOTONIC_COARSE => env.now_monotonic_coarse(cpu),
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
             let nanos = if clock_id == CLOCK_PROCESS_CPUTIME_ID {
                 env.proc.current_group_cpu_nanos(cpu.icount())
@@ -3072,9 +3095,17 @@ fn sys_clock_gettime(env: &mut LinuxEnv, cpu: &mut Cpu, clock_id: u64, ts: u64) 
     Ok(0)
 }
 
-fn validate_clock_id(clock_id: u64) -> Result<(), u64> {
+fn clock_resolution_nanos(clock_id: u64) -> Result<i64, u64> {
     match clock_id {
-        0..=9 if clock_id != 10 => Ok(()),
+        CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => Ok(1_000_000),
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_BOOTTIME
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM => Ok(1),
         _ => Err(abi::EINVAL),
     }
 }
@@ -3161,9 +3192,77 @@ fn sys_prlimit64(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> SysRe
     Ok(0)
 }
 
+/// Linux `rseq(2)` registration for the fixed virtual-CPU model.
+///
+/// A registered thread sees CPU zero for the whole lifetime of its execution:
+/// WebTOS serializes guest execution and never migrates a task between
+/// virtual CPUs mid-instruction.  That is a real, conservative rseq model —
+/// `cpu_id_start == cpu_id` authorizes user-space's fast path, while no hidden
+/// host CPU identity leaks into the guest.  We deliberately do not advertise
+/// rseq critical-section restart on migration because migration cannot occur
+/// in this scheduler.
+fn sys_rseq(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: u64,
+    flags: u64,
+    signature: u64,
+) -> SysResult {
+    const RSEQ_LEN: u64 = 32;
+    const RSEQ_FLAG_UNREGISTER: u64 = 1;
+    const RSEQ_SIG: u32 = 0x5305_3053;
+    const RSEQ_CPU_ID_UNINITIALIZED: u32 = u32::MAX;
+
+    // Linux fixes the ABI size for a given architecture.  Accepting a
+    // truncated or future structure would leave fields the caller expects
+    // the kernel to own without a defined meaning.
+    if len != RSEQ_LEN || addr == 0 || addr & (RSEQ_LEN - 1) != 0 {
+        return Err(abi::EINVAL);
+    }
+    if signature as u32 != RSEQ_SIG || signature >> 32 != 0 {
+        return Err(abi::EINVAL);
+    }
+    if flags & !RSEQ_FLAG_UNREGISTER != 0 {
+        return Err(abi::EINVAL);
+    }
+
+    if flags == RSEQ_FLAG_UNREGISTER {
+        let Some(registration) = env.proc.rseq else {
+            return Err(abi::EINVAL);
+        };
+        if registration.addr != addr || registration.signature != RSEQ_SIG {
+            return Err(abi::EINVAL);
+        }
+        // The two kernel-owned CPU fields become explicitly uninitialized;
+        // user-owned rseq_cs/flags are left untouched.
+        let mut uninitialized = [0_u8; 8];
+        uninitialized[..4].copy_from_slice(&RSEQ_CPU_ID_UNINITIALIZED.to_le_bytes());
+        uninitialized[4..].copy_from_slice(&RSEQ_CPU_ID_UNINITIALIZED.to_le_bytes());
+        write_mem(env, cpu, addr, &uninitialized)?;
+        env.proc.rseq = None;
+        return Ok(0);
+    }
+
+    if env.proc.rseq.is_some() {
+        return Err(abi::EBUSY);
+    }
+    // Validate both kernel-owned words before changing process state, so an
+    // unmapped or read-only user block cannot leave a half-registration.
+    let _ = read_mem(env, cpu, addr, 8)?;
+    write_mem(env, cpu, addr, &[0; 8])?;
+    env.proc.rseq = Some(RseqRegistration {
+        addr,
+        signature: RSEQ_SIG,
+    });
+    Ok(0)
+}
+
 // ── Processes, threads, and scheduling (milestone 4) ────────────────────────
 
-use crate::proc::{ParkState, ParkedTask, Process, SignalFrame, Zombie, ROOT_PID};
+use crate::proc::{
+    ParkState, ParkedTask, Process, RseqRegistration, SignalFrame, Zombie, ROOT_PID,
+};
 
 /// `syscall` encodes as `0f 05`; rewinding NEXT_PC by its length makes the
 /// guest re-execute the instruction, giving blocking syscalls restart

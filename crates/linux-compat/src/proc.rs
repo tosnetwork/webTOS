@@ -37,6 +37,18 @@ pub struct SignalFrame {
     pub on_alt: bool,
 }
 
+/// Registration metadata for Linux's per-thread restartable-sequences ABI.
+///
+/// The ABI block itself remains guest-owned memory.  Keeping only its address
+/// here lets the kernel publish a stable virtual CPU at registration and
+/// invalidate that registration on teardown without treating hidden host
+/// state as the authority for the sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RseqRegistration {
+    pub addr: u64,
+    pub signature: u32,
+}
+
 /// Per-process (or per-thread) state. This is everything a task owns
 /// besides its CPU registers and memory map.
 pub struct Process {
@@ -89,6 +101,10 @@ pub struct Process {
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: zeroed and futex-woken
     /// when this task exits (pthread_join relies on it).
     pub clear_child_tid: u64,
+    /// Registered `struct rseq`, if this thread opted into the Linux rseq
+    /// ABI. It is strictly per-thread: clone siblings and fork children must
+    /// register their own area.
+    pub rseq: Option<RseqRegistration>,
     /// Address-space id (see [`crate::alloc_asid`]). Threads share it; fork
     /// and execve take a fresh one. Keys the block cache per address space.
     pub asid: u64,
@@ -135,6 +151,7 @@ impl Process {
             argv: Vec::new(),
             envp: Vec::new(),
             clear_child_tid: 0,
+            rseq: None,
             asid: 0,
             vfork_done: None,
             stopped: false,
@@ -171,6 +188,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            rseq: None,
             asid: crate::alloc_asid(),
             vfork_done: None,
             stopped: false,
@@ -208,6 +226,7 @@ impl Process {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             clear_child_tid: 0,
+            rseq: None,
             asid: self.asid,
             vfork_done: None,
             stopped: false,

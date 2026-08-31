@@ -320,6 +320,56 @@ int main(void) {
     );
 }
 
+/// rseq registration is per thread and publishes only kernel-owned CPU
+/// fields. The deterministic machine has one stable executing virtual CPU,
+/// so a registered user-space fast path must see matching CPU ids; duplicate
+/// registration and an invalid unregistration must still fail rather than
+/// silently replacing an active ABI block.
+#[test]
+fn rseq_register_unregister_and_validation() {
+    let source = r##"
+typedef unsigned int u32;
+typedef unsigned long u64;
+struct rseq_abi {
+    u32 cpu_id_start;
+    u32 cpu_id;
+    u64 rseq_cs;
+    u32 flags;
+    u32 pad;
+} __attribute__((aligned(32)));
+static struct rseq_abi area;
+static long raw(long nr, long a0, long a1, long a2, long a3) {
+    long ret;
+    register long r10 __asm__("r10") = a3;
+    __asm__ volatile("syscall" : "=a"(ret) : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10) : "rcx", "r11", "memory");
+    return ret;
+}
+__attribute__((noreturn)) void _start(void) {
+    const long SYS_rseq = 334, SYS_exit = 60;
+    const long sig = 0x53053053;
+    if (raw(SYS_rseq, (long)&area, 32, 0, sig) != 0) goto bad;
+    if (area.cpu_id_start != 0 || area.cpu_id != 0) goto bad;
+    if (raw(SYS_rseq, (long)&area, 32, 0, sig) != -16) goto bad;
+    if (raw(SYS_rseq, (long)&area, 32, 1, sig) != 0) goto bad;
+    if (area.cpu_id_start != ~0u || area.cpu_id != ~0u) goto bad;
+    if (raw(SYS_rseq, (long)&area, 32, 1, sig) != -22) goto bad;
+    __asm__ volatile("syscall" : : "a"(SYS_exit), "D"(0) : "rcx", "r11", "memory");
+bad:
+    __asm__ volatile("syscall" : : "a"(SYS_exit), "D"(1) : "rcx", "r11", "memory");
+    __builtin_unreachable();
+}
+"##;
+    let Some(image) = compile_c(
+        "rseq_abi",
+        source,
+        &["-nostdlib", "-no-pie", "-Wl,-e,_start"],
+    ) else {
+        return;
+    };
+    let run = run_image(image, "rseq_abi");
+    expect_clean(&run);
+}
+
 #[test]
 fn virtual_cpu_topology_matches_the_affinity_contract() {
     let source = r#"
@@ -456,6 +506,42 @@ int main(void) {
         run.output.contains("parent=")
             && run.output.contains("worker=")
             && run.output.contains("process="),
+        "output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn coarse_clocks_publish_and_observe_linux_tick_resolution() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdio.h>
+#include <time.h>
+
+int main(void) {
+    struct timespec fine_res, coarse_res, realtime, monotonic;
+    if (clock_getres(CLOCK_MONOTONIC, &fine_res)) return 1;
+    if (clock_getres(CLOCK_MONOTONIC_COARSE, &coarse_res)) return 2;
+    if (fine_res.tv_sec != 0 || fine_res.tv_nsec != 1) return 3;
+    if (coarse_res.tv_sec != 0 || coarse_res.tv_nsec != 1000000) return 4;
+    if (clock_gettime(CLOCK_REALTIME_COARSE, &realtime)) return 5;
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &monotonic)) return 6;
+    if (realtime.tv_nsec % 1000000 || monotonic.tv_nsec % 1000000) return 7;
+    errno = 0;
+    if (clock_getres(99, &fine_res) != -1 || errno != EINVAL) return 8;
+    printf("fine=%ld coarse=%ld realtime_ns=%ld monotonic_ns=%ld\n",
+           fine_res.tv_nsec, coarse_res.tv_nsec, realtime.tv_nsec, monotonic.tv_nsec);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("coarse_clock", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "coarse_clock");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("coarse=1000000"),
         "output: {:?}",
         run.output
     );
