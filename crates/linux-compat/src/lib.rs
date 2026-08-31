@@ -218,6 +218,13 @@ pub struct LinuxEnv {
     /// zeros. Manifest-backed ranges are recreated by `pager` and remain
     /// eligible for discard.
     pub(crate) file_backed_ranges: Vec<FileBackedRange>,
+    /// Private mappings excluded from a fork child's copied address space by
+    /// MADV_DONTFORK. Entries are scoped to the owning address-space id.
+    pub(crate) dontfork_ranges: Vec<AdviceRange>,
+    /// Relocation applied to the current main executable's ELF virtual
+    /// addresses. Retained so MADV_DONTNEED can restore writable private
+    /// image pages from their exact PT_LOAD file bytes.
+    pub(crate) exe_load_offset: u64,
     /// VFS node ids the guest has opened, when access tracking is on (`Some`).
     /// A delivered file never in this set was materialized for nothing — the
     /// measure of how much a lazy image could avoid. Off by default so the set
@@ -352,6 +359,8 @@ impl LinuxEnv {
             vfs,
             shared_maps: Vec::new(),
             file_backed_ranges: Vec::new(),
+            dontfork_ranges: Vec::new(),
+            exe_load_offset: 0,
             opened_files: None,
             proc: Process::initial(),
             sched: Scheduler::new(),
@@ -1044,6 +1053,60 @@ impl LinuxEnv {
         self.file_backed_ranges.retain(|range| range.asid != asid);
     }
 
+    pub(crate) fn set_dontfork(&mut self, asid: u64, start: u64, end: u64) {
+        self.dontfork_ranges.push(AdviceRange { asid, start, end });
+    }
+
+    pub(crate) fn clear_dontfork(&mut self, asid: u64, start: u64, end: u64) {
+        let mut kept = Vec::with_capacity(self.dontfork_ranges.len() + 1);
+        for range in self.dontfork_ranges.drain(..) {
+            if range.asid != asid || range.end <= start || range.start >= end {
+                kept.push(range);
+                continue;
+            }
+            if range.start < start {
+                kept.push(AdviceRange {
+                    end: start,
+                    ..range
+                });
+            }
+            if range.end > end {
+                kept.push(AdviceRange {
+                    start: end,
+                    ..range
+                });
+            }
+        }
+        self.dontfork_ranges = kept;
+    }
+
+    pub(crate) fn drop_dontfork_space(&mut self, asid: u64) {
+        self.dontfork_ranges.retain(|range| range.asid != asid);
+    }
+
+    pub(crate) fn remap_dontfork(
+        &mut self,
+        asid: u64,
+        old_start: u64,
+        old_end: u64,
+        new_start: u64,
+    ) {
+        let inherited: Vec<(u64, u64)> = self
+            .dontfork_ranges
+            .iter()
+            .filter(|range| range.asid == asid)
+            .filter_map(|range| {
+                let start = range.start.max(old_start);
+                let end = range.end.min(old_end);
+                (start < end).then_some((start - old_start, end - old_start))
+            })
+            .collect();
+        self.clear_dontfork(asid, old_start, old_end);
+        for (start, end) in inherited {
+            self.set_dontfork(asid, new_start + start, new_start + end);
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn alloc_mmap(&mut self, len: u64) -> u64 {
         let target = self.proc.mmap_next.get();
@@ -1109,6 +1172,7 @@ impl LinuxEnv {
             metadata.binary.base_ptr,
             metadata.binary.length,
         );
+        self.exe_load_offset = metadata.binary.offset;
         if let Some(interpreter) = &metadata.interpreter {
             self.record_file_backed_range(self.proc.asid, interpreter.base_ptr, interpreter.length);
         }
@@ -1301,6 +1365,7 @@ impl Environment for LinuxEnv {
         let old_asid = self.proc.asid;
         self.pager.drop_space(old_asid);
         self.drop_file_backed_space(old_asid);
+        self.drop_dontfork_space(old_asid);
         self.file_chunk_wait = None;
         // A fresh root process; the filesystem persists across loads, any
         // tasks from a previous run do not.
@@ -1523,6 +1588,13 @@ pub(crate) struct SharedMap {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FileBackedRange {
+    pub(crate) asid: u64,
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdviceRange {
     pub(crate) asid: u64,
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -2584,6 +2656,12 @@ impl Machine {
             .iter()
             .map(|(pid, nr, ic)| format!("{pid}:{nr}@{ic}"))
             .collect()
+    }
+
+    /// A compact snapshot of every task not currently on the virtual CPU.
+    /// Intended for opt-in runtime diagnostics; it contains no guest memory.
+    pub fn parked_task_snapshot(&mut self) -> Vec<String> {
+        syscall::parked_task_snapshot(self.env())
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {

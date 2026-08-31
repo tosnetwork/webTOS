@@ -130,6 +130,84 @@ int main(void) {
     );
 }
 
+#[test]
+fn madvise_dontfork_excludes_pages_and_dofork_restores_inheritance() {
+    let source = r#"
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 1;
+    volatile uint64_t *page = mmap(0, (size_t)page_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return 2;
+    *page = UINT64_C(0xdecafbad12345678);
+    if (madvise((void *)page, (size_t)page_size, MADV_DONTFORK)) return 3;
+
+    pid_t pid = fork();
+    if (pid < 0) return 4;
+    if (pid == 0) _exit(mprotect((void *)page, (size_t)page_size, PROT_READ) == -1 ? 0 : 20);
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) return 5;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return 6;
+
+    if (madvise((void *)page, (size_t)page_size, MADV_DOFORK)) return 7;
+    pid = fork();
+    if (pid < 0) return 8;
+    if (pid == 0) _exit(mprotect((void *)page, (size_t)page_size, PROT_READ) == 0 &&
+        *page == UINT64_C(0xdecafbad12345678) ? 0 : 22);
+    status = 0;
+    if (waitpid(pid, &status, 0) != pid) return 9;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 10;
+}
+"#;
+    let Some(image) = compile_c("madvise_fork", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "madvise_fork");
+    expect_clean(&run);
+}
+
+#[test]
+fn robust_pthread_mutex_becomes_owner_dead_when_holder_exits() {
+    let source = r#"
+#include <errno.h>
+#include <pthread.h>
+#include <stdlib.h>
+
+static pthread_mutex_t lock;
+static void *holder(void *unused) {
+    (void)unused;
+    if (pthread_mutex_lock(&lock) != 0) return (void *)1;
+    return 0; /* Exit deliberately without unlocking. */
+}
+int main(void) {
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) return 1;
+    if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST)) return 2;
+    if (pthread_mutex_init(&lock, &attr)) return 3;
+    pthread_t thread;
+    if (pthread_create(&thread, 0, holder, 0)) return 4;
+    void *result = 0;
+    if (pthread_join(thread, &result) || result) return 5;
+    int rc = pthread_mutex_lock(&lock);
+    if (rc != EOWNERDEAD) return 6;
+    if (pthread_mutex_consistent(&lock)) return 7;
+    return pthread_mutex_unlock(&lock) == 0 ? 0 : 8;
+}
+"#;
+    let Some(image) = compile_c("robust_pthread", source, &["-pthread"]) else {
+        return;
+    };
+    let run = run_image(image, "robust_pthread");
+    expect_clean(&run);
+}
+
 /// A parent reading a child's stdout pipe to EOF must wake when the child
 /// exits, even when the child is the last other runnable task. The exiting
 /// process's descriptor table has to be released before the scheduler looks
@@ -377,6 +455,8 @@ fn virtual_cpu_topology_matches_the_affinity_contract() {
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 int main(void) {
     FILE *file = fopen("/sys/devices/system/cpu/online", "r");
@@ -385,10 +465,12 @@ int main(void) {
     cpu_set_t set;
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set)) return 2;
+    unsigned cpu = 99, node = 99;
+    if (syscall(SYS_getcpu, &cpu, &node, 0) || cpu != 0 || node != 0) return 4;
     int count = CPU_COUNT(&set);
-    printf("online=%scount=%d cpus=%d%d%d%d\n", online, count,
+    printf("online=%scount=%d cpus=%d%d%d%d current=%u node=%u\n", online, count,
            CPU_ISSET(0, &set), CPU_ISSET(1, &set),
-           CPU_ISSET(2, &set), CPU_ISSET(3, &set));
+           CPU_ISSET(2, &set), CPU_ISSET(3, &set), cpu, node);
     return strcmp(online, "0-3\n") == 0 && count == 4 ? 0 : 3;
 }
 "#;
@@ -398,7 +480,7 @@ int main(void) {
     let run = run_image(image, "cpu_topology");
     expect_clean(&run);
     assert!(
-        run.output.contains("count=4 cpus=1111"),
+        run.output.contains("count=4 cpus=1111 current=0 node=0"),
         "output: {:?}",
         run.output
     );

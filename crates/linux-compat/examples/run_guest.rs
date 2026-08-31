@@ -302,6 +302,13 @@ fn main() {
         let rendered = machine.drain_terminal_output();
         print!("{}", String::from_utf8_lossy(&rendered));
     }
+    if std::env::var_os("GUEST_TASK_STATES").is_some() {
+        let (exe, pid) = machine.current_task();
+        eprintln!("[runner] current pid={pid} exe={exe}");
+        for state in machine.parked_task_snapshot() {
+            eprintln!("[runner] parked {state}");
+        }
+    }
     if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
         let (exe, pid) = machine.current_task();
         let vm = machine.vm_mut();
@@ -458,6 +465,38 @@ fn main() {
             eprintln!("[profile] hottest blocks (weight = entries x instructions):");
             for (weight, addr, entries) in hot.iter().take(30) {
                 eprintln!("[profile]   {addr:#x} weight={weight} entries={entries}");
+            }
+            if let Ok(spec) = std::env::var("GUEST_PROFILE_IMAGE_RANGE") {
+                let (start, end) = spec
+                    .split_once(':')
+                    .map(|(start, end)| {
+                        let parse = |value: &str| {
+                            u64::from_str_radix(value.trim_start_matches("0x"), 16)
+                                .expect("profile image address")
+                        };
+                        (parse(start), parse(end))
+                    })
+                    .expect("GUEST_PROFILE_IMAGE_RANGE=start:end");
+                let (inside, outside) =
+                    hot.iter()
+                        .fold((0_u64, 0_u64), |(inside, outside), (weight, addr, _)| {
+                            if (start..end).contains(addr) {
+                                (inside.saturating_add(*weight), outside)
+                            } else {
+                                (inside, outside.saturating_add(*weight))
+                            }
+                        });
+                eprintln!(
+                    "[profile] image_range={start:#x}..{end:#x} inside={inside} outside={outside}"
+                );
+                eprintln!("[profile] hottest blocks outside image range:");
+                for (weight, addr, entries) in hot
+                    .iter()
+                    .filter(|(_, addr, _)| !(start..end).contains(addr))
+                    .take(30)
+                {
+                    eprintln!("[profile]   {addr:#x} weight={weight} entries={entries}");
+                }
             }
         }
         if let Some(coverage) = machine.jit_coverage() {

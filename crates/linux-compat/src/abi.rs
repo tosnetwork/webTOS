@@ -36,6 +36,7 @@ pub const SYS_PIPE: u64 = 22;
 pub const SYS_DUP: u64 = 32;
 pub const SYS_DUP2: u64 = 33;
 pub const SYS_DUP3: u64 = 292;
+pub const SYS_GETCPU: u64 = 309;
 pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_SELECT: u64 = 23;
 pub const SYS_NANOSLEEP: u64 = 35;

@@ -49,6 +49,14 @@ pub struct RseqRegistration {
     pub signature: u32,
 }
 
+/// Per-thread registration made through `set_robust_list(2)`. Linux uses the
+/// user-owned linked list when a thread exits to mark locks it held as owner
+/// dead and wake a waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RobustListRegistration {
+    pub head: u64,
+}
+
 /// Per-process (or per-thread) state. This is everything a task owns
 /// besides its CPU registers and memory map.
 pub struct Process {
@@ -105,6 +113,9 @@ pub struct Process {
     /// ABI. It is strictly per-thread: clone siblings and fork children must
     /// register their own area.
     pub rseq: Option<RseqRegistration>,
+    /// Registered robust-futex list. It is per-thread; a new pthread starts
+    /// with no registration, while a forked current thread inherits it.
+    pub robust_list: Option<RobustListRegistration>,
     /// Address-space id (see [`crate::alloc_asid`]). Threads share it; fork
     /// and execve take a fresh one. Keys the block cache per address space.
     pub asid: u64,
@@ -152,6 +163,7 @@ impl Process {
             envp: Vec::new(),
             clear_child_tid: 0,
             rseq: None,
+            robust_list: None,
             asid: 0,
             vfork_done: None,
             stopped: false,
@@ -189,6 +201,7 @@ impl Process {
             envp: self.envp.clone(),
             clear_child_tid: 0,
             rseq: None,
+            robust_list: self.robust_list,
             asid: crate::alloc_asid(),
             vfork_done: None,
             stopped: false,
@@ -227,6 +240,7 @@ impl Process {
             envp: self.envp.clone(),
             clear_child_tid: 0,
             rseq: None,
+            robust_list: None,
             asid: self.asid,
             vfork_done: None,
             stopped: false,

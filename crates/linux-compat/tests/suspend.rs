@@ -142,6 +142,54 @@ int main(void) {
 }
 
 #[test]
+fn guest_idle_wait_advances_invariant_tsc_with_monotonic_clock() {
+    let Some(image) = compile_c(
+        "tsc_idle_wait",
+        r#"
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+
+static inline uint64_t tsc(void) {
+    unsigned lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+int main(void) {
+    struct timespec before, after, wait = { .tv_sec = 3 };
+    uint64_t t0 = tsc();
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    if (nanosleep(&wait, 0)) return 2;
+    uint64_t t1 = tsc();
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    uint64_t clock_ns = (uint64_t)(after.tv_sec - before.tv_sec) * 1000000000ULL
+                      + (uint64_t)(after.tv_nsec - before.tv_nsec);
+    printf("tsc_delta=%llu clock_delta=%llu\n",
+           (unsigned long long)(t1 - t0), (unsigned long long)clock_ns);
+    uint64_t difference = (t1 - t0) > clock_ns
+                        ? (t1 - t0) - clock_ns : clock_ns - (t1 - t0);
+    return (difference <= 100 && clock_ns >= 3000000000ULL) ? 0 : 3;
+}
+"#,
+    ) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![b"fixture".to_vec()], vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine.vm_mut().icount_limit = 200_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "{output}");
+    assert!(output.contains("clock_delta=3"), "{output}");
+}
+
+#[test]
 fn a_periodic_timer_reports_the_periods_it_missed_rather_than_firing_for_each() {
     let Some(image) = compile_c(
         "periodic",

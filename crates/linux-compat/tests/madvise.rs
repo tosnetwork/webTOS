@@ -91,7 +91,7 @@ fn unknown_and_unimplemented_structural_advice_fail_closed() {
         [0, 4096, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, u64::MAX, 0],
     );
     assert!(address > 0);
-    for advice in [u64::MAX, 9, 10, 11, 18, 19, 24] {
+    for advice in [u64::MAX, 9, 18, 19, 24] {
         let (result, _) =
             machine.issue_syscall(SYS_MADVISE, [address as u64, 4096, advice, 0, 0, 0]);
         assert_eq!(
@@ -102,7 +102,7 @@ fn unknown_and_unimplemented_structural_advice_fail_closed() {
 }
 
 #[test]
-fn eager_file_backed_pages_are_not_substituted_with_anonymous_zeros() {
+fn dontneed_accepts_immutable_eager_file_pages_without_changing_bytes() {
     let mut machine = machine();
     let mut before = [0_u8; 16];
     machine
@@ -114,16 +114,13 @@ fn eager_file_backed_pages_are_not_substituted_with_anonymous_zeros() {
     assert!(before.iter().any(|&byte| byte != 0));
 
     let (result, _) = machine.issue_syscall(SYS_MADVISE, [0x40_0000, 4096, MADV_DONTNEED, 0, 0, 0]);
-    assert_eq!(
-        result, -22,
-        "eager file reload is not implemented, so fail closed"
-    );
+    assert_eq!(result, 0, "clean read-only file bytes may stay resident");
     let mut after = [0_u8; 16];
     machine
         .vm_mut()
         .cpu
         .mem
         .read_bytes(0x40_0000, &mut after, perm::READ)
-        .expect("ELF header page after refused advice");
+        .expect("ELF header page after advice");
     assert_eq!(after, before, "file-backed bytes must remain intact");
 }

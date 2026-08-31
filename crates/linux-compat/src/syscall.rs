@@ -587,6 +587,11 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             let ok = cpu.mem.unmap_memory_len(a[0], a[1]);
             if ok {
                 env.forget_file_backed_range(env.proc.asid, a[0], align_up(a[1], PAGE_SIZE));
+                env.clear_dontfork(
+                    env.proc.asid,
+                    a[0],
+                    a[0].saturating_add(align_up(a[1], PAGE_SIZE)),
+                );
                 env.pager
                     .unmap(env.proc.asid, a[0], align_up(a[1], PAGE_SIZE));
             }
@@ -651,6 +656,18 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_SETPGID => sys_setpgid(env, a[0], a[1]),
         abi::SYS_GETTID => Ok(env.proc.pid),
         abi::SYS_GETPPID => Ok(env.proc.ppid),
+        abi::SYS_GETCPU => {
+            // The deterministic scheduler executes every task on virtual CPU
+            // zero. This is the same stable identity published through rseq;
+            // callers may omit either output pointer just as on Linux.
+            if a[0] != 0 {
+                write_mem(env, cpu, a[0], &0_u32.to_le_bytes())?;
+            }
+            if a[1] != 0 {
+                write_mem(env, cpu, a[1], &0_u32.to_le_bytes())?;
+            }
+            Ok(0)
+        }
         abi::SYS_GETUID | abi::SYS_GETGID | abi::SYS_GETEUID | abi::SYS_GETEGID => Ok(0),
         abi::SYS_GETGROUPS => Ok(0),
         abi::SYS_SCHED_SETSCHEDULER => sys_sched_setscheduler(env, cpu, a[0], a[1], a[2]),
@@ -702,12 +719,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             Ok(8)
         }
 
-        // Robust-list teardown needs the complete linked-list protocol; do
-        // not claim support before it exists.  rseq is different: this
-        // userspace kernel executes one stable virtual CPU at a time, so the
-        // registration ABI can be implemented faithfully without pretending
-        // to provide host scheduling behaviour.
-        abi::SYS_SET_ROBUST_LIST => Err(abi::ENOSYS),
+        abi::SYS_SET_ROBUST_LIST => sys_set_robust_list(env, a[0], a[1]),
         abi::SYS_RSEQ => sys_rseq(env, cpu, a[0], a[1], a[2], a[3]),
 
         abi::SYS_SYSINFO => sys_sysinfo(env, cpu, a[0]),
@@ -2765,8 +2777,93 @@ fn sys_mmap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
 /// that subsequent reads observe zero-filled pages. Returning success while
 /// retaining old bytes leaks one allocation into the next and breaks real
 /// allocators (JSC/Bun uses this as its page-discard primitive).
+fn restore_executable_file_range(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: u64,
+) -> Result<bool, u64> {
+    let Some(elf_addr) = addr.checked_sub(env.exe_load_offset) else {
+        return Ok(false);
+    };
+    let Some(elf_end) = elf_addr.checked_add(len) else {
+        return Err(abi::ENOMEM);
+    };
+    let resolved = env
+        .vfs
+        .resolve(env.proc.cwd, &env.proc.exe_path, true)
+        .map_err(|_| abi::EINVAL)?;
+    let Some(node) = resolved.node else {
+        return Ok(false);
+    };
+    let restored = {
+        let file = env.vfs.materialize_file(node).map_err(|_| abi::EINVAL)?;
+        if file.len() < 64 || &file[..4] != b"\x7fELF" || file[4] != 2 || file[5] != 1 {
+            return Ok(false);
+        }
+        let u16_at = |at: usize| -> Option<u16> {
+            Some(u16::from_le_bytes(file.get(at..at + 2)?.try_into().ok()?))
+        };
+        let u32_at = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(file.get(at..at + 4)?.try_into().ok()?))
+        };
+        let u64_at = |at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(file.get(at..at + 8)?.try_into().ok()?))
+        };
+        let phoff = u64_at(32).ok_or(abi::EINVAL)? as usize;
+        let phentsize = u16_at(54).ok_or(abi::EINVAL)? as usize;
+        let phnum = u16_at(56).ok_or(abi::EINVAL)? as usize;
+        if phentsize < 56 {
+            return Err(abi::EINVAL);
+        }
+        let mut bytes = None;
+        for index in 0..phnum {
+            let Some(at) = phoff.checked_add(index.saturating_mul(phentsize)) else {
+                return Err(abi::EINVAL);
+            };
+            if u32_at(at) != Some(1) {
+                continue; // PT_LOAD
+            }
+            let file_offset = u64_at(at + 8).ok_or(abi::EINVAL)?;
+            let vaddr = u64_at(at + 16).ok_or(abi::EINVAL)?;
+            let file_size = u64_at(at + 32).ok_or(abi::EINVAL)?;
+            let mem_size = u64_at(at + 40).ok_or(abi::EINVAL)?;
+            let Some(segment_end) = vaddr.checked_add(mem_size) else {
+                return Err(abi::EINVAL);
+            };
+            if elf_addr < vaddr || elf_end > segment_end {
+                continue;
+            }
+            let size = usize::try_from(len).map_err(|_| abi::ENOMEM)?;
+            let mut image = vec![0_u8; size];
+            let file_backed_end = vaddr.saturating_add(file_size);
+            let copy_end = elf_end.min(file_backed_end);
+            if copy_end > elf_addr {
+                let relative = elf_addr - vaddr;
+                let source_start = file_offset.checked_add(relative).ok_or(abi::EINVAL)? as usize;
+                let copy_len = usize::try_from(copy_end - elf_addr).map_err(|_| abi::ENOMEM)?;
+                let source_end = source_start.checked_add(copy_len).ok_or(abi::EINVAL)?;
+                let source = file.get(source_start..source_end).ok_or(abi::EINVAL)?;
+                image[..copy_len].copy_from_slice(source);
+            }
+            bytes = Some(image);
+            break;
+        }
+        bytes
+    };
+    let Some(restored) = restored else {
+        return Ok(false);
+    };
+    cpu.mem
+        .write_bytes(addr, &restored, perm::WRITE)
+        .map_err(|_| abi::ENOMEM)?;
+    Ok(true)
+}
+
 fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u64) -> SysResult {
     const MADV_DONTNEED: u64 = 4;
+    const MADV_DONTFORK: u64 = 10;
+    const MADV_DOFORK: u64 = 11;
 
     if len == 0 {
         return Ok(0);
@@ -2780,6 +2877,14 @@ fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u
         .ok_or(abi::ENOMEM)?;
     let end = addr.checked_add(len).ok_or(abi::ENOMEM)?;
 
+    if advice == MADV_DONTFORK {
+        env.set_dontfork(env.proc.asid, addr, end);
+        return Ok(0);
+    }
+    if advice == MADV_DOFORK {
+        env.clear_dontfork(env.proc.asid, addr, end);
+        return Ok(0);
+    }
     if advice != MADV_DONTNEED {
         return match advice {
             // These are content-preserving performance/core-dump hints. The
@@ -2791,12 +2896,10 @@ fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u
             | 20..=23 // COLD, PAGEOUT, POPULATE_READ/WRITE
             | 25 => Ok(0), // COLLAPSE
 
-            // REMOVE changes the backing store. DONTFORK/DOFORK and
-            // WIPEONFORK/KEEPONFORK change the address space inherited by a
-            // child. DONTNEED_LOCKED has locking preconditions. None is a
-            // mere hint, so fail closed until those policies are represented
-            // in Process/COW state. Unknown advice values are EINVAL too,
-            // which real runtimes use as a feature probe.
+            // REMOVE changes the backing store. WIPEONFORK/KEEPONFORK change
+            // inherited contents, and DONTNEED_LOCKED has locking
+            // preconditions. Unknown advice values are EINVAL too, which real
+            // runtimes use as a feature probe.
             _ => Err(abi::EINVAL),
         };
     }
@@ -2815,18 +2918,32 @@ fn sys_madvise(env: &mut LinuxEnv, cpu: &mut Cpu, addr: u64, len: u64, advice: u
         return Err(abi::EINVAL);
     }
 
-    let touches_eager_file = env.file_backed_ranges.iter().any(|mapping| {
-        if mapping.asid != env.proc.asid || mapping.start >= end || mapping.end <= addr {
-            return false;
-        }
-        let first = mapping.start.max(addr) & !(PAGE_SIZE - 1);
-        let last = mapping.end.min(end);
-        (first..last)
+    if env
+        .file_backed_ranges
+        .iter()
+        .any(|mapping| mapping.asid == env.proc.asid && mapping.start <= addr && mapping.end >= end)
+    {
+        let eager = (addr..end)
             .step_by(PAGE_SIZE as usize)
-            .any(|page| env.pager.page_state(env.proc.asid, page).is_none())
-    });
-    if touches_eager_file {
-        return Err(abi::EINVAL);
+            .all(|page| env.pager.page_state(env.proc.asid, page).is_none());
+        if eager {
+            // For an immutable private file mapping, retaining the clean
+            // resident bytes is observationally identical to dropping and
+            // faulting them back from the same file. This lets runtimes use
+            // DONTNEED on read-only image data without requiring an eager
+            // backing-file reloader. Writable private mappings may contain
+            // dirty COW data and still require the full reload path.
+            let writable = (addr..end)
+                .step_by(PAGE_SIZE as usize)
+                .any(|page| cpu.mem.get_perm(page) & perm::WRITE != 0);
+            if !writable {
+                return Ok(0);
+            }
+            if restore_executable_file_range(env, cpu, addr, len)? {
+                return Ok(0);
+            }
+            return Err(abi::EINVAL);
+        }
     }
 
     let mut page = addr;
@@ -2870,6 +2987,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
                 .unmap_memory_len(old_addr + new_size, old_size - new_size);
             env.pager
                 .unmap(env.proc.asid, old_addr + new_size, old_size - new_size);
+            env.clear_dontfork(env.proc.asid, old_addr + new_size, old_addr + old_size);
         }
         return Ok(old_addr);
     }
@@ -2908,6 +3026,7 @@ fn sys_mremap(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
         .map_err(|_| abi::EFAULT)?;
     write_mem(env, cpu, target, &buf)?;
     cpu.mem.unmap_memory_len(old_addr, old_size);
+    env.remap_dontfork(env.proc.asid, old_addr, old_addr + old_size, target);
     env.pager
         .remap(env.proc.asid, old_addr, old_size, target, new_size);
     env.forget_file_backed_range(env.proc.asid, old_addr, old_size);
@@ -3261,7 +3380,8 @@ fn sys_rseq(
 // ── Processes, threads, and scheduling (milestone 4) ────────────────────────
 
 use crate::proc::{
-    ParkState, ParkedTask, Process, RseqRegistration, SignalFrame, Zombie, ROOT_PID,
+    ParkState, ParkedTask, Process, RobustListRegistration, RseqRegistration, SignalFrame, Zombie,
+    ROOT_PID,
 };
 
 /// `syscall` encodes as `0f 05`; rewinding NEXT_PC by its length makes the
@@ -3285,6 +3405,77 @@ const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+
+/// Register the x86-64 `struct robust_list_head` for the current thread.
+/// The kernel deliberately does not dereference `head` at registration time:
+/// it needs to remain usable while a thread tears itself down, so validate
+/// only the fixed ABI shape here and perform fault-tolerant traversal at exit.
+fn sys_set_robust_list(env: &mut LinuxEnv, head: u64, len: u64) -> SysResult {
+    const ROBUST_LIST_HEAD_LEN: u64 = 24;
+    if head == 0 || len != ROBUST_LIST_HEAD_LEN {
+        return Err(abi::EINVAL);
+    }
+    env.proc.robust_list = Some(RobustListRegistration { head });
+    Ok(0)
+}
+
+/// Apply Linux robust-futex owner-death handling for the exiting thread.
+/// Every operation is best-effort, as Linux treats an unreadable/corrupt
+/// userspace robust list as a faulty userspace list rather than blocking task
+/// teardown. The bounded walk prevents hostile guest memory from turning exit
+/// into an unbounded host loop.
+fn release_robust_futexes(env: &mut LinuxEnv, cpu: &mut Cpu) {
+    const MAX_ROBUST_LIST_ENTRIES: usize = 2_048;
+    let Some(registration) = env.proc.robust_list.take() else {
+        return;
+    };
+    let tid = env.proc.pid as u32;
+    let Ok(head) = read_mem(env, cpu, registration.head, 24) else {
+        return;
+    };
+    let next = u64::from_le_bytes(head[0..8].try_into().expect("head next"));
+    let futex_offset = i64::from_le_bytes(head[8..16].try_into().expect("head offset"));
+    let pending = u64::from_le_bytes(head[16..24].try_into().expect("head pending"));
+    let mut visited = std::collections::HashSet::new();
+    let mut mark_owner_dead = |node: u64, env: &mut LinuxEnv, cpu: &mut Cpu| {
+        if node == 0 || !visited.insert(node) {
+            return;
+        }
+        let Some(futex_addr) = node.checked_add_signed(futex_offset) else {
+            return;
+        };
+        let Ok(bytes) = read_mem(env, cpu, futex_addr, 4) else {
+            return;
+        };
+        let value = u32::from_le_bytes(bytes.try_into().expect("futex word"));
+        if value & FUTEX_TID_MASK != tid {
+            return;
+        }
+        let replacement = (value & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if write_mem(env, cpu, futex_addr, &replacement.to_le_bytes()).is_ok() {
+            env.sched.futex_wake(futex_addr, 1);
+        }
+    };
+
+    // `list_op_pending` is examined first; libc sets it while modifying the
+    // list, so omitting it can strand a mutex exactly during lock acquisition.
+    mark_owner_dead(pending, env, cpu);
+    let mut node = next;
+    for _ in 0..MAX_ROBUST_LIST_ENTRIES {
+        if node == 0 || node == registration.head {
+            break;
+        }
+        let Ok(link) = read_mem(env, cpu, node, 8) else {
+            break;
+        };
+        let following = u64::from_le_bytes(link.try_into().expect("robust link"));
+        mark_owner_dead(node, env, cpu);
+        node = following;
+    }
+}
 
 fn encode_exit_status(code: u64) -> i32 {
     ((code as i32) & 0xff) << 8
@@ -3832,81 +4023,101 @@ fn block_and_switch(env: &mut LinuxEnv, cpu: &mut Cpu, state: ParkState, restart
 
 /// Logs every parked task's blocking reason and signal state; called only on
 /// the fatal deadlock paths so a hang in a real workload is diagnosable.
+pub(crate) fn parked_task_snapshot(env: &LinuxEnv) -> Vec<String> {
+    env.sched
+        .parked
+        .iter()
+        .map(|task| {
+            let state = format_park_state(&task.state);
+            format!(
+                "pid={} tgid={} ppid={} sigmask={:#x} pending={:#x} state={state}",
+                task.proc.pid,
+                task.proc.tgid,
+                task.proc.ppid,
+                task.proc.sigmask,
+                task.proc.pending_signals,
+            )
+        })
+        .collect()
+}
+
+fn format_park_state(state: &ParkState) -> String {
+    match state {
+        ParkState::Ready => "Ready".to_string(),
+        ParkState::WaitChild { pid, untraced } => {
+            format!("WaitChild(pid={pid}, untraced={untraced})")
+        }
+        ParkState::Futex { addr, deadline, .. } => {
+            format!("Futex(addr={addr:#x}, deadline={deadline:?})")
+        }
+        ParkState::PipeRead { pipe } => {
+            let p = pipe.borrow();
+            format!(
+                "PipeRead(len={}, writers={}, readers={})",
+                p.data.len(),
+                p.writers,
+                p.readers
+            )
+        }
+        ParkState::PipeWrite { pipe } => {
+            let p = pipe.borrow();
+            format!(
+                "PipeWrite(len={}, writers={}, readers={})",
+                p.data.len(),
+                p.writers,
+                p.readers
+            )
+        }
+        ParkState::Waiting { watches, deadline } => {
+            let kinds: Vec<String> = watches
+                .iter()
+                .map(|w| match w {
+                    crate::proc::Watch::PipeReadable(p) => {
+                        let p = p.borrow();
+                        format!("pipeR(len={},w={})", p.data.len(), p.writers)
+                    }
+                    crate::proc::Watch::PipeWritable(p) => {
+                        let p = p.borrow();
+                        format!("pipeW(len={},r={})", p.data.len(), p.readers)
+                    }
+                    crate::proc::Watch::Event(e) => {
+                        format!("event(count={})", e.borrow().count)
+                    }
+                    crate::proc::Watch::InotifyReadable(i) => {
+                        format!("inotifyR(queued={})", i.borrow().queue.len())
+                    }
+                    crate::proc::Watch::InotifyActivity(i, seen) => {
+                        format!("inotifyA(now={},seen={seen})", i.borrow().activity)
+                    }
+                    crate::proc::Watch::Timer(t) => {
+                        format!("timer(next={:?})", t.borrow().next_expiry)
+                    }
+                    crate::proc::Watch::NetReadable(_) => "net".to_string(),
+                    crate::proc::Watch::PipeActivity(p, seen) => {
+                        format!("pipeAct(now={},seen={seen})", p.borrow().activity)
+                    }
+                    crate::proc::Watch::EventActivity(e, seen) => {
+                        format!("eventAct(now={},seen={seen})", e.borrow().activity)
+                    }
+                    crate::proc::Watch::PtyReadable(_, m) => format!("ptyR(master={m})"),
+                    crate::proc::Watch::PtyActivity(p, seen) => {
+                        format!("ptyAct(now={},seen={seen})", p.borrow().activity)
+                    }
+                    crate::proc::Watch::Always => "always".to_string(),
+                })
+                .collect();
+            format!(
+                "Waiting(watches=[{}], deadline={deadline:?})",
+                kinds.join(",")
+            )
+        }
+        ParkState::VforkDone { done } => format!("VforkDone(done={})", done.get()),
+    }
+}
+
 fn dump_parked(env: &LinuxEnv) {
     for task in &env.sched.parked {
-        let state = match &task.state {
-            ParkState::Ready => "Ready".to_string(),
-            ParkState::WaitChild { pid, untraced } => {
-                format!("WaitChild(pid={pid}, untraced={untraced})")
-            }
-            ParkState::Futex { addr, deadline, .. } => {
-                format!("Futex(addr={addr:#x}, deadline={deadline:?})")
-            }
-            ParkState::PipeRead { pipe } => {
-                let p = pipe.borrow();
-                format!(
-                    "PipeRead(len={}, writers={}, readers={})",
-                    p.data.len(),
-                    p.writers,
-                    p.readers
-                )
-            }
-            ParkState::PipeWrite { pipe } => {
-                let p = pipe.borrow();
-                format!(
-                    "PipeWrite(len={}, writers={}, readers={})",
-                    p.data.len(),
-                    p.writers,
-                    p.readers
-                )
-            }
-            ParkState::Waiting { watches, deadline } => {
-                let kinds: Vec<String> = watches
-                    .iter()
-                    .map(|w| match w {
-                        crate::proc::Watch::PipeReadable(p) => {
-                            let p = p.borrow();
-                            format!("pipeR(len={},w={})", p.data.len(), p.writers)
-                        }
-                        crate::proc::Watch::PipeWritable(p) => {
-                            let p = p.borrow();
-                            format!("pipeW(len={},r={})", p.data.len(), p.readers)
-                        }
-                        crate::proc::Watch::Event(e) => {
-                            format!("event(count={})", e.borrow().count)
-                        }
-                        crate::proc::Watch::InotifyReadable(i) => {
-                            format!("inotifyR(queued={})", i.borrow().queue.len())
-                        }
-                        crate::proc::Watch::InotifyActivity(i, seen) => {
-                            format!("inotifyA(now={},seen={seen})", i.borrow().activity)
-                        }
-                        crate::proc::Watch::Timer(t) => {
-                            format!("timer(next={:?})", t.borrow().next_expiry)
-                        }
-                        crate::proc::Watch::NetReadable(_) => "net".to_string(),
-                        crate::proc::Watch::PipeActivity(p, seen) => {
-                            format!("pipeAct(now={},seen={seen})", p.borrow().activity)
-                        }
-                        crate::proc::Watch::EventActivity(e, seen) => {
-                            format!("eventAct(now={},seen={seen})", e.borrow().activity)
-                        }
-                        crate::proc::Watch::PtyReadable(_, m) => {
-                            format!("ptyR(master={m})")
-                        }
-                        crate::proc::Watch::PtyActivity(p, seen) => {
-                            format!("ptyAct(now={},seen={seen})", p.borrow().activity)
-                        }
-                        crate::proc::Watch::Always => "always".to_string(),
-                    })
-                    .collect();
-                format!(
-                    "Waiting(watches=[{}], deadline={deadline:?})",
-                    kinds.join(",")
-                )
-            }
-            ParkState::VforkDone { done } => format!("VforkDone(done={})", done.get()),
-        };
+        let state = format_park_state(&task.state);
         tracing::error!(
             "  parked pid={} tgid={} ppid={} sigmask={:#x} pending={:#x} state={state}",
             task.proc.pid,
@@ -4035,6 +4246,7 @@ fn task_exit(env: &mut LinuxEnv, cpu: &mut Cpu, status: i32, exit_group: bool) -
         let _ = write_mem(env, cpu, addr, &0_u32.to_le_bytes());
         env.sched.futex_wake(addr, u64::MAX);
     }
+    release_robust_futexes(env, cpu);
 
     // An exiting task is never parked, so close its running CPU interval
     // explicitly before the Process value is discarded. This keeps both the
@@ -4820,6 +5032,20 @@ fn sys_clone_impl(env: &mut LinuxEnv, cpu: &mut Cpu, spec: CloneSpec) -> Outcome
     } else {
         Some(cpu.mem.snapshot_virtual_mapping())
     };
+    if let Some(map) = child_mem.take() {
+        let parent_map = cpu.mem.take_virtual_mapping();
+        cpu.mem.restore_virtual_mapping(map);
+        for range in env
+            .dontfork_ranges
+            .iter()
+            .filter(|range| range.asid == env.proc.asid)
+        {
+            cpu.mem
+                .unmap_memory_len(range.start, range.end.saturating_sub(range.start));
+        }
+        child_mem = Some(cpu.mem.take_virtual_mapping());
+        cpu.mem.restore_virtual_mapping(parent_map);
+    }
 
     // Build the child's parked CPU state: RAX = 0, resuming after the
     // syscall, with its own stack/TLS when requested.
@@ -4995,6 +5221,7 @@ fn sys_execve(
     x64_engine::vm::set_current_asid(env.proc.asid);
     env.pager.drop_space(old_asid);
     env.drop_file_backed_space(old_asid);
+    env.drop_dontfork_space(old_asid);
     let result = env.start_image(cpu, &path);
     cpu.icount = icount;
 
@@ -5958,8 +6185,10 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
     // deadline so timeouts and timers fire.
     let deadline = deadline?;
     if deadline > now {
-        env.warp_nanos += deadline - now;
-        tracing::debug!("time warp: +{} ns (idle until deadline)", deadline - now);
+        let delta = deadline - now;
+        env.warp_nanos = env.warp_nanos.saturating_add(delta);
+        cpu.time_offset = cpu.time_offset.saturating_add(delta);
+        tracing::debug!("time warp: +{delta} ns (idle until deadline)");
     }
     let now = env.now_nanos(cpu);
     env.sched.find_ready(now)
