@@ -1,8 +1,12 @@
 //! Debug runner: execute an ELF from the host filesystem inside the machine.
 //! Usage: run_guest <elf> [args...] (env: GUEST_ENV="K=V,K=V")
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    io::{Read as _, Write as _},
+    rc::Rc,
+};
 
 use linux_compat::net::NativeBroker;
 use linux_compat::Machine;
@@ -54,8 +58,9 @@ fn main() {
     // JIT heap, which exceeds the engine's conservative 1 GiB default before
     // the child has even built its exec stack. Hosts needing a tighter limit
     // can still select it explicitly through GUEST_MEM_MB.
-    let mb: usize = std::env::var("GUEST_MEM_MB")
-        .map_or(2048, |value| value.parse().expect("GUEST_MEM_MB must be a number"));
+    let mb: usize = std::env::var("GUEST_MEM_MB").map_or(2048, |value| {
+        value.parse().expect("GUEST_MEM_MB must be a number")
+    });
     let pages = mb.saturating_mul(256); // 4 KiB pages
     assert!(
         machine.vm_mut().cpu.mem.set_capacity(pages),
@@ -114,22 +119,36 @@ fn main() {
     // kernel authority (getcwd(2) remains authoritative), but runtimes such
     // as Bun use it while resolving their startup directory and expect the
     // conventional shell environment to contain it.
+    // GUEST_PTY=1 runs the guest on an interactive terminal (stdin/stdout a
+    // host-driven pty). GUEST_PTY_INPUT provides an initial keystroke batch;
+    // GUEST_PTY_INPUT_STEPS="first|second" supplies batches only after each
+    // guest terminal wait. Both recognize `\n`/`\t`/`\xNN` escapes. Without
+    // scripted steps, terminal waits are bridged to the runner's own stdin.
+    // GUEST_PTY_SIZE=ROWSxCOLS overrides the 40x120 default.
+    let pty_stdio = std::env::var_os("GUEST_PTY").is_some();
+
     let mut envp: Vec<Vec<u8>> = vec![
         b"PATH=/bin".to_vec(),
         b"HOME=/root".to_vec(),
         b"PWD=/".to_vec(),
     ];
+    if pty_stdio {
+        // A real interactive session always has TERM exported by the shell;
+        // a CLI's TUI entry point (Ink, readline, etc.) treats a missing
+        // TERM as "not a real terminal" and falls back to non-interactive
+        // mode even though isatty() on the pty fds succeeds.
+        envp.push(b"TERM=xterm-256color".to_vec());
+    }
     if let Ok(extra) = std::env::var("GUEST_ENV") {
         envp.extend(extra.split(',').map(|kv| kv.as_bytes().to_vec()));
     }
     machine.set_args(argv, envp);
     machine.load(guest_exe.as_bytes()).expect("load");
 
-    // GUEST_PTY=1 runs the guest on an interactive terminal (stdin/stdout a
-    // host-driven pty). GUEST_PTY_INPUT provides the keystrokes to feed
-    // (`\n`/`\t`/`\xNN` escapes recognized); rendered output is printed after
-    // the run. GUEST_PTY_SIZE=ROWSxCOLS overrides the 40x120 default.
-    let pty_stdio = std::env::var_os("GUEST_PTY").is_some();
+    let mut pty_input_steps: VecDeque<Vec<u8>> = std::env::var("GUEST_PTY_INPUT_STEPS")
+        .ok()
+        .map(|steps| steps.split('|').map(unescape).collect())
+        .unwrap_or_default();
     if pty_stdio {
         let (rows, cols) = std::env::var("GUEST_PTY_SIZE")
             .ok()
@@ -211,6 +230,30 @@ fn main() {
     }
     let exit = loop {
         let exit = machine.run();
+        if matches!(exit, x64_engine::CpuExit::Interrupted)
+            && pty_stdio
+            && machine.awaiting_terminal_input()
+        {
+            // A terminal read is a host turn, not a process exit. Flush the
+            // first frame/prompt now, then resume exactly the same machine
+            // after the user (or scripted harness) supplies more bytes.
+            let rendered = machine.drain_terminal_output();
+            print!("{}", String::from_utf8_lossy(&rendered));
+            std::io::stdout().flush().expect("flush terminal output");
+            if let Some(bytes) = pty_input_steps.pop_front() {
+                machine.feed_terminal_input(&bytes);
+                continue;
+            }
+            let mut bytes = [0_u8; 4096];
+            match std::io::stdin().read(&mut bytes) {
+                Ok(count) if count != 0 => {
+                    machine.feed_terminal_input(&bytes[..count]);
+                    continue;
+                }
+                Ok(_) => break exit, // host stdin reached EOF
+                Err(error) => panic!("read terminal input: {error}"),
+            }
+        }
         let x64_engine::CpuExit::Breakpoint { rip } = exit else {
             break exit;
         };

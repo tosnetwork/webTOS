@@ -289,6 +289,71 @@ int main(void) {
     );
 }
 
+/// Runtimes that classify stdio via statx(2) — Bun is one — read
+/// stx_rdev_major/minor to recognize a Linux pty (major 136). A prior
+/// version left those fields zero, making a real pty look like an unrelated
+/// character device even though ioctl-based isatty() succeeded.
+#[test]
+fn statx_reports_pty_rdev() {
+    let source = r#"
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+
+struct statx_timestamp { int64_t tv_sec; uint32_t tv_nsec; int32_t pad; };
+struct statx {
+    uint32_t stx_mask, stx_blksize; uint64_t stx_attributes;
+    uint32_t stx_nlink, stx_uid, stx_gid; uint16_t stx_mode; uint16_t pad0;
+    uint64_t stx_ino; uint64_t stx_size; uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    struct statx_timestamp stx_atime, stx_btime, stx_ctime, stx_mtime;
+    uint32_t stx_rdev_major, stx_rdev_minor, stx_dev_major, stx_dev_minor;
+    /* The kernel always writes its full 256-byte statx ABI object. */
+    unsigned char reserved[128];
+};
+
+int main(void) {
+    struct statx sx;
+    memset(&sx, 0, sizeof(sx));
+    long r = syscall(SYS_statx, 0, "", AT_EMPTY_PATH, 0x7ff /* STATX_BASIC_STATS */, &sx);
+    if (r != 0) return 2;
+    dprintf(1, "statx=%u:%u\n", sx.stx_rdev_major, sx.stx_rdev_minor);
+    if (sx.stx_rdev_major != 136 || sx.stx_rdev_minor != 0) return 3;
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("statxpty", source, &[]) else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![b"fixture".to_vec()], vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine.install_pty_stdio(40, 120);
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "stdio pty did not expose its Linux rdev through statx: {output}"
+    );
+}
+
 /// The pinned BusyBox image, or None when it has not been fetched.
 fn busybox() -> Option<Vec<u8>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/busybox-musl");

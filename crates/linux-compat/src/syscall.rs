@@ -1904,6 +1904,13 @@ fn sys_statx(
     put(32, &stat.ino.to_le_bytes());
     put(40, &(stat.size as u64).to_le_bytes());
     put(48, &(stat.blocks as u64).to_le_bytes());
+    // stx_rdev_major/minor (kernel offsets 128/132) are what callers use to
+    // recognize a character device as a Linux pty (major 136), distinct from
+    // stx_dev_major/minor below which names the containing filesystem.
+    // Leaving these zero makes every pty fd look like an unrecognized char
+    // device to anything that classifies ttys via statx instead of fstat.
+    put(128, &((stat.rdev >> 8) as u32).to_le_bytes());
+    put(132, &((stat.rdev & 0xff) as u32).to_le_bytes());
     for (base, sec, nsec) in [
         (64, stat.atime_sec, stat.atime_nsec),
         (96, stat.ctime_sec, stat.ctime_nsec),
