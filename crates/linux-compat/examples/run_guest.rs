@@ -108,8 +108,16 @@ fn main() {
         }
     }
 
-    let image = std::fs::read(&args[0]).expect("read elf");
-    let guest_exe = std::env::var("GUEST_EXE").unwrap_or_else(|_| "/bin/guest".to_string());
+    // A packaged CLI can re-exec `/proc/self/exe` to start workers, or derive
+    // resources and its own invocation mode from that path. Mapping every
+    // host executable to `/bin/guest` makes such a child observe a fabricated
+    // identity. Preserve the canonical host path by default so `argv[0]` and
+    // `/proc/self/exe` have the same semantics as a native launch; callers
+    // that deliberately need a synthetic guest path can still set GUEST_EXE.
+    let host_exe = std::fs::canonicalize(&args[0]).expect("canonicalize elf path");
+    let image = std::fs::read(&host_exe).expect("read elf");
+    let guest_exe =
+        std::env::var("GUEST_EXE").unwrap_or_else(|_| host_exe.to_string_lossy().into_owned());
     machine
         .add_file(guest_exe.as_bytes(), image, 0o755)
         .expect("add");

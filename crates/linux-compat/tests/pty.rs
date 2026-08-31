@@ -300,6 +300,8 @@ fn statx_reports_pty_rdev() {
 #include <stdint.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -320,12 +322,19 @@ struct statx {
 };
 
 int main(void) {
+    volatile struct stat st;
+    if (syscall(SYS_fstat, 0, (struct stat *)&st) != 0) return 2;
+    unsigned fstat_major = major(st.st_rdev);
+    unsigned fstat_minor = minor(st.st_rdev);
+
     struct statx sx;
     memset(&sx, 0, sizeof(sx));
     long r = syscall(SYS_statx, 0, "", AT_EMPTY_PATH, 0x7ff /* STATX_BASIC_STATS */, &sx);
-    if (r != 0) return 2;
-    dprintf(1, "statx=%u:%u\n", sx.stx_rdev_major, sx.stx_rdev_minor);
-    if (sx.stx_rdev_major != 136 || sx.stx_rdev_minor != 0) return 3;
+    if (r != 0) return 3;
+    dprintf(1, "fstat=%u:%u statx=%u:%u\n",
+            fstat_major, fstat_minor, sx.stx_rdev_major, sx.stx_rdev_minor);
+    if (fstat_major != 136 || fstat_minor != 0) return 4;
+    if (sx.stx_rdev_major != 136 || sx.stx_rdev_minor != 0) return 5;
     return 0;
 }
 "#;

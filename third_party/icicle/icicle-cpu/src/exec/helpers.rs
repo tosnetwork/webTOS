@@ -1230,6 +1230,8 @@ pub mod x86 {
         ("webtos_vpmovb2m_128", packed_bytes_to_mask_128),
         ("webtos_vpmovm2w_128", packed_mask_to_words_128),
         ("webtos_vpmovw2m_128", packed_words_to_mask_128),
+        ("webtos_vpmovm2d_128", packed_mask_to_dwords_128),
+        ("webtos_vpmovm2q_128", packed_mask_to_qwords_128),
         ("webtos_vpcompressd_128_chunk", packed_compress_d_128_chunk),
         ("webtos_vpcompressd_256_chunk", packed_compress_d_256_chunk),
         ("webtos_vpcompressd_512_chunk", packed_compress_d_512_chunk),
@@ -3171,6 +3173,56 @@ pub mod x86 {
         for lane in 0..8 {
             let word = if mask & (1_u64 << (chunk * 8 + lane)) != 0 { u16::MAX } else { 0 };
             output[lane * 2..lane * 2 + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_mask_to_dwords_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mask = cpu.read::<u64>(args[0]);
+        let chunk = cpu.read::<u8>(args[1]) as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..4 {
+            let dword = if mask & (1_u64 << (chunk * 4 + lane)) != 0 {
+                u32::MAX
+            } else {
+                0
+            };
+            output[lane * 4..lane * 4 + 4].copy_from_slice(&dword.to_le_bytes());
+        }
+        cpu.write_var(dst, u128::from_le_bytes(output));
+    }
+
+    fn packed_mask_to_qwords_128(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        if dst.size != 16 || args[0].size() != 8 || args[1].size() != 1 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = u64::from(dst.size);
+            return;
+        }
+        let mask = cpu.read::<u64>(args[0]);
+        let chunk = cpu.read::<u8>(args[1]) as usize;
+        if chunk >= 4 {
+            cpu.exception.code = ExceptionCode::InvalidOpSize as u32;
+            cpu.exception.value = chunk as u64;
+            return;
+        }
+        let mut output = [0_u8; 16];
+        for lane in 0..2 {
+            let qword = if mask & (1_u64 << (chunk * 2 + lane)) != 0 {
+                u64::MAX
+            } else {
+                0
+            };
+            output[lane * 8..lane * 8 + 8].copy_from_slice(&qword.to_le_bytes());
         }
         cpu.write_var(dst, u128::from_le_bytes(output));
     }

@@ -14,6 +14,8 @@ const DATA_ADDR: u64 = 0x8000;
 const CLAUDE_BROADCAST_RIP: u64 = 0x399_b8e2;
 const CLAUDE_BROADCAST: [u8; 10] = [0x62, 0xf2, 0x7d, 0x48, 0x58, 0x0d, 0x54, 0x67, 0xc5, 0xfc];
 const CLAUDE_TERNLOG: [u8; 7] = [0x62, 0xf3, 0x75, 0x48, 0x25, 0x06, 0xf8];
+const CLAUDE_MASK_TO_QWORDS: [u8; 6] = [0x62, 0x72, 0xfe, 0x48, 0x38, 0xd0];
+const CLAUDE_COMPARE_EQUAL_BYTES: [u8; 6] = [0x62, 0xf1, 0x5d, 0x40, 0x74, 0xd4];
 
 fn vm() -> InterpVm {
     let ldef = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -206,6 +208,72 @@ fn vpbroadcastd_honors_merge_and_zero_masks_while_k0_is_unmasked() {
 
     let k0 = execute_broadcast(&mut vm, 0x48, 0x58, 0x0f, source, 0);
     assert_eq!(k0, [source; 16]);
+}
+
+#[test]
+fn claude_vpmovm2q_expands_each_k_mask_bit_to_a_full_qword() {
+    let mut vm = vm();
+    map_page(&mut vm, CODE_ADDR);
+    vm.cpu
+        .mem
+        .write_bytes(CODE_ADDR, &CLAUDE_MASK_TO_QWORDS, perm::NONE)
+        .unwrap();
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, CODE_ADDR);
+
+    let mask = 0b1010_0101_u64;
+    vm.cpu.write_var(reg(&vm, "K0"), mask);
+    write_zmm(&mut vm, "ZMM10", [u128::MAX; 4]);
+
+    let exit = run_one(&mut vm);
+    assert!(matches!(exit, VmExit::InstructionLimit), "{exit:?}");
+
+    let expected = std::array::from_fn(|chunk| {
+        let mut value = 0_u128;
+        for lane in 0..2 {
+            if mask & (1 << (chunk * 2 + lane)) != 0 {
+                value |= u128::from(u64::MAX) << (lane * 64);
+            }
+        }
+        value
+    });
+    assert_eq!(read_zmm(&vm, "ZMM10"), expected);
+}
+
+#[test]
+fn claude_vpcmpeqb_compares_all_64_zmm_byte_lanes() {
+    let mut vm = vm();
+    map_page(&mut vm, CODE_ADDR);
+    vm.cpu
+        .mem
+        .write_bytes(CODE_ADDR, &CLAUDE_COMPARE_EQUAL_BYTES, perm::NONE)
+        .unwrap();
+    (vm.cpu.arch.on_boot)(&mut vm.cpu, CODE_ADDR);
+
+    let left = std::array::from_fn(|index| index as u8 ^ 0xa5);
+    let mut right = left;
+    for index in [0, 17, 34, 63] {
+        right[index] ^= 0xff;
+    }
+    let pack = |bytes: [u8; 64]| {
+        std::array::from_fn(|chunk| {
+            u128::from_le_bytes(bytes[chunk * 16..(chunk + 1) * 16].try_into().unwrap())
+        })
+    };
+    write_zmm(&mut vm, "ZMM20", pack(left));
+    write_zmm(&mut vm, "ZMM4", pack(right));
+    vm.cpu.write_var(reg(&vm, "K2"), u64::MAX);
+
+    let exit = run_one(&mut vm);
+    assert!(matches!(exit, VmExit::InstructionLimit), "{exit:?}");
+
+    let expected = left
+        .iter()
+        .zip(right)
+        .enumerate()
+        .fold(0_u64, |mask, (lane, (left, right))| {
+            mask | (u64::from(left == &right) << lane)
+        });
+    assert_eq!(vm.cpu.read_var::<u64>(reg(&vm, "K2")), expected);
 }
 
 #[test]

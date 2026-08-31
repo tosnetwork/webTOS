@@ -3419,7 +3419,9 @@ define pcodeop vpcmpeqb_avx512vl ;
 :VPCMPEQB KReg_reg AVXOpMask, evexV5_YmmReg, YmmReg2_m256  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & AVXOpMask & evexV5_YmmReg; byte=0x74; KReg_reg ... & YmmReg2_m256
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vpcmpeqb_avx512vl( evexV5_YmmReg, YmmReg2_m256 );
+	local low:2 = vpcmpeqb_avx512vl(evexV5_YmmReg[0,128], YmmReg2_m256[0,128]);
+	local high:2 = vpcmpeqb_avx512vl(evexV5_YmmReg[128,128], YmmReg2_m256[128,128]);
+	local tmp:4 = zext(low) | (zext(high) << 16);
 	KReg_reg = zext(AVXOpMask[0,32]) & tmp;
 }
 
@@ -3428,8 +3430,12 @@ define pcodeop vpcmpeqb_avx512bw ;
 :VPCMPEQB KReg_reg AVXOpMask, evexV5_ZmmReg, ZmmReg2_m512  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_66) & $(VEX_0F) & $(VEX_WIG) & AVXOpMask & evexV5_ZmmReg; byte=0x74; KReg_reg ... & ZmmReg2_m512
 [ evexD8Type = 1; evexTType = 0; ] # (TupleType FVM)
 {
-	local tmp = vpcmpeqb_avx512bw( evexV5_ZmmReg, ZmmReg2_m512 );
-	KReg_reg = zext(AVXOpMask[0,64]) & tmp;
+	local part0:2 = vpcmpeqb_avx512bw(evexV5_ZmmReg[0,128], ZmmReg2_m512[0,128]);
+	local part1:2 = vpcmpeqb_avx512bw(evexV5_ZmmReg[128,128], ZmmReg2_m512[128,128]);
+	local part2:2 = vpcmpeqb_avx512bw(evexV5_ZmmReg[256,128], ZmmReg2_m512[256,128]);
+	local part3:2 = vpcmpeqb_avx512bw(evexV5_ZmmReg[384,128], ZmmReg2_m512[384,128]);
+	local tmp:8 = zext(part0) | (zext(part1) << 16) | (zext(part2) << 32) | (zext(part3) << 48);
+	KReg_reg = AVXOpMask & tmp;
 }
 
 # PCMPEQB/PCMPEQW/PCMPEQD 4-245 PAGE 1365 LINE 70883
@@ -12734,47 +12740,55 @@ define pcodeop webtos_vpmovm2w_128;
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114425
-define pcodeop vpmovm2d_avx512vl ;
+define pcodeop webtos_vpmovm2d_128;
 :VPMOVM2D XmmReg1, KReg_rm  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0); byte=0x38; (XmmReg1 & ZmmReg1) & KReg_rm
 {
-	local tmp:16 = vpmovm2d_avx512vl( KReg_rm );
+	local tmp:16 = webtos_vpmovm2d_128(KReg_rm, 0:1);
 	ZmmReg1 = zext(tmp);
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114427
 :VPMOVM2D YmmReg1, KReg_rm  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0); byte=0x38; (YmmReg1 & ZmmReg1) & KReg_rm
 {
-	local tmp:32 = vpmovm2d_avx512vl( KReg_rm );
+	local tmp:32;
+	tmp[0,128] = webtos_vpmovm2d_128(KReg_rm, 0:1);
+	tmp[128,128] = webtos_vpmovm2d_128(KReg_rm, 1:1);
 	ZmmReg1 = zext(tmp);
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114429
-define pcodeop vpmovm2d_avx512dq ;
 :VPMOVM2D ZmmReg1, KReg_rm  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W0); byte=0x38; ZmmReg1 & KReg_rm
 {
-	ZmmReg1 = vpmovm2d_avx512dq( KReg_rm );
+	ZmmReg1[0,128] = webtos_vpmovm2d_128(KReg_rm, 0:1);
+	ZmmReg1[128,128] = webtos_vpmovm2d_128(KReg_rm, 1:1);
+	ZmmReg1[256,128] = webtos_vpmovm2d_128(KReg_rm, 2:1);
+	ZmmReg1[384,128] = webtos_vpmovm2d_128(KReg_rm, 3:1);
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114431
-define pcodeop vpmovm2q_avx512vl ;
+define pcodeop webtos_vpmovm2q_128;
 :VPMOVM2Q XmmReg1, KReg_rm  is $(EVEX_NONE) & $(VEX_L128) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1); byte=0x38; (XmmReg1 & ZmmReg1) & KReg_rm
 {
-	local tmp:16 = vpmovm2q_avx512vl( KReg_rm );
+	local tmp:16 = webtos_vpmovm2q_128(KReg_rm, 0:1);
 	ZmmReg1 = zext(tmp);
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114433
 :VPMOVM2Q YmmReg1, KReg_rm  is $(EVEX_NONE) & $(VEX_L256) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1); byte=0x38; (YmmReg1 & ZmmReg1) & KReg_rm
 {
-	local tmp:32 = vpmovm2q_avx512vl( KReg_rm );
+	local tmp:32;
+	tmp[0,128] = webtos_vpmovm2q_128(KReg_rm, 0:1);
+	tmp[128,128] = webtos_vpmovm2q_128(KReg_rm, 1:1);
 	ZmmReg1 = zext(tmp);
 }
 
 # VPMOVM2B/VPMOVM2W/VPMOVM2D/VPMOVM2Q 5-400 PAGE 2224 LINE 114435
-define pcodeop vpmovm2q_avx512dq ;
 :VPMOVM2Q ZmmReg1, KReg_rm  is $(EVEX_NONE) & $(EVEX_L512) & $(VEX_PRE_F3) & $(VEX_0F38) & $(VEX_W1); byte=0x38; ZmmReg1 & KReg_rm
 {
-	ZmmReg1 = vpmovm2q_avx512dq( KReg_rm );
+	ZmmReg1[0,128] = webtos_vpmovm2q_128(KReg_rm, 0:1);
+	ZmmReg1[128,128] = webtos_vpmovm2q_128(KReg_rm, 1:1);
+	ZmmReg1[256,128] = webtos_vpmovm2q_128(KReg_rm, 2:1);
+	ZmmReg1[384,128] = webtos_vpmovm2q_128(KReg_rm, 3:1);
 }
 
 # VPMOVB2M/VPMOVW2M/VPMOVD2M/VPMOVQ2M 5-403 PAGE 2227 LINE 114542
