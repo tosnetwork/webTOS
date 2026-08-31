@@ -506,6 +506,28 @@ fn main() {
             },
         },
         Case {
+            name: "blendps xmm0,xmm1,0x9",
+            code: &[0x66, 0x0f, 0x3a, 0x0c, 0xc1, 0x09],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castps_si128(_mm_blend_ps::<0x09>(
+                    _mm_castsi128_ps(load(a)),
+                    _mm_castsi128_ps(load(b)),
+                )))
+            },
+        },
+        Case {
+            name: "blendpd xmm0,xmm1,0x1",
+            code: &[0x66, 0x0f, 0x3a, 0x0d, 0xc1, 0x01],
+            xmm_out: true,
+            reference: |a, b| unsafe {
+                store(_mm_castpd_si128(_mm_blend_pd::<0x01>(
+                    _mm_castsi128_pd(load(a)),
+                    _mm_castsi128_pd(load(b)),
+                )))
+            },
+        },
+        Case {
             name: "pblendvb xmm0,xmm1 (mask=xmm0)",
             code: &[0x66, 0x0f, 0x38, 0x10, 0xc1],
             xmm_out: true,

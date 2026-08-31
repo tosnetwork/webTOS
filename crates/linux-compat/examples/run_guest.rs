@@ -108,7 +108,15 @@ fn main() {
         .expect("add");
     let mut argv: Vec<Vec<u8>> = vec![guest_exe.as_bytes().to_vec()];
     argv.extend(args[1..].iter().map(|a| a.as_bytes().to_vec()));
-    let mut envp: Vec<Vec<u8>> = vec![b"PATH=/bin".to_vec(), b"HOME=/root".to_vec()];
+    // Match the process' initial VFS working directory. `PWD` is not a
+    // kernel authority (getcwd(2) remains authoritative), but runtimes such
+    // as Bun use it while resolving their startup directory and expect the
+    // conventional shell environment to contain it.
+    let mut envp: Vec<Vec<u8>> = vec![
+        b"PATH=/bin".to_vec(),
+        b"HOME=/root".to_vec(),
+        b"PWD=/".to_vec(),
+    ];
     if let Ok(extra) = std::env::var("GUEST_ENV") {
         envp.extend(extra.split(',').map(|kv| kv.as_bytes().to_vec()));
     }
@@ -311,6 +319,7 @@ fn main() {
     }
     if !matches!(exit, x64_engine::CpuExit::Halt { code: Some(0) }) {
         let (exe, pid) = machine.current_task();
+        let syscall_trail = machine.syscall_trail().join(" ");
         let vm = machine.vm_mut();
         let rip = vm.cpu.read_pc();
         let rsp: u64 = vm
@@ -338,10 +347,40 @@ fn main() {
                 "[runner]   page {page:#x}: mapped={mapped} readable={readable} executable={executable}"
             );
         }
-        eprintln!(
-            "[runner] syscall trail (pid:nr@icount): {}",
-            machine.syscall_trail().join(" ")
-        );
+        eprintln!("[runner] syscall trail (pid:nr@icount): {syscall_trail}");
+        // FAULT_PCODE=1 prints the current lifted block around the failing
+        // p-code operation. Generated runtimes often fault far from a symbol,
+        // so the guest instruction alone is not enough to tell whether an
+        // emulator register/value became invalid before the access.
+        if std::env::var_os("FAULT_PCODE").is_some() {
+            use pcode::PcodeDisplay;
+            let block_id = vm.cpu.block_id;
+            let offset = vm.cpu.block_offset as usize;
+            match vm.code.blocks.get(block_id as usize) {
+                Some(block) => {
+                    eprintln!(
+                        "[runner] pcode block={block_id} start={:#x} offset={offset}",
+                        block.start
+                    );
+                    let first = offset.saturating_sub(8);
+                    let last = (offset + 9).min(block.pcode.instructions.len());
+                    for (index, statement) in
+                        block.pcode.instructions[first..last].iter().enumerate()
+                    {
+                        let index = first + index;
+                        let marker = if index == offset { "=>" } else { "  " };
+                        eprintln!(
+                            "[runner] {marker} pcode[{index}] {}",
+                            statement.display(&vm.cpu.arch.sleigh)
+                        );
+                    }
+                }
+                None => eprintln!(
+                    "[runner] pcode unavailable: block={block_id} offset={offset} blocks={}",
+                    vm.code.blocks.len()
+                ),
+            }
+        }
         // FAULT_STACK=N prints N qwords from the faulting RSP, flagging
         // values that look like return addresses into the program image.
         if let Ok(n) = std::env::var("FAULT_STACK") {

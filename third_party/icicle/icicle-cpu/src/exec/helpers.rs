@@ -1090,6 +1090,8 @@ pub mod x86 {
         // x86-64-v2 baseline emit these unconditionally, without a CPUID
         // check, so static binaries hit them even when CPUID stays quiet.
         ("pblendw", pblendw),
+        ("blendps", blendps),
+        ("blendpd", blendpd),
         ("pblendvb", pblendvb),
         ("blendvps", blendvps),
         ("blendvpd", blendvpd),
@@ -10077,6 +10079,32 @@ pub mod x86 {
             out[2 * i..2 * i + 2].copy_from_slice(&src[2 * i..2 * i + 2]);
         }
         write_xmm(cpu, dst, out);
+    }
+
+    fn blend_immediate(cpu: &mut Cpu, dst: VarNode, args: [Value; 2], lane: usize) {
+        let (Some(a), Some(b)) = (xmm_bytes(cpu, args[0]), xmm_bytes(cpu, args[1])) else {
+            return;
+        };
+        let mask = cpu.args[0] as u8;
+        let mut out = [0u8; 16];
+        for index in 0..16 / lane {
+            let source = if mask & (1 << index) == 0 { &a } else { &b };
+            let offset = index * lane;
+            out[offset..offset + lane].copy_from_slice(&source[offset..offset + lane]);
+        }
+        write_xmm(cpu, dst, out);
+    }
+
+    /// SSE4.1 BLENDPS: choose each packed 32-bit lane from the first or
+    /// second source according to imm8 bits 0..3.
+    fn blendps(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        blend_immediate(cpu, dst, args, 4);
+    }
+
+    /// SSE4.1 BLENDPD: choose each packed 64-bit lane from the first or
+    /// second source according to imm8 bits 0..1.
+    fn blendpd(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {
+        blend_immediate(cpu, dst, args, 8);
     }
 
     fn pblendvb(cpu: &mut Cpu, dst: VarNode, args: [Value; 2]) {

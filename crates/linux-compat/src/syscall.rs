@@ -255,7 +255,7 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
                     if std::env::var_os("SYSCALL_ERR_TRACE").is_some() {
                         let path = match nr {
                             2 => read_cstr_raw(cpu, a0).ok(),
-                            257 | 262 => read_cstr_raw(cpu, a1).ok(),
+                            257 | 262 | abi::SYS_STATX => read_cstr_raw(cpu, a1).ok(),
                             _ => None,
                         }
                         .map(|p| format!(" path={}", p.escape_ascii()))
@@ -1197,17 +1197,20 @@ fn sys_sysinfo(env: &mut LinuxEnv, cpu: &mut Cpu, ptr: u64) -> SysResult {
     let used_pages = cpu.mem.total_pages() as u64;
     let cap_pages = cpu.mem.capacity() as u64;
     let mem_unit = PAGE_SIZE;
-    // `struct sysinfo` on x86-64: uptime, three load averages, totalram,
-    // freeram, sharedram, bufferram, totalswap, freeswap, procs, pad,
-    // totalhigh, freehigh, mem_unit, and padding to 112 bytes.
+    // `struct sysinfo` on x86-64: uptime at 0, three load averages at 8,
+    // then totalram at 32.  `procs` is a 16-bit field at 80; totalhigh and
+    // freehigh resume 64-bit alignment at 88 and 96.  A previous layout put
+    // totalram at 40, leaving it zero. JSC reads totalram to size its initial
+    // allocation limit, so that ABI error forced a critical full collection
+    // after virtually every allocation during Bun startup.
     let mut buf = [0_u8; 112];
     let mut put = |offset: usize, value: u64| {
         buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     };
     put(0, env.now_nanos(cpu) / 1_000_000_000); // uptime, seconds
-    put(40, cap_pages); // totalram, in mem_unit
-    put(48, cap_pages.saturating_sub(used_pages)); // freeram
-    put(72, 1); // procs
+    put(32, cap_pages); // totalram, in mem_unit
+    put(40, cap_pages.saturating_sub(used_pages)); // freeram
+    buf[80..82].copy_from_slice(&1_u16.to_le_bytes()); // procs
     buf[104..108].copy_from_slice(&(mem_unit as u32).to_le_bytes());
     write_mem(env, cpu, ptr, &buf)?;
     Ok(0)
@@ -3762,6 +3765,19 @@ fn schedule_next(env: &mut LinuxEnv, cpu: &mut Cpu) -> bool {
     cpu.restore(&task.cpu);
     cpu.icount = icount;
     cpu.time_offset = time_offset;
+    // Lifted block ids are process-local execution cursors, but the lifted
+    // code arena is shared by the whole machine. A different task can write
+    // to a page that has already been executed (for example JavaScriptCore
+    // filling an RWX JIT page); the engine then flushes that shared arena.
+    // Parked tasks still carry the old numeric block id in their CPU snapshot.
+    // Restoring it after the flush would make an otherwise valid guest PC
+    // index a block from the discarded arena. Resume through the current PC
+    // instead: the next engine turn finds or re-lifts the block in the live
+    // cache. Task switches occur at syscall boundaries, where PC is the
+    // architectural restart point, so this does not discard a mid-pcode
+    // operation.
+    cpu.block_id = u64::MAX;
+    cpu.block_offset = 0;
     env.proc = task.proc;
     env.proc.start_cpu_turn(cpu.icount());
     crate::set_current_pid(env.proc.pid);
