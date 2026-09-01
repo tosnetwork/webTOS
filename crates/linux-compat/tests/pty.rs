@@ -81,6 +81,7 @@ int main(void) {
     printf("master got %d: %s", n, buf);
     return 0;
 }
+
 "#;
     let Some(image) = compile_c("openpty", source, &[]) else {
         return;
@@ -91,6 +92,63 @@ int main(void) {
     assert!(
         out.contains("master got 15: hi-from-slave\r\n"),
         "openpty output: {out:?}"
+    );
+}
+
+/// Syscall arguments declared as `unsigned int` use only their low 32 bits.
+/// JSC's native host-function bridge leaves a tagged JS value in the upper
+/// half of RDI when it calls libc's `isatty`, which then issues ioctl(TCGETS).
+/// Linux accepts that call; the compatibility layer must not turn it into an
+/// EBADF merely because the unused high bits are non-zero.
+#[test]
+fn ioctl_truncates_a_tagged_fd_to_linux_unsigned_int_width() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <asm/unistd.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
+
+static long tagged_ioctl(unsigned int fd, unsigned long request, void *arg) {
+    long result;
+    unsigned long tagged_fd = 0xfffe000000000000ULL | fd;
+    __asm__ volatile (
+        "syscall"
+        : "=a"(result)
+        : "a"(__NR_ioctl), "D"(tagged_fd), "S"(request), "d"(arg)
+        : "rcx", "r11", "memory");
+    return result;
+}
+
+int main(void) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) || unlockpt(master)) return 1;
+    char *name = ptsname(master);
+    if (!name) return 2;
+    int slave = open(name, O_RDWR | O_NOCTTY);
+    if (slave < 0) return 3;
+    struct termios term;
+    if (tagged_ioctl((unsigned int)slave, TCGETS, &term) != 0) return 4;
+    puts("tagged-fd ioctl accepted");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("tagged-fd-ioctl", source, &[]) else {
+        return;
+    };
+    let (exit, out) = run(image);
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "tagged ioctl: {out:?}"
+    );
+    assert!(
+        out.contains("tagged-fd ioctl accepted"),
+        "tagged ioctl output: {out:?}"
     );
 }
 
@@ -289,6 +347,88 @@ int main(void) {
     );
 }
 
+/// A mock Claude/Bun bootstrap. The real runtime marks each standard stream as
+/// interactive by calling `isatty(2)` and then snapshots termios before its JS
+/// frontend evaluates `process.stdin.isTTY && process.stdout.isTTY`. It also
+/// performs the normal terminal probes below while constructing its streams.
+///
+/// Keep this as an executable guest test rather than assuming that a host pty
+/// implies the same ABI-visible terminal state inside the emulator.
+#[test]
+fn stdio_pty_matches_mock_claude_bun_bootstrap() {
+    let source = r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+
+int main(void) {
+    struct termios term;
+    struct winsize size;
+    char link[64] = {0};
+    for (int fd = 0; fd < 3; fd++) {
+        if (!isatty(fd)) return 10 + fd;
+        // Bun's native binding converts the libc integer result to a C++
+        // bool before it is encoded as a JavaScript boolean. Keep an explicit
+        // compare/setcc-shaped conversion in this mock as a regression for
+        // that ABI boundary rather than testing only a branch on non-zero.
+        volatile int exactly_one = isatty(fd) == 1;
+        if (!exactly_one) return 13 + fd;
+        if (tcgetattr(fd, &term) != 0) return 15 + fd;
+        if (ioctl(fd, TCGETS, &term) != 0) return 20 + fd;
+        if (ioctl(fd, TIOCGWINSZ, &size) != 0) return 30 + fd;
+        struct stat fd_stat;
+        if (fstat(fd, &fd_stat) != 0 || !S_ISCHR(fd_stat.st_mode)) return 35 + fd;
+        int duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (duplicate < 3) return 38 + fd;
+        close(duplicate);
+        char path[32];
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        ssize_t n = readlink(path, link, sizeof(link) - 1);
+        if (n <= 0) return 40 + fd;
+        link[n] = 0;
+        if (strncmp(link, "/dev/pts/", 9) != 0) return 50 + fd;
+    }
+    int tty = open("/dev/tty", O_RDWR);
+    if (tty < 0 || !isatty(tty)) return 60;
+    if (ioctl(tty, TCGETS, &term) != 0 || ioctl(tty, TIOCGWINSZ, &size) != 0) return 61;
+    int pty_number = -1;
+    if (ioctl(0, TIOCGPTN, &pty_number) != -1 || errno != ENOTTY) return 62;
+    struct stat st;
+    if (stat(link, &st) != 0) return 63;
+    if (!S_ISCHR(st.st_mode) || major(st.st_rdev) != 136) return 64;
+    int reopened = open(link, O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (reopened < 0 || !isatty(reopened)) return 65;
+    dprintf(1, "mock-claude interactive rows=%u cols=%u\n", size.ws_row, size.ws_col);
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("modern-tty-probe", source, &[]) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/fixture", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![b"fixture".to_vec()], vec![b"PATH=/bin".to_vec()]);
+    machine.load(b"/bin/fixture").expect("ELF load failed");
+    machine.install_pty_stdio(40, 120);
+    machine.vm_mut().icount_limit = machine.icount() + 4_000_000_000;
+    let exit = machine.run();
+    let rendered = String::from_utf8_lossy(&machine.drain_terminal_output()).into_owned();
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "probe: {rendered:?}");
+    assert!(
+        rendered.contains("mock-claude interactive rows=40 cols=120"),
+        "probe: {rendered:?}"
+    );
+}
+
 /// Runtimes that classify stdio via statx(2) — Bun is one — read
 /// stx_rdev_major/minor to recognize a Linux pty (major 136). A prior
 /// version left those fields zero, making a real pty look like an unrelated
@@ -407,6 +547,10 @@ fn stdio_pty_pauses_for_input_and_resumes() {
         machine.awaiting_terminal_input(),
         "pause should be attributed to terminal input"
     );
+    assert!(
+        machine.terminal_input_pending(),
+        "the host-facing pty-read predicate should identify the parked reader"
+    );
     assert_eq!(machine.exit_code(), None, "a pause is not an exit");
 
     // The user types. The same process resumes and echoes the line back.
@@ -422,6 +566,7 @@ fn stdio_pty_pauses_for_input_and_resumes() {
     // `cat` has no more input, so it parks again rather than exiting.
     assert_eq!(exit, CpuExit::Interrupted, "output: {rendered:?}");
     assert!(machine.awaiting_terminal_input());
+    assert!(machine.terminal_input_pending());
 }
 
 /// A real full-screen program in the terminal. `busybox vi` takes the

@@ -5972,10 +5972,21 @@ pub mod x86 {
                 return;
             }
             let immediate = cpu.read::<u8>(args[1]);
-            let chunk = cpu.args[7] as u8;
             for lane in 0..lanes {
                 let bits = if lane_size == 4 { 2 } else { 1 };
-                let control_lane = chunk * lanes + lane;
+                let chunk = cpu.args[7] as u8;
+                // VPERMILPS has four two-bit controls in imm8, one set for
+                // every 128-bit lane. VPERMILPD instead has one control per
+                // 64-bit element, so its eight imm8 bits address the full
+                // 512-bit vector. Pcode lowers a wide vector into 128-bit
+                // chunks: use the chunk only for PD, and wrap the PS lane
+                // index to its four controls. Without that wrap an upper ZMM
+                // PS chunk shifts an u8 by 8 or more (a debug-build panic).
+                let control_lane = if lane_size == 4 {
+                    lane
+                } else {
+                    chunk * lanes + lane
+                };
                 let source_lane = (immediate >> (control_lane * bits)) & ((1 << bits) - 1);
                 let value: u64 =
                     cpu.read_dynamic(args[0].slice(source_lane * lane_size, lane_size)).zxt();

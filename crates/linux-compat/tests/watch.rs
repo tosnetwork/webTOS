@@ -255,3 +255,60 @@ int main(void) {{
         "a change from another process did not reach the watcher: {output}"
     );
 }
+
+/// An empty *blocking* inotify descriptor is not a file at end-of-file.  A
+/// file watcher such as a terminal client commonly submits a 64 KiB read and
+/// expects the kernel to park it until another task changes a watched path.
+/// Returning zero here makes the watcher treat the descriptor as permanently
+/// closed and spin, consuming its entire event-loop turn before it can make
+/// the network request that follows.
+#[test]
+fn a_blocking_inotify_read_waits_for_and_consumes_an_event() {
+    let Some(image) = compile_c(
+        "watch_blocking_read",
+        &format!(
+            r#"{PREAMBLE}
+#include <sys/wait.h>
+int main(void) {{
+    fd = inotify_init1(0);
+    if (fd < 0) {{ printf("init: %s\n", strerror(errno)); return 1; }}
+    if (inotify_add_watch(fd, "/work", IN_CREATE) < 0) {{
+        printf("watch: %s\n", strerror(errno)); return 2;
+    }}
+    pid_t pid = fork();
+    if (pid < 0) return 3;
+    if (pid == 0) {{
+        int child = creat("/work/unblocks-parent", 0644);
+        if (child < 0) _exit(4);
+        close(child);
+        _exit(0);
+    }}
+
+    char buf[65536];
+    ssize_t got = read(fd, buf, sizeof buf);
+    if (got <= 0) {{
+        printf("read=%zd errno=%d\n", got, errno);
+        return 5;
+    }}
+    struct inotify_event *event = (struct inotify_event *)buf;
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("read=%zd mask=%#x name=[%s] child=%d\n", got, event->mask,
+           event->len ? event->name : "", status);
+    return event->mask == IN_CREATE && event->len &&
+                   strcmp(event->name, "unblocks-parent") == 0 && status == 0
+               ? 0
+               : 6;
+}}
+"#
+        ),
+    ) else {
+        return;
+    };
+    let (exit, output) = run(image);
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "{output}");
+    assert!(
+        output.contains("name=[unblocks-parent]"),
+        "the blocked read did not consume its wake event: {output}"
+    );
+}

@@ -7,7 +7,8 @@
     "test:node": "node web/test_node.mjs",
     "test:browsers": "node web/test_browsers.mjs",
     "gateway": "node tools/webtos_gateway.mjs",
-    "bench": "node web/bench.mjs"
+    "bench": "node web/bench.mjs",
+    "test:claude-mock": "cc -static -Os -s -pthread -o web/mock_claude web/mock_claude.c && PROBE_MOCK_CLAUDE=1 PROBE_GUEST_MEMORY_MB=256 node web/probe_claude_tui.mjs 1"
   },
   "devDependencies": {
     "playwright": "^1.62.1",

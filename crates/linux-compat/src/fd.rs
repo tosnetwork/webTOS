@@ -271,10 +271,20 @@ pub type TimerFdRef = Rc<RefCell<TimerFdInner>>;
 pub struct NetSocket {
     pub broker: BrokerRef,
     pub kind: SocketKind,
+    /// Linux address family selected at `socket(2)`. The broker keeps the
+    /// family so `connect`, getpeername and getsockname cannot silently
+    /// reinterpret an IPv6 endpoint as IPv4.
+    pub family: u64,
     /// Broker endpoint; created lazily for UDP, at connect for TCP.
     pub handle: Option<Handle>,
     /// Destination set by `connect` (TCP peer, or default UDP target).
-    pub peer: Option<std::net::SocketAddrV4>,
+    pub peer: Option<std::net::SocketAddr>,
+    /// Kernel-local protocol bytes (currently the deterministic, read-only
+    /// NETLINK_ROUTE address dump). They never cross the host network broker.
+    pub local_rx: std::collections::VecDeque<u8>,
+    /// Kernel-assigned local port ID for a local protocol socket. NETLINK
+    /// uses the thread-group's `getpid()` value, not the calling thread ID.
+    pub local_protocol_id: u32,
     /// Monotone counter bumped on every guest send/recv on this socket.
     /// Edge-triggered epoll re-arms a delivered edge when it moves: once the
     /// guest consumed some of the readable data, still-pending bytes are a
@@ -286,12 +296,18 @@ pub struct NetSocket {
 pub enum SocketKind {
     Tcp,
     Udp,
+    /// A local-domain client socket. The compatibility layer models its
+    /// kernel-visible creation and absent-path error separately from the
+    /// brokered IP transport.
+    Unix,
+    NetlinkRoute,
 }
 
 impl std::fmt::Debug for NetSocket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetSocket")
             .field("kind", &self.kind)
+            .field("family", &self.family)
             .field("handle", &self.handle)
             .field("peer", &self.peer)
             .finish()

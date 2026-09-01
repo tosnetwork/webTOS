@@ -6,6 +6,7 @@ base_image.runtime.manifest
 .codex
 .codex/
 /web/webtos_web.wasm
+/web/mock_claude
 /web/bench_control.wasm
 /web/hello_linux.elf
 /test_data/busybox-musl

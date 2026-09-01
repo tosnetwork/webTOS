@@ -1130,6 +1130,20 @@ pub extern "C" fn wtw_pty_input(ptr: u32, len: u32) -> i32 {
     })
 }
 
+/// Returns whether a foreground task is currently parked reading the
+/// host-owned stdio pty.  Unlike `STATUS_AWAITING_INPUT`, this remains true
+/// when another guest thread is runnable, which is the normal shape of a
+/// multithreaded terminal application.
+#[no_mangle]
+pub extern "C" fn wtw_pty_input_pending() -> i32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_mut()
+            .is_some_and(|machine| machine.terminal_input_pending()) as i32
+    })
+}
+
 /// Reports a new terminal size and raises SIGWINCH on the foreground group.
 #[no_mangle]
 pub extern "C" fn wtw_pty_resize(rows: u32, cols: u32) -> i32 {

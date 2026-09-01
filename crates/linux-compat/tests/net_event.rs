@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -521,6 +521,854 @@ fn nslookup_resolves_through_udp_dns() {
     assert!(
         run.output.contains("10.0.0.1"),
         "nslookup output: {:?}",
+        run.output
+    );
+}
+
+/// IPv6 TCP must be a first-class client socket family even when the test does
+/// not make an external connection. Modern agent CLIs create an IPv6 endpoint
+/// before their IPv4 Happy-Eyeballs fallback; rejecting socket(2) itself makes
+/// that normal probe look like a total network failure.
+#[test]
+fn ipv6_tcp_socket_reports_a_real_sockaddr_in6_identity() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in6 addr = {0};
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) return 2;
+    if (addr.sin6_family != AF_INET6 || len != sizeof(addr)) return 3;
+    puts("ipv6-tcp-socket-ok");
+    return 0;
+}
+
+"#;
+    let Some(image) = compile_c("ipv6-tcp-socket", source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/ipv6-tcp-socket", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"ipv6-tcp-socket".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/ipv6-tcp-socket")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "IPv6 guest output: {output:?}"
+    );
+    assert!(
+        output.contains("ipv6-tcp-socket-ok"),
+        "IPv6 guest output: {output:?}"
+    );
+}
+
+/// Native mode must carry an IPv6 TCP connection through the same explicit
+/// broker boundary as IPv4. This is loopback-only: it proves address handling
+/// without depending on public DNS or an external service.
+#[test]
+fn native_broker_connects_ipv6_tcp_without_reinterpreting_the_peer() {
+    let listener = match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("skipping IPv6 loopback broker test: {error}");
+            return;
+        }
+    };
+    let peer = match listener.local_addr().expect("listener address") {
+        std::net::SocketAddr::V6(peer) => peer,
+        std::net::SocketAddr::V4(_) => panic!("IPv6 listener returned IPv4 address"),
+    };
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("IPv6 accept");
+        let mut received = [0_u8; 4];
+        stream.read_exact(&mut received).expect("IPv6 read");
+        received
+    });
+
+    let mut broker = NativeBroker::new();
+    let handle = broker.tcp_connect_v6(peer).expect("IPv6 broker connect");
+    assert_eq!(broker.tcp_send(handle, b"ping").expect("IPv6 send"), 4);
+    assert_eq!(server.join().expect("IPv6 server"), *b"ping");
+}
+
+/// `Machine::set_network` always inserts `MeteredBroker`; IPv6 cannot be
+/// accidentally lost at that wrapper boundary. Agent runtimes commonly try
+/// an IPv6 address before their IPv4 fallback, so returning EAFNOSUPPORT here
+/// turns a valid native transport into a misleading generic connection error.
+#[test]
+fn metered_broker_forwards_ipv6_tcp_connections() {
+    let listener = match TcpListener::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("skipping IPv6 loopback metered-broker test: {error}");
+            return;
+        }
+    };
+    let peer = match listener.local_addr().expect("listener address") {
+        std::net::SocketAddr::V6(peer) => peer,
+        std::net::SocketAddr::V4(_) => panic!("IPv6 listener returned IPv4 address"),
+    };
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("IPv6 accept");
+        let mut received = [0_u8; 4];
+        stream.read_exact(&mut received).expect("IPv6 read");
+        received
+    });
+
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    let broker = machine
+        .env()
+        .network_broker()
+        .expect("the metered broker installed by set_network");
+    let handle = broker
+        .borrow_mut()
+        .tcp_connect_v6(peer)
+        .expect("metered IPv6 broker connect");
+    assert_eq!(broker.borrow_mut().tcp_send(handle, b"ping"), Ok(4));
+    assert_eq!(server.join().expect("IPv6 server"), *b"ping");
+}
+
+/// Runtime network discovery uses an IPv6 UDP socket before its TLS client
+/// opens TCP. Keep that native, metered path available: rejecting it makes a
+/// valid network stack surface as an opaque `FailedToOpenSocket` error.
+#[test]
+fn guest_sends_ipv6_udp_through_the_metered_broker() {
+    let listener = match UdpSocket::bind(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("skipping IPv6 UDP loopback test: {error}");
+            return;
+        }
+    };
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {{
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in6 local = {{0}};
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = in6addr_any;
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0) return 2;
+    struct sockaddr_in6 peer = {{0}};
+    peer.sin6_family = AF_INET6;
+    peer.sin6_port = htons({port});
+    peer.sin6_addr = in6addr_loopback;
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != 0) return 3;
+    struct sockaddr disconnected = {{ .sa_family = AF_UNSPEC }};
+    if (connect(fd, &disconnected, sizeof(disconnected)) != 0) return 4;
+    if (sendto(fd, "ping", 4, 0, (struct sockaddr *)&peer, sizeof(peer)) != 4) return 5;
+    puts("ipv6-udp-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("ipv6-udp", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/ipv6-udp", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(vec![b"ipv6-udp".to_vec()], vec![b"HOME=/root".to_vec()]);
+    machine.load(b"/bin/ipv6-udp").expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "IPv6 UDP output: {output:?}"
+    );
+    let mut received = [0_u8; 4];
+    let (count, _) = listener.recv_from(&mut received).expect("IPv6 UDP receive");
+    assert_eq!(&received[..count], b"ping");
+    assert!(
+        output.contains("ipv6-udp-ok"),
+        "IPv6 UDP output: {output:?}"
+    );
+}
+
+/// DNS and modern runtime probes commonly use `sendmsg` with a header and a
+/// payload in separate iovecs. UDP must emit those iovecs as one complete
+/// datagram; forwarding just the first produces a syntactically malformed
+/// query and makes higher layers report a misleading socket-open failure.
+#[test]
+fn guest_sendmsg_gathers_all_udp_iovecs_into_one_datagram() {
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP listener");
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    char first[] = "dns-";
+    char second[] = "packet";
+    struct iovec iov[] = {{
+        {{ .iov_base = first, .iov_len = sizeof(first) - 1 }},
+        {{ .iov_base = second, .iov_len = sizeof(second) - 1 }},
+    }};
+    struct msghdr msg = {{
+        .msg_name = &peer,
+        .msg_namelen = sizeof(peer),
+        .msg_iov = iov,
+        .msg_iovlen = 2,
+    }};
+    if (sendmsg(fd, &msg, 0) != 10) return 2;
+    puts("udp-sendmsg-gather-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("udp-sendmsg-gather", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/udp-sendmsg-gather", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"udp-sendmsg-gather".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/udp-sendmsg-gather")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "UDP sendmsg output: {output:?}"
+    );
+    let mut received = [0_u8; 32];
+    let (count, _) = listener.recv_from(&mut received).expect("UDP receive");
+    assert_eq!(&received[..count], b"dns-packet");
+    assert!(
+        output.contains("udp-sendmsg-gather-ok"),
+        "UDP sendmsg output: {output:?}"
+    );
+}
+
+/// TLS libraries build a ClientHello with `writev(2)`.  A short write is
+/// permitted, but silently forwarding only the first iovec while returning
+/// success corrupts the record and is not a short write at all.
+#[test]
+fn guest_writev_gathers_all_tcp_iovecs_into_one_stream_write() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("TCP listener");
+    listener
+        .set_nonblocking(false)
+        .expect("listener blocking mode");
+    let port = listener.local_addr().expect("listener address").port();
+    let received = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("TCP accept");
+        let mut out = [0_u8; 32];
+        let count = stream.read(&mut out).expect("TCP read");
+        out[..count].to_vec()
+    });
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(0x0a000002);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer))) return 2;
+    char first[] = "TLS-";
+    char second[] = "record";
+    struct iovec iov[] = {{
+        {{ .iov_base = first, .iov_len = 4 }},
+        {{ .iov_base = second, .iov_len = 6 }},
+    }};
+    if (writev(fd, iov, 2) != 10) return 3;
+    puts("tcp-writev-gather-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("tcp-writev-gather", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/tcp-writev-gather", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"tcp-writev-gather".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/tcp-writev-gather")
+        .expect("ELF load failed");
+    let mut broker = NativeBroker::new();
+    broker.redirect(
+        SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), port),
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+    );
+    broker.restrict_to_redirects();
+    machine.set_network(Rc::new(RefCell::new(broker)));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "TCP writev output: {output:?}"
+    );
+    assert_eq!(received.join().expect("TCP server"), b"TLS-record");
+    assert!(
+        output.contains("tcp-writev-gather-ok"),
+        "TCP writev output: {output:?}"
+    );
+}
+
+/// Glibc's resolver uses `sendmmsg` to submit A and AAAA queries together.
+/// The batch must report a completed count and write each `msg_len`, rather
+/// than degrading into ENOSYS before DNS ever leaves the guest.
+#[test]
+fn guest_sendmmsg_submits_each_udp_datagram_and_writes_lengths() {
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP listener");
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let source = format!(
+        r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer))) return 2;
+    char one[] = "A?";
+    char two[] = "AAAA?";
+    struct iovec iov[] = {{
+        {{ .iov_base = one, .iov_len = sizeof(one) - 1 }},
+        {{ .iov_base = two, .iov_len = sizeof(two) - 1 }},
+    }};
+    struct mmsghdr messages[2] = {{
+        {{ .msg_hdr = {{ .msg_iov = &iov[0], .msg_iovlen = 1 }} }},
+        {{ .msg_hdr = {{ .msg_iov = &iov[1], .msg_iovlen = 1 }} }},
+    }};
+    if (sendmmsg(fd, messages, 2, 0) != 2) return 3;
+    if (messages[0].msg_len != 2 || messages[1].msg_len != 5) return 4;
+    puts("udp-sendmmsg-batch-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("udp-sendmmsg-batch", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/udp-sendmmsg-batch", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"udp-sendmmsg-batch".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/udp-sendmmsg-batch")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "UDP sendmmsg output: {output:?}"
+    );
+    let mut first = [0_u8; 16];
+    let mut second = [0_u8; 16];
+    let (first_count, _) = listener.recv_from(&mut first).expect("first UDP receive");
+    let (second_count, _) = listener.recv_from(&mut second).expect("second UDP receive");
+    assert_eq!(&first[..first_count], b"A?");
+    assert_eq!(&second[..second_count], b"AAAA?");
+    assert!(
+        output.contains("udp-sendmmsg-batch-ok"),
+        "UDP sendmmsg output: {output:?}"
+    );
+}
+
+/// `recvfrom` must preserve the caller's independent buffer/length state
+/// across datagrams while writing back a sockaddr and its reduced length.
+/// Resolver code performs this exact sequence for A and AAAA replies.
+#[test]
+fn guest_recvfrom_reads_two_udp_replies_without_corrupting_next_length() {
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP listener");
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = std::thread::spawn(move || {
+        let mut request = [0_u8; 16];
+        let (_, peer) = listener.recv_from(&mut request).expect("UDP request");
+        listener.send_to(b"answer-a", peer).expect("first reply");
+        listener
+            .send_to(b"answer-aaaa", peer)
+            .expect("second reply");
+    });
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer))) return 2;
+    if (send(fd, "query", 5, 0) != 5) return 3;
+    char first[32] = {{0}}, second[32] = {{0}};
+    struct sockaddr_in from = {{0}};
+    socklen_t from_len = sizeof(from);
+    int a = recvfrom(fd, first, sizeof(first), 0, (struct sockaddr *)&from, &from_len);
+    if (a != 8 || from_len != sizeof(from) || from.sin_family != AF_INET) return 4;
+    from_len = sizeof(from);
+    int b = recvfrom(fd, second, sizeof(second), 0, (struct sockaddr *)&from, &from_len);
+    if (b != 11 || from_len != sizeof(from) || from.sin_family != AF_INET) return 5;
+    if (memcmp(first, "answer-a", 8) || memcmp(second, "answer-aaaa", 11)) return 6;
+    puts("udp-recvfrom-two-replies-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("udp-recvfrom-two-replies", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/udp-recvfrom-two-replies", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"udp-recvfrom-two-replies".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/udp-recvfrom-two-replies")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "UDP recvfrom output: {output:?}"
+    );
+    server.join().expect("UDP server");
+    assert!(
+        output.contains("udp-recvfrom-two-replies-ok"),
+        "UDP recvfrom output: {output:?}"
+    );
+}
+
+/// Event-loop DNS clients commonly use `FIONREAD` to size a receive buffer
+/// after epoll marks a UDP socket readable.  Returning zero here makes the
+/// client issue a legal but destructive zero-length `recvfrom`, silently
+/// discarding the queued DNS reply before any TCP connection can be opened.
+#[test]
+fn guest_fionread_reports_the_next_udp_datagram_size_without_consuming_it() {
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP listener");
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = std::thread::spawn(move || {
+        let mut request = [0_u8; 16];
+        let (_, peer) = listener.recv_from(&mut request).expect("UDP request");
+        listener.send_to(b"sized-reply", peer).expect("reply");
+    });
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer))) return 2;
+    if (send(fd, "q", 1, 0) != 1) return 3;
+    int available = 0;
+    for (int attempts = 0; attempts != 1000 && available == 0; ++attempts) {{
+        if (ioctl(fd, FIONREAD, &available)) return 4;
+        usleep(1000);
+    }}
+    if (available != 11) return 5;
+    char reply[16] = {{0}};
+    if (recvfrom(fd, reply, available, 0, 0, 0) != available) return 6;
+    if (reply[0] != 's' || reply[10] != 'y') return 7;
+    puts("udp-fionread-size-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("udp-fionread-size", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/udp-fionread-size", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"udp-fionread-size".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/udp-fionread-size")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "UDP FIONREAD output: {output:?}"
+    );
+    server.join().expect("UDP server");
+    assert!(
+        output.contains("udp-fionread-size-ok"),
+        "UDP FIONREAD output: {output:?}"
+    );
+}
+
+/// A zero-length `MSG_PEEK` is a readiness probe, not permission to discard
+/// the pending datagram. Resolver runtimes use it between A/AAAA receives.
+#[test]
+fn guest_zero_length_udp_peek_does_not_consume_the_datagram() {
+    let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("UDP listener");
+    listener
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = std::thread::spawn(move || {
+        let mut request = [0_u8; 16];
+        let (_, peer) = listener.recv_from(&mut request).expect("UDP request");
+        listener.send_to(b"reply", peer).expect("reply");
+    });
+    let source = format!(
+        r#"
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {{0}};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons({port});
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer))) return 2;
+    if (send(fd, "q", 1, 0) != 1) return 3;
+    char ignored;
+    if (recvfrom(fd, &ignored, 0, MSG_PEEK, 0, 0) != 0) return 4;
+    char reply[8] = {{0}};
+    if (recvfrom(fd, reply, sizeof(reply), 0, 0, 0) != 5) return 5;
+    if (reply[0] != 'r' || reply[4] != 'y') return 6;
+    puts("udp-zero-peek-ok");
+    return 0;
+}}
+"#
+    );
+    let Some(image) = compile_c("udp-zero-peek", &source, &[]) else {
+        return;
+    };
+    init_logging();
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/udp-zero-peek", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"udp-zero-peek".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/udp-zero-peek")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "UDP zero peek output: {output:?}"
+    );
+    server.join().expect("UDP server");
+    assert!(
+        output.contains("udp-zero-peek-ok"),
+        "UDP zero peek output: {output:?}"
+    );
+}
+
+/// A missing local name-service socket is an ordinary ENOENT probe, not a
+/// global network denial. This must work even with no IP broker attached.
+#[test]
+fn unix_socket_absent_service_returns_enoent_without_a_network_broker() {
+    let source = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/var/run/nscd/socket");
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != -1) return 2;
+    if (errno != ENOENT) return 3;
+    puts("unix-enoent-fallback-ok");
+    return 0;
+}
+
+"#;
+    let Some(image) = compile_c("unix-enoent-fallback", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "unix-enoent-fallback");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("unix-enoent-fallback-ok"),
+        "UNIX probe output: {:?}",
+        run.output
+    );
+}
+
+/// A runtime may reserve a guest-local Unix control endpoint before any
+/// helper connects to it. This must not be misclassified as an unsupported
+/// network listener merely because host networking is denied.
+#[test]
+fn unix_control_listener_binds_and_listens_without_a_network_broker() {
+    let source = r#"
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, "/run/user/1000/control.sock");
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) return 2;
+    if (listen(fd, 16) != 0) return 3;
+    puts("unix-control-listener-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("unix-control-listener", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "unix-control-listener");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("unix-control-listener-ok"),
+        "UNIX control listener output: {:?}",
+        run.output
+    );
+}
+
+/// Linux 5.11's epoll_pwait2 accepts a timespec timeout rather than the
+/// millisecond integer used by epoll_wait. A zero timeout is a compact guest
+/// regression for the syscall decoding and argument layout.
+#[test]
+fn epoll_pwait2_accepts_a_zero_timespec_timeout() {
+    let source = r#"
+#include <asm/unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(void) {
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (ep < 0) return 1;
+    struct epoll_event event;
+    struct timespec timeout = {0, 0};
+    long result = syscall(__NR_epoll_pwait2, ep, &event, 1, &timeout, 0, 0);
+    if (result != 0) return 2;
+    puts("epoll-pwait2-zero-timeout-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("epoll-pwait2", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-pwait2");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("epoll-pwait2-zero-timeout-ok"),
+        "epoll_pwait2 output: {:?}",
+        run.output
+    );
+}
+
+/// The guest-local route view is deliberately limited to a deterministic
+/// loopback address dump. It must nevertheless use the real netlink framing
+/// expected by runtime address-discovery code.
+#[test]
+fn netlink_route_getaddr_returns_a_loopback_dump_and_done() {
+    let source = r#"
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0) return 1;
+    struct sockaddr_nl local = { .nl_family = AF_NETLINK };
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local))) return 2;
+    struct sockaddr_nl reported = {0};
+    socklen_t reported_len = sizeof(reported);
+    if (getsockname(fd, (struct sockaddr *)&reported, &reported_len)) return 10;
+    if (reported_len != sizeof(reported) || reported.nl_family != AF_NETLINK ||
+        reported.nl_pid == 0 || reported.nl_groups != 0) return 11;
+    struct { struct nlmsghdr hdr; struct ifaddrmsg addr; } req = {0};
+    req.hdr.nlmsg_len = sizeof(req);
+    req.hdr.nlmsg_type = RTM_GETADDR;
+    req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.hdr.nlmsg_seq = 7;
+    req.addr.ifa_family = AF_UNSPEC;
+    struct sockaddr_nl kernel = { .nl_family = AF_NETLINK };
+    if (sendto(fd, &req, sizeof(req), 0, (struct sockaddr *)&kernel, sizeof(kernel)) != sizeof(req)) return 3;
+    char buf[512];
+    /* The route response is a byte stream from the guest-local protocol
+       queue. A partial recv must consume its byte, rather than replay it on
+       the next call. */
+    int first = recv(fd, buf, 1, 0);
+    if (first != 1) return 4;
+    unsigned char first_byte = (unsigned char)buf[0];
+    struct sockaddr_nl sender = {0};
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct msghdr msg = { .msg_name = &sender, .msg_namelen = sizeof(sender), .msg_iov = &iov, .msg_iovlen = 1 };
+    int n = recvmsg(fd, &msg, 0);
+    if (n < 19) return 5;
+    if (msg.msg_namelen != sizeof(sender) || sender.nl_family != AF_NETLINK || sender.nl_pid != 0) return 9;
+    /* The first byte is the little-endian low byte of nlmsg_len (normally
+       0x20 or larger), so a replay would put it at buf[0] here. The next byte
+       must instead be the second length byte, usually zero. */
+    if ((unsigned char)buf[0] == first_byte) return 6;
+    unsigned char header[sizeof(struct nlmsghdr)];
+    header[0] = first_byte;
+    memcpy(header + 1, buf, sizeof(header) - 1);
+    struct nlmsghdr *h = (struct nlmsghdr *)header;
+    if (h->nlmsg_type != RTM_NEWADDR || h->nlmsg_seq != 7 || h->nlmsg_pid != reported.nl_pid) return 7;
+    if (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) != -1 || errno != EAGAIN) return 8;
+    puts("netlink-loopback-dump-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("netlink-loopback-dump", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "netlink-loopback-dump");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("netlink-loopback-dump-ok"),
+        "netlink output: {:?}",
         run.output
     );
 }

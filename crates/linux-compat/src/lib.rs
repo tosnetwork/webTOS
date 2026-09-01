@@ -661,10 +661,23 @@ impl LinuxEnv {
         }
     }
 
-    /// Queues host keystrokes for the stdio pty; delivered when the guest
-    /// blocks reading it (see the stall resolver).
+    /// Places host keystrokes into the terminal buffer immediately.
     pub fn feed_terminal_input(&mut self, bytes: &[u8]) {
-        self.stdio_input.extend(bytes.iter().copied());
+        self.deliver_terminal_input(bytes);
+    }
+
+    pub(crate) fn deliver_terminal_input(&mut self, bytes: &[u8]) {
+        let Some(pty) = self.stdio_pty.clone() else {
+            self.stdio_input.extend(bytes.iter().copied());
+            return;
+        };
+        let mut pty = pty.borrow_mut();
+        let signal = pty.feed_input(bytes);
+        let pgrp = pty.fg_pgrp;
+        drop(pty);
+        if let Some(signal) = signal {
+            crate::syscall::deliver_signal_to_pgrp(self, pgrp, signal);
+        }
     }
 
     /// Drains everything the guest has written to the stdio pty (terminal
@@ -701,6 +714,31 @@ impl LinuxEnv {
     /// for the host to supply terminal input.
     pub fn awaiting_terminal_input(&self) -> bool {
         self.terminal_input_wait
+    }
+
+    /// Whether any task is presently parked on the host-owned stdio pty with
+    /// no queued keystrokes.  This is intentionally stronger than
+    /// [`Self::awaiting_terminal_input`]: a multithreaded TUI can keep a
+    /// worker runnable while its foreground thread is already waiting for
+    /// input, so a host run slice returns `InstructionLimit` rather than a
+    /// whole-machine interactive stall.  The host may safely queue input in
+    /// either case; only the foreground pty reader can consume it.
+    pub(crate) fn terminal_input_pending(&self) -> bool {
+        let Some(stdio) = self.stdio_pty.as_ref() else {
+            return false;
+        };
+        if !self.stdio_input.is_empty() {
+            return false;
+        }
+        self.sched.parked.iter().any(|task| match &task.state {
+            proc::ParkState::Waiting { watches, deadline } => {
+                deadline.is_none()
+                    && watches.iter().any(|watch| {
+                        matches!(watch, proc::Watch::PtyReadable(pty, false) if std::rc::Rc::ptr_eq(pty, stdio))
+                    })
+            }
+            _ => false,
+        })
     }
 
     /// True when the last run stopped waiting on the host's network transport.
@@ -1860,15 +1898,26 @@ impl Machine {
         self.env().set_args(argv, envp);
     }
 
+    /// Sets the credentials visible to the initial process. This is a guest
+    /// identity declaration, not permission to access host files: VFS and
+    /// network policy remain independently mediated. It must be called
+    /// before the guest creates threads or children so the initial process is
+    /// their inherited credential source.
+    pub fn set_credentials(&mut self, uid: u32, gid: u32) {
+        let env = self.env();
+        env.proc.uid = uid;
+        env.proc.gid = gid;
+    }
+
     /// Runs the guest's stdin/stdout/stderr over a host-driven pty (so the
     /// guest sees an interactive terminal). Call after `load`, before `run`.
     pub fn install_pty_stdio(&mut self, rows: u16, cols: u16) {
         self.env().install_pty_stdio(rows, cols);
     }
 
-    /// Queues terminal input (keystrokes) for the stdio pty.
+    /// Delivers terminal input (keystrokes) to the stdio pty.
     pub fn feed_terminal_input(&mut self, bytes: &[u8]) {
-        self.env().feed_terminal_input(bytes);
+        self.env().deliver_terminal_input(bytes);
     }
 
     /// Drains rendered terminal output written by the guest to the stdio pty.
@@ -1888,6 +1937,13 @@ impl Machine {
     /// again to continue.
     pub fn awaiting_terminal_input(&mut self) -> bool {
         self.env().awaiting_terminal_input()
+    }
+
+    /// True when a foreground task is parked on the host-owned terminal even
+    /// if another task remains runnable.  Browser hosts use this to avoid
+    /// withholding a real user's keystrokes behind unrelated runtime work.
+    pub fn terminal_input_pending(&mut self) -> bool {
+        self.env().terminal_input_pending()
     }
 
     /// True when [`run`](Self::run) stopped waiting on the host's network

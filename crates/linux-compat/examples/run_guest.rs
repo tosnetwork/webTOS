@@ -50,7 +50,20 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let ldef = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../third_party/ghidra-x86/languages/x86.ldefs");
-    let mut machine = Machine::from_ldef(&ldef, &EngineConfig::default()).expect("build");
+    // GUEST_NO_PCODE_OPT=1 is a diagnostic parity switch: it leaves the
+    // decoder and guest ABI unchanged, but runs the exact workload without
+    // instruction/block p-code rewrites.  It is useful when a generated
+    // runtime fails only after it has emitted self-modifying native code.
+    let config = if std::env::var_os("GUEST_NO_PCODE_OPT").is_some() {
+        EngineConfig {
+            optimize_instructions: false,
+            optimize_block: false,
+            ..EngineConfig::default()
+        }
+    } else {
+        EngineConfig::default()
+    };
+    let mut machine = Machine::from_ldef(&ldef, &config).expect("build");
 
     // GUEST_MEM_MB=N sets the guest's physical-memory cap (default 2 GiB).
     // The cap is lazy: it reserves no host memory up front. A modern agent
@@ -79,12 +92,29 @@ fn main() {
     };
     machine.set_wall_clock_base(epoch);
 
-    // GUEST_NET=1 attaches an allow-all native broker (real host outbound) and
-    // a resolv.conf pointing at a public resolver, so the guest can do real
-    // DNS + TCP. Without it, sockets are denied by default.
+    // GUEST_NET=1 attaches an allow-all native broker (real host outbound)
+    // and imports the host resolver configuration, so the guest follows the
+    // same local stub/DNS policy as a native CLI. GUEST_RESOLV_CONF can
+    // select an explicit configuration; a public resolver is only the
+    // fallback for hosts with no resolv.conf. Without GUEST_NET, sockets are
+    // denied by default.
     if std::env::var("GUEST_NET").is_ok() {
         machine.set_network(Rc::new(RefCell::new(NativeBroker::new())));
-        let _ = machine.add_file(b"/etc/resolv.conf", b"nameserver 8.8.8.8\n".to_vec(), 0o644);
+        let resolv_conf = std::env::var_os("GUEST_RESOLV_CONF")
+            .map(std::path::PathBuf::from)
+            .map_or_else(
+                || std::fs::read("/etc/resolv.conf"),
+                |path| std::fs::read(path),
+            )
+            .unwrap_or_else(|_| b"nameserver 8.8.8.8\n".to_vec());
+        let _ = machine.add_file(b"/etc/resolv.conf", resolv_conf, 0o644);
+        // A native network run must provide a trust anchor as well as a
+        // resolver. Copy only the public CA bundle (rather than a broad
+        // /etc mount) so TLS clients can initialize without exposing host
+        // credentials or unrelated configuration to the guest.
+        if let Ok(ca_bundle) = std::fs::read("/etc/ssl/certs/ca-certificates.crt") {
+            let _ = machine.add_file(b"/etc/ssl/certs/ca-certificates.crt", ca_bundle, 0o644);
+        }
     }
 
     // GUEST_MOUNT="host_dir:guest_prefix,host_dir:guest_prefix" imports host
@@ -109,15 +139,16 @@ fn main() {
     }
 
     // A packaged CLI can re-exec `/proc/self/exe` to start workers, or derive
-    // resources and its own invocation mode from that path. Mapping every
-    // host executable to `/bin/guest` makes such a child observe a fabricated
-    // identity. Preserve the canonical host path by default so `argv[0]` and
-    // `/proc/self/exe` have the same semantics as a native launch; callers
-    // that deliberately need a synthetic guest path can still set GUEST_EXE.
+    // its front-end mode from `argv[0]`. Mapping every host executable to
+    // `/bin/guest` fabricates that identity; canonicalizing the supplied path
+    // is also wrong for a launcher symlink such as `claude`, because native
+    // exec preserves the invocation spelling in argv[0]. Canonicalize only
+    // for reading the image and preserve the supplied guest entry path by
+    // default. Callers can still select an explicit synthetic path with
+    // GUEST_EXE when that is intentional.
     let host_exe = std::fs::canonicalize(&args[0]).expect("canonicalize elf path");
     let image = std::fs::read(&host_exe).expect("read elf");
-    let guest_exe =
-        std::env::var("GUEST_EXE").unwrap_or_else(|_| host_exe.to_string_lossy().into_owned());
+    let guest_exe = std::env::var("GUEST_EXE").unwrap_or_else(|_| args[0].clone());
     machine
         .add_file(guest_exe.as_bytes(), image, 0o755)
         .expect("add");
@@ -148,10 +179,65 @@ fn main() {
         envp.push(b"TERM=xterm-256color".to_vec());
     }
     if let Ok(extra) = std::env::var("GUEST_ENV") {
-        envp.extend(extra.split(',').map(|kv| kv.as_bytes().to_vec()));
+        // Environment lookup is defined by name, but some real runtimes
+        // choose the first duplicate entry.  Appending `HOME=/home/guest`
+        // after the runner default `HOME=/root` therefore left child
+        // processes (including re-execed helpers) rooted at `/root`.  Make
+        // GUEST_ENV a true override and reject malformed entries early.
+        for kv in extra.split(',') {
+            let (key, _) = kv
+                .split_once('=')
+                .filter(|(key, _)| !key.is_empty())
+                .expect("GUEST_ENV entries must be NAME=VALUE");
+            envp.retain(|entry| {
+                entry
+                    .splitn(2, |byte| *byte == b'=')
+                    .next()
+                    .is_none_or(|existing_key| existing_key != key.as_bytes())
+            });
+            envp.push(kv.as_bytes().to_vec());
+        }
     }
     machine.set_args(argv, envp);
+    // Keep the guest principal explicit. A tool such as Claude Code uses
+    // getuid(2), not only $HOME, when locating its state and credential
+    // directories. The default remains root for hermetic fixtures; a native
+    // runner can opt into its intended unprivileged guest identity without
+    // granting it any new host authority.
+    let guest_uid = std::env::var("GUEST_UID")
+        .ok()
+        .map(|value| value.parse::<u32>().expect("GUEST_UID must be a u32"))
+        .unwrap_or(0);
+    let guest_gid = std::env::var("GUEST_GID")
+        .ok()
+        .map(|value| value.parse::<u32>().expect("GUEST_GID must be a u32"))
+        .unwrap_or(0);
+    // `getpwuid(3)` is used independently of $HOME by interactive CLIs and
+    // their helper processes.  Provide only the declared guest principal,
+    // not the host's whole account database.  This preserves the runner's
+    // explicit-identity model while letting glibc resolve a non-root home.
+    if guest_uid != 0 || guest_gid != 0 || std::env::var_os("GUEST_HOME").is_some() {
+        let account = std::env::var("GUEST_ACCOUNT").unwrap_or_else(|_| "guest".to_owned());
+        let home = std::env::var("GUEST_HOME").unwrap_or_else(|_| {
+            if guest_uid == 0 {
+                "/root".to_owned()
+            } else {
+                format!("/home/{account}")
+            }
+        });
+        let passwd = format!("{account}:x:{guest_uid}:{guest_gid}:{account}:{home}:/bin/sh\n");
+        let group = format!("{account}:x:{guest_gid}:\n");
+        machine
+            .add_file(b"/etc/passwd", passwd.into_bytes(), 0o644)
+            .expect("add guest passwd entry");
+        machine
+            .add_file(b"/etc/group", group.into_bytes(), 0o644)
+            .expect("add guest group entry");
+    }
     machine.load(guest_exe.as_bytes()).expect("load");
+    // `load` performs an exec-style initial-process setup, so credentials
+    // must be installed after it rather than being overwritten by that reset.
+    machine.set_credentials(guest_uid, guest_gid);
 
     let mut pty_input_steps: VecDeque<Vec<u8>> = std::env::var("GUEST_PTY_INPUT_STEPS")
         .ok()
@@ -386,6 +472,24 @@ fn main() {
         let _ = vm.cpu.mem.read_bytes(rip, &mut buf, icicle_mem::perm::NONE);
         let hex: String = buf.iter().map(|b| format!("{b:02x} ")).collect();
         eprintln!("[runner] fault pid={pid} exe={exe} rip={rip:#x} rsp={rsp:#x} bytes: {hex}");
+        let code_start = rip.saturating_sub(64);
+        let mut code_window = [0_u8; 160];
+        let _ = vm
+            .cpu
+            .mem
+            .read_bytes(code_start, &mut code_window, icicle_mem::perm::NONE);
+        let code_hex: String = code_window.iter().map(|b| format!("{b:02x} ")).collect();
+        eprintln!("[runner] fault code window @{code_start:#x}: {code_hex}");
+        let mut registers = String::new();
+        for name in [
+            "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11",
+            "R12", "R13", "R14", "R15",
+        ] {
+            if let Some(var) = vm.cpu.arch.sleigh.get_varnode(name) {
+                registers.push_str(&format!("{name}={:#x} ", vm.cpu.read_reg(var)));
+            }
+        }
+        eprintln!("[runner] fault registers: {registers}");
         // What the faulting page is actually mapped as. A jump into a page
         // the loader left non-executable and a jump into nothing at all look
         // identical from the exception alone.

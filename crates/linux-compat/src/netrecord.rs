@@ -258,6 +258,10 @@ impl<B: NetworkBroker> NetworkBroker for RecordingBroker<B> {
         self.inner.tcp_shutdown_write(handle)
     }
 
+    fn pending_read_bytes(&mut self, handle: Handle) -> Result<Option<usize>, u64> {
+        self.inner.pending_read_bytes(handle)
+    }
+
     fn udp_open(&mut self) -> Result<Handle, u64> {
         let result = self.inner.udp_open();
         self.record(NetEvent::UdpOpen { result });
@@ -382,6 +386,37 @@ impl NetworkBroker for ReplayBroker {
 
     fn tcp_shutdown_write(&mut self, _handle: Handle) -> Result<(), u64> {
         Ok(())
+    }
+
+    fn pending_read_bytes(&mut self, _handle: Handle) -> Result<Option<usize>, u64> {
+        // Queue inspection must not consume an event: the next real receive
+        // still has to replay the same bytes.  The recording preserves the
+        // received result, which is enough to reconstruct Linux FIONREAD's
+        // next-read size without inventing host input.
+        match self.recording.events.get(self.cursor) {
+            Some(NetEvent::Received {
+                outcome: RecordedRecv::Data(bytes),
+                ..
+            }) => Ok(Some(bytes.len())),
+            Some(NetEvent::Received {
+                outcome: RecordedRecv::Closed,
+                ..
+            }) => Ok(Some(0)),
+            Some(NetEvent::Received {
+                outcome: RecordedRecv::WouldBlock,
+                ..
+            }) => Ok(None),
+            Some(NetEvent::Received {
+                outcome: RecordedRecv::Error(errno),
+                ..
+            }) => Err(*errno),
+            Some(NetEvent::ReceivedFrom {
+                result: Some((bytes, _)),
+                ..
+            }) => Ok(Some(bytes.len())),
+            Some(NetEvent::ReceivedFrom { result: None, .. }) | None => Ok(None),
+            Some(_) => Ok(None),
+        }
     }
 
     fn udp_open(&mut self) -> Result<Handle, u64> {

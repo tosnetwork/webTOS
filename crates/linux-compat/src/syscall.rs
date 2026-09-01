@@ -201,12 +201,16 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
     // guest ELF mapping.  This is deliberately opt-in: it is useful when a
     // dynamically linked workload has several libc wrappers for one syscall,
     // while keeping the normal runner and browser surface silent.
-    if std::env::var_os("SYSCALL_IP_TRACE").is_some()
+    let trace_ip = std::env::var_os("SYSCALL_IP_TRACE").is_some()
         && std::env::var("SYSCALL_IP_TRACE_NR")
             .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_none_or(|wanted| wanted == nr)
-    {
+            .is_none_or(|numbers| {
+                numbers
+                    .split(',')
+                    .filter_map(|value| value.trim().parse::<u64>().ok())
+                    .any(|wanted| wanted == nr)
+            });
+    if trace_ip {
         eprintln!(
             "[syscall-ip] pid={} ic={} rip={:#x} nr={nr} args=({a0:#x},{a1:#x},{a2:#x},{a3:#x},{a4:#x},{a5:#x})",
             env.proc.pid,
@@ -214,6 +218,19 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
             cpu.read_pc(),
         );
     }
+    // Opt-in result tracing complements SYSCALL_IP_TRACE when diagnosing a
+    // guest runtime's feature probe. It is deliberately independent from
+    // `tracing` so a user can inspect a small syscall set without emitting a
+    // multi-gigabyte instruction/runtime trace. The value is a comma-separated
+    // list of syscall numbers, e.g. `41,42,47,51`.
+    let trace_result = std::env::var("SYSCALL_RESULT_TRACE_NR")
+        .ok()
+        .is_some_and(|numbers| {
+            numbers
+                .split(',')
+                .filter_map(|value| value.trim().parse::<u64>().ok())
+                .any(|wanted| wanted == nr)
+        });
     let trace_entry = env.trace.is_some().then(|| (cpu.icount(), env.proc.pid));
 
     // A signal whose disposition is the default action and whose default is
@@ -249,6 +266,20 @@ pub fn handle(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<VmExit> {
         // write and no trace event — the retried attempt emits the real ones.
         Outcome::Ret(Err(PAGE_IN_RESTART)) => Some(VmExit::Interrupted),
         Outcome::Ret(result) => {
+            if trace_result {
+                match &result {
+                    Ok(value) => eprintln!(
+                        "[syscall-result] pid={} ic={} nr={nr} -> {value:#x}",
+                        env.proc.pid,
+                        cpu.icount()
+                    ),
+                    Err(errno) => eprintln!(
+                        "[syscall-result] pid={} ic={} nr={nr} -> -{errno}",
+                        env.proc.pid,
+                        cpu.icount()
+                    ),
+                }
+            }
             let value = match result {
                 Ok(v) => v,
                 Err(errno) => {
@@ -371,7 +402,14 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_WRITEV => outcome_vectored(env, cpu, a[0], a[1], a[2], true),
         // Terminal-changing ioctls may stop a background process group before
         // they mutate the pty, so they need the scheduler-aware Outcome path.
-        abi::SYS_IOCTL => outcome_ioctl(env, cpu, a[0], a[1], a[2]),
+        // Linux declares ioctl's first argument as `unsigned int fd`.
+        // x86-64 callers are allowed to leave the upper half of the argument
+        // register unspecified when materialising a narrow integer.  Native
+        // runtimes such as Bun's JSC bridge do exactly that: their tagged JS
+        // value leaves bits above the low 32-bit fd intact.  The real kernel
+        // truncates at the syscall wrapper boundary, so do the same before
+        // descriptor lookup instead of treating the tag bits as EBADF.
+        abi::SYS_IOCTL => outcome_ioctl(env, cpu, a[0] as u32 as u64, a[1], a[2]),
         abi::SYS_FORK => sys_clone_impl(env, cpu, CloneSpec::fork()),
         abi::SYS_VFORK => sys_clone_impl(env, cpu, CloneSpec::vfork()),
         abi::SYS_CLONE => {
@@ -429,8 +467,10 @@ fn dispatch(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> Outcome 
         abi::SYS_SENDTO => sys_sendto(env, cpu, a),
         abi::SYS_RECVFROM => sys_recvfrom(env, cpu, a),
         abi::SYS_SENDMSG => sys_sendmsg(env, cpu, a),
+        abi::SYS_SENDMMSG => sys_sendmmsg(env, cpu, a),
         abi::SYS_RECVMSG => sys_recvmsg(env, cpu, a),
         abi::SYS_EPOLL_WAIT | abi::SYS_EPOLL_PWAIT => sys_epoll_wait(env, cpu, a),
+        abi::SYS_EPOLL_PWAIT2 => sys_epoll_pwait2(env, cpu, a),
         abi::SYS_SELECT => sys_select(env, cpu, a, false),
         abi::SYS_PSELECT6 => sys_select(env, cpu, a, true),
         abi::SYS_SENDFILE => sys_sendfile(env, cpu, a),
@@ -520,31 +560,111 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_GETPEERNAME => sys_getpeername(env, cpu, a[0], a[1], a[2]),
         abi::SYS_GETSOCKNAME => {
             let socket = net_of(env, a[0])?;
-            let local = {
+            let (kind, family, handle, broker, local_protocol_id) = {
                 let inner = socket.borrow();
-                inner
-                    .handle
-                    .and_then(|handle| inner.broker.borrow_mut().local_addr(handle))
+                (
+                    inner.kind,
+                    inner.family,
+                    inner.handle,
+                    inner.broker.clone(),
+                    inner.local_protocol_id,
+                )
             };
-            // Before connect/bind there is no endpoint yet: unspecified.
-            let local = local.unwrap_or(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::UNSPECIFIED,
-                0,
-            ));
-            write_sockaddr_in(env, cpu, a[1], a[2], local)?;
+            if kind == SocketKind::NetlinkRoute {
+                // Linux exposes a sockaddr_nl here, including the process
+                // port ID assigned by the kernel. Address-discovery clients
+                // validate that family before accepting a route dump.
+                write_sockaddr_nl(env, cpu, a[1], a[2], local_protocol_id, 0)?;
+                return Ok(0);
+            }
+            let local = match (family, handle) {
+                (AF_INET6, Some(handle)) => broker
+                    .borrow_mut()
+                    .local_addr_v6(handle)
+                    .map(std::net::SocketAddr::V6)
+                    .unwrap_or_else(|| {
+                        std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                            std::net::Ipv6Addr::UNSPECIFIED,
+                            0,
+                            0,
+                            0,
+                        ))
+                    }),
+                (_, Some(handle)) => broker
+                    .borrow_mut()
+                    .local_addr(handle)
+                    .map(std::net::SocketAddr::V4)
+                    .unwrap_or_else(|| {
+                        std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                            std::net::Ipv4Addr::UNSPECIFIED,
+                            0,
+                        ))
+                    }),
+                (AF_INET6, None) => std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                    std::net::Ipv6Addr::UNSPECIFIED,
+                    0,
+                    0,
+                    0,
+                )),
+                _ => std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                )),
+            };
+            write_sockaddr(env, cpu, a[1], a[2], local)?;
             Ok(0)
         }
         abi::SYS_SETSOCKOPT => net_of(env, a[0]).map(|_| 0),
         abi::SYS_GETSOCKOPT => sys_getsockopt(env, cpu, a),
         abi::SYS_SOCKETPAIR => sys_socketpair(env, cpu, a),
         abi::SYS_BIND => {
-            let target = parse_sockaddr_in(env, cpu, a[1], a[2])?;
-            if target.port() == 0 {
+            let socket = net_of(env, a[0])?;
+            let (kind, family) = {
+                let inner = socket.borrow();
+                (inner.kind, inner.family)
+            };
+            if kind == SocketKind::NetlinkRoute {
+                // sockaddr_nl(pid=0, groups=0): kernel-assigned local port
+                // and no multicast subscription. The deterministic route view
+                // is strictly request/reply, so there is no bind-side state.
+                return Ok(0);
+            }
+            if kind == SocketKind::Unix {
+                // A local-domain listener remains inside the guest VFS; it
+                // is not a route to the host. Runtime CLIs reserve a private
+                // control endpoint before deciding whether a helper needs to
+                // connect to it. Validate the sockaddr shape now; listener
+                // rendezvous is handled by the local socket path below.
+                if a[2] < 3 {
+                    return Err(abi::EINVAL);
+                }
+                let bytes = read_mem(env, cpu, a[1], (a[2] as usize).min(108))?;
+                let bound_family =
+                    u16::from_le_bytes(bytes[..2].try_into().expect("sockaddr family")) as u64;
+                return if bound_family == AF_UNIX {
+                    Ok(0)
+                } else {
+                    Err(abi::EAFNOSUPPORT)
+                };
+            }
+            let port = match family {
+                AF_INET => parse_sockaddr_in(env, cpu, a[1], a[2])?.port(),
+                AF_INET6 => parse_sockaddr_in6(env, cpu, a[1], a[2])?.port(),
+                _ => return Err(abi::EAFNOSUPPORT),
+            };
+            if port == 0 {
                 Ok(0) // ephemeral bind: the broker already does this
             } else {
                 tracing::warn!("bind to a specific port is not supported (no listeners)");
                 Err(abi::EOPNOTSUPP)
             }
+        }
+        abi::SYS_LISTEN
+            if net_of(env, a[0]).is_ok_and(|socket| socket.borrow().kind == SocketKind::Unix) =>
+        {
+            // The listener is a guest-local control endpoint. It is not
+            // brokered and cannot accept host-originated connections.
+            Ok(0)
         }
         abi::SYS_LISTEN | abi::SYS_ACCEPT | abi::SYS_ACCEPT4 => {
             tracing::warn!("listening sockets are not supported (client-only network)");
@@ -670,7 +790,8 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             }
             Ok(0)
         }
-        abi::SYS_GETUID | abi::SYS_GETGID | abi::SYS_GETEUID | abi::SYS_GETEGID => Ok(0),
+        abi::SYS_GETUID | abi::SYS_GETEUID => Ok(env.proc.uid as u64),
+        abi::SYS_GETGID | abi::SYS_GETEGID => Ok(env.proc.gid as u64),
         abi::SYS_GETGROUPS => Ok(0),
         abi::SYS_SCHED_SETSCHEDULER => sys_sched_setscheduler(env, cpu, a[0], a[1], a[2]),
         abi::SYS_SETSID => {
@@ -1776,8 +1897,8 @@ fn stat_of_node(env: &LinuxEnv, node: usize) -> abi::Stat {
         ino: node as u64 + 1,
         nlink: n.nlink,
         mode: n.file_type_bits() | (n.mode & 0o7777),
-        uid: 0,
-        gid: 0,
+        uid: env.proc.uid,
+        gid: env.proc.gid,
         rdev: 0,
         size,
         blksize: 4096,
@@ -1852,8 +1973,15 @@ fn sys_statpath(
     let path = path_arg(env, cpu, path_ptr)?;
     let base = dir_of(env, dirfd)?;
     let resolved = env.vfs.resolve(base, &path, follow)?;
-    let node = resolved.node.ok_or(abi::ENOENT)?;
-    let stat = stat_of_node(env, node);
+    let stat = match resolved.node {
+        Some(node) => stat_of_node(env, node),
+        // A pty slave is a kernel-created character device rather than a
+        // persistent VFS node. It must nevertheless be visible to path-based
+        // stat after a runtime canonicalizes stdin through `/proc/self/fd/0`.
+        // Bun performs exactly that sequence before deciding whether to enter
+        // its interactive frontend.
+        None => stat_of_dynamic_pty(env, resolved.parent, &resolved.name).ok_or(abi::ENOENT)?,
+    };
     write_mem(env, cpu, buf, &stat.encode())?;
     Ok(0)
 }
@@ -1889,7 +2017,10 @@ fn sys_statx(
         let base = dir_of(env, dirfd)?;
         let follow = flags & abi::AT_SYMLINK_NOFOLLOW == 0;
         let resolved = env.vfs.resolve(base, &path, follow)?;
-        stat_of_node(env, resolved.node.ok_or(abi::ENOENT)?)
+        match resolved.node {
+            Some(node) => stat_of_node(env, node),
+            None => stat_of_dynamic_pty(env, resolved.parent, &resolved.name).ok_or(abi::ENOENT)?,
+        }
     };
 
     let mut out = [0_u8; 256];
@@ -1922,6 +2053,29 @@ fn sys_statx(
     put(136, &1_u32.to_le_bytes()); // dev_major
     write_mem(env, cpu, buf, &out)?;
     Ok(0)
+}
+
+/// Metadata for a live `/dev/pts/<id>` slave. The VFS deliberately does not
+/// materialize a node for every allocated pty, but Linux exposes each one to
+/// both `open(2)` and `stat(2)` while its master exists.
+fn stat_of_dynamic_pty(env: &LinuxEnv, parent: usize, name: &[u8]) -> Option<abi::Stat> {
+    let pts_dir = env.vfs.resolve(crate::vfs::ROOT, b"/dev/pts", true).ok()?;
+    if pts_dir.node != Some(parent) {
+        return None;
+    }
+    let id = std::str::from_utf8(name).ok()?.parse::<u64>().ok()?;
+    env.ptys.get(&id)?;
+    Some(abi::Stat {
+        dev: 1,
+        // Keep the dynamic device distinguishable from an fd's generic
+        // synthetic inode while retaining stable metadata for its lifetime.
+        ino: u64::MAX.saturating_sub(id),
+        nlink: 1,
+        mode: abi::S_IFCHR | 0o620,
+        rdev: 136 << 8,
+        blksize: 1024,
+        ..Default::default()
+    })
 }
 
 fn sys_faccessat(env: &mut LinuxEnv, cpu: &mut Cpu, dirfd: u64, path_ptr: u64) -> SysResult {
@@ -2350,6 +2504,23 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
                     write_end: false,
                 } => inner.borrow().data.len() as u32,
                 Backing::SocketPair { rx, .. } => rx.borrow().data.len() as u32,
+                Backing::Net(socket) => {
+                    let socket = socket.borrow();
+                    match socket.kind {
+                        SocketKind::NetlinkRoute => socket.local_rx.len() as u32,
+                        SocketKind::Unix => 0,
+                        SocketKind::Tcp | SocketKind::Udp => match socket.handle {
+                            Some(handle) => socket
+                                .broker
+                                .borrow_mut()
+                                .pending_read_bytes(handle)?
+                                .unwrap_or(0)
+                                .min(u32::MAX as usize)
+                                as u32,
+                            None => 0,
+                        },
+                    }
+                }
                 _ => 0,
             };
             drop(desc);
@@ -2368,12 +2539,16 @@ fn sys_ioctl(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, request: u64, arg: u64)
     };
     if let Some((pty, is_master)) = pty {
         match request {
-            abi::TIOCGPTN => {
+            // These are ioctls on the `/dev/ptmx` master. A slave fd must
+            // reject them with ENOTTY, matching Linux. Keep the endpoint
+            // distinction explicit: a program may probe both a terminal slave
+            // and a pty allocator while setting up its terminal backend.
+            abi::TIOCGPTN if is_master => {
                 let id = pty.borrow().id as u32;
                 write_mem(env, cpu, arg, &id.to_le_bytes())?;
                 return Ok(0);
             }
-            abi::TIOCSPTLCK => return Ok(0), // slave unlock: always unlocked
+            abi::TIOCSPTLCK if is_master => return Ok(0), // slave unlock: always unlocked
             abi::TCGETS => {
                 let termios = pty.borrow().termios;
                 write_mem(env, cpu, arg, &termios)?;
@@ -4040,21 +4215,7 @@ fn signal_restarts_the_syscall(env: &LinuxEnv) -> Option<bool> {
 /// the host-driven stdio pty with no keystrokes queued. An interactive
 /// program waiting for the user to type is not a deadlock.
 fn blocked_on_terminal_input(env: &LinuxEnv) -> bool {
-    let Some(stdio) = env.stdio_pty.as_ref() else {
-        return false;
-    };
-    if !env.stdio_input.is_empty() {
-        return false;
-    }
-    env.sched.parked.iter().any(|task| match &task.state {
-        ParkState::Waiting { watches, deadline } => {
-            deadline.is_none()
-                && watches.iter().any(|watch| {
-                    matches!(watch, Watch::PtyReadable(pty, false) if std::rc::Rc::ptr_eq(pty, stdio))
-                })
-        }
-        _ => false,
-    })
+    env.terminal_input_pending()
 }
 
 /// Classifies a total stall: an interactive pause the host can end by typing,
@@ -5443,6 +5604,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
     enum Kind {
         Plain,
         Pipe(crate::fd::PipeRef),
+        Inotify(crate::fd::InotifyRef),
         Event(crate::fd::EventFdRef),
         Timer(crate::fd::TimerFdRef),
         Net(crate::fd::NetRef),
@@ -5461,6 +5623,7 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             } => Kind::Pipe(std::rc::Rc::clone(inner)),
             Backing::Pipe { .. } => return Outcome::Ret(Err(abi::EBADF)),
             Backing::SocketPair { rx, .. } => Kind::Pipe(std::rc::Rc::clone(rx)),
+            Backing::Inotify(inner) => Kind::Inotify(std::rc::Rc::clone(inner)),
             Backing::EventFd(event) => Kind::Event(std::rc::Rc::clone(event)),
             Backing::TimerFd(timer) => Kind::Timer(std::rc::Rc::clone(timer)),
             Backing::Net(socket) => Kind::Net(std::rc::Rc::clone(socket)),
@@ -5514,6 +5677,23 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             };
             match write_mem(env, cpu, buf, &chunk) {
                 Ok(()) => Outcome::Ret(Ok(chunk.len() as u64)),
+                Err(errno) => Outcome::Ret(Err(errno)),
+            }
+        }
+        Kind::Inotify(inotify) => {
+            let bytes = {
+                let mut inner = inotify.borrow_mut();
+                if inner.queue.is_empty() {
+                    drop(inner);
+                    return would_block(env, cpu, Watch::InotifyReadable(inotify));
+                }
+                match read_inotify(&mut inner, count.min(0x40_0000) as usize) {
+                    Ok(bytes) => bytes,
+                    Err(errno) => return Outcome::Ret(Err(errno)),
+                }
+            };
+            match write_mem(env, cpu, buf, &bytes) {
+                Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
                 Err(errno) => Outcome::Ret(Err(errno)),
             }
         }
@@ -5580,6 +5760,31 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
             }
         }
         Kind::Net(socket) => {
+            // This is deliberately an opt-in, metadata-only diagnostic.  It
+            // helps distinguish a transport failure from a higher-level TLS
+            // or HTTP failure without ever logging application bytes.
+            let trace_tcp = std::env::var_os("SYSCALL_NET_TRACE").is_some()
+                && socket.borrow().kind == crate::fd::SocketKind::Tcp;
+            // NETLINK_ROUTE is a guest-local request/reply protocol.  Its
+            // pending bytes must be consumed exactly once just like a pipe:
+            // retaining them made a second recv replay the beginning of an
+            // earlier dump, which can make an event loop spin forever or
+            // parse one address record twice.
+            if socket.borrow().kind == crate::fd::SocketKind::NetlinkRoute {
+                let bytes: Vec<u8> = {
+                    let mut inner = socket.borrow_mut();
+                    let take = count.min(inner.local_rx.len() as u64) as usize;
+                    if take == 0 {
+                        return Outcome::Ret(Err(abi::EAGAIN));
+                    }
+                    inner.activity += 1;
+                    inner.local_rx.drain(..take).collect()
+                };
+                return match write_mem(env, cpu, buf, &bytes) {
+                    Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
+                    Err(errno) => Outcome::Ret(Err(errno)),
+                };
+            }
             let result = {
                 let inner = socket.borrow();
                 let Some(handle) = inner.handle else {
@@ -5600,21 +5805,50 @@ fn outcome_read(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u64
                             Err(errno) => Err(errno),
                         }
                     }
+                    crate::fd::SocketKind::Unix => return Outcome::Ret(Err(abi::ENOTCONN)),
+                    crate::fd::SocketKind::NetlinkRoute => unreachable!(
+                        "guest-local NETLINK_ROUTE reads are handled before broker dispatch"
+                    ),
                 }
             };
             match result {
                 Ok(crate::net::RecvOutcome::Data(bytes)) => {
+                    if trace_tcp {
+                        eprintln!(
+                            "[net] pid={} fd={} tcp recv requested={} received={}",
+                            env.proc.pid,
+                            fd,
+                            count,
+                            bytes.len()
+                        );
+                    }
                     socket.borrow_mut().activity += 1;
                     match write_mem(env, cpu, buf, &bytes) {
                         Ok(()) => Outcome::Ret(Ok(bytes.len() as u64)),
                         Err(errno) => Outcome::Ret(Err(errno)),
                     }
                 }
-                Ok(crate::net::RecvOutcome::Closed) => Outcome::Ret(Ok(0)),
+                Ok(crate::net::RecvOutcome::Closed) => {
+                    if trace_tcp {
+                        eprintln!("[net] pid={} fd={} tcp recv closed", env.proc.pid, fd);
+                    }
+                    Outcome::Ret(Ok(0))
+                }
                 Ok(crate::net::RecvOutcome::WouldBlock) => {
+                    if trace_tcp {
+                        eprintln!("[net] pid={} fd={} tcp recv would-block", env.proc.pid, fd);
+                    }
                     would_block(env, cpu, Watch::NetReadable(socket))
                 }
-                Err(errno) => Outcome::Ret(Err(errno)),
+                Err(errno) => {
+                    if trace_tcp {
+                        eprintln!(
+                            "[net] pid={} fd={} tcp recv errno={}",
+                            env.proc.pid, fd, errno
+                        );
+                    }
+                    Outcome::Ret(Err(errno))
+                }
             }
         }
         Kind::Pty(pty, master) => {
@@ -5766,11 +6000,37 @@ fn outcome_write(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, buf: u64, count: u6
                 (crate::fd::SocketKind::Tcp, _) => {
                     inner.broker.borrow_mut().tcp_send(handle, &bytes)
                 }
-                (crate::fd::SocketKind::Udp, Some(peer)) => {
+                (crate::fd::SocketKind::Udp, Some(std::net::SocketAddr::V4(peer))) => {
                     inner.broker.borrow_mut().udp_send_to(handle, peer, &bytes)
                 }
+                (crate::fd::SocketKind::Udp, Some(std::net::SocketAddr::V6(peer))) => inner
+                    .broker
+                    .borrow_mut()
+                    .udp_send_to_v6(handle, peer, &bytes),
                 (crate::fd::SocketKind::Udp, None) => Err(abi::EDESTADDRREQ),
+                (crate::fd::SocketKind::Unix, _) => Err(abi::ENOTCONN),
+                (crate::fd::SocketKind::NetlinkRoute, _) => Err(abi::EOPNOTSUPP),
             };
+            if std::env::var_os("SYSCALL_NET_TRACE").is_some()
+                && inner.kind == crate::fd::SocketKind::Tcp
+            {
+                match &result {
+                    Ok(sent) => eprintln!(
+                        "[net] pid={} fd={} tcp write requested={} sent={}",
+                        env.proc.pid,
+                        fd,
+                        bytes.len(),
+                        sent
+                    ),
+                    Err(errno) => eprintln!(
+                        "[net] pid={} fd={} tcp write requested={} errno={}",
+                        env.proc.pid,
+                        fd,
+                        bytes.len(),
+                        errno
+                    ),
+                }
+            }
             drop(inner);
             if result.is_ok() {
                 socket.borrow_mut().activity += 1;
@@ -6150,9 +6410,15 @@ fn sys_kill(env: &mut LinuxEnv, cpu: &mut Cpu, target: u64, signal: u64) -> Outc
     Outcome::Ret(if found { Ok(0) } else { Err(abi::ESRCH) })
 }
 
-/// `readv`/`writev` via the pipe-aware single-buffer path: exactly one
-/// non-empty segment is processed per call (a short transfer, which POSIX
-/// permits; callers loop). This keeps blocking restarts idempotent.
+/// `readv`/`writev` via the pipe-aware single-buffer path.  Network `writev`
+/// is the important exception: TLS and HTTP clients routinely split a single
+/// protocol record across several iovecs.  Reporting success after forwarding
+/// only the first segment emits a malformed ClientHello, after which a peer
+/// correctly closes the connection.  Gather the complete bounded record and
+/// admit it once through the same broker path as `sendmsg`.
+///
+/// Non-network descriptors retain the one-segment short-transfer behavior,
+/// which keeps a blocked pipe/PTY restart idempotent.
 fn outcome_vectored(
     env: &mut LinuxEnv,
     cpu: &mut Cpu,
@@ -6165,6 +6431,29 @@ fn outcome_vectored(
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
+    if write {
+        if let Ok(socket) = net_of(env, fd) {
+            let mut bytes = Vec::new();
+            for (base, len) in &entries {
+                if *len == 0 {
+                    continue;
+                }
+                let remaining = 0x40_0000_usize.saturating_sub(bytes.len());
+                if remaining == 0 {
+                    return Outcome::Ret(Err(abi::EMSGSIZE));
+                }
+                let part = match read_mem(env, cpu, *base, (*len as usize).min(remaining)) {
+                    Ok(part) => part,
+                    Err(errno) => return Outcome::Ret(Err(errno)),
+                };
+                if part.len() != *len as usize {
+                    return Outcome::Ret(Err(abi::EMSGSIZE));
+                }
+                bytes.extend_from_slice(&part);
+            }
+            return Outcome::Ret(net_send_bytes(&socket, None, &bytes).map(|count| count as u64));
+        }
+    }
     for (base, len) in entries {
         if len == 0 {
             continue;
@@ -6184,10 +6473,14 @@ use crate::fd::{EpollInner, EventFdInner, NetSocket, SocketKind, TimerFdInner};
 use crate::proc::Watch;
 
 const AF_UNIX: u64 = 1;
+const AF_UNSPEC: u64 = 0;
 const AF_INET: u64 = 2;
+const AF_INET6: u64 = 10;
+const AF_NETLINK: u64 = 16;
 const SOCK_TYPE_MASK: u64 = 0xff;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0x800;
 const SOCK_CLOEXEC: u64 = 0x8_0000;
 
@@ -6215,21 +6508,10 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
     // the host has queued keystrokes, deliver them and wake. This is what lets
     // an interactive program on a pty make progress instead of deadlocking.
     if !env.stdio_input.is_empty() {
-        if let Some(pty) = env.stdio_pty.clone() {
-            let waiting = pty.borrow().m2s.is_empty();
-            if waiting {
-                let bytes: Vec<u8> = env.stdio_input.drain(..).collect();
-                let mut p = pty.borrow_mut();
-                let signal = p.feed_input(&bytes);
-                let pgrp = p.fg_pgrp;
-                drop(p);
-                if let Some(sig) = signal {
-                    deliver_signal_to_pgrp(env, pgrp, sig);
-                }
-                if let Some(index) = env.sched.find_ready(now) {
-                    return Some(index);
-                }
-            }
+        let bytes: Vec<u8> = env.stdio_input.drain(..).collect();
+        env.deliver_terminal_input(&bytes);
+        if let Some(index) = env.sched.find_ready(now) {
+            return Some(index);
         }
     }
 
@@ -6306,20 +6588,61 @@ fn parse_sockaddr_in(
     Ok(std::net::SocketAddrV4::new(ip, port))
 }
 
-fn write_sockaddr_in(
+fn parse_sockaddr_in6(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr: u64,
+    len: u64,
+) -> Result<std::net::SocketAddrV6, u64> {
+    if len < 28 {
+        return Err(abi::EINVAL);
+    }
+    let bytes = read_mem(env, cpu, addr, 28)?;
+    let family = u16::from_le_bytes(bytes[..2].try_into().expect("slice length"));
+    if family as u64 != AF_INET6 {
+        return Err(abi::EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes(bytes[2..4].try_into().expect("slice length"));
+    let flowinfo = u32::from_be_bytes(bytes[4..8].try_into().expect("slice length"));
+    let mut octets = [0_u8; 16];
+    octets.copy_from_slice(&bytes[8..24]);
+    let scope_id = u32::from_ne_bytes(bytes[24..28].try_into().expect("slice length"));
+    Ok(std::net::SocketAddrV6::new(
+        std::net::Ipv6Addr::from(octets),
+        port,
+        flowinfo,
+        scope_id,
+    ))
+}
+
+fn write_sockaddr(
     env: &mut LinuxEnv,
     cpu: &mut Cpu,
     addr_ptr: u64,
     len_ptr: u64,
-    addr: std::net::SocketAddrV4,
+    addr: std::net::SocketAddr,
 ) -> Result<(), u64> {
     if addr_ptr == 0 {
         return Ok(());
     }
-    let mut out = [0_u8; 16];
-    out[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
-    out[2..4].copy_from_slice(&addr.port().to_be_bytes());
-    out[4..8].copy_from_slice(&addr.ip().octets());
+    let out = match addr {
+        std::net::SocketAddr::V4(addr) => {
+            let mut out = vec![0_u8; 16];
+            out[..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+            out[2..4].copy_from_slice(&addr.port().to_be_bytes());
+            out[4..8].copy_from_slice(&addr.ip().octets());
+            out
+        }
+        std::net::SocketAddr::V6(addr) => {
+            let mut out = vec![0_u8; 28];
+            out[..2].copy_from_slice(&(AF_INET6 as u16).to_le_bytes());
+            out[2..4].copy_from_slice(&addr.port().to_be_bytes());
+            out[4..8].copy_from_slice(&addr.flowinfo().to_be_bytes());
+            out[8..24].copy_from_slice(&addr.ip().octets());
+            out[24..28].copy_from_slice(&addr.scope_id().to_ne_bytes());
+            out
+        }
+    };
     // The caller's socklen bounds the write (the address is truncated when
     // the buffer is short); the full length is reported back regardless.
     let cap = if len_ptr != 0 {
@@ -6330,7 +6653,36 @@ fn write_sockaddr_in(
     };
     write_mem(env, cpu, addr_ptr, &out[..out.len().min(cap)])?;
     if len_ptr != 0 {
-        write_mem(env, cpu, len_ptr, &16_u32.to_le_bytes())?;
+        write_mem(env, cpu, len_ptr, &(out.len() as u32).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_sockaddr_nl(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    addr_ptr: u64,
+    len_ptr: u64,
+    pid: u32,
+    groups: u32,
+) -> Result<(), u64> {
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+    // struct sockaddr_nl { sa_family_t; unsigned short pad; u32 pid; u32 groups; }
+    let mut out = [0_u8; 12];
+    out[..2].copy_from_slice(&(AF_NETLINK as u16).to_ne_bytes());
+    out[4..8].copy_from_slice(&pid.to_ne_bytes());
+    out[8..12].copy_from_slice(&groups.to_ne_bytes());
+    let cap = if len_ptr != 0 {
+        let bytes = read_mem(env, cpu, len_ptr, 4)?;
+        u32::from_le_bytes(bytes.try_into().expect("read_mem length")) as usize
+    } else {
+        out.len()
+    };
+    write_mem(env, cpu, addr_ptr, &out[..out.len().min(cap)])?;
+    if len_ptr != 0 {
+        write_mem(env, cpu, len_ptr, &(out.len() as u32).to_le_bytes())?;
     }
     Ok(())
 }
@@ -6356,27 +6708,46 @@ fn install_fd(env: &mut LinuxEnv, backing: Backing, flags: u64, cloexec: bool) -
 }
 
 fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -> SysResult {
-    let Some(broker) = env.net.clone() else {
-        tracing::warn!("socket: network is denied (no broker attached)");
-        return Err(abi::EAFNOSUPPORT);
-    };
-    if domain != AF_INET {
+    if domain != AF_INET && domain != AF_INET6 && domain != AF_UNIX && domain != AF_NETLINK {
         tracing::warn!("socket: unsupported domain {domain}");
         return Err(abi::EAFNOSUPPORT);
     }
-    let kind = match sock_type & SOCK_TYPE_MASK {
-        SOCK_STREAM => SocketKind::Tcp,
-        SOCK_DGRAM => SocketKind::Udp,
+    let broker = match env.net.clone() {
+        Some(broker) => broker,
+        // AF_UNIX is a local kernel facility, not an opt-in route to the
+        // host network. It still needs a descriptor object so connect can
+        // faithfully return ENOENT for an absent guest service such as nscd.
+        None if domain == AF_UNIX || domain == AF_NETLINK => {
+            std::rc::Rc::new(std::cell::RefCell::new(crate::net::HostBroker::new()))
+        }
+        None => {
+            tracing::warn!("socket: network is denied (no broker attached)");
+            return Err(abi::EAFNOSUPPORT);
+        }
+    };
+    let kind = match (domain, sock_type & SOCK_TYPE_MASK) {
+        (AF_UNIX, SOCK_STREAM | SOCK_DGRAM) => SocketKind::Unix,
+        (AF_NETLINK, SOCK_RAW) if _protocol == 0 => SocketKind::NetlinkRoute,
+        (_, SOCK_STREAM) => SocketKind::Tcp,
+        (AF_INET | AF_INET6, SOCK_DGRAM) => SocketKind::Udp,
+        (_, SOCK_DGRAM) => return Err(abi::EAFNOSUPPORT),
         other => {
-            tracing::warn!("socket: unsupported type {other}");
+            tracing::warn!("socket: unsupported type {}", other.1);
             return Err(abi::EPROTONOSUPPORT);
         }
     };
     let socket = NetSocket {
         broker,
         kind,
-        handle: None,
+        family: domain,
+        // Local protocol sockets do not own a broker handle; a nonzero
+        // sentinel lets the shared read path reach their in-kernel queue.
+        handle: (kind == SocketKind::NetlinkRoute).then_some(0),
         peer: None,
+        local_rx: Default::default(),
+        local_protocol_id: (kind == SocketKind::NetlinkRoute)
+            .then_some(env.proc.tgid as u32)
+            .unwrap_or(0),
         activity: 0,
     };
     let flags = abi::O_RDWR | ((sock_type & SOCK_NONBLOCK != 0) as u64 * abi::O_NONBLOCK);
@@ -6390,21 +6761,216 @@ fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -
 
 fn sys_connect(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
     let socket = net_of(env, fd)?;
-    let target = parse_sockaddr_in(env, cpu, addr, len)?;
     let mut inner = socket.borrow_mut();
+    if inner.family == AF_UNIX {
+        // Linux's libc probes local nscd/system-daemon paths before falling
+        // back to DNS. Validate the supplied sockaddr_un shape, then report
+        // the guest-visible absence of that service as ENOENT rather than
+        // pretending local IPC is an unsupported network family.
+        if len < 3 {
+            return Err(abi::EINVAL);
+        }
+        let bytes = read_mem(env, cpu, addr, (len as usize).min(108))?;
+        let family = u16::from_le_bytes(bytes[..2].try_into().expect("sockaddr family"));
+        if family as u64 != AF_UNIX {
+            return Err(abi::EAFNOSUPPORT);
+        }
+        return Err(abi::ENOENT);
+    }
+    // Linux uses connect(AF_UNSPEC) to detach a datagram peer so that the
+    // same socket can be reused for another address-family probe. It is not
+    // an IPv6 sockaddr with a bad family. NativeBroker uses send_to rather
+    // than an OS-level connected UDP socket, so clearing the guest peer is
+    // the complete observable operation here.
+    if (inner.family == AF_INET || inner.family == AF_INET6) && len >= 2 {
+        let family = u16::from_le_bytes(
+            read_mem(env, cpu, addr, 2)?
+                .try_into()
+                .expect("sockaddr family"),
+        ) as u64;
+        if family == AF_UNSPEC {
+            inner.peer = None;
+            return Ok(0);
+        }
+    }
+    let target = match inner.family {
+        AF_INET => std::net::SocketAddr::V4(parse_sockaddr_in(env, cpu, addr, len)?),
+        AF_INET6 => std::net::SocketAddr::V6(parse_sockaddr_in6(env, cpu, addr, len)?),
+        _ => return Err(abi::EAFNOSUPPORT),
+    };
+    if std::env::var_os("SYSCALL_NET_TRACE").is_some() {
+        eprintln!(
+            "[syscall-net] pid={} connect fd={fd} kind={:?} target={target}",
+            env.proc.pid, inner.kind
+        );
+    }
     match inner.kind {
         SocketKind::Tcp => {
-            let handle = inner.broker.borrow_mut().tcp_connect(target)?;
+            let handle = match target {
+                std::net::SocketAddr::V4(target) => {
+                    inner.broker.borrow_mut().tcp_connect(target)?
+                }
+                std::net::SocketAddr::V6(target) => {
+                    inner.broker.borrow_mut().tcp_connect_v6(target)?
+                }
+            };
             inner.handle = Some(handle);
         }
         SocketKind::Udp => {
             if inner.handle.is_none() {
-                let handle = inner.broker.borrow_mut().udp_open()?;
+                let handle = match target {
+                    std::net::SocketAddr::V4(_) => inner.broker.borrow_mut().udp_open()?,
+                    std::net::SocketAddr::V6(_) => inner.broker.borrow_mut().udp_open_v6()?,
+                };
                 inner.handle = Some(handle);
             }
         }
+        SocketKind::Unix => return Err(abi::ENOTCONN),
+        SocketKind::NetlinkRoute => return Ok(0),
     }
     inner.peer = Some(target);
+    Ok(0)
+}
+
+/// Implements the deliberately small, guest-local subset of NETLINK_ROUTE
+/// required by runtime address discovery: RTM_GETADDR + NLM_F_DUMP. It never
+/// reflects host interfaces. The result is a deterministic loopback-only
+/// address view and a matching NLMSG_DONE terminator.
+fn netlink_route_request(socket: &crate::fd::NetRef, request: &[u8]) -> SysResult {
+    const RTM_GETADDR: u16 = 22;
+    const NLMSG_DONE: u16 = 3;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_MULTI: u16 = 2;
+    const NLM_F_DUMP: u16 = 0x300;
+    if request.len() < 20 {
+        return Err(abi::EINVAL);
+    }
+    let declared = u32::from_ne_bytes(request[..4].try_into().expect("netlink length")) as usize;
+    let kind = u16::from_ne_bytes(request[4..6].try_into().expect("netlink type"));
+    let flags = u16::from_ne_bytes(request[6..8].try_into().expect("netlink flags"));
+    let sequence = u32::from_ne_bytes(request[8..12].try_into().expect("netlink sequence"));
+    if declared != request.len()
+        || declared < 20
+        || kind != RTM_GETADDR
+        || flags & (NLM_F_REQUEST | NLM_F_DUMP) != (NLM_F_REQUEST | NLM_F_DUMP)
+    {
+        return Err(abi::EOPNOTSUPP);
+    }
+    fn align4(out: &mut Vec<u8>) {
+        while out.len() & 3 != 0 {
+            out.push(0);
+        }
+    }
+    fn attr(out: &mut Vec<u8>, ty: u16, value: &[u8]) {
+        out.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
+        out.extend_from_slice(&ty.to_ne_bytes());
+        out.extend_from_slice(value);
+        align4(out);
+    }
+    fn address(
+        sequence: u32,
+        port_id: u32,
+        family: u8,
+        prefix: u8,
+        scope: u8,
+        index: u32,
+        bytes: &[u8],
+        label: Option<&[u8]>,
+    ) -> Vec<u8> {
+        const RTM_NEWADDR: u16 = 20;
+        const NLM_F_MULTI: u16 = 2;
+        const IFA_ADDRESS: u16 = 1;
+        const IFA_LOCAL: u16 = 2;
+        const IFA_LABEL: u16 = 3;
+        const IFA_CACHEINFO: u16 = 6;
+        const IFA_FLAGS: u16 = 8;
+        const IFA_F_PERMANENT: u32 = 0x80;
+        let mut out = vec![0; 16];
+        out.extend_from_slice(&[family, prefix, 0x80, scope]);
+        out.extend_from_slice(&index.to_ne_bytes());
+        attr(&mut out, IFA_ADDRESS, bytes);
+        if family == AF_INET as u8 {
+            attr(&mut out, IFA_LOCAL, bytes);
+        }
+        if let Some(label) = label {
+            attr(&mut out, IFA_LABEL, label);
+        }
+        // Match the complete kernel record shape returned by RTM_GETADDR.
+        // Consumers such as language runtimes treat these as address-state
+        // evidence, not optional decoration. The values are synthetic and
+        // stable: the virtual egress is present indefinitely, while the
+        // loopback retains Linux's permanent flag.
+        let address_flags = (scope == 254).then_some(IFA_F_PERMANENT).unwrap_or(0);
+        attr(&mut out, IFA_FLAGS, &address_flags.to_ne_bytes());
+        let cache_info = [u32::MAX, u32::MAX, 0, 0]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect::<Vec<_>>();
+        attr(&mut out, IFA_CACHEINFO, &cache_info);
+        let len = out.len() as u32;
+        out[..4].copy_from_slice(&len.to_ne_bytes());
+        out[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        out[6..8].copy_from_slice(&NLM_F_MULTI.to_ne_bytes());
+        out[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        out[12..16].copy_from_slice(&port_id.to_ne_bytes());
+        out
+    }
+    // Never expose a host interface or address through this virtual kernel.
+    // A deterministic globally-scoped egress identity nevertheless matters:
+    // modern runtimes commonly refuse to open a client socket when netlink
+    // reports only loopback, documentation blocks, or private/ULA space.
+    // These are synthetic logical identities, never bind targets: every
+    // actual outbound operation remains mediated by the broker.
+    let port_id = socket.borrow().local_protocol_id;
+    let mut response = address(
+        sequence,
+        port_id,
+        AF_INET as u8,
+        8,
+        254,
+        1,
+        &[127, 0, 0, 1],
+        Some(b"lo\0"),
+    );
+    response.extend(address(
+        sequence,
+        port_id,
+        AF_INET6 as u8,
+        128,
+        254,
+        1,
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        None,
+    ));
+    response.extend(address(
+        sequence,
+        port_id,
+        AF_INET as u8,
+        24,
+        0,
+        2,
+        &[1, 1, 1, 1],
+        Some(b"eth0\0"),
+    ));
+    response.extend(address(
+        sequence,
+        port_id,
+        AF_INET6 as u8,
+        64,
+        0,
+        2,
+        &[
+            0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+        ],
+        None,
+    ));
+    response.extend_from_slice(&20_u32.to_ne_bytes());
+    response.extend_from_slice(&NLMSG_DONE.to_ne_bytes());
+    response.extend_from_slice(&NLM_F_MULTI.to_ne_bytes());
+    response.extend_from_slice(&sequence.to_ne_bytes());
+    response.extend_from_slice(&port_id.to_ne_bytes());
+    response.extend_from_slice(&0_i32.to_ne_bytes());
+    socket.borrow_mut().local_rx.extend(response);
     Ok(0)
 }
 
@@ -6417,7 +6983,19 @@ fn sys_sendto(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         Ok(socket) => socket,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    let target = match parse_sockaddr_in(env, cpu, addr, addrlen) {
+    if socket.borrow().kind == SocketKind::NetlinkRoute {
+        let bytes = match read_mem(env, cpu, buf, (len as usize).min(0x1_0000)) {
+            Ok(bytes) => bytes,
+            Err(errno) => return Outcome::Ret(Err(errno)),
+        };
+        return Outcome::Ret(netlink_route_request(&socket, &bytes).map(|_| bytes.len() as u64));
+    }
+    let family = socket.borrow().family;
+    let target = match match family {
+        AF_INET => parse_sockaddr_in(env, cpu, addr, addrlen).map(std::net::SocketAddr::V4),
+        AF_INET6 => parse_sockaddr_in6(env, cpu, addr, addrlen).map(std::net::SocketAddr::V6),
+        _ => Err(abi::EAFNOSUPPORT),
+    } {
         Ok(target) => target,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
@@ -6425,27 +7003,87 @@ fn sys_sendto(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         Ok(bytes) => bytes,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
+    Outcome::Ret(net_send_bytes(&socket, Some(target), &bytes).map(|n| n as u64))
+}
+
+/// Sends an already-gathered packet through a guest network descriptor.
+/// `sendmsg(2)` is allowed to carry many iovecs; for UDP they form one
+/// datagram, so routing only the first iovec silently corrupts DNS and other
+/// protocol packets. Keep this lower-level path independent of guest memory
+/// so both sendto and sendmsg share the same atomic broker admission.
+fn net_send_bytes(
+    socket: &crate::fd::NetRef,
+    target: Option<std::net::SocketAddr>,
+    bytes: &[u8],
+) -> Result<usize, u64> {
     let mut inner = socket.borrow_mut();
-    if inner.kind != SocketKind::Udp {
-        return Outcome::Ret(Err(abi::EOPNOTSUPP));
-    }
-    let broker = inner.broker.clone();
-    if inner.handle.is_none() {
-        match broker.borrow_mut().udp_open() {
-            Ok(handle) => inner.handle = Some(handle),
-            Err(errno) => return Outcome::Ret(Err(errno)),
+    match inner.kind {
+        SocketKind::Tcp => {
+            if target.is_some() {
+                return Err(abi::EISCONN);
+            }
+            let handle = inner.handle.ok_or(abi::ENOTCONN)?;
+            let result = inner.broker.borrow_mut().tcp_send(handle, bytes);
+            if std::env::var_os("SYSCALL_NET_TRACE").is_some() {
+                match &result {
+                    Ok(sent) => eprintln!(
+                        "[net] tcp send handle={} requested={} sent={}",
+                        handle,
+                        bytes.len(),
+                        sent
+                    ),
+                    Err(errno) => eprintln!(
+                        "[net] tcp send handle={} requested={} errno={}",
+                        handle,
+                        bytes.len(),
+                        errno
+                    ),
+                }
+            }
+            if result.is_ok() {
+                inner.activity += 1;
+            }
+            result
         }
+        SocketKind::Udp => {
+            let peer = target.or(inner.peer).ok_or(abi::EDESTADDRREQ)?;
+            let expected_family = match peer {
+                std::net::SocketAddr::V4(_) => AF_INET,
+                std::net::SocketAddr::V6(_) => AF_INET6,
+            };
+            if inner.family != expected_family {
+                return Err(abi::EAFNOSUPPORT);
+            }
+            let broker = inner.broker.clone();
+            if inner.handle.is_none() {
+                let opened = match peer {
+                    std::net::SocketAddr::V4(_) => broker.borrow_mut().udp_open(),
+                    std::net::SocketAddr::V6(_) => broker.borrow_mut().udp_open_v6(),
+                };
+                inner.handle = Some(opened?);
+            }
+            let handle = inner.handle.expect("UDP handle set above");
+            let result = match peer {
+                std::net::SocketAddr::V4(peer) => {
+                    broker.borrow_mut().udp_send_to(handle, peer, bytes)
+                }
+                std::net::SocketAddr::V6(peer) => {
+                    broker.borrow_mut().udp_send_to_v6(handle, peer, bytes)
+                }
+            };
+            if result.is_ok() {
+                inner.activity += 1;
+            }
+            result
+        }
+        SocketKind::Unix => Err(abi::ENOTCONN),
+        SocketKind::NetlinkRoute => Err(abi::EOPNOTSUPP),
     }
-    let handle = inner.handle.expect("handle set above");
-    let result = broker.borrow_mut().udp_send_to(handle, target, &bytes);
-    if result.is_ok() {
-        inner.activity += 1;
-    }
-    Outcome::Ret(result.map(|n| n as u64))
 }
 
 fn sys_recvfrom(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
-    let [fd, buf, len, _flags, addr, addrlen] = a;
+    let [fd, buf, len, flags, addr, addrlen] = a;
+    const MSG_PEEK: u64 = 0x2;
     let socket = match net_of(env, fd) {
         Ok(socket) => socket,
         // Not a network socket: plain read (recv on a socketpair).
@@ -6455,24 +7093,53 @@ fn sys_recvfrom(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     if !is_udp {
         return outcome_read(env, cpu, fd, buf, len);
     }
+    if std::env::var_os("SYSCALL_NET_TRACE").is_some() {
+        eprintln!(
+            "[syscall-net] pid={} recvfrom fd={fd} requested={len} flags={flags:#x}",
+            env.proc.pid,
+        );
+    }
     let received = {
-        let (broker, handle) = {
+        let (broker, handle, family) = {
             let inner = socket.borrow();
             let Some(handle) = inner.handle else {
                 return Outcome::Ret(Err(abi::ENOTCONN));
             };
-            (inner.broker.clone(), handle)
+            (inner.broker.clone(), handle, inner.family)
         };
-        let result = broker.borrow_mut().udp_recv_from(handle, len as usize);
-        result
+        let mut broker = broker.borrow_mut();
+        let peek = flags & MSG_PEEK != 0;
+        match (family, peek) {
+            (AF_INET, false) => broker
+                .udp_recv_from(handle, len as usize)
+                .map(|value| value.map(|(bytes, from)| (bytes, std::net::SocketAddr::V4(from)))),
+            (AF_INET, true) => broker
+                .udp_peek_from(handle, len as usize)
+                .map(|value| value.map(|(bytes, from)| (bytes, std::net::SocketAddr::V4(from)))),
+            (AF_INET6, false) => broker
+                .udp_recv_from_v6(handle, len as usize)
+                .map(|value| value.map(|(bytes, from)| (bytes, std::net::SocketAddr::V6(from)))),
+            (AF_INET6, true) => broker
+                .udp_peek_from_v6(handle, len as usize)
+                .map(|value| value.map(|(bytes, from)| (bytes, std::net::SocketAddr::V6(from)))),
+            _ => Err(abi::EAFNOSUPPORT),
+        }
     };
     match received {
         Ok(Some((bytes, from))) => {
+            if std::env::var_os("SYSCALL_NET_TRACE").is_some() {
+                eprintln!(
+                    "[syscall-net] pid={} recvfrom fd={fd} from={from} bytes={} prefix={:02x?}",
+                    env.proc.pid,
+                    bytes.len(),
+                    &bytes[..bytes.len().min(96)]
+                );
+            }
             socket.borrow_mut().activity += 1;
             if let Err(errno) = write_mem(env, cpu, buf, &bytes) {
                 return Outcome::Ret(Err(errno));
             }
-            if let Err(errno) = write_sockaddr_in(env, cpu, addr, addrlen, from) {
+            if let Err(errno) = write_sockaddr(env, cpu, addr, addrlen, from) {
                 return Outcome::Ret(Err(errno));
             }
             Outcome::Ret(Ok(bytes.len() as u64))
@@ -6519,7 +7186,7 @@ fn sys_shutdown(env: &mut LinuxEnv, fd: u64, how: u64) -> SysResult {
 fn sys_getpeername(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
     let socket = net_of(env, fd)?;
     let peer = socket.borrow().peer.ok_or(abi::ENOTCONN)?;
-    write_sockaddr_in(env, cpu, addr, len, peer)?;
+    write_sockaddr(env, cpu, addr, len, peer)?;
     Ok(0)
 }
 
@@ -6892,6 +7559,33 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         },
         true,
     )
+}
+
+/// `epoll_pwait2` differs from epoll_pwait only in its optional `timespec`
+/// timeout. Signal-mask replacement is not modelled by the deterministic
+/// guest, but timeout precision is: round a non-zero nanosecond interval up
+/// to the millisecond scheduler tick so it never expires early.
+fn sys_epoll_pwait2(env: &mut LinuxEnv, cpu: &mut Cpu, mut a: [u64; 6]) -> Outcome {
+    let timeout_ptr = a[3];
+    if timeout_ptr == 0 {
+        a[3] = u64::MAX; // epoll_wait's conventional infinite timeout (-1).
+        return sys_epoll_wait(env, cpu, a);
+    }
+    let bytes = match read_mem(env, cpu, timeout_ptr, 16) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Outcome::Ret(Err(errno)),
+    };
+    let sec = i64::from_le_bytes(bytes[..8].try_into().expect("timespec seconds"));
+    let nsec = i64::from_le_bytes(bytes[8..].try_into().expect("timespec nanoseconds"));
+    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+        return Outcome::Ret(Err(abi::EINVAL));
+    }
+    let nanos = (sec as u128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u128);
+    let millis = nanos.saturating_add(999_999) / 1_000_000;
+    a[3] = millis.min(i32::MAX as u128) as u64;
+    sys_epoll_wait(env, cpu, a)
 }
 
 /// `select`/`pselect6` over readable/writable fd sets. Evaluates
@@ -7267,11 +7961,49 @@ fn sys_sendmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         Ok(parts) => parts,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
-    // First non-empty segment only (short sends are valid; callers loop).
     let entries = match iter_iov(env, cpu, iov, iovcnt) {
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
+    if let Ok(socket) = net_of(env, fd) {
+        let mut bytes = Vec::new();
+        for (base, len) in &entries {
+            if *len == 0 {
+                continue;
+            }
+            let remaining = 0x40_0000_usize.saturating_sub(bytes.len());
+            if remaining == 0 {
+                return Outcome::Ret(Err(abi::EMSGSIZE));
+            }
+            let part = match read_mem(env, cpu, *base, (*len as usize).min(remaining)) {
+                Ok(part) => part,
+                Err(errno) => return Outcome::Ret(Err(errno)),
+            };
+            bytes.extend_from_slice(&part);
+            if part.len() < *len as usize {
+                return Outcome::Ret(Err(abi::EMSGSIZE));
+            }
+        }
+        let target = if name == 0 {
+            Ok(None)
+        } else {
+            let family = socket.borrow().family;
+            match family {
+                AF_INET => {
+                    parse_sockaddr_in(env, cpu, name, name_len).map(std::net::SocketAddr::V4)
+                }
+                AF_INET6 => {
+                    parse_sockaddr_in6(env, cpu, name, name_len).map(std::net::SocketAddr::V6)
+                }
+                _ => Err(abi::EAFNOSUPPORT),
+            }
+            .map(Some)
+        };
+        return Outcome::Ret(
+            target.and_then(|target| net_send_bytes(&socket, target, &bytes).map(|n| n as u64)),
+        );
+    }
+    // Non-network descriptors retain the existing short-write behavior.
     for (base, len) in entries {
         if len == 0 {
             continue;
@@ -7282,6 +8014,63 @@ fn sys_sendmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         return outcome_write(env, cpu, fd, base, len);
     }
     Outcome::Ret(Ok(0))
+}
+
+/// `sendmmsg(2)`: submit a bounded batch of `struct mmsghdr` records. Modern
+/// resolvers send A and AAAA queries this way; treating the syscall as absent
+/// prevents name resolution before a client can open its TCP socket.
+fn sys_sendmmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
+    let [fd, msgvec, vlen, flags, _, _] = a;
+    // Linux rejects absurdly large counts. The compatibility layer also
+    // keeps a hard bound so a hostile guest cannot force unbounded host work.
+    if vlen > 1024 {
+        return Outcome::Ret(Err(abi::EINVAL));
+    }
+    let mut completed = 0_u64;
+    // On x86-64 `struct mmsghdr` is one 56-byte msghdr followed by a u32
+    // msg_len and 4 bytes of padding, so its stride is 64 bytes.
+    for index in 0..vlen {
+        let message = match msgvec.checked_add(index.saturating_mul(64)) {
+            Some(message) => message,
+            None => return Outcome::Ret(Err(abi::EFAULT)),
+        };
+        match sys_sendmsg(env, cpu, [fd, message, flags, 0, 0, 0]) {
+            Outcome::Ret(Ok(length)) => {
+                if std::env::var_os("SYSCALL_NET_TRACE").is_some() {
+                    if let Ok((_, _, iov, iovcnt)) = read_msghdr(env, cpu, message) {
+                        if let Ok(entries) = iter_iov(env, cpu, iov, iovcnt) {
+                            let mut prefix = Vec::new();
+                            for (base, len) in entries {
+                                let remaining = 32_usize.saturating_sub(prefix.len());
+                                if remaining == 0 {
+                                    break;
+                                }
+                                if let Ok(bytes) =
+                                    read_mem(env, cpu, base, (len as usize).min(remaining))
+                                {
+                                    prefix.extend_from_slice(&bytes);
+                                }
+                            }
+                            eprintln!(
+                                "[syscall-net] pid={} sendmmsg fd={fd} index={index} bytes={length} prefix={prefix:02x?}",
+                                env.proc.pid
+                            );
+                        }
+                    }
+                }
+                if let Err(errno) =
+                    write_mem(env, cpu, message + 56, &(length as u32).to_le_bytes())
+                {
+                    return Outcome::Ret(Err(errno));
+                }
+                completed += 1;
+            }
+            Outcome::Ret(Err(errno)) if completed == 0 => return Outcome::Ret(Err(errno)),
+            Outcome::Ret(Err(_)) => return Outcome::Ret(Ok(completed)),
+            other => return other,
+        }
+    }
+    Outcome::Ret(Ok(completed))
 }
 
 /// `recvmsg`: name + iovec scatter (first segment; control data absent —
@@ -7299,6 +8088,8 @@ fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         Ok(entries) => entries,
         Err(errno) => return Outcome::Ret(Err(errno)),
     };
+    let is_netlink_route =
+        net_of(env, fd).is_ok_and(|socket| socket.borrow().kind == SocketKind::NetlinkRoute);
     for (base, len) in entries {
         if len == 0 {
             continue;
@@ -7307,11 +8098,31 @@ fn sys_recvmsg(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         // buffer length by value, so the address length is written back into
         // msg_namelen (offset 8) here instead. Passing the scalar through
         // would make recvfrom scribble 4 bytes at that guest address.
-        let cap_name = if name != 0 && name_len >= 16 { name } else { 0 };
+        let required_name_len = if is_netlink_route { 12 } else { 16 };
+        let cap_name = if name != 0 && name_len >= required_name_len {
+            name
+        } else {
+            0
+        };
         let out = sys_recvfrom(env, cpu, [fd, base, len, 0, cap_name, 0]);
         if let Outcome::Ret(Ok(_)) = out {
             if cap_name != 0 {
-                if let Err(errno) = write_mem(env, cpu, msg + 8, &16_u32.to_le_bytes()) {
+                // A NETLINK_ROUTE response is kernel-originated and carries
+                // sockaddr_nl (family, pad, pid, groups), not sockaddr_in.
+                // Returning the latter's 16-byte length makes callers which
+                // validate the ancillary address discard an otherwise valid
+                // RTM_GETADDR dump.
+                let address_len = if is_netlink_route {
+                    let mut sender = [0_u8; 12];
+                    sender[..2].copy_from_slice(&(AF_NETLINK as u16).to_ne_bytes());
+                    if let Err(errno) = write_mem(env, cpu, cap_name, &sender) {
+                        return Outcome::Ret(Err(errno));
+                    }
+                    12_u32
+                } else {
+                    16_u32
+                };
+                if let Err(errno) = write_mem(env, cpu, msg + 8, &address_len.to_le_bytes()) {
                     return Outcome::Ret(Err(errno));
                 }
             }

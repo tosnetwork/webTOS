@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -47,12 +47,34 @@ pub trait NetworkBroker {
     /// Opens a TCP connection. Blocking (bounded by the broker's own
     /// connect timeout); called at `connect(2)`.
     fn tcp_connect(&mut self, addr: SocketAddrV4) -> Result<Handle, u64>;
+    /// Opens an IPv6 TCP endpoint. Brokers that only have an IPv4 transport
+    /// reject this explicitly; callers can then apply normal Happy-Eyeballs
+    /// fallback instead of receiving a fabricated IPv4 connection.
+    fn tcp_connect_v6(&mut self, _addr: SocketAddrV6) -> Result<Handle, u64> {
+        Err(abi::EAFNOSUPPORT)
+    }
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64>;
     fn tcp_recv(&mut self, handle: Handle, max: usize) -> Result<RecvOutcome, u64>;
     fn tcp_shutdown_write(&mut self, handle: Handle) -> Result<(), u64>;
 
+    /// Returns the number of bytes that a non-consuming read can presently
+    /// observe.  This is the kernel-visible value behind `FIONREAD`: for a
+    /// stream it is the available prefix, and for a datagram it is the next
+    /// datagram's size.  `None` means that no data is readable yet.
+    ///
+    /// This deliberately belongs to the broker rather than the syscall
+    /// layer.  A host-driven broker owns the receive queue, while a native
+    /// broker must query its host socket without consuming data.
+    fn pending_read_bytes(&mut self, handle: Handle) -> Result<Option<usize>, u64>;
+
     /// Creates a UDP endpoint (bound to an ephemeral local port).
     fn udp_open(&mut self) -> Result<Handle, u64>;
+    /// Creates an IPv6 UDP endpoint. A broker which cannot preserve the
+    /// address family must reject it rather than silently changing a guest
+    /// IPv6 probe into IPv4.
+    fn udp_open_v6(&mut self) -> Result<Handle, u64> {
+        Err(abi::EAFNOSUPPORT)
+    }
     fn udp_send_to(
         &mut self,
         handle: Handle,
@@ -64,6 +86,37 @@ pub trait NetworkBroker {
         handle: Handle,
         max: usize,
     ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64>;
+    /// Reads a UDP datagram without consuming it, for `MSG_PEEK`.
+    fn udp_peek_from(
+        &mut self,
+        _handle: Handle,
+        _max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64> {
+        Err(abi::EOPNOTSUPP)
+    }
+    fn udp_send_to_v6(
+        &mut self,
+        _handle: Handle,
+        _addr: SocketAddrV6,
+        _bytes: &[u8],
+    ) -> Result<usize, u64> {
+        Err(abi::EAFNOSUPPORT)
+    }
+    fn udp_recv_from_v6(
+        &mut self,
+        _handle: Handle,
+        _max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        Err(abi::EAFNOSUPPORT)
+    }
+    /// IPv6 counterpart of [`NetworkBroker::udp_peek_from`].
+    fn udp_peek_from_v6(
+        &mut self,
+        _handle: Handle,
+        _max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        Err(abi::EAFNOSUPPORT)
+    }
 
     /// True when a read on `handle` would make progress (data, EOF, or an
     /// error to report).
@@ -71,6 +124,9 @@ pub trait NetworkBroker {
 
     /// The local address of an endpoint, when known.
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4>;
+    fn local_addr_v6(&mut self, _handle: Handle) -> Option<SocketAddrV6> {
+        None
+    }
 
     fn close(&mut self, handle: Handle);
 
@@ -134,6 +190,19 @@ impl NativeBroker {
         self.next_handle += 1;
         handle
     }
+
+    fn tcp_connect_addr(&mut self, target: SocketAddr) -> Result<Handle, u64> {
+        let stream = std::net::TcpStream::connect_timeout(&target, Duration::from_secs(10))
+            .map_err(|e| {
+                tracing::warn!("network: connect {target} failed: {e}");
+                io_errno(&e)
+            })?;
+        stream.set_nonblocking(true).map_err(|e| io_errno(&e))?;
+        stream.set_nodelay(true).ok();
+        let handle = self.handle();
+        self.tcp.insert(handle, stream);
+        Ok(handle)
+    }
 }
 
 impl Default for NativeBroker {
@@ -154,17 +223,15 @@ fn io_errno(err: &std::io::Error) -> u64 {
 impl NetworkBroker for NativeBroker {
     fn tcp_connect(&mut self, addr: SocketAddrV4) -> Result<Handle, u64> {
         let target = self.resolve(addr)?;
-        let stream =
-            std::net::TcpStream::connect_timeout(&SocketAddr::V4(target), Duration::from_secs(10))
-                .map_err(|e| {
-                    tracing::warn!("network: connect {target} failed: {e}");
-                    io_errno(&e)
-                })?;
-        stream.set_nonblocking(true).map_err(|e| io_errno(&e))?;
-        stream.set_nodelay(true).ok();
-        let handle = self.handle();
-        self.tcp.insert(handle, stream);
-        Ok(handle)
+        self.tcp_connect_addr(SocketAddr::V4(target))
+    }
+
+    fn tcp_connect_v6(&mut self, addr: SocketAddrV6) -> Result<Handle, u64> {
+        if self.restrict_to_redirects {
+            tracing::warn!("network: IPv6 destination {addr} refused (no IPv6 redirect table)");
+            return Err(abi::ENETUNREACH);
+        }
+        self.tcp_connect_addr(SocketAddr::V6(addr))
     }
 
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {
@@ -209,12 +276,40 @@ impl NetworkBroker for NativeBroker {
             .map_err(|e| io_errno(&e))
     }
 
+    fn pending_read_bytes(&mut self, handle: Handle) -> Result<Option<usize>, u64> {
+        if let Some(stream) = self.tcp.get_mut(&handle) {
+            let mut bytes = vec![0_u8; 0x10_0000];
+            return match stream.peek(&mut bytes) {
+                Ok(count) => Ok(Some(count)), // includes EOF as zero
+                Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+                Err(error) => Err(io_errno(&error)),
+            };
+        }
+        let socket = self.udp.get_mut(&handle).ok_or(abi::EBADF)?;
+        let mut bytes = vec![0_u8; 0x1_0000];
+        match socket.peek_from(&mut bytes) {
+            Ok((count, _)) => Ok(Some(count)),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(io_errno(&error)),
+        }
+    }
+
     fn udp_open(&mut self) -> Result<Handle, u64> {
         // Bind to the unspecified address, not loopback: a 127.0.0.1-bound
         // socket cannot reach a public resolver (real DNS), only a loopback
         // one. 0.0.0.0 lets the host pick the right source interface for both.
         let socket =
             std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| io_errno(&e))?;
+        socket.set_nonblocking(true).map_err(|e| io_errno(&e))?;
+        let handle = self.handle();
+        self.udp.insert(handle, socket);
+        Ok(handle)
+    }
+
+    fn udp_open_v6(&mut self) -> Result<Handle, u64> {
+        let socket =
+            std::net::UdpSocket::bind(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+                .map_err(|e| io_errno(&e))?;
         socket.set_nonblocking(true).map_err(|e| io_errno(&e))?;
         let handle = self.handle();
         self.udp.insert(handle, socket);
@@ -255,6 +350,78 @@ impl NetworkBroker for NativeBroker {
         }
     }
 
+    fn udp_peek_from(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64> {
+        let socket = self.udp.get_mut(&handle).ok_or(abi::EBADF)?;
+        let mut buf = vec![0_u8; max.min(0x1_0000)];
+        match socket.peek_from(&mut buf) {
+            Ok((n, SocketAddr::V4(from))) => {
+                buf.truncate(n);
+                Ok(Some((buf, from)))
+            }
+            Ok((_, SocketAddr::V6(_))) => Err(abi::EAFNOSUPPORT),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(io_errno(&e)),
+        }
+    }
+
+    fn udp_send_to_v6(
+        &mut self,
+        handle: Handle,
+        addr: SocketAddrV6,
+        bytes: &[u8],
+    ) -> Result<usize, u64> {
+        if self.restrict_to_redirects {
+            tracing::warn!(
+                "network: IPv6 datagram destination {addr} refused (no IPv6 redirect table)"
+            );
+            return Err(abi::ENETUNREACH);
+        }
+        let socket = self.udp.get_mut(&handle).ok_or(abi::EBADF)?;
+        socket
+            .send_to(bytes, SocketAddr::V6(addr))
+            .map_err(|e| io_errno(&e))
+    }
+
+    fn udp_recv_from_v6(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        let socket = self.udp.get_mut(&handle).ok_or(abi::EBADF)?;
+        let mut buf = vec![0_u8; max.min(0x1_0000)];
+        match socket.recv_from(&mut buf) {
+            Ok((n, SocketAddr::V6(from))) => {
+                buf.truncate(n);
+                Ok(Some((buf, from)))
+            }
+            Ok((_, SocketAddr::V4(_))) => Err(abi::EAFNOSUPPORT),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(io_errno(&e)),
+        }
+    }
+
+    fn udp_peek_from_v6(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        let socket = self.udp.get_mut(&handle).ok_or(abi::EBADF)?;
+        let mut buf = vec![0_u8; max.min(0x1_0000)];
+        match socket.peek_from(&mut buf) {
+            Ok((n, SocketAddr::V6(from))) => {
+                buf.truncate(n);
+                Ok(Some((buf, from)))
+            }
+            Ok((_, SocketAddr::V4(_))) => Err(abi::EAFNOSUPPORT),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(io_errno(&e)),
+        }
+    }
+
     fn readable(&mut self, handle: Handle) -> bool {
         if let Some(stream) = self.tcp.get_mut(&handle) {
             let mut probe = [0_u8; 1];
@@ -283,6 +450,20 @@ impl NetworkBroker for NativeBroker {
         };
         match addr {
             Some(SocketAddr::V4(addr)) => Some(addr),
+            _ => None,
+        }
+    }
+
+    fn local_addr_v6(&mut self, handle: Handle) -> Option<SocketAddrV6> {
+        let addr = if let Some(stream) = self.tcp.get(&handle) {
+            stream.local_addr().ok()
+        } else {
+            self.udp
+                .get(&handle)
+                .and_then(|socket| socket.local_addr().ok())
+        };
+        match addr {
+            Some(SocketAddr::V6(addr)) => Some(addr),
             _ => None,
         }
     }
@@ -546,6 +727,23 @@ impl NetworkBroker for HostBroker {
         Ok(())
     }
 
+    fn pending_read_bytes(&mut self, handle: Handle) -> Result<Option<usize>, u64> {
+        let endpoint = self.endpoints.get(&handle).ok_or(abi::EBADF)?;
+        if !endpoint.rx.is_empty() {
+            return Ok(Some(endpoint.rx.len()));
+        }
+        if let Some((bytes, _)) = endpoint.datagrams.front() {
+            return Ok(Some(bytes.len()));
+        }
+        if endpoint.closed {
+            return Ok(Some(0));
+        }
+        if let Some(errno) = endpoint.error {
+            return Err(errno);
+        }
+        Ok(None)
+    }
+
     fn udp_open(&mut self) -> Result<Handle, u64> {
         let handle = self.handle();
         self.endpoints.insert(handle, Endpoint::default());
@@ -582,6 +780,21 @@ impl NetworkBroker for HostBroker {
                 bytes.truncate(max.min(0x1_0000));
                 Ok(Some((bytes, from)))
             }
+            None => match endpoint.error {
+                Some(errno) => Err(errno),
+                None => Ok(None),
+            },
+        }
+    }
+
+    fn udp_peek_from(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64> {
+        let endpoint = self.endpoints.get(&handle).ok_or(abi::EBADF)?;
+        match endpoint.datagrams.front() {
+            Some((bytes, from)) => Ok(Some((bytes[..bytes.len().min(max)].to_vec(), *from))),
             None => match endpoint.error {
                 Some(errno) => Err(errno),
                 None => Ok(None),
@@ -729,6 +942,10 @@ impl NetworkBroker for MeteredBroker {
         self.inner.borrow_mut().tcp_connect(addr)
     }
 
+    fn tcp_connect_v6(&mut self, addr: SocketAddrV6) -> Result<Handle, u64> {
+        self.inner.borrow_mut().tcp_connect_v6(addr)
+    }
+
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {
         let allowance = self.allow(bytes.len())?;
         let sent = self
@@ -752,8 +969,18 @@ impl NetworkBroker for MeteredBroker {
         self.inner.borrow_mut().tcp_shutdown_write(handle)
     }
 
+    fn pending_read_bytes(&mut self, handle: Handle) -> Result<Option<usize>, u64> {
+        // Inspection does not cross the broker boundary, so it must not
+        // consume quota.  The following actual receive remains metered.
+        self.inner.borrow_mut().pending_read_bytes(handle)
+    }
+
     fn udp_open(&mut self) -> Result<Handle, u64> {
         self.inner.borrow_mut().udp_open()
+    }
+
+    fn udp_open_v6(&mut self) -> Result<Handle, u64> {
+        self.inner.borrow_mut().udp_open_v6()
     }
 
     fn udp_send_to(
@@ -788,6 +1015,57 @@ impl NetworkBroker for MeteredBroker {
             self.meter.borrow_mut().charge(0, bytes.len());
         }
         Ok(received)
+    }
+
+    fn udp_peek_from(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, u64> {
+        let allowance = self.allow(max)?;
+        self.inner.borrow_mut().udp_peek_from(handle, allowance)
+    }
+
+    fn udp_send_to_v6(
+        &mut self,
+        handle: Handle,
+        addr: SocketAddrV6,
+        bytes: &[u8],
+    ) -> Result<usize, u64> {
+        if self.allow(bytes.len())? < bytes.len() {
+            return Err(abi::EPERM);
+        }
+        let sent = self
+            .inner
+            .borrow_mut()
+            .udp_send_to_v6(handle, addr, bytes)?;
+        self.meter.borrow_mut().charge(sent, 0);
+        Ok(sent)
+    }
+
+    fn udp_recv_from_v6(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        let allowance = self.allow(max)?;
+        let received = self
+            .inner
+            .borrow_mut()
+            .udp_recv_from_v6(handle, allowance)?;
+        if let Some((bytes, _)) = &received {
+            self.meter.borrow_mut().charge(0, bytes.len());
+        }
+        Ok(received)
+    }
+
+    fn udp_peek_from_v6(
+        &mut self,
+        handle: Handle,
+        max: usize,
+    ) -> Result<Option<(Vec<u8>, SocketAddrV6)>, u64> {
+        let allowance = self.allow(max)?;
+        self.inner.borrow_mut().udp_peek_from_v6(handle, allowance)
     }
 
     fn readable(&mut self, handle: Handle) -> bool {

@@ -70,6 +70,11 @@ pub struct Process {
     /// Session ID. A session survives fork and changes only through setsid;
     /// terminal ioctls expose it independently from the foreground group.
     pub sid: u64,
+    /// Guest credentials. They are explicit machine configuration rather
+    /// than an accidental reflection of the host runner's privilege. New
+    /// processes and threads inherit them in the normal Linux manner.
+    pub uid: u32,
+    pub gid: u32,
     /// Shared with sibling threads (`CLONE_FILES`); `fork` deep-clones the
     /// table (entries still share open file descriptions).
     pub fds: Rc<RefCell<FdTable>>,
@@ -151,6 +156,8 @@ impl Process {
             ppid: 1,
             pgid: ROOT_PID,
             sid: ROOT_PID,
+            uid: 0,
+            gid: 0,
             fds: Rc::new(RefCell::new(FdTable::new())),
             cwd: crate::vfs::ROOT,
             umask: 0o022,
@@ -186,6 +193,8 @@ impl Process {
             ppid: self.tgid,
             pgid: self.pgid,
             sid: self.sid,
+            uid: self.uid,
+            gid: self.gid,
             fds: Rc::new(RefCell::new(self.fds.borrow().clone())),
             cwd: self.cwd,
             umask: self.umask,
@@ -226,6 +235,8 @@ impl Process {
             ppid: self.ppid,
             pgid: self.pgid,
             sid: self.sid,
+            uid: self.uid,
+            gid: self.gid,
             fds: Rc::clone(&self.fds),
             cwd: self.cwd,
             umask: self.umask,
