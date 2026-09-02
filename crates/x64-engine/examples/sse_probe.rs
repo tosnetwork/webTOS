@@ -1074,6 +1074,11 @@ fn main() {
             |a, b| unsafe { store(_mm_sll_epi64(load(a), load(b))) }
         ),
         xc!(
+            "psllq xmm0,57",
+            &[0x66, 0x0f, 0x73, 0xf0, 0x39],
+            |a, _b| unsafe { store(_mm_slli_epi64::<57>(load(a))) }
+        ),
+        xc!(
             "psrad xmm0,xmm1",
             &[0x66, 0x0f, 0xe2, 0xc1],
             |a, b| unsafe { store(_mm_sra_epi32(load(a), load(b))) }
@@ -1475,8 +1480,13 @@ fn main() {
     ];
 
     let iterations = 200;
+    let filter = std::env::var("SSE_PROBE_FILTER").ok();
     let mut failures = 0;
-    for case in cases.iter().chain(extra.iter()) {
+    for case in cases.iter().chain(extra.iter()).filter(|case| {
+        filter
+            .as_ref()
+            .is_none_or(|needle| case.name.contains(needle))
+    }) {
         let mut mismatches = 0;
         let mut first: Option<String> = None;
         for _ in 0..iterations {

@@ -14,7 +14,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use linux_compat::net::{HostBroker, NativeBroker, NetworkBroker, RecvOutcome};
+use linux_compat::net::{ConnectStatus, HostBroker, NativeBroker, NetworkBroker, RecvOutcome};
 use linux_compat::Machine;
 use x64_engine::{CpuExit, EngineConfig};
 
@@ -168,6 +168,7 @@ int main(void) {
            n1, n2, arm, n3, m1, m2);
     return 0;
 }
+
 "#;
     let Some(image) = compile_c("epollet", source, &[]) else {
         return;
@@ -178,6 +179,239 @@ int main(void) {
         run.output
             .contains("ET n1=1 n2=0 arm=0 rearm=1 LT m1=1 m2=1"),
         "edge/level epoll semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
+/// `EPOLLONESHOT` is how Bun and other modern reactors keep a writable fd
+/// from being returned forever. Delivery disables the interest regardless of
+/// level/edge mode; only `EPOLL_CTL_MOD` rearms it.
+#[test]
+fn epoll_oneshot_disarms_until_mod_rearms_it() {
+    let source = r#"
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+int main(void) {
+    int efd = eventfd(1, EFD_NONBLOCK);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (efd < 0 || ep < 0) return 1;
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLOUT | EPOLLONESHOT,
+        .data.u64 = 99,
+    };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev)) return 2;
+    struct epoll_event out;
+    int first = epoll_wait(ep, &out, 1, 0);
+    int disabled = epoll_wait(ep, &out, 1, 0);
+    if (epoll_ctl(ep, EPOLL_CTL_MOD, efd, &ev)) return 3;
+    int rearmed = epoll_wait(ep, &out, 1, 0);
+    int disabled_again = epoll_wait(ep, &out, 1, 0);
+    printf("oneshot first=%d disabled=%d rearmed=%d disabled_again=%d\n",
+           first, disabled, rearmed, disabled_again);
+    return first == 1 && disabled == 0 && rearmed == 1 && disabled_again == 0
+        ? 0 : 4;
+}
+"#;
+    let Some(image) = compile_c("epoll-oneshot", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-oneshot");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("oneshot first=1 disabled=0 rearmed=1 disabled_again=0"),
+        "EPOLLONESHOT semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn closing_an_epoll_target_drops_oneshot_state_before_fd_reuse() {
+    let source = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+int main(void) {
+    int old = eventfd(1, EFD_NONBLOCK);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (old < 0 || ep < 0) return 1;
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLONESHOT,
+        .data.u64 = 41,
+    };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, old, &ev)) return 2;
+    struct epoll_event out;
+    if (epoll_wait(ep, &out, 1, 0) != 1) return 3;
+    if (close(old)) return 4;
+
+    int replacement = eventfd(1, EFD_NONBLOCK);
+    if (replacement != old) return 5;
+    ev.data.u64 = 42;
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, replacement, &ev)) return 6;
+    int delivered = epoll_wait(ep, &out, 1, 0);
+
+    errno = 0;
+    int absent = eventfd(0, EFD_NONBLOCK);
+    int mod = epoll_ctl(ep, EPOLL_CTL_MOD, absent, &ev);
+    printf("reuse delivered=%d data=%llu mod=%d errno=%d\n",
+           delivered, (unsigned long long)out.data.u64, mod, errno);
+    return delivered == 1 && out.data.u64 == 42 && mod == -1 && errno == ENOENT
+        ? 0 : 7;
+}
+"#;
+    let Some(image) = compile_c("epoll-close-reuse", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-close-reuse");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("reuse delivered=1 data=42 mod=-1 errno=2"),
+        "epoll close/reuse semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn dup2_replacement_drops_the_destination_epoll_registration() {
+    let source = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+int main(void) {
+    int destination = eventfd(1, EFD_NONBLOCK);
+    int source = eventfd(1, EFD_NONBLOCK);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    if (destination < 0 || source < 0 || ep < 0) return 1;
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLONESHOT,
+        .data.u64 = 51,
+    };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, destination, &ev)) return 2;
+    struct epoll_event out;
+    if (epoll_wait(ep, &out, 1, 0) != 1) return 3;
+    if (dup2(source, destination) != destination) return 4;
+
+    ev.data.u64 = 52;
+    errno = 0;
+    int added = epoll_ctl(ep, EPOLL_CTL_ADD, destination, &ev);
+    int delivered = epoll_wait(ep, &out, 1, 0);
+    printf("dup2 added=%d errno=%d delivered=%d data=%llu\n",
+           added, errno, delivered, (unsigned long long)out.data.u64);
+    return added == 0 && delivered == 1 && out.data.u64 == 52 ? 0 : 5;
+}
+"#;
+    let Some(image) = compile_c("epoll-dup2-replace", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-dup2-replace");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("dup2 added=0 errno=0 delivered=1 data=52"),
+        "epoll dup2 replacement semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn exec_drops_cloexec_target_from_surviving_epoll_instance() {
+    let source = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc == 3) {
+        int target = atoi(argv[1]);
+        int ep = atoi(argv[2]);
+        int replacement = eventfd(1, EFD_NONBLOCK);
+        if (replacement != target) return 10;
+        struct epoll_event ev = {
+            .events = EPOLLIN | EPOLLONESHOT,
+            .data.u64 = 62,
+        };
+        errno = 0;
+        int added = epoll_ctl(ep, EPOLL_CTL_ADD, replacement, &ev);
+        struct epoll_event out;
+        int delivered = epoll_wait(ep, &out, 1, 0);
+        printf("exec added=%d errno=%d delivered=%d data=%llu\n",
+               added, errno, delivered, (unsigned long long)out.data.u64);
+        return added == 0 && delivered == 1 && out.data.u64 == 62 ? 0 : 11;
+    }
+
+    int target = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
+    int ep = epoll_create1(0);
+    if (target < 0 || ep < 0) return 1;
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLONESHOT,
+        .data.u64 = 61,
+    };
+    if (epoll_ctl(ep, EPOLL_CTL_ADD, target, &ev)) return 2;
+    struct epoll_event out;
+    if (epoll_wait(ep, &out, 1, 0) != 1) return 3;
+    char target_text[32], ep_text[32];
+    snprintf(target_text, sizeof(target_text), "%d", target);
+    snprintf(ep_text, sizeof(ep_text), "%d", ep);
+    execl("/bin/epoll-exec-cloexec", "epoll-exec-cloexec",
+          target_text, ep_text, (char *)0);
+    return 4;
+}
+"#;
+    let Some(image) = compile_c("epoll-exec-cloexec", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-exec-cloexec");
+    expect_clean(&run);
+    assert!(
+        run.output
+            .contains("exec added=0 errno=0 delivered=1 data=62"),
+        "epoll close-on-exec semantics wrong; output: {:?}",
+        run.output
+    );
+}
+
+#[test]
+fn epoll_create_variants_take_flags_from_the_linux_abi_position() {
+    let source = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+
+int main(void) {
+    int legacy = epoll_create(7);
+    int modern = epoll_create1(EPOLL_CLOEXEC);
+    if (legacy < 0 || modern < 0) return 1;
+    int legacy_flags = fcntl(legacy, F_GETFD);
+    int modern_flags = fcntl(modern, F_GETFD);
+    printf("epoll flags legacy=%d modern=%d\n", legacy_flags, modern_flags);
+    return legacy_flags == 0 && modern_flags == FD_CLOEXEC ? 0 : 2;
+}
+"#;
+    let Some(image) = compile_c("epoll-create-flags", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "epoll-create-flags");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("epoll flags legacy=0 modern=1"),
+        "epoll create argument mapping wrong; output: {:?}",
         run.output
     );
 }
@@ -1758,6 +1992,168 @@ fn run_argv_pumped(machine: &mut Machine, host: &mut BrokerHost, path: &str, arg
     );
 }
 
+/// A host-side network command is independent of the scheduler's aggregate
+/// wait state. Bun keeps housekeeping threads runnable while its request
+/// thread is parked, so a browser driver that drains commands only after
+/// `awaiting_network()` can starve a connect forever.
+#[test]
+fn host_commands_are_drained_while_sibling_is_runnable() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static volatile int done;
+static void *housekeeping(void *unused) {
+    (void)unused;
+    while (!done) sched_yield();
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 10;
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, housekeeping, NULL) != 0) return 11;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 12;
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons((unsigned short)atoi(argv[1]));
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != 0) return 13;
+    static const char request[] = "GET /hello HTTP/1.0\r\n\r\n";
+    if (write(fd, request, sizeof(request) - 1) != (ssize_t)(sizeof(request) - 1)) return 14;
+    char response[512] = {0};
+    ssize_t n = read(fd, response, sizeof(response) - 1);
+    if (n <= 0) return 15;
+    done = 1;
+    pthread_join(worker, NULL);
+    close(fd);
+    puts(strstr(response, "hello-from-webtos-m5") ? "sibling-network-ok" : "bad-response");
+    return strstr(response, "hello-from-webtos-m5") ? 0 : 16;
+}
+"#;
+    let Some(image) = compile_c("network-runnable-sibling", source, &["-pthread"]) else {
+        return;
+    };
+    let server = spawn_http_server();
+    let mut host = BrokerHost::new(vec![server]);
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/network-runnable-sibling", image, 0o755)
+        .expect("add fixture");
+    let broker = Rc::new(RefCell::new(HostBroker::new()));
+    machine.set_network(broker.clone());
+    machine.set_args(
+        vec![
+            b"network-runnable-sibling".to_vec(),
+            server.port().to_string().into_bytes(),
+        ],
+        vec![b"PATH=/bin".to_vec()],
+    );
+    machine
+        .load(b"/bin/network-runnable-sibling")
+        .expect("ELF load failed");
+
+    let mut output = Vec::new();
+    let mut drained_while_running = false;
+    let mut exit = None;
+    for _ in 0..2_000 {
+        machine.vm_mut().icount_limit = machine.icount() + 5_000_000;
+        let outcome = machine.run();
+        output.extend(machine.take_output());
+
+        // This mirrors the browser's fixed per-slice, nonblocking drain. The
+        // assertion records the exact state that made status-gated pumping
+        // incorrect: commands exist although the whole machine is runnable.
+        if broker.borrow().has_commands() {
+            if !machine.awaiting_network() {
+                drained_while_running = true;
+            }
+            let commands = broker.borrow_mut().take_commands();
+            host.perform(&commands, &broker);
+        }
+        let _ = host.poll(&broker);
+
+        if outcome != CpuExit::InstructionLimit && outcome != CpuExit::Interrupted {
+            exit = Some(outcome);
+            break;
+        }
+    }
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        drained_while_running,
+        "fixture never exposed commands behind a runnable sibling"
+    );
+    assert_eq!(
+        exit,
+        Some(CpuExit::Halt { code: Some(0) }),
+        "guest did not complete after per-slice network drains: {output:?}"
+    );
+    assert!(output.contains("sibling-network-ok"), "output: {output:?}");
+}
+
+#[test]
+fn epoll_reports_host_connect_completion_and_so_error() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons((unsigned short)atoi(argv[1]));
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != -1 || errno != EINPROGRESS) return 2;
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event wanted = { .events = EPOLLOUT | EPOLLET, .data.fd = fd };
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, fd, &wanted)) return 3;
+    struct epoll_event got = {0};
+    if (epoll_wait(ep, &got, 1, -1) != 1 || !(got.events & EPOLLOUT)) return 4;
+    int error = -1;
+    socklen_t length = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) || error != 0 || length != sizeof(error)) return 5;
+    puts("host-connect-complete-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("host-connect-complete", source, &[]) else {
+        return;
+    };
+    let server = spawn_http_server();
+    let mut host = BrokerHost::new(vec![server]);
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/host-connect-complete", image, 0o755)
+        .expect("add fixture");
+    let port = server.port().to_string();
+    let run = run_argv_pumped(
+        &mut machine,
+        &mut host,
+        "/bin/host-connect-complete",
+        &["host-connect-complete", &port],
+    );
+    expect_clean(&run);
+    assert!(
+        run.output.contains("host-connect-complete-ok"),
+        "output: {:?}",
+        run.output
+    );
+}
+
 #[test]
 fn host_driven_broker_fetches_http() {
     let Some(mut machine) = alpine_machine() else {
@@ -2100,6 +2496,102 @@ fn a_signal_interrupts_a_socket_read_unless_the_handler_asked_for_a_restart() {
 }
 
 // ── Transient failure and reconnect ──────────────────────────────────────────
+
+#[test]
+fn nonblocking_host_connect_is_in_progress_until_the_host_completes_it() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(443);
+    peer.sin_addr.s_addr = htonl(0x0a000001);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != -1 || errno != EINPROGRESS) return 2;
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event wanted = { .events = EPOLLOUT | EPOLLET, .data.fd = fd };
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, fd, &wanted)) return 3;
+    struct epoll_event got;
+    if (epoll_wait(ep, &got, 1, 0) != 0) return 4;
+    puts("host-connect-pending-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("host-connect-pending", source, &[]) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/host-connect-pending", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"host-connect-pending".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/host-connect-pending")
+        .expect("ELF load failed");
+    machine.set_network(Rc::new(RefCell::new(HostBroker::new())));
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(exit, CpuExit::Halt { code: Some(0) }, "{output:?}");
+    assert!(output.contains("host-connect-pending-ok"), "{output:?}");
+}
+
+#[test]
+fn host_broker_serializes_ipv6_tcp_without_losing_scope_or_flowinfo() {
+    let mut broker = HostBroker::new();
+    let destination = SocketAddrV6::new(
+        "2001:db8:1:2:3:4:5:6".parse().expect("IPv6 fixture"),
+        443,
+        0x1122_3344,
+        7,
+    );
+    let handle = broker
+        .tcp_connect_v6(destination)
+        .expect("IPv6 connect command");
+    assert_eq!(handle, 1);
+    assert_eq!(
+        broker.tcp_connect_status(handle),
+        ConnectStatus::Pending,
+        "queuing a host connect is not synchronous connection success"
+    );
+    let encoded = broker.take_commands();
+    let mut expected = vec![7, 1, 0, 0, 0];
+    expected.extend_from_slice(&destination.ip().octets());
+    expected.extend_from_slice(&destination.port().to_be_bytes());
+    expected.extend_from_slice(&destination.flowinfo().to_le_bytes());
+    expected.extend_from_slice(&destination.scope_id().to_le_bytes());
+    assert_eq!(encoded, expected);
+    broker.deliver_connected(handle, None);
+    assert_eq!(broker.tcp_connect_status(handle), ConnectStatus::Connected);
+}
+
+#[test]
+fn host_broker_socket_error_is_observable_then_cleared_like_so_error() {
+    let mut broker = HostBroker::new();
+    let handle = broker
+        .tcp_connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443))
+        .expect("connect handle");
+    broker.deliver_error(handle, linux_compat::abi::ECONNREFUSED);
+    assert_eq!(
+        broker.tcp_connect_status(handle),
+        ConnectStatus::Failed(linux_compat::abi::ECONNREFUSED)
+    );
+    assert_eq!(
+        broker.tcp_take_error(handle),
+        Ok(Some(linux_compat::abi::ECONNREFUSED))
+    );
+    assert_eq!(broker.tcp_take_error(handle), Ok(None));
+}
 
 #[test]
 fn host_proxy_error_is_delivered_once_as_econnreset() {

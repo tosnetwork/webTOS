@@ -954,6 +954,72 @@ _start:
 }
 
 #[test]
+fn a_five_byte_instruction_with_three_resident_prefix_bytes_pages_in_its_tail() {
+    let temp = std::env::temp_dir().join(format!(
+        "webtos-lazy-cross-three-byte-prefix-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&temp);
+    let source = temp.join("cross-three-byte-prefix.S");
+    let binary = temp.join("cross-three-byte-prefix");
+    std::fs::write(
+        &source,
+        br#".global _start
+.text
+_start:
+  .fill 4093, 1, 0x90
+  psllq $0x39, %xmm0
+  mov $60, %eax
+  xor %edi, %edi
+  syscall
+"#,
+    )
+    .expect("fixture source");
+    let built = Command::new("gcc")
+        .args([
+            "-nostdlib",
+            "-static",
+            "-Wl,-Ttext=0x401000",
+            "-Wl,-e,_start",
+            "-o",
+        ])
+        .arg(&binary)
+        .arg(&source)
+        .status()
+        .ok()
+        .filter(|status| status.success())
+        .and_then(|_| std::fs::read(&binary).ok());
+    let Some(image) = linux_compat::testing::require("x86-64 cross-page SSE fixture", built) else {
+        return;
+    };
+
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build");
+    let (file, store) = chunks(&image);
+    let authority = manifest(&[(
+        b"/bin/cross-three-byte-prefix",
+        image.as_slice(),
+        &file,
+        0o755,
+    )]);
+    machine
+        .install_chunk_manifest(&authority)
+        .expect("chunk manifest");
+    let first = file.chunks[0];
+    machine
+        .put_chunk(first, store[&first].clone())
+        .expect("ELF metadata chunk");
+    machine.set_args(vec![b"cross-three-byte-prefix".to_vec()], Vec::new());
+    machine
+        .load(b"/bin/cross-three-byte-prefix")
+        .expect("load cross-page fixture");
+
+    let run = drive(machine, &store);
+    assert_eq!(run.exit, CpuExit::Halt { code: Some(0) });
+    assert!(run.page_ins >= 2, "both executable pages were not filled");
+}
+
+#[test]
 fn scoped_secret_promotes_only_an_authorized_resident_file() {
     let config = br#"{"token":"${TOKEN}"}\n"#;
     let (file, store) = chunks(config);

@@ -5,15 +5,17 @@
 // renders with Ink on the MAIN screen (no alternate-screen switch), so the
 // paint detector is its first interactive text, not \x1b[?1049h.
 // Usage: node web/probe_claude_tui.mjs [minutes]
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createConnection } from "node:net";
 import { createSocket } from "node:dgram";
-import { resolve4 } from "node:dns/promises";
+import { resolve4, resolve6 } from "node:dns/promises";
 import { makeJitHost } from "./jit_host.mjs";
 
 const wasmPath = new URL("./webtos_web.wasm", import.meta.url).pathname;
 const realTask = process.env.PROBE_REAL_TASK === "1";
+const fetchFixture = process.env.PROBE_FETCH_FIXTURE === "1";
+const networkMode = realTask || fetchFixture;
 // This exercises the exact browser/PTY/controller path without depending on
 // a remote model service.  It deliberately renders the same accessibility
 // cursor-position controls used by the real client, waits for the explicit
@@ -25,6 +27,41 @@ const taskMode = realTask || mockTask;
 // has submitted the task, so the multi-billion-instruction Bun cold-start does
 // not drown the evidence needed to explain a post-prompt stall.
 const taskTrace = process.env.PROBE_TASK_TRACE === "1";
+// Capture the narrow synchronous failure window after Claude has constructed
+// an API request but before a broker command appears.  Starting at terminal
+// submission is too early: Bun can exhaust a bounded trace while preparing the
+// request.  Starting after the debug marker lets the following retry expose
+// the exact guest syscall result that Claude turns into "Connection error".
+const apiFailureTrace = realTask && process.env.PROBE_API_FAILURE_TRACE === "1";
+const apiFailureTraceInstructions = Number(
+  process.env.PROBE_API_FAILURE_TRACE_INSTRUCTIONS ?? 800_000_000,
+);
+if (!Number.isSafeInteger(apiFailureTraceInstructions) || apiFailureTraceInstructions < 1) {
+  throw new Error(
+    `PROBE_API_FAILURE_TRACE_INSTRUCTIONS must be a positive integer, got ${process.env.PROBE_API_FAILURE_TRACE_INSTRUCTIONS}`,
+  );
+}
+// Claude's own debug stream is opt-in and routed to the controlling terminal
+// only for diagnosis. Real-session output remains redacted; below we expose
+// boolean lifecycle markers rather than log lines, request IDs, or content.
+const claudeDebug = realTask && process.env.PROBE_CLAUDE_DEBUG === "1";
+const claudeDebugPath = "/work/claude-debug.log";
+// Metadata-only transport chronology for diagnosing a guest runtime. It never
+// prints command payloads (which are encrypted TLS records but can still carry
+// sensitive traffic), credentials, terminal text, or response bytes.
+const networkTrace = networkMode && process.env.PROBE_NET_TRACE === "1";
+const networkTraceEpoch = performance.now();
+let networkTraceSequence = 0;
+const traceNetwork = (event, fields = {}) => {
+  if (!networkTrace) return;
+  networkTraceSequence += 1;
+  console.error(
+    `[network-trace] seq=${networkTraceSequence} ms=${Math.round(performance.now() - networkTraceEpoch)} ` +
+      `event=${event} ${Object.entries(fields)
+        .map(([key, value]) => `${key}=${String(value).replaceAll(/\s/g, "_")}`)
+        .join(" ")}`.trimEnd(),
+  );
+};
 const taskTraceInstructions = Number(process.env.PROBE_TASK_TRACE_INSTRUCTIONS ?? 750_000_000);
 if (!Number.isSafeInteger(taskTraceInstructions) || taskTraceInstructions < 1) {
   throw new Error(`PROBE_TASK_TRACE_INSTRUCTIONS must be a positive integer, got ${process.env.PROBE_TASK_TRACE_INSTRUCTIONS}`);
@@ -40,7 +77,12 @@ if (!Number.isSafeInteger(taskTraceInstructions) || taskTraceInstructions < 1) {
 // is a wall-time allowance, not an authority expansion.
 const minutes = Number(process.argv[2] ?? (realTask ? 480 : 10));
 
-const claude = await readFile(new URL("./claude", import.meta.url));
+const claude = fetchFixture
+  ? await readFile(
+      process.env.PROBE_FETCH_RUNTIME ??
+        "/tmp/webtos-bun-1.3.1/bun-linux-x64-baseline/bun",
+    )
+  : await readFile(new URL("./claude", import.meta.url));
 const libDir = new URL("./claude-libs/", import.meta.url);
 const mockClaude = mockTask
   ? await readFile(new URL("./mock_claude", import.meta.url))
@@ -50,7 +92,7 @@ const lib = async (name) => ({
   bytes: await readFile(new URL(name, libDir)),
 });
 const files = [
-  { path: "/bin/claude", bytes: mockTask ? mockClaude : claude },
+  { path: fetchFixture ? "/bin/bun" : "/bin/claude", bytes: mockTask ? mockClaude : claude },
   await lib("ld-linux-x86-64.so.2"),
   await lib("libc.so.6"),
   await lib("libm.so.6"),
@@ -58,6 +100,35 @@ const files = [
   await lib("libpthread.so.0"),
   await lib("librt.so.1"),
 ];
+if (fetchFixture) {
+  files.push(
+    { path: "/etc/resolv.conf", bytes: Buffer.from("nameserver 1.1.1.1\n") },
+    {
+      path: "/work/fetch-fixture.js",
+      bytes: Buffer.from(`
+const endpoint = "https://api.anthropic.com/api/hello";
+const report = (label, error) =>
+  console.log(\`FETCH \${label} code=\${error?.code ?? "none"} name=\${error?.name ?? "none"}\`);
+await Promise.all([1, 2].map(async (attempt) => {
+  try {
+    const response = await fetch(endpoint);
+    await response.body?.cancel();
+    console.log(\`FETCH parallel=\${attempt} status=\${response.status}\`);
+  } catch (error) {
+    report(\`parallel=\${attempt}\`, error);
+  }
+}));
+try {
+  const response = await fetch(endpoint);
+  const body = await response.arrayBuffer();
+  console.log(\`FETCH final status=\${response.status} bytes=\${body.byteLength}\`);
+} catch (error) {
+  report("final", error);
+}
+`),
+    },
+  );
+}
 if (taskMode) {
   files.push(
     { path: "/bin/busybox", bytes: await readFile(new URL("./busybox-musl", import.meta.url)) },
@@ -122,7 +193,8 @@ const err = () => new TextDecoder().decode(mem().slice(e.wtw_error_ptr(), e.wtw_
 // interpreter. Keep JIT opt-in for this acceptance workload so this probe
 // validates the architectural path rather than timing out in an unrelated
 // optimizer limitation; `PROBE_JIT=1` remains available for profiling it.
-const useJit = process.env.PROBE_JIT === "1" || (!realTask && process.env.PROBE_JIT !== "0");
+const useJit =
+  process.env.PROBE_JIT === "1" || (!networkMode && process.env.PROBE_JIT !== "0");
 const usePty = process.env.PROBE_PTY !== "0";
 const traceEvery = Number(process.env.PROBE_TRACE_EVERY ?? 0);
 if (!Number.isSafeInteger(traceEvery) || traceEvery < 0 || traceEvery > 0xffff_ffff) {
@@ -140,6 +212,17 @@ if (
 ) {
   throw new Error(
     `PROBE_TRACE_AFTER_ICOUNT must be a non-negative safe integer, got ${process.env.PROBE_TRACE_AFTER_ICOUNT}`,
+  );
+}
+const traceAfterRenderedBytes = process.env.PROBE_TRACE_AFTER_RENDERED_BYTES === undefined
+  ? null
+  : Number(process.env.PROBE_TRACE_AFTER_RENDERED_BYTES);
+if (
+  traceAfterRenderedBytes !== null &&
+  (!Number.isSafeInteger(traceAfterRenderedBytes) || traceAfterRenderedBytes < 1)
+) {
+  throw new Error(
+    `PROBE_TRACE_AFTER_RENDERED_BYTES must be a positive safe integer, got ${process.env.PROBE_TRACE_AFTER_RENDERED_BYTES}`,
   );
 }
 const traceEventBudget = Number(process.env.PROBE_TRACE_EVENT_BUDGET ?? 0);
@@ -182,10 +265,14 @@ if (e.wtw_init() !== 0) throw new Error(`init: ${err()}`);
 if (e.wtw_set_guest_memory_mb(guestMemoryMb) !== 0) throw new Error(`guestmem: ${err()}`);
 if (useJit && e.wtw_jit_enable(jitAfter) !== 0) throw new Error(`jit: ${err()}`);
 if (e.wtw_install_chunk_manifest(...put(manifest)) !== 0) throw new Error(`manifest: ${err()}`);
-const executable = taskMode ? "/bin/busybox" : "/bin/claude";
+const executable = taskMode ? "/bin/busybox" : fetchFixture ? "/bin/bun" : "/bin/claude";
 if (taskMode) {
   e.wtw_arg(...put("sh"));
   e.wtw_arg(...put("-i"));
+}
+if (fetchFixture) {
+  e.wtw_arg(...put("bun"));
+  e.wtw_arg(...put("/work/fetch-fixture.js"));
 }
 if (realTask) {
   const principal = "claude-m9-acceptance";
@@ -203,6 +290,8 @@ if (realTask) {
   ) !== 0) {
     throw new Error(`credential handle: ${err()}`);
   }
+  if (e.wtw_net_enable() !== 0) throw new Error(`network: ${err()}`);
+} else if (fetchFixture) {
   if (e.wtw_net_enable() !== 0) throw new Error(`network: ${err()}`);
 } else if (!taskMode) {
   e.wtw_arg(...put("claude"));
@@ -256,10 +345,26 @@ const ENETUNREACH = 101;
 const ECONNRESET = 104;
 const ETIMEDOUT = 110;
 const ECONNREFUSED = 111;
-const apiAddresses = new Set(realTask ? await resolve4("api.anthropic.com") : []);
+const apiAddressFamilies = networkMode
+  ? await Promise.all([
+      resolve4("api.anthropic.com").catch(() => []),
+      resolve6("api.anthropic.com").catch(() => []),
+    ])
+  : [[], []];
+const canonicalAddress = (ip) => {
+  if (!ip.includes(":")) return ip;
+  // URL's host parser gives one RFC 5952-style representation, so a DNS
+  // resolver's compressed spelling and the command stream's expanded
+  // spelling cannot bypass or accidentally fail the exact allowlist.
+  const host = new URL(`http://[${ip}]/`).hostname;
+  return host.slice(1, -1);
+};
+const apiAddresses = new Set(apiAddressFamilies.flat().map(canonicalAddress));
 const sockets = new Map();
 let netEvents = 0;
 let netWake = null;
+let networkCommandBatches = 0;
+let networkCommandBytes = 0;
 const noteNetEvent = () => {
   netEvents += 1;
   if (netWake) {
@@ -269,6 +374,7 @@ const noteNetEvent = () => {
   }
 };
 const deliverNetError = (handle, errno) => {
+  traceNetwork("guest-error", { handle, errno });
   e.wtw_net_error(handle, errno);
   noteNetEvent();
 };
@@ -279,8 +385,10 @@ const nodeErrno = (error) => {
   return ENETUNREACH;
 };
 const permitted = (ip, port) =>
-  (ip === "1.1.1.1" && port === 53) || (apiAddresses.has(ip) && port === 443);
+  (ip === "1.1.1.1" && port === 53) ||
+  (apiAddresses.has(canonicalAddress(ip)) && port === 443);
 const deliverNetData = (handle, bytes) => {
+  traceNetwork("guest-data", { handle, bytes: bytes.length });
   e.wtw_net_data(handle, ...put(bytes));
   noteNetEvent();
 };
@@ -290,23 +398,41 @@ const openTcp = (handle, ip, port) => {
     deliverNetError(handle, ENETUNREACH);
     return;
   }
-  const socket = createConnection({ host: ip, port });
+  traceNetwork("host-connect-start", {
+    handle,
+    family: ip.includes(":") ? 6 : 4,
+    destination: `${ip}:${port}`,
+  });
+  const socket = createConnection({ host: ip, port, family: ip.includes(":") ? 6 : 4 });
   sockets.set(handle, { kind: "tcp", socket });
   socket.on("connect", () => {
+    traceNetwork("host-connect", { handle });
     e.wtw_net_connected(handle, 0, 0);
     noteNetEvent();
   });
   socket.on("data", (bytes) => deliverNetData(handle, bytes));
   socket.on("end", () => {
+    traceNetwork("host-end", { handle });
     e.wtw_net_closed(handle);
     noteNetEvent();
   });
-  socket.on("error", (error) => deliverNetError(handle, nodeErrno(error)));
+  socket.on("error", (error) => {
+    traceNetwork("host-error", { handle, code: error?.code ?? "unknown" });
+    deliverNetError(handle, nodeErrno(error));
+  });
+  socket.on("close", (hadError) => traceNetwork("host-close", { handle, hadError }));
+  socket.on("drain", () => traceNetwork("host-drain", { handle }));
 };
 const openUdp = (handle) => {
   const socket = createSocket("udp4");
   sockets.set(handle, { kind: "udp", socket });
   socket.on("message", (bytes, remote) => {
+    traceNetwork("host-udp-data", {
+      handle,
+      family: remote.family,
+      source: `${remote.address}:${remote.port}`,
+      bytes: bytes.length,
+    });
     const octets = remote.address.split(".").map(Number);
     const ip = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
     e.wtw_net_datagram(handle, ip, remote.port, ...put(bytes));
@@ -333,6 +459,20 @@ const performNetwork = (stream) => {
     offset += 6;
     return { ip, port };
   };
+  const destination6 = () => {
+    const groups = [];
+    for (let at = 0; at < 16; at += 2) {
+      groups.push(((stream[offset + at] << 8) | stream[offset + at + 1]).toString(16));
+    }
+    let ip = groups.join(":");
+    const port = view.getUint16(offset + 16, false);
+    // Flow information is transport metadata which Node does not expose on
+    // connect. Scope is part of a routable link-local IPv6 address.
+    const scope = view.getUint32(offset + 22, true);
+    if (scope !== 0) ip += `%${scope}`;
+    offset += 26;
+    return { ip, port };
+  };
   const payload = () => {
     const length = u32();
     const bytes = stream.slice(offset, offset + length);
@@ -344,16 +484,26 @@ const performNetwork = (stream) => {
     const handle = u32();
     if (op === 1) {
       const { ip, port } = destination();
+      traceNetwork("command-connect", { handle, family: 4, destination: `${ip}:${port}` });
       openTcp(handle, ip, port);
     } else if (op === 2) {
-      sockets.get(handle)?.socket.write(payload());
+      const bytes = payload();
+      const accepted = sockets.get(handle)?.socket.write(bytes);
+      traceNetwork("command-send", { handle, bytes: bytes.length, accepted: accepted ?? false });
     } else if (op === 3) {
+      traceNetwork("command-shutdown-write", { handle });
       sockets.get(handle)?.socket.end();
     } else if (op === 4) {
+      traceNetwork("command-udp-open", { handle });
       openUdp(handle);
     } else if (op === 5) {
       const { ip, port } = destination();
       const bytes = payload();
+      traceNetwork("command-udp-send", {
+        handle,
+        destination: `${ip}:${port}`,
+        bytes: bytes.length,
+      });
       if (!permitted(ip, port)) {
         console.error(`[network] refused udp ${ip}:${port}`);
         deliverNetError(handle, ENETUNREACH);
@@ -362,17 +512,37 @@ const performNetwork = (stream) => {
       }
     } else if (op === 6) {
       const entry = sockets.get(handle);
+      traceNetwork("command-close", { handle, kind: entry?.kind ?? "missing" });
       if (entry?.kind === "udp") entry.socket.close();
       else entry?.socket.destroy();
       sockets.delete(handle);
+    } else if (op === 7) {
+      const { ip, port } = destination6();
+      traceNetwork("command-connect", { handle, family: 6, destination: `[${ip}]:${port}` });
+      openTcp(handle, ip, port);
     } else {
       throw new Error(`unknown network opcode ${op}`);
     }
   }
 };
+// Broker commands are per-socket side effects, not a whole-machine wait
+// state. A Bun worker may stay runnable after another thread queued connect
+// or send, so every VM slice must dispatch these commands without blocking.
+// Waiting for a reply remains exclusive to STATUS_AWAITING_NETWORK below.
+const drainNetworkCommands = () => {
+  const commands = takeNetworkCommands();
+  if (commands.length === 0) return false;
+  performNetwork(commands);
+  networkCommandBatches += 1;
+  networkCommandBytes += commands.length;
+  console.error(
+    `[network] dispatched_batch=${networkCommandBatches} bytes=${commands.length} total_bytes=${networkCommandBytes}`,
+  );
+  return true;
+};
 const pumpNetwork = async () => {
   const before = netEvents;
-  performNetwork(takeNetworkCommands());
+  drainNetworkCommands();
   if (netEvents !== before) return;
   const budget = e.wtw_net_budget_ms() >>> 0;
   const waitMs = Math.min(budget === NET_BUDGET_UNBOUNDED ? 1000 : budget, 1000);
@@ -395,10 +565,21 @@ for (;;) {
   deliver("metadata");
 }
 if (usePty && e.wtw_pty_install(40, 120) !== 0) throw new Error(`pty: ${err()}`);
-if (traceEvery > 0 && traceAfterIcount === null && e.wtw_trace_start(traceEvery) !== 0) {
+if (
+  traceEvery > 0 &&
+  traceAfterIcount === null &&
+  traceAfterRenderedBytes === null &&
+  e.wtw_trace_start(traceEvery) !== 0
+) {
   throw new Error(`trace start: ${err()}`);
 }
-if (traceEvery > 0 && traceAfterIcount === null && traceEventBudget > 0 && e.wtw_set_event_log_budget(traceEventBudget) !== 0) {
+if (
+  traceEvery > 0 &&
+  traceAfterIcount === null &&
+  traceAfterRenderedBytes === null &&
+  traceEventBudget > 0 &&
+  e.wtw_set_event_log_budget(traceEventBudget) !== 0
+) {
   throw new Error(`trace budget: ${err()}`);
 }
 const maxFuel = process.env.PROBE_MAX_FUEL ? Number(process.env.PROBE_MAX_FUEL) : 50_000_000;
@@ -415,15 +596,27 @@ let taskPhase = taskMode ? "shell" : "paint";
 let taskSucceeded = false;
 let networkWaits = 0;
 let taskNetworkBaseline = 0;
+let taskNetworkBatchBaseline = 0;
 let taskSuccessBaseline = 0;
 let exitMarkerBaseline = 0;
 let taskTraceStartIcount = null;
 let taskTraceExpired = false;
-let tracing = traceEvery > 0 && traceAfterIcount === null;
+let apiFailureTraceStartIcount = null;
+let apiFailureTraceExpired = false;
+let tracing = traceEvery > 0 && traceAfterIcount === null && traceAfterRenderedBytes === null;
 let deferredTraceStarted = false;
 let trustSelectionSent = false;
 let loggedRenderedBytes = 0;
 let taskInputEchoed = false;
+let loggedClaudeDebugState = "";
+const guestFile = (path) => {
+  const len = e.wtw_file_read(...put(path));
+  if (len < 0) return null;
+  return new TextDecoder().decode(mem().slice(e.wtw_file_read_ptr(), e.wtw_file_read_ptr() + len));
+};
+const taskInstruction =
+  "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
+  "then reply with exactly WEBTOS_TASK_DONE.";
 const currentIcount = () =>
   (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
 // The cost of emulating runnable guest instructions is not guest-visible wall
@@ -459,6 +652,13 @@ const terminalText = () =>
     .replace(/\x1b[=>]/g, "");
 const interactivePromptVisible = () =>
   /trust\s+this\s+folder|Welcome\s+to\s+Claude|Choose\s+the\s+text\s+style|What\s+can\s+I\s+help|How\s+can\s+I\s+help|Claude\s+Code\s+v\d/.test(terminalText());
+// A verified Claude composer can read from a non-blocking terminal and wait
+// in epoll rather than parking a blocking read.  The pty is a byte queue, so
+// queuing a task at this explicit, non-trust prompt is safe; it will be read
+// by that event loop on its next turn.  Do not use a generic paint byte count
+// here: startup/progress frames are not input authority.
+const composerPromptVisible = () =>
+  !trustPromptVisible() && interactivePromptVisible();
 const painted = () =>
   interactivePromptVisible() ||
   // A short paint-only probe is permitted to use a generic visual hint. A
@@ -477,14 +677,21 @@ const input = (text) => {
 // returns STATUS_RUNNING, so status alone is not an input-admission signal.
 const terminalInputPending = () => e.wtw_pty_input_pending() !== 0;
 const occurrences = (needle) => rendered.split(needle).length - 1;
+const safeErrorDetail = (value) =>
+  value
+    .replace(/https?:\/\/\S+/gi, "<url>")
+    .replace(/\b(?:Bearer|Basic)\s+\S+/gi, "<authorization>")
+    .replace(/\b(?:sk-ant|sk-|oauth)[A-Za-z0-9._-]+/gi, "<credential>")
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "<opaque-id>")
+    .slice(0, 240);
 const claudeExited = () => /(?:^|\r?\n)WEBTOS_CLAUDE_EXIT=\d+/.test(rendered);
 const trustPromptVisible = () => /Quick\s+safety\s+check|trust\s+this\s+folder/.test(terminalText());
 while (Date.now() < deadline) {
   if (
     traceEvery > 0 &&
     !tracing &&
-    traceAfterIcount !== null &&
-    currentIcount() >= traceAfterIcount
+    ((traceAfterIcount !== null && currentIcount() >= traceAfterIcount) ||
+      (traceAfterRenderedBytes !== null && rendered.length >= traceAfterRenderedBytes))
   ) {
     if (e.wtw_trace_start(traceEvery) !== 0) throw new Error(`deferred trace start: ${err()}`);
     if (traceEventBudget > 0 && e.wtw_set_event_log_budget(traceEventBudget) !== 0) {
@@ -493,7 +700,7 @@ while (Date.now() < deadline) {
     tracing = true;
     deferredTraceStarted = true;
     console.error(
-      `[trace] deferred trace started at icount=${currentIcount().toLocaleString()} sample_every=${traceEvery} budget=${traceEventBudget}`,
+      `[trace] deferred trace started at icount=${currentIcount().toLocaleString()} rendered_bytes=${rendered.length} sample_every=${traceEvery} budget=${traceEventBudget}`,
     );
   }
   if (traceStopAfterIcount !== null && currentIcount() >= traceStopAfterIcount) {
@@ -516,11 +723,25 @@ while (Date.now() < deadline) {
     );
   }
   drain();
+  // Do not hide per-thread network work behind a whole-machine status. The
+  // broker's empty take is a side-effect-free zero-length result.
+  if (realTask && drainNetworkCommands()) {
+    // A queued non-blocking connect is not complete until Node's socket
+    // callback runs. Bun may keep unrelated guest threads runnable, so the
+    // machine need not report a whole-process network wait yet. Yield exactly
+    // after a new host command batch; otherwise a synchronous probe loop can
+    // starve the callback that makes EPOLLOUT true.
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   // This is only a boolean confirmation that the fixed, locally generated
   // acceptance instruction crossed the terminal boundary.  Never print the
   // terminal transcript for a real session: it can contain model output or
   // private task data.
-  if (taskPhase === "task" && !taskInputEchoed && terminalText().includes("Read /work/input.txt")) {
+  if (
+    (taskPhase === "task-text" || taskPhase === "task") &&
+    !taskInputEchoed &&
+    terminalText().includes("Read /work/input.txt")
+  ) {
     taskInputEchoed = true;
     console.error("[terminal-input] task_instruction_echoed=true");
   }
@@ -536,6 +757,86 @@ while (Date.now() < deadline) {
         `terminal_input_pending=${terminalInputPending()}`,
     );
     loggedRenderedBytes = rendered.length;
+  }
+  // Read Claude's private debug file only after the task has been submitted.
+  // Before that point a missing file is expected, and probing it must not
+  // replace a genuine VM diagnostic in the shared error buffer.
+  if (claudeDebug && taskPhase === "task" && slices % 250 === 0) {
+    const debugText = guestFile(claudeDebugPath);
+    if (debugText !== null) {
+      const connectionDetails = [
+        ...debugText.matchAll(/Connection error details: code=([^,\r\n]*), message=([^\r\n]*)/g),
+      ]
+        .map((match) => ({
+          code: safeErrorDetail(match[1].trim()),
+          message: safeErrorDetail(match[2].trim()),
+        }))
+        .filter(
+          (item, index, all) =>
+            all.findIndex(
+              (candidate) =>
+                candidate.code === item.code && candidate.message === item.message,
+            ) === index,
+        )
+        .slice(-4);
+      const debugLifecycle = {
+        // Counts and fixed source labels distinguish Claude's background
+        // session-title request from the actual engine turn without exposing
+        // prompts, model output, request IDs, or account data.
+        apiDispatchCount: (debugText.match(/\[API:timing\] dispatching/g) ?? []).length,
+        apiRequestCount: (debugText.match(/\[API REQUEST\]/g) ?? []).length,
+        titleRequest: debugText.includes("source=generate_session_title"),
+        replMainRequest: debugText.includes("source=repl_main_thread"),
+        sdkRequest: debugText.includes("source=sdk"),
+        engineTurnStart: /\[engine\] turn \d+ start/.test(debugText),
+        firstByte: debugText.includes("[API:timing] first byte"),
+        engineTurnEnd: /\[engine\] turn \d+ end/.test(debugText),
+        toolUse: debugText.includes("tool_use") || debugText.includes("ToolUse"),
+        bootstrapFetchOk: debugText.includes("[Bootstrap] Fetch ok"),
+        authError: /auth(?:entication|orization)?[^\r\n]{0,80}(?:error|failed|invalid)/i.test(debugText),
+        apiError: /\[API[^\]]*\][^\r\n]{0,120}(?:error|failed)/i.test(debugText),
+        connectionError: debugText.includes("undefined Connection error"),
+        connectionDetails,
+        fetchError: /(?:fetch|network)[^\r\n]{0,100}(?:error|failed|timeout)/i.test(debugText),
+      };
+      const debugState = JSON.stringify(debugLifecycle);
+      if (debugState !== loggedClaudeDebugState) {
+        console.error(`[claude-debug-state] ${debugState}`);
+        loggedClaudeDebugState = debugState;
+      }
+      if (
+        apiFailureTrace &&
+        apiFailureTraceStartIcount === null &&
+        debugLifecycle.engineTurnStart
+      ) {
+        // Events only: register samples spend the finite event budget without
+        // explaining a synchronous I/O failure.  Starting at engine-turn
+        // admission captures the *first* request's initialization; later
+        // retries can merely rethrow an error cached by Bun's dispatcher.
+        if (e.wtw_trace_start(0) !== 0) {
+          throw new Error(`API failure trace: ${err()}`);
+        }
+        if (e.wtw_set_event_log_budget(32768) !== 0) {
+          throw new Error(`API failure trace budget: ${err()}`);
+        }
+        tracing = true;
+        apiFailureTraceStartIcount = currentIcount();
+        console.error(
+          `[trace] API failure trace started at icount=${apiFailureTraceStartIcount.toLocaleString()} ` +
+            `before_or_at_requests=${debugLifecycle.apiRequestCount}`,
+        );
+      }
+    }
+  }
+  if (
+    apiFailureTraceStartIcount !== null &&
+    currentIcount() - apiFailureTraceStartIcount >= apiFailureTraceInstructions
+  ) {
+    apiFailureTraceExpired = true;
+    console.error(
+      `[trace] API failure trace budget reached at icount=${currentIcount().toLocaleString()}`,
+    );
+    break;
   }
   if (status === STATUS_AWAITING_NETWORK) {
     networkWaits += 1;
@@ -557,6 +858,7 @@ while (Date.now() < deadline) {
         // customizations, while the virtual filesystem/network broker remains
         // the independent execution boundary.
         "cd /work && /bin/claude --safe-mode --ax-screen-reader --no-chrome " +
+          (claudeDebug ? `--debug-file ${claudeDebugPath} ` : "") +
           "--permission-mode acceptEdits " +
           "--allowedTools Read,Edit --model haiku; echo WEBTOS_CLAUDE_EXIT=$?\r",
       );
@@ -573,38 +875,47 @@ while (Date.now() < deadline) {
       taskPhase = "trust";
       continue;
     }
-    // A rendered frame is not an input boundary.  The real client continues
-    // bootstrapping for a short period after drawing its accessibility prompt;
-    // submitting then can be consumed by an internal terminal mode change
-    // rather than by Claude's composer.  Only inject a task once the guest
-    // has actually blocked on the pty read that asks the host for input.
-    if (taskPhase === "claude-start" && terminalInputPending() && painted()) {
-      input(
-        "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
-          "then reply with exactly WEBTOS_TASK_DONE.\r",
-      );
+    // Prefer a concrete pending pty read, but do not confuse it with the
+    // only admissible TUI shape. Bun may use O_NONBLOCK + epoll for stdin, in
+    // which case the foreground has no blocked read even though it is at the
+    // verified composer. The pty preserves the bytes until that poll reads.
+    if (
+      taskPhase === "claude-start" &&
+      (terminalInputPending() || composerPromptVisible())
+    ) {
+      // Bun/Ink distinguishes human key events from pasted input partly by
+      // delivery shape. If the text and CR share one pty write, they can be
+      // returned by one read and the trailing CR can remain part of the paste
+      // instead of becoming the Return key. Send the text first; the
+      // task-text state waits for proof that the guest consumed it before a
+      // separate Return event is admitted.
+      input(taskInstruction);
       taskNetworkBaseline = networkWaits;
+      taskNetworkBatchBaseline = networkCommandBatches;
       taskSuccessBaseline = occurrences("WEBTOS_TASK_DONE");
-      taskPhase = "task";
-      if (taskTrace) {
-        // A coarse architectural sample plus a bounded syscall stream makes
-        // the busy path diagnosable without retaining a multi-gigabyte trace.
-        if (e.wtw_trace_start(50_000_000) !== 0) throw new Error(`task trace: ${err()}`);
-        if (e.wtw_set_event_log_budget(4096) !== 0) throw new Error(`task trace budget: ${err()}`);
-        tracing = true;
-        taskTraceStartIcount = currentIcount();
-      }
+      taskPhase = "task-text";
       continue;
     }
     if (taskPhase === "trust" && terminalInputPending() && trustSelectionSent) {
-      input(
-        "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
-          "then reply with exactly WEBTOS_TASK_DONE.\r",
-      );
+      input(taskInstruction);
       taskNetworkBaseline = networkWaits;
+      taskNetworkBatchBaseline = networkCommandBatches;
       taskSuccessBaseline = occurrences("WEBTOS_TASK_DONE");
+      taskPhase = "task-text";
+      continue;
+    }
+    if (
+      taskPhase === "task-text" &&
+      // The real TUI's application-level repaint proves that Ink consumed
+      // the text. The deterministic mock does not echo in raw mode, so its
+      // next blocked terminal read is the equivalent consumption proof.
+      (taskInputEchoed || (mockTask && terminalInputPending()))
+    ) {
+      input("\r");
       taskPhase = "task";
       if (taskTrace) {
+        // Trace from the semantic submit event rather than from the preceding
+        // text insertion, so the bounded event budget covers task dispatch.
         if (e.wtw_trace_start(50_000_000) !== 0) throw new Error(`task trace: ${err()}`);
         if (e.wtw_set_event_log_budget(4096) !== 0) throw new Error(`task trace budget: ${err()}`);
         tracing = true;
@@ -621,7 +932,9 @@ while (Date.now() < deadline) {
     if (
       taskPhase === "task" &&
       terminalInputPending() &&
-      (mockTask || networkWaits > taskNetworkBaseline) &&
+      (mockTask ||
+        networkWaits > taskNetworkBaseline ||
+        networkCommandBatches > taskNetworkBatchBaseline) &&
       occurrences("WEBTOS_TASK_DONE") > taskSuccessBaseline
     ) {
       exitMarkerBaseline = occurrences("WEBTOS_CLAUDE_EXIT=");
@@ -665,6 +978,12 @@ while (Date.now() < deadline) {
     continue;
   }
   if (status !== 0) break;
+  // wtw_run is synchronous. Once a host socket exists, yield so Node can run
+  // connect/data/error callbacks even while another guest thread keeps the
+  // VM continuously runnable.
+  if (networkMode && sockets.size > 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 drain();
 
@@ -674,6 +993,7 @@ console.log(
   `jit=${useJit} jit_after=${jitAfter} pty=${usePty} realtime_clock=${realtimeClock} ` +
     `guest_memory_mb=${guestMemoryMb} ` +
     `clock_warp_ms=${realtimeWarpAppliedMs} status=${status} slices=${slices} ` +
+    `network_command_batches=${networkCommandBatches} network_command_bytes=${networkCommandBytes} ` +
     `page_ins=${pageIns} icount=${icount.toLocaleString()} ` +
     `jit_blocks=${Number(e.wtw_jit_block_dispatch_count()).toLocaleString()} ` +
     `jit_regions=${Number(e.wtw_jit_region_dispatch_count()).toLocaleString()} ` +
@@ -682,7 +1002,7 @@ console.log(
 );
 if (status !== 0 && status !== 1 && status !== 7) console.log(`engine error: ${err()}`);
 console.log(
-  `painted=${alt} real_task=${realTask} mock_task=${mockTask} task_phase=${taskPhase} task_succeeded=${taskSucceeded} task_trace_expired=${taskTraceExpired} ` +
+  `painted=${alt} real_task=${realTask} mock_task=${mockTask} task_phase=${taskPhase} task_succeeded=${taskSucceeded} task_trace_expired=${taskTraceExpired} api_failure_trace_expired=${apiFailureTraceExpired} ` +
     `task_instruction_echoed=${taskInputEchoed} deferred_trace_started=${deferredTraceStarted} rendered_bytes=${rendered.length}`,
 );
 const printable = rendered.replace(/\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]/g, "").trim();
@@ -698,6 +1018,10 @@ if (tracing) {
   const traceText = new TextDecoder().decode(
     mem().slice(e.wtw_trace_ptr(), e.wtw_trace_ptr() + traceLen),
   );
+  if (process.env.PROBE_TRACE_OUTPUT) {
+    await writeFile(process.env.PROBE_TRACE_OUTPUT, traceText, { mode: 0o600 });
+    console.error(`[trace] raw trace written to ${process.env.PROBE_TRACE_OUTPUT}`);
+  }
   const ripCounts = new Map();
   const syscallCounts = new Map();
   const syscallShapeCounts = new Map();

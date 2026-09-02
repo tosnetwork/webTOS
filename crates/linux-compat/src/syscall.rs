@@ -491,7 +491,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         ),
         abi::SYS_OPENAT => sys_openat(env, cpu, a[0], a[1], a[2], a[3]),
         abi::SYS_CLOSE => {
-            let closed = env.proc.fds.borrow_mut().close(a[0]);
+            let closed = close_fd(env, a[0]);
             // Closing the last descriptor on an unlinked file is when its
             // contents finally become unreachable.
             if closed.is_ok() {
@@ -680,7 +680,12 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
         abi::SYS_TIMERFD_CREATE => sys_timerfd_create(env, a[0], a[1]),
         abi::SYS_TIMERFD_SETTIME => sys_timerfd_settime(env, cpu, a),
         abi::SYS_TIMERFD_GETTIME => sys_timerfd_gettime(env, cpu, a[0], a[1]),
-        abi::SYS_EPOLL_CREATE | abi::SYS_EPOLL_CREATE1 => sys_epoll_create(env, a[1]),
+        // epoll_create(size) has no flags; epoll_create1(flags) takes them in
+        // the first syscall argument. Reading RSI here made CLOEXEC depend on
+        // an unrelated stale register and could close the runtime's event
+        // loop across exec.
+        abi::SYS_EPOLL_CREATE => sys_epoll_create(env, 0),
+        abi::SYS_EPOLL_CREATE1 => sys_epoll_create(env, a[0]),
         abi::SYS_EPOLL_CTL => sys_epoll_ctl(env, cpu, a),
 
         abi::SYS_MMAP => {
@@ -854,6 +859,51 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             tracing::warn!("unimplemented syscall {nr} -> ENOSYS");
             Err(abi::ENOSYS)
         }
+    }
+}
+
+/// Closes one descriptor and removes its numeric registration from every
+/// epoll instance in the process. Linux ties an epoll item to the registered
+/// open-file description and removes it when that description is gone; this
+/// fd-number model must at least prevent a later fd reuse from inheriting the
+/// old interest, edge suppression, or ONESHOT-disabled state.
+fn close_fd(env: &mut LinuxEnv, fd: u64) -> Result<(), u64> {
+    let epolls: Vec<crate::fd::EpollRef> = {
+        let fds = env.proc.fds.borrow();
+        fds.iter()
+            .filter_map(|(_, entry)| match &entry.desc.borrow().backing {
+                Backing::Epoll(epoll) => Some(epoll.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    env.proc.fds.borrow_mut().close(fd)?;
+    for epoll in epolls {
+        let mut inner = epoll.borrow_mut();
+        inner.interests.remove(&fd);
+        inner.oneshot_disabled.remove(&fd);
+        inner.edge_fired.remove(&fd);
+    }
+    Ok(())
+}
+
+/// Applies close-on-exec through the same epoll-aware close path as `close`
+/// and `close_range`. Dropping table slots directly would leave registrations
+/// keyed by those numeric descriptors behind, so a descriptor allocated by
+/// the new image could inherit stale readiness and ONESHOT state.
+fn close_cloexec_fds(env: &mut LinuxEnv) {
+    let cloexec: Vec<u64> = env
+        .proc
+        .fds
+        .borrow()
+        .iter()
+        .filter_map(|(fd, entry)| entry.cloexec.then_some(fd))
+        .collect();
+    for fd in cloexec {
+        // The list came from this table and no guest code runs between its
+        // creation and the closes, so failure only means an internal bug.
+        let closed = close_fd(env, fd);
+        debug_assert!(closed.is_ok());
     }
 }
 
@@ -1385,7 +1435,9 @@ fn sys_close_range(env: &mut LinuxEnv, first: u64, last: u64, flags: u64) -> Sys
                 entry.cloexec = true;
             }
         } else {
-            let _ = fds.close(fd);
+            drop(fds);
+            let _ = close_fd(env, fd);
+            fds = env.proc.fds.borrow_mut();
         }
     }
     Ok(0)
@@ -2379,6 +2431,13 @@ fn sys_dup2(env: &mut LinuxEnv, fd: u64, new_fd: u64, cloexec: bool) -> SysResul
     if fd == new_fd {
         return Ok(new_fd);
     }
+    // dup2/dup3 atomically close an occupied destination before installing
+    // the duplicate. Route that implicit close through the epoll cleanup used
+    // by close(2), otherwise the replacement can inherit the old descriptor's
+    // registration and disabled ONESHOT state.
+    if env.proc.fds.borrow().get(new_fd).is_ok() {
+        close_fd(env, new_fd)?;
+    }
     env.proc.fds.borrow_mut().insert_at(
         new_fd,
         FdEntry {
@@ -2737,7 +2796,8 @@ fn desc_read_ready(desc: &Description, now: u64) -> bool {
     }
 }
 
-/// Write-readiness (pipes/socketpairs can fill; everything else accepts).
+/// Write-readiness. A host-driven TCP socket becomes writable only after the
+/// host reports connect completion (or failure), matching non-blocking Linux.
 fn desc_write_ready(desc: &Description) -> bool {
     match &desc.backing {
         Backing::Pipe {
@@ -2748,7 +2808,32 @@ fn desc_write_ready(desc: &Description) -> bool {
             let inner = inner.borrow();
             inner.data.len() < crate::PIPE_CAPACITY || inner.readers == 0
         }
+        Backing::Net(socket) if socket.borrow().kind == SocketKind::Tcp => {
+            let socket = socket.borrow();
+            socket.handle.is_some_and(|handle| {
+                !matches!(
+                    socket.broker.borrow_mut().tcp_connect_status(handle),
+                    crate::net::ConnectStatus::Pending
+                )
+            })
+        }
         _ => true,
+    }
+}
+
+/// The readiness source for a descriptor that is not currently writable.
+fn write_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
+    use crate::proc::Watch;
+    match &desc.backing {
+        Backing::Pipe {
+            inner,
+            write_end: true,
+        }
+        | Backing::SocketPair { tx: inner, .. } => Some(Watch::PipeWritable(inner.clone())),
+        Backing::Net(socket) if socket.borrow().kind == SocketKind::Tcp => {
+            Some(Watch::NetWritable(socket.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -4346,7 +4431,8 @@ fn format_park_state(state: &ParkState) -> String {
                     crate::proc::Watch::Timer(t) => {
                         format!("timer(next={:?})", t.borrow().next_expiry)
                     }
-                    crate::proc::Watch::NetReadable(_) => "net".to_string(),
+                    crate::proc::Watch::NetReadable(_) => "net-read".to_string(),
+                    crate::proc::Watch::NetWritable(_) => "net-write".to_string(),
                     crate::proc::Watch::PipeActivity(p, seen) => {
                         format!("pipeAct(now={},seen={seen})", p.borrow().activity)
                     }
@@ -5466,7 +5552,7 @@ fn sys_execve(
     if let Some(done) = env.proc.vfork_done.take() {
         done.set(true);
     }
-    env.proc.fds.borrow_mut().close_cloexec();
+    close_cloexec_fds(env);
 
     // The instruction counter must survive the CPU reset inside the loader.
     let icount = cpu.icount;
@@ -6493,6 +6579,9 @@ const EPOLL_CTL_MOD: u64 = 3;
 const EPOLLIN: u32 = 0x1;
 const EPOLLOUT: u32 = 0x4;
 const EPOLLHUP: u32 = 0x10;
+/// Disable an interest after one delivered event.  Userspace rearms it with
+/// `EPOLL_CTL_MOD`; an ordinary readiness transition does not rearm it.
+const EPOLLONESHOT: u32 = 0x4000_0000;
 /// Edge-triggered: report a fd only on a not-ready→ready transition, not on
 /// every wait while it stays ready.
 const EPOLLET: u32 = 0x8000_0000;
@@ -6760,6 +6849,7 @@ fn sys_socket(env: &mut LinuxEnv, domain: u64, sock_type: u64, _protocol: u64) -
 }
 
 fn sys_connect(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) -> SysResult {
+    let nonblocking = env.proc.fds.borrow().get(fd)?.desc.borrow().flags & abi::O_NONBLOCK != 0;
     let socket = net_of(env, fd)?;
     let mut inner = socket.borrow_mut();
     if inner.family == AF_UNIX {
@@ -6829,6 +6919,15 @@ fn sys_connect(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u64) 
         SocketKind::NetlinkRoute => return Ok(0),
     }
     inner.peer = Some(target);
+    if inner.kind == SocketKind::Tcp && nonblocking {
+        let handle = inner.handle.expect("TCP connect installed a broker handle");
+        if matches!(
+            inner.broker.borrow_mut().tcp_connect_status(handle),
+            crate::net::ConnectStatus::Pending
+        ) {
+            return Err(abi::EINPROGRESS);
+        }
+    }
     Ok(0)
 }
 
@@ -7191,14 +7290,25 @@ fn sys_getpeername(env: &mut LinuxEnv, cpu: &mut Cpu, fd: u64, addr: u64, len: u
 }
 
 fn sys_getsockopt(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
-    let [fd, _level, optname, optval, optlen, _] = a;
-    net_of(env, fd)?;
+    let [fd, level, optname, optval, optlen, _] = a;
+    let socket = net_of(env, fd)?;
+    const SOL_SOCKET: u64 = 1;
     const SO_ERROR: u64 = 4;
+    let value = if level == SOL_SOCKET && optname == SO_ERROR {
+        let inner = socket.borrow();
+        match inner.handle {
+            Some(handle) => inner
+                .broker
+                .borrow_mut()
+                .tcp_take_error(handle)?
+                .unwrap_or(0) as u32,
+            None => 0,
+        }
+    } else {
+        0
+    };
     if optval != 0 {
-        // SO_ERROR reads back 0 (no pending error); every other option
-        // also reads as a zeroed 32-bit value.
-        let _ = optname == SO_ERROR;
-        write_mem(env, cpu, optval, &[0_u8; 4])?;
+        write_mem(env, cpu, optval, &value.to_ne_bytes())?;
         if optlen != 0 {
             write_mem(env, cpu, optlen, &4_u32.to_le_bytes())?;
         }
@@ -7421,14 +7531,20 @@ fn sys_epoll_ctl(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> SysResult {
             if op == EPOLL_CTL_ADD && inner.interests.contains_key(&fd) {
                 return Err(abi::EEXIST);
             }
+            if op == EPOLL_CTL_MOD && !inner.interests.contains_key(&fd) {
+                return Err(abi::ENOENT);
+            }
             inner.interests.insert(fd, (events, data));
-            // A fresh ADD or a re-arming MOD starts disarmed (no edge owed).
+            // A fresh ADD or MOD arms ONESHOT and starts with no delivered
+            // edge.  Linux uses MOD as the explicit ONESHOT rearm operation.
+            inner.oneshot_disabled.remove(&fd);
             inner.edge_fired.remove(&fd);
             Ok(0)
         }
         EPOLL_CTL_DEL => {
             let mut inner = epoll.borrow_mut();
             inner.interests.remove(&fd).ok_or(abi::ENOENT)?;
+            inner.oneshot_disabled.remove(&fd);
             inner.edge_fired.remove(&fd);
             Ok(0)
         }
@@ -7446,7 +7562,7 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     let now = env.now_nanos(cpu);
 
     // Evaluate readiness for every registered fd.
-    let mut ready: Vec<(u32, u64)> = Vec::new();
+    let mut ready: Vec<(u64, u32, u64)> = Vec::new();
     let mut watches: Vec<Watch> = Vec::new();
     // Edge-triggered bookkeeping applied after the scan (the interest map is
     // borrowed immutably during it), tracked per direction so a delivered
@@ -7457,6 +7573,9 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
         let inner = epoll.borrow();
         let fds = env.proc.fds.borrow();
         for (&fd, &(events, data)) in inner.interests.iter() {
+            if inner.oneshot_disabled.contains(&fd) {
+                continue;
+            }
             let Ok(entry) = fds.get(fd) else { continue };
             let desc = entry.desc.borrow();
             let mut fired = 0_u32;
@@ -7477,8 +7596,12 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
                     fired |= EPOLLHUP;
                 }
             }
-            if events & EPOLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
-                fired |= EPOLLOUT;
+            if events & EPOLLOUT != 0 && desc.writable() {
+                if desc_write_ready(&desc) {
+                    fired |= EPOLLOUT;
+                } else if let Some(watch) = write_watch_of(&desc) {
+                    watches.push(watch);
+                }
             }
             let is_et = events & EPOLLET != 0;
             if is_et {
@@ -7502,7 +7625,7 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
                     new_fired.push((fd, fired, act));
                 }
                 if report != 0 && ready.len() < max_events {
-                    ready.push((report, data));
+                    ready.push((fd, report, data));
                 } else if fired != 0 {
                     // Ready but suppressed: nothing to report now, yet fresh
                     // activity must wake a parked waiter so the new edge is
@@ -7514,7 +7637,7 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
                 continue;
             }
             if fired != 0 && ready.len() < max_events {
-                ready.push((fired, data));
+                ready.push((fd, fired, data));
             }
         }
     }
@@ -7530,8 +7653,22 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
     }
 
     if !ready.is_empty() {
+        // Disarm only entries actually copied to this wait's result. A ready
+        // ONESHOT entry beyond maxevents was not delivered and remains armed.
+        {
+            let mut inner = epoll.borrow_mut();
+            for (fd, _, _) in &ready {
+                if inner
+                    .interests
+                    .get(fd)
+                    .is_some_and(|(events, _)| events & EPOLLONESHOT != 0)
+                {
+                    inner.oneshot_disabled.insert(*fd);
+                }
+            }
+        }
         let mut out = Vec::with_capacity(ready.len() * 12);
-        for (events, data) in &ready {
+        for (_, events, data) in &ready {
             out.extend_from_slice(&events.to_le_bytes());
             out.extend_from_slice(&data.to_le_bytes());
         }
@@ -7639,9 +7776,13 @@ fn sys_select(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6], timespec: bool) ->
                     watches.push(watch);
                 }
             }
-            if want_write && desc.writable() && desc_write_ready(&desc) {
-                w_out[word] |= bit;
-                count += 1;
+            if want_write && desc.writable() {
+                if desc_write_ready(&desc) {
+                    w_out[word] |= bit;
+                    count += 1;
+                } else if let Some(watch) = write_watch_of(&desc) {
+                    watches.push(watch);
+                }
             }
         }
     }

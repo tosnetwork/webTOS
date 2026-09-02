@@ -334,6 +334,8 @@ pub enum Watch {
     Timer(TimerFdRef),
     /// Network socket readability, checked through the broker.
     NetReadable(NetRef),
+    /// Completion (success or failure) of a non-blocking TCP connect.
+    NetWritable(NetRef),
     /// Fires when the pipe's activity counter moves past the recorded value
     /// (a new write, read, or end close). Used for edge-triggered epoll fds
     /// whose delivered edge is suppressed: only fresh activity re-arms them.
@@ -371,6 +373,16 @@ impl Watch {
                 let socket = socket.borrow();
                 match socket.handle {
                     Some(handle) => socket.broker.borrow_mut().readable(handle),
+                    None => false,
+                }
+            }
+            Watch::NetWritable(socket) => {
+                let socket = socket.borrow();
+                match socket.handle {
+                    Some(handle) => !matches!(
+                        socket.broker.borrow_mut().tcp_connect_status(handle),
+                        crate::net::ConnectStatus::Pending
+                    ),
                     None => false,
                 }
             }
@@ -596,8 +608,8 @@ impl Scheduler {
             .min()
     }
 
-    /// Broker handles that parked tasks are waiting to read, for the idle
-    /// host wait.
+    /// Broker handles that parked tasks are waiting on, for the idle host
+    /// wait. Connection completion is a host network event just like input.
     pub fn net_watch_handles(&self) -> Vec<crate::net::Handle> {
         self.parked
             .iter()
@@ -605,7 +617,7 @@ impl Scheduler {
                 ParkState::Waiting { watches, .. } => watches
                     .iter()
                     .filter_map(|w| match w {
-                        Watch::NetReadable(s) => s.borrow().handle,
+                        Watch::NetReadable(s) | Watch::NetWritable(s) => s.borrow().handle,
                         _ => None,
                     })
                     .collect::<Vec<_>>(),

@@ -320,6 +320,12 @@ pub type NetRef = Rc<RefCell<NetSocket>>;
 #[derive(Debug, Default)]
 pub struct EpollInner {
     pub interests: std::collections::BTreeMap<u64, (u32, u64)>,
+    /// `EPOLLONESHOT` entries that have delivered an event and therefore stay
+    /// disabled until userspace rearms them with `EPOLL_CTL_MOD`.  Keep this
+    /// separate from edge-trigger suppression: ONESHOT disarms even a
+    /// level-triggered, permanently writable descriptor, while EPOLLET
+    /// automatically observes later readiness transitions.
+    pub oneshot_disabled: std::collections::BTreeSet<u64>,
     /// Edge-triggered (`EPOLLET`) suppression, tracked per direction. Maps a
     /// guest fd to the mask of directions (`EPOLLIN`/`EPOLLOUT`) whose readiness
     /// edge has been delivered and not yet re-armed. A direction is suppressed

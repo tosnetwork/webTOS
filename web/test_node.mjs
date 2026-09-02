@@ -169,6 +169,15 @@ try {
 }
 addFile("/bin/busybox", busybox);
 addFile("/etc/motd.txt", "from-the-vfs\n");
+{
+  const len = e.wtw_file_read(...put("/etc/motd.txt"));
+  const contents = len < 0 ? "" : text(e.wtw_file_read_ptr(), len);
+  if (contents !== "from-the-vfs\n") {
+    console.error(`[node] FAILED narrow guest-file read: len=${len} error=${err()}`);
+    process.exit(1);
+  }
+  console.log("[node] ok: narrow guest-file read");
+}
 
 const bb = (...argv) => runProcess("/bin/busybox", ["busybox", ...argv]);
 
@@ -468,7 +477,9 @@ async function lazyAgentRun({ label, manifest, chunks, loadPath, argv, envp, exp
         console.error(
           `[node] FAILED ${label}: status=${status} exit=${f.wtw_exit_code()} ` +
             `pages=${f.wtw_page_in_count()} delivered=${delivered} resident=${residentKiB} KiB ` +
-            `output=${JSON.stringify(output.slice(0, 120))}`,
+            `error=${JSON.stringify(new TextDecoder().decode(
+              fmem().slice(f.wtw_error_ptr(), f.wtw_error_ptr() + f.wtw_error_len()),
+            ))} output=${JSON.stringify(output.slice(0, 120))}`,
         );
         process.exit(1);
       }

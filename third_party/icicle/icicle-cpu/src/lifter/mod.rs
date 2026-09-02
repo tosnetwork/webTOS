@@ -86,6 +86,17 @@ impl InstructionLifter {
         self.decoder.global_context = context;
     }
 
+    /// Reports whether a prospective instruction window contains a byte that
+    /// the source cannot execute. Decoding reads a full window before its length
+    /// is known. If that read crosses into a demand-paged executable page,
+    /// unread bytes are represented as zero and the decoder can otherwise
+    /// misclassify an incomplete, legal instruction as `InvalidInstruction`.
+    fn has_non_executable(src: &mut impl InstructionSource, vaddr: u64, len: usize) -> bool {
+        (0..len).any(|offset| {
+            vaddr.checked_add(offset as u64).is_none_or(|address| !src.ensure_exec(address, 1))
+        })
+    }
+
     /// Allows one architecture-specific opaque operation to lower a wide
     /// result into independent 128-bit helper calls. Callers must prove the
     /// operation is lane-local; the generic runtime never infers this.
@@ -201,19 +212,24 @@ impl InstructionLifter {
 
         self.decoder.set_inst(vaddr, &buf);
         if self.decoder.decode_into(&src.arch().sleigh, &mut self.decoded).is_none() {
-            // If the decoding fails we need to check if it failed because the memory is not
-            // executable, or because the instruction is actually invalid.
-            let err = src
-                .ensure_exec(vaddr, 1)
-                .then_some(DecodeError::InvalidInstruction)
-                .unwrap_or(DecodeError::NonExecutableMemory(vaddr));
+            // A failed decode may have consumed placeholder zeroes after an
+            // executable prefix. Check the complete maximum instruction
+            // window, not only its first byte. Keep the exception address at
+            // the instruction start: it is the architectural restart PC, and
+            // the pager can derive an adjacent cold page from a resident
+            // cross-page fault.
+            let err = Self::has_non_executable(src, vaddr, buf.len())
+                .then_some(DecodeError::NonExecutableMemory(vaddr))
+                .unwrap_or(DecodeError::InvalidInstruction);
             return Err(err);
         }
 
         // Now that we know the length of the instruction, ensure the region is executable.
         let len = self.decoded.num_bytes() as usize;
-        let is_executable = len <= buf.len() && src.ensure_exec(vaddr, len);
-        if !is_executable {
+        if len > buf.len() {
+            return Err(DecodeError::InvalidInstruction);
+        }
+        if Self::has_non_executable(src, vaddr, len) {
             return Err(DecodeError::NonExecutableMemory(vaddr));
         }
         tracing::trace!("decode: {vaddr:#x} {:02x?}", &buf[..len]);

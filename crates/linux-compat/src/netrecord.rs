@@ -20,7 +20,7 @@ use std::net::SocketAddrV4;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::net::{Handle, NetworkBroker, RecvOutcome};
+use crate::net::{ConnectStatus, Handle, NetworkBroker, RecvOutcome};
 
 /// One thing that happened at the network interface. Recorded in order, so a
 /// replay hands the same results back in the same sequence.
@@ -232,6 +232,14 @@ impl<B: NetworkBroker> NetworkBroker for RecordingBroker<B> {
         let result = self.inner.tcp_connect(addr);
         self.record(NetEvent::TcpConnect { addr, result });
         result
+    }
+
+    fn tcp_connect_status(&mut self, handle: Handle) -> ConnectStatus {
+        self.inner.tcp_connect_status(handle)
+    }
+
+    fn tcp_take_error(&mut self, handle: Handle) -> Result<Option<u64>, u64> {
+        self.inner.tcp_take_error(handle)
     }
 
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {

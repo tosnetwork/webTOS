@@ -8,7 +8,10 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 // Bun/Claude keeps non-UI workers runnable while the foreground renderer is
@@ -20,12 +23,25 @@ static _Atomic int worker_stop;
 
 static void *runnable_worker(void *unused) {
     (void)unused;
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event event;
+    // A zero timeout deliberately models a runtime's immediate event-loop
+    // turn.  It exercises the same epoll_pwait2 ABI the real Bun trace uses,
+    // while sched_yield keeps the fixture usable if a host lacks that optional
+    // syscall.
+    const struct timespec poll_now = {0, 0};
     while (!atomic_load_explicit(&worker_stop, memory_order_relaxed)) {
-        // A real runtime cooperatively yields between timer/event-loop turns.
-        // Yielding keeps this deterministic fixture runnable without burning
-        // an unbounded guest instruction budget in one basic block.
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+#ifdef SYS_epoll_pwait2
+        if (epoll_fd >= 0) {
+            syscall(SYS_epoll_pwait2, epoll_fd, &event, 1, &poll_now, NULL, 0);
+        }
+#endif
+        // A real runtime cooperatively yields between event-loop turns.
         sched_yield();
     }
+    if (epoll_fd >= 0) close(epoll_fd);
     return NULL;
 }
 

@@ -33,6 +33,14 @@ pub enum RecvOutcome {
     WouldBlock,
 }
 
+/// Completion state of a non-blocking TCP connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectStatus {
+    Pending,
+    Connected,
+    Failed(u64),
+}
+
 /// Host-side network mediation. All methods are non-blocking except
 /// [`NetworkBroker::wait_ready`], which the scheduler calls only when every
 /// task is blocked and at least one waits on the network.
@@ -52,6 +60,17 @@ pub trait NetworkBroker {
     /// fallback instead of receiving a fabricated IPv4 connection.
     fn tcp_connect_v6(&mut self, _addr: SocketAddrV6) -> Result<Handle, u64> {
         Err(abi::EAFNOSUPPORT)
+    }
+    /// Kernel-visible completion state used by poll/epoll and SO_ERROR.
+    /// Native and replay brokers complete connect before returning a handle;
+    /// a host-driven broker overrides this while its transport is in flight.
+    fn tcp_connect_status(&mut self, _handle: Handle) -> ConnectStatus {
+        ConnectStatus::Connected
+    }
+    /// Reads and clears the pending asynchronous socket error, as SO_ERROR
+    /// does on Linux. A status query above deliberately does not consume it.
+    fn tcp_take_error(&mut self, _handle: Handle) -> Result<Option<u64>, u64> {
+        Ok(None)
     }
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64>;
     fn tcp_recv(&mut self, handle: Handle, max: usize) -> Result<RecvOutcome, u64>;
@@ -500,6 +519,10 @@ pub enum NetCommand {
         handle: Handle,
         addr: SocketAddrV4,
     },
+    TcpConnectV6 {
+        handle: Handle,
+        addr: SocketAddrV6,
+    },
     TcpSend {
         handle: Handle,
         bytes: Vec<u8>,
@@ -527,6 +550,7 @@ const OP_TCP_SHUTDOWN_WRITE: u8 = 3;
 const OP_UDP_OPEN: u8 = 4;
 const OP_UDP_SEND_TO: u8 = 5;
 const OP_CLOSE: u8 = 6;
+const OP_TCP_CONNECT_V6: u8 = 7;
 
 #[derive(Default)]
 struct Endpoint {
@@ -538,6 +562,8 @@ struct Endpoint {
     closed: bool,
     /// A transport error to report on the guest's next operation.
     error: Option<u64>,
+    /// The host has completed the asynchronous TCP connection.
+    connected: bool,
     /// The local address the host assigned, when it reported one.
     local: Option<SocketAddrV4>,
 }
@@ -584,8 +610,9 @@ impl HostBroker {
 
     /// Takes the pending commands, encoded for a host that reads bytes.
     /// Layout per command: `op:u8, handle:u32le`, then op-specific fields
-    /// (`addr:u32be, port:u16be` for a destination, `len:u32le` + bytes for
-    /// a payload).
+    /// (`addr:u32be, port:u16be` for IPv4; `addr:[u8;16], port:u16be,
+    /// flowinfo:u32le, scope_id:u32le` for IPv6; `len:u32le` + bytes for a
+    /// payload).
     pub fn take_commands(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         let push_addr = |out: &mut Vec<u8>, addr: &SocketAddrV4| {
@@ -598,6 +625,14 @@ impl HostBroker {
                     out.push(OP_TCP_CONNECT);
                     out.extend_from_slice(&(handle as u32).to_le_bytes());
                     push_addr(&mut out, &addr);
+                }
+                NetCommand::TcpConnectV6 { handle, addr } => {
+                    out.push(OP_TCP_CONNECT_V6);
+                    out.extend_from_slice(&(handle as u32).to_le_bytes());
+                    out.extend_from_slice(&addr.ip().octets());
+                    out.extend_from_slice(&addr.port().to_be_bytes());
+                    out.extend_from_slice(&addr.flowinfo().to_le_bytes());
+                    out.extend_from_slice(&addr.scope_id().to_le_bytes());
                 }
                 NetCommand::TcpSend { handle, bytes } => {
                     out.push(OP_TCP_SEND);
@@ -643,6 +678,7 @@ impl HostBroker {
     pub fn deliver_connected(&mut self, handle: Handle, local: Option<SocketAddrV4>) {
         let endpoint = self.endpoint(handle);
         endpoint.local = local;
+        endpoint.connected = true;
     }
 
     /// The host delivers stream bytes from the peer.
@@ -688,6 +724,30 @@ impl NetworkBroker for HostBroker {
         self.endpoints.insert(handle, Endpoint::default());
         self.commands.push(NetCommand::TcpConnect { handle, addr });
         Ok(handle)
+    }
+
+    fn tcp_connect_v6(&mut self, addr: SocketAddrV6) -> Result<Handle, u64> {
+        let handle = self.handle();
+        self.endpoints.insert(handle, Endpoint::default());
+        self.commands
+            .push(NetCommand::TcpConnectV6 { handle, addr });
+        Ok(handle)
+    }
+
+    fn tcp_connect_status(&mut self, handle: Handle) -> ConnectStatus {
+        match self.endpoints.get(&handle) {
+            Some(endpoint) if endpoint.error.is_some() => {
+                ConnectStatus::Failed(endpoint.error.expect("checked error"))
+            }
+            Some(endpoint) if endpoint.connected => ConnectStatus::Connected,
+            Some(_) => ConnectStatus::Pending,
+            None => ConnectStatus::Failed(abi::EBADF),
+        }
+    }
+
+    fn tcp_take_error(&mut self, handle: Handle) -> Result<Option<u64>, u64> {
+        let endpoint = self.endpoints.get_mut(&handle).ok_or(abi::EBADF)?;
+        Ok(endpoint.error.take())
     }
 
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {
@@ -944,6 +1004,14 @@ impl NetworkBroker for MeteredBroker {
 
     fn tcp_connect_v6(&mut self, addr: SocketAddrV6) -> Result<Handle, u64> {
         self.inner.borrow_mut().tcp_connect_v6(addr)
+    }
+
+    fn tcp_connect_status(&mut self, handle: Handle) -> ConnectStatus {
+        self.inner.borrow_mut().tcp_connect_status(handle)
+    }
+
+    fn tcp_take_error(&mut self, handle: Handle) -> Result<Option<u64>, u64> {
+        self.inner.borrow_mut().tcp_take_error(handle)
     }
 
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {

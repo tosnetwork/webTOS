@@ -834,6 +834,39 @@ pub extern "C" fn wtw_file_append(
     })
 }
 
+/// Copies one resident guest file into the host scratch buffer and returns
+/// its byte length, or `-2` when the path is absent/not resident. The latter is
+/// an ordinary polling result and deliberately does not overwrite the VM's
+/// diagnostic buffer. The host can already export the complete guest
+/// filesystem; this narrower accessor avoids serializing the whole tree for
+/// diagnostics and controller-side result checks. Chunked files must first be
+/// resident.
+#[no_mangle]
+pub extern "C" fn wtw_file_read(path_ptr: u32, path_len: u32) -> i32 {
+    with_state(|state| {
+        let Some(path) = path_arg(path_ptr, path_len) else {
+            return fail(state, "path is not inside the module's memory");
+        };
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_file_read called before wtw_init");
+        };
+        let Some(bytes) = machine.env().vfs.read_file(&path).map(<[u8]>::to_vec) else {
+            return -2;
+        };
+        let Ok(len) = i32::try_from(bytes.len()) else {
+            return fail(state, "guest file is too large for the wasm host ABI");
+        };
+        state.scratch = bytes;
+        len
+    })
+}
+
+/// Pointer paired with the most recent successful [`wtw_file_read`].
+#[no_mangle]
+pub extern "C" fn wtw_file_read_ptr() -> u32 {
+    with_state(|state| state.scratch.as_ptr() as u32)
+}
+
 /// Adds a symlink to the guest filesystem, so one multi-call image (BusyBox
 /// and friends) can appear on `PATH` under each of its command names.
 #[no_mangle]
@@ -1024,7 +1057,34 @@ fn classify(state: &mut HostState, exit: CpuExit) -> i32 {
             STATUS_PAGE_FAULT
         }
         CpuExit::IllegalInstruction { rip } => {
-            state.error = format!("illegal instruction at {rip:#x}");
+            // `CpuExit` intentionally groups decode, p-code-size, float-size,
+            // and unimplemented-operation failures. Preserve the underlying
+            // engine evidence here so a real workload does not turn a known
+            // good opcode into an unactionable "illegal instruction" report.
+            let vm = machine.vm_mut();
+            let reason = vm.cpu.exception.code;
+            let value = vm.cpu.exception.value;
+            let block_id = vm.cpu.block_id;
+            let block_offset = vm.cpu.block_offset;
+            let mut instruction = [0_u8; 15];
+            let bytes = if vm
+                .cpu
+                .mem
+                .read_bytes(rip, &mut instruction, perm::NONE)
+                .is_ok()
+            {
+                instruction
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                "<unmapped>".into()
+            };
+            state.error = format!(
+                "illegal instruction at {rip:#x}; reason={reason:#x} value={value:#x}; \
+                 block={block_id}:{block_offset}; bytes={bytes}"
+            );
             STATUS_ILLEGAL_INSTRUCTION
         }
         CpuExit::Unhandled { code, value } => {

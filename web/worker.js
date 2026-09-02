@@ -804,6 +804,25 @@ const netCommands = () => {
   return mem().slice(exports.wtw_net_cmd_ptr(), exports.wtw_net_cmd_ptr() + len);
 };
 
+/// Dispatches guest network commands without waiting for a reply. Commands
+/// can coexist with STATUS_RUNNING when another guest thread remains runnable,
+/// so this is a per-slice obligation rather than a whole-machine wait action.
+function drainNetworkCommands() {
+  const commands = netCommands();
+  if (commands.length === 0) return false;
+  performNetwork(commands);
+  return true;
+}
+
+function formatIPv6(octets, scope = 0) {
+  const groups = [];
+  for (let at = 0; at < 16; at += 2) {
+    groups.push(((octets[at] << 8) | octets[at + 1]).toString(16));
+  }
+  const address = groups.join(":");
+  return scope === 0 ? address : `${address}%${scope}`;
+}
+
 const deliverData = (handle, bytes) => {
   const [ptr, len] = stage(bytes);
   exports.wtw_net_data(handle, ptr, len);
@@ -824,7 +843,9 @@ const deliverError = (handle, errno) => {
 };
 
 function openTcp(handle, ip, port) {
-  const socket = new WebSocket(`${gateway}/tcp?host=${ip}&port=${port}`);
+  const socket = new WebSocket(
+    `${gateway}/tcp?host=${encodeURIComponent(ip)}&port=${encodeURIComponent(port)}`,
+  );
   socket.binaryType = "arraybuffer";
   const entry = { socket, queue: [], open: false };
   sockets.set(handle, entry);
@@ -874,6 +895,14 @@ function networkErrorContractProbe() {
     const got = tcpCloseErrno(entry, code);
     return { name, got, want, ok: got === want };
   });
+}
+
+function ipv6CommandContractProbe() {
+  const octets = new Uint8Array([
+    0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x02,
+    0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06,
+  ]);
+  return formatIPv6(octets, 7);
 }
 
 function snapshotSlotContractProbe() {
@@ -933,6 +962,14 @@ function performNetwork(stream) {
     i += 6;
     return { ip, port };
   };
+  const dest6 = () => {
+    const octets = stream.subarray(i, i + 16);
+    const port = view.getUint16(i + 16, false);
+    const scope = view.getUint32(i + 22, true);
+    const ip = formatIPv6(octets, scope);
+    i += 26;
+    return { ip, port };
+  };
   const payload = () => {
     const len = u32();
     const bytes = stream.slice(i, i + len);
@@ -976,6 +1013,12 @@ function performNetwork(stream) {
         sockets.delete(handle);
         break;
       }
+      case 7: {
+        const { ip, port } = dest6();
+        if (gateway) openTcp(handle, ip, port);
+        else deliverError(handle, ENETUNREACH);
+        break;
+      }
       default:
         throw new Error(`unknown broker opcode ${op}`);
     }
@@ -986,7 +1029,7 @@ function performNetwork(stream) {
 /// asked for, then wait for a reply. Returns once something was delivered or
 /// the guest's own timer is due, and tells the machine which happened.
 async function pumpNetwork() {
-  performNetwork(netCommands());
+  drainNetworkCommands();
   // The export is a u32; JS reads a wasm i32, so 0xffffffff arrives as -1.
   const budget = exports.wtw_net_budget_ms() >>> 0;
   const waitMs = Math.min(
@@ -1026,6 +1069,10 @@ async function pump() {
     for (;;) {
       const status = exports.wtw_run(FUEL);
       drain();
+      // A runnable sibling must not starve connect/send commands queued by a
+      // different guest thread. Only the blocking wait below remains gated
+      // on STATUS_AWAITING_NETWORK.
+      if (gateway) drainNetworkCommands();
       if (status === STATUS_AWAITING_INPUT) {
         waiting = true;
         postMessage({ type: "waiting" });
@@ -1156,6 +1203,9 @@ self.onmessage = async (event) => {
     if (msg.type === "network") enableNetwork(msg.gateway);
     if (msg.type === "networkErrorContractProbe") {
       postMessage({ type: "networkErrorContract", cases: networkErrorContractProbe() });
+    }
+    if (msg.type === "ipv6CommandContractProbe") {
+      postMessage({ type: "ipv6CommandContract", address: ipv6CommandContractProbe() });
     }
     if (msg.type === "snapshotSlotContractProbe") {
       postMessage({ type: "snapshotSlotContract", cases: snapshotSlotContractProbe() });

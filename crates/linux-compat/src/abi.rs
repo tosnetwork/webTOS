@@ -205,6 +205,7 @@ pub const ENOTCONN: u64 = 107;
 pub const EISCONN: u64 = 106;
 pub const ETIMEDOUT: u64 = 110;
 pub const ECONNREFUSED: u64 = 111;
+pub const EINPROGRESS: u64 = 115;
 
 /// Encodes `-errno` in the register-return convention.
 pub const fn neg(errno: u64) -> u64 {

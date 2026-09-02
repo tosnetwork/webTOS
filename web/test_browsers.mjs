@@ -1086,6 +1086,24 @@ async function runEngine(name, origin, gateway, images) {
       networkContract.map((item) => `${item.name}=${item.got}`).join(", "),
     );
 
+    const ipv6CommandContract = await page.evaluate(async (workerUrl) => {
+      const worker = new Worker(workerUrl);
+      const result = new Promise((resolve) => {
+        worker.onmessage = (event) => {
+          if (event.data.type === "ipv6CommandContract") resolve(event.data.address);
+        };
+      });
+      worker.postMessage({ type: "ipv6CommandContractProbe" });
+      const address = await result;
+      worker.terminate();
+      return address;
+    }, `${origin}/web/worker.js`);
+    record(
+      "network: IPv6 broker commands preserve all address bytes and scope",
+      ipv6CommandContract === "2001:db8:1:2:3:4:5:6%7",
+      ipv6CommandContract,
+    );
+
     const snapshotSlotContract = await page.evaluate(async (workerUrl) => {
       const worker = new Worker(workerUrl);
       const result = new Promise((resolve) => {
