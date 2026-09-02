@@ -1370,6 +1370,44 @@ pub extern "C" fn wtw_net_enable() -> i32 {
     })
 }
 
+/// Sets the Unix-second base used by the guest's `CLOCK_REALTIME`.
+///
+/// Offline runs intentionally retain the engine's deterministic epoch. A
+/// host that enables real networking must call this first: TLS, OAuth and
+/// signed protocols compare peer timestamps with wall time, and silently
+/// running them against a build-time epoch can turn a valid credential into
+/// an expired one (or vice versa). `f64` is used at the Wasm boundary because
+/// JavaScript represents Unix seconds exactly at today's magnitudes without
+/// requiring BigInt integration.
+#[no_mangle]
+pub extern "C" fn wtw_set_wall_clock_unix_sec(unix_sec: f64) -> i32 {
+    with_state(|state| {
+        let Some(machine) = state.machine.as_mut() else {
+            return fail(state, "wtw_set_wall_clock_unix_sec called before wtw_init");
+        };
+        let Some(unix_sec) = valid_wall_clock_unix_sec(unix_sec) else {
+            return fail(
+                state,
+                "wall clock must be a non-negative integral Unix second",
+            );
+        };
+        machine.set_wall_clock_base(unix_sec);
+        0
+    })
+}
+
+fn valid_wall_clock_unix_sec(unix_sec: f64) -> Option<i64> {
+    if unix_sec.is_finite()
+        && unix_sec.fract() == 0.0
+        && unix_sec >= 0.0
+        && unix_sec < i64::MAX as f64
+    {
+        Some(unix_sec as i64)
+    } else {
+        None
+    }
+}
+
 fn with_broker(state: &mut HostState, f: impl FnOnce(&mut HostBroker)) -> i32 {
     match state.net.clone() {
         Some(broker) => {
@@ -2036,7 +2074,7 @@ pub extern "C" fn wtw_reset() {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_run_fuel, RUN_CALL_FUEL_CAP};
+    use super::{bounded_run_fuel, valid_wall_clock_unix_sec, RUN_CALL_FUEL_CAP};
 
     #[test]
     fn synchronous_run_fuel_is_bounded_for_browser_liveness() {
@@ -2046,5 +2084,19 @@ mod tests {
             RUN_CALL_FUEL_CAP
         );
         assert_eq!(bounded_run_fuel(u32::MAX), RUN_CALL_FUEL_CAP);
+    }
+
+    #[test]
+    fn network_wall_clock_accepts_only_exact_nonnegative_seconds() {
+        assert_eq!(valid_wall_clock_unix_sec(0.0), Some(0));
+        assert_eq!(
+            valid_wall_clock_unix_sec(1_788_000_000.0),
+            Some(1_788_000_000)
+        );
+        assert_eq!(valid_wall_clock_unix_sec(-1.0), None);
+        assert_eq!(valid_wall_clock_unix_sec(0.5), None);
+        assert_eq!(valid_wall_clock_unix_sec(f64::NAN), None);
+        assert_eq!(valid_wall_clock_unix_sec(f64::INFINITY), None);
+        assert_eq!(valid_wall_clock_unix_sec(i64::MAX as f64), None);
     }
 }

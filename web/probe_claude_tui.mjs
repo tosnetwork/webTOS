@@ -77,12 +77,13 @@ if (!Number.isSafeInteger(taskTraceInstructions) || taskTraceInstructions < 1) {
 // is a wall-time allowance, not an authority expansion.
 const minutes = Number(process.argv[2] ?? (realTask ? 480 : 10));
 
+const claudeBinary = process.env.PROBE_CLAUDE_BINARY;
 const claude = fetchFixture
   ? await readFile(
       process.env.PROBE_FETCH_RUNTIME ??
         "/tmp/webtos-bun-1.3.1/bun-linux-x64-baseline/bun",
     )
-  : await readFile(new URL("./claude", import.meta.url));
+  : await readFile(claudeBinary ?? new URL("./claude", import.meta.url));
 const libDir = new URL("./claude-libs/", import.meta.url);
 const mockClaude = mockTask
   ? await readFile(new URL("./mock_claude", import.meta.url))
@@ -111,6 +112,12 @@ const report = (label, error) =>
   console.log(\`FETCH \${label} code=\${error?.code ?? "none"} name=\${error?.name ?? "none"}\`);
 await Promise.all([1, 2].map(async (attempt) => {
   try {
+    // Claude starts a second API connection shortly after the first request
+    // is submitted, while its response is still pending.  Preserve that
+    // timing shape instead of issuing both fetches in the same JS turn: it
+    // catches timer/event-loop and cached-resolver lifetime bugs which a
+    // cold Promise.all alone cannot expose.
+    if (attempt === 2) await Bun.sleep(20);
     const response = await fetch(endpoint);
     await response.body?.cancel();
     console.log(\`FETCH parallel=\${attempt} status=\${response.status}\`);
@@ -124,6 +131,17 @@ try {
   console.log(\`FETCH final status=\${response.status} bytes=\${body.byteLength}\`);
 } catch (error) {
   report("final", error);
+}
+try {
+  const closing = await fetch(endpoint, { headers: { Connection: "close" } });
+  await closing.arrayBuffer();
+  console.log(\`FETCH closing status=\${closing.status}\`);
+  await Bun.sleep(20);
+  const reopened = await fetch(endpoint);
+  await reopened.arrayBuffer();
+  console.log(\`FETCH reopened status=\${reopened.status}\`);
+} catch (error) {
+  report("reopened", error);
 }
 `),
     },
@@ -290,8 +308,14 @@ if (realTask) {
   ) !== 0) {
     throw new Error(`credential handle: ${err()}`);
   }
+  if (e.wtw_set_wall_clock_unix_sec(Math.floor(Date.now() / 1000)) !== 0) {
+    throw new Error(`wall clock: ${err()}`);
+  }
   if (e.wtw_net_enable() !== 0) throw new Error(`network: ${err()}`);
 } else if (fetchFixture) {
+  if (e.wtw_set_wall_clock_unix_sec(Math.floor(Date.now() / 1000)) !== 0) {
+    throw new Error(`wall clock: ${err()}`);
+  }
   if (e.wtw_net_enable() !== 0) throw new Error(`network: ${err()}`);
 } else if (!taskMode) {
   e.wtw_arg(...put("claude"));
@@ -374,6 +398,7 @@ const noteNetEvent = () => {
   }
 };
 const deliverNetError = (handle, errno) => {
+  syncRealtimeClock();
   traceNetwork("guest-error", { handle, errno });
   e.wtw_net_error(handle, errno);
   noteNetEvent();
@@ -388,6 +413,7 @@ const permitted = (ip, port) =>
   (ip === "1.1.1.1" && port === 53) ||
   (apiAddresses.has(canonicalAddress(ip)) && port === 443);
 const deliverNetData = (handle, bytes) => {
+  syncRealtimeClock();
   traceNetwork("guest-data", { handle, bytes: bytes.length });
   e.wtw_net_data(handle, ...put(bytes));
   noteNetEvent();
@@ -398,20 +424,31 @@ const openTcp = (handle, ip, port) => {
     deliverNetError(handle, ENETUNREACH);
     return;
   }
+  beginRealtimeClock();
   traceNetwork("host-connect-start", {
     handle,
     family: ip.includes(":") ? 6 : 4,
     destination: `${ip}:${port}`,
   });
-  const socket = createConnection({ host: ip, port, family: ip.includes(":") ? 6 : 4 });
+  // Linux preserves the local write half after a peer FIN. The guest TLS
+  // stack must be able to send close-notify before it closes the descriptor;
+  // Node's default auto-end would make the host and guest disagree here.
+  const socket = createConnection({
+    host: ip,
+    port,
+    family: ip.includes(":") ? 6 : 4,
+    allowHalfOpen: true,
+  });
   sockets.set(handle, { kind: "tcp", socket });
   socket.on("connect", () => {
+    syncRealtimeClock();
     traceNetwork("host-connect", { handle });
     e.wtw_net_connected(handle, 0, 0);
     noteNetEvent();
   });
   socket.on("data", (bytes) => deliverNetData(handle, bytes));
   socket.on("end", () => {
+    syncRealtimeClock();
     traceNetwork("host-end", { handle });
     e.wtw_net_closed(handle);
     noteNetEvent();
@@ -420,13 +457,18 @@ const openTcp = (handle, ip, port) => {
     traceNetwork("host-error", { handle, code: error?.code ?? "unknown" });
     deliverNetError(handle, nodeErrno(error));
   });
-  socket.on("close", (hadError) => traceNetwork("host-close", { handle, hadError }));
+  socket.on("close", (hadError) => {
+    syncRealtimeClock();
+    traceNetwork("host-close", { handle, hadError });
+  });
   socket.on("drain", () => traceNetwork("host-drain", { handle }));
 };
 const openUdp = (handle) => {
+  beginRealtimeClock();
   const socket = createSocket("udp4");
   sockets.set(handle, { kind: "udp", socket });
   socket.on("message", (bytes, remote) => {
+    syncRealtimeClock();
     traceNetwork("host-udp-data", {
       handle,
       family: remote.family,
@@ -609,27 +651,39 @@ let trustSelectionSent = false;
 let loggedRenderedBytes = 0;
 let taskInputEchoed = false;
 let loggedClaudeDebugState = "";
+const taskInstruction =
+  "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
+  "then reply with exactly WEBTOS_TASK_DONE.";
+const claudeCommand = () =>
+  "cd /work && /bin/claude --safe-mode --ax-screen-reader --no-chrome " +
+  (claudeDebug ? `--debug-file ${claudeDebugPath} ` : "") +
+  "--permission-mode acceptEdits --allowedTools Read,Edit --model haiku; " +
+  "echo WEBTOS_CLAUDE_EXIT=$?\r";
 const guestFile = (path) => {
   const len = e.wtw_file_read(...put(path));
   if (len < 0) return null;
   return new TextDecoder().decode(mem().slice(e.wtw_file_read_ptr(), e.wtw_file_read_ptr() + len));
 };
-const taskInstruction =
-  "Read /work/input.txt, replace M9_PENDING with M9_CLAUDE_COMPLETED using the Edit tool, " +
-  "then reply with exactly WEBTOS_TASK_DONE.";
 const currentIcount = () =>
   (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
-// The cost of emulating runnable guest instructions is not guest-visible wall
-// time. Feeding that host overhead back into the VM makes a slow emulator look
-// like a suspended machine and can fire minutes of maintenance timers during
-// process startup. Real blocking network waits advance through `net_expire`;
-// suspension is tested separately. Keep this diagnostic warp opt-in only.
-const realtimeClock = realTask && process.env.PROBE_REALTIME_CLOCK === "1";
-const realtimeHostStart = performance.now();
-const realtimeIcountStart = currentIcount();
+// Once a guest talks to real peers, host elapsed time is observable: servers
+// expire idle connections and credentials while the emulator is computing.
+// Keep offline runs deterministic, but make real-network acceptance causal by
+// default. `PROBE_REALTIME_CLOCK=0` remains a diagnostic reproduction switch.
+const realtimeClock = realTask && process.env.PROBE_REALTIME_CLOCK !== "0";
+let realtimeHostStart = 0;
+let realtimeIcountStart = 0;
 let realtimeWarpAppliedMs = 0;
+let realtimeClockActive = false;
+const beginRealtimeClock = () => {
+  if (!realtimeClock || realtimeClockActive) return;
+  realtimeHostStart = performance.now();
+  realtimeIcountStart = currentIcount();
+  realtimeWarpAppliedMs = 0;
+  realtimeClockActive = true;
+};
 const syncRealtimeClock = () => {
-  if (!realtimeClock) return;
+  if (!realtimeClock || !realtimeClockActive) return;
   const hostElapsedMs = performance.now() - realtimeHostStart;
   const instructionElapsedMs = (currentIcount() - realtimeIcountStart) / 1_000_000;
   const deficitMs = Math.floor(hostElapsedMs - instructionElapsedMs - realtimeWarpAppliedMs);
@@ -709,7 +763,6 @@ while (Date.now() < deadline) {
   }
   const t0 = Date.now();
   status = tracing ? e.wtw_run_traced(maxFuel) : e.wtw_run(maxFuel);
-  syncRealtimeClock();
   slices += 1;
   if (slices <= 20 || slices % logEvery === 0) {
     const ic = (e.wtw_icount_hi() >>> 0) * 2 ** 32 + (e.wtw_icount_lo() >>> 0);
@@ -857,10 +910,11 @@ while (Date.now() < deadline) {
         // disables MCP, skills, hooks, plugins, agents, and project
         // customizations, while the virtual filesystem/network broker remains
         // the independent execution boundary.
-        "cd /work && /bin/claude --safe-mode --ax-screen-reader --no-chrome " +
-          (claudeDebug ? `--debug-file ${claudeDebugPath} ` : "") +
-          "--permission-mode acceptEdits " +
-          "--allowedTools Read,Edit --model haiku; echo WEBTOS_CLAUDE_EXIT=$?\r",
+        // Do not add `--bare` here. It also skips credential/keychain reads,
+        // which turns a valid subscription profile delivered through the
+        // scoped secret handle into an unauthenticated session. `--safe-mode`
+        // disables custom code while preserving the official login path.
+        claudeCommand(),
       );
       taskPhase = "claude-start";
       continue;

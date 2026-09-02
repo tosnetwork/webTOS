@@ -1,7 +1,7 @@
 # Milestone 9: Ice Lake Execution Parity
 
-- **Status:** implementation and browser acceptance complete; the final live
-  Claude task is being recorded
+- **Status:** ISA implementation and browser acceptance are complete; the
+  final live Claude task remains blocked at the client/API lifecycle boundary
 - **Relationship to M7:** follow-on ISA coverage. M7 could use the conservative
   SSE/Westmere route, but M9's own final acceptance requires the pinned Claude
   Code workload to complete under the published Ice Lake profile

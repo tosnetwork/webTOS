@@ -308,6 +308,10 @@ impl<B: NetworkBroker> NetworkBroker for RecordingBroker<B> {
         self.inner.readable(handle)
     }
 
+    fn tcp_read_closed(&mut self, handle: Handle) -> bool {
+        self.inner.tcp_read_closed(handle)
+    }
+
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {
         self.inner.local_addr(handle)
     }

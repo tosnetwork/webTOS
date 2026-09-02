@@ -1436,6 +1436,25 @@ Remaining acceptance work:
   handle, read and edit the fixture through the model, exit cleanly, and
   verify the resulting file. M9 remains incomplete until this succeeds.
 
+The live investigation on 2026-09-02 closed two runtime defects before that
+gate: networked guests now receive the host's current Unix epoch before TLS or
+OAuth validation, and TCP peer half-close is exposed as Linux
+`POLLRDHUP`/`EPOLLRDHUP`. The latter makes Bun send TLS close-notify and evict
+the closed broker handle. A focused Bun fixture successfully performs a
+request, receives a forced `Connection: close`, and opens a fresh connection
+for another request, so generic DNS/TCP/TLS reconnection is covered.
+
+The pinned Claude Code 2.1.247 empty interactive session nevertheless spends
+about seven minutes between its authenticated account response and its first
+model turn. After the server's keep-alive window closes, the later Claude SDK
+dispatch fails synchronously without issuing a socket syscall. Passing the
+task as the CLI's initial interactive prompt does not move that dispatch ahead
+of TUI initialization, so it is not an acceptance workaround. Claude Code
+2.1.258 is a separate forward-compatibility case, not a replacement gate: its
+credential-enabled JSC path deterministically faults in generated code at
+guest RIP `0x100060cefe`, while M9 remains pinned to 2.1.247. Neither failure
+may be reported as a completed live task.
+
 ## Deliberately not pursued
 
 Not everything unbuilt is unfinished. These were considered, measured, and

@@ -2155,6 +2155,79 @@ int main(int argc, char **argv) {
 }
 
 #[test]
+fn epoll_reports_host_tcp_read_half_close() {
+    let source = r#"
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 1;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons((unsigned short)atoi(argv[1]));
+    peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (fd < 0) return 2;
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != 0 && errno != EINPROGRESS) return 3;
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event wanted = {
+        .events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET,
+        .data.fd = fd,
+    };
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, fd, &wanted)) return 4;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        struct epoll_event got = {0};
+        if (epoll_wait(ep, &got, 1, -1) != 1) return 5;
+        if (got.events & EPOLLRDHUP) {
+            char byte;
+            if (read(fd, &byte, 1) != 0) return 6;
+            puts("host-rdhup-ok");
+            return 0;
+        }
+    }
+    return 7;
+}
+"#;
+    let Some(image) = compile_c("host-rdhup", source, &[]) else {
+        return;
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind close server");
+    let destination = match listener.local_addr().expect("close server address") {
+        std::net::SocketAddr::V4(address) => address,
+        _ => unreachable!("bound IPv4 close server"),
+    };
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept close fixture");
+        drop(stream);
+    });
+    let mut host = BrokerHost::new(vec![destination]);
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/host-rdhup", image, 0o755)
+        .expect("add fixture");
+    let port = destination.port().to_string();
+    let run = run_argv_pumped(
+        &mut machine,
+        &mut host,
+        "/bin/host-rdhup",
+        &["host-rdhup", &port],
+    );
+    server.join().expect("close server");
+    expect_clean(&run);
+    assert!(
+        run.output.contains("host-rdhup-ok"),
+        "output: {:?}",
+        run.output
+    );
+}
+
+#[test]
 fn host_driven_broker_fetches_http() {
     let Some(mut machine) = alpine_machine() else {
         return;

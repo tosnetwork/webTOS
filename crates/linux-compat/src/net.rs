@@ -141,6 +141,15 @@ pub trait NetworkBroker {
     /// error to report).
     fn readable(&mut self, handle: Handle) -> bool;
 
+    /// True after the peer has closed its write half of a TCP stream.
+    ///
+    /// Readability alone is insufficient for Linux reactors: epoll reports
+    /// `EPOLLRDHUP` as a distinct condition, and runtimes use it to evict a
+    /// cleanly closed HTTP keep-alive connection before the next request.
+    fn tcp_read_closed(&mut self, _handle: Handle) -> bool {
+        false
+    }
+
     /// The local address of an endpoint, when known.
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4>;
     fn local_addr_v6(&mut self, _handle: Handle) -> Option<SocketAddrV6> {
@@ -459,6 +468,14 @@ impl NetworkBroker for NativeBroker {
             };
         }
         false
+    }
+
+    fn tcp_read_closed(&mut self, handle: Handle) -> bool {
+        let Some(stream) = self.tcp.get_mut(&handle) else {
+            return false;
+        };
+        let mut probe = [0_u8; 1];
+        matches!(stream.peek(&mut probe), Ok(0))
     }
 
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {
@@ -868,6 +885,12 @@ impl NetworkBroker for HostBroker {
             .is_some_and(|endpoint| endpoint.readable())
     }
 
+    fn tcp_read_closed(&mut self, handle: Handle) -> bool {
+        self.endpoints
+            .get(&handle)
+            .is_some_and(|endpoint| endpoint.closed)
+    }
+
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {
         self.endpoints.get(&handle).and_then(|e| e.local)
     }
@@ -1138,6 +1161,10 @@ impl NetworkBroker for MeteredBroker {
 
     fn readable(&mut self, handle: Handle) -> bool {
         self.inner.borrow_mut().readable(handle)
+    }
+
+    fn tcp_read_closed(&mut self, handle: Handle) -> bool {
+        self.inner.borrow_mut().tcp_read_closed(handle)
     }
 
     fn local_addr(&mut self, handle: Handle) -> Option<SocketAddrV4> {

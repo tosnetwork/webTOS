@@ -782,12 +782,47 @@ function tcpCloseErrno(entry, code) {
 
 let gateway = null;
 const sockets = new Map();
+let networkClockHostStart = 0;
+let networkClockIcountStart = 0;
+let networkClockWarpMs = 0;
+let networkClockActive = false;
 /// Bumped whenever anything is delivered into the machine, so a paused pump
 /// can tell "something arrived" from "the wait expired".
 let netEvents = 0;
 /// Resolver for a pump parked on the network, so a delivery wakes it at once
 /// instead of after its timeout.
 let netWake = null;
+
+const guestIcount = () =>
+  (exports.wtw_icount_hi() >>> 0) * 2 ** 32 + (exports.wtw_icount_lo() >>> 0);
+
+/// Reconciles the deterministic instruction clock with time observed by real
+/// peers. At the engine's one-nanosecond-per-instruction rate, one million
+/// instructions already credit one millisecond; only the remaining host
+/// elapsed time is added, exactly once. This is enabled at the network
+/// capability boundary, not for reproducible offline workloads.
+function syncNetworkClock() {
+  if (!gateway || !networkClockActive) return;
+  const hostElapsedMs = performance.now() - networkClockHostStart;
+  const instructionElapsedMs = (guestIcount() - networkClockIcountStart) / 1_000_000;
+  let deficitMs = Math.floor(hostElapsedMs - instructionElapsedMs - networkClockWarpMs);
+  while (deficitMs > 0) {
+    const step = Math.min(deficitMs, 0xffff_ffff);
+    if (exports.wtw_skip_time_ms(step) !== 0) {
+      throw new Error(`network clock sync failed: ${lastError()}`);
+    }
+    networkClockWarpMs += step;
+    deficitMs -= step;
+  }
+}
+
+function beginNetworkClock() {
+  if (networkClockActive) return;
+  networkClockHostStart = performance.now();
+  networkClockIcountStart = guestIcount();
+  networkClockWarpMs = 0;
+  networkClockActive = true;
+}
 
 function noteNetEvent() {
   netEvents += 1;
@@ -843,6 +878,7 @@ const deliverError = (handle, errno) => {
 };
 
 function openTcp(handle, ip, port) {
+  beginNetworkClock();
   const socket = new WebSocket(
     `${gateway}/tcp?host=${encodeURIComponent(ip)}&port=${encodeURIComponent(port)}`,
   );
@@ -850,11 +886,13 @@ function openTcp(handle, ip, port) {
   const entry = { socket, queue: [], open: false };
   sockets.set(handle, entry);
   socket.onopen = () => {
+    syncNetworkClock();
     entry.open = true;
     for (const pending of entry.queue) socket.send(pending);
     entry.queue.length = 0;
   };
   socket.onmessage = (event) => {
+    syncNetworkClock();
     if (typeof event.data === "string") {
       // "open" once the relay's own TCP connect succeeded; "eof" on a peer
       // half-close, which the guest reads as end of stream.
@@ -875,6 +913,7 @@ function openTcp(handle, ip, port) {
   // errno is decided there rather than twice.
   socket.onerror = () => {};
   socket.onclose = (event) => {
+    syncNetworkClock();
     if (sockets.get(handle) !== entry) return; // the guest already closed it
     sockets.delete(handle);
     const errno = tcpCloseErrno(entry, event.code);
@@ -919,20 +958,24 @@ function snapshotSlotContractProbe() {
 }
 
 function openUdp(handle) {
+  beginNetworkClock();
   const socket = new WebSocket(`${gateway}/udp`);
   socket.binaryType = "arraybuffer";
   const entry = { socket, queue: [], open: false };
   sockets.set(handle, entry);
   socket.onopen = () => {
+    syncNetworkClock();
     entry.open = true;
     for (const pending of entry.queue) socket.send(pending);
     entry.queue.length = 0;
   };
   socket.onmessage = (event) => {
+    syncNetworkClock();
     if (typeof event.data !== "string") deliverDatagram(handle, new Uint8Array(event.data));
   };
   socket.onerror = () => {};
   socket.onclose = () => {
+    syncNetworkClock();
     if (sockets.get(handle) !== entry) return; // the guest already closed it
     sockets.delete(handle);
     deliverError(handle, entry.open ? ECONNRESET : ENETUNREACH);
@@ -1050,6 +1093,7 @@ async function pumpNetwork() {
       }, waitMs);
     });
   }
+  syncNetworkClock();
   // Nothing arrived: let the guest's clock advance so its timeouts can fire.
   if (netEvents === before) exports.wtw_net_expire();
 }
@@ -1106,10 +1150,17 @@ async function pump() {
 /// Grants the guest a network, routed through the host's relay. Called before
 /// the process starts; without it `socket(2)` fails and nothing can connect.
 function enableNetwork(url) {
+  // Real transports require real wall time for certificate, credential and
+  // signed-message validity. Keep offline machines deterministic, but bind a
+  // networked machine to the host epoch before its first socket can open.
+  if (exports.wtw_set_wall_clock_unix_sec(Math.floor(Date.now() / 1000)) !== 0) {
+    throw new Error(`wall clock setup failed: ${lastError()}`);
+  }
   if (exports.wtw_net_enable() !== 0) {
     throw new Error(`network enable failed: ${lastError()}`);
   }
   gateway = url.replace(/\/$/, "");
+  networkClockActive = false;
   postMessage({ type: "status", text: `network enabled via ${gateway}` });
 }
 

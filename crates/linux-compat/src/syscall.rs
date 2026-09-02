@@ -2747,6 +2747,7 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
     const POLLERR: u16 = 0x8;
     const POLLHUP: u16 = 0x10;
     const POLLNVAL: u16 = 0x20;
+    const POLLRDHUP: u16 = 0x2000;
 
     let now = env.now_nanos(cpu);
     let nfds = nfds.min(1024) as usize;
@@ -2765,6 +2766,9 @@ fn sys_poll(env: &mut LinuxEnv, cpu: &mut Cpu, fds_ptr: u64, nfds: u64) -> SysRe
                 }
                 if events & POLLOUT != 0 && desc.writable() && desc_write_ready(&desc) {
                     bits |= POLLOUT;
+                }
+                if events & POLLRDHUP != 0 && desc_net_read_closed(&desc) {
+                    bits |= POLLRDHUP;
                 }
                 if let Backing::Pipe {
                     inner,
@@ -2819,6 +2823,21 @@ fn desc_write_ready(desc: &Description) -> bool {
         }
         _ => true,
     }
+}
+
+/// Whether a TCP peer has closed its write half. Linux exposes this separately
+/// from ordinary readability through `POLLRDHUP`/`EPOLLRDHUP`.
+fn desc_net_read_closed(desc: &Description) -> bool {
+    let Backing::Net(socket) = &desc.backing else {
+        return false;
+    };
+    let socket = socket.borrow();
+    if socket.kind != SocketKind::Tcp {
+        return false;
+    }
+    socket
+        .handle
+        .is_some_and(|handle| socket.broker.borrow_mut().tcp_read_closed(handle))
 }
 
 /// The readiness source for a descriptor that is not currently writable.
@@ -6579,6 +6598,7 @@ const EPOLL_CTL_MOD: u64 = 3;
 const EPOLLIN: u32 = 0x1;
 const EPOLLOUT: u32 = 0x4;
 const EPOLLHUP: u32 = 0x10;
+const EPOLLRDHUP: u32 = 0x2000;
 /// Disable an interest after one delivered event.  Userspace rearms it with
 /// `EPOLL_CTL_MOD`; an ordinary readiness transition does not rearm it.
 const EPOLLONESHOT: u32 = 0x4000_0000;
@@ -7585,6 +7605,9 @@ fn sys_epoll_wait(env: &mut LinuxEnv, cpu: &mut Cpu, a: [u64; 6]) -> Outcome {
                 } else if let Some(watch) = read_watch_of(&desc) {
                     watches.push(watch);
                 }
+            }
+            if events & EPOLLRDHUP != 0 && desc_net_read_closed(&desc) {
+                fired |= EPOLLRDHUP;
             }
             // Hang-up is reported regardless of the requested events.
             if let Backing::Pipe {
