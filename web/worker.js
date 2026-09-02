@@ -886,38 +886,40 @@ function openTcp(handle, ip, port) {
   const entry = { socket, queue: [], open: false };
   sockets.set(handle, entry);
   socket.onopen = () => {
-    syncNetworkClock();
     entry.open = true;
     for (const pending of entry.queue) socket.send(pending);
     entry.queue.length = 0;
+    syncNetworkClock();
   };
   socket.onmessage = (event) => {
-    syncNetworkClock();
     if (typeof event.data === "string") {
       // "open" once the relay's own TCP connect succeeded; "eof" on a peer
       // half-close, which the guest reads as end of stream.
       if (event.data === "open") {
         entry.connected = true;
         exports.wtw_net_connected(handle, 0, 0);
+        syncNetworkClock();
         noteNetEvent();
       } else if (event.data === "eof") {
         entry.eof = true;
         exports.wtw_net_closed(handle);
+        syncNetworkClock();
         noteNetEvent();
       }
       return;
     }
     deliverData(handle, new Uint8Array(event.data));
+    syncNetworkClock();
   };
   // The close event always follows an error and carries why, so the guest's
   // errno is decided there rather than twice.
   socket.onerror = () => {};
   socket.onclose = (event) => {
-    syncNetworkClock();
     if (sockets.get(handle) !== entry) return; // the guest already closed it
     sockets.delete(handle);
     const errno = tcpCloseErrno(entry, event.code);
     if (errno !== null) deliverError(handle, errno);
+    syncNetworkClock();
   };
 }
 
@@ -964,21 +966,23 @@ function openUdp(handle) {
   const entry = { socket, queue: [], open: false };
   sockets.set(handle, entry);
   socket.onopen = () => {
-    syncNetworkClock();
     entry.open = true;
     for (const pending of entry.queue) socket.send(pending);
     entry.queue.length = 0;
+    syncNetworkClock();
   };
   socket.onmessage = (event) => {
-    syncNetworkClock();
-    if (typeof event.data !== "string") deliverDatagram(handle, new Uint8Array(event.data));
+    if (typeof event.data !== "string") {
+      deliverDatagram(handle, new Uint8Array(event.data));
+      syncNetworkClock();
+    }
   };
   socket.onerror = () => {};
   socket.onclose = () => {
-    syncNetworkClock();
     if (sockets.get(handle) !== entry) return; // the guest already closed it
     sockets.delete(handle);
     deliverError(handle, entry.open ? ECONNRESET : ENETUNREACH);
+    syncNetworkClock();
   };
 }
 
@@ -1080,6 +1084,7 @@ async function pumpNetwork() {
     NET_WAIT_CAP_MS,
   );
   const before = netEvents;
+  const waitStarted = performance.now();
   if (waitMs > 0) {
     // Sleep until a socket delivers something or the guest's own timer is
     // due. Spinning here would burn the worker for nothing.
@@ -1093,9 +1098,14 @@ async function pumpNetwork() {
       }, waitMs);
     });
   }
-  syncNetworkClock();
   // Nothing arrived: let the guest's clock advance so its timeouts can fire.
-  if (netEvents === before) exports.wtw_net_expire();
+  if (netEvents === before) {
+    const waitedMs = Math.min(0xffff_ffff, Math.ceil(performance.now() - waitStarted));
+    if (exports.wtw_net_expire(waitedMs) !== 0) {
+      throw new Error(`network expiry failed: ${lastError()}`);
+    }
+    if (networkClockActive) networkClockWarpMs += waitedMs;
+  }
 }
 
 // ---------------------------------------------------------------- terminal

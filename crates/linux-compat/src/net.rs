@@ -72,6 +72,13 @@ pub trait NetworkBroker {
     fn tcp_take_error(&mut self, _handle: Handle) -> Result<Option<u64>, u64> {
         Ok(None)
     }
+    /// Monotone generation for host-side endpoint activity.  Host-driven
+    /// transports advance it whenever connection state, received data, EOF,
+    /// or an error is delivered.  Edge-triggered pollers use this to observe
+    /// a fresh host event even while the descriptor remains ready.
+    fn activity(&mut self, _handle: Handle) -> u64 {
+        0
+    }
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64>;
     fn tcp_recv(&mut self, handle: Handle, max: usize) -> Result<RecvOutcome, u64>;
     fn tcp_shutdown_write(&mut self, handle: Handle) -> Result<(), u64>;
@@ -583,6 +590,10 @@ struct Endpoint {
     connected: bool,
     /// The local address the host assigned, when it reported one.
     local: Option<SocketAddrV4>,
+    /// Advances on every externally delivered endpoint event.  This is
+    /// separate from a guest socket's own send/recv generation: browser host
+    /// callbacks can change readiness while the guest is parked.
+    activity: u64,
 }
 
 impl Endpoint {
@@ -696,23 +707,32 @@ impl HostBroker {
         let endpoint = self.endpoint(handle);
         endpoint.local = local;
         endpoint.connected = true;
+        endpoint.activity = endpoint.activity.wrapping_add(1);
     }
 
     /// The host delivers stream bytes from the peer.
     pub fn deliver_data(&mut self, handle: Handle, bytes: &[u8]) {
-        self.endpoint(handle).rx.extend(bytes.iter().copied());
+        if !bytes.is_empty() {
+            let endpoint = self.endpoint(handle);
+            endpoint.rx.extend(bytes.iter().copied());
+            endpoint.activity = endpoint.activity.wrapping_add(1);
+        }
     }
 
     /// The host delivers one datagram and its sender.
     pub fn deliver_datagram(&mut self, handle: Handle, from: SocketAddrV4, bytes: &[u8]) {
-        self.endpoint(handle)
-            .datagrams
-            .push_back((bytes.to_vec(), from));
+        let endpoint = self.endpoint(handle);
+        endpoint.datagrams.push_back((bytes.to_vec(), from));
+        endpoint.activity = endpoint.activity.wrapping_add(1);
     }
 
     /// The host reports the peer closed the stream.
     pub fn deliver_closed(&mut self, handle: Handle) {
-        self.endpoint(handle).closed = true;
+        let endpoint = self.endpoint(handle);
+        if !endpoint.closed {
+            endpoint.closed = true;
+            endpoint.activity = endpoint.activity.wrapping_add(1);
+        }
     }
 
     /// The host reports a transport failure; the guest sees `errno` on its
@@ -721,6 +741,7 @@ impl HostBroker {
         let endpoint = self.endpoint(handle);
         if endpoint.error.is_none() {
             endpoint.error = Some(errno);
+            endpoint.activity = endpoint.activity.wrapping_add(1);
         }
     }
 }
@@ -734,6 +755,12 @@ impl Default for HostBroker {
 impl NetworkBroker for HostBroker {
     fn host_driven(&self) -> bool {
         true
+    }
+
+    fn activity(&mut self, handle: Handle) -> u64 {
+        self.endpoints
+            .get(&handle)
+            .map_or(0, |endpoint| endpoint.activity)
     }
 
     fn tcp_connect(&mut self, addr: SocketAddrV4) -> Result<Handle, u64> {
@@ -1035,6 +1062,10 @@ impl NetworkBroker for MeteredBroker {
 
     fn tcp_take_error(&mut self, handle: Handle) -> Result<Option<u64>, u64> {
         self.inner.borrow_mut().tcp_take_error(handle)
+    }
+
+    fn activity(&mut self, handle: Handle) -> u64 {
+        self.inner.borrow_mut().activity(handle)
     }
 
     fn tcp_send(&mut self, handle: Handle, bytes: &[u8]) -> Result<usize, u64> {

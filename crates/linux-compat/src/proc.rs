@@ -342,6 +342,10 @@ pub enum Watch {
     PipeActivity(PipeRef, u64),
     /// Same as [`Watch::PipeActivity`] for an eventfd.
     EventActivity(EventFdRef, u64),
+    /// Fires when either the guest or its host-driven broker changes a
+    /// network endpoint.  In particular, received bytes must re-arm EPOLLET
+    /// while the guest is parked.
+    NetActivity(NetRef, u64),
     /// Readability of a pty end (`master = true` watches slave-to-master
     /// output; `false` watches master-to-slave input).
     PtyReadable(PtyRef, bool),
@@ -388,6 +392,7 @@ impl Watch {
             }
             Watch::PipeActivity(pipe, seen) => pipe.borrow().activity != *seen,
             Watch::EventActivity(event, seen) => event.borrow().activity != *seen,
+            Watch::NetActivity(socket, seen) => socket.borrow().activity_generation() != *seen,
             Watch::PtyReadable(pty, master) => {
                 let pty = pty.borrow();
                 if *master {
@@ -576,7 +581,11 @@ impl Scheduler {
                 pipe.data.len() < crate::PIPE_CAPACITY || pipe.readers == 0
             }
             ParkState::Waiting { watches, deadline } => {
-                deadline.is_some_and(|d| now >= d) || watches.iter().any(|w| w.ready(now))
+                // A host event delivered in the same wake cycle as expiry is
+                // observable when poll/epoll checks its fd set. Preserve that
+                // causality instead of manufacturing a timeout merely because
+                // the host callback also advanced CLOCK_MONOTONIC past d.
+                watches.iter().any(|w| w.ready(now)) || deadline.is_some_and(|d| now >= d)
             }
             ParkState::VforkDone { done } => done.get(),
         }
@@ -617,7 +626,9 @@ impl Scheduler {
                 ParkState::Waiting { watches, .. } => watches
                     .iter()
                     .filter_map(|w| match w {
-                        Watch::NetReadable(s) | Watch::NetWritable(s) => s.borrow().handle,
+                        Watch::NetReadable(s)
+                        | Watch::NetWritable(s)
+                        | Watch::NetActivity(s, _) => s.borrow().handle,
                         _ => None,
                     })
                     .collect::<Vec<_>>(),

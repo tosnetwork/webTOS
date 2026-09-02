@@ -768,9 +768,11 @@ impl LinuxEnv {
         Ok(())
     }
 
-    /// Tells the machine the host waited for network activity and none came,
-    /// so the next stall may advance guest time instead of pausing again.
-    pub fn expire_network_wait(&mut self) {
+    /// Tells the scheduler that a bounded host network wait completed without
+    /// an event.  The machine wrapper accounts for the actual elapsed time;
+    /// this flag only admits one readiness pass and must never imply that an
+    /// arbitrary guest deadline elapsed.
+    pub(crate) fn expire_network_wait(&mut self) {
         self.network_expired = true;
     }
 
@@ -781,7 +783,11 @@ impl LinuxEnv {
         let now = self.now_nanos(cpu);
         self.sched
             .earliest_deadline()
-            .map(|deadline| deadline.saturating_sub(now) / 1_000_000)
+            // A positive sub-millisecond remainder still requires one host
+            // event-loop turn. Rounding down to zero makes a browser expire
+            // the wait without letting I/O callbacks run and can spin forever
+            // just before the deadline.
+            .map(|deadline| deadline.saturating_sub(now).div_ceil(1_000_000))
     }
 
     pub fn add_file(&mut self, path: &[u8], bytes: Vec<u8>, mode: u32) -> Result<(), String> {
@@ -1956,7 +1962,11 @@ impl Machine {
     }
 
     /// See [`LinuxEnv::expire_network_wait`].
-    pub fn expire_network_wait(&mut self) {
+    pub fn expire_network_wait(&mut self, waited_ms: u64) {
+        // A browser deliberately caps one trip through its host event loop.
+        // Account for exactly that observed interval rather than allowing the
+        // scheduler to jump to a potentially much later request timeout.
+        self.skip_time(waited_ms.saturating_mul(1_000_000));
         self.env().expire_network_wait();
     }
 
@@ -2456,6 +2466,18 @@ impl Machine {
     /// Bytes the guest may still relay, or None when no budget is set.
     pub fn network_headroom(&mut self) -> Option<usize> {
         self.env().net_meter.borrow().headroom()
+    }
+
+    /// Open descriptors in the current process. This is safe operational
+    /// metadata for diagnosing resource exhaustion; it exposes neither paths
+    /// nor descriptor contents.
+    pub fn open_fd_count(&mut self) -> usize {
+        self.env().proc.fds.borrow().occupied()
+    }
+
+    /// The fixed RLIMIT_NOFILE enforced by every descriptor table.
+    pub const fn fd_limit(&self) -> usize {
+        fd::FD_LIMIT
     }
 
     /// Records that `nanos` of real time passed while nothing ran.

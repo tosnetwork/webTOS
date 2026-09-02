@@ -810,7 +810,7 @@ fn dispatch_simple(env: &mut LinuxEnv, cpu: &mut Cpu, nr: u64, a: [u64; 6]) -> S
             env.proc.clear_child_tid = a[0];
             Ok(env.proc.pid)
         }
-        abi::SYS_PRLIMIT64 => sys_prlimit64(env, cpu, a[2], a[3]),
+        abi::SYS_PRLIMIT64 => sys_prlimit64(env, cpu, a[1], a[2], a[3]),
         abi::SYS_SETRLIMIT => Ok(0),
         abi::SYS_PRCTL => {
             const PR_SET_PDEATHSIG: u64 = 1;
@@ -2865,7 +2865,7 @@ fn backing_activity(desc: &Description) -> u64 {
         Backing::SocketPair { rx, tx } => rx.borrow().activity + tx.borrow().activity,
         Backing::EventFd(event) => event.borrow().activity,
         Backing::Inotify(inner) => inner.borrow().activity,
-        Backing::Net(socket) => socket.borrow().activity,
+        Backing::Net(socket) => socket.borrow().activity_generation(),
         Backing::PtyMaster(pty) | Backing::PtySlave(pty) => pty.borrow().activity,
         _ => 0,
     }
@@ -2888,6 +2888,10 @@ fn activity_watch_of(desc: &Description) -> Option<crate::proc::Watch> {
         Backing::EventFd(event) => {
             Some(Watch::EventActivity(event.clone(), event.borrow().activity))
         }
+        Backing::Net(socket) => Some(Watch::NetActivity(
+            socket.clone(),
+            socket.borrow().activity_generation(),
+        )),
         Backing::PtyMaster(pty) | Backing::PtySlave(pty) => {
             Some(Watch::PtyActivity(pty.clone(), pty.borrow().activity))
         }
@@ -3661,12 +3665,42 @@ fn sys_getrandom(env: &mut LinuxEnv, cpu: &mut Cpu, buf: u64, len: u64) -> SysRe
     Ok(len as u64)
 }
 
-fn sys_prlimit64(env: &mut LinuxEnv, cpu: &mut Cpu, new: u64, old: u64) -> SysResult {
+fn sys_prlimit64(
+    env: &mut LinuxEnv,
+    cpu: &mut Cpu,
+    resource: u64,
+    new: u64,
+    old: u64,
+) -> SysResult {
     if old != 0 {
-        // RLIM_INFINITY for both current and max.
-        write_mem(env, cpu, old, &[0xff_u8; 16])?;
+        // Linux resource 7 is RLIMIT_NOFILE. Reporting infinity while the fd
+        // table silently rejects descriptor 1024 makes runtimes over-admit
+        // sockets and then fail synchronously with an unexpected EMFILE.
+        let limit = if resource == 7 {
+            crate::fd::FD_LIMIT as u64
+        } else {
+            u64::MAX
+        };
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&limit.to_le_bytes());
+        bytes[8..].copy_from_slice(&limit.to_le_bytes());
+        write_mem(env, cpu, old, &bytes)?;
     }
-    let _ = new; // limits are accepted but not enforced
+    // The execution profile owns fixed limits. Accepting a different new
+    // value without storing and enforcing it would be another lie.
+    if new != 0 {
+        let requested = read_mem(env, cpu, new, 16)?;
+        let current = u64::from_le_bytes(requested[..8].try_into().expect("slice length"));
+        let maximum = u64::from_le_bytes(requested[8..].try_into().expect("slice length"));
+        let enforced = if resource == 7 {
+            crate::fd::FD_LIMIT as u64
+        } else {
+            u64::MAX
+        };
+        if current != enforced || maximum != enforced {
+            return Err(abi::EPERM);
+        }
+    }
     Ok(0)
 }
 
@@ -4452,6 +4486,10 @@ fn format_park_state(state: &ParkState) -> String {
                     }
                     crate::proc::Watch::NetReadable(_) => "net-read".to_string(),
                     crate::proc::Watch::NetWritable(_) => "net-write".to_string(),
+                    crate::proc::Watch::NetActivity(socket, seen) => format!(
+                        "netAct(now={},seen={seen})",
+                        socket.borrow().activity_generation()
+                    ),
                     crate::proc::Watch::PipeActivity(p, seen) => {
                         format!("pipeAct(now={},seen={seen})", p.borrow().activity)
                     }
@@ -6632,11 +6670,19 @@ fn resolve_stall(env: &mut LinuxEnv, cpu: &mut Cpu) -> Option<usize> {
             // A host-driven broker owns no transport of its own: the host must
             // run its event loop before guest time may advance, or a socket
             // timeout would fire before the reply had any chance to arrive.
-            // Pause once per stall; the host says "nothing came" by expiring
-            // the wait, and only then does the clock move.
+            // Pause once per stall. The host reports the actual bounded time
+            // it waited; Machine::expire_network_wait has already credited
+            // exactly that interval to the clocks. Expiry therefore admits a
+            // readiness pass, not a jump to an arbitrary later deadline.
             if broker.borrow().host_driven() {
                 if env.network_expired {
                     env.network_expired = false;
+                    let now = env.now_nanos(cpu);
+                    if let Some(index) = env.sched.find_ready(now) {
+                        return Some(index);
+                    }
+                    env.network_wait = true;
+                    return None;
                 } else {
                     env.network_wait = true;
                     return None;
@@ -8045,13 +8091,12 @@ fn outcome_poll(
                 }
             }
             if events & POLLOUT != 0 {
-                if let Backing::Pipe {
-                    inner,
-                    write_end: true,
-                }
-                | Backing::SocketPair { tx: inner, .. } = &desc.backing
-                {
-                    watches.push(Watch::PipeWritable(inner.clone()));
+                // Match the readiness scan above and epoll's blocking path:
+                // a pending non-blocking network connect is not writable yet,
+                // but it is still a host-owned wait that must keep the
+                // scheduler from warping directly to the poll timeout.
+                if let Some(watch) = write_watch_of(&desc) {
+                    watches.push(watch);
                 }
             }
         }

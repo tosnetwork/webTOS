@@ -1351,6 +1351,28 @@ pub extern "C" fn wtw_guest_memory_cap_mb() -> u32 {
     })
 }
 
+/// Number of open descriptors in the current guest process.
+#[no_mangle]
+pub extern "C" fn wtw_open_fd_count() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_mut()
+            .map_or(0, |machine| machine.open_fd_count() as u32)
+    })
+}
+
+/// Fixed RLIMIT_NOFILE enforced by the guest descriptor table.
+#[no_mangle]
+pub extern "C" fn wtw_fd_limit() -> u32 {
+    with_state(|state| {
+        state
+            .machine
+            .as_ref()
+            .map_or(0, |machine| machine.fd_limit() as u32)
+    })
+}
+
 // ----------------------------------------------------------------- network
 
 /// Attaches the host-driven network broker. Until this is called the guest
@@ -1497,15 +1519,17 @@ pub extern "C" fn wtw_net_error(handle: u32, errno: u32) -> i32 {
     })
 }
 
-/// Tells the machine the host waited for network activity and none arrived,
-/// so the next stall may advance guest time and let socket timeouts fire.
+/// Tells the machine how many milliseconds the host actually waited for
+/// network activity without receiving an event. The guest advances by that
+/// bounded interval only; a capped browser wait must not consume an entire
+/// distant request timeout.
 #[no_mangle]
-pub extern "C" fn wtw_net_expire() -> i32 {
+pub extern "C" fn wtw_net_expire(waited_ms: u32) -> i32 {
     with_state(|state| {
         let Some(machine) = state.machine.as_mut() else {
             return fail(state, "wtw_net_expire called before wtw_init");
         };
-        machine.expire_network_wait();
+        machine.expire_network_wait(waited_ms as u64);
         0
     })
 }

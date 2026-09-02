@@ -1983,7 +1983,7 @@ fn run_argv_pumped(machine: &mut Machine, host: &mut BrokerHost, path: &str, arg
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         if !delivered {
-            machine.expire_network_wait();
+            machine.expire_network_wait(100);
         }
     }
     panic!(
@@ -2664,6 +2664,192 @@ fn host_broker_socket_error_is_observable_then_cleared_like_so_error() {
         Ok(Some(linux_compat::abi::ECONNREFUSED))
     );
     assert_eq!(broker.tcp_take_error(handle), Ok(None));
+}
+
+/// A host-driven transport wait must advance by the amount the host actually
+/// waited, not jump straight to the guest's (possibly distant) timeout.  A
+/// browser deliberately caps each host wait so it can service cancellation
+/// and other sockets; treating that cap as proof that the whole guest timeout
+/// elapsed makes a 30-second request fail after one second of real time.
+#[test]
+fn capped_host_wait_does_not_expire_a_distant_socket_timeout() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <poll.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) return 10;
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(443);
+    peer.sin_addr.s_addr = htonl(0x0a000001);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != -1 || errno != EINPROGRESS)
+        return 11;
+    puts("waiting");
+    fflush(stdout);
+    struct pollfd wanted = { .fd = fd, .events = POLLOUT };
+    int result = poll(&wanted, 1, 30000);
+    printf("poll=%d\n", result);
+    return result == 0 ? 12 : 0;
+}
+
+"#;
+    let Some(image) = compile_c("capped-host-wait", source, &[]) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/capped-host-wait", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"capped-host-wait".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/capped-host-wait")
+        .expect("ELF load failed");
+    let broker = Rc::new(RefCell::new(HostBroker::new()));
+    machine.set_network(broker.clone());
+
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    let first = machine.run();
+    let first_output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(first, CpuExit::Interrupted, "{first_output:?}");
+    assert!(machine.awaiting_network());
+    assert!(first_output.contains("waiting"));
+    assert!(!broker.borrow_mut().take_commands().is_empty());
+
+    // Report that no socket event arrived during one bounded real second.
+    machine.expire_network_wait(1_000);
+    machine.vm_mut().icount_limit = machine.icount() + 1_000_000_000;
+    let second = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(second, CpuExit::Interrupted, "{output:?}");
+    assert!(
+        machine.awaiting_network(),
+        "a one-second host wait incorrectly consumed the full 30-second timeout: {output:?}"
+    );
+}
+
+/// A host callback is itself edge-producing activity.  This matters when an
+/// EPOLLET consumer intentionally leaves a socket readable: after the current
+/// edge has been delivered, another host data callback must wake the parked
+/// epoll waiter even though readability never transitioned through false.
+#[test]
+fn host_delivery_rearms_a_suppressed_network_edge() {
+    let source = r#"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) return 10;
+    struct sockaddr_in peer = {0};
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(443);
+    peer.sin_addr.s_addr = htonl(0x0a000001);
+    if (connect(fd, (struct sockaddr *)&peer, sizeof(peer)) != -1 || errno != EINPROGRESS)
+        return 11;
+    int ep = epoll_create1(0);
+    struct epoll_event wanted = { .events = EPOLLIN | EPOLLOUT | EPOLLET, .data.fd = fd };
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, fd, &wanted)) return 12;
+    struct epoll_event got;
+    if (epoll_wait(ep, &got, 1, -1) != 1 || !(got.events & EPOLLIN)) return 13;
+    char byte;
+    if (recv(fd, &byte, 1, 0) != 1) return 14; /* leave one byte readable */
+    if (epoll_wait(ep, &got, 1, 0) != 1 || !(got.events & EPOLLIN)) return 15;
+    puts("suppressed-wait-ready");
+    fflush(stdout);
+    if (epoll_wait(ep, &got, 1, -1) != 1 || !(got.events & EPOLLIN)) return 16;
+    puts("fresh-host-edge");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("host-delivery-edge", source, &[]) else {
+        return;
+    };
+    let mut machine =
+        Machine::from_ldef(&ldef_path(), &EngineConfig::default()).expect("machine build failed");
+    machine
+        .add_file(b"/bin/host-delivery-edge", image, 0o755)
+        .expect("add fixture");
+    machine.set_args(
+        vec![b"host-delivery-edge".to_vec()],
+        vec![b"HOME=/root".to_vec()],
+    );
+    machine
+        .load(b"/bin/host-delivery-edge")
+        .expect("ELF load failed");
+    let broker = Rc::new(RefCell::new(HostBroker::new()));
+    machine.set_network(broker.clone());
+
+    machine.vm_mut().icount_limit = 4_000_000_000;
+    assert_eq!(machine.run(), CpuExit::Interrupted);
+    assert!(machine.awaiting_network());
+    assert!(!broker.borrow_mut().take_commands().is_empty());
+
+    // The first callback establishes both readiness directions and leaves two
+    // bytes so the guest can consume only part of the readable state.
+    broker.borrow_mut().deliver_connected(1, None);
+    broker.borrow_mut().deliver_data(1, b"ab");
+    machine.vm_mut().icount_limit = machine.icount() + 200_000_000;
+    let middle_exit = machine.run();
+    let middle = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    assert_eq!(middle_exit, CpuExit::Interrupted, "{middle:?}");
+    assert!(machine.awaiting_network(), "{middle:?}");
+    assert!(middle.contains("suppressed-wait-ready"), "{middle:?}");
+
+    // Readability never became false.  Only the broker's activity generation
+    // distinguishes this delivery from the edge already consumed above.
+    broker.borrow_mut().deliver_data(1, b"c");
+    machine.vm_mut().icount_limit = machine.icount() + 200_000_000;
+    let exit = machine.run();
+    let output = String::from_utf8_lossy(&machine.take_output()).into_owned();
+    let parked = machine.parked_task_snapshot();
+    assert_eq!(
+        exit,
+        CpuExit::Halt { code: Some(0) },
+        "output={output:?} awaiting={} parked={parked:?}",
+        machine.awaiting_network()
+    );
+    assert!(output.contains("fresh-host-edge"), "{output:?}");
+}
+
+#[test]
+fn nofile_limit_matches_the_descriptor_table_ceiling() {
+    let source = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <sys/resource.h>
+
+int main(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit)) return 10;
+    if (limit.rlim_cur != 65536 || limit.rlim_max != 65536) return 11;
+    if (setrlimit(RLIMIT_NOFILE, &limit)) return 12;
+    limit.rlim_cur--;
+    errno = 0;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != -1 || errno != EPERM) return 13;
+    puts("nofile-limit-ok");
+    return 0;
+}
+"#;
+    let Some(image) = compile_c("nofile-limit", source, &[]) else {
+        return;
+    };
+    let run = run_image(image, "nofile-limit");
+    expect_clean(&run);
+    assert!(run.output.contains("nofile-limit-ok"), "{:?}", run.output);
 }
 
 #[test]

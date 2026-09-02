@@ -398,9 +398,9 @@ const noteNetEvent = () => {
   }
 };
 const deliverNetError = (handle, errno) => {
-  syncRealtimeClock();
   traceNetwork("guest-error", { handle, errno });
   e.wtw_net_error(handle, errno);
+  syncRealtimeClock();
   noteNetEvent();
 };
 const nodeErrno = (error) => {
@@ -413,9 +413,9 @@ const permitted = (ip, port) =>
   (ip === "1.1.1.1" && port === 53) ||
   (apiAddresses.has(canonicalAddress(ip)) && port === 443);
 const deliverNetData = (handle, bytes) => {
-  syncRealtimeClock();
   traceNetwork("guest-data", { handle, bytes: bytes.length });
   e.wtw_net_data(handle, ...put(bytes));
+  syncRealtimeClock();
   noteNetEvent();
 };
 const openTcp = (handle, ip, port) => {
@@ -441,16 +441,16 @@ const openTcp = (handle, ip, port) => {
   });
   sockets.set(handle, { kind: "tcp", socket });
   socket.on("connect", () => {
-    syncRealtimeClock();
     traceNetwork("host-connect", { handle });
     e.wtw_net_connected(handle, 0, 0);
+    syncRealtimeClock();
     noteNetEvent();
   });
   socket.on("data", (bytes) => deliverNetData(handle, bytes));
   socket.on("end", () => {
-    syncRealtimeClock();
     traceNetwork("host-end", { handle });
     e.wtw_net_closed(handle);
+    syncRealtimeClock();
     noteNetEvent();
   });
   socket.on("error", (error) => {
@@ -468,7 +468,6 @@ const openUdp = (handle) => {
   const socket = createSocket("udp4");
   sockets.set(handle, { kind: "udp", socket });
   socket.on("message", (bytes, remote) => {
-    syncRealtimeClock();
     traceNetwork("host-udp-data", {
       handle,
       family: remote.family,
@@ -478,6 +477,7 @@ const openUdp = (handle) => {
     const octets = remote.address.split(".").map(Number);
     const ip = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
     e.wtw_net_datagram(handle, ip, remote.port, ...put(bytes));
+    syncRealtimeClock();
     noteNetEvent();
   });
   socket.on("error", (error) => deliverNetError(handle, nodeErrno(error)));
@@ -588,6 +588,7 @@ const pumpNetwork = async () => {
   if (netEvents !== before) return;
   const budget = e.wtw_net_budget_ms() >>> 0;
   const waitMs = Math.min(budget === NET_BUDGET_UNBOUNDED ? 1000 : budget, 1000);
+  const waitStarted = performance.now();
   await new Promise((resolve) => {
     netWake = resolve;
     setTimeout(() => {
@@ -597,7 +598,11 @@ const pumpNetwork = async () => {
       }
     }, waitMs);
   });
-  if (netEvents === before) e.wtw_net_expire();
+  if (netEvents === before) {
+    const waitedMs = Math.min(0xffff_ffff, Math.ceil(performance.now() - waitStarted));
+    if (e.wtw_net_expire(waitedMs) !== 0) throw new Error(`network expiry: ${err()}`);
+    if (realtimeClockActive) realtimeWarpAppliedMs += waitedMs;
+  }
 };
 
 for (;;) {
@@ -772,7 +777,8 @@ while (Date.now() < deadline) {
         `jit_regions=${Number(e.wtw_jit_region_dispatch_count()).toLocaleString()} ` +
         `jit_code_bytes=${Number(e.wtw_jit_code_bytes()).toLocaleString()} ` +
         `jit_evictions=${Number(e.wtw_jit_evictions()).toLocaleString()} ` +
-        `guest_mem_mb=${e.wtw_guest_memory_used_mb()}/${e.wtw_guest_memory_cap_mb()}`,
+        `guest_mem_mb=${e.wtw_guest_memory_used_mb()}/${e.wtw_guest_memory_cap_mb()} ` +
+        `open_fds=${e.wtw_open_fd_count()}/${e.wtw_fd_limit()}`,
     );
   }
   drain();

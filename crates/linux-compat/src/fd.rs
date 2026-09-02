@@ -292,6 +292,18 @@ pub struct NetSocket {
     pub activity: u64,
 }
 
+impl NetSocket {
+    /// Combined guest- and host-side activity generation.  The broker half is
+    /// essential for async host transports, whose callbacks change socket
+    /// readiness without executing a guest syscall first.
+    pub fn activity_generation(&self) -> u64 {
+        let host = self
+            .handle
+            .map_or(0, |handle| self.broker.borrow_mut().activity(handle));
+        self.activity.wrapping_add(host)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketKind {
     Tcp,
@@ -461,7 +473,10 @@ impl Clone for FdTable {
     }
 }
 
-const FD_LIMIT: usize = 1024;
+/// Process-visible descriptor ceiling. Native runtimes size worker pools and
+/// connection tables from RLIMIT_NOFILE, so this value is also returned by
+/// prlimit64 rather than advertising an impossible RLIM_INFINITY.
+pub(crate) const FD_LIMIT: usize = 65_536;
 
 impl FdTable {
     pub fn new() -> Self {
@@ -489,6 +504,11 @@ impl FdTable {
             .iter()
             .enumerate()
             .filter_map(|(fd, e)| e.as_ref().map(|e| (fd as u64, e)))
+    }
+
+    /// Number of descriptors currently occupied by this process.
+    pub(crate) fn occupied(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
     }
 
     pub fn get(&self, fd: u64) -> Result<&FdEntry, u64> {
